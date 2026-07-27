@@ -433,7 +433,19 @@ many. A receipt therefore names the items it discharges — which may be a subse
 gain gates as the work lands — and the `f1_` functions discharging them, and the selected
 count must equal the length of that list. Below it, the filter dropped a gate, and that is a
 failing receipt however green the split. This section is discharged only once every item
-requiring a gate has been named across those receipts. Zero is likewise
+requiring a gate has been named across those receipts.
+
+**Discharge and acceptance are two different bars, and the gap between them must be named
+here rather than left as a silent exception.** Full discharge is the sentence above. A
+smaller set — the **acceptance-blocking items** — gates acceptance of this ADR; every item
+outside that set still requires its gate, just not before acceptance. Which items block is a
+scope decision by the owner and not a technical one, so it is recorded here by name and
+re-recorded whenever it changes. **As at 2026-07-27 the blocking set is items 2 and 4**
+(David, relayed by Watson, narrowing an earlier ruling that all four then-ungated items had
+to land first); **items 5 and 6 are scheduled follow-up and do not block acceptance.**
+Accepting this ADR while that scheduled set is non-empty means its Validation section is
+knowingly partial at acceptance, and no receipt may be written or read as though the section
+were complete. Zero is likewise
 invalid, but by the runner's own exit code rather than by this rule — and stating the rule
 over a per-receipt list rather than over a fixed count keeps it sound both as further items
 gain gates and if that runner default is ever configured away.
