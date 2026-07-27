@@ -513,6 +513,17 @@ receipt is read as evidence. And build every mutation set with at least one arm 
 red** — that near-miss was caught only because a control arm failed to fail. A set in which
 every arm is expected green cannot distinguish a sound gate from a mutation that never landed.
 
+**A list committed alongside the code it cites cannot name its own commit, so it takes the
+other form.** Requiring the final SHA is unsatisfiable when the list ships *inside* that
+commit: the SHA does not exist until the bytes containing it are fixed. Such a list therefore
+**declares its parent, and asserts that the cited region is unchanged between that parent and
+the commit carrying the list — with a receipt, not an assurance.** A hash of the region at
+both commits is that receipt; "production is untouched" as a bare parenthetical is not, because
+it is exactly the claim a reader cannot check without redoing the work. The region only has to
+cover the cited lines, so hashing the file's head up to the first changed line is usually
+enough. Where a list is written against a tree it does not ship in — a review copy, a receipt
+posted before the commit lands — the final-SHA requirement above applies unchanged.
+
 **The exit inventory is a floor for a second reason: some breaks are not exits at all.** Where
 a gate observes two production operations agreeing with *each other* — an encrypt and a
 decrypt, a writer and a reader, a serialiser and its parser — an edit applied to **both** sides
