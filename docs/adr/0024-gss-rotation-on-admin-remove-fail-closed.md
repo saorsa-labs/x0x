@@ -438,6 +438,58 @@ invalid, but by the runner's own exit code rather than by this rule — and stat
 over a per-receipt list rather than over a fixed count keeps it sound both as further items
 gain gates and if that runner default is ever configured away.
 
+**Break disclosure — required of every gate in this section.** A gate is evidence only
+against the ways of breaking that someone named. Mutation-redness does not establish that a
+gate observes its property: the §3 gates are mutation-red on the `:5908` conjunct and were
+still blind to the survivor being removed alongside the victim, because that break was never
+on anyone's list. So each gate must be accompanied by a list of the breaks considered, and
+for each either **the mutation that turns the gate red, an assertion or precondition in the
+gate that refuses the path, or a statement that the gate does not observe that break and why
+that is accepted.** A refusing precondition ranks with a mutation and is often the honest
+form: a gate asserting an exact plaintext already cannot pass on any error exit, and
+demanding a bespoke mutation per exit would buy ceremony rather than evidence. This is a
+requirement to disclose, not a
+prohibition on assertions: a rule forbidding any assertion a broken property could still
+produce would forbid 7a's own length assertion, which still yields 32 if rotation breaks by
+returning a constant.
+
+A list drawn from the author's imagination fails the same way the gates do — an author names
+the breaks their gate already catches. The minimum content is therefore mechanical: **name
+the target operation and the observation the gate makes of it, then enumerate from the source
+every control-flow exit or alternate dispatch between the gate's entry point and that
+operation which could bypass or substitute for it — explicit returns, `?` propagation,
+`let`-`else` bindings, `match` and `if` arms, and returns from delegated handlers — and
+account for each.** A scan for `return` is a floor, not a completeness proof; this very
+handler ends in a `match` arm that exits without one. The endpoint of that path is the code
+that performs the property, not the code that reads its inputs. For "a survivor can decrypt",
+the path runs to the key derivation at `56d0c4b:src/server/routes/named_groups.rs:12353` and
+the cipher at `:12367` — not to the stored-secret read at `:12314` — and it contains **ten**
+exits, not the four that precede the read: `:12291` group-not-found, `:12294` withdrawn,
+`:12298` not-a-member, `:12306` TreeKem-plane, `:12315` no-shared-secret, `:12325`
+epoch-mismatch, `:12340` bad ciphertext base64, `:12346` bad nonce base64, `:12350` nonce
+length, `:12362` cipher-init failure. Every one yields "decryption did not succeed" — which
+is exactly what a **negative** gate such as item 4 asserts — and none of them authenticates a
+ciphertext: nine never reach the key material at all, and the tenth derives it and then fails
+to construct the cipher. Three of them (`:12340`, `:12346`, `:12350`) are reachable from
+nothing more than a malformed input the gate itself constructs. Drawing the line at the input
+read would have hidden six of the ten; drawing it at the derivation would still have hidden
+`:12362`.
+
+**One exit lies past the target operation, and it is a different kind — do not file it as
+blindness.** The interval above ends at the operation, but what a gate observes is the
+endpoint's *response*, and on the success arm this handler hands its assembled response to a
+shared terminality-recheck helper that can replace it wholesale with a withdrawn-group
+conflict. That helper can suppress a true success; it cannot manufacture one, because the
+response's payload field is encoded inline from the binding the cipher returned and has no
+other source in the handler. So it can only turn a gate red when the property holds — never
+leave one green when the property breaks. That is a **false-negative and test-isolation
+hazard**, refused by a precondition (assert the response is success-shaped before asserting
+the plaintext) together with test hygiene: the helper is driven by a process-global
+forced-withdrawal set keyed by group id, so a gate must use ids of its own and must not
+install that guard. It is recorded under that heading and **not** as an accepted blind spot.
+That term is reserved for a break that can leave a gate green, and it carries no information
+once it also covers breaks that cannot.
+
 1. Fails on the pinned pre-fix commit (or on a mutation) and passes on the patched tree.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
    that its `state_hash` matches. Convergence is the wrong assertion (Context, driver 2):
@@ -520,6 +572,21 @@ gain gates and if that runner default is ever configured away.
    `rotate_shared_secret`, or moving rotation out of the handler. D5 does not justify that
    production surface. If a future change gives the wrong-length value a real producer, 7b
    becomes a required gate.
+
+   **Scope: 7b describes the remove handler and nothing else. The other consumer of the same
+   producer fails the opposite way.** `ban_group_member` also calls `rotate_shared_secret()`
+   and also narrows `Vec<u8>` to `[u8; 32]`, but by zero-initialising and copying under a
+   length test with **no `else`** (`:10492-10496`). On a wrong-length secret the array stays
+   all zeros and flows on as `Some(sec)` (`:10521`) into `publish_secure_share` (`:10556`),
+   while `rotate_shared_secret` has already stored the wrong-length value on `next` — so the
+   actor's own record and every sealed envelope would disagree, at a known key. This is not
+   reachable today, for the same reason §2a is not: `src/groups/mod.rs:431` (baseline)
+   hardcodes 32, and 7a now pins it. It is recorded because 7b's "defence in depth" reading
+   was derived from one consumer and is **false of the other** — for remove the 7a gate is
+   the second line of defence, for ban it is the only one. A reader sweeping this file for
+   `[0u8; 32]` will also find `approve_join_request` (`:10893`); that site is **not** the
+   same shape — its length test is on the match arm (`:10892`), so a wrong-length secret
+   fails to match and no zero key is published.
 
 **Review triggers.** Re-run the structural audit above, and re-open D10, if any of these
 change: a new `named_groups.write()` writer is added, the membership-lock boundary moves,
