@@ -440,10 +440,11 @@ green all-new soak proves nothing about a mixed fleet.
    That default's effect on the receipt is a race, not a property: fail-fast cancels only
    what is still queued at the instant of failure, so whether either unaffected test is
    omitted depends on scheduling — thread count, ordering, and how long the siblings run.
-   Serially the run has been observed to stop at two of three results; at default
-   parallelism all three are already scheduled when the failure lands, the complete
-   PASS/PASS/FAIL split survives, and the no-flag output differs from the `--no-fail-fast`
-   output only by the line `Cancelling due to test failure:`. **The split is therefore an
+   In Watson's measured matrix the serial no-flag run stopped after two of three results,
+   while in six default-parallel no-flag runs all three tests were already scheduled when
+   the failure landed and the complete PASS/PASS/FAIL split survived — and those runs still
+   reported `Cancelling due to test failure:`. Both halves are observations of that matrix,
+   not guarantees of either scheduling mode. **The split is therefore an
    outcome, not a proof of execution shape — a compliant-looking receipt can be produced
    without the flag**, which is why reporting the split cannot be the criterion. The receipt
    must evidence the invocation. Primary evidence is the exact command, which must contain
