@@ -435,14 +435,27 @@ green all-new soak proves nothing about a mixed fleet.
    demonstrate nothing about which assertion the mutation pins, leaving the claim in this
    sub-item unfalsifiable by its own gate. **Three functions are necessary but not
    sufficient**, because `cargo nextest` is fail-fast by default: with no flag it cancels
-   the run on the first failure, so the two unaffected functions may never be scheduled and
-   the receipt again shows a single result. The repo's `.config/nextest.toml` sets no
-   `fail-fast` key — it is byte-identical at the baseline and at `56d0c4b` — so that default
-   governs here. The mutation receipt must therefore run the three functions under
-   `--no-fail-fast`, or invoke them separately, and must report the PASS/PASS/FAIL split by
-   test name; if it runs through `just adr-gates-f1`, that recipe must itself pass
-   `--no-fail-fast`, otherwise the recipe silently reintroduces the ambiguity this paragraph
-   exists to remove. A separate broken-expectation control proves the runner can report red.
+   the run on the first failure. The repo's `.config/nextest.toml` sets no `fail-fast` key —
+   it is byte-identical at the baseline and at `56d0c4b` — so that default governs here.
+   That default's effect on the receipt is a race, not a property: fail-fast cancels only
+   what is still queued at the instant of failure, so whether either unaffected test is
+   omitted depends on scheduling — thread count, ordering, and how long the siblings run.
+   Serially the run has been observed to stop at two of three results; at default
+   parallelism all three are already scheduled when the failure lands, the complete
+   PASS/PASS/FAIL split survives, and the no-flag output differs from the `--no-fail-fast`
+   output only by the line `Cancelling due to test failure:`. **The split is therefore an
+   outcome, not a proof of execution shape — a compliant-looking receipt can be produced
+   without the flag**, which is why reporting the split cannot be the criterion. The receipt
+   must evidence the invocation. Primary evidence is the exact command, which must contain
+   `--no-fail-fast` or be three separate invocations, one per test; corroborating evidence
+   is the runner's verbatim output naming all three tests. Verbatim output alone does not
+   suffice — it can be excerpted or reformatted, so the absence of `Cancelling due to test
+   failure:` is a tell and not a guarantee. If `just adr-gates-f1` is the recorded
+   invocation, the recipe body must be quoted beside it so that its `--no-fail-fast` is
+   visible; otherwise the recipe silently reintroduces the ambiguity this paragraph exists
+   to remove. `--test-threads=1 --no-fail-fast` is the least ambiguous shape, though serial
+   execution is not required once the flag is explicit. A separate broken-expectation
+   control proves the runner can report red.
 
    **7b — source-reviewed defence, not a gate. All citations in this sub-item are at
    `56d0c4b` except those naming `src/groups/`, which are at the baseline.** If the 7a
