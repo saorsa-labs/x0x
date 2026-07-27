@@ -36,9 +36,9 @@ Three properties of the surrounding code shape the fix:
    be `warn`ed and skipped. Ban's fail-open is **structural**, a consequence of sealing
    after persistence, not an unchecked return value.
 2. **A stranded survivor is invisible to consensus.** `shared_secret` is not one of the
-   eight inputs to `compute_state_hash` (`src/groups/state_commit.rs:219-238`:
-   group id, revision, prev hash, roster root, policy hash, public meta hash,
-   `security_binding`, withdrawn). A member who never receives the new secret keeps a
+   eight inputs to `compute_state_hash` — its parameter list, `src/groups/state_commit.rs`
+   `:219-228`, is group id, revision, prev hash, roster root, policy hash, public meta
+   hash, `security_binding`, withdrawn. A member who never receives the new secret keeps a
    matching `state_hash` forever while decrypting nothing. Any convergence-based
    assertion passes on this bug.
 3. **Nothing proves that a survivor without a roster KEM key never held the secret.** A
@@ -313,9 +313,9 @@ claim of this shape must be run structurally, not derived from a text search.**
   transaction, no rollback machinery. An implementation that builds one has misread D2.
 - **The preflight bounds construction, not delivery, and this ADR claims nothing beyond
   that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
-  publish error and a timeout into `tracing::warn!`; the direct path at `:1834` onward is
-  documented as best-effort. So a crash or a failed publish *after* the commit has been
-  persisted can still leave a survivor without its envelope. That residue is a delivery
+  publish error and a timeout into `tracing::warn!`; the direct path's own doc comment
+  (`:1835-1837`) calls its delivery best-effort. So a crash or a failed publish *after* the
+  commit has been persisted can still leave a survivor without its envelope. That residue is a delivery
   property of the transport, unchanged by F1 and not addressed here; the gate asserts
   decryptability against the **published envelopes** (Validation item 4) precisely because
   end state alone cannot see it.
