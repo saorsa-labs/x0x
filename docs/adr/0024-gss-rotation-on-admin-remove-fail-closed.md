@@ -433,8 +433,16 @@ green all-new soak proves nothing about a mixed fleet.
    separate test functions.** Combined into one, the length assertion panics first and the
    other two never run: the receipt would then show only that "7a turned red" and would
    demonstrate nothing about which assertion the mutation pins, leaving the claim in this
-   sub-item unfalsifiable by its own gate. A separate broken-expectation control proves the
-   runner can report red.
+   sub-item unfalsifiable by its own gate. **Three functions are necessary but not
+   sufficient**, because `cargo nextest` is fail-fast by default: with no flag it cancels
+   the run on the first failure, so the two unaffected functions may never be scheduled and
+   the receipt again shows a single result. The repo's `.config/nextest.toml` sets no
+   `fail-fast` key — it is byte-identical at the baseline and at `56d0c4b` — so that default
+   governs here. The mutation receipt must therefore run the three functions under
+   `--no-fail-fast`, or invoke them separately, and must report the PASS/PASS/FAIL split by
+   test name; if it runs through `just adr-gates-f1`, that recipe must itself pass
+   `--no-fail-fast`, otherwise the recipe silently reintroduces the ambiguity this paragraph
+   exists to remove. A separate broken-expectation control proves the runner can report red.
 
    **7b — source-reviewed defence, not a gate. All citations in this sub-item are at
    `56d0c4b` except those naming `src/groups/`, which are at the baseline.** If the 7a
