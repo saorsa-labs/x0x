@@ -502,6 +502,28 @@ install that guard. It is recorded under that heading and **not** as an accepted
 That term is reserved for a break that can leave a gate green, and it carries no information
 once it also covers breaks that cannot.
 
+**Which label a path takes is decided by direction, and one question decides it.** These
+labels collapsed into one another three times during this section's first use: twice by
+filing under the heading reserved for paths that can leave a gate green a path that can only
+turn it red and a path that cannot fire at all, and once by attributing a path to a
+Validation item whose sentence does not reach it. All three are prevented by asking, per
+path, **if this fires, which way does the gate move?**
+
+- **Stays green while the property is broken** — *accepted blind spot.* The only label that
+  requires an accepted-and-why, because it is the only one that costs coverage.
+- **Turns red while the property holds** — *false-negative or test-isolation hazard.*
+  Discharged by a precondition and by test hygiene, never by a mutation: a mutation aimed at
+  it would be a mutation against a correct gate.
+- **Cannot fire** — say *unreachable* and give the reason. It needs no label at all, and
+  borrowing one that means the opposite is worse than leaving the row bare.
+
+Two things that are **not** labels. A mutation and a refusing precondition are *evidence
+forms*; either can discharge a path of any direction, so neither identifies a kind. And "no
+gate observes this" is a statement about **coverage**, which is independent of **ownership** —
+a path may be unobserved and owned by a scheduled item, or unobserved and owned by nothing.
+State which, because a plausible-sounding owner reads as discharged, and that is worse than
+recording no owner at all.
+
 1. Fails on the pinned pre-fix commit (or on a mutation) and passes on the patched tree.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
    that its `state_hash` matches. Convergence is the wrong assertion (Context, driver 2):
