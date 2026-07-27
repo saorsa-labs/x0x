@@ -16359,6 +16359,222 @@ mod tests {
         Ok(())
     }
 
+    // ── Gate 4a (item 4, containment): a removed caller is refused at the
+    // roster guard, NOT at the crypto. The observation is the `:12298`
+    // `forbidden("not a member")` return, which precedes the shared_secret
+    // read (`:12314`) and the cipher (`:12367`). This gate pins containment
+    // only and says nothing about key material — item 4's key-material
+    // property is gate 4b, observed below the endpoint.
+    //
+    // Both the roster guard (`:12298`) and a downstream decrypt failure
+    // (`:12394`) return 403, so status alone cannot distinguish them. The
+    // load-bearing observation is the body message "not a member": only the
+    // roster guard produces it.
+    //
+    // Mutation: leave the caller Active (skip `remove_member`) → the roster
+    // guard does not fire → the request falls through to a different response
+    // (decrypt failure / epoch mismatch) whose body is not "not a member" →
+    // the body assertion fails and the gate goes red.
+    #[tokio::test]
+    async fn f1_item4a_removed_caller_refused_at_roster_guard() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let admin_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+
+        let group_id = "f1-item4a-local".to_string();
+        let stable_group_id = "f1-item4a-stable".to_string();
+        let epoch: u64 = 7;
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item4a containment".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id,
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(vec![9; 32]);
+        // Caller is added then removed: state == Removed (neither Active nor
+        // Banned), so the `:12296-12298` roster guard fires.
+        info.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.remove_member(&local_hex, Some(admin_hex));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // The roster guard fires before any `req` field is read. Supply a
+        // well-formed request anyway, so the only thing that can refuse the
+        // caller is the roster guard rather than a 400 on malformed input.
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64: BASE64.encode(b"item4a-ciphertext-not-reached"),
+                nonce_b64: BASE64.encode([0u8; 12]),
+                secret_epoch: epoch,
+            }),
+        )
+        .await;
+
+        // Positive precondition: the group really is GSS-plane (explicit, not
+        // fixture-inherited), so the refusal is the roster guard and not the
+        // TreeKem dispatch at `:12306`.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4a group must be present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item4a must exercise the GSS plane"
+            );
+        }
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "removed caller must be refused (403)"
+        );
+        let err_msg = body.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            err_msg.contains("not a member"),
+            "refusal must come from the roster guard at :12298 (body error = {err_msg:?}); \
+             a decrypt-failure 403 at :12394 would prove the guard did NOT fire"
+        );
+        Ok(())
+    }
+
+    // ── Gate 4b (item 4, key material): the secret a removed member retains
+    // (S0, pre-rotation) does NOT open content published at the new epoch
+    // (sealed under S1, post-rotation). Observed BELOW the endpoint, because
+    // the endpoint refuses a removed caller at the roster guard and never
+    // reaches the cipher — that is 4a's point. The derivation is public and
+    // pure (`GroupInfo::derive_message_key`), so the property is testable
+    // directly.
+    //
+    // Two arms vary ONLY the secret: same ciphertext, nonce, AAD and epoch;
+    // S0 vs S1 is the sole difference (Watson's constraint ii). The S1 arm
+    // MUST succeed (constraint i) — it is the passing control that turns the
+    // S0 failure into a measurement rather than a broken-harness artifact.
+    //
+    // Mutation: drop `material.extend_from_slice(secret)` from
+    // `GroupInfo::derive_message_key` (`src/groups/mod.rs:743`). The derived
+    // key then no longer depends on the secret, key_s0 == key_s1, S0 opens the
+    // ciphertext, and the `is_err()` assertion fails (gate red).
+    #[test]
+    fn f1_item4b_retained_secret_does_not_open_new_epoch_content() -> Result<()> {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use rand::RngCore;
+
+        // Real producer: `rotate_shared_secret` is the sole production secret
+        // source (the symbol gate 7a pins). S0 is the pre-rotation secret the
+        // removed member retains; S1 is what the new epoch is sealed under.
+        let creator = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "f1 item4b key material".to_string(),
+            String::new(),
+            creator,
+            "f1-item4b-local".to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        group.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "f1-item4b-stable".to_string(),
+            hex::encode(creator.as_bytes()),
+            group.created_at,
+            String::new(),
+        ));
+        group.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        let epoch_before: u64 = 7;
+        group.secret_epoch = epoch_before;
+        let s0: Vec<u8> = vec![9; 32]; // retained by the removed member
+        group.shared_secret = Some(s0.clone());
+        group.recompute_state_hash();
+
+        // Real rotation: producer returns S1 and advances the epoch by one.
+        let (s1, epoch_after) = group.rotate_shared_secret();
+        assert_eq!(
+            epoch_after,
+            epoch_before + 1,
+            "rotation advances epoch by one"
+        );
+        assert_eq!(s1.len(), 32, "rotated secret is 32 bytes");
+
+        let group_id = group.stable_group_id().to_string();
+        let plaintext = b"item-4b new-epoch plaintext";
+
+        // Produce ONE real envelope at the new epoch under S1, using the exact
+        // primitives and AAD the production encryptor uses.
+        let key_s1 = x0x::groups::GroupInfo::derive_message_key(&s1, epoch_after, &group_id);
+        let cipher_s1 = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key_s1)
+            .expect("32-byte key always initializes ChaCha20Poly1305");
+        let aad = format!("x0x.group.secure|{}|{}", group_id, epoch_after);
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher_s1
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .expect("encrypt under S1 must succeed");
+
+        // S0 arm — the retained secret must NOT open new-epoch content. Same
+        // ciphertext, nonce, AAD and epoch as the S1 arm; the secret is the
+        // only difference.
+        let key_s0 = x0x::groups::GroupInfo::derive_message_key(&s0, epoch_after, &group_id);
+        let cipher_s0 = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key_s0)
+            .expect("32-byte key always initializes ChaCha20Poly1305");
+        let open_s0 = cipher_s0.decrypt(
+            nonce,
+            Payload {
+                msg: &ciphertext,
+                aad: aad.as_bytes(),
+            },
+        );
+        assert!(
+            open_s0.is_err(),
+            "S0 (retained pre-rotation secret) must NOT decrypt new-epoch content; \
+             if this passes, derive_message_key no longer depends on the secret"
+        );
+
+        // S1 arm — passing control. The same envelope opens cleanly under S1,
+        // proving the envelope is well-formed and the S0 failure is
+        // attributable to the key alone.
+        let open_s1 = cipher_s1
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .expect("S1 (post-rotation secret) must decrypt new-epoch content");
+        assert_eq!(
+            open_s1.as_slice(),
+            plaintext,
+            "S1 must recover the exact plaintext"
+        );
+
+        Ok(())
+    }
     fn treekem_metadata_group_info(
         creator: AgentId,
         group_id: &str,
