@@ -15,14 +15,16 @@ therefore carries its own evidence rather than referring to it for load-bearing 
 
 **Two coordinate systems.** Code that F1 itself introduced does not exist at the baseline
 and cannot be cited there, so every such citation is stamped **at `56d0c4b`** in place —
-the F1 implementation commit `56d0c4bc61fbb649042aad8ea42d25d8f0c85c39` on `glm/f1-fix`,
-which changes exactly one file, `src/server/routes/named_groups.rs` (+231/-40). **An
+the F1 implementation commit `56d0c4bc61fbb649042aad8ea42d25d8f0c85c39` on `glm/f1-fix`.
+That commit is +11/-5; the whole range `e3013710d7..56d0c4b` is +231/-40. **Both touch
+exactly one file, `src/server/routes/named_groups.rs`** — and it is the *range*, not the
+commit alone, that licenses the carve-out below. **An
 unstamped citation is at the baseline, and a stamp never carries from one citation to the
 next — adjacency is not a scope.** An enumeration may instead **declare** a single resolving
 commit for all of its rows, in words, immediately before them; that declaration governs
 exactly those rows and nothing else. Anything covered by neither an in-place stamp nor such a
 declaration is at the baseline, and no exception is to be inferred from a neighbouring
-citation. Because that commit touches no other file, cites
+citation. Because nothing outside `named_groups.rs` changes anywhere in that range, cites
 into `src/groups/` resolve identically at either. The +231 lines shift everything below
 them, so a `named_groups.rs` number read during implementation review is not the same
 number at the baseline and must be translated rather than carried across.
@@ -318,8 +320,8 @@ claim of this shape must be run structurally, not derived from a text search.**
   that group until they publish one.
 - **The clear predicate and the delivery predicate are not the same predicate, and this
   ADR does not reconcile them.** The receiver clears on an epoch comparison alone —
-  `if old_epoch < secret_epoch { next.shared_secret = None }` (`:5052-5054` **at
-  `56d0c4b`**, in the arm at `:5048-5055`), which does not consult the receiving node's
+  `if old_epoch < secret_epoch { next.shared_secret = None }` (**both of the next two are at
+  `56d0c4b`**: `:5052-5054`, in the arm at `:5048-5055`), which does not consult the receiving node's
   own membership state. The sender selects envelope recipients by roster state:
   `active_members()` minus the actor (`:8602-8606` **at `56d0c4b`**), and `active_members()`
   admits only `GroupMemberState::Active` (`src/groups/mod.rs:1080-1082`,
@@ -457,7 +459,7 @@ gain gates and if that runner default is ever configured away.
 
 **Break disclosure — required of every gate in this section.** A gate is evidence only
 against the ways of breaking that someone named. Mutation-redness does not establish that a
-gate observes its property: the §3 gates are mutation-red on the `:5908` conjunct and were
+gate observes its property: the §3 gates are mutation-red on the `:5832` conjunct and were
 still blind to the survivor being removed alongside the victim, because that break was never
 on anyone's list. So each gate must be accompanied by a list of the breaks considered, and
 for each either **the mutation that turns the gate red, an assertion or precondition in the
