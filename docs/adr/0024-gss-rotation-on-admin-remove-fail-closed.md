@@ -41,19 +41,26 @@ Three properties of the surrounding code shape the fix:
    `security_binding`, withdrawn). A member who never receives the new secret keeps a
    matching `state_hash` forever while decrypting nothing. Any convergence-based
    assertion passes on this bug.
-3. **A survivor without a roster KEM key can still hold the secret.** A non-TreeKEM invite
-   stub reaches `shared_secret: Some(..)` with an active roster whose
+3. **Nothing proves that a survivor without a roster KEM key never held the secret.** A
+   non-TreeKEM invite stub reaches `shared_secret: Some(..)` with an active roster whose
    `kem_public_key_b64` is `None`: `GroupInfo::with_policy` generates a secret for every
    `MlsEncrypted` group (`src/groups/mod.rs:346-354`, installed by field shorthand at
    `:390`); `invite_join_group_info` (`:7632-7638`) clears it only for TreeKEM
    (`:7656-7658`); and the invite snapshot strips every roster ML-KEM key
-   (`src/server/routes/identity.rs:382`, copied at `:7671-7672`). So "no KEM key" does not
-   imply "never held the secret", and there is no positive enrollment invariant that would
-   make it imply that.
+   (`src/server/routes/identity.rs:382`, copied at `:7671-7672`). **Stated at exactly the
+   strength the evidence carries:** that path proves `shared_secret: Some(..)` and
+   `kem_public_key_b64: None` coexist on a reachable state — it does *not* prove that
+   particular secret is the live group secret, because `with_policy` generates it locally
+   and whether it is ever the authority's is an open question (see the final section). What
+   makes the decision is the negative: **no positive enrollment invariant proves a keyless
+   survivor never held the live secret**, and fail-closed is the only safe reading of that
+   gap.
 
 ## Decision Drivers
 
-- A removed member must lose read access at the moment of removal, on both planes.
+- A removed member must be unable to decrypt content published at the rotated epoch, on
+  both planes — the same claim the gate asserts, stated as the goal rather than the looser
+  "loses read access at the moment of removal", which the transport cannot guarantee.
 - Silent partial failure is worse than refusal: a stranded survivor is undetectable
   (driver 2 above), an aborted removal is immediately visible to the caller.
 - The fix must not reproduce ban's ordering, which makes fail-closed impossible.
@@ -194,10 +201,12 @@ requires receiver and `.write()` on one line, so it sees 49 of the 72 in this fi
 | `:7845-7849` | `join_group_via_invite` (`:7712`) |
 | `:12628-12632` | `persist_treekem_and_named_groups_atomic_with_info` (`:12564`) |
 
-**The enumeration is complete, not merely self-consistent.** The 33 production writes live
-in **32** enclosing functions; exactly **14** of those contain no lexical
-`group_membership_lock`; one of the 14 is `#[cfg(test)]`; the remaining **13** are the
-candidate set:
+**The enumeration is complete, not merely self-consistent.** The **33 pre-inline-test-module
+writes** live in **32** enclosing functions; exactly **14** of those contain no lexical
+`group_membership_lock`; one of the 14 is `#[cfg(test)]`; that leaves **13 production
+candidates**. (33 is the pre-`mod tests` count and still includes the `#[cfg(test)]` helper
+subtracted in the table above — the 32 production figure and the 32 enclosing functions are
+different quantities that coincide numerically.)
 
 | fn | decl | write |
 |---|---|---|
@@ -272,9 +281,10 @@ claim of this shape must be run structurally, not derived from a text search.**
 ### Positive
 
 - Removal and ban have the same security outcome on the GSS plane: the removed member
-  loses read access at the moment of removal.
-- No partial rekey is reachable. Either every survivor is resealed or the removal did not
-  happen.
+  **cannot decrypt content published at the rotated epoch**.
+- **No KEM/preflight-induced partial commit is reachable:** either every survivor envelope
+  is buildable or the removal aborts. Scoped deliberately to what the preflight proves —
+  see the delivery limit under Neutral / Operational.
 - Rotation never becomes observable from a failed attempt: the mutation happens on a
   private clone that is dropped.
 - A group can no longer rotate onto an all-zero key through a silent conversion (D5).
@@ -301,10 +311,21 @@ claim of this shape must be run structurally, not derived from a text search.**
   receivers ignore `secret_epoch`. Their behaviour is a gate item, not an assumption.
 - The abort path is a bare `return` inside the block expression opened at `:8458` — no
   transaction, no rollback machinery. An implementation that builds one has misread D2.
+- **The preflight bounds construction, not delivery, and this ADR claims nothing beyond
+  that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
+  publish error and a timeout into `tracing::warn!`; the direct path at `:1834` onward is
+  documented as best-effort. So a crash or a failed publish *after* the commit has been
+  persisted can still leave a survivor without its envelope. That residue is a delivery
+  property of the transport, unchanged by F1 and not addressed here; the gate asserts
+  decryptability against the **published envelopes** (Validation item 4) precisely because
+  end state alone cannot see it.
 
 ## Validation
 
-An F1 runner registered under `just adr-gates`. Item 5 asserts against the **stored**
+An F1 runner registered as **`just adr-gates-f1`**, filtering `test(/^f1_/)` — one recipe,
+not a parallel harness. Named explicitly because the base commit's justfile has **no**
+`adr-gates` recipe at all (`grep -i adr justfile` at `e3013710d7`: no match), so an ADR
+citing that name would point at a command the branch does not add. Item 5 asserts against the **stored**
 `GroupInfo`, never against the discarded clone; item 6 is the load-bearing one, because a
 green all-new soak proves nothing about a mixed fleet.
 
