@@ -873,12 +873,76 @@ fn secure_share_aad(group_id: &str, recipient_hex: &str, secret_epoch: u64) -> V
     aad
 }
 
+/// Failure constructing a `SecureShareDelivered` envelope without side effects.
+///
+/// Carries only the failure class — never key material or ciphertext — so
+/// logging the error cannot leak the group secret. Same conservative posture
+/// as F1 §2a constraint 3 (the `Vec<u8>` → `[u8; 32]` conversion's `Err`
+/// payload *is* the secret), applied to the KEM seal path here.
+#[derive(Debug)]
+enum SecureShareError {
+    /// Recipient KEM public key was not valid base64.
+    InvalidKemKey,
+    /// ML-KEM encapsulation or AEAD seal failed.
+    SealFailed,
+}
+
+/// Build — but do not publish — a `SecureShareDelivered` envelope sealed to the
+/// recipient's ML-KEM-768 public key. Side-effect-free: no metadata publish,
+/// no delivery spawn. This is the preflight primitive for the admin-remove
+/// path (F1 §5): it must validate *every* survivor envelope before
+/// `seal_commit` and abort (fail closed) on the first that cannot build.
+///
+/// `publish_secure_share` delegates here and then publishes, preserving its
+/// fail-open contract for approval/ban. The remove path calls this directly
+/// and fails CLOSED — it never proceeds past a survivor whose envelope cannot
+/// be built (F1 §5a).
+fn build_secure_share_event(
+    group_id: &str,
+    recipient_hex: &str,
+    recipient_kem_public_b64: &str,
+    actor_hex: &str,
+    secret: &[u8; 32],
+    secret_epoch: u64,
+) -> Result<NamedGroupMetadataEvent, SecureShareError> {
+    use base64::Engine as _;
+    let recipient_kem_public = BASE64
+        .decode(recipient_kem_public_b64)
+        .map_err(|_| SecureShareError::InvalidKemKey)?;
+    let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
+    let (kem_ct, aead_nonce, aead_ct) = x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+        &recipient_kem_public,
+        &aad,
+        secret,
+    )
+    .map_err(|_| SecureShareError::SealFailed)?;
+    Ok(NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id: group_id.to_string(),
+        recipient: recipient_hex.to_string(),
+        secret_epoch,
+        kem_ciphertext_b64: BASE64.encode(&kem_ct),
+        aead_nonce_b64: BASE64.encode(aead_nonce),
+        aead_ciphertext_b64: BASE64.encode(&aead_ct),
+        actor: actor_hex.to_string(),
+    })
+}
+
 /// Build and publish a `SecureShareDelivered` envelope sealed to the named
-/// recipient's ML-KEM-768 public key. Used by approval (new member) and
-/// ban-rekey (remaining members). Returns true iff the envelope was sealed
-/// and broadcast. Returns false if the recipient's KEM pubkey is unknown
-/// locally — in that case the caller should log and proceed without the
-/// envelope rather than crashing.
+/// recipient's ML-KEM-768 public key, used by the approval (new member) and
+/// ban-rekey (remaining members) paths.
+///
+/// **Fail-open contract — approval/ban only.** Returns true iff the envelope
+/// was sealed and broadcast; returns false if the recipient's KEM pubkey is
+/// unknown or unusable locally, in which case the caller logs and proceeds
+/// without the envelope rather than crashing. That is the right call for
+/// approval/ban, which have *already* persisted the roster change by the time
+/// they seal and so cannot abort.
+///
+/// The admin-remove path does **not** use this function: it builds every
+/// survivor envelope up front via `build_secure_share_event` and fails CLOSED
+/// (aborting before `seal_commit`) if any cannot be built (F1 §5/§5a). Do not
+/// route remove through here — that would re-introduce the fail-open the F1
+/// design exists to close.
 #[allow(clippy::too_many_arguments)]
 async fn publish_secure_share(
     state: &AppState,
@@ -890,38 +954,29 @@ async fn publish_secure_share(
     secret: &[u8; 32],
     secret_epoch: u64,
 ) -> bool {
-    use base64::Engine as _;
-    let recipient_kem_public = match BASE64.decode(recipient_kem_public_b64) {
-        Ok(b) => b,
-        Err(e) => {
+    let event = match build_secure_share_event(
+        group_id,
+        recipient_hex,
+        recipient_kem_public_b64,
+        actor_hex,
+        secret,
+        secret_epoch,
+    ) {
+        Ok(ev) => ev,
+        Err(SecureShareError::InvalidKemKey) => {
             tracing::warn!(
                 recipient = %LogHexId::agent(&recipient_hex),
-                "publish_secure_share: recipient KEM public key not valid base64: {e}"
+                "publish_secure_share: recipient KEM public key not valid base64"
             );
             return false;
         }
-    };
-    let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
-    let (kem_ct, aead_nonce, aead_ct) =
-        match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
-            &recipient_kem_public,
-            &aad,
-            secret,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(recipient = %LogHexId::agent(&recipient_hex), "KEM seal failed: {e}");
-                return false;
-            }
-        };
-    let event = NamedGroupMetadataEvent::SecureShareDelivered {
-        group_id: group_id.to_string(),
-        recipient: recipient_hex.to_string(),
-        secret_epoch,
-        kem_ciphertext_b64: BASE64.encode(&kem_ct),
-        aead_nonce_b64: BASE64.encode(aead_nonce),
-        aead_ciphertext_b64: BASE64.encode(&aead_ct),
-        actor: actor_hex.to_string(),
+        Err(SecureShareError::SealFailed) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "KEM seal failed for secure-share envelope"
+            );
+            return false;
+        }
     };
     publish_named_group_metadata_event(state, metadata_topic, &event).await;
     spawn_named_group_event_delivery(state, recipient_hex, &event);
