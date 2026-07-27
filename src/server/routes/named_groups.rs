@@ -113,8 +113,9 @@ pub(in crate::server) struct TreeKemCacheMutation {
 }
 
 #[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<Vec<(String, String)>> =
-    StdMutex::new(Vec::new());
+static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
+    Vec<(String, String, Option<String>)>,
+> = StdMutex::new(Vec::new());
 
 #[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
@@ -512,6 +513,18 @@ fn named_group_metadata_event_group_id(event: &NamedGroupMetadataEvent) -> &str 
         | NamedGroupMetadataEvent::GroupMetadataUpdated { group_id, .. }
         | NamedGroupMetadataEvent::MemberJoined { group_id, .. }
         | NamedGroupMetadataEvent::SecureShareDelivered { group_id, .. } => group_id,
+    }
+}
+
+/// Test-only extractor mirroring [`named_group_metadata_event_group_id`]: the
+/// hex agent_id of the intended recipient for `SecureShareDelivered`, `None`
+/// for every other variant. Lets the publish-attempt recorder capture the
+/// published recipient set rather than only a publish count.
+#[cfg(test)]
+fn named_group_metadata_event_recipient(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::SecureShareDelivered { recipient, .. } => Some(recipient),
+        _ => None,
     }
 }
 
@@ -1865,6 +1878,7 @@ async fn publish_named_group_metadata_event(
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
+            named_group_metadata_event_recipient(event).map(str::to_string),
         ));
     }
 
@@ -15025,8 +15039,10 @@ mod tests {
         assert!(
             publish_attempts
                 .iter()
-                .any(|(topic, event_group_id)| topic == &metadata_topic
-                    && event_group_id == &stable_group_id),
+                .any(
+                    |(topic, event_group_id, _recipient)| topic == &metadata_topic
+                        && event_group_id == &stable_group_id
+                ),
             "join handler should attempt to publish the joiner-authored MemberJoined request"
         );
         Ok(())
@@ -16573,6 +16589,177 @@ mod tests {
             "S1 must recover the exact plaintext"
         );
 
+        Ok(())
+    }
+
+    // ── Gate 4c (item 4, published recipient set): the recipient set the
+    // remove handler actually publishes to excludes the removed member and
+    // includes each survivor. This is the only SENDER-side gate in the F1 set
+    // — it drives the real `remove_named_group_member` producer path (the gap
+    // Watson's M5 mutation found: 4a/4b are receiver-side / below-endpoint and
+    // never invoke the handler, so a reseal aimed at the removed member was
+    // invisible to the whole suite).
+    //
+    // The recorder is widened (production change above) to capture the
+    // `SecureShareDelivered.recipient` field it previously discarded — without
+    // that, every survivor envelope shares the same `(topic, group_id)` and
+    // the recorder can only express a publish COUNT, which is the proxy this
+    // round exists to stop.
+    //
+    // Observed lane: the metadata-topic publish at `:8693` only. The direct
+    // (`:8694`) and delayed (`:8695`) delivery in
+    // `spawn_named_group_event_delivery` have no `#[cfg(test)]` hook (they
+    // spawn straight to `agent.send_direct_with_config`) and are named here as
+    // not-observed, not covered.
+    //
+    // Mutation (Watson's M5): at `:8603` change `next.active_members()` to
+    // `next.members_v2.values().filter(|m| !m.is_banned())`. The removed
+    // member (state Removed, not Banned) re-enters the survivor set; with a
+    // roster KEM key the envelope builds and publishes to them; the recorder
+    // captures their hex as a recipient and the "victim not in recipients"
+    // assertion fails (gate red). Reverted before the SHA.
+    #[tokio::test]
+    async fn f1_item4c_remove_handler_publishes_survivors_not_the_removed_member() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_id = state.agent.agent_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Distinct agents. Both get real ML-KEM-768 public keys: the survivor
+        // so its envelope builds, and the victim so that under the M5 mutation
+        // its re-inclusion reaches the publish rather than the `:8613`
+        // missing-KEM abort (which would mask the property under test).
+        let survivor_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let survivor_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let victim_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+
+        let group_id = "f1-item4c-local".to_string();
+        let stable_group_id = "f1-item4c-stable".to_string();
+
+        // Local daemon is admin/creator/actor: the handler signs the commit
+        // with `state.agent.identity().agent_keypair()` and authorizes via
+        // `require_admin_or_above(info, &local_agent_hex)`.
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item4c recipient set".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            local_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member_with_kem(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(survivor_kem_b64),
+        );
+        info.add_member_with_kem(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(victim_kem_b64),
+        );
+        info.recompute_state_hash();
+        let metadata_topic = info.metadata_topic.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive precondition: GSS plane, so the TreeKem dispatch at `:8539`
+        // cannot fire and no recipient set is ever built for a different plane.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4c group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item4c must exercise the GSS remove path, not the TreeKem dispatch"
+            );
+        }
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            remove_named_group_member(
+                State(Arc::clone(&state)),
+                Path((group_id.clone(), victim_hex.clone())),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin remove of a member must succeed, body: {body}"
+        );
+
+        // Post-state: victim Removed, survivor still Active (positive).
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4c group retained");
+            assert!(
+                !stored.has_active_member(&victim_hex),
+                "victim must be Removed after admin remove"
+            );
+            assert!(
+                stored.has_active_member(&survivor_hex),
+                "survivor must remain Active after admin remove"
+            );
+        }
+
+        // Core 4c observation: the published recipient set. The recorder now
+        // carries `SecureShareDelivered.recipient` alongside topic+group, so
+        // the assertion is on the recipient set, not a publish count.
+        let published_recipients: Vec<String> = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .iter()
+            .filter_map(|(topic, gid, recipient)| {
+                (topic == &metadata_topic && gid == &stable_group_id)
+                    .then(|| recipient.clone())
+                    .flatten()
+            })
+            .collect();
+
+        assert!(
+            !published_recipients.is_empty(),
+            "the remove handler must publish at least one survivor envelope"
+        );
+        assert!(
+            !published_recipients.contains(&victim_hex),
+            "the removed member must NOT appear in the published recipient set; \
+             got {published_recipients:?}"
+        );
+        assert!(
+            published_recipients.contains(&survivor_hex),
+            "the survivor must appear in the published recipient set; \
+             got {published_recipients:?}"
+        );
         Ok(())
     }
     fn treekem_metadata_group_info(
