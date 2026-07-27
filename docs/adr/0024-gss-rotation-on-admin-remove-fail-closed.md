@@ -135,7 +135,9 @@ ever populates it. The apply mutator gains ban's `else if` (`:5247-5254`) at `:4
 epoch and `security_binding` are written **unconditionally** and only the secret clear is
 gated on strict `<`. Conditioning the `security_binding` write on local secret state would
 make two receivers in different local states compute different `state_hash` values for the
-same commit — it is a hashed input (`state_commit.rs:219-238`). A step-0 guard rejecting
+same commit — it is a hashed input: the parameter is `state_commit.rs:226` and its
+absorption into the hash buffer is `:237` (`:238` absorbs `withdrawn`, a different input).
+A step-0 guard rejecting
 `self_leave_auth && secret_epoch.is_some()` sits outside the plane split, as the backstop
 against a crafted `MemberSelf` commit, which validates by construction
 (`state_commit.rs:737`).
@@ -315,10 +317,12 @@ claim of this shape must be run structurally, not derived from a text search.**
   that.** `publish_named_group_metadata_event` (`:1797-1833`) returns `()` and folds both a
   publish error and a timeout into `tracing::warn!`; the direct path's own doc comment
   (`:1835-1837`) calls its delivery best-effort. So a crash or a failed publish *after* the
-  commit has been persisted can still leave a survivor without its envelope. That residue is a delivery
-  property of the transport, unchanged by F1 and not addressed here; the gate asserts
-  decryptability against the **published envelopes** (Validation item 4) precisely because
-  end state alone cannot see it.
+  commit has been persisted can still leave a survivor without its envelope. That residue is
+  a delivery property of the transport, unchanged by F1 and not addressed here. **No
+  validation item reaches it:** Validation item 2 proves survivor decryptability from the
+  envelope; neither it nor the publish-attempt oracle proves delivery. Item 4 asserts the
+  removed member's non-decryption against the published envelopes; items 2 and 4 test the
+  cryptographic behaviour of event objects, not delivery.
 
 ## Validation
 
