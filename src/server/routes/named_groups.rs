@@ -637,6 +637,12 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
+        /// For MlsEncrypted groups, the new GSS secret epoch committed into
+        /// the signed state hash (F1 / ADR-0010). Receivers update the
+        /// security binding before `finalize_applied_commit`, mirroring
+        /// `MemberBanned`.
+        #[serde(default)]
+        secret_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -8516,6 +8522,7 @@ pub(in crate::server) async fn remove_named_group_member(
             agent_id: agent_id_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch)
@@ -9163,6 +9170,7 @@ async fn leave_treekem_group(
         agent_id: local_agent_hex,
         treekem_commit_b64: None,
         treekem_epoch: None,
+        secret_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -9325,6 +9333,7 @@ async fn remove_treekem_named_group_member(
         agent_id: agent_id_hex.clone(),
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
         treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -9705,6 +9714,7 @@ pub(in crate::server) async fn leave_group(
         agent_id: local_agent_hex.clone(),
         treekem_commit_b64: None,
         treekem_epoch: None,
+        secret_epoch: None,
         commit: Some(commit),
     };
     drop(groups);
@@ -15368,6 +15378,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(commit),
         };
 
@@ -17460,6 +17471,7 @@ mod tests {
             agent_id: "22".repeat(32),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&event));
@@ -17575,6 +17587,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &member_hex)),
         };
 
@@ -17596,6 +17609,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
         };
         assert!(!authorized_treekem_membership_event_for_queue(
@@ -17611,6 +17625,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(2),
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 5, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
