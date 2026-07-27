@@ -416,10 +416,35 @@ green all-new soak proves nothing about a mixed fleet.
    the persisted-revision assertion even though its final state looks tidy.
 6. Mixed-version negative control: an old receiver must reproduce the permanent wedge on
    pre-fix code, and the rollout guard must prevent it.
-7. Covers D5 directly — a rotated secret of the wrong length aborts with zero state change
-   and the group never publishes an envelope sealed to an all-zero key. Unreachable
-   through the public API at this commit, so it is a unit test on the conversion boundary;
-   the test name must say so rather than dress it up as a reachable path.
+7. Covers D5, which is unchanged, split by **evidence class**. The two halves are not
+   interchangeable and 7a does not subsume 7b: 7a pins the invariant §2a defends, 7b is the
+   defence itself and no gate observes it.
+
+   **7a — gate-enforced (producer invariant). Citations in this sub-item are
+   `src/groups/mod.rs` at the baseline.** `GroupInfo::rotate_shared_secret` (`:429-437`) is
+   the sole production producer of the value §2a converts, and allocates it at `:431`. The
+   gate calls that method on a real `GroupInfo` and asserts three linked producer
+   properties: the returned secret is 32 bytes; `secret_epoch` advanced by exactly one
+   (`:433`); the stored `shared_secret` is the same bytes as the returned one (`:434`). The
+   pinning mutation is `vec![0u8; 32]` → `vec![0u8; 31]` at `:431`, and it turns the
+   **length** assertion red and only that one — the epoch and stored-identity assertions
+   survive it, so they are carried by this gate but not pinned by this mutation. A separate
+   broken-expectation control proves the runner can report red.
+
+   **7b — source-reviewed defence, not a gate. All citations in this sub-item are at
+   `56d0c4b`.** If the 7a invariant ever fails despite the gate, the §2a conversion
+   (`:8590-8598`) aborts: its `return api_error(...)` statement (`:8593-8596`) precedes
+   `seal_commit` (`:8640`), the map insert (`:8651`), persistence (`:8667`) and publication
+   (`:8688`). Between the `named_groups.write()` acquisition (`:8548`) and that return, the
+   only mutations are to the private clone `next` (`:8567`), which is dropped on return, so
+   there is no stored, persisted or published state for the abort to change. The `Err(v)`
+   arm (`:8592`) binds the secret-bearing `Vec` solely to read `v.len()` (`:8595`).
+   **No gate observes the abort, the zero state change, or the absence of an all-zero-key
+   envelope** — the branch has no production producer that can reach it, and the only ways
+   to drive it are a `#[cfg(test)]` hook on `GroupInfo`, a test parameter on
+   `rotate_shared_secret`, or moving rotation out of the handler. D5 does not justify that
+   production surface. If a future change gives the wrong-length value a real producer, 7b
+   becomes a required gate.
 
 **Review triggers.** Re-run the structural audit above, and re-open D10, if any of these
 change: a new `named_groups.write()` writer is added, the membership-lock boundary moves,
