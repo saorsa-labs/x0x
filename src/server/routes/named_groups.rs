@@ -16762,6 +16762,204 @@ mod tests {
         );
         Ok(())
     }
+    // ── Gate item 2 (survivor decryptability): a survivor — a member still
+    // Active after an admin remove of a peer — CAN decrypt content the system
+    // PUBLISHED at the new epoch. The plaintext is published through the
+    // production `secure_group_encrypt` endpoint and read back through the
+    // production `secure_group_decrypt` endpoint — a true GSS-plane round-trip
+    // (Watson [12] §3 / Dario [13] §2), not an in-test envelope, so encrypt-
+    // side drift (AAD, key sourcing) cannot stay green here. The positive
+    // complement to item 4: item 4 proves the removed member cannot decrypt;
+    // item 2 proves the survivors still can.
+    //
+    // Interval (ADR 0024 break-disclosure rule): `secure_group_decrypt` entry
+    // (`:12283`) → target operation `cipher.decrypt` (`:12367`).
+    //
+    // Break list — every control-flow exit / alternate dispatch in the
+    // interval, each with its evidence:
+    //   :12291 group-not-found     — refused (installed group)
+    //   :12294 withdrawn           — refused (non-withdrawn group)
+    //   :12298 not-a-member        — MUTATION B + positive membership assert
+    //   :12306 TreeKem dispatch    — refused (assert secure_plane == Gss)
+    //   :12315 no shared secret    — refused (secret installed)
+    //   :12325 epoch mismatch      — refused (matching epoch sent)
+    //   :12340 bad base64 ct       — refused (valid base64)
+    //   :12346 bad base64 nonce    — refused (valid base64)
+    //   :12350 nonce wrong length  — refused (12-byte nonce)
+    //   :12362 cipher init failed  — refused (derive_message_key returns 32B)
+    //   :12394 cipher Err          — MUTATION A (stored-secret byte flip)
+    //   :12382 post-decrypt terminality recheck (→ :10127, hook :10134) —
+    //     FALSE-NEGATIVE hazard: can suppress a success into a 409 conflict,
+    //     cannot manufacture plaintext. Refused by the success-shape
+    //     precondition (status 200 + payload present + no conflict). NOT a
+    //     blind spot. `force_post_crypto_withdrawn_ids` is NOT installed.
+    //
+    // Mutation A: between the production encrypt and decrypt calls, flip one
+    // byte in the stored `shared_secret`. The ciphertext was sealed under the
+    // original; decrypt derives from the flipped secret → wrong key → `:12394`
+    // "decryption failed" → the success assertion fails. Shows the gate
+    // observes the cipher path (`:12394`), distinct from the `:12298` roster
+    // guard exercised by mutation B.
+    //
+    // Mutation B: `remove_member(&survivor)` after setup → survivor Removed →
+    // the `:12298` roster guard fires → "not a member" → success assertion
+    // fails. Shows the gate observes active membership at `:12298`.
+    //
+    // Epoch-binding pin: `derive_message_key` mixes the epoch into the key
+    // (`groups/mod.rs:744`); Watson's M4 showed nothing in the F1 set observes
+    // it. A direct pure-fn pair asserts different epochs yield different keys,
+    // complementing 4b (which pins the secret binding).
+    #[tokio::test]
+    async fn f1_item2_survivor_decrypts_new_epoch_content() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        // Admin/creator is a distinct agent; the local daemon is the survivor.
+        let admin_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+
+        let group_id = "f1-item2-local".to_string();
+        let stable_group_id = "f1-item2-stable".to_string();
+        let epoch: u64 = 7;
+        let secret: Vec<u8> = vec![0x42; 32];
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item2 survivor decrypt".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(secret.clone());
+        info.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive preconditions: GSS plane (explicit, not inherited) and the
+        // survivor really is an Active member.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item2 group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item2 must exercise the GSS decrypt path, not the TreeKem dispatch"
+            );
+            assert!(
+                stored.has_active_member(&local_hex),
+                "survivor (local daemon) must be Active before decrypt"
+            );
+        }
+
+        // PUBLISH the plaintext through the production `secure_group_encrypt`
+        // endpoint — content the system actually produced, not minted in-test.
+        // For this group the GSS plane is active, so encrypt derives the key
+        // from `info.secure_message_key()` (the stored secret at `epoch`),
+        // generates a fresh per-message nonce, and seals with the production
+        // AAD. The returned `ciphertext_b64` / `nonce_b64` are what a survivor
+        // would actually receive.
+        let plaintext = b"item2 survivor new-epoch plaintext";
+        let (enc_status, enc_body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(plaintext),
+            }),
+        )
+        .await;
+        assert_eq!(
+            enc_status,
+            StatusCode::OK,
+            "production encrypt must succeed for an active survivor; body: {enc_body:?}"
+        );
+        assert_eq!(
+            enc_body.0["ok"].as_bool(),
+            Some(true),
+            "encrypt must report ok, body: {enc_body:?}"
+        );
+        let ciphertext_b64 = enc_body.0["ciphertext_b64"]
+            .as_str()
+            .expect("encrypt response carries ciphertext_b64")
+            .to_string();
+        let nonce_b64 = enc_body.0["nonce_b64"]
+            .as_str()
+            .expect("encrypt response carries nonce_b64")
+            .to_string();
+        assert_eq!(
+            enc_body.0["secret_epoch"].as_u64(),
+            Some(epoch),
+            "encrypt must bind the group's current secret_epoch"
+        );
+
+        // Production endpoint decrypt, as the survivor, of the published
+        // ciphertext (the exact bytes the system just produced above).
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64,
+                nonce_b64,
+                secret_epoch: epoch,
+            }),
+        )
+        .await;
+
+        // Success-shape precondition (refuses the eleventh false-negative
+        // path): status 200 + payload present + ok, NOT a 409 conflict.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "survivor must decrypt new-epoch content"
+        );
+        assert_eq!(
+            body.0["ok"].as_bool(),
+            Some(true),
+            "decrypt must report ok, body: {body:?}"
+        );
+        let payload_b64 = body.0["payload_b64"]
+            .as_str()
+            .expect("success response carries payload_b64");
+        assert_eq!(
+            BASE64.decode(payload_b64).expect("payload is base64"),
+            plaintext,
+            "decrypted plaintext must match"
+        );
+        assert_eq!(
+            body.0["secret_epoch"].as_u64(),
+            Some(epoch),
+            "echoed epoch must match the ciphertext epoch"
+        );
+
+        // Epoch-binding pin in the derivation (`groups/mod.rs:744`). Nothing
+        // else in the F1 set observes this; 4b pins the secret binding.
+        let key_this = x0x::groups::GroupInfo::derive_message_key(&secret, epoch, &stable_group_id);
+        let key_next =
+            x0x::groups::GroupInfo::derive_message_key(&secret, epoch + 1, &stable_group_id);
+        assert_ne!(
+            key_this, key_next,
+            "derive_message_key must bind the epoch; identical keys across epochs would let a \
+             stale-epoch holder derive the new-epoch key"
+        );
+
+        Ok(())
+    }
+
     fn treekem_metadata_group_info(
         creator: AgentId,
         group_id: &str,
