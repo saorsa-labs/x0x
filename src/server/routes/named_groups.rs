@@ -16376,14 +16376,14 @@ mod tests {
     }
 
     // ── Gate 4a (item 4, containment): a removed caller is refused at the
-    // roster guard, NOT at the crypto. The observation is the `:12298`
+    // roster guard, NOT at the crypto. The observation is the `:12312`
     // `forbidden("not a member")` return, which precedes the shared_secret
-    // read (`:12314`) and the cipher (`:12367`). This gate pins containment
+    // read (`:12328`) and the cipher (`:12381`). This gate pins containment
     // only and says nothing about key material — item 4's key-material
     // property is gate 4b, observed below the endpoint.
     //
-    // Both the roster guard (`:12298`) and a downstream decrypt failure
-    // (`:12394`) return 403, so status alone cannot distinguish them. The
+    // Both the roster guard (`:12312`) and a downstream decrypt failure
+    // (`:12408`) return 403, so status alone cannot distinguish them. The
     // load-bearing observation is the body message "not a member": only the
     // roster guard produces it.
     //
@@ -16419,7 +16419,7 @@ mod tests {
         info.secret_epoch = epoch;
         info.shared_secret = Some(vec![9; 32]);
         // Caller is added then removed: state == Removed (neither Active nor
-        // Banned), so the `:12296-12298` roster guard fires.
+        // Banned), so the `:12310-12312` roster guard fires.
         info.add_member(
             local_hex.clone(),
             x0x::groups::GroupRole::Member,
@@ -16450,7 +16450,7 @@ mod tests {
 
         // Positive precondition: the group really is GSS-plane (explicit, not
         // fixture-inherited), so the refusal is the roster guard and not the
-        // TreeKem dispatch at `:12306`.
+        // TreeKem dispatch at `:12320`.
         {
             let groups = state.named_groups.read().await;
             let stored = groups.get(&group_id).expect("item4a group must be present");
@@ -16469,8 +16469,8 @@ mod tests {
         let err_msg = body.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
         assert!(
             err_msg.contains("not a member"),
-            "refusal must come from the roster guard at :12298 (body error = {err_msg:?}); \
-             a decrypt-failure 403 at :12394 would prove the guard did NOT fire"
+            "refusal must come from the roster guard at :12312 (body error = {err_msg:?}); \
+             a decrypt-failure 403 at :12408 would prove the guard did NOT fire"
         );
         Ok(())
     }
@@ -16606,18 +16606,42 @@ mod tests {
     // the recorder can only express a publish COUNT, which is the proxy this
     // round exists to stop.
     //
-    // Observed lane: the metadata-topic publish at `:8693` only. The direct
-    // (`:8694`) and delayed (`:8695`) delivery in
+    // Interval (ADR 0024 break-disclosure rule): `remove_named_group_member`
+    // entry (`:8516`) → target operation publish (`:8707`). Resolves at
+    // `9d11d69` (production unchanged from `f52746c`; this commit is
+    // comment-only); re-resolve after any rebase (ADR 0024 `ca85a1d`).
+    //
+    // Break list — every control-flow exit / alternate dispatch in the
+    // interval, each with its evidence:
+    //   :8523 parse-id / :8538 self-removal / :8563 group-not-found /
+    //   :8567 non-admin / :8570 withdrawn / :8573 member-not-found /
+    //   :8577 last-admin — refused by preconditions.
+    //   :8553 TreeKem dispatch — refused (assert secure_plane == Gss).
+    //   :8607 §2a wrong-length abort — UNREACHABLE (producer hardcodes 32B;
+    //     7b). No label: if it fired the handler 500s before any publish and
+    //     this gate goes RED, so it cannot leave the gate green (direction
+    //     test, `e0fc016`/`8053a3d`).
+    //   :8627 missing-KEM / :8644 envelope seal-fail — item 5's property,
+    //     scheduled, not observed.
+    //   :8657 seal_commit — not observed, no owning Validation item. Zero
+    //     state change: `next` is a clone (`:8581`) and nothing publishes,
+    //     saves or inserts between the write-lock (`:8562`) and `insert` (`:8665`);
+    //     both domain Err arms are pre-empted upstream (last-admin `:8577`,
+    //     withdrawn `:8570`), leaving only an ML-DSA signing fault
+    //     (`state_commit.rs:448`).
+    //
+    // Observed lane: the metadata-topic publish at `:8707` only. The direct
+    // (`:8708`) and delayed (`:8709`) delivery in
     // `spawn_named_group_event_delivery` have no `#[cfg(test)]` hook (they
     // spawn straight to `agent.send_direct_with_config`) and are named here as
     // not-observed, not covered.
     //
-    // Mutation (Watson's M5): at `:8603` change `next.active_members()` to
+    // Mutation (Watson's M5): at `:8617` change `next.active_members()` to
     // `next.members_v2.values().filter(|m| !m.is_banned())`. The removed
     // member (state Removed, not Banned) re-enters the survivor set; with a
     // roster KEM key the envelope builds and publishes to them; the recorder
     // captures their hex as a recipient and the "victim not in recipients"
-    // assertion fails (gate red). Reverted before the SHA.
+    // assertion fails (gate red). REQUIRED red arm of the set. Reverted.
     #[tokio::test]
     async fn f1_item4c_remove_handler_publishes_survivors_not_the_removed_member() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
@@ -16626,7 +16650,7 @@ mod tests {
 
         // Distinct agents. Both get real ML-KEM-768 public keys: the survivor
         // so its envelope builds, and the victim so that under the M5 mutation
-        // its re-inclusion reaches the publish rather than the `:8613`
+        // its re-inclusion reaches the publish rather than the `:8627`
         // missing-KEM abort (which would mask the property under test).
         let survivor_hex = hex::encode(
             crate::identity::AgentKeypair::generate()?
@@ -16685,7 +16709,7 @@ mod tests {
             .await
             .insert(group_id.clone(), info);
 
-        // Positive precondition: GSS plane, so the TreeKem dispatch at `:8539`
+        // Positive precondition: GSS plane, so the TreeKem dispatch at `:8553`
         // cannot fire and no recipient set is ever built for a different plane.
         {
             let groups = state.named_groups.read().await;
@@ -16773,22 +16797,24 @@ mod tests {
     // item 2 proves the survivors still can.
     //
     // Interval (ADR 0024 break-disclosure rule): `secure_group_decrypt` entry
-    // (`:12283`) → target operation `cipher.decrypt` (`:12367`).
+    // (`:12297`) → target operation `cipher.decrypt` (`:12381`). Resolves at
+    // `9d11d69` (production unchanged from `f52746c`; this commit is
+    // comment-only); re-resolve after any rebase (ADR 0024 `ca85a1d`).
     //
     // Break list — every control-flow exit / alternate dispatch in the
     // interval, each with its evidence:
-    //   :12291 group-not-found     — refused (installed group)
-    //   :12294 withdrawn           — refused (non-withdrawn group)
-    //   :12298 not-a-member        — MUTATION B + positive membership assert
-    //   :12306 TreeKem dispatch    — refused (assert secure_plane == Gss)
-    //   :12315 no shared secret    — refused (secret installed)
-    //   :12325 epoch mismatch      — refused (matching epoch sent)
-    //   :12340 bad base64 ct       — refused (valid base64)
-    //   :12346 bad base64 nonce    — refused (valid base64)
-    //   :12350 nonce wrong length  — refused (12-byte nonce)
-    //   :12362 cipher init failed  — refused (derive_message_key returns 32B)
-    //   :12394 cipher Err          — MUTATION A (stored-secret byte flip)
-    //   :12382 post-decrypt terminality recheck (→ :10127, hook :10134) —
+    //   :12305 group-not-found     — refused (installed group)
+    //   :12308 withdrawn           — refused (non-withdrawn group)
+    //   :12312 not-a-member        — MUTATION B + positive membership assert
+    //   :12320 TreeKem dispatch    — refused (assert secure_plane == Gss)
+    //   :12328 no shared secret    — refused (secret installed)
+    //   :12339 epoch mismatch      — refused (matching epoch sent)
+    //   :12354 bad base64 ct       — refused (valid base64)
+    //   :12360 bad base64 nonce    — refused (valid base64)
+    //   :12364 nonce wrong length  — refused (12-byte nonce)
+    //   :12376 cipher init failed  — refused (derive_message_key returns 32B)
+    //   :12408 cipher Err          — MUTATION A (stored-secret byte flip)
+    //   :12396 post-decrypt terminality recheck (→ :10141, hook :10148) —
     //     FALSE-NEGATIVE hazard: can suppress a success into a 409 conflict,
     //     cannot manufacture plaintext. Refused by the success-shape
     //     precondition (status 200 + payload present + no conflict). NOT a
@@ -16796,14 +16822,25 @@ mod tests {
     //
     // Mutation A: between the production encrypt and decrypt calls, flip one
     // byte in the stored `shared_secret`. The ciphertext was sealed under the
-    // original; decrypt derives from the flipped secret → wrong key → `:12394`
+    // original; decrypt derives from the flipped secret → wrong key → `:12408`
     // "decryption failed" → the success assertion fails. Shows the gate
-    // observes the cipher path (`:12394`), distinct from the `:12298` roster
+    // observes the cipher path (`:12408`), distinct from the `:12312` roster
     // guard exercised by mutation B.
     //
     // Mutation B: `remove_member(&survivor)` after setup → survivor Removed →
-    // the `:12298` roster guard fires → "not a member" → success assertion
-    // fails. Shows the gate observes active membership at `:12298`.
+    // the `:12312` roster guard fires → "not a member" → success assertion
+    // fails. Shows the gate observes active membership at `:12312`.
+    //
+    // Mutation SYM/ASYM (round-trip teeth — Watson [12] §2 / Dario [13] §1):
+    //   ASYM — change the AAD on the ENCRYPT side only (`:12251`) → this gate
+    //     RED, sole failure (encrypt and decrypt no longer agree). REQUIRED
+    //     red arm of the mutation set (`8053a3d`).
+    //   SYM  — change the AAD on BOTH production sides (`:12251` + `:12380`)
+    //     → all green. ACCEPTED BLIND SPOT (direction test, `8053a3d`):
+    //     symmetric drift is invisible because the gate observes the two
+    //     endpoints agreeing with each other, not with any prior format — a
+    //     compatibility property, not a decryptability one. Nothing in the F1
+    //     set observes it; named, not fixed.
     //
     // Epoch-binding pin: `derive_message_key` mixes the epoch into the key
     // (`groups/mod.rs:744`); Watson's M4 showed nothing in the F1 set observes
