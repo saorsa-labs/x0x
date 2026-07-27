@@ -11996,11 +11996,17 @@ pub(in crate::server) struct SecureDecryptRequest {
 /// TreeKEM-specific transport shape (direct invites/adds and ban/unban).
 ///
 /// Request-access joins and creator removals use real TreeKEM Commit/Welcome or
-/// Commit transport. The remaining guarded handlers still run the legacy GSS
-/// rekey path (`rotate_shared_secret` + per-recipient reseal), which would
-/// silently re-introduce a shared secret and relabel the plane. Refuse those
-/// endpoints loudly until they provide KeyPackage/Welcome or removal Commit
-/// inputs.
+/// Commit transport. The remaining guarded handlers would, if they fell back
+/// to the legacy GSS rekey path (`rotate_shared_secret` + per-recipient
+/// reseal), silently re-introduce a shared secret and relabel the plane — so
+/// this guard refuses them loudly until they provide KeyPackage/Welcome or
+/// removal Commit inputs.
+///
+/// The GSS admin-remove path is a *separate*, intentional caller of
+/// `rotate_shared_secret` + per-recipient reseal (F1 / ADR-0010): it runs only
+/// for GSS-plane groups (this guard returns `None` for them) and fails closed
+/// via `build_secure_share_event`. It is not one of the "remaining guarded
+/// handlers" above and is not refused here.
 fn treekem_membership_unsupported(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
