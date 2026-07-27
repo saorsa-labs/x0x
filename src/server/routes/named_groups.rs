@@ -4939,6 +4939,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             agent_id,
             treekem_commit_b64,
             treekem_epoch,
+            secret_epoch,
             commit,
             ..
         } => {
@@ -4950,6 +4951,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
             if !admin_remove_auth && !self_leave_auth {
+                return false;
+            }
+            // F1 §4 Step 0: a self-leave commit carrying a GSS secret_epoch is
+            // a crafted MemberSelf event — self-removal is rejected at the
+            // sender (§1) and a self-leave never rotates. Reject before the
+            // plane split so it cannot reach the GSS rekey branch.
+            if self_leave_auth && secret_epoch.is_some() {
                 return false;
             }
             let action_kind = if self_leave_auth {
@@ -4982,6 +4990,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 if let Some((_, epoch)) = treekem_payload.as_ref() {
                     next.secret_epoch = *epoch;
                     next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                } else if let Some(secret_epoch) = secret_epoch {
+                    let old_epoch = next.secret_epoch;
+                    next.secret_epoch = secret_epoch;
+                    next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+                    if old_epoch < secret_epoch {
+                        next.shared_secret = None;
+                    }
                 }
             }) else {
                 return false;
