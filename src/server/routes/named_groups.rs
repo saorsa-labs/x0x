@@ -8458,6 +8458,19 @@ pub(in crate::server) async fn remove_named_group_member(
         }
     };
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // F1 §1: self-removal is a leave, not a remove. Reject before the
+    // membership lock — `leave_group` re-acquires the same per-group lock and
+    // `tokio::sync::Mutex` is not reentrant, so delegating would self-deadlock
+    // *while holding the lock*, hanging every later op on this group. This
+    // also short-circuits the live TreeKEM self-target divergence
+    // (`remove_treekem` sets `treekem_epoch: Some(..)` unconditionally and
+    // receivers drop the event under `self_leave_auth`).
+    if agent_id_hex == local_agent_hex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "self-removal is a leave; use DELETE /groups/:id",
+        );
+    }
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
