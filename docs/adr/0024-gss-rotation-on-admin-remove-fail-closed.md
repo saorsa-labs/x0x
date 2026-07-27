@@ -487,6 +487,31 @@ nothing more than a malformed input the gate itself constructs. Drawing the line
 read would have hidden six of the ten; drawing it at the derivation would still have hidden
 `:12362`.
 
+**A break list is a set of line numbers, so it means nothing without the commit it resolves
+at, and it must be re-resolved at the commit that ships.** The list above states its commit in
+its first citation and the rest of the rows inherit it; that is a requirement, not a
+formatting habit. A gate that adds production code *above* its own interval moves every line
+in that interval, so a list written against the commit the gate was designed on can be wrong
+at the commit the gate lives on — and a rebase invalidates a break list exactly as it
+invalidates a diff. This is not hypothetical: on this rule's first use a gate's own production
+hunks shifted its whole interval by fourteen lines, and a mutation aimed at a line from the
+stale list edited a blank line, did nothing, and reported the entire set green. **Two things
+follow. State the commit each list resolves at, and re-resolve it at the final SHA before the
+receipt is read as evidence. And build every mutation set with at least one arm that MUST go
+red** — that near-miss was caught only because a control arm failed to fail. A set in which
+every arm is expected green cannot distinguish a sound gate from a mutation that never landed.
+
+**The exit inventory is a floor for a second reason: some breaks are not exits at all.** Where
+a gate observes two production operations agreeing with *each other* — an encrypt and a
+decrypt, a writer and a reader, a serialiser and its parser — an edit applied to **both** sides
+leaves the gate green while the format between them moves. No control-flow exit is involved,
+so no enumeration of exits can reach it; it is found only by asking what a matched pair of
+edits would hide. Such a gate observes that the two sides agree, which is the property worth
+having, and does **not** observe that either side still matches what was there before. A
+paired-operation gate must record that as a break it does not observe, and it belongs in the
+blind-spot bucket by the direction test above: it leaves the gate green while something real
+is broken.
+
 **One exit lies past the target operation, and it is a different kind — do not file it as
 blindness.** The interval above ends at the operation, but what a gate observes is the
 endpoint's *response*, and on the success arm this handler hands its assembled response to a
