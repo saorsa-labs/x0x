@@ -418,8 +418,10 @@ third, since the matched segment must still begin with `f1_`.
 A filter fails by selecting **too few** tests, and only one of the two ways of doing that is
 caught by the runner. An empty selection is already a hard failure: measured at
 cargo-nextest 0.9.126, a filter matching nothing yields `error: no tests to run` and exit
-code 4, and no `no-tests` key is set in `.config/nextest.toml` at `e3013710d7`, `56d0c4b` or
-this commit, so the default stands. A **non-empty subset** is not caught — a filter that
+code 4. That measurement was taken in a crate carrying no nextest configuration at all, and
+this repo's `.config/nextest.toml` sets no `no-tests` key at `e3013710d7`, `56d0c4b` or this
+commit, so nothing checked in overrides it; environment-level overrides were not enumerated
+and are not relied on below. A **non-empty subset** is not caught — a filter that
 selects some required gates and omits others runs them, passes them, and exits 0. That is
 the false green this section must exclude, and it is invisible in a pass/fail split.
 Therefore **a receipt for this recipe must state how many tests were selected**, and a count
