@@ -424,11 +424,19 @@ commit, so nothing checked in overrides it; environment-level overrides were not
 and are not relied on below. A **non-empty subset** is not caught — a filter that
 selects some required gates and omits others runs them, passes them, and exits 0. That is
 the false green this section must exclude, and it is invisible in a pass/fail split.
-Therefore **a receipt for this recipe must state how many tests were selected**, and a count
-below the number of gate functions this section requires is a failing receipt however green
-the split. Zero is likewise invalid, but by the runner's own exit code rather than by this
-rule — and stating the rule over the required gate count rather than over zero keeps it
-sound if that runner default is ever configured away.
+Therefore **a receipt for this recipe must state how many tests were selected, and must name
+the gate functions that count is made of.** This section fixes no single number and must not
+be read as implying one: item 1 states a property every gate has to have rather than naming
+a gate of its own, item 7a requires exactly three functions, item 7b requires none because
+no gate observes it, and the remaining items each require at least one without fixing how
+many. A receipt therefore names the items it discharges — which may be a subset, since items
+gain gates as the work lands — and the `f1_` functions discharging them, and the selected
+count must equal the length of that list. Below it, the filter dropped a gate, and that is a
+failing receipt however green the split. This section is discharged only once every item
+requiring a gate has been named across those receipts. Zero is likewise
+invalid, but by the runner's own exit code rather than by this rule — and stating the rule
+over a per-receipt list rather than over a fixed count keeps it sound both as further items
+gain gates and if that runner default is ever configured away.
 
 1. Fails on the pinned pre-fix commit (or on a mutation) and passes on the patched tree.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
