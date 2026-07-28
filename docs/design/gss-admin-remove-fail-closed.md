@@ -447,31 +447,14 @@ resolve only at the commit declared in that block. General-rule citations
 before the worked example resolve at:
 `e3013710d7ed69077de9a799dffdbeb5ac80535a`.
 
-**Break disclosure — required of every gate in this section.** A gate is evidence only
-against the ways of breaking that someone named. Mutation-redness does not establish that a
-gate observes its property: the Validation item 3 gates are mutation-red on the `:5832`
-conjunct and were still blind to the survivor being removed alongside the victim, because
-that break was never on anyone's list. So each gate must be accompanied by a list of the breaks considered, and
-for each either **the mutation that turns the gate red, an assertion or precondition in the
-gate that refuses the path, or a statement that the gate does not observe that break and why
-that is accepted.** A refusing precondition ranks with a mutation and is often the honest
-form: a gate asserting an exact plaintext already cannot pass on any error exit, and
-demanding a bespoke mutation per exit would buy ceremony rather than evidence. This is a
-requirement to disclose, not a
-prohibition on assertions: a rule forbidding any assertion a broken property could still
-produce would forbid 7a's own length assertion, which still yields 32 if rotation breaks by
-returning a constant.
+**Break disclosure is required of every control. The requirement is stated in
+[ADR 0024 `## Validation`](../adr/0024-gss-rotation-on-admin-remove-fail-closed.md#validation)
+and deliberately not restated here.** A mutable chapter cannot hold a normative requirement,
+and two copies of one rule diverge on their first edit. What follows is the worked example of
+applying it and the receipt mechanics the ADR delegates to this chapter.
 
-A list drawn from the author's imagination fails the same way the gates do — an author names
-the breaks their gate already catches. The minimum content is therefore mechanical: **name
-the target operation and the observation the gate makes of it, then enumerate from the source
-every control-flow exit or alternate dispatch between the gate's entry point and that
-operation which could bypass or substitute for it — explicit returns, `?` propagation,
-`let`-`else` bindings, `match` and `if` arms, and returns from delegated handlers — and
-account for each.** A scan for `return` is a floor, not a completeness proof; this very
-handler ends in a `match` arm that exits without one. The endpoint of that path is the code
-that performs the property, not the code that reads its inputs. **Declaration for the worked
-example that follows: every line number in it resolves at `56d0c4b`, in
+**Declaration for the worked example that follows: every line number in it resolves at
+`56d0c4b`, in
 `src/server/routes/named_groups.rs`, and none of them at the baseline.** For "a survivor can
 decrypt", the path runs to the key derivation at `:12353` and
 the cipher at `:12367` — not to the stored-secret read at `:12314` — and it contains **ten**
@@ -499,9 +482,11 @@ invalidates a diff. This is not hypothetical: on this rule's first use a gate's 
 hunks shifted its whole interval by fourteen lines, and a mutation aimed at a line from the
 stale list edited a blank line, did nothing, and reported the entire set green. **Two things
 follow. State the commit each list resolves at, and re-resolve it at the final SHA before the
-receipt is read as evidence. And build every mutation set with at least one arm that MUST go
-red** — that near-miss was caught only because a control arm failed to fail. A set in which
-every arm is expected green cannot distinguish a sound gate from a mutation that never landed.
+receipt is read as evidence. As chapter practice, build every mutation set with at least one
+arm that must go red** — that near-miss was caught only because a control arm failed to fail.
+This practice is not an ADR 0024 requirement, and nothing in the repository enforces it. A
+set in which every arm is expected green cannot distinguish a sound gate from a mutation that
+never landed.
 
 **A list committed alongside the code it cites cannot name its own commit, so it takes the
 other form.** Requiring the final SHA is unsatisfiable when the list ships *inside* that
@@ -581,7 +566,11 @@ The item definitions in this section are migrated from ADR 0024 at
 `111f4f86e3ad11a943473e702d6b46a5e62735c0`. Code citations in a sub-item
 resolve only at the commit declared in that sub-item.
 
-1. Fails on the pinned pre-fix commit (or on a mutation) and passes on the patched tree.
+1. The opening paragraph of
+   [ADR 0024 `## Validation`](../adr/0024-gss-rotation-on-admin-remove-fail-closed.md#validation)
+   states this item's cross-cutting fail/pass evidence property, which binds every control
+   and names no control of its own. This item was promoted into the governing ADR and is
+   deliberately not restated here.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
    that its `state_hash` matches. Convergence is the wrong assertion (ADR Grounding G-002):
    it passes on the bug.
@@ -738,7 +727,8 @@ requires a revision/state-hash compare-and-swap design, not an audit.
 
 Resolves at: `111f4f86e3ad11a943473e702d6b46a5e62735c0`
 
-This ledger maps every source line exactly once to its primary destination.
+This ledger records the original migration at the declared commit, mapping every source line
+exactly once to its primary destination; it is not a current map of where text lives.
 The ADR carries stable decisions and Grounding evidence; this chapter carries
 mutable mechanisms, detailed audit procedure, gate definitions, and receipt
 rules. Blank lines and headings travel with their enclosing range.
