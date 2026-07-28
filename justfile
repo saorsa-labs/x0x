@@ -25,6 +25,15 @@ test:
 test-verbose:
     cargo nextest run --all-features --workspace --no-capture
 
+# Run the F1 GSS-rotation ADR gate tests (gate 3 ordering + gate 7a
+# producer). The filter `test(/(^|::)f1_/)` selects the five f1_
+# tests added to `mod tests` in src/server/routes/named_groups.rs. The
+# `(^|::)` form also discovers future top-level integration tests.
+# `--no-fail-fast --test-threads=1` is required so the §7a mutation
+# receipt's PASS/PASS/FAIL split by test name is unambiguous.
+adr-gates-f1:
+    cargo nextest run -p x0x --all-features --no-fail-fast --test-threads=1 -E 'test(/(^|::)f1_/)'
+
 build:
     cargo build --all-features
 
