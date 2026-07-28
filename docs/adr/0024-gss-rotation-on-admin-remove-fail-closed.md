@@ -76,8 +76,10 @@ reachability unresolved rather than declared defective.
 
 ## Validation
 
-Every control must be shown to fail on the pinned pre-fix commit or on a
-mutation, and to pass on the patched tree.
+Every control must be shown to fail when its own source is run against the
+production code at `e3013710d7ed69077de9a799dffdbeb5ac80535a`, or against a
+declared mutation satisfying the break-disclosure requirement below, and to
+pass on the patched tree.
 
 Acceptance requires independent controls showing that:
 
@@ -93,10 +95,44 @@ Acceptance requires independent controls showing that:
 - the rotated-secret producer preserves its length, epoch, and stored-value
   invariants.
 
-Runner, receipt, break-disclosure, mutation, and gate-mapping mechanisms live
-in the [reference chapter](../design/gss-admin-remove-fail-closed.md). As
-recorded on 2026-07-27, survivor decryptability and removed-member exclusion
-block acceptance; abort and mixed-version controls remain required follow-up.
+**Break disclosure — required of every control in this section.**
+
+Resolves at: `e3013710d7ed69077de9a799dffdbeb5ac80535a`
+
+A control is evidence only against the ways of breaking that someone named.
+Mutation-redness does not establish that a control observes its property: the
+metadata-first and envelope-first delivery controls are mutation-red on the
+`src/server/routes/named_groups.rs:5832` conjunct and were still blind to the
+survivor being removed alongside the victim, because that break was never on
+anyone's list. So each control must be accompanied by a list of the breaks
+considered, and for each either **the mutation that makes the control fail, an
+assertion or precondition in the control that refuses the path, or a statement
+that the control does not observe that break and why that is accepted.** A
+refusing precondition ranks with a mutation and is often the honest form: a
+control asserting an exact plaintext already cannot pass on any error exit,
+and demanding a bespoke mutation per exit would buy ceremony rather than
+evidence. This is a requirement to disclose, not a prohibition on assertions:
+a rule forbidding any assertion a broken property could still produce would
+forbid the length assertion on the rotated-secret producer, which still yields
+32 if rotation breaks by returning a constant.
+
+A list drawn from the author's imagination fails the same way the controls do
+— an author names the breaks their control already catches. The minimum content
+is therefore mechanical: **name the target operation and the observation the
+control makes of it, then enumerate from the source every control-flow exit or
+alternate dispatch between the control's entry point and that operation which
+could bypass or substitute for it — explicit returns, `?` propagation,
+`let`-`else` bindings, `match` and `if` arms, and returns from delegated
+handlers — and account for each.** A scan for `return` is a floor, not a
+completeness proof; the `secure_group_decrypt` handler ends in a tail `match`,
+whose arms exit the handler without an explicit `return`. The endpoint of that
+path is the code that performs the property, not the code that reads its
+inputs.
+
+Runner, receipt, mutation, and gate-mapping mechanisms live in the
+[reference chapter](../design/gss-admin-remove-fail-closed.md). As recorded on
+2026-07-27, survivor decryptability and removed-member exclusion block
+acceptance; abort and mixed-version controls remain required follow-up.
 Acceptance with follow-up outstanding is not full validation discharge.
 
 ## Grounding
