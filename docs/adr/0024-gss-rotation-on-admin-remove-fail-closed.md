@@ -602,13 +602,15 @@ recording no owner at all.
    functions the runner above filters on and no coordinate system in this document reaches
    them.
    - **4a** — `f1_item4a_removed_caller_refused_at_roster_guard` observes an **API-level
-     refusal**: the removed caller is refused `403` at `secure_group_decrypt`'s roster
-     guard, which fires before any `req` field is read and before any cipher is reached (it
-     asserts the group is GSS-plane, so the refusal cannot be the TreeKem dispatch
-     instead). **4a discharges no part of non-decryption** — it stays green if the crypto
-     is replaced by a pass-through after the membership test. It is here to establish that
-     seam, which is why 4b must be observed below the endpoint, and not as evidence for
-     this item.
+     refusal**: the removed caller is refused with the roster guard's own `not a member`
+     body, not merely a `403` — a decrypt-failure 403 further down the same handler
+     satisfies a status-only assertion while proving the guard did **not** fire. That guard
+     is in `secure_group_decrypt` and fires before any `req` field is read and before any
+     cipher is reached, and the gate asserts the group is GSS-plane, so the refusal cannot
+     be the TreeKem dispatch instead. **4a discharges no part of non-decryption** — it
+     stays green if the crypto is replaced by a pass-through after the membership test. It
+     is here to establish that seam, which is why 4b must be observed below the endpoint,
+     and not as evidence for this item.
    - **4b** — `f1_item4b_retained_secret_does_not_open_new_epoch_content` observes **key
      material**: the secret a removed member retains does not open content sealed at the
      new epoch. Two arms vary only the secret and the new-epoch arm must succeed, so the
