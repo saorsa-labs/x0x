@@ -33,6 +33,7 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0021: DM Origin-Machine Attestation for Gossip DMs](./0021-dm-origin-machine-attestation.md) — machine-key attestation of DM origin; codec scaffolding landed (`DmOriginAttestation` in `src/dm.rs`) but enforcement not yet wired
+- [ADR 0025: Required Gates Must Prove Observation Completeness](./0025-required-gates-prove-observation-completeness.md) — pre-consensus proposal for default-run test routing, registry-derived required inventories, and proof that selected tests executed their promised observations (Dario review and Kimi ruling outstanding)
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 

@@ -1,0 +1,512 @@
+# ADR 0025: Required Gates Must Prove Observation Completeness
+
+- **Status:** Proposed — pre-consensus (Kimi ruling outstanding)
+- **Date:** 2026-07-28
+- **Decision owners:** David Irvine
+- **Reviewers:** Dario (draft review pending); Kimi (required ruling outstanding); Watson (evidence verification)
+- **Supersedes:** none
+- **Superseded by:** none
+- **Related:** `justfile`, `.github/workflows/ci.yml`,
+  `.github/workflows/integration.yml`, `.config/nextest.toml`, `tests/**`;
+  Buzz measurement event
+  `b1dc8e11e419913f4cba0d86f49c8e638c4ce9296fb54bb65d1ad4ea1372fe6c`
+
+> **Pre-consensus draft:** David has selected default-run with a declared,
+> machine-checkable opt-out. The remaining design records the current Sam and
+> Dario position plus Watson's verified corrections. Kimi's ruling on the
+> remaining clauses is outstanding. This ADR must not be presented as
+> consensus, marked Accepted, or implemented before that review and David's
+> explicit approval.
+
+## Context
+
+x0x's test commands can report success without observing all of the properties
+the repository treats as covered. The investigation began with `#[ignore]`,
+but the failure is not specific to an attribute. At commit
+`e3013710d7ed69077de9a799dffdbeb5ac80535a`, at least three mechanisms have
+the same effect:
+
+1. `#[ignore]` keeps a discovered test out of the ordinary test run.
+2. A hand-written nextest exclusion keeps a non-ignored test out of one CI
+   context.
+3. A runtime precondition returns success before the test reaches its
+   assertions, so the harness records `PASS` rather than an unmet
+   precondition.
+
+These mechanisms defeat different audits. Counting ignored tests cannot find
+workflow exclusions. Comparing selected inventories cannot find a selected
+test that returns success before observing its property. Naming each current
+mechanism would leave the policy open to the next container.
+
+The governing problem is therefore property-level:
+
+> A required gate may report success only if it can account for every
+> discovered test, the tier and required context that selected it, whether it
+> executed its promised observation, and every declared reason it did not.
+
+The measured repository state illustrates the gap:
+
+- nextest discovers 2,685 test cases across 30 binaries, including 245 ignored
+  tests; 196 ignores are bare and 49 carry a reason;
+- `just test`, CI Test Suite, and CI Coverage have three different effective
+  inventories;
+- CI Test Suite excludes
+  `binary(x0x_0041_synthetic_kill_restart)`;
+- CI Coverage additionally excludes
+  `binary(x0x_0041_prefer_newest_test)` and
+  `binary(named_group_join_metadata_event)`;
+- those workflow filters remove five non-ignored tests from Coverage, so the
+  245-test ignore census cannot see the divergence;
+- local `just` recipes, CI workflows, and two orphaned shell scripts select
+  ignored tests with separately maintained commands;
+- no CI workflow invokes `just`, so local and CI gates share no dispatcher;
+- a structural evidence sweep over `tests/**` found 33 early-success sites
+  across 27 non-ignored test functions; an independent reproduction found 29
+  candidate dormant sites, then source review reclassified seven as
+  fail-closed and left 22 genuine dormant self-void sites across 12 ignored
+  test functions;
+- two of the 33 live sites are regeneration escape hatches; the other 31 are
+  runtime-precondition paths across 25 test functions;
+- a follow-up over unit-test modules found two further live self-void paths in
+  `src/exec/service.rs`, including an issue-118 regression guard, plus three
+  already-fail-closed success returns that the syntactic rule below will make
+  explicit;
+- three separately defined `build_or_skip_network_bind_error`-style helpers
+  institutionalize the silent-success convention; and
+- 15 of the 22 genuine dormant self-void sites are in
+  `tailnet_streams_integration`, so enabling ignored cohorts before
+  observation accounting exists could manufacture a green migration result.
+
+The structural sweeps are evidence, not the proposed implementation. A
+brace-depth walk misclassified returns from nested async blocks and closures;
+a lookback heuristic misclassified assertion-dominated returns. The shipping
+audit must be syntax-aware, cover integration tests and unit-test modules, and
+enforce a syntactic test-exit rule that does not depend on heuristic data-flow
+classification or log messages.
+
+Tool constraints also shape the decision. cargo-nextest 0.9.126 can select
+`binary(...)` and `test(...)` filtersets and can choose ignore-state behavior
+with `--run-ignored default|only|all`. It cannot select the reason string in
+`#[ignore = "..."]`. Its test groups control scheduling, and this version has
+no `test_group(...)` filterset predicate.
+
+Finally, a green command is not a merge gate by itself. `main` currently has
+no verified substantive green baseline context suitable for protection and no
+verified rule requiring the comprehensive test status. Recent substantive
+workflows include failures; Security Audit's scheduled green runs do not
+exercise the test suite, and Claude Code has produced skipped rather than
+pass/fail conclusions. Selecting whichever context looks green would create
+another proxy.
+
+## Decision Drivers
+
+- New tests must run by default. A missing or mistyped opt-out must increase
+  execution rather than silently reduce it.
+- Required local and CI contexts must be derived from one execution
+  definition rather than independently maintained command lines.
+- A gate must account for both selection and actual observation; inventory
+  equality alone is insufficient.
+- Runtime preconditions must be observable and machine-reconciled.
+- Isolation, external infrastructure, and soak budgets are legitimate
+  scheduling concerns, but `flaky` and `known-defect` are not opt-out tiers.
+- The design must be enforceable with the nextest capabilities actually
+  present in the repository.
+- Branch protection must be proven with both configuration readback and a
+  merge-blocking negative control.
+- Migration must not grandfather the mechanisms that created the current
+  blind spots.
+
+## Considered Options
+
+1. **Curated allowlist of tests that must run.**
+2. **Use `#[ignore]` and its reason string as the routing authority.**
+3. **Use nextest test-group membership as the routing authority.**
+4. **Run by default; declare only non-default tiers in a source-carried
+   namespace, with one executable registry and observation accounting.**
+
+Option 1 is rejected because completeness would depend on continuously adding
+new tests to a second list. A forgotten entry removes coverage.
+
+Option 2 is rejected because nextest exposes only the ignored bit, not the
+reason string, and one bit cannot route required-isolated, external, and soak
+work independently.
+
+Option 3 is rejected because test groups are scheduling configuration, not an
+opt-out property, and nextest 0.9.126 cannot select a test group in a
+filterset.
+
+Option 4 is selected. It makes ordinary execution the fail-safe complement of
+explicit non-default selectors and makes the registry the executable source
+of routing, reachability, and observation policy.
+
+## Decision
+
+### 1. Scope the policy to observation, not to current bypass mechanisms
+
+The policy governs anything that allows a declared gate to report success
+without observing a property it promises to observe. `#[ignore]`, workflow
+filtersets, runtime early-success returns, retry-only success, and
+environment-controlled regeneration paths are known instances, not a closed
+taxonomy.
+
+Governance must test the invariant, not merely search for those tokens.
+
+### 2. Default is the complement
+
+Every discovered test is classified mechanically:
+
+- if it matches no non-default selector, it is in `default`;
+- if it matches exactly one non-default selector, it is in that tier;
+- if it matches more than one non-default selector, governance fails.
+
+Ordinary tests do not carry a `default_*` name and the registry does not
+enumerate them. Requiring that would recreate the rejected allowlist across
+the ordinary suite.
+
+Only non-default tiers carry a source-level, machine-selectable namespace:
+
+- use an integration-target name when the whole binary has one non-default
+  policy;
+- use a module or test-name namespace when one binary contains multiple
+  policies.
+
+The non-default selectors must be pairwise disjoint. A missing or mistyped
+non-default namespace falls into `default` and runs.
+
+Where cargo's ordinary runner must also skip a non-default case,
+`#[ignore = "..."]` remains structured human-readable metadata. It is not the
+routing authority. In the enforced steady state, the primary dispatcher uses
+`--run-ignored all`, so an unclassified ignore does not disappear from the
+default inventory. The advisory migration stage in Decision 11 deliberately
+retains `--run-ignored default` until the dormant self-void paths are migrated
+and the ignored cohort is ready to activate.
+
+The initial tiers are:
+
+| Tier | Required execution |
+|---|---|
+| `default` | `just check` and pull-request CI |
+| `required-isolated` | `just check` and pull-request CI, after compilation with declared isolation/concurrency |
+| `external` | only in the context that supplies its declared infrastructure |
+| `soak` | on its declared schedule and budget |
+
+There is no `flaky` or `known-defect` tier.
+
+A compile-contention measurement for
+`tailnet_streams_integration::backpressure_throttles_writer_with_bounded_buffering`
+produced four passes and one `bob accepted` failure while clean workspace
+builds were active, versus five passes in five unloaded controls. All ten test
+invocations were compile-free, and the loaded tests began and ended while
+their competing builds remained active. This sample supports
+`required-isolated` placement without claiming statistical proof of
+causation. That tier remains required locally and in pull-request CI.
+
+### 3. One executable registry owns routing and reachability
+
+The registry enumerates tier definitions, not individual default tests. Each
+tier definition owns:
+
+- its positive `binary(...)` / `test(...)` selector;
+- every permitted context-specific exclusion;
+- local, pull-request, external, and scheduled execution contexts;
+- scheduling, isolation, concurrency, and timeout policy;
+- infrastructure preconditions;
+- failure policy;
+- owner; and
+- reason and expiry for any declared context-specific divergence.
+
+A single dispatcher consumes the registry. Hand-written tier-specific nextest
+commands, inline workflow exclusions, and separately maintained test lists
+are forbidden.
+
+`run-required` iterates the registry definitions for `default` and
+`required-isolated`; `just check` invokes `run-required`. CI derives its
+required and scheduled matrices from the same registry and invokes the same
+dispatcher.
+
+The invariant is one execution definition per tier, reachable in every
+context that definition declares. It is not "exactly one process" or "exactly
+one call site": local and CI contexts may invoke the same definition.
+
+Reachability is proven from the dispatcher graph. A command that merely
+appears in an otherwise orphaned shell script does not prove execution.
+
+Required dispatchers must propagate semantic failure to a failing status.
+Governance follows the result rather than rejecting token shapes: for example,
+`|| true` may preserve captured output only when a later fail-closed check
+turns the captured failure into a failing status.
+
+### 4. Reconcile selection and terminal-result inventories in every context
+
+The registry-derived required inventory is the union of `default` and
+`required-isolated`. Each required local and CI context emits its effective
+selected inventory before execution and reconciles it against that required
+inventory.
+
+After execution, each required context emits the set of discovered test
+identities that produced a terminal result in that run and reconciles that set
+against the same registry-derived required inventory. Selected-set equality is
+necessary but insufficient: the required run fails when a required test
+produced no result or when an unselected test identity produced one.
+
+The initial dispatcher may obtain terminal results from cargo-nextest 0.9.126
+with `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` and
+`--message-format libtest-json-plus`. Because that interface is experimental,
+the dispatcher owns the environment flag and parser and fails closed when the
+machine-readable result stream is unavailable or malformed.
+
+A context-specific difference may exist only when the registry declares it
+with a reason, owner, and expiry. It cannot be expressed as an inline
+workflow filter. A known product or dependency defect is not a permitted
+reason.
+
+The same accounting applies to external and soak tiers: a tier that is not
+scheduled in a context is accounted for by its registry execution policy,
+not by running a test that returns success without infrastructure.
+
+### 5. A selected test must account for whether it observed its property
+
+An unmet runtime precondition may not resolve to an ordinary passing test.
+The default behavior is to fail with the unmet precondition.
+
+Where Rust's test harness cannot express a native skip result, test code may
+use one declared helper that emits a machine-readable skip record keyed to
+the discovered test identity. The helper is diagnostic accounting, not a
+success escape:
+
+- a required dispatcher fails if its recorded skip count is non-zero;
+- a scheduled external or soak context fails if its promised infrastructure
+  is absent; and
+- a tier not scheduled in a context is accounted for by the registry, not by
+  a passing test.
+
+Within a test function's own control-flow scope, every
+precondition-failure or destructuring-failure arm must diverge through an
+assertion, `panic!`, `unreachable!`, or the declared skip helper. Direct
+success returns such as `return;`, `return Ok(())`, and
+`let ... else { return Ok(()) }` are forbidden. An assertion-dominated
+destructuring arm must use explicit divergence rather than retain an
+unreachable success return.
+
+The audit must be syntax-aware and cover integration-test functions and unit
+test modules. It distinguishes a return from the test function from a return
+inside a nested closure or async block, and recognizes only the declared skip
+helper as an allowed success-exit mechanism. It does not try to infer whether
+an assertion dominates a success return, and it does not grep for `return`,
+`Ok(())`, or a "skipping" message. The current brace-depth censuses may seed
+the implementation and migration, but are not the normative audit.
+
+### 6. Regeneration and validation are separate entry points
+
+An environment variable may not turn a required validation test into a green
+regeneration no-op. Artifact generation moves to an explicit non-test command
+such as an `xtask` or equivalent dispatcher action. Required tests always
+validate the committed artifact.
+
+Until those paths are separated, the required dispatcher rejects the
+regeneration environment variables and the structural audit continues to
+report the early-success paths.
+
+### 7. Known defects cannot be stored in an observation bypass
+
+No ignore, exclusion, early-success precondition, retry-only success, or
+successor mechanism may store a deterministic product or dependency defect.
+
+The two CRDT convergence cases must be triaged against intended conflict
+semantics:
+
+- if the expectation is correct, fix the product or dependency and run the
+  regression normally;
+- if the current behavior is intended, convert the test to a passing
+  characterization and track any desired semantic change separately; or
+- if intent is unresolved, keep the semantic decision visibly open in an
+  issue with an owner and expiry, without counting it as coverage.
+
+`Flaky` requires measured pass/fail evidence. Even measured intermittence is
+evidence for diagnosis, not a permanent tier. The historically retry-passing
+`x0x_0041_synthetic_kill_restart` exclusion therefore requires an owner and a
+resolution rather than continued storage in a workflow filter.
+
+An environmental requirement may justify an `external` tier only when the
+registry names the infrastructure, owning context, owner, and fail-closed
+behavior.
+
+### 8. `just check` and CI use the same required dispatcher
+
+`just check` includes:
+
+- formatting;
+- lint;
+- build;
+- documentation;
+- the `default` test filter;
+- the `required-isolated` filter; and
+- the observation-completeness governance audit.
+
+Pull-request CI invokes the same registry-derived required dispatcher and
+publishes the same selected-inventory, terminal-result, and skip-accounting
+receipt. Coverage tooling may add instrumentation, but it may not silently
+shrink the required inventory or omit terminal results.
+
+### 9. A merge gate requires proven branch enforcement
+
+A CI command is advisory until `main` has a ruleset or branch-protection rule
+requiring its exact status context. The rule covers administrators and normal
+pushes, with only a documented break-glass bypass.
+
+Enforcement requires both:
+
+1. API readback of the configured rule and exact required status context; and
+2. an intentionally red pull request that GitHub refuses to merge.
+
+Security Audit, Claude Code, or another context that does not produce a
+substantive pass/fail test observation cannot substitute for the required
+test context.
+
+### 10. No open-ended grandfathering
+
+The ADR may be reviewed before migration, but the comprehensive status cannot
+be required or described as complete until the final receipt is green:
+
+```text
+bare #[ignore]                              0
+non-default tests outside registry naming  0
+multi-tier matches                         0
+unreachable declared tiers                 0
+undeclared required-context divergence     0
+hand-written exclusion filtersets          0
+dispatcher bypasses                        0
+silent early-success paths                 0
+regeneration-as-passing-test paths          0
+required-run recorded skips                0
+required tests with no reported result      0
+reported results outside selected inventory 0
+legacy baseline allowlist                  0
+```
+
+There is deliberately no `unclassified default test` metric: a discovered
+test that matches no non-default selector is default by construction.
+
+The 196 bare ignore attributes, current workflow exclusions, 31 live
+integration-test runtime-precondition paths, two further live unit-test
+self-void paths, 22 dormant self-void paths, ten already-fail-closed success
+returns that must become explicit divergence, two regeneration escape
+hatches, and fragmented legacy runners are migration work. Moving a bypass
+from one container to another does not satisfy the policy.
+
+### 11. Enforcement order is part of the decision
+
+There is no verified current substantive green baseline context. Rollout is:
+
+1. Produce substantive green CI and Build runs on `main` at a recorded SHA,
+   and record every effective test inventory at that SHA. The next approved
+   substantive merge may provide this anchor; if either workflow is red,
+   stop and diagnose that SHA.
+2. Protect those exact observed contexts, including administrators, and read
+   the rule back. This is a provisional branch-control anchor, not proof that
+   the current smaller CI inventory is complete.
+3. Introduce the registry, dispatcher, inventory reconciliation,
+   syntax-aware test-exit audit, single skip-recording helper, skip
+   reconciliation, and tier jobs in advisory mode. At this stage the
+   dispatcher intentionally retains `--run-ignored default`: discovery and
+   governance account for all ignored tests, but the new dispatcher does not
+   execute them or claim a comprehensive receipt.
+4. Migrate the currently live integration-test and unit-test
+   runtime-precondition paths, convert already-fail-closed success returns to
+   explicit divergence, and move regeneration out of validation tests. Do not
+   activate ignored cohorts before this observation machinery exists.
+5. Migrate every dormant early-success path and classify all 245 ignored
+   tests. Only then switch the primary dispatcher to `--run-ignored all`,
+   activate the ignored cohorts, remove undeclared workflow exclusions, and
+   reach the comprehensive zero receipt.
+6. Require the exact comprehensive status and prove an intentionally red
+   pull request cannot merge.
+7. Only then remove the fragmented legacy runners and supersede the
+   provisional baseline context.
+
+## Consequences
+
+### Positive
+
+- New tests run by default even when their author forgets the policy
+  namespace.
+- Local and CI selection derive from one executable definition.
+- The gate proves both selection and observation; a selected-but-self-voiding
+  test can no longer masquerade as coverage.
+- Isolation, external infrastructure, and soak budgets remain expressible
+  without creating a defect quarantine.
+- Required status claims become independently testable through inventory
+  receipts, protection readback, and a negative merge control.
+
+### Negative / Trade-offs
+
+- The migration covers all 245 ignores, existing workflow exclusions, silent
+  precondition paths, regeneration escape hatches, and legacy runners.
+- A syntax-aware Rust audit and machine-readable skip reconciliation add
+  tooling that must be maintained with test-language changes.
+- Terminal-result reconciliation initially depends on cargo-nextest's
+  experimental `libtest-json-plus` interface; its adapter must fail closed and
+  be reviewed when nextest changes the format or stabilizes a replacement.
+- Required local and pull-request gates will take longer because
+  `required-isolated` remains required rather than being silently deferred.
+- Some currently green tests will become explicit failures when their
+  preconditions are unavailable.
+- External and soak jobs need declared owners, infrastructure contracts,
+  schedules, and budgets.
+
+### Neutral / Operational
+
+- `#[ignore = "..."]` remains useful metadata for cargo's ordinary runner,
+  but no longer decides routing.
+- The registry defines policies and selectors, not an exhaustive test list.
+- Target-level namespaces classify homogeneous binaries efficiently; mixed
+  binaries pay the cost of module/test-level naming.
+- Context-specific inventory divergence is visible, owned, and expiring
+  rather than forbidden in all circumstances.
+- The measured tailnet backpressure case belongs in `required-isolated`; that
+  changes scheduling within the required set, not whether the property is
+  required.
+
+## Validation
+
+Before the comprehensive status can become required:
+
+- nextest discovery plus registry evaluation shows every test in the default
+  complement or exactly one non-default tier;
+- all non-default selectors are pairwise disjoint;
+- every declared tier is reachable from every context it names;
+- `just check` and pull-request CI emit and reconcile their effective
+  selected inventories against the registry-derived required inventory;
+- each required run emits a machine-readable terminal result for every
+  required test identity, emits none outside its selected inventory, and
+  fails when the result stream is missing or malformed;
+- coverage uses the same required inventory and terminal-result
+  reconciliation;
+- governance finds no hand-written tier commands or inline workflow
+  exclusions outside the dispatcher;
+- a syntax-aware audit over integration tests and unit-test modules finds no
+  direct success return from a precondition or destructuring failure arm
+  outside the declared skip helper;
+- a required run records zero skips and propagates semantic failure;
+- regeneration commands and validation tests are distinct;
+- the migration receipt in Decision 10 is all zero;
+- API readback shows the exact comprehensive status required for `main`,
+  including administrators; and
+- an intentionally red pull request is refused merge.
+
+Review triggers after acceptance:
+
+- a new test harness, runner, retry layer, coverage tool, or workflow that can
+  change the effective inventory;
+- a new mechanism that can convert an unmet observation into success;
+- a new non-default tier or context-specific divergence;
+- a branch-protection or status-context rename; or
+- evidence that the static audit cannot recognize a Rust control-flow form
+  used by the test suite.
+
+## Notes for AI-assisted work
+
+AI tools may help draft this ADR, but **must not mark it Accepted without
+human review**. This draft is explicitly pre-consensus until Kimi rules and
+David approves it. Accepted ADRs are immutable: create a new superseding ADR
+rather than editing an Accepted ADR.
