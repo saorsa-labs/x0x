@@ -392,9 +392,12 @@ claim of this shape must be run structurally, not derived from a text search.**
   commit has been persisted can still leave a survivor without its envelope. That residue is
   a delivery property of the transport, unchanged by F1 and not addressed here. **No
   validation item reaches it:** Validation item 2 proves survivor decryptability from the
-  envelope; neither it nor the publish-attempt oracle proves delivery. Item 4 asserts the
-  removed member's non-decryption against the published envelopes; items 2 and 4 test the
-  cryptographic behaviour of event objects, not delivery.
+  envelope; neither it nor the publish-attempt oracle proves delivery. Of item 4's three
+  gates, 4c observes the recipient set of the published envelopes — a publish *attempt*
+  recorded in-process, which is construction and not delivery — 4b tests key material below
+  the endpoint, and 4a observes an API refusal. So items 2 and 4 between them test the
+  construction and cryptographic behaviour of event objects and the endpoint's refusals;
+  none of their four gates reaches arrival.
 
 ## Validation
 
@@ -593,7 +596,39 @@ recording no owner at all.
    secret installs under each.
 4. Asserts the removed member's non-decryption against the **published envelopes**, not
    final state: a reseal aimed at the removed member must fail the gate even when the end
-   state looks tidy.
+   state looks tidy. Three gates discharge this item and they are not interchangeable; each
+   is named here with the thing it observes, so the mapping is checkable rather than
+   inferred. Gates are named by test function, not by line, because they are the `f1_`
+   functions the runner above filters on and no coordinate system in this document reaches
+   them.
+   - **4a** — `f1_item4a_removed_caller_refused_at_roster_guard` observes an **API-level
+     refusal**: the removed caller is refused `403` at `secure_group_decrypt`'s roster
+     guard, which fires before any `req` field is read and before any cipher is reached (it
+     asserts the group is GSS-plane, so the refusal cannot be the TreeKem dispatch
+     instead). **4a discharges no part of non-decryption** — it stays green if the crypto
+     is replaced by a pass-through after the membership test. It is here to establish that
+     seam, which is why 4b must be observed below the endpoint, and not as evidence for
+     this item.
+   - **4b** — `f1_item4b_retained_secret_does_not_open_new_epoch_content` observes **key
+     material**: the secret a removed member retains does not open content sealed at the
+     new epoch. Two arms vary only the secret and the new-epoch arm must succeed, so the
+     failure is a measurement rather than a broken harness. Observed on
+     `GroupInfo::derive_message_key` **below the endpoint** — so it proves non-decryption
+     of an equivalently sealed payload, **not of a published envelope**.
+   - **4c** — `f1_item4c_remove_handler_publishes_survivors_not_the_removed_member` is the
+     only gate that observes a **published envelope**: it drives the real remove handler
+     and asserts the recipient of each published `SecureShareDelivered` includes the
+     survivor and excludes the removed member. The assertion is on the recipient set, not a
+     publish count. Observed lane is the metadata-topic publish only; the direct and
+     delayed delivery lanes are named as not observed.
+
+   **The residue, stated rather than left to be inferred:** no single gate asserts both
+   halves of the sentence above at once — a removed member failing to decrypt an envelope
+   that was actually published to them. 4c makes that scenario unconstructible **on the
+   observed lane** by keeping the removed member out of the recipient set, and 4b shows the
+   key such a member retains would not open it; the conjunction itself is **not observed**
+   by any gate. Coverage and ownership are independent axes (above): this item owns it, and
+   no gate covers it.
 5. Covers a missing-KEM survivor **and** a keyed survivor whose seal fails — both assert
    the removal is refused with zero externally visible state change: unchanged
    `secret_epoch` and `shared_secret` in the map, no persisted revision, no published
