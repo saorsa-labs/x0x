@@ -188,6 +188,12 @@ Only non-default tiers carry a source-level, machine-selectable namespace:
 - use a module or test-name namespace when one binary contains multiple
   policies.
 
+`governance-fixture` uses the reserved source-level
+`governance_fixture_*` integration-target, module, or test-name namespace under
+the same rule. The registry pairs every namespace match with one exact fixture
+identity; an identity list is not an exception to selector-based
+classification.
+
 The non-default selectors must be pairwise disjoint. A missing or mistyped
 non-default namespace falls into `default` and runs.
 
@@ -207,7 +213,7 @@ The initial tiers are:
 | `required-isolated` | `just check` and pull-request CI, after compilation with declared isolation/concurrency |
 | `external` | only in the context that supplies its declared infrastructure |
 | `soak` | on its declared schedule and budget |
-| `governance-fixture` | only in the registry-declared `fixture` context; never in a functional required inventory |
+| `governance-fixture` | source namespace `governance_fixture_*`; only in the registry-declared `fixture` context; never in a functional required inventory |
 
 There is no `flaky` or `known-defect` tier.
 
@@ -240,9 +246,14 @@ context schema contains `local`, `pull-request`, `external`, `scheduled`, and
 - owner; and
 - reason and expiry for any declared context-specific divergence.
 
-The non-functional `governance-fixture` definition instead owns the exact
-fixture identities and the `fixture` context. That context has one entry point
-and is the only context permitted to select those identities.
+The non-functional `governance-fixture` definition instead owns its positive
+source-namespace selector, the exact fixture identities matched by that
+selector, and the `fixture` context. The selector classifies each fixture out
+of the `default` complement; it is not a fixture-mode selection authority. The
+closed identity list is what a fixture key resolves to. Every listed identity
+must match the selector exactly once, every discovered selector match must be
+listed, and no functional test may match it. The `fixture` context has one
+entry point and is the only context permitted to select those identities.
 
 A single dispatcher consumes the registry. Any policy that affects selection,
 scheduling, isolation, concurrency, timeout, termination, or retry behavior
@@ -688,6 +699,9 @@ Before the comprehensive status can become required:
 - nextest discovery plus registry evaluation shows every test in the default
   complement or exactly one non-default tier;
 - all non-default selectors are pairwise disjoint;
+- governance-fixture namespace discovery and the registry's closed identity
+  list reconcile in both directions, and none of those identities appears in a
+  required inventory;
 - every declared tier is reachable from every context it names;
 - `just check` and pull-request CI emit and reconcile their effective
   selected inventories against the registry-derived required inventory;
