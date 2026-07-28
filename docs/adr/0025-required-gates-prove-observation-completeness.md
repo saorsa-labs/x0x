@@ -60,6 +60,11 @@ The measured repository state illustrates the gap:
 - local `just` recipes, CI workflows, and two orphaned shell scripts select
   ignored tests with separately maintained commands;
 - no CI workflow invokes `just`, so local and CI gates share no dispatcher;
+- `.config/nextest.toml` separately owns three
+  `profile.default.overrides` filtersets that assign the serialized
+  `quic-localhost` test group; these change scheduling rather than selection,
+  but they are already a hand-maintained tier definition outside any
+  registry;
 - a structural evidence sweep over `tests/**` found 33 early-success sites
   across 27 non-ignored test functions; an independent reproduction found 29
   candidate dormant sites, then source review reclassified seven as
@@ -89,6 +94,16 @@ Tool constraints also shape the decision. cargo-nextest 0.9.126 can select
 with `--run-ignored default|only|all`. It cannot select the reason string in
 `#[ignore = "..."]`. Its test groups control scheduling, and this version has
 no `test_group(...)` filterset predicate.
+
+Its experimental `libtest-json-plus` stream also does not emit a per-test
+ignored or skipped outcome. In a measured default run over a binary with seven
+ignored tests and one active test, all eight identities emitted `started`,
+only the active test emitted a terminal `ok`, and nextest reported the other
+seven only in its aggregate skipped count. Absence of a terminal event
+therefore cannot mean "declared not run": the same shape would also occur if a
+selected test stopped before producing a result. This matters because the
+repository's default nextest profile can terminate slow tests after ten
+60-second periods.
 
 Finally, a green command is not a merge gate by itself. `main` currently has
 no verified substantive green baseline context suitable for protection and no
@@ -217,7 +232,10 @@ tier definition owns:
 
 A single dispatcher consumes the registry. Hand-written tier-specific nextest
 commands, inline workflow exclusions, and separately maintained test lists
-are forbidden.
+are forbidden. The three existing `quic-localhost` scheduling overrides are
+migration inputs: their selectors and concurrency policy must move under the
+registry, and any generated nextest configuration must be derived from it
+rather than maintained as a second source.
 
 `run-required` iterates the registry definitions for `default` and
 `required-isolated`; `just check` invokes `run-required`. CI derives its
@@ -236,24 +254,54 @@ Governance follows the result rather than rejecting token shapes: for example,
 `|| true` may preserve captured output only when a later fail-closed check
 turns the captured failure into a failing status.
 
-### 4. Reconcile selection and terminal-result inventories in every context
+### 4. Reconcile selection and one positive outcome per discovered identity
 
 The registry-derived required inventory is the union of `default` and
 `required-isolated`. Each required local and CI context emits its effective
 selected inventory before execution and reconciles it against that required
-inventory.
+inventory. Selection is derived from registry selectors before the runner's
+ignore-state disposition is applied. During the advisory migration, an
+ignored identity in the default complement therefore remains selected even
+though it receives a declared not-executed outcome.
 
-After execution, each required context emits the set of discovered test
-identities that produced a terminal result in that run and reconciles that set
-against the same registry-derived required inventory. Selected-set equality is
-necessary but insufficient: the required run fails when a required test
-produced no result or when an unselected test identity produced one.
+Each context also emits exactly one positive outcome for every discovered test
+identity from this closed set:
 
-The initial dispatcher may obtain terminal results from cargo-nextest 0.9.126
+- `executed-and-passed`: the identity was selected and emitted a passing
+  per-test terminal event;
+- `executed-and-failed`: the identity was selected and emitted a failing
+  per-test terminal event;
+- `declared-not-selected`: the registry declares that identity's tier out of
+  scope for this context; or
+- `declared-not-executed-with-reason`: the dispatcher or declared skip helper
+  positively records why an otherwise selected identity did not execute its
+  promised observation.
+
+Accounting an `executed-and-failed` outcome does not convert semantic failure
+into success; the dispatcher still returns a failing status.
+
+A `started` event is not terminal. `declared-not-selected` must come from the
+registry before execution. `declared-not-executed-with-reason` may come only
+from a dispatcher declaration made before execution or from the
+machine-readable skip helper; it is never inferred from a missing runner
+event.
+
+The dispatcher reconciles the outcome table one-to-one against nextest
+discovery, the effective selected inventory, and the runner's own
+run/pass/fail/not-run totals. An identity with zero or multiple outcomes
+fails the run. A selected identity with no terminal event and no positive
+declared-not-executed record fails the run. A terminal event for an identity
+declared unselected or not executed also fails the run. Selected-set equality
+is necessary but insufficient.
+
+The initial dispatcher may obtain executed outcomes from cargo-nextest 0.9.126
 with `NEXTEST_EXPERIMENTAL_LIBTEST_JSON=1` and
 `--message-format libtest-json-plus`. Because that interface is experimental,
-the dispatcher owns the environment flag and parser and fails closed when the
-machine-readable result stream is unavailable or malformed.
+the registry version-pins the recognized raw event-to-outcome mapping, and the
+dispatcher owns the environment flag and parser. Unknown events or an
+unavailable or malformed stream fail closed. The dispatcher reconciles
+explicit not-run declarations with nextest's aggregate skipped/not-run count;
+it does not translate raw event absence into an outcome.
 
 A context-specific difference may exist only when the registry declares it
 with a reason, owner, and expiry. It cannot be expressed as an inline
@@ -272,7 +320,8 @@ The default behavior is to fail with the unmet precondition.
 Where Rust's test harness cannot express a native skip result, test code may
 use one declared helper that emits a machine-readable skip record keyed to
 the discovered test identity. The helper is diagnostic accounting, not a
-success escape:
+success escape. Its record maps to
+`declared-not-executed-with-reason`, never to `executed-and-passed`:
 
 - a required dispatcher fails if its recorded skip count is non-zero;
 - a scheduled external or soak context fails if its promised infrastructure
@@ -344,9 +393,9 @@ behavior.
 - the observation-completeness governance audit.
 
 Pull-request CI invokes the same registry-derived required dispatcher and
-publishes the same selected-inventory, terminal-result, and skip-accounting
+publishes the same selected-inventory, closed-outcome, and skip-accounting
 receipt. Coverage tooling may add instrumentation, but it may not silently
-shrink the required inventory or omit terminal results.
+shrink the required inventory or omit an outcome.
 
 ### 9. A merge gate requires proven branch enforcement
 
@@ -375,12 +424,15 @@ multi-tier matches                         0
 unreachable declared tiers                 0
 undeclared required-context divergence     0
 hand-written exclusion filtersets          0
+non-registry scheduling overrides          0
 dispatcher bypasses                        0
 silent early-success paths                 0
 regeneration-as-passing-test paths          0
 required-run recorded skips                0
-required tests with no reported result      0
-reported results outside selected inventory 0
+identities without exactly one outcome      0
+executed identities without terminal event  0
+outcome / runner-summary mismatches          0
+required-run declared-not-executed outcomes 0
 legacy baseline allowlist                  0
 ```
 
@@ -392,7 +444,10 @@ integration-test runtime-precondition paths, two further live unit-test
 self-void paths, 22 dormant self-void paths, ten already-fail-closed success
 returns that must become explicit divergence, two regeneration escape
 hatches, and fragmented legacy runners are migration work. Moving a bypass
-from one container to another does not satisfy the policy.
+from one container to another does not satisfy the policy. The three existing
+`quic-localhost` scheduling overrides are also migration work under the
+registry's single-source rule; the measured tailnet backpressure case matches
+none of them and currently receives no declared isolation.
 
 ### 11. Enforcement order is part of the decision
 
@@ -407,10 +462,17 @@ There is no verified current substantive green baseline context. Rollout is:
    the current smaller CI inventory is complete.
 3. Introduce the registry, dispatcher, inventory reconciliation,
    syntax-aware test-exit audit, single skip-recording helper, skip
-   reconciliation, and tier jobs in advisory mode. At this stage the
-   dispatcher intentionally retains `--run-ignored default`: discovery and
-   governance account for all ignored tests, but the new dispatcher does not
-   execute them or claim a comprehensive receipt.
+   reconciliation, and tier jobs in advisory mode; absorb the three existing
+   scheduling overrides into the registry. At this stage the dispatcher
+   intentionally retains `--run-ignored default`. Before execution it emits a
+   temporary `declared-not-executed-with-reason` outcome for each ignored
+   identity that remains selected in that context, scoped to this advisory
+   migration and reconciled with nextest's aggregate skipped count. That
+   declaration has an owner and expires at step 5; it is derived from
+   discovered ignore state, not a per-test allowlist.
+   Outcome accounting can therefore pass honestly while the separate
+   comprehensive-readiness receipt reports the remaining migration work. The
+   dispatcher does not claim comprehensive coverage.
 4. Migrate the currently live integration-test and unit-test
    runtime-precondition paths, convert already-fail-closed success returns to
    explicit divergence, and move regeneration out of validation tests. Do not
@@ -433,6 +495,8 @@ There is no verified current substantive green baseline context. Rollout is:
 - Local and CI selection derive from one executable definition.
 - The gate proves both selection and observation; a selected-but-self-voiding
   test can no longer masquerade as coverage.
+- Every discovered identity has a positive, closed-set outcome; raw absence
+  can no longer mean either "ignored" or "process died."
 - Isolation, external infrastructure, and soak budgets remain expressible
   without creating a defect quarantine.
 - Required status claims become independently testable through inventory
@@ -444,7 +508,7 @@ There is no verified current substantive green baseline context. Rollout is:
   precondition paths, regeneration escape hatches, and legacy runners.
 - A syntax-aware Rust audit and machine-readable skip reconciliation add
   tooling that must be maintained with test-language changes.
-- Terminal-result reconciliation initially depends on cargo-nextest's
+- Executed-outcome reconciliation initially depends on cargo-nextest's
   experimental `libtest-json-plus` interface; its adapter must fail closed and
   be reviewed when nextest changes the format or stabilizes a replacement.
 - Required local and pull-request gates will take longer because
@@ -459,6 +523,8 @@ There is no verified current substantive green baseline context. Rollout is:
 - `#[ignore = "..."]` remains useful metadata for cargo's ordinary runner,
   but no longer decides routing.
 - The registry defines policies and selectors, not an exhaustive test list.
+- The registry also owns scheduling selectors currently hand-maintained as
+  nextest profile overrides.
 - Target-level namespaces classify homogeneous binaries efficiently; mixed
   binaries pay the cost of module/test-level naming.
 - Context-specific inventory divergence is visible, owned, and expiring
@@ -477,17 +543,21 @@ Before the comprehensive status can become required:
 - every declared tier is reachable from every context it names;
 - `just check` and pull-request CI emit and reconcile their effective
   selected inventories against the registry-derived required inventory;
-- each required run emits a machine-readable terminal result for every
-  required test identity, emits none outside its selected inventory, and
-  fails when the result stream is missing or malformed;
-- coverage uses the same required inventory and terminal-result
+- each context assigns exactly one declared closed-set outcome to every
+  discovered identity;
+- every executed outcome has a matching per-test terminal event, every
+  not-selected or not-executed outcome is positively declared rather than
+  inferred from absence, and outcome counts reconcile with nextest's own
+  run/pass/fail/not-run totals;
+- coverage uses the same required inventory and closed-outcome
   reconciliation;
 - governance finds no hand-written tier commands or inline workflow
-  exclusions outside the dispatcher;
+  exclusions or scheduling overrides outside the dispatcher/registry;
 - a syntax-aware audit over integration tests and unit-test modules finds no
   direct success return from a precondition or destructuring failure arm
   outside the declared skip helper;
-- a required run records zero skips and propagates semantic failure;
+- a required run records zero skips, zero declared-not-executed outcomes, and
+  propagates semantic failure;
 - regeneration commands and validation tests are distinct;
 - the migration receipt in Decision 10 is all zero;
 - API readback shows the exact comprehensive status required for `main`,
