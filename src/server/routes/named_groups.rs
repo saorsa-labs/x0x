@@ -16608,8 +16608,11 @@ mod tests {
     //
     // Interval (ADR 0024 break-disclosure rule): `remove_named_group_member`
     // entry (`:8516`) → target operation publish (`:8707`). Resolves at
-    // `9d11d69` (production unchanged from `f52746c`; this commit is
-    // comment-only); re-resolve after any rebase (ADR 0024 `ca85a1d`).
+    // `9d11d69`; receipt (ADR 0024 `9fb3b20`): `head -n 16378` of this file
+    // ⇒ sha256 `89bb14e96b3f71525d5cd3d746eb1a71573b94d462b32986ba64a2d2d5d33ccb`,
+    // identical at `9d11d69` and `6cc03e5`. Highest cite `:12408` < 16378,
+    // and this commit edits no line ≤ 16378, so the hash holds here too.
+    // Re-resolve after any rebase.
     //
     // Break list — every control-flow exit / alternate dispatch in the
     // interval, each with its evidence:
@@ -16798,8 +16801,11 @@ mod tests {
     //
     // Interval (ADR 0024 break-disclosure rule): `secure_group_decrypt` entry
     // (`:12297`) → target operation `cipher.decrypt` (`:12381`). Resolves at
-    // `9d11d69` (production unchanged from `f52746c`; this commit is
-    // comment-only); re-resolve after any rebase (ADR 0024 `ca85a1d`).
+    // `9d11d69`; receipt (ADR 0024 `9fb3b20`): `head -n 16378` of this file
+    // ⇒ sha256 `89bb14e96b3f71525d5cd3d746eb1a71573b94d462b32986ba64a2d2d5d33ccb`,
+    // identical at `9d11d69` and `6cc03e5`. Highest cite `:12408` < 16378,
+    // and this commit edits no line ≤ 16378, so the hash holds here too.
+    // Re-resolve after any rebase.
     //
     // Break list — every control-flow exit / alternate dispatch in the
     // interval, each with its evidence:
