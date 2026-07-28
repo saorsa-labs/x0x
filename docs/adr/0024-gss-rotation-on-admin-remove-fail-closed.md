@@ -76,6 +76,9 @@ reachability unresolved rather than declared defective.
 
 ## Validation
 
+Every control must be shown to fail on the pinned pre-fix commit or on a
+mutation, and to pass on the patched tree.
+
 Acceptance requires independent controls showing that:
 
 - a survivor decrypts content published at the rotated epoch;

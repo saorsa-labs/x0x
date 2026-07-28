@@ -19,6 +19,8 @@ computed from that field; no ADR-side chapter allowlist is maintained.
 Repository-baseline citations in this section resolve at:
 `e3013710d7ed69077de9a799dffdbeb5ac80535a`, with
 `git status --porcelain src/` empty.
+Unless a citation names another file, every bare `:N` or `:N-N` citation
+resolves to `src/server/routes/named_groups.rs`.
 
 **Two coordinate systems.** Code that F1 itself introduced does not exist at the baseline
 and cannot be cited there, so every such citation is stamped **at `56d0c4b`** in place —
