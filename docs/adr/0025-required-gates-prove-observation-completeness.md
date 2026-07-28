@@ -3,7 +3,7 @@
 - **Status:** Proposed — pre-consensus (Kimi ruling outstanding)
 - **Date:** 2026-07-28
 - **Decision owners:** David Irvine
-- **Reviewers:** Dario (draft review pending); Kimi (required ruling outstanding); Watson (evidence verification)
+- **Reviewers:** Dario (amended-draft review pending); Kimi (required ruling outstanding); Watson (evidence verification)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** `justfile`, `.github/workflows/ci.yml`,
@@ -58,7 +58,10 @@ The measured repository state illustrates the gap:
 - those workflow filters remove five non-ignored tests from Coverage, so the
   245-test ignore census cannot see the divergence;
 - local `just` recipes, CI workflows, and two orphaned shell scripts select
-  ignored tests with separately maintained commands;
+  ignored tests with separately maintained commands; the orphaned shell
+  runner graph also reaches `tests/runners/x0x_test_runner.py`, which has its
+  own retry accounting and is not invoked directly by a tracked workflow or
+  `justfile` recipe;
 - no CI workflow invokes `just`, so local and CI gates share no dispatcher;
 - `.config/nextest.toml` separately owns three
   `profile.default.overrides` filtersets that assign the serialized
@@ -224,18 +227,26 @@ tier definition owns:
 - its positive `binary(...)` / `test(...)` selector;
 - every permitted context-specific exclusion;
 - local, pull-request, external, and scheduled execution contexts;
-- scheduling, isolation, concurrency, and timeout policy;
+- scheduling, isolation, concurrency, timeout, termination, and retry policy;
 - infrastructure preconditions;
 - failure policy;
 - owner; and
 - reason and expiry for any declared context-specific divergence.
 
-A single dispatcher consumes the registry. Hand-written tier-specific nextest
-commands, inline workflow exclusions, and separately maintained test lists
-are forbidden. The three existing `quic-localhost` scheduling overrides are
-migration inputs: their selectors and concurrency policy must move under the
-registry, and any generated nextest configuration must be derived from it
-rather than maintained as a second source.
+A single dispatcher consumes the registry. Any policy that affects selection,
+scheduling, isolation, concurrency, timeout, termination, or retry behavior
+for a required tier must be derived from the registry, irrespective of the
+tool or file in which that policy is expressed. A workflow, nextest profile,
+script, `justfile` recipe, or successor container may consume generated policy
+but may not become an independent authority.
+
+Hand-written tier-specific nextest commands, inline workflow exclusions, and
+separately maintained test lists are known violations of that property, not a
+closed taxonomy. The three existing `quic-localhost` scheduling overrides and
+the default profile's slow-test termination policy are migration inputs. Their
+selectors and execution policy must move under the registry, and any generated
+nextest configuration must be derived from it rather than maintained as a
+second source.
 
 `run-required` iterates the registry definitions for `default` and
 `required-isolated`; `just check` invokes `run-required`. CI derives its
@@ -280,11 +291,19 @@ identity from this closed set:
 Accounting an `executed-and-failed` outcome does not convert semantic failure
 into success; the dispatcher still returns a failing status.
 
-A `started` event is not terminal. `declared-not-selected` must come from the
-registry before execution. `declared-not-executed-with-reason` may come only
-from a dispatcher declaration made before execution or from the
-machine-readable skip helper; it is never inferred from a missing runner
-event.
+A `started` event is evidence only that an identity appeared in the stream,
+not that it executed: ignored tests emit `started` without running.
+`declared-not-selected` must come from the registry before execution.
+`declared-not-executed-with-reason` may come only from a dispatcher
+declaration made before execution or from the machine-readable skip helper; it
+is never inferred from a missing runner event.
+
+During rollout steps 3 and 4, the sole temporary authority for declaring an
+ignored default-complement identity not executed is the dispatcher's pre-run
+discovery of runner ignore state, reconciled with the runner's aggregate
+not-run count. It is not a per-test registry entry or allowlist. After step 5
+removes that migration state, the registry's context and tier policy is the
+only authority for a pre-run not-selected declaration.
 
 The dispatcher reconciles the outcome table one-to-one against nextest
 discovery, the effective selected inventory, and the runner's own
@@ -318,10 +337,16 @@ An unmet runtime precondition may not resolve to an ordinary passing test.
 The default behavior is to fail with the unmet precondition.
 
 Where Rust's test harness cannot express a native skip result, test code may
-use one declared helper that emits a machine-readable skip record keyed to
-the discovered test identity. The helper is diagnostic accounting, not a
-success escape. Its record maps to
-`declared-not-executed-with-reason`, never to `executed-and-passed`:
+use one declared skip-exit helper that emits a machine-readable skip record
+keyed to the discovered test identity and exits the test. The helper must be
+the exit operation itself: one macro or equivalent syntax-level construct
+performs both actions, and its call site contains no separate success return.
+`record_skip("reason"); return Ok(())` is forbidden because recognizing it
+would require the audit to infer statement domination.
+
+The helper is diagnostic accounting, not an observation or a bypass. Its
+record maps to `declared-not-executed-with-reason`, never to
+`executed-and-passed`:
 
 - a required dispatcher fails if its recorded skip count is non-zero;
 - a scheduled external or soak context fails if its promised infrastructure
@@ -329,9 +354,9 @@ success escape. Its record maps to
 - a tier not scheduled in a context is accounted for by the registry, not by
   a passing test.
 
-Within a test function's own control-flow scope, every
-precondition-failure or destructuring-failure arm must diverge through an
-assertion, `panic!`, `unreachable!`, or the declared skip helper. Direct
+Within a test function's own control-flow scope, every precondition-failure or
+destructuring-failure arm must either diverge through an assertion, `panic!`,
+or `unreachable!`, or exit through the declared skip-exit helper. Direct
 success returns such as `return;`, `return Ok(())`, and
 `let ... else { return Ok(()) }` are forbidden. An assertion-dominated
 destructuring arm must use explicit divergence rather than retain an
@@ -339,11 +364,12 @@ unreachable success return.
 
 The audit must be syntax-aware and cover integration-test functions and unit
 test modules. It distinguishes a return from the test function from a return
-inside a nested closure or async block, and recognizes only the declared skip
-helper as an allowed success-exit mechanism. It does not try to infer whether
-an assertion dominates a success return, and it does not grep for `return`,
-`Ok(())`, or a "skipping" message. The current brace-depth censuses may seed
-the implementation and migration, but are not the normative audit.
+inside a nested closure or async block, and recognizes only the single
+skip-exit construct as an allowed success-exit mechanism. It does not try to
+infer whether an assertion or a preceding skip-record call dominates a
+success return, and it does not grep for `return`, `Ok(())`, or a "skipping"
+message. The current brace-depth censuses may seed the implementation and
+migration, but are not the normative audit.
 
 ### 6. Regeneration and validation are separate entry points
 
@@ -368,8 +394,11 @@ semantics:
   regression normally;
 - if the current behavior is intended, convert the test to a passing
   characterization and track any desired semantic change separately; or
-- if intent is unresolved, keep the semantic decision visibly open in an
-  issue with an owner and expiry, without counting it as coverage.
+- if intent is unresolved, remove the disputed test from the executable suite
+  rather than ignoring or tiering it, preserve the reproducer and competing
+  expectations in an issue with an owner and expiry, and do not claim the
+  property as covered until the decision produces either a normal regression
+  or an honest characterization test.
 
 `Flaky` requires measured pass/fail evidence. Even measured intermittence is
 evidence for diagnosis, not a permanent tier. The historically retry-passing
@@ -425,6 +454,7 @@ unreachable declared tiers                 0
 undeclared required-context divergence     0
 hand-written exclusion filtersets          0
 non-registry scheduling overrides          0
+required-tier policy not registry-derived  0
 dispatcher bypasses                        0
 silent early-success paths                 0
 regeneration-as-passing-test paths          0
@@ -443,11 +473,15 @@ The 196 bare ignore attributes, current workflow exclusions, 31 live
 integration-test runtime-precondition paths, two further live unit-test
 self-void paths, 22 dormant self-void paths, ten already-fail-closed success
 returns that must become explicit divergence, two regeneration escape
-hatches, and fragmented legacy runners are migration work. Moving a bypass
-from one container to another does not satisfy the policy. The three existing
-`quic-localhost` scheduling overrides are also migration work under the
-registry's single-source rule; the measured tailnet backpressure case matches
-none of them and currently receives no declared isolation.
+hatches, and fragmented legacy runners are migration work. The legacy runner
+scope includes two orphaned shell entry points and
+`tests/runners/x0x_test_runner.py`, which those scripts invoke and which owns
+retry accounting of its own. Moving a bypass from one container to another
+does not satisfy the policy. The three existing `quic-localhost` scheduling
+overrides and the default profile's slow-test termination policy are also
+migration work under the registry's single-source rule; the measured tailnet
+backpressure case matches none of those test groups and currently receives no
+declared isolation.
 
 ### 11. Enforcement order is part of the decision
 
@@ -463,13 +497,14 @@ There is no verified current substantive green baseline context. Rollout is:
 3. Introduce the registry, dispatcher, inventory reconciliation,
    syntax-aware test-exit audit, single skip-recording helper, skip
    reconciliation, and tier jobs in advisory mode; absorb the three existing
-   scheduling overrides into the registry. At this stage the dispatcher
-   intentionally retains `--run-ignored default`. Before execution it emits a
-   temporary `declared-not-executed-with-reason` outcome for each ignored
-   identity that remains selected in that context, scoped to this advisory
-   migration and reconciled with nextest's aggregate skipped count. That
-   declaration has an owner and expires at step 5; it is derived from
-   discovered ignore state, not a per-test allowlist.
+   scheduling overrides and the default profile's termination policy into the
+   registry. At this stage the dispatcher intentionally retains
+   `--run-ignored default`. Before execution it emits a temporary
+   `declared-not-executed-with-reason` outcome for each ignored identity that
+   remains selected in that context, scoped to this advisory migration and
+   reconciled with nextest's aggregate skipped count. That declaration has an
+   owner and expires at step 5; it is derived from discovered ignore state,
+   not a per-test allowlist.
    Outcome accounting can therefore pass honestly while the separate
    comprehensive-readiness receipt reports the remaining migration work. The
    dispatcher does not claim comprehensive coverage.
@@ -551,11 +586,13 @@ Before the comprehensive status can become required:
   run/pass/fail/not-run totals;
 - coverage uses the same required inventory and closed-outcome
   reconciliation;
-- governance finds no hand-written tier commands or inline workflow
-  exclusions or scheduling overrides outside the dispatcher/registry;
+- governance proves every required-tier selection, scheduling, isolation,
+  concurrency, timeout, termination, and retry policy is derived from the
+  registry, in whatever file or tool expresses it;
 - a syntax-aware audit over integration tests and unit-test modules finds no
-  direct success return from a precondition or destructuring failure arm
-  outside the declared skip helper;
+  direct success return from a precondition or destructuring failure arm; the
+  only allowed success exit is the single skip-exit construct, whose call site
+  contains no separate return;
 - a required run records zero skips, zero declared-not-executed outcomes, and
   propagates semantic failure;
 - regeneration commands and validation tests are distinct;
