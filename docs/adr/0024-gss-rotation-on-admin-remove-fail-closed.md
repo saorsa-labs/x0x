@@ -527,7 +527,13 @@ reads as verified. Hashing the file's head up to the first changed line satisfie
 conditions only when the list sits *after* every line it cites, which is the ordinary shape
 for a break list in a test module citing production above it. A list that sits above its
 citations gets a head region that stops short of them and certifies nothing that matters:
-bound the region around the citations instead, and state its endpoints. Where a list is
+bound the region around the citations instead, and state its endpoints. **Both conditions can
+be met and the receipt still fail**, because a line number below an insertion does not name the
+same content at the parent and at the child: such a region needs **two endpoint pairs, one per
+commit, differing by the edit's line delta** — or to be bound by an anchor in the content
+rather than by line number at all. The ordinary shape needs neither, and the reason is worth
+stating because it is what makes head-hashing sound rather than merely convenient: **an edit
+below a region cannot move the lines above it.** Where a list is
 written against a tree it does not ship in — a review copy, a receipt
 posted before the commit lands — the final-SHA requirement above applies unchanged.
 
