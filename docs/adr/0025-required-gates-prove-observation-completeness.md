@@ -207,8 +207,14 @@ The initial tiers are:
 | `required-isolated` | `just check` and pull-request CI, after compilation with declared isolation/concurrency |
 | `external` | only in the context that supplies its declared infrastructure |
 | `soak` | on its declared schedule and budget |
+| `governance-fixture` | only in the registry-declared `fixture` context; never in a functional required inventory |
 
 There is no `flaky` or `known-defect` tier.
+
+`governance-fixture` is a non-functional control tier, not a product-test
+opt-out. It contains only the exact governance fixtures that certify the
+dispatcher itself and is unreachable through ordinary or required-tier
+selectors.
 
 A compile-contention measurement for
 `tailnet_streams_integration::backpressure_throttles_writer_with_bounded_buffering`
@@ -221,17 +227,22 @@ causation. That tier remains required locally and in pull-request CI.
 
 ### 3. One executable registry owns routing and reachability
 
-The registry enumerates tier definitions, not individual default tests. Each
-tier definition owns:
+The registry enumerates tier definitions, not individual default tests. Its
+context schema contains `local`, `pull-request`, `external`, `scheduled`, and
+`fixture`. Each functional tier definition owns:
 
 - its positive `binary(...)` / `test(...)` selector;
 - every permitted context-specific exclusion;
-- local, pull-request, external, and scheduled execution contexts;
+- the non-fixture execution contexts in which it runs;
 - scheduling, isolation, concurrency, timeout, termination, and retry policy;
 - infrastructure preconditions;
 - failure policy;
 - owner; and
 - reason and expiry for any declared context-specific divergence.
+
+The non-functional `governance-fixture` definition instead owns the exact
+fixture identities and the `fixture` context. That context has one entry point
+and is the only context permitted to select those identities.
 
 A single dispatcher consumes the registry. Any policy that affects selection,
 scheduling, isolation, concurrency, timeout, termination, or retry behavior
@@ -252,6 +263,16 @@ second source.
 `required-isolated`; `just check` invokes `run-required`. CI derives its
 required and scheduled matrices from the same registry and invokes the same
 dispatcher.
+
+The dispatcher exposes exactly one registry-declared governance-fixture target
+mode as the sole entry point for the `fixture` context. It accepts only a
+closed registry fixture key, never a caller-supplied selector or arbitrary
+target, and resolves that key only to exact identities in the
+`governance-fixture` tier. It executes the same runner adapter, outcome mapping,
+reconciliation, and semantic-failure propagation path as a required run. A
+governance audit may invoke that mode as a separate self-test, but the mode
+cannot supply, replace, narrow, or extend the inventory of any required local
+or CI context.
 
 The invariant is one execution definition per tier, reachable in every
 context that definition declares. It is not "exactly one process" or "exactly
@@ -275,8 +296,15 @@ ignore-state disposition is applied. During the advisory migration, an
 ignored identity in the default complement therefore remains selected even
 though it receives a declared not-executed outcome.
 
-Each context also emits exactly one positive outcome for every discovered test
-identity from this closed set:
+In governance-fixture target mode, the exact identities declared by the
+`governance-fixture` tier are that run's required inventory. The same
+selection and outcome reconciliation applies. Its inventory reconciliation
+must succeed before the audit may attribute a non-zero exit to the behavior a
+fixture is intended to certify.
+
+Each required context and governance-fixture run also emits exactly one
+positive outcome for every identity in its discovery scope from this closed
+set:
 
 - `executed-and-passed`: the identity was selected and emitted a passing
   per-test terminal event;
@@ -287,6 +315,15 @@ identity from this closed set:
 - `declared-not-executed-with-reason`: the dispatcher or declared skip helper
   positively records why an otherwise selected identity did not execute its
   promised observation.
+
+Each label is valid only when every predicate in its definition holds. The
+reconciler therefore rejects an executed outcome for an unselected identity;
+an executed outcome whose pass/fail polarity lacks the matching terminal
+event; a `declared-not-selected` outcome for a selected identity or without a
+pre-run registry declaration; and a
+`declared-not-executed-with-reason` outcome for an unselected identity, without
+one of the permitted positive sources, or alongside a terminal event. An
+unknown outcome label is not an extensibility point and fails closed.
 
 Accounting an `executed-and-failed` outcome does not convert semantic failure
 into success; the dispatcher still returns a failing status.
@@ -306,11 +343,13 @@ removes that migration state, the registry's context and tier policy is the
 only authority for a pre-run not-selected declaration.
 
 The dispatcher reconciles the outcome table one-to-one against nextest
-discovery, the effective selected inventory, and the runner's own
-run/pass/fail/not-run totals. An identity with zero or multiple outcomes
-fails the run. A selected identity with no terminal event and no positive
-declared-not-executed record fails the run. A terminal event for an identity
-declared unselected or not executed also fails the run. Selected-set equality
+discovery, the effective selected inventory, the closed outcome definitions,
+and the runner's own run/pass/fail/not-run totals. An identity with zero or
+multiple outcomes fails the run. A selected identity with no terminal event
+and no positive declared-not-executed record fails the run. A selected identity
+carrying `declared-not-selected` fails the run. An executed outcome or reported
+terminal result outside the selected inventory fails the run. A terminal event
+for an identity declared not executed also fails the run. Selected-set equality
 is necessary but insufficient.
 
 The initial dispatcher may obtain executed outcomes from cargo-nextest 0.9.126
@@ -321,6 +360,42 @@ dispatcher owns the environment flag and parser. Unknown events or an
 unavailable or malformed stream fail closed. The dispatcher reconciles
 explicit not-run declarations with nextest's aggregate skipped/not-run count;
 it does not translate raw event absence into an outcome.
+
+Outcome reconciliation has a governance mutation manifest derived from the
+union of the rejection rules above and every predicate in the closed outcome
+definitions. The registry declares one case per atomic mutation in the
+non-functional `governance-fixture` tier:
+
+- zero outcomes and multiple outcomes for one identity are separate cases;
+- an `executed-and-passed` or `executed-and-failed` outcome for an unselected
+  identity, without its matching terminal event, or with the opposite terminal
+  polarity is mutated separately;
+- `declared-not-selected` on a selected identity and without its pre-run
+  registry declaration, and alongside a terminal event are separate cases;
+- `declared-not-executed-with-reason` on an unselected identity, without a
+  permitted positive source, and alongside a terminal event are separate
+  cases;
+- an unknown outcome label is a separate fail-closed parser case; and
+- an otherwise valid outcome table disagreeing with the runner's aggregate
+  run/pass/fail/not-run totals is a separate case.
+
+Each fixture mutates exactly one predicate from an otherwise valid state. When
+that state also satisfies an umbrella rejection sentence above, the mutation
+manifest names the canonical diagnostic and no other diagnostic may satisfy
+the control. The audit passes only when selected-inventory reconciliation
+succeeds, the dispatcher reports that named outcome-reconciliation failure,
+attributes its non-zero status to that failure, and exits non-zero. A
+skip-helper record, semantic test failure, unrelated inventory failure, another
+reconciliation condition, or a self-reported zero receipt cannot satisfy a
+control.
+
+Governance checks the mutation manifest and the outcome-accounting rows in the
+Decision 10 receipt in both directions: every atomic invalid state has a
+specific diagnostic and receipt row, and every such receipt row is justified
+by at least one independently reddening mutation case. The steady-state
+readiness row that requires zero valid
+`declared-not-executed-with-reason` outcomes is identified separately and is
+not misrepresented as an invalid-state mutation.
 
 A context-specific difference may exist only when the registry declares it
 with a reason, owner, and expiry. It cannot be expressed as an inline
@@ -346,18 +421,26 @@ would require the audit to infer statement domination.
 
 The one allowed helper is pinned to an exact definition rather than accepted
 by a name pattern. Governance verifies that definition emits the
-machine-readable record and owns a positive-control fixture outside the
-workspace's discovered test inventory. The audit invokes that fixture through
-the required dispatcher as a subprocess and passes only when the helper fires
-and the dispatcher exits non-zero. The fixture is not an ordinary test and is
-not placed in a functional tier: either placement would make the required
-inventory permanently red or certify the wrong execution context.
+machine-readable record. The registry declares its positive-control fixture in
+the non-functional `governance-fixture` tier, outside the workspace's ordinary
+discovered test inventory. The audit invokes it through the dispatcher's
+closed fixture mode as a subprocess and passes only when all of these hold:
+the helper record maps the fixture identity to
+`declared-not-executed-with-reason`; inventory and outcome reconciliation
+otherwise succeed; the dispatcher attributes its failure to the non-zero
+skip-helper record count; and the dispatcher exits non-zero. An inventory or
+reconciliation failure cannot satisfy the control. The fixture is not an
+ordinary test and is not placed in a functional tier, because either placement
+would make the required inventory permanently red or certify the wrong
+execution context.
 
 The helper is diagnostic accounting, not an observation or a bypass. Its
 record maps to `declared-not-executed-with-reason`, never to
 `executed-and-passed`:
 
-- a required dispatcher fails if its recorded skip count is non-zero;
+- a required dispatcher fails if its skip-helper record count is non-zero;
+  that count includes only machine-readable records emitted by the pinned
+  helper, never dispatcher pre-run declarations;
 - a scheduled external or soak context fails if its promised infrastructure
   is absent; and
 - a tier not scheduled in a context is accounted for by the registry, not by
@@ -447,11 +530,15 @@ Enforcement requires both:
 2. an intentionally red pull request that GitHub refuses to merge.
 
 Dispatcher failure propagation has its own governance negative control,
-separate from the transient red pull request. Governance owns a deliberately
-failing fixture outside the workspace's discovered test inventory and invokes
-the required dispatcher over it as a subprocess. The audit passes only when
-the dispatcher reports the executed failure and exits non-zero. The fixture is
-not an ordinary test and is not assigned to a functional tier, because either
+separate from the transient red pull request. The registry declares a
+deliberately failing fixture in the non-functional `governance-fixture` tier,
+outside the workspace's ordinary discovered test inventory. Governance invokes
+it through the dispatcher's closed fixture mode as a subprocess. The audit
+passes only when the fixture receives `executed-and-failed`, inventory and
+outcome reconciliation otherwise succeed, the dispatcher attributes its
+failing status to that semantic failure, and it exits non-zero. An inventory
+or reconciliation failure cannot satisfy the control. The fixture is not an
+ordinary test and is not assigned to a functional tier, because either
 placement would make a normal required run permanently red or exercise a
 different context from the one being certified.
 
@@ -476,9 +563,14 @@ required-tier policy not registry-derived  0
 dispatcher bypasses                        0
 silent early-success paths                 0
 regeneration-as-passing-test paths          0
-required-run recorded skips                0
+required-run skip-helper records           0
+unknown outcome labels                     0
 identities without exactly one outcome      0
-executed identities without terminal event  0
+executed-outcome / terminal mismatches       0
+selected identities declared not selected   0
+outcomes without authorized declaration     0
+not-executed outcomes contradicting state    0
+reported results outside selected inventory 0
 outcome / runner-summary mismatches          0
 required-run declared-not-executed outcomes 0
 legacy baseline allowlist                  0
@@ -514,10 +606,12 @@ There is no verified current substantive green baseline context. Rollout is:
    the current smaller CI inventory is complete.
 3. Introduce the registry, dispatcher, inventory reconciliation,
    syntax-aware test-exit audit, single skip-recording helper, skip
-   reconciliation, the two governance-owned out-of-inventory control fixtures,
-   and tier jobs in advisory mode; absorb the three existing scheduling
-   overrides and the default profile's termination policy into the registry.
-   At this stage the dispatcher intentionally retains
+   reconciliation, the non-functional governance tier and its closed fixture
+   mode with the complete outcome-reconciliation mutation manifest,
+   skip-helper positive control, and semantic-failure control outside the
+   ordinary workspace inventory, and tier jobs in advisory mode; absorb the
+   three existing scheduling overrides and the default profile's termination
+   policy into the registry. At this stage the dispatcher intentionally retains
    `--run-ignored default`. Before execution it emits a temporary
    `declared-not-executed-with-reason` outcome for each ignored identity that
    remains selected in that context, scoped to this advisory migration and
@@ -608,17 +702,31 @@ Before the comprehensive status can become required:
 - governance proves every required-tier selection, scheduling, isolation,
   concurrency, timeout, termination, and retry policy is derived from the
   registry, in whatever file or tool expresses it;
+- the governance-fixture mode accepts only a closed registry fixture key,
+  never a caller-supplied target or selector, selects only its
+  registry-declared identities, follows the required reconciliation path, and
+  cannot change a required context's inventory;
+- the governance-tier mutation manifest independently proves every atomic
+  invalid state derived from the outcome-reconciliation rejection rules and
+  the closed outcome definitions, including cardinality, selection,
+  per-identity terminal polarity, declaration source, and runner-aggregate
+  mismatches; the audit checks the manifest and every outcome-accounting
+  receipt row in both directions, and each control requires selected-inventory
+  reconciliation to succeed and attributes the non-zero dispatcher exit only
+  to its named condition;
 - a syntax-aware audit over integration tests and unit-test modules finds no
   direct success return from a precondition or destructuring failure arm; the
   only allowed success exit is the single skip-exit construct, whose call site
   contains no separate return;
 - governance pins that skip-exit construct to one exact definition and its
-  out-of-inventory positive-control fixture proves that the helper records a
-  skip and makes the required dispatcher exit non-zero;
-- an out-of-inventory deliberately failing fixture proves that the required
-  dispatcher reports semantic failure and exits non-zero;
-- a required run records zero skips, zero declared-not-executed outcomes, and
-  propagates semantic failure;
+  governance-tier positive-control fixture proves that the helper record
+  caused the non-zero dispatcher exit while inventory and outcome
+  reconciliation succeeded;
+- a governance-tier deliberately failing fixture proves that its
+  `executed-and-failed` outcome caused the non-zero dispatcher exit while
+  inventory and outcome reconciliation succeeded;
+- a required run emits zero skip-helper records, zero
+  declared-not-executed outcomes, and propagates semantic failure;
 - regeneration commands and validation tests are distinct;
 - the migration receipt in Decision 10 is all zero;
 - API readback shows the exact comprehensive status required for `main`,
