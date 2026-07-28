@@ -519,9 +519,16 @@ commit: the SHA does not exist until the bytes containing it are fixed. Such a l
 **declares its parent, and asserts that the cited region is unchanged between that parent and
 the commit carrying the list — with a receipt, not an assurance.** A hash of the region at
 both commits is that receipt; "production is untouched" as a bare parenthetical is not, because
-it is exactly the claim a reader cannot check without redoing the work. The region only has to
-cover the cited lines, so hashing the file's head up to the first changed line is usually
-enough. Where a list is written against a tree it does not ship in — a review copy, a receipt
+it is exactly the claim a reader cannot check without redoing the work. **The region has two
+conditions, and the second is the one that bites: it must contain every cited line, and it
+must contain none of the edit that writes the receipt.** A receipt its own commit invalidates
+is worse than none — the hash is stale the moment it is recorded, and stale in a way that
+reads as verified. Hashing the file's head up to the first changed line satisfies both
+conditions only when the list sits *after* every line it cites, which is the ordinary shape
+for a break list in a test module citing production above it. A list that sits above its
+citations gets a head region that stops short of them and certifies nothing that matters:
+bound the region around the citations instead, and state its endpoints. Where a list is
+written against a tree it does not ship in — a review copy, a receipt
 posted before the commit lands — the final-SHA requirement above applies unchanged.
 
 **The exit inventory is a floor for a second reason: some breaks are not exits at all.** Where
