@@ -344,6 +344,15 @@ performs both actions, and its call site contains no separate success return.
 `record_skip("reason"); return Ok(())` is forbidden because recognizing it
 would require the audit to infer statement domination.
 
+The one allowed helper is pinned to an exact definition rather than accepted
+by a name pattern. Governance verifies that definition emits the
+machine-readable record and owns a positive-control fixture outside the
+workspace's discovered test inventory. The audit invokes that fixture through
+the required dispatcher as a subprocess and passes only when the helper fires
+and the dispatcher exits non-zero. The fixture is not an ordinary test and is
+not placed in a functional tier: either placement would make the required
+inventory permanently red or certify the wrong execution context.
+
 The helper is diagnostic accounting, not an observation or a bypass. Its
 record maps to `declared-not-executed-with-reason`, never to
 `executed-and-passed`:
@@ -437,6 +446,15 @@ Enforcement requires both:
 1. API readback of the configured rule and exact required status context; and
 2. an intentionally red pull request that GitHub refuses to merge.
 
+Dispatcher failure propagation has its own governance negative control,
+separate from the transient red pull request. Governance owns a deliberately
+failing fixture outside the workspace's discovered test inventory and invokes
+the required dispatcher over it as a subprocess. The audit passes only when
+the dispatcher reports the executed failure and exits non-zero. The fixture is
+not an ordinary test and is not assigned to a functional tier, because either
+placement would make a normal required run permanently red or exercise a
+different context from the one being certified.
+
 Security Audit, Claude Code, or another context that does not produce a
 substantive pass/fail test observation cannot substitute for the required
 test context.
@@ -496,9 +514,10 @@ There is no verified current substantive green baseline context. Rollout is:
    the current smaller CI inventory is complete.
 3. Introduce the registry, dispatcher, inventory reconciliation,
    syntax-aware test-exit audit, single skip-recording helper, skip
-   reconciliation, and tier jobs in advisory mode; absorb the three existing
-   scheduling overrides and the default profile's termination policy into the
-   registry. At this stage the dispatcher intentionally retains
+   reconciliation, the two governance-owned out-of-inventory control fixtures,
+   and tier jobs in advisory mode; absorb the three existing scheduling
+   overrides and the default profile's termination policy into the registry.
+   At this stage the dispatcher intentionally retains
    `--run-ignored default`. Before execution it emits a temporary
    `declared-not-executed-with-reason` outcome for each ignored identity that
    remains selected in that context, scoped to this advisory migration and
@@ -593,6 +612,11 @@ Before the comprehensive status can become required:
   direct success return from a precondition or destructuring failure arm; the
   only allowed success exit is the single skip-exit construct, whose call site
   contains no separate return;
+- governance pins that skip-exit construct to one exact definition and its
+  out-of-inventory positive-control fixture proves that the helper records a
+  skip and makes the required dispatcher exit non-zero;
+- an out-of-inventory deliberately failing fixture proves that the required
+  dispatcher reports semantic failure and exits non-zero;
 - a required run records zero skips, zero declared-not-executed outcomes, and
   propagates semantic failure;
 - regeneration commands and validation tests are distinct;
