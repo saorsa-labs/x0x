@@ -1,9 +1,9 @@
 # ADR 0025: Required Gates Must Prove Observation Completeness
 
-- **Status:** Proposed — pre-consensus (Kimi ruling outstanding)
+- **Status:** Accepted 2026-07-28 by the decision owner at commit `c35336a3f7044b03191b6ef270be9298d30a9373`, recorded as Buzz event `00c8063894d4070f87c5ed9ab19c337b248a043fb0a963d960b3279b2fe8cf4d`. Kimi's ruling was waived by the decision owner, not obtained.
 - **Date:** 2026-07-28
 - **Decision owners:** David Irvine
-- **Reviewers:** Dario; Kimi (required ruling outstanding); Watson
+- **Reviewers:** Sam (author); Dario; Watson. Kimi did not review; his ruling was waived (see Status).
 - **Supersedes:** none
 - **Superseded by:** none
 
