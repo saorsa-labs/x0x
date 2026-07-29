@@ -113,8 +113,9 @@ pub(in crate::server) struct TreeKemCacheMutation {
 }
 
 #[cfg(test)]
-static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<Vec<(String, String)>> =
-    StdMutex::new(Vec::new());
+static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
+    Vec<(String, String, Option<String>)>,
+> = StdMutex::new(Vec::new());
 
 #[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
@@ -515,6 +516,18 @@ fn named_group_metadata_event_group_id(event: &NamedGroupMetadataEvent) -> &str 
     }
 }
 
+/// Test-only extractor mirroring [`named_group_metadata_event_group_id`]: the
+/// hex agent_id of the intended recipient for `SecureShareDelivered`, `None`
+/// for every other variant. Lets the publish-attempt recorder capture the
+/// published recipient set rather than only a publish count.
+#[cfg(test)]
+fn named_group_metadata_event_recipient(event: &NamedGroupMetadataEvent) -> Option<&str> {
+    match event {
+        NamedGroupMetadataEvent::SecureShareDelivered { recipient, .. } => Some(recipient),
+        _ => None,
+    }
+}
+
 fn withdrawn_group_allows_metadata_event(event: &NamedGroupMetadataEvent) -> bool {
     matches!(
         event,
@@ -637,6 +650,12 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// TreeKEM epoch after applying `treekem_commit_b64`.
         #[serde(default)]
         treekem_epoch: Option<u64>,
+        /// For MlsEncrypted groups, the new GSS secret epoch committed into
+        /// the signed state hash (F1 / ADR-0010). Receivers update the
+        /// security binding before `finalize_applied_commit`, mirroring
+        /// `MemberBanned`.
+        #[serde(default)]
+        secret_epoch: Option<u64>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -867,12 +886,76 @@ fn secure_share_aad(group_id: &str, recipient_hex: &str, secret_epoch: u64) -> V
     aad
 }
 
+/// Failure constructing a `SecureShareDelivered` envelope without side effects.
+///
+/// Carries only the failure class — never key material or ciphertext — so
+/// logging the error cannot leak the group secret. Same conservative posture
+/// as F1 §2a constraint 3 (the `Vec<u8>` → `[u8; 32]` conversion's `Err`
+/// payload *is* the secret), applied to the KEM seal path here.
+#[derive(Debug)]
+enum SecureShareError {
+    /// Recipient KEM public key was not valid base64.
+    InvalidKemKey,
+    /// ML-KEM encapsulation or AEAD seal failed.
+    SealFailed,
+}
+
+/// Build — but do not publish — a `SecureShareDelivered` envelope sealed to the
+/// recipient's ML-KEM-768 public key. Side-effect-free: no metadata publish,
+/// no delivery spawn. This is the preflight primitive for the admin-remove
+/// path (F1 §5): it must validate *every* survivor envelope before
+/// `seal_commit` and abort (fail closed) on the first that cannot build.
+///
+/// `publish_secure_share` delegates here and then publishes, preserving its
+/// fail-open contract for approval/ban. The remove path calls this directly
+/// and fails CLOSED — it never proceeds past a survivor whose envelope cannot
+/// be built (F1 §5a).
+fn build_secure_share_event(
+    group_id: &str,
+    recipient_hex: &str,
+    recipient_kem_public_b64: &str,
+    actor_hex: &str,
+    secret: &[u8; 32],
+    secret_epoch: u64,
+) -> Result<NamedGroupMetadataEvent, SecureShareError> {
+    use base64::Engine as _;
+    let recipient_kem_public = BASE64
+        .decode(recipient_kem_public_b64)
+        .map_err(|_| SecureShareError::InvalidKemKey)?;
+    let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
+    let (kem_ct, aead_nonce, aead_ct) = x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+        &recipient_kem_public,
+        &aad,
+        secret,
+    )
+    .map_err(|_| SecureShareError::SealFailed)?;
+    Ok(NamedGroupMetadataEvent::SecureShareDelivered {
+        group_id: group_id.to_string(),
+        recipient: recipient_hex.to_string(),
+        secret_epoch,
+        kem_ciphertext_b64: BASE64.encode(&kem_ct),
+        aead_nonce_b64: BASE64.encode(aead_nonce),
+        aead_ciphertext_b64: BASE64.encode(&aead_ct),
+        actor: actor_hex.to_string(),
+    })
+}
+
 /// Build and publish a `SecureShareDelivered` envelope sealed to the named
-/// recipient's ML-KEM-768 public key. Used by approval (new member) and
-/// ban-rekey (remaining members). Returns true iff the envelope was sealed
-/// and broadcast. Returns false if the recipient's KEM pubkey is unknown
-/// locally — in that case the caller should log and proceed without the
-/// envelope rather than crashing.
+/// recipient's ML-KEM-768 public key, used by the approval (new member) and
+/// ban-rekey (remaining members) paths.
+///
+/// **Fail-open contract — approval/ban only.** Returns true iff the envelope
+/// was sealed and broadcast; returns false if the recipient's KEM pubkey is
+/// unknown or unusable locally, in which case the caller logs and proceeds
+/// without the envelope rather than crashing. That is the right call for
+/// approval/ban, which have *already* persisted the roster change by the time
+/// they seal and so cannot abort.
+///
+/// The admin-remove path does **not** use this function: it builds every
+/// survivor envelope up front via `build_secure_share_event` and fails CLOSED
+/// (aborting before `seal_commit`) if any cannot be built (F1 §5/§5a). Do not
+/// route remove through here — that would re-introduce the fail-open the F1
+/// design exists to close.
 #[allow(clippy::too_many_arguments)]
 async fn publish_secure_share(
     state: &AppState,
@@ -884,38 +967,29 @@ async fn publish_secure_share(
     secret: &[u8; 32],
     secret_epoch: u64,
 ) -> bool {
-    use base64::Engine as _;
-    let recipient_kem_public = match BASE64.decode(recipient_kem_public_b64) {
-        Ok(b) => b,
-        Err(e) => {
+    let event = match build_secure_share_event(
+        group_id,
+        recipient_hex,
+        recipient_kem_public_b64,
+        actor_hex,
+        secret,
+        secret_epoch,
+    ) {
+        Ok(ev) => ev,
+        Err(SecureShareError::InvalidKemKey) => {
             tracing::warn!(
                 recipient = %LogHexId::agent(&recipient_hex),
-                "publish_secure_share: recipient KEM public key not valid base64: {e}"
+                "publish_secure_share: recipient KEM public key not valid base64"
             );
             return false;
         }
-    };
-    let aad = secure_share_aad(group_id, recipient_hex, secret_epoch);
-    let (kem_ct, aead_nonce, aead_ct) =
-        match x0x::groups::kem_envelope::seal_group_secret_to_recipient(
-            &recipient_kem_public,
-            &aad,
-            secret,
-        ) {
-            Ok(t) => t,
-            Err(e) => {
-                tracing::warn!(recipient = %LogHexId::agent(&recipient_hex), "KEM seal failed: {e}");
-                return false;
-            }
-        };
-    let event = NamedGroupMetadataEvent::SecureShareDelivered {
-        group_id: group_id.to_string(),
-        recipient: recipient_hex.to_string(),
-        secret_epoch,
-        kem_ciphertext_b64: BASE64.encode(&kem_ct),
-        aead_nonce_b64: BASE64.encode(aead_nonce),
-        aead_ciphertext_b64: BASE64.encode(&aead_ct),
-        actor: actor_hex.to_string(),
+        Err(SecureShareError::SealFailed) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "KEM seal failed for secure-share envelope"
+            );
+            return false;
+        }
     };
     publish_named_group_metadata_event(state, metadata_topic, &event).await;
     spawn_named_group_event_delivery(state, recipient_hex, &event);
@@ -1804,6 +1878,7 @@ async fn publish_named_group_metadata_event(
         attempts.push((
             metadata_topic.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
+            named_group_metadata_event_recipient(event).map(str::to_string),
         ));
     }
 
@@ -4933,6 +5008,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             agent_id,
             treekem_commit_b64,
             treekem_epoch,
+            secret_epoch,
             commit,
             ..
         } => {
@@ -4944,6 +5020,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
             if !admin_remove_auth && !self_leave_auth {
+                return false;
+            }
+            // F1 §4 Step 0: a self-leave commit carrying a GSS secret_epoch is
+            // a crafted MemberSelf event — self-removal is rejected at the
+            // sender (§1) and a self-leave never rotates. Reject before the
+            // plane split so it cannot reach the GSS rekey branch.
+            if self_leave_auth && secret_epoch.is_some() {
                 return false;
             }
             let action_kind = if self_leave_auth {
@@ -4976,6 +5059,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 if let Some((_, epoch)) = treekem_payload.as_ref() {
                     next.secret_epoch = *epoch;
                     next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                } else if let Some(secret_epoch) = secret_epoch {
+                    let old_epoch = next.secret_epoch;
+                    next.secret_epoch = secret_epoch;
+                    next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+                    if old_epoch < secret_epoch {
+                        next.shared_secret = None;
+                    }
                 }
             }) else {
                 return false;
@@ -8437,6 +8527,19 @@ pub(in crate::server) async fn remove_named_group_member(
         }
     };
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // F1 §1: self-removal is a leave, not a remove. Reject before the
+    // membership lock — `leave_group` re-acquires the same per-group lock and
+    // `tokio::sync::Mutex` is not reentrant, so delegating would self-deadlock
+    // *while holding the lock*, hanging every later op on this group. This
+    // also short-circuits the live TreeKEM self-target divergence
+    // (`remove_treekem` sets `treekem_epoch: Some(..)` unconditionally and
+    // receivers drop the event under `self_leave_auth`).
+    if agent_id_hex == local_agent_hex {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "self-removal is a leave; use DELETE /groups/:id",
+        );
+    }
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
@@ -8455,7 +8558,7 @@ pub(in crate::server) async fn remove_named_group_member(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
-    let (metadata_topic, event, members, epoch) = {
+    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -8479,6 +8582,75 @@ pub(in crate::server) async fn remove_named_group_member(
         next.roster_revision = next.roster_revision.saturating_add(1);
         let revision = next.roster_revision;
         next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
+
+        // F1 §2/§2a/§5a — GSS rekey on admin remove. For MlsEncrypted groups:
+        // rotate the shared secret, fallibly convert Vec<u8> → [u8; 32], then
+        // build every survivor envelope in memory (preflight). Any failure
+        // bare-returns *before* seal_commit/insert/save/publish; the rotated
+        // clone `next` is dropped, so no rotation becomes live, persisted or
+        // published. Sealing deliberately sits AHEAD of persistence — do not
+        // mirror ban's post-save `warn + continue`, which is the fail-open
+        // anti-pattern past its `:10325`.
+        let event_group_id = next.stable_group_id().to_string();
+        let mut new_secret_epoch: Option<u64> = None;
+        let mut buffered_survivor_envelopes: Vec<(String, NamedGroupMetadataEvent)> = Vec::new();
+        let is_encrypted =
+            next.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
+        if is_encrypted {
+            let (sec_vec, ep) = next.rotate_shared_secret();
+            // §2a: the conversion is mandatory (seal needs &[u8;32]) and must
+            // be fallible. `Err(v)` *is* the secret material — bind `v` only
+            // to read its length; never format or log it.
+            let sec: [u8; 32] = match sec_vec.try_into() {
+                Ok(s) => s,
+                Err(v) => {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("rotated secret has wrong length ({} bytes)", v.len()),
+                    );
+                }
+            };
+            new_secret_epoch = Some(ep);
+            // `remove_member` already excluded the removed member; the actor
+            // (admin) is skipped separately — they already hold the secret.
+            let survivors: Vec<(String, Option<String>)> = next
+                .active_members()
+                .map(|m| (m.agent_id.clone(), m.kem_public_key_b64.clone()))
+                .filter(|(recipient, _)| recipient != &local_agent_hex)
+                .collect();
+            for (recipient_hex, kem_b64) in &survivors {
+                let Some(kem) = kem_b64 else {
+                    // §5 fail-closed: no enrollment invariant proves a keyless
+                    // survivor never held the live secret (a stripped-roster
+                    // GSS invite stub reaches `shared_secret: Some(..)` with
+                    // `kem_public_key_b64: None`). Abort — clone discarded.
+                    return api_error(
+                        StatusCode::FAILED_DEPENDENCY,
+                        format!(
+                            "cannot rotate group secret: survivor {recipient_hex} has no roster KEM key"
+                        ),
+                    );
+                };
+                match build_secure_share_event(
+                    &event_group_id,
+                    recipient_hex,
+                    kem,
+                    &local_agent_hex,
+                    &sec,
+                    ep,
+                ) {
+                    Ok(ev) => buffered_survivor_envelopes.push((recipient_hex.clone(), ev)),
+                    Err(_) => {
+                        return api_error(
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                                "cannot rotate group secret: survivor {recipient_hex} envelope build failed"
+                            ),
+                        );
+                    }
+                }
+            }
+        }
         let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
@@ -8489,7 +8661,6 @@ pub(in crate::server) async fn remove_named_group_member(
             }
         };
         let metadata_topic = next.metadata_topic.clone();
-        let event_group_id = next.stable_group_id().to_string();
         let members = named_group_member_values(&next);
         named_groups.insert(id.clone(), next);
         drop(named_groups);
@@ -8516,12 +8687,32 @@ pub(in crate::server) async fn remove_named_group_member(
             agent_id: agent_id_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: new_secret_epoch,
             commit: Some(commit),
         };
-        (metadata_topic, event, members, epoch)
+        (
+            metadata_topic,
+            event,
+            members,
+            epoch,
+            buffered_survivor_envelopes,
+        )
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // F1 §5a step 5: publish the buffered survivor envelopes only after the
+    // removal is live and persisted. Each is broadcast on the metadata topic
+    // plus direct + delayed delivery, mirroring publish_secure_share's shape.
+    for (recipient_hex, ev) in &buffered_survivor_envelopes {
+        publish_named_group_metadata_event(&state, &metadata_topic, ev).await;
+        spawn_named_group_event_delivery(&state, recipient_hex, ev);
+        spawn_named_group_event_delivery_after(
+            &state,
+            recipient_hex,
+            ev,
+            GROUP_BACKGROUND_PUBLISH_DELAY,
+        );
+    }
     maybe_publish_group_card_after_state_change(&state, &id).await;
     (
         StatusCode::OK,
@@ -9163,6 +9354,7 @@ async fn leave_treekem_group(
         agent_id: local_agent_hex,
         treekem_commit_b64: None,
         treekem_epoch: None,
+        secret_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -9325,6 +9517,7 @@ async fn remove_treekem_named_group_member(
         agent_id: agent_id_hex.clone(),
         treekem_commit_b64: Some(base64::engine::general_purpose::STANDARD.encode(treekem_commit)),
         treekem_epoch: Some(treekem_epoch),
+        secret_epoch: None,
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
@@ -9705,6 +9898,7 @@ pub(in crate::server) async fn leave_group(
         agent_id: local_agent_hex.clone(),
         treekem_commit_b64: None,
         treekem_epoch: None,
+        secret_epoch: None,
         commit: Some(commit),
     };
     drop(groups);
@@ -11816,11 +12010,17 @@ pub(in crate::server) struct SecureDecryptRequest {
 /// TreeKEM-specific transport shape (direct invites/adds and ban/unban).
 ///
 /// Request-access joins and creator removals use real TreeKEM Commit/Welcome or
-/// Commit transport. The remaining guarded handlers still run the legacy GSS
-/// rekey path (`rotate_shared_secret` + per-recipient reseal), which would
-/// silently re-introduce a shared secret and relabel the plane. Refuse those
-/// endpoints loudly until they provide KeyPackage/Welcome or removal Commit
-/// inputs.
+/// Commit transport. The remaining guarded handlers would, if they fell back
+/// to the legacy GSS rekey path (`rotate_shared_secret` + per-recipient
+/// reseal), silently re-introduce a shared secret and relabel the plane — so
+/// this guard refuses them loudly until they provide KeyPackage/Welcome or
+/// removal Commit inputs.
+///
+/// The GSS admin-remove path is a *separate*, intentional caller of
+/// `rotate_shared_secret` + per-recipient reseal (F1 / ADR-0010): it runs only
+/// for GSS-plane groups (this guard returns `None` for them) and fails closed
+/// via `build_secure_share_event`. It is not one of the "remaining guarded
+/// handlers" above and is not refused here.
 fn treekem_membership_unsupported(
     info: &x0x::groups::GroupInfo,
 ) -> Option<(StatusCode, Json<serde_json::Value>)> {
@@ -14839,8 +15039,10 @@ mod tests {
         assert!(
             publish_attempts
                 .iter()
-                .any(|(topic, event_group_id)| topic == &metadata_topic
-                    && event_group_id == &stable_group_id),
+                .any(
+                    |(topic, event_group_id, _recipient)| topic == &metadata_topic
+                        && event_group_id == &stable_group_id
+                ),
             "join handler should attempt to publish the joiner-authored MemberJoined request"
         );
         Ok(())
@@ -15368,6 +15570,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(commit),
         };
 
@@ -15809,6 +16012,994 @@ mod tests {
         assert!(info.withdrawn, "lost-race withdrawal should win");
         assert_eq!(info.shared_secret, None, "secret must not be installed");
         assert_ne!(info.secret_epoch, secret_epoch, "epoch must not advance");
+        Ok(())
+    }
+
+    // ── F1 GSS-rotation ADR gate tests (§3 ordering + §7a producer) ─────
+    //
+    // These tests exercise the production apply seam
+    // `apply_named_group_metadata_event` (NOT an interior helper) for the
+    // fail-closed GSS rekey on admin-remove. Gate 3 pins both delivery
+    // orderings of the signed `MemberRemoved` commit and the
+    // `SecureShareDelivered` envelope to the same converged committed state.
+    // Gate 7a pins the real `GroupInfo::rotate_shared_secret` producer.
+
+    struct F1GssRotationFixture {
+        state: Arc<AppState>,
+        _dir: tempfile::TempDir,
+        admin_kp: crate::identity::AgentKeypair,
+        victim_hex: String,
+        group_id: String,
+        new_epoch: u64,
+        new_secret: [u8; 32],
+        committed_state_hash: String,
+        remove_event: NamedGroupMetadataEvent,
+        envelope_event: NamedGroupMetadataEvent,
+    }
+
+    // Build an independent, freshly-keyed fixture: a GSS-plane group whose
+    // separately-generated admin creator authors the rotation, the local
+    // daemon is an active survivor (the envelope recipient), and a third
+    // agent is the removal victim. The committed transition is built by
+    // cloning the installed parent, bumping the roster revision, removing the
+    // victim, rotating the GSS, fallibly converting to `[u8; 32]`, and sealing
+    // the commit under the admin's keypair — exactly the production producer
+    // path. The envelope is sealed to the survivor's KEM public key with the
+    // same AAD the opener recomputes.
+    async fn f1_gss_rotation_fixture(group_tag: &str) -> Result<F1GssRotationFixture> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_kp = crate::identity::AgentKeypair::generate()?;
+        let admin_id = admin_kp.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let group_id = format!("f1-gss-{group_tag}-local");
+        let stable_group_id = format!("f1-gss-{group_tag}-stable");
+        let parent_epoch: u64 = 7;
+
+        let mut parent = x0x::groups::GroupInfo::with_policy(
+            "f1 gss rotation".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        parent.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            admin_hex.clone(),
+            parent.created_at,
+            String::new(),
+        ));
+        parent.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        parent.secret_epoch = parent_epoch;
+        parent.shared_secret = Some(vec![9; 32]);
+        parent.security_binding = Some(format!("gss:epoch={parent_epoch}"));
+        parent.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        parent.add_member(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        parent.recompute_state_hash();
+
+        // Install the parent (the survivor daemon's pre-event view) in state.
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), parent.clone());
+
+        // Producer-side committed transition: remove victim, rotate GSS, seal.
+        let mut committed = parent.clone();
+        committed.roster_revision = committed.roster_revision.saturating_add(1);
+        let roster_revision = committed.roster_revision;
+        committed.remove_member(&victim_hex, Some(admin_hex.clone()));
+        let (new_secret_vec, new_epoch) = committed.rotate_shared_secret();
+        // §2a: the conversion is mandatory (seal needs `&[u8; 32]`) and must
+        // be fallible. `Err(v)` *is* the secret material — bind `v` only to
+        // read its length; never format or log it.
+        let new_secret: [u8; 32] = match new_secret_vec.try_into() {
+            Ok(s) => s,
+            Err(v) => {
+                return Err(anyhow::anyhow!(
+                    "rotate_shared_secret returned {} bytes; expected 32",
+                    v.len()
+                ));
+            }
+        };
+        let commit = committed.seal_commit(&admin_kp, 1_000)?;
+        let committed_state_hash = committed.state_hash.clone();
+
+        // Seal the rotated secret to the survivor daemon. The opener
+        // recomputes AAD from the event's `group_id` (the stable id) +
+        // recipient + epoch, so the sealer must use the identical binding.
+        let aad = secure_share_aad(&stable_group_id, &local_hex, new_epoch);
+        let (kem_ct, aead_nonce, aead_ct) =
+            x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+                &state.agent_kem_keypair.public_bytes,
+                &aad,
+                &new_secret,
+            )?;
+        let envelope_event = NamedGroupMetadataEvent::SecureShareDelivered {
+            group_id: stable_group_id.clone(),
+            recipient: local_hex,
+            secret_epoch: new_epoch,
+            kem_ciphertext_b64: BASE64.encode(&kem_ct),
+            aead_nonce_b64: BASE64.encode(aead_nonce),
+            aead_ciphertext_b64: BASE64.encode(&aead_ct),
+            actor: admin_hex.clone(),
+        };
+
+        let remove_event = NamedGroupMetadataEvent::MemberRemoved {
+            group_id: stable_group_id,
+            revision: roster_revision,
+            actor: admin_hex.clone(),
+            agent_id: victim_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            secret_epoch: Some(new_epoch),
+            commit: Some(commit),
+        };
+
+        Ok(F1GssRotationFixture {
+            state,
+            _dir,
+            admin_kp,
+            victim_hex,
+            group_id,
+            new_epoch,
+            new_secret,
+            committed_state_hash,
+            remove_event,
+            envelope_event,
+        })
+    }
+
+    // Convergence contract shared by both delivery orderings: after both the
+    // signed remove and the envelope have applied, the stored state must be
+    // identical regardless of arrival order.
+    async fn assert_gss_rotation_converged(
+        state: &Arc<AppState>,
+        group_id: &str,
+        victim_hex: &str,
+        new_epoch: u64,
+        new_secret: &[u8; 32],
+        committed_state_hash: &str,
+    ) -> Result<()> {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return Err(anyhow::anyhow!(
+                "converged group missing from storage key {group_id}"
+            ));
+        };
+        assert!(
+            !info.has_active_member(victim_hex),
+            "victim must be Removed after admin-remove convergence"
+        );
+        assert!(
+            info.members_v2
+                .get(victim_hex)
+                .is_some_and(|m| m.is_removed()),
+            "victim roster entry must carry the Removed state"
+        );
+        assert_eq!(
+            info.secret_epoch, new_epoch,
+            "secret_epoch must be the rotated epoch E+1"
+        );
+        assert_eq!(
+            info.security_binding,
+            Some(format!("gss:epoch={new_epoch}")),
+            "security_binding must track the rotated epoch"
+        );
+        assert!(
+            info.shared_secret.as_deref() == Some(new_secret.as_slice()),
+            "shared_secret must be the rotated S1 after convergence"
+        );
+        assert_eq!(
+            info.state_hash, committed_state_hash,
+            "committed state_hash must match the producer-sealed transition"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f1_gss_rotation_metadata_first_removes_then_installs_envelope() -> Result<()> {
+        let f = f1_gss_rotation_fixture("metadata-first").await?;
+        let sender = f.admin_kp.agent_id();
+
+        // Metadata-first: the signed `MemberRemoved` lands before the
+        // envelope. The apply arm fail-closes the GSS (old epoch E < E+1
+        // wipes `shared_secret` to `None`) but advances epoch/binding from
+        // the signed commit alone.
+        let removed =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+        assert!(
+            removed,
+            "MemberRemoved with a valid signed commit must apply (returns true)"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let Some(info) = groups.get(&f.group_id) else {
+                return Err(anyhow::anyhow!("metadata-first group missing"));
+            };
+            assert_eq!(
+                info.shared_secret, None,
+                "metadata-first intermediate must fail-close shared_secret to None"
+            );
+            assert_eq!(
+                info.secret_epoch, f.new_epoch,
+                "metadata-first intermediate must already carry the rotated epoch"
+            );
+        }
+
+        // The envelope then delivers the fresh secret to the survivor. The
+        // strict-< stale check accepts equal-epoch delivery while the secret
+        // is still absent.
+        let delivered =
+            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
+                .await;
+        // SecureShareDelivered signals "no rebroadcast" (returns false);
+        // success is observed in stored state, not in this boolean.
+        assert!(
+            !delivered,
+            "SecureShareDelivered returns false; convergence is asserted on stored state"
+        );
+
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn f1_gss_rotation_envelope_first_installs_then_remove_preserves_secret() -> Result<()> {
+        let f = f1_gss_rotation_fixture("envelope-first").await?;
+        let sender = f.admin_kp.agent_id();
+
+        // Envelope-first: the fresh secret lands before the signed remove.
+        // The strict-< stale check accepts the newer epoch and installs S1.
+        let delivered =
+            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
+                .await;
+        assert!(
+            !delivered,
+            "SecureShareDelivered returns false; success is observed in stored state"
+        );
+        {
+            let groups = f.state.named_groups.read().await;
+            let Some(info) = groups.get(&f.group_id) else {
+                return Err(anyhow::anyhow!("envelope-first group missing"));
+            };
+            assert!(
+                info.shared_secret.as_deref() == Some(f.new_secret.as_slice()),
+                "envelope-first intermediate must already hold S1"
+            );
+            assert_eq!(
+                info.secret_epoch, f.new_epoch,
+                "envelope-first intermediate must already carry the rotated epoch"
+            );
+        }
+
+        // The signed remove then applies. Because the local epoch already
+        // equals the commit's epoch, the strict `old < new` wipe is a no-op
+        // and the just-installed S1 survives (the secret is preserved).
+        let removed =
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+        assert!(
+            removed,
+            "MemberRemoved with a valid signed commit must apply (returns true)"
+        );
+
+        assert_gss_rotation_converged(
+            &f.state,
+            &f.group_id,
+            &f.victim_hex,
+            f.new_epoch,
+            &f.new_secret,
+            &f.committed_state_hash,
+        )
+        .await?;
+        Ok(())
+    }
+
+    // ── Gate 7a: real `GroupInfo::rotate_shared_secret` producer invariants ─
+    fn f1_gss_group_for_rotate() -> Result<x0x::groups::GroupInfo> {
+        let creator = crate::identity::AgentKeypair::generate()?;
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 rotate producer".to_string(),
+            String::new(),
+            creator.agent_id(),
+            "f1-rotate-producer-local".to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.recompute_state_hash();
+        Ok(info)
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_returns_32_byte_secret() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let (secret, _epoch) = info.rotate_shared_secret();
+        assert_eq!(
+            secret.len(),
+            32,
+            "rotate_shared_secret must yield a 32-byte secret"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_advances_epoch_by_exactly_one() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let prev_epoch = info.secret_epoch;
+        let (_secret, new_epoch) = info.rotate_shared_secret();
+        assert_eq!(
+            new_epoch,
+            prev_epoch.saturating_add(1),
+            "returned epoch must be exactly prev + 1"
+        );
+        assert_eq!(
+            info.secret_epoch,
+            prev_epoch.saturating_add(1),
+            "stored epoch must be exactly prev + 1"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn f1_gss_rotate_shared_secret_producer_stored_secret_equals_returned_bytes() -> Result<()> {
+        let mut info = f1_gss_group_for_rotate()?;
+        let (secret, _epoch) = info.rotate_shared_secret();
+        assert!(
+            info.shared_secret.as_deref() == Some(secret.as_slice()),
+            "stored shared_secret must be byte-identical to the returned secret"
+        );
+        Ok(())
+    }
+
+    // ── Gate 4a (item 4, containment): a removed caller is refused at the
+    // roster guard, NOT at the crypto. The observation is the `:12312`
+    // `forbidden("not a member")` return, which precedes the shared_secret
+    // read (`:12328`) and the cipher (`:12381`). This gate pins containment
+    // only and says nothing about key material — item 4's key-material
+    // property is gate 4b, observed below the endpoint.
+    //
+    // Both the roster guard (`:12312`) and a downstream decrypt failure
+    // (`:12408`) return 403, so status alone cannot distinguish them. The
+    // load-bearing observation is the body message "not a member": only the
+    // roster guard produces it.
+    //
+    // Mutation: leave the caller Active (skip `remove_member`) → the roster
+    // guard does not fire → the request falls through to a different response
+    // (decrypt failure / epoch mismatch) whose body is not "not a member" →
+    // the body assertion fails and the gate goes red.
+    #[tokio::test]
+    async fn f1_item4a_removed_caller_refused_at_roster_guard() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let admin_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+
+        let group_id = "f1-item4a-local".to_string();
+        let stable_group_id = "f1-item4a-stable".to_string();
+        let epoch: u64 = 7;
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item4a containment".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id,
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(vec![9; 32]);
+        // Caller is added then removed: state == Removed (neither Active nor
+        // Banned), so the `:12310-12312` roster guard fires.
+        info.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.remove_member(&local_hex, Some(admin_hex));
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // The roster guard fires before any `req` field is read. Supply a
+        // well-formed request anyway, so the only thing that can refuse the
+        // caller is the roster guard rather than a 400 on malformed input.
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64: BASE64.encode(b"item4a-ciphertext-not-reached"),
+                nonce_b64: BASE64.encode([0u8; 12]),
+                secret_epoch: epoch,
+            }),
+        )
+        .await;
+
+        // Positive precondition: the group really is GSS-plane (explicit, not
+        // fixture-inherited), so the refusal is the roster guard and not the
+        // TreeKem dispatch at `:12320`.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4a group must be present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item4a must exercise the GSS plane"
+            );
+        }
+
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "removed caller must be refused (403)"
+        );
+        let err_msg = body.0.get("error").and_then(|v| v.as_str()).unwrap_or("");
+        assert!(
+            err_msg.contains("not a member"),
+            "refusal must come from the roster guard at :12312 (body error = {err_msg:?}); \
+             a decrypt-failure 403 at :12408 would prove the guard did NOT fire"
+        );
+        Ok(())
+    }
+
+    // ── Gate 4b (item 4, key material): the secret a removed member retains
+    // (S0, pre-rotation) does NOT open content published at the new epoch
+    // (sealed under S1, post-rotation). Observed BELOW the endpoint, because
+    // the endpoint refuses a removed caller at the roster guard and never
+    // reaches the cipher — that is 4a's point. The derivation is public and
+    // pure (`GroupInfo::derive_message_key`), so the property is testable
+    // directly.
+    //
+    // Two arms vary ONLY the secret: same ciphertext, nonce, AAD and epoch;
+    // S0 vs S1 is the sole difference (Watson's constraint ii). The S1 arm
+    // MUST succeed (constraint i) — it is the passing control that turns the
+    // S0 failure into a measurement rather than a broken-harness artifact.
+    //
+    // Mutation: drop `material.extend_from_slice(secret)` from
+    // `GroupInfo::derive_message_key` (`src/groups/mod.rs:743`). The derived
+    // key then no longer depends on the secret, key_s0 == key_s1, S0 opens the
+    // ciphertext, and the `is_err()` assertion fails (gate red).
+    #[test]
+    fn f1_item4b_retained_secret_does_not_open_new_epoch_content() -> Result<()> {
+        use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+        use rand::RngCore;
+
+        // Real producer: `rotate_shared_secret` is the sole production secret
+        // source (the symbol gate 7a pins). S0 is the pre-rotation secret the
+        // removed member retains; S1 is what the new epoch is sealed under.
+        let creator = crate::identity::AgentKeypair::generate()?.agent_id();
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "f1 item4b key material".to_string(),
+            String::new(),
+            creator,
+            "f1-item4b-local".to_string(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        group.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            "f1-item4b-stable".to_string(),
+            hex::encode(creator.as_bytes()),
+            group.created_at,
+            String::new(),
+        ));
+        group.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        let epoch_before: u64 = 7;
+        group.secret_epoch = epoch_before;
+        let s0: Vec<u8> = vec![9; 32]; // retained by the removed member
+        group.shared_secret = Some(s0.clone());
+        group.recompute_state_hash();
+
+        // Real rotation: producer returns S1 and advances the epoch by one.
+        let (s1, epoch_after) = group.rotate_shared_secret();
+        assert_eq!(
+            epoch_after,
+            epoch_before + 1,
+            "rotation advances epoch by one"
+        );
+        assert_eq!(s1.len(), 32, "rotated secret is 32 bytes");
+
+        let group_id = group.stable_group_id().to_string();
+        let plaintext = b"item-4b new-epoch plaintext";
+
+        // Produce ONE real envelope at the new epoch under S1, using the exact
+        // primitives and AAD the production encryptor uses.
+        let key_s1 = x0x::groups::GroupInfo::derive_message_key(&s1, epoch_after, &group_id);
+        let cipher_s1 = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key_s1)
+            .expect("32-byte key always initializes ChaCha20Poly1305");
+        let aad = format!("x0x.group.secure|{}|{}", group_id, epoch_after);
+        let mut nonce_bytes = [0u8; 12];
+        rand::thread_rng().fill_bytes(&mut nonce_bytes);
+        let nonce = chacha20poly1305::Nonce::from_slice(&nonce_bytes);
+        let ciphertext = cipher_s1
+            .encrypt(
+                nonce,
+                Payload {
+                    msg: plaintext.as_slice(),
+                    aad: aad.as_bytes(),
+                },
+            )
+            .expect("encrypt under S1 must succeed");
+
+        // S0 arm — the retained secret must NOT open new-epoch content. Same
+        // ciphertext, nonce, AAD and epoch as the S1 arm; the secret is the
+        // only difference.
+        let key_s0 = x0x::groups::GroupInfo::derive_message_key(&s0, epoch_after, &group_id);
+        let cipher_s0 = chacha20poly1305::ChaCha20Poly1305::new_from_slice(&key_s0)
+            .expect("32-byte key always initializes ChaCha20Poly1305");
+        let open_s0 = cipher_s0.decrypt(
+            nonce,
+            Payload {
+                msg: &ciphertext,
+                aad: aad.as_bytes(),
+            },
+        );
+        assert!(
+            open_s0.is_err(),
+            "S0 (retained pre-rotation secret) must NOT decrypt new-epoch content; \
+             if this passes, derive_message_key no longer depends on the secret"
+        );
+
+        // S1 arm — passing control. The same envelope opens cleanly under S1,
+        // proving the envelope is well-formed and the S0 failure is
+        // attributable to the key alone.
+        let open_s1 = cipher_s1
+            .decrypt(
+                nonce,
+                Payload {
+                    msg: &ciphertext,
+                    aad: aad.as_bytes(),
+                },
+            )
+            .expect("S1 (post-rotation secret) must decrypt new-epoch content");
+        assert_eq!(
+            open_s1.as_slice(),
+            plaintext,
+            "S1 must recover the exact plaintext"
+        );
+
+        Ok(())
+    }
+
+    // ── Gate 4c (item 4, published recipient set): the recipient set the
+    // remove handler actually publishes to excludes the removed member and
+    // includes each survivor. This is the only SENDER-side gate in the F1 set
+    // — it drives the real `remove_named_group_member` producer path (the gap
+    // Watson's M5 mutation found: 4a/4b are receiver-side / below-endpoint and
+    // never invoke the handler, so a reseal aimed at the removed member was
+    // invisible to the whole suite).
+    //
+    // The recorder is widened (production change above) to capture the
+    // `SecureShareDelivered.recipient` field it previously discarded — without
+    // that, every survivor envelope shares the same `(topic, group_id)` and
+    // the recorder can only express a publish COUNT, which is the proxy this
+    // round exists to stop.
+    //
+    // Interval (ADR 0024 break-disclosure rule): `remove_named_group_member`
+    // entry (`:8516`) → target operation publish (`:8707`). Resolves at
+    // `9d11d69`; receipt (ADR 0024 `9fb3b20`): `head -n 16378` of this file
+    // ⇒ sha256 `89bb14e96b3f71525d5cd3d746eb1a71573b94d462b32986ba64a2d2d5d33ccb`,
+    // identical at `9d11d69` and `6cc03e5`. Highest cite `:12408` < 16378,
+    // and this commit edits no line ≤ 16378, so the hash holds here too.
+    // Re-resolve after any rebase.
+    //
+    // Break list — every control-flow exit / alternate dispatch in the
+    // interval, each with its evidence:
+    //   :8523 parse-id / :8538 self-removal / :8563 group-not-found /
+    //   :8567 non-admin / :8570 withdrawn / :8573 member-not-found /
+    //   :8577 last-admin — refused by preconditions.
+    //   :8553 TreeKem dispatch — refused (assert secure_plane == Gss).
+    //   :8607 §2a wrong-length abort — UNREACHABLE (producer hardcodes 32B;
+    //     7b). No label: if it fired the handler 500s before any publish and
+    //     this gate goes RED, so it cannot leave the gate green (direction
+    //     test, `e0fc016`/`8053a3d`).
+    //   :8627 missing-KEM / :8644 envelope seal-fail — item 5's property,
+    //     scheduled, not observed.
+    //   :8657 seal_commit — not observed, no owning Validation item. Zero
+    //     state change: `next` is a clone (`:8581`) and nothing publishes,
+    //     saves or inserts between the write-lock (`:8562`) and `insert` (`:8665`);
+    //     both domain Err arms are pre-empted upstream (last-admin `:8577`,
+    //     withdrawn `:8570`), leaving only an ML-DSA signing fault
+    //     (`state_commit.rs:448`).
+    //
+    // Observed lane: the metadata-topic publish at `:8707` only. The direct
+    // (`:8708`) and delayed (`:8709`) delivery in
+    // `spawn_named_group_event_delivery` have no `#[cfg(test)]` hook (they
+    // spawn straight to `agent.send_direct_with_config`) and are named here as
+    // not-observed, not covered.
+    //
+    // Mutation (Watson's M5): at `:8617` change `next.active_members()` to
+    // `next.members_v2.values().filter(|m| !m.is_banned())`. The removed
+    // member (state Removed, not Banned) re-enters the survivor set; with a
+    // roster KEM key the envelope builds and publishes to them; the recorder
+    // captures their hex as a recipient and the "victim not in recipients"
+    // assertion fails (gate red). REQUIRED red arm of the set. Reverted.
+    #[tokio::test]
+    async fn f1_item4c_remove_handler_publishes_survivors_not_the_removed_member() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_id = state.agent.agent_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // Distinct agents. Both get real ML-KEM-768 public keys: the survivor
+        // so its envelope builds, and the victim so that under the M5 mutation
+        // its re-inclusion reaches the publish rather than the `:8627`
+        // missing-KEM abort (which would mask the property under test).
+        let survivor_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let survivor_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let victim_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+
+        let group_id = "f1-item4c-local".to_string();
+        let stable_group_id = "f1-item4c-stable".to_string();
+
+        // Local daemon is admin/creator/actor: the handler signs the commit
+        // with `state.agent.identity().agent_keypair()` and authorizes via
+        // `require_admin_or_above(info, &local_agent_hex)`.
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item4c recipient set".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            local_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member_with_kem(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(survivor_kem_b64),
+        );
+        info.add_member_with_kem(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(victim_kem_b64),
+        );
+        info.recompute_state_hash();
+        let metadata_topic = info.metadata_topic.clone();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive precondition: GSS plane, so the TreeKem dispatch at `:8553`
+        // cannot fire and no recipient set is ever built for a different plane.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4c group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item4c must exercise the GSS remove path, not the TreeKem dispatch"
+            );
+        }
+
+        NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            remove_named_group_member(
+                State(Arc::clone(&state)),
+                Path((group_id.clone(), victim_hex.clone())),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin remove of a member must succeed, body: {body}"
+        );
+
+        // Post-state: victim Removed, survivor still Active (positive).
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item4c group retained");
+            assert!(
+                !stored.has_active_member(&victim_hex),
+                "victim must be Removed after admin remove"
+            );
+            assert!(
+                stored.has_active_member(&survivor_hex),
+                "survivor must remain Active after admin remove"
+            );
+        }
+
+        // Core 4c observation: the published recipient set. The recorder now
+        // carries `SecureShareDelivered.recipient` alongside topic+group, so
+        // the assertion is on the recipient set, not a publish count.
+        let published_recipients: Vec<String> = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST
+            .lock()
+            .expect("publish-attempt recorder poisoned")
+            .iter()
+            .filter_map(|(topic, gid, recipient)| {
+                (topic == &metadata_topic && gid == &stable_group_id)
+                    .then(|| recipient.clone())
+                    .flatten()
+            })
+            .collect();
+
+        assert!(
+            !published_recipients.is_empty(),
+            "the remove handler must publish at least one survivor envelope"
+        );
+        assert!(
+            !published_recipients.contains(&victim_hex),
+            "the removed member must NOT appear in the published recipient set; \
+             got {published_recipients:?}"
+        );
+        assert!(
+            published_recipients.contains(&survivor_hex),
+            "the survivor must appear in the published recipient set; \
+             got {published_recipients:?}"
+        );
+        Ok(())
+    }
+    // ── Gate item 2 (survivor decryptability): a survivor — a member still
+    // Active after an admin remove of a peer — CAN decrypt content the system
+    // PUBLISHED at the new epoch. The plaintext is published through the
+    // production `secure_group_encrypt` endpoint and read back through the
+    // production `secure_group_decrypt` endpoint — a true GSS-plane round-trip
+    // (Watson [12] §3 / Dario [13] §2), not an in-test envelope, so encrypt-
+    // side drift (AAD, key sourcing) cannot stay green here. The positive
+    // complement to item 4: item 4 proves the removed member cannot decrypt;
+    // item 2 proves the survivors still can.
+    //
+    // Interval (ADR 0024 break-disclosure rule): `secure_group_decrypt` entry
+    // (`:12297`) → target operation `cipher.decrypt` (`:12381`). Resolves at
+    // `9d11d69`; receipt (ADR 0024 `9fb3b20`): `head -n 16378` of this file
+    // ⇒ sha256 `89bb14e96b3f71525d5cd3d746eb1a71573b94d462b32986ba64a2d2d5d33ccb`,
+    // identical at `9d11d69` and `6cc03e5`. Highest cite `:12408` < 16378,
+    // and this commit edits no line ≤ 16378, so the hash holds here too.
+    // Re-resolve after any rebase.
+    //
+    // Break list — every control-flow exit / alternate dispatch in the
+    // interval, each with its evidence:
+    //   :12305 group-not-found     — refused (installed group)
+    //   :12308 withdrawn           — refused (non-withdrawn group)
+    //   :12312 not-a-member        — MUTATION B + positive membership assert
+    //   :12320 TreeKem dispatch    — refused (assert secure_plane == Gss)
+    //   :12328 no shared secret    — refused (secret installed)
+    //   :12339 epoch mismatch      — refused (matching epoch sent)
+    //   :12354 bad base64 ct       — refused (valid base64)
+    //   :12360 bad base64 nonce    — refused (valid base64)
+    //   :12364 nonce wrong length  — refused (12-byte nonce)
+    //   :12376 cipher init failed  — refused (derive_message_key returns 32B)
+    //   :12408 cipher Err          — MUTATION A (stored-secret byte flip)
+    //   :12396 post-decrypt terminality recheck (→ :10141, hook :10148) —
+    //     FALSE-NEGATIVE hazard: can suppress a success into a 409 conflict,
+    //     cannot manufacture plaintext. Refused by the success-shape
+    //     precondition (status 200 + payload present + no conflict). NOT a
+    //     blind spot. `force_post_crypto_withdrawn_ids` is NOT installed.
+    //
+    // Mutation A: between the production encrypt and decrypt calls, flip one
+    // byte in the stored `shared_secret`. The ciphertext was sealed under the
+    // original; decrypt derives from the flipped secret → wrong key → `:12408`
+    // "decryption failed" → the success assertion fails. Shows the gate
+    // observes the cipher path (`:12408`), distinct from the `:12312` roster
+    // guard exercised by mutation B.
+    //
+    // Mutation B: `remove_member(&survivor)` after setup → survivor Removed →
+    // the `:12312` roster guard fires → "not a member" → success assertion
+    // fails. Shows the gate observes active membership at `:12312`.
+    //
+    // Mutation SYM/ASYM (round-trip teeth — Watson [12] §2 / Dario [13] §1):
+    //   ASYM — change the AAD on the ENCRYPT side only (`:12251`) → this gate
+    //     RED, sole failure (encrypt and decrypt no longer agree). REQUIRED
+    //     red arm of the mutation set (`8053a3d`).
+    //   SYM  — change the AAD on BOTH production sides (`:12251` + `:12380`)
+    //     → all green. ACCEPTED BLIND SPOT (direction test, `8053a3d`):
+    //     symmetric drift is invisible because the gate observes the two
+    //     endpoints agreeing with each other, not with any prior format — a
+    //     compatibility property, not a decryptability one. Nothing in the F1
+    //     set observes it; named, not fixed.
+    //
+    // Epoch-binding pin: `derive_message_key` mixes the epoch into the key
+    // (`groups/mod.rs:744`); Watson's M4 showed nothing in the F1 set observes
+    // it. A direct pure-fn pair asserts different epochs yield different keys,
+    // complementing 4b (which pins the secret binding).
+    #[tokio::test]
+    async fn f1_item2_survivor_decrypts_new_epoch_content() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        // Admin/creator is a distinct agent; the local daemon is the survivor.
+        let admin_id = crate::identity::AgentKeypair::generate()?.agent_id();
+        let admin_hex = hex::encode(admin_id.as_bytes());
+
+        let group_id = "f1-item2-local".to_string();
+        let stable_group_id = "f1-item2-stable".to_string();
+        let epoch: u64 = 7;
+        let secret: Vec<u8> = vec![0x42; 32];
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "f1 item2 survivor decrypt".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            admin_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.secret_epoch = epoch;
+        info.shared_secret = Some(secret.clone());
+        info.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive preconditions: GSS plane (explicit, not inherited) and the
+        // survivor really is an Active member.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("item2 group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "item2 must exercise the GSS decrypt path, not the TreeKem dispatch"
+            );
+            assert!(
+                stored.has_active_member(&local_hex),
+                "survivor (local daemon) must be Active before decrypt"
+            );
+        }
+
+        // PUBLISH the plaintext through the production `secure_group_encrypt`
+        // endpoint — content the system actually produced, not minted in-test.
+        // For this group the GSS plane is active, so encrypt derives the key
+        // from `info.secure_message_key()` (the stored secret at `epoch`),
+        // generates a fresh per-message nonce, and seals with the production
+        // AAD. The returned `ciphertext_b64` / `nonce_b64` are what a survivor
+        // would actually receive.
+        let plaintext = b"item2 survivor new-epoch plaintext";
+        let (enc_status, enc_body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(plaintext),
+            }),
+        )
+        .await;
+        assert_eq!(
+            enc_status,
+            StatusCode::OK,
+            "production encrypt must succeed for an active survivor; body: {enc_body:?}"
+        );
+        assert_eq!(
+            enc_body.0["ok"].as_bool(),
+            Some(true),
+            "encrypt must report ok, body: {enc_body:?}"
+        );
+        let ciphertext_b64 = enc_body.0["ciphertext_b64"]
+            .as_str()
+            .expect("encrypt response carries ciphertext_b64")
+            .to_string();
+        let nonce_b64 = enc_body.0["nonce_b64"]
+            .as_str()
+            .expect("encrypt response carries nonce_b64")
+            .to_string();
+        assert_eq!(
+            enc_body.0["secret_epoch"].as_u64(),
+            Some(epoch),
+            "encrypt must bind the group's current secret_epoch"
+        );
+
+        // Production endpoint decrypt, as the survivor, of the published
+        // ciphertext (the exact bytes the system just produced above).
+        let (status, body) = secure_group_decrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(SecureDecryptRequest {
+                ciphertext_b64,
+                nonce_b64,
+                secret_epoch: epoch,
+            }),
+        )
+        .await;
+
+        // Success-shape precondition (refuses the eleventh false-negative
+        // path): status 200 + payload present + ok, NOT a 409 conflict.
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "survivor must decrypt new-epoch content"
+        );
+        assert_eq!(
+            body.0["ok"].as_bool(),
+            Some(true),
+            "decrypt must report ok, body: {body:?}"
+        );
+        let payload_b64 = body.0["payload_b64"]
+            .as_str()
+            .expect("success response carries payload_b64");
+        assert_eq!(
+            BASE64.decode(payload_b64).expect("payload is base64"),
+            plaintext,
+            "decrypted plaintext must match"
+        );
+        assert_eq!(
+            body.0["secret_epoch"].as_u64(),
+            Some(epoch),
+            "echoed epoch must match the ciphertext epoch"
+        );
+
+        // Epoch-binding pin in the derivation (`groups/mod.rs:744`). Nothing
+        // else in the F1 set observes this; 4b pins the secret binding.
+        let key_this = x0x::groups::GroupInfo::derive_message_key(&secret, epoch, &stable_group_id);
+        let key_next =
+            x0x::groups::GroupInfo::derive_message_key(&secret, epoch + 1, &stable_group_id);
+        assert_ne!(
+            key_this, key_next,
+            "derive_message_key must bind the epoch; identical keys across epochs would let a \
+             stale-epoch holder derive the new-epoch key"
+        );
+
         Ok(())
     }
 
@@ -17460,6 +18651,7 @@ mod tests {
             agent_id: "22".repeat(32),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&event));
@@ -17575,6 +18767,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &member_hex)),
         };
 
@@ -17596,6 +18789,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 4, &creator_hex)),
         };
         assert!(!authorized_treekem_membership_event_for_queue(
@@ -17611,6 +18805,7 @@ mod tests {
             agent_id: member_hex.clone(),
             treekem_commit_b64: Some("Yw==".to_string()),
             treekem_epoch: Some(2),
+            secret_epoch: None,
             commit: Some(fake_group_state_commit(&group_id, 5, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(

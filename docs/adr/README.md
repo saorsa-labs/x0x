@@ -25,6 +25,7 @@ This directory contains architecture decision records for x0x.
 - [ADR 0020: Tailnet Phase 1 — per-peer byte-streams + local port-forwarding](./0020-tailnet-phase-1-byte-streams-and-forwarding.md) — PeerStream over `Node::open_bi`/`accept_bi` with the identity gate inside open/accept; `src/forward.rs` local port-forwarder gated by the connect ACL (#131/ADR-0019) + key lifecycle (#130); loopback-only Phase 1 (accepted 2026-07-22)
 - [ADR 0022: Tailnet stream API — per-protocol acceptors, connect-ACL gate, bounded backpressure](./0022-tailnet-stream-api.md) — protocol-byte routing to single-owner acceptors (bounded, drop-on-full), stream-layer connect-ACL pair gate after the identity gate, QUIC flow-control backpressure with asserted bounds; issue #132 deliverable 1 (accepted 2026-07-22)
 - [ADR 0023: Durable Local History Is a Core x0x Capability](./0023-durable-local-history.md) (accepted 2026-07-22) — default-on SQLite history store in x0xd (durable/replaceable/ephemeral taxonomy, bounded shed-on-full writer, local-only — never served to the network); lifts the nostr-bridge spike's store design; substrate for tic-tac-toe
+- [ADR 0025: Required Gates Must Prove Observation Completeness](./0025-required-gates-prove-observation-completeness.md) (accepted 2026-07-28) — a required gate passes only when it accounts for the complete discovered set and proves each required observation completed; default execution is the computed complement of explicit, machine-checkable non-default declarations (no ordinary-test allowlist); one executable authority owns classification and reachability for both local and pull-request CI; non-observation may not resolve to a pass; enforcement is staged and a status becomes a merge gate only after a failing PR is demonstrably refused. Mechanism, schemas and rollout live in [docs/design/required-gates-observation-completeness.md](../design/required-gates-observation-completeness.md)
 
 ## Accepted (Phase 1 Functionally Complete)
 
@@ -33,7 +34,7 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0021: DM Origin-Machine Attestation for Gossip DMs](./0021-dm-origin-machine-attestation.md) — machine-key attestation of DM origin; codec scaffolding landed (`DmOriginAttestation` in `src/dm.rs`) but enforcement not yet wired
-- [ADR 0025: Required Gates Must Prove Observation Completeness](./0025-required-gates-prove-observation-completeness.md) — pre-consensus proposal for default-run test routing, registry-derived required inventories, and proof that selected tests executed their promised observations (amended-draft review and Kimi ruling outstanding)
+- [ADR 0024: GSS Rotation on Admin Remove Is Fail-Closed and Seals Before It Persists](./0024-gss-rotation-on-admin-remove-fail-closed.md) — the legacy GSS plane (ADR 0010) rotates and reseals on admin remove as it already does on ban; every survivor envelope is built before `seal_commit`, persistence and publication, and any failure aborts the removal outright; records the accepted availability and map-lock contention costs, and the no-drop map-lock rule as conservative policy whose necessity is unproven
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
