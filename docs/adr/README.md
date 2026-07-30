@@ -35,6 +35,7 @@ This directory contains architecture decision records for x0x.
 
 - [ADR 0021: DM Origin-Machine Attestation for Gossip DMs](./0021-dm-origin-machine-attestation.md) — machine-key attestation of DM origin; codec scaffolding landed (`DmOriginAttestation` in `src/dm.rs`) but enforcement not yet wired
 - [ADR 0024: GSS Rotation on Admin Remove Is Fail-Closed and Seals Before It Persists](./0024-gss-rotation-on-admin-remove-fail-closed.md) — the legacy GSS plane (ADR 0010) rotates and reseals on admin remove as it already does on ban; every survivor envelope is built before `seal_commit`, persistence and publication, and any failure aborts the removal outright; records the accepted availability and map-lock contention costs, and the no-drop map-lock rule as conservative policy whose necessity is unproven
+- [ADR 0026: Managed x0xd Deployment Has Distinct Roots and Closed Resolution](./0026-managed-x0xd-deployment.md) — every concurrent daemon has a distinct effective data root; one repository-identified path binds installation and root resolution, proves the complete running set, and closes controlled transitions. Mechanisms live in [docs/design/managed-x0xd-deployment.md](../design/managed-x0xd-deployment.md)
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
