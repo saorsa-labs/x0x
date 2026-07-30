@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.35.0] - 2026-07-29
+
+### Security
+
+- **GSS group secret is now rotated on admin remove (F1, ADR-0010 conformance).**
+  `DELETE /groups/:id/members/:agent_id` removed the member from the roster but
+  never rotated the group shared secret, so a removed member retained a working
+  key and could continue decrypting content published after their removal. Only
+  the *ban* path (`POST /groups/:id/ban/:agent_id`) rotated. The remove handler
+  now derives a fresh secret, advances the epoch, and re-seals it to the
+  surviving roster; the removed member is excluded from that fan-out. Verified
+  cross-daemon on three live daemons: pre-fix the removed member decrypted
+  post-removal ciphertext at an unchanged epoch, post-fix the epoch advances,
+  survivors still decrypt, and the removed member is refused.
+
+  The rotation is **fail-closed**: unlike ban's post-save `warn + continue`, a
+  remove that cannot re-seal to a survivor (missing roster KEM key, envelope
+  build failure) is rejected rather than silently completing without rotation.
+  Callers that previously saw an unconditional success from this endpoint may
+  now receive an error — this is the reason for the minor version bump.
+
+### Added
+
+- **ADR 0024** — reference-chapter ownership, citation scoping, and break-list
+  declaration rules for accepted ADRs.
+- **ADR 0025** — required gates must prove observation completeness; governance
+  fixtures namespaced and per-test outcomes made positive.
+- `just adr-gates-f1` — runs the five `f1_` ADR gate tests with
+  `--no-fail-fast --test-threads=1` so the §7a mutation receipt's PASS/PASS/FAIL
+  split by test name is unambiguous.
+
 ## [v0.34.3] - 2026-07-23
 
 ### Fixed
