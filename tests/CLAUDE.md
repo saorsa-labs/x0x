@@ -19,6 +19,7 @@ covers project-wide rules and architecture.
 | `crdt_convergence_concurrent.rs` | Concurrent CRDT operations converging |
 | `crdt_partition_tolerance.rs` | Network partition and recovery |
 | `mls_integration.rs` | Group encryption, key rotation |
+| `f1_gss_remove_live.rs` | F1/ADR-0010: admin remove (`DELETE /groups/:id/members/:agent_id`) rotates the GSS secret — epoch advances, survivor still decrypts, removed member locked out. Daemon-backed, `--ignored`; run via `just adr-gates-f1-live`. Validated to FAIL against a pre-F1 build (ADR-0025 observation completeness). **Note: the `D.2` block in `e2e_named_groups.sh` covers the *ban* path, which rotated pre-F1 — it cannot observe this defect.** |
 | `network_integration.rs` | Bootstrap connection |
 | `network_timeout.rs` | Connection timeouts |
 | `nat_traversal_integration.rs` | NAT hole-punching |

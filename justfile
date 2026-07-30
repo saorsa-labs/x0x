@@ -34,6 +34,14 @@ test-verbose:
 adr-gates-f1:
     cargo nextest run -p x0x --all-features --no-fail-fast --test-threads=1 -E 'test(/(^|::)f1_/)'
 
+# Live counterpart to `adr-gates-f1`: spawns three real x0xd daemons and proves
+# the ADMIN REMOVE path rotates the GSS secret cross-daemon. Separate from
+# `adr-gates-f1` because the test is `#[ignore]`d (real daemons, ~1 min) and so
+# is not selected by that recipe's default run. Validated against a pre-F1
+# build (e301371), where R1 and R3 fail — see the file header.
+adr-gates-f1-live:
+    cargo nextest run -p x0x --all-features --no-fail-fast --test-threads=1 --run-ignored all -E 'test(/(^|::)f1_.*_live/)'
+
 build:
     cargo build --all-features
 
