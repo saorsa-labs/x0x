@@ -8,7 +8,8 @@
 
 use super::super::state::AppState;
 use super::super::{
-    api_error, bad_request, forbidden, not_found, parse_agent_id_hex, parse_optional_json,
+    api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
+    parse_optional_json,
 };
 use super::direct::direct_message_send_config;
 use super::files::{
@@ -12426,8 +12427,11 @@ pub(in crate::server) async fn secure_group_decrypt(
 /// delivered envelope arrives; in that window `info.shared_secret` is None
 /// and this endpoint returns 424.
 ///
-/// The recipient must be a known member of the group with a published KEM
-/// public key (404 / 424 otherwise).
+/// The recipient must be an active member of the group with a published KEM
+/// public key. An absent recipient yields 404 `"recipient is not a member"`;
+/// a present-but-inactive entry (e.g. soft-deleted) yields 409 with
+/// `reason: "recipient_not_active"`; a recipient without a published KEM key
+/// yields 424.
 ///
 /// Used by the D.2 adversarial E2E proof to obtain a **real live-path
 /// envelope** (produced via the same `seal_group_secret_to_recipient` +
@@ -12459,10 +12463,21 @@ pub(in crate::server) async fn secure_group_reseal(
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
-    // Recipient must be a known member with a KEM pubkey.
+    // Recipient must be an ACTIVE member with a published KEM pubkey. A
+    // present-but-inactive entry (soft-deleted by removal, which retains the
+    // KEM key) is rejected with a distinct 409 + reason so it stays
+    // machine-separable from an absent recipient (404) and from the
+    // withdrawn-group 409 (which carries no reason).
     let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
         return not_found("recipient is not a member");
     };
+    if !recipient_member.is_active() {
+        return api_error_with_reason(
+            StatusCode::CONFLICT,
+            "recipient is not an active member",
+            "recipient_not_active",
+        );
+    }
     let Some(recipient_kem_b64) = recipient_member.kem_public_key_b64.clone() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -15926,6 +15941,89 @@ mod tests {
                 "aead_ciphertext_b64",
             ],
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn secure_reseal_rejects_inactive_and_absent_recipient() -> Result<()> {
+        // Active-recipient sealing contract (cleanup item a):
+        //   present-but-inactive (Removed) recipient -> 409 + reason "recipient_not_active"
+        //   absent recipient                          -> 404, no reason
+        //   active recipient                          -> 200 (seal succeeds)
+        // The two 409 conditions stay machine-separable: the withdrawn-group
+        // 409 carries no `reason`; the inactive-recipient 409 carries it.
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gss-reseal-active-recipient";
+        install_secure_endpoint_group(&state, group_id, group_id, x0x::mls::SecureGroupPlane::Gss)
+            .await;
+        let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
+        let charlie = "33".repeat(32);
+        let bob = "44".repeat(32);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group installed");
+            // Charlie: active member with a published KEM key.
+            info.add_member_with_kem(
+                charlie.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(caller_hex.clone()),
+                None,
+                Some(kem_b64.clone()),
+            );
+            // Bob: added with a KEM key, then soft-deleted (Removed). The entry
+            // and KEM key are retained — the retained-but-inactive state the
+            // active-recipient predicate must reject before sealing.
+            info.add_member_with_kem(
+                bob.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(caller_hex.clone()),
+                None,
+                Some(kem_b64.clone()),
+            );
+            info.remove_member(&bob, Some(caller_hex.clone()));
+            info.recompute_state_hash();
+        }
+
+        // Absent recipient -> 404, no reason.
+        let absent = "55".repeat(32);
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest { recipient: absent }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"].as_bool(), Some(false));
+        assert_eq!(body.0["error"].as_str(), Some("recipient is not a member"));
+        assert!(body.0.get("reason").is_none());
+
+        // Present-but-inactive (Removed) recipient -> 409 + reason.
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest {
+                recipient: bob.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["ok"].as_bool(), Some(false));
+        assert_eq!(body.0["reason"].as_str(), Some("recipient_not_active"));
+
+        // Active recipient -> 200, real secret envelope produced.
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest {
+                recipient: charlie.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"].as_bool(), Some(true));
+        assert!(body.0.get("kem_ciphertext_b64").is_some());
         Ok(())
     }
 

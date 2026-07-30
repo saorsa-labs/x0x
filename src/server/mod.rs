@@ -1681,6 +1681,21 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<se
     )
 }
 
+/// Like [`api_error`], but adds a machine-readable `reason` field to the
+/// response body. Use when two responses share an HTTP status yet must stay
+/// machine-separable (e.g. two distinct 409 CONFLICT conditions). Existing
+/// `api_error` callers keep their `{ "ok": false, "error": <msg> }` body.
+fn api_error_with_reason(
+    status: StatusCode,
+    msg: impl Into<String>,
+    reason: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": msg.into(), "reason": reason })),
+    )
+}
+
 /// `400 Bad Request` error response.
 fn bad_request(msg: impl Into<String>) -> (StatusCode, Json<serde_json::Value>) {
     api_error(StatusCode::BAD_REQUEST, msg)
