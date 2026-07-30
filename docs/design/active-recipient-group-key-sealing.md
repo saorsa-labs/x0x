@@ -112,11 +112,13 @@ baseline. It is not the acceptance instrument for a universal rule.
 At the acceptance commit, an executable receipt:
 
 - derives the sealing-mechanism set by a stated, re-runnable rule: enumerate
-  the public API of the group-key envelope module or modules (today
-  `src/groups/kem_envelope.rs`), classify every public item whose signature
-  takes or returns group key material or recipient-openable ciphertext as a
-  sealing mechanism, and record the rule's output — the complete module
-  surface and each item's classification — rather than accepting a typed
+  the complete public API surface of the group-key envelope module or modules
+  (today `src/groups/kem_envelope.rs`), including associated functions and
+  methods on public types; classify each surface entry as a sealing mechanism
+  when its signature takes or returns group key material or
+  recipient-openable ciphertext, and otherwise as out of scope, including
+  entries without a signature; record the rule's output — the complete module
+  surface and each entry's classification — rather than accepting a typed
   mechanism list;
 - discovers authority-bearing production call paths that choose the recipient,
   including paths that reach a sealing mechanism through a delegated wrapper;
