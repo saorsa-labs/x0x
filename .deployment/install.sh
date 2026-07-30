@@ -1,122 +1,118 @@
-#!/bin/bash
-# Installation script for x0xd on VPS nodes
-# Usage: ./install.sh [--binary path/to/binary] [--config path/to/config.toml]
-# Default: Uses /tmp/x0xd and /tmp/bootstrap.toml if not specified
-
+#!/usr/bin/env bash
+# =============================================================================
+# Authoritative x0xd installer for managed production bootstrap hosts.
+#
+# Single repository-identified installation path for the production x0xd
+# instance (ADR 0026). Installs the tracked systemd/x0xd.service unit and the
+# production configuration generated from the tracked config/bootstrap-config.toml
+# source to the SAME paths the unit reads, so a fresh host is brought up
+# identically to the live fleet.
+#
+# This replaces the legacy .deployment/deploy.sh — which uploaded
+# bootstrap-<node>.toml to /etc/x0x/bootstrap.toml, a path its own installed
+# unit never read — and the contradictory top-level .deployment/x0xd.service,
+# which read /etc/x0x/x0xd.toml. Both have been retired so the tree no longer
+# carries two claimed deployment authorities (ADR 0026, design chapter §1/§6).
+#
+# The installer does NOT start the service. Starting x0xd is a managed
+# transition that requires preflight/postflight over the complete running set
+# (design chapter §5); start it explicitly once that is satisfied:
+#
+#     systemctl start x0xd
+#
+# Usage (run ON THE TARGET HOST as root):
+#   .deployment/install.sh                           # unit + config from tracked sources
+#   .deployment/install.sh --binary /path/to/x0xd    # also install the binary
+#   .deployment/install.sh --config /path/to/bootstrap-config.toml
+#
+# Options:
+#   --binary PATH   x0xd binary to install at /opt/x0x/x0xd (optional)
+#   --unit PATH     override the tracked unit source (default: systemd/x0xd.service)
+#   --config PATH   override the tracked config source (default: config/bootstrap-config.toml)
+#   -h, --help      show this help
+# =============================================================================
 set -euo pipefail
 
-# Colors
-RED='\033[0;31m'
-GREEN='\033[0;32m'
-YELLOW='\033[1;33m'
-NC='\033[0m'
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+UNIT_SRC_DEFAULT="$SCRIPT_DIR/systemd/x0xd.service"
+CONFIG_SRC_DEFAULT="$SCRIPT_DIR/config/bootstrap-config.toml"
 
-log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+UNIT_SRC="$UNIT_SRC_DEFAULT"
+CONFIG_SRC="$CONFIG_SRC_DEFAULT"
+BINARY_SRC="${BINARY:-}"
+
+usage() {
+    cat <<'EOF'
+Usage: install.sh [options]
+
+Installs the tracked systemd/x0xd.service unit and the production config
+(from config/bootstrap-config.toml) to the paths the unit reads.
+Run on the target host as root. Does NOT start the service.
+
+Options:
+  --binary PATH   x0xd binary to install at /opt/x0x/x0xd (optional)
+  --unit PATH     override tracked unit source (default: systemd/x0xd.service)
+  --config PATH   override tracked config source (default: config/bootstrap-config.toml)
+  -h, --help      show this help
+EOF
 }
 
-log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
-}
+while [ $# -gt 0 ]; do
+    case "$1" in
+        --binary) BINARY_SRC="${2:?--binary requires a path}"; shift 2 ;;
+        --unit)   UNIT_SRC="${2:?--unit requires a path}"; shift 2 ;;
+        --config) CONFIG_SRC="${2:?--config requires a path}"; shift 2 ;;
+        -h|--help) usage; exit 0 ;;
+        *) echo "error: unknown argument: $1" >&2; usage >&2; exit 1 ;;
+    esac
+done
 
-log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
-}
+# Canonical destination paths. systemd/x0xd.service reads /etc/x0x/config.toml,
+# so the production config is installed at exactly that path.
+UNIT_DST="/etc/systemd/system/x0xd.service"
+CONFIG_DST="/etc/x0x/config.toml"
+BINARY_DST="/opt/x0x/x0xd"
 
-# Parse arguments
-BINARY_PATH="${1:-/tmp/x0xd}"
-CONFIG_PATH="${2:-/tmp/bootstrap.toml}"
+# --- fail-closed validation of the tracked sources ---------------------------
+[ -f "$UNIT_SRC" ]   || { echo "error: unit source not found: $UNIT_SRC" >&2; exit 1; }
+[ -f "$CONFIG_SRC" ] || { echo "error: config source not found: $CONFIG_SRC" >&2; exit 1; }
 
-if [[ ! -f "$BINARY_PATH" ]]; then
-    log_error "Binary not found: $BINARY_PATH"
+# The installer must write the production config to the same path its selected
+# unit reads (design chapter §6 step 2). Refuse to install if they disagree.
+unit_config="$(grep -oE -- '--config[= ][^ ]+' "$UNIT_SRC" | head -1 | sed -E 's/^--config[= ]+//')"
+if [ -n "$unit_config" ] && [ "$unit_config" != "$CONFIG_DST" ]; then
+    echo "error: unit $UNIT_SRC reads '$unit_config' but this installer writes '$CONFIG_DST'" >&2
+    echo "       the install path and the unit's --config path must agree" >&2
     exit 1
 fi
 
-if [[ ! -f "$CONFIG_PATH" ]]; then
-    log_error "Config not found: $CONFIG_PATH"
+echo "[install] unit:   $UNIT_SRC -> $UNIT_DST"
+echo "[install] config: $CONFIG_SRC -> $CONFIG_DST"
+[ -n "$BINARY_SRC" ] && echo "[install] binary: $BINARY_SRC -> $BINARY_DST"
+
+if [ "$(id -u)" -ne 0 ]; then
+    echo "error: must run as root (writes $UNIT_DST, $CONFIG_DST, $BINARY_DST)" >&2
     exit 1
 fi
 
-log_info "Installing x0xd..."
-log_info "Binary: $BINARY_PATH"
-log_info "Config: $CONFIG_PATH"
-
-# Create x0x user if doesn't exist
-if ! id -u x0x >/dev/null 2>&1; then
-    log_info "Creating x0x user..."
-    useradd --system --no-create-home --shell /bin/false x0x
-else
-    log_info "User x0x already exists"
+# --- install binary (optional) ----------------------------------------------
+if [ -n "$BINARY_SRC" ]; then
+    [ -f "$BINARY_SRC" ] || { echo "error: binary not found: $BINARY_SRC" >&2; exit 1; }
+    mkdir -p /opt/x0x
+    install -m 0755 "$BINARY_SRC" "$BINARY_DST"
 fi
 
-# Create directories
-log_info "Creating directories..."
-mkdir -p /opt/x0x
+# --- install production config to the path the unit reads --------------------
 mkdir -p /etc/x0x
-mkdir -p /var/lib/x0x/data
-chown -R x0x:x0x /var/lib/x0x
+install -m 0644 "$CONFIG_SRC" "$CONFIG_DST"
 
-# Copy binary
-log_info "Installing binary..."
-cp "$BINARY_PATH" /opt/x0x/x0xd
-chmod +x /opt/x0x/x0xd
-chown root:root /opt/x0x/x0xd
+# --- install the tracked systemd unit ---------------------------------------
+mkdir -p "$(dirname "$UNIT_DST")"
+install -m 0644 "$UNIT_SRC" "$UNIT_DST"
 
-# Copy config
-log_info "Installing config..."
-cp "$CONFIG_PATH" /etc/x0x/bootstrap.toml
-chmod 644 /etc/x0x/bootstrap.toml
-chown root:root /etc/x0x/bootstrap.toml
-
-# Install systemd service
-log_info "Installing systemd service..."
-if [[ -f "/tmp/x0xd.service" ]]; then
-    cp /tmp/x0xd.service /etc/systemd/system/x0xd.service
-    chmod 644 /etc/systemd/system/x0xd.service
-else
-    log_warn "Service file not found at /tmp/x0xd.service"
-    log_warn "Please install manually or run this script after uploading service file"
-fi
-
-# Reload systemd
-log_info "Reloading systemd..."
 systemctl daemon-reload
+systemctl enable x0xd >/dev/null 2>&1 || true
 
-# Enable service
-log_info "Enabling x0xd service..."
-systemctl enable x0xd
-
-# Start service
-log_info "Starting x0xd service..."
-systemctl start x0xd
-
-# Wait a moment for service to start
-sleep 2
-
-# Check status
-if systemctl is-active --quiet x0xd; then
-    log_info "Service is running"
-
-    # Check health endpoint
-    if command -v curl >/dev/null 2>&1; then
-        log_info "Checking health endpoint..."
-        if curl -s -f http://127.0.0.1:12600/health >/dev/null; then
-            log_info "Health check: OK"
-        else
-            log_warn "Health check failed - service may still be initializing"
-        fi
-    fi
-
-    log_info "Installation complete!"
-    log_info ""
-    log_info "Commands:"
-    log_info "  Status:  systemctl status x0xd"
-    log_info "  Logs:    journalctl -u x0xd -f"
-    log_info "  Restart: systemctl restart x0xd"
-    log_info "  Stop:    systemctl stop x0xd"
-    log_info "  Health:  curl http://127.0.0.1:12600/health"
-else
-    log_error "Service failed to start"
-    log_error "Check logs: journalctl -u x0xd -n 50 --no-pager"
-    exit 1
-fi
+echo "[install] done. unit enabled; service NOT started (managed transition)."
+echo "[install] start explicitly:  systemctl start x0xd"
+echo "[install] verify:            curl -s http://127.0.0.1:12600/health"

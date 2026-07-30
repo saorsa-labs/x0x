@@ -1,0 +1,42 @@
+[Unit]
+Description=x0xd - x0x testnet instance (--name testnet)
+Documentation=https://github.com/saorsa-labs/x0x/blob/main/docs/adr/0026-managed-x0xd-deployment.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+
+# Testnet instance, tracked repo-only definition (no fleet installer). Runs
+# alongside the production x0xd.service on the same bootstrap hosts.
+#
+# Root-distinct from production by construction (ADR 0026 Decision 1):
+#   - `--name testnet` derives an instance-scoped identity and, because
+#     config-testnet.toml leaves data_dir at its default, an effective data
+#     root of $XDG_DATA_HOME/x0x-testnet (e.g. /root/.local/share/x0x-testnet
+#     when run as root) -- never the production root.
+#   - config-testnet.toml binds the testnet to distinct ports (QUIC 6483,
+#     REST 127.0.0.1:13600) so it cannot clash with the production listener
+#     (5483 / 12600). The named-instance port overrides do NOT fire here
+#     because the testnet config sets those addresses explicitly; the explicit
+#     values are the authority.
+#
+# The binary is the same x0xd build, deployed under the testnet name. The
+# tracked config source is config/bootstrap-config-testnet.toml.
+ExecStart=/opt/x0x/x0xd-testnet --name testnet --config /etc/x0x/config-testnet.toml
+
+WorkingDirectory=/var/lib/x0x
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=x0xd-testnet
+
+Restart=always
+RestartSec=5s
+
+Environment=RUST_LOG=info
+
+LimitNOFILE=4096
+
+[Install]
+WantedBy=multi-user.target
