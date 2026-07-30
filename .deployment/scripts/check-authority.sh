@@ -30,6 +30,13 @@
 # Exit: 0 compliant / 1 violation or self-test failure / 2 usage error.
 # =============================================================================
 set -euo pipefail
+# Requires bash ≥4 (associative arrays: declare -A). Stock macOS /bin/bash is
+# 3.2 and errors on `declare -A`; fail with a reason rather than a usage error.
+if [ -z "${BASH_VERSINFO[0]:-}" ] || [ "${BASH_VERSINFO[0]}" -lt 4 ]; then
+    echo "error: ${BASH_SOURCE[0]} requires bash ≥4 (uses associative arrays); current bash is ${BASH_VERSION:-unknown}." >&2
+    echo "       invoke via a modern bash on PATH — the repo gate uses PATH bash; macOS stock /bin/bash is 3.2." >&2
+    exit 1
+fi
 
 SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
 DEPLOYMENT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -191,15 +198,16 @@ run_self_test() {
         return 1
     fi
 
-    # Each disclosed control (chapter §3) + the advisory-1 no-flag arm.
+    # The six §3 controls (C4 has two discovery arms) + the advisory-1 no-flag arm (C2b).
     # Mutators run with cwd = a fresh copy of .deployment; _rewrite is the
     # BSD+GNU-safe in-place sed (> tmp && mv), so the self-test is portable
     # across macOS and Linux runners without eval or nested quoting.
-    mut_C1()  { printf '[Unit]\nDescription=competing\n\n[Service]\nExecStart=/opt/x0x/x0xd --config /etc/x0x/x0xd.toml\n' > x0xd.service; }
+    mut_C1()  { _rewrite install.sh 's|^UNIT_SRC_DEFAULT=.*|UNIT_SRC_DEFAULT="$SCRIPT_DIR/systemd/x0xd-testnet.service"|'; }
     mut_C2a() { _rewrite install.sh 's|^CONFIG_DST=.*|CONFIG_DST="/etc/x0x/x0xd.toml"|'; }
     mut_C2b() { _rewrite systemd/x0xd.service 's| --config /etc/x0x/config.toml||'; }
     mut_C3()  { rm -f systemd/x0xd-testnet.service; }
     mut_C4()  { printf '[Unit]\nDescription=staging\n\n[Service]\nExecStart=/opt/x0x/x0xd-staging --config /etc/x0x/staging.toml\n' > systemd/x0xd-staging.service; }
+    mut_C4b() { printf '[Unit]\nDescription=competing\n\n[Service]\nExecStart=/opt/x0x/x0xd --config /etc/x0x/x0xd.toml\n' > x0xd.service; }
     mut_C5()  { _rewrite systemd/x0xd-443.service 's|/etc/x0x/x0xd-443.toml|/etc/x0x/config.toml|'; }
     mut_C6()  { _rewrite deploy-443.sh 's|^LIVE=.*|LIVE=/etc/x0x/x0xd.toml|'; }
 
@@ -217,13 +225,14 @@ run_self_test() {
         fi
     }
 
-    expect_fail C1-competing-prod-unit       mut_C1
-    expect_fail C2-config-disagree           mut_C2a
-    expect_fail C2-no-config-flag            mut_C2b
-    expect_fail C3-missing-testnet-unit      mut_C3
-    expect_fail C4-orphan-alternative        mut_C4
-    expect_fail C5-duplicate-root            mut_C5
-    expect_fail C6-deploy443-source-mismatch mut_C6
+    expect_fail C1-installer-default-mismatch mut_C1
+    expect_fail C2-config-disagree            mut_C2a
+    expect_fail C2-no-config-flag             mut_C2b
+    expect_fail C3-missing-testnet-unit       mut_C3
+    expect_fail C4-orphan-alternative         mut_C4
+    expect_fail C4-competing-prod-unit        mut_C4b
+    expect_fail C5-duplicate-root             mut_C5
+    expect_fail C6-deploy443-source-mismatch  mut_C6
 
     rm -rf "$tmp"
     echo "[self-test] $pass control(s) fired, $failed failed to fire"
