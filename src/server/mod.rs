@@ -10,6 +10,7 @@
 use crate as x0x;
 
 mod auth;
+pub mod config;
 mod crdt_subscriptions;
 mod routes;
 mod sse;
@@ -19,6 +20,7 @@ mod ws;
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
+pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,

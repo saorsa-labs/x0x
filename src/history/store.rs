@@ -129,9 +129,20 @@ impl Store {
     /// exclusivity probe fails fast).
     pub fn open_with_busy_timeout(path: &Path, busy: std::time::Duration) -> HistoryResult<Self> {
         if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| {
+                // Surface the resolved db path (the operator's `<data_dir>`
+                // or an explicit `history.db_path`) so a permission/ENOENT
+                // failure names the path actually attempted, not just the
+                // raw io message.
+                HistoryError::Io(std::io::Error::new(
+                    e.kind(),
+                    format!("create parent dir for history db {}: {e}", path.display()),
+                ))
+            })?;
         }
-        let conn = Connection::open(path)?;
+        let conn = Connection::open(path).map_err(|e| {
+            HistoryError::Database(format!("open history db {}: {e}", path.display()))
+        })?;
         conn.busy_timeout(busy)?;
         // auto_vacuum must be decided before the first table exists; on an
         // already-populated db this pragma is a no-op (the setting is baked
@@ -736,5 +747,23 @@ mod tests {
 
         let rows = store.query(&HistoryQuery::default()).unwrap();
         assert_eq!(rows.len(), 1, "one row per replaceable slot");
+    }
+    /// Item (b): a failed open must name the *resolved* db path (the path the
+    /// daemon actually attempted), not just the raw io message. A db path whose
+    /// parent is an existing file makes `create_dir_all` fail; the error must
+    /// contain the resolved path so an operator with a derived `<data_dir>`
+    /// sees which path was tried.
+    #[test]
+    fn open_error_names_the_resolved_db_path() {
+        // `file` is a regular file; its path used as a parent dir is invalid,
+        // so `create_dir_all` fails at open.
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let bad_path = file.path().join("history.db");
+        let err = Store::open(&bad_path).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&bad_path.display().to_string()),
+            "history init error must name the resolved db path; got: {msg}"
+        );
     }
 }
