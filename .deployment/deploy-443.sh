@@ -7,7 +7,7 @@
 # port), with its own state dir + machine identity, alongside the existing
 # listener. No client ever does this — only operator-run bootstrap nodes.
 #
-# The 443 config is generated FROM the host's live /etc/x0x/x0xd.toml so it
+# The 443 config is generated FROM the host's live /etc/x0x/config.toml so it
 # can never drift from the running :5483 config: only bind_address, data_dir,
 # machine_key_path and api_address are overridden.
 #

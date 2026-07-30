@@ -78,9 +78,15 @@ BINARY_DST="/opt/x0x/x0xd"
 [ -f "$CONFIG_SRC" ] || { echo "error: config source not found: $CONFIG_SRC" >&2; exit 1; }
 
 # The installer must write the production config to the same path its selected
-# unit reads (design chapter §6 step 2). Refuse to install if they disagree.
+# unit reads (design chapter §6 step 2). Refuse to install if the unit binds
+# no --config path at all (a flag-less unit leaves the invariant unenforced)
+# or if the two paths disagree.
 unit_config="$(grep -oE -- '--config[= ][^ ]+' "$UNIT_SRC" | head -1 | sed -E 's/^--config[= ]+//')"
-if [ -n "$unit_config" ] && [ "$unit_config" != "$CONFIG_DST" ]; then
+if [ -z "$unit_config" ]; then
+    echo "error: unit $UNIT_SRC ExecStart carries no --config flag" >&2
+    echo "       every managed unit must bind its config path (design chapter §6 step 2)" >&2
+    exit 1
+elif [ "$unit_config" != "$CONFIG_DST" ]; then
     echo "error: unit $UNIT_SRC reads '$unit_config' but this installer writes '$CONFIG_DST'" >&2
     echo "       the install path and the unit's --config path must agree" >&2
     exit 1
