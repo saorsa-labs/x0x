@@ -4,8 +4,9 @@
 - **Date:** 2026-07-30
 - **Decision owners:** David Irvine
 - **Reviewers:** Sam (author); Dario; Watson. Watson made Kimi's reserved
-  rulings under David Irvine's delegation (Buzz event `eb6a888a`); Kimi
-  reviews at implementation.
+  cleanup rulings under David Irvine's delegation (Buzz event `eb6a888a`);
+  Kimi's independent design review of this authored decision is pending
+  before implementation.
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** ADR 0024; ADR 0025;
@@ -125,8 +126,14 @@ Acceptance requires independent controls showing that:
 - changing only the recipient predicate back to bare roster-entry presence
   makes the product-rule gate fail and attributes failure to the
   active-membership condition;
-- every production call path that chooses a named recipient for current-epoch
-  group key material establishes active membership before sealing;
+- at the acceptance commit, recorded evidence names the enumeration method and
+  the complete sealing-mechanism set it searches, lists every discovered
+  production call path that chooses a named recipient for current-epoch group
+  key material, and accounts for each path exactly once as carrying the
+  active-membership predicate or an evidenced compile-time exclusion;
+- adding an otherwise valid production recipient-selecting path through any
+  named sealing mechanism without the predicate or an evidenced exclusion
+  makes validation fail and attributes the uncovered path;
 - every exception identifies the recipient-selecting call path and proves that
   path is excluded from production builds at compile time;
 - the shared roster-agnostic sealing primitive remains outside the exception

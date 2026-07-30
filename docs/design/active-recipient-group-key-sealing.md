@@ -101,3 +101,48 @@ or remove it.
 A follow-up product ADR will trace the authentication boundary and choose
 keep, restrict, or compile-time-excluded test-only disposition. The
 active-recipient production gate does not depend on this endpoint.
+
+## 7. Acceptance-time recipient-selection accounting
+
+Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Grounding inventories the recipient-selection paths surveyed at the source
+baseline. It is not the acceptance instrument for a universal rule.
+
+At the acceptance commit, an executable receipt:
+
+- names the enumeration method and the complete set of sealing mechanisms it
+  treats as capable of wrapping current-epoch group key material for a named
+  recipient;
+- discovers authority-bearing production call paths that choose the recipient,
+  including paths that reach a sealing mechanism through a delegated wrapper;
+- records the exact source path and function for every discovered call path;
+- reconciles discovery and the recorded inventory in both directions; and
+- accounts for each path exactly once as establishing active membership before
+  sealing or as carrying evidence that the recipient-selecting path itself is
+  excluded from production builds at compile time.
+
+The check fails on an unaccounted discovered path, a recorded path absent from
+discovery, a predicate after sealing, a predicate on the wrong recipient, or
+an exception that proves only runtime unreachability. It must not assume that
+`seal_group_secret_to_recipient` is the only sealing mechanism.
+
+A differential control adds an otherwise valid production path through a
+different named mechanism or delegated wrapper without the active-membership
+predicate. The accounting check must fail and attribute that path; the
+manual-reseal product gate may remain green.
+
+## 8. Execution reachability and coverage status
+
+Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Active-recipient controls do not establish coverage merely by existing as
+ignored tests, appearing in a test-list receipt, or having a hand-run command.
+They count only after ADR 0025's single execution authority classifies every
+identity and reaches the controls from each declared required context through
+the registry-derived dispatcher and selector.
+
+Until that reachability and closed outcome accounting exist, repository and CI
+status must describe the active-recipient property as not covered. Landing an
+ignored stub or CI-only job does not discharge ADR 0027 Validation and does not
+make its status a merge gate.
