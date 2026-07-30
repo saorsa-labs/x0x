@@ -65,15 +65,34 @@ if ! grep -Eq '^[[:space:]]*bind_address[[:space:]]*=' "$LIVE"; then
 fi
 
 # Generate the 443 config: copy the live one, override exactly 4 keys.
-# Any key absent from the live file is appended so the override always lands.
+#
+# These four keys are TOP-LEVEL `DaemonConfig` fields (src/server/state.rs:200).
+# TOML scoping makes placement load-bearing: a key written after a `[section]`
+# header belongs to that section, and `DaemonConfig` carries no
+# `deny_unknown_fields`, so a misplaced `data_dir` is parsed, ignored, and
+# silently replaced by `default_data_dir()`. Two daemons on one host then
+# resolve the same `<data_dir>/history.db`, which ADR-0023's exclusive open
+# turns into a restart loop for whichever daemon loses the race (issue #281).
+#
+# The previous implementation was section-blind in both branches: it appended
+# an absent key at EOF (every bootstrap-*.toml ends inside `[update]`, so the
+# key landed there) and rewrote an existing key wherever it sat. The generated
+# `diff -u` looked correct in both cases — the line really was written, just
+# into the wrong scope. Per ADR-0025, the diff is not proof of the observation.
+#
+# This implementation is section-aware and self-healing: it deletes every
+# occurrence of the key anywhere in the file, then re-emits it in the top-level
+# block immediately before the first section header (or at EOF when the file
+# has no sections, where EOF *is* top level).
 TMP=$(mktemp)
 override() { # key value(quoted-literal-to-write)
   local key="$1" val="$2"
-  if grep -Eq "^[[:space:]]*${key}[[:space:]]*=" "$TMP"; then
-    sed -i -E "s|^[[:space:]]*${key}[[:space:]]*=.*|${key} = ${val}|" "$TMP"
-  else
-    printf '%s = %s\n' "$key" "$val" >> "$TMP"
-  fi
+  awk -v k="$key" -v v="$val" '
+    /^[[:space:]]*\[/ && !done       { print k " = " v; done = 1 }
+    $0 ~ "^[[:space:]]*" k "[[:space:]]*=" { next }
+                                     { print }
+    END                              { if (!done) print k " = " v }
+  ' "$TMP" > "$TMP.new" && mv "$TMP.new" "$TMP"
 }
 cp "$LIVE" "$TMP"
 override bind_address '"[::]:443"'
@@ -87,6 +106,25 @@ override api_address '"127.0.0.1:12643"'
 echo "--- generated $GEN (diff vs live) ---"
 diff -u "$LIVE" "$TMP" || true
 echo "-------------------------------------"
+
+# Fail closed BEFORE shipping: prove each overridden key is top-level in the
+# generated file. The diff above shows only that a line was written, not that
+# it is in scope — the exact gap that let issue #281 ship. `awk` finds the
+# first section header; every override must appear before it, exactly once.
+first_section=$(grep -nE '^[[:space:]]*\[' "$TMP" | head -1 | cut -d: -f1)
+: "${first_section:=999999}"
+for k in bind_address data_dir machine_key_path api_address; do
+  hits=$(grep -cE "^[[:space:]]*${k}[[:space:]]*=" "$TMP" || true)
+  line=$(grep -nE "^[[:space:]]*${k}[[:space:]]*=" "$TMP" | head -1 | cut -d: -f1)
+  if [ "$hits" != "1" ] || [ -z "$line" ] || [ "$line" -ge "$first_section" ]; then
+    echo "FATAL: '$k' is not a single top-level key in the generated config"
+    echo "       (occurrences=$hits line=${line:-none} first_section=$first_section)."
+    echo "       A key at or after the first [section] header is silently ignored"
+    echo "       by DaemonConfig and falls back to its default — issue #281."
+    rm -f "$TMP"; exit 1
+  fi
+done
+echo "  verified: 4/4 overrides are top-level (pre-[section]) keys"
 
 do_run "mkdir -p $DATA_DIR/data"
 if [ "$DRY" = 1 ]; then echo "  DRY: write $GEN"; else cp "$TMP" "$GEN"; fi
