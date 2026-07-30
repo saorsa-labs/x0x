@@ -18,6 +18,7 @@ use super::files::{
 use super::groups::save_mls_groups;
 use super::identity::populate_invite_base_state_from_group_info;
 use crate as x0x;
+use crate::groups::aad::secure_share_aad;
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -871,20 +872,6 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// Hex agent_id of the distributor (actor) — for authority checks.
         actor: String,
     },
-}
-
-/// Construct the AEAD additional-authenticated-data binding for a
-/// `SecureShareDelivered` envelope. Must match exactly between sealer and
-/// opener.
-fn secure_share_aad(group_id: &str, recipient_hex: &str, secret_epoch: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(128);
-    aad.extend_from_slice(b"x0x.group.share.v2|");
-    aad.extend_from_slice(group_id.as_bytes());
-    aad.push(b'|');
-    aad.extend_from_slice(recipient_hex.as_bytes());
-    aad.push(b'|');
-    aad.extend_from_slice(&secret_epoch.to_le_bytes());
-    aad
 }
 
 /// Failure constructing a `SecureShareDelivered` envelope without side effects.

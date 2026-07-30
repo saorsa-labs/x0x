@@ -9,6 +9,7 @@
 //!
 //! Groups are the primary collaboration primitive for agents and humans.
 
+pub mod aad;
 pub mod card;
 pub mod diagnostics;
 pub mod directory;
