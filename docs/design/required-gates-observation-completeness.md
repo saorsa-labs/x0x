@@ -529,3 +529,109 @@ their enclosing range.
 The table's ranges are contiguous, non-overlapping, and cover source lines
 1–765. Future edits update this chapter in place; they do not rewrite the
 source migration or amend the Proposed decision.
+
+## F1 removed-member exclusion evidence — ADR 0025 ownership
+
+Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+The phase-aware R3 observation, execution classification, and F1 fixture
+controls belong in
+`docs/design/required-gates-observation-completeness.md`, governed by Accepted
+ADR 0025. They do not amend ADR 0025 and do not belong in either the deployment
+chapter or the new active-recipient chapter.
+
+The current R3 is not one weak observation but a race between two reasons for
+the same `None`. Its helper discards every non-200 response. Before Bob applies
+`MemberRemoved`, his record still contains epoch E and an E+1 ciphertext
+returns 409. A valid self-removal apply then removes Bob from the roster,
+deletes his entire named-group record, clears the related caches and returns
+(`named_groups.rs:5058,5074-5111`). The same decrypt request thereafter
+returns 404 because the record is absent (`:12304-12305`). The one-shot
+`is_none()` assertion at `tests/f1_gss_remove_live.rs:349-352` neither
+establishes nor reports which phase it sampled.
+
+The ADR 0025-governed chapter owns these mutable mechanisms:
+
+1. **Bind epoch E to Bob's real baseline without a secret-export route.**
+   While Bob is active, production `secure_group_reseal` seals E to Bob
+   (`named_groups.rs:12446-12528`). The integration-test target loads Bob's
+   actual persisted `<data_dir>/agent_kem.key` and opens that real envelope
+   with the public production `open_group_secret` primitive. The recovered E
+   key must open the same baseline content that Bob's stored-state decrypt
+   endpoint already opened through the production content derivation, nonce,
+   AAD, and AEAD inputs.
+2. **Bind the survivor sensitivity lane.** After R2, production reseal to
+   active Charlie must succeed. The integration-test target opens that
+   envelope with Charlie's actual persisted key; the recovered E+1 key must
+   open the exact survivor ciphertext, while Bob's captured E key must fail
+   authentication. The test needs a shared production AAD builder extracted
+   from private `secure_share_aad` (`named_groups.rs:878-886`); duplicating
+   that wire binding in the test is not acceptable.
+3. **Model the R3 phase honestly.** During any pre-terminal interval, Bob's
+   stored-state decrypt response must be 409 with a parseable body,
+   `ciphertext_epoch == post_epoch`, and `local_epoch < ciphertext_epoch`.
+   HTTP 200 is red. A prompt correct apply may make this interval empty; the
+   gate must not hold removal unfinished merely to obtain 409. In its own
+   bounded window, the same previously proven group must transition to 404.
+   That 404 is a terminal phase marker, not key-exclusion evidence; 403, 424,
+   malformed, unreadable, and unmodelled responses fail.
+4. **Retain the Bob-lane vacuity/sensitivity control.** In the
+   integration-test target only, call the public production
+   `seal_group_secret_to_recipient` primitive with the real E+1 secret,
+   Bob's retained KEM public key, and the shared production AAD. Open it with
+   Bob's actual persisted private key and require the recovered secret to
+   decrypt the real survivor ciphertext. This proves Bob's recipient-bound
+   envelope fixture is usable and possession would compromise content. It is
+   not production enforcement evidence and is not the product mutation. The
+   new active-recipient chapter, not the ADR 0025 chapter, owns the evidence
+   that the test call path which selects Bob is excluded from production
+   builds at compile time. The shared sealing primitive is not excluded.
+5. **Keep delivery observations phase-specific.** A pre-terminal
+   test-constructed valid E+1 envelope may be delivered behind a barrier that
+   proves installation and E+1 decrypt before removal continues; that is an
+   installation sensitivity arm, not the product-rule mutation. After
+   terminal 404, `SecureShareDelivered` resolution rejects `unknown_group`
+   before KEM open/install (`:4629-4647`). That post-terminal arm pins
+   non-resurrection only and must not be counted as key-exclusion evidence or
+   attributed to `ensure_named_group_key_material_install_allowed`, which
+   models withdrawn groups rather than removed-self record deletion.
+
+At `e04b73a`, `just adr-gates-f1-live` is the only tracked invocation and no
+GitHub workflow reaches it. Under ADR 0025, the repository may not claim this
+property is covered until the gate is classified by the single execution
+authority and reached in its declared context.
+
+## Local and CI validation contract
+
+Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Use one named, registry-derived required integration recipe. `just check`
+invokes that recipe after compilation, and pull-request CI invokes the same
+dispatcher and selector. Deterministic tests that spawn only local daemons are
+classified as required-isolated; VPS, external-network, and soak tests remain
+explicit non-default declarations owned by their actual contexts. A global
+unclassified `--run-ignored all` is not the contract.
+
+Gemma's measured inventory at
+`RESEARCH/X0X_IGNORED_TEST_INVENTORY_2026_07_30.md` has SHA-256
+`15dc15197a2a11585d8a98c09085a9a05a470e44b0929fd6571d8ecf0c55a52c`.
+Under CI's all-feature set it discovers 2,695 tests and 246 ignored
+identities. The nine CI commands select 156; `just adr-gates-f1-live` selects
+one disjoint identity; 89 are unaccounted. Eleven of those 89 explicitly
+require live VPS or external-network access.
+
+The execution authority must classify all 246 identities exactly once before
+the selector is frozen. The current 156 CI-selected, one F1-only, and 89
+unaccounted partitions are inventory evidence, not the final context
+classification. In particular, the remaining 78 unaccounted identities
+cannot be inferred local merely because they are not among the eleven
+explicit external cases. The measured 180.96 seconds is cold
+discovery/compilation wall time; no test body ran, so it is not test runtime.
+
+Using the same dispatcher locally and in CI proves shared authority and
+reachability, not merge enforcement. Current `main` is unprotected. Under
+Accepted ADR 0025 Decision 5, the comprehensive status may be called a merge
+gate only after protection for that exact status is enabled and read back and
+an intentionally failing pull request is refused merge. CI may land before
+that staged proof, but its status must be described as CI-only until the
+readback and red-PR receipt exist.
