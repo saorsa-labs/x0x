@@ -38,6 +38,52 @@ hardening script removes that uploaded filename as legacy. Kimi should
 confirm this source-history reading. If Kimi finds contrary authority or
 product intent, the exact retire-versus-repair choice goes to David.
 
+## 1a. Machine-readable inventory schema and single-source migration
+
+Resolves at: `14d92796215f2ac8005d25fb2077920df0c44dc1`.
+
+The canonical record authority is a strict JSON manifest at
+`.deployment/authority-inventory.json`. This chapter governs its schema; the
+manifest owns the instance records; installers, generators, and repository
+checks are consumers. Markdown must not carry a second instance list, and an
+executable consumer must not retain an inline copy.
+
+The top-level object contains:
+
+- `schema_version`, a positive integer whose current value is `1`; and
+- `instances`, a non-empty array of records with unique stable `id` values.
+
+Each instance record contains:
+
+- `id`;
+- `unit.source`, `unit.destination`, and a possibly empty `unit.dropins` array
+  whose records each carry `source` and `destination`;
+- `config.destination` and exactly one config authority:
+  `config.source` for a tracked config, or `config.generator` plus its declared
+  `config.input_instances` for generated config;
+- `binary.destination`; and
+- `installation.entrypoint` plus literal `installation.selector_args` used
+  only to select that instance when an entry point serves more than one.
+
+Repository source paths are deployment-root-relative and must remain inside
+`.deployment/` after canonicalization. Live destinations are absolute. Unknown
+keys, unknown schema versions, duplicate identifiers, an empty inventory, a
+missing referenced artifact, a config with both or neither source authority,
+or a non-literal selector fail validation.
+
+The manifest does not copy values that the referenced artifacts own. The
+consumer derives the actual binary, `--name`, `--config`, environment,
+generator inputs, and effective-root inputs from the unit, config, generator,
+and installer, then reconciles those derived values with the manifest and
+discovered repository artifacts in both directions.
+
+Moving the inventory out of an executable is one atomic repository change:
+add the manifest, make every consumer read and validate it, delete all inline
+instance records, and keep the gate red if neither authority is usable, both
+persist, or any consumer still obtains instance records from executable code.
+Adding a manifest beside the current inline inventory is non-compliant even
+temporarily in a reviewable revision.
+
 ## 2. Effective-resolution adapter
 
 Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
