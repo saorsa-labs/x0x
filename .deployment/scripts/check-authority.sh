@@ -15,6 +15,11 @@
 #   C5  two units that resolve the same effective root (duplicate root); or
 #   C6  deploy-443.sh cloning a non-authoritative live config (comment/body
 #       mismatch).
+#   (C7 is reserved for the per-instance reachability control of the
+#    inventory-MOVE follow-up; it is not part of this commit.)
+#   C8  shell/unit/config syntax error in a tracked deployment artifact
+#       (§3:67). Config/unit syntax run under a disclosed platform bound:
+#       skipped WITH a printed note where the tool is absent, never silent.
 #
 # This is the STATIC check. It reconciles tracked repository artifacts only;
 # it performs no fleet contact and is NOT the PID-bound runtime observation of
@@ -103,6 +108,28 @@ gen443_live_src() {  # the live config path deploy-443.sh clones the 443 config 
         | head -1 | sed -E 's/^LIVE=//'
 }
 
+# --- syntax-parse helpers (chapter §3:67) ------------------------------------
+# TOML via the python stdlib (tomllib, ≥3.11) or the tomli backport.
+have_toml_parser() {
+    python3 -c "import tomllib" 2>/dev/null || python3 -c "import tomli" 2>/dev/null
+}
+# toml_parse PATH: silent + exit 0 if it parses; a one-line reason on stdout
+# + exit 1 if malformed. Caller MUST gate on have_toml_parser first.
+toml_parse() {
+    python3 - "$1" <<'PY'
+import sys
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
+try:
+    tomllib.load(open(sys.argv[1], "rb"))
+except Exception as e:  # tomllib.TOMLDecodeError and friends
+    print(f"toml: {e}")
+    sys.exit(1)
+PY
+}
+
 fail() { echo "FAIL [$1] $2" >&2; exit 1; }
 
 # --- the six controls --------------------------------------------------------
@@ -113,6 +140,50 @@ run_check() {
         [ -f "$DEPLOYMENT_DIR/$f" ] \
             || fail C3-missing "declared artifact absent: $f"
     done
+
+    # C8 — syntax validity of tracked deployment artifacts (§3:67: "shell/
+    # unit/config syntax checks appropriate to the chosen mechanism"). Runs
+    # after C3 (existence) and before the semantic greps: a syntactically
+    # broken script/unit/config makes C1/C2/C6's value extraction meaningless.
+    # Config/unit run under a disclosed platform bound: skipped WITH a printed
+    # note where the tool is absent — never silent (§3:67).
+
+    # 8a — shell syntax: bash -n over every tracked .deployment/*.sh.
+    # Discovery (mirrors C4): a newly tracked script is checked by default,
+    # and this covers the check script itself.
+    local s berr
+    while IFS= read -r s; do
+        [ -n "$s" ] || continue
+        if ! berr="$(bash -n "$DEPLOYMENT_DIR/$s" 2>&1)"; then
+            fail C8-shell-syntax "script '$s' fails bash -n: $berr"
+        fi
+    done < <(cd "$DEPLOYMENT_DIR" && find . -type f -name '*.sh' | sed 's|^\./||' | sort)
+
+    # 8b — config syntax: TOML parse of both declared config sources.
+    local cfg c8_cfg="verified" terr
+    if have_toml_parser; then
+        for cfg in "$PROD_CFG" "$TESTNET_CFG"; do
+            if ! terr="$(toml_parse "$DEPLOYMENT_DIR/$cfg")"; then
+                fail C8-config-syntax "config '$cfg' fails TOML parse: $terr"
+            fi
+        done
+    else
+        echo "NOTE [C8] no python TOML parser (tomllib/tomli) — config syntax SKIPPED (disclosed platform bound)" >&2
+        c8_cfg="skipped(no parser)"
+    fi
+
+    # 8c — unit syntax: systemd-analyze verify over the three declared units.
+    local un c8_unit="verified" uerr
+    if command -v systemd-analyze >/dev/null 2>&1; then
+        for un in "$PROD_UNIT" "$TESTNET_UNIT" "$UNIT443"; do
+            if ! uerr="$(systemd-analyze verify "$DEPLOYMENT_DIR/$un" 2>&1)"; then
+                fail C8-unit-syntax "unit '$un' fails systemd-analyze verify: $uerr"
+            fi
+        done
+    else
+        echo "NOTE [C8] systemd-analyze absent — unit syntax SKIPPED (disclosed platform bound, e.g. macOS dev)" >&2
+        c8_unit="skipped(no systemd-analyze)"
+    fi
 
     # C1 — one production authority, reached from the install entry point.
     [ -f "$DEPLOYMENT_DIR/$INSTALLER" ] \
@@ -178,7 +249,7 @@ run_check() {
         esac
     done < <(cd "$DEPLOYMENT_DIR" && find ./config -type f -name '*.toml' 2>/dev/null | sed 's|^\./||' | sort)
 
-    echo "OK [authority] .deployment reconciles: units {prod,testnet,443}, config sources {prod,testnet}; install↔prod --config agree ('$prod_cfg_arg'); roots distinct; deploy-443 source bound ('$live')."
+    echo "OK [authority] .deployment reconciles: units {prod,testnet,443}, config sources {prod,testnet}; install↔prod --config agree ('$prod_cfg_arg'); roots distinct; deploy-443 source bound ('$live'); syntax shell=verified config=$c8_cfg unit=$c8_unit (§3:67)."
 }
 
 # Portable in-place rewrite: sed -E EXPR FILE > tmp && mv (BSD+GNU safe).
@@ -198,7 +269,10 @@ run_self_test() {
         return 1
     fi
 
-    # The six §3 controls (C4 has two discovery arms) + the advisory-1 no-flag arm (C2b).
+    # The §3 controls: C1–C6 (C4 two discovery arms, C2b no-flag arm) + C8
+    # syntax (two arms: shell + config). C7 reachability lands with the
+    # inventory-MOVE follow-up; unit syntax (8c) has no red arm here because
+    # systemd-analyze is absent where self-test runs.
     # Mutators run with cwd = a fresh copy of .deployment; _rewrite is the
     # BSD+GNU-safe in-place sed (> tmp && mv), so the self-test is portable
     # across macOS and Linux runners without eval or nested quoting.
@@ -210,6 +284,8 @@ run_self_test() {
     mut_C4b() { printf '[Unit]\nDescription=competing\n\n[Service]\nExecStart=/opt/x0x/x0xd --config /etc/x0x/x0xd.toml\n' > x0xd.service; }
     mut_C5()  { _rewrite systemd/x0xd-443.service 's|/etc/x0x/x0xd-443.toml|/etc/x0x/config.toml|'; }
     mut_C6()  { _rewrite deploy-443.sh 's|^LIVE=.*|LIVE=/etc/x0x/x0xd.toml|'; }
+    mut_C8a() { printf '\nthen\n' >> install.sh; }                                        # bare keyword → bash -n syntax error
+    mut_C8b() { printf '\nbroken = "unterminated\n' >> config/bootstrap-config.toml; }    # unterminated string → TOML parse error
 
     # expect_fail NAME MUTATOR-FN : apply the mutator to a fresh copy, expect red.
     expect_fail() {
@@ -233,6 +309,8 @@ run_self_test() {
     expect_fail C4-competing-prod-unit        mut_C4b
     expect_fail C5-duplicate-root             mut_C5
     expect_fail C6-deploy443-source-mismatch  mut_C6
+    expect_fail C8-shell-syntax-error         mut_C8a
+    expect_fail C8-config-syntax-error        mut_C8b
 
     rm -rf "$tmp"
     echo "[self-test] $pass control(s) fired, $failed failed to fire"
