@@ -40,7 +40,7 @@ product intent, the exact retire-versus-repair choice goes to David.
 
 ## 1a. Machine-readable inventory schema and single-source migration
 
-Resolves at: `14d92796215f2ac8005d25fb2077920df0c44dc1`.
+Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
 
 The canonical record authority is a strict JSON manifest at
 `.deployment/authority-inventory.json`. This chapter governs its schema; the
@@ -64,6 +64,13 @@ Each instance record contains:
 - `binary.destination`; and
 - `installation.entrypoint` plus literal `installation.selector_args` used
   only to select that instance when an entry point serves more than one.
+
+Selector arguments carry only a stable instance selector, such as
+`--instance testnet`. They do not repeat unit, config, binary, source, or
+destination values owned by the manifest record or its referenced artifacts.
+A shared entry point reads those values from the selected manifest record;
+path-valued flags such as `--config /etc/x0x/config-testnet.toml` are not
+conforming selector arguments.
 
 Repository source paths are deployment-root-relative and must remain inside
 `.deployment/` after canonicalization. Live destinations are absolute. Unknown
