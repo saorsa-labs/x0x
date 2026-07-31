@@ -7,7 +7,18 @@
 # port), with its own state dir + machine identity, alongside the existing
 # listener. No client ever does this — only operator-run bootstrap nodes.
 #
-# The 443 config is generated FROM the host's live /etc/x0x/config.toml so it
+# A manifest consumer (design chapter §1a). The instance inventory lives in
+# authority-inventory.json; this script reads and validates the manifest,
+# resolves its own instance record (the unique record whose
+# installation.entrypoint is this script with empty selector_args — the 443
+# instance), and derives unit source, unit destination, the generated-config
+# destination, and the live config it clones from its declared input instance.
+# It holds no inline instance list and no inline destination paths: every
+# instance-record value flows manifest → local resolution → positional args →
+# the remote payload.
+#
+# The 443 config is generated FROM the production instance's live config
+# (resolved from the manifest as input_instances[0]'s config.destination) so it
 # can never drift from the running :5483 config: only bind_address, data_dir,
 # machine_key_path and api_address are overridden.
 #
@@ -15,6 +26,8 @@
 #   ./deploy-443.sh <node|all>        # deploy
 #   DRY_RUN=1 ./deploy-443.sh <node>  # print actions only
 #   ./deploy-443.sh --verify <node>   # verify an existing 443 listener
+#   ./deploy-443.sh --resolve         # print the resolved values this script
+#                                    # would ship, then exit (no fleet contact)
 #
 #   <node> ∈ nyc sfo helsinki nuremberg singapore sydney all
 #
@@ -23,7 +36,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-UNIT_SRC="$SCRIPT_DIR/systemd/x0xd-443.service"
+MANIFEST="$SCRIPT_DIR/authority-inventory.json"
 DRY_RUN="${DRY_RUN:-0}"
 SSH="ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes -o StrictHostKeyChecking=accept-new"
 
@@ -42,18 +55,100 @@ ok()    { echo -e "${GREEN}[ OK ]${NC} $*"; }
 warn()  { echo -e "${YELLOW}[WARN]${NC} $*"; }
 err()   { echo -e "${RED}[FAIL]${NC} $*"; }
 
+# --- manifest resolution (§1a): deploy-443.sh is a consumer ------------------
+# Resolve this script's own instance (the unique record whose
+# installation.entrypoint is this script with empty selector_args) and derive
+# every instance-record value from the manifest. Emits TSV:
+#   id \t unit.source \t unit.destination \t gen(config.destination) \t live
+# where `live` is input_instances[0]'s config.destination (the live config
+# cloned on the host). Holds no inline instance list.
+resolve_instance() {
+    python3 - "$MANIFEST" "${BASH_SOURCE[0]##*/}" <<'PY'
+import sys, json
+path, self_entry = sys.argv[1], sys.argv[2]
+try:
+    with open(path) as f:
+        m = json.load(f)
+except Exception as e:
+    print(f"error: cannot load manifest {path}: {e}", file=sys.stderr); sys.exit(1)
+insts = m.get("instances", [])
+defs = [i for i in insts
+        if i.get("installation", {}).get("entrypoint") == self_entry
+        and not i.get("installation", {}).get("selector_args")]
+if len(defs) != 1:
+    print(f"error: manifest must name exactly one {self_entry} default instance "
+          f"(entrypoint {self_entry}, empty selector_args); found {len(defs)}",
+          file=sys.stderr); sys.exit(1)
+rec = defs[0]
+cfg = rec["config"]
+if "source" in cfg:
+    print(f"error: instance '{rec['id']}' is a tracked-config instance "
+          f"(config.source present); {self_entry} serves generators only",
+          file=sys.stderr); sys.exit(1)
+for k in ("generator", "input_instances", "destination"):
+    if k not in cfg:
+        print(f"error: instance '{rec['id']}' config missing '{k}'", file=sys.stderr); sys.exit(1)
+gen = cfg["destination"]
+inputs = cfg["input_instances"]
+live_rec = next((i for i in insts if i.get("id") == inputs[0]), None)
+if live_rec is None:
+    print(f"error: instance '{rec['id']}' input_instances references unknown id '{inputs[0]}'",
+          file=sys.stderr); sys.exit(1)
+live = live_rec["config"]["destination"]
+print("\t".join([
+    rec["id"],
+    rec["unit"]["source"],
+    rec["unit"]["destination"],
+    gen,
+    live,
+]))
+PY
+}
+
+IFS=$'\t' read -r INST_ID UNIT_SRC_REL UNIT_DST GEN LIVE < <(resolve_instance)
+# Local unit source path (this script ships the unit file to the remote /tmp).
+UNIT_SRC="$SCRIPT_DIR/$UNIT_SRC_REL"
+
+# --- argument parsing --------------------------------------------------------
+# --resolve is parsed BEFORE the usage/node guard and takes no node argument:
+# an arm failing on a usage exit (2) proves nothing about resolution (Dario
+# 05fad365 argument-parsing trap).
+RESOLVE_ONLY=0
+if [ "${1:-}" = "--resolve" ]; then RESOLVE_ONLY=1; shift; fi
 VERIFY_ONLY=0
 if [ "${1:-}" = "--verify" ]; then VERIFY_ONLY=1; shift; fi
-TARGET="${1:-}"
-if [ -z "$TARGET" ]; then err "usage: $0 [--verify] <node|all>"; exit 2; fi
 
-# Remote script executed on each host. Reads $DRY from arg 1.
+if [ "$RESOLVE_ONLY" = 1 ]; then
+    # Print the values this script resolves AND would actually ship to the
+    # remote payload (LIVE, GEN, UNIT_DST are the positional args; UNIT_SRC is
+    # the local unit file). Exits before deploy_node — no ssh/scp reachable on
+    # this path, verifiable by construction (exit precedes the fleet functions)
+    # and by execution. A check reconciling this output against the manifest
+    # observes the SHIPPING path, never the manifest against itself.
+    echo "id=$INST_ID"
+    echo "unit.source=$UNIT_SRC_REL"
+    echo "unit.destination=$UNIT_DST"
+    echo "gen=$GEN"
+    echo "live=$LIVE"
+    exit 0
+fi
+
+TARGET="${1:-}"
+if [ -z "$TARGET" ]; then err "usage: $0 [--resolve|--verify] <node|all>"; exit 2; fi
+
+# Remote script executed on each host. Reads its values from positional args:
+#   $1 = DRY (0|1), $2 = LIVE (live config path), $3 = GEN (generated config
+#   destination), $4 = UNIT_DST (systemd unit destination). No defaults — a
+#   missing arg is a fatal contract violation, not a silent fallback. The
+#   driver quotes each value (printf %q) so a path containing whitespace
+#   arrives as one argument, not two (Dario/Kimi word-split fix).
 # Single-quoted heredoc — all expansion happens ON THE REMOTE.
 REMOTE_DEPLOY=$(cat <<'EOF'
 set -eu
 DRY="${1:-0}"
-LIVE=/etc/x0x/config.toml
-GEN=/etc/x0x/x0xd-443.toml
+LIVE="${2:?LIVE (live config path) required}"
+GEN="${3:?GEN (generated config path) required}"
+UNIT_DST="${4:?UNIT_DST (systemd unit destination) required}"
 DATA_DIR=/var/lib/x0x-443
 do_run() { if [ "$DRY" = 1 ]; then echo "  DRY: $*"; else eval "$@"; fi; }
 
@@ -132,7 +227,7 @@ rm -f "$TMP"
 
 # Install/refresh the systemd unit (delivered to /tmp by the local driver).
 if [ -f /tmp/x0xd-443.service ]; then
-  do_run "install -m 644 /tmp/x0xd-443.service /etc/systemd/system/x0xd-443.service"
+  do_run "install -m 644 /tmp/x0xd-443.service $UNIT_DST"
   do_run "rm -f /tmp/x0xd-443.service"
 fi
 do_run "systemctl daemon-reload"
@@ -175,7 +270,10 @@ deploy_node() {
         "$UNIT_SRC" "root@$ip:/tmp/x0xd-443.service" || { err "$name: scp unit failed"; return 1; }
     fi
     # shellcheck disable=SC2029
-    if $SSH "root@$ip" "bash -s -- $DRY_RUN" <<<"$REMOTE_DEPLOY"; then
+    # The command string is re-parsed by the remote shell (the disable
+    # acknowledges SC2029). Each positional value is printf-%q-escaped so a
+    # path containing whitespace arrives as a single argument, not two.
+    if $SSH "root@$ip" "bash -s -- $(printf %q "$DRY_RUN") $(printf %q "$LIVE") $(printf %q "$GEN") $(printf %q "$UNIT_DST")" <<<"$REMOTE_DEPLOY"; then
       ok "$name: 443 listener deployed"
     else
       err "$name: deploy failed"; return 1

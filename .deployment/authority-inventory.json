@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "instances": [
+    {
+      "id": "prod",
+      "unit": {
+        "source": "systemd/x0xd.service",
+        "destination": "/etc/systemd/system/x0xd.service",
+        "dropins": []
+      },
+      "config": {
+        "source": "config/bootstrap-config.toml",
+        "destination": "/etc/x0x/config.toml"
+      },
+      "binary": {
+        "destination": "/opt/x0x/x0xd"
+      },
+      "installation": {
+        "entrypoint": "install.sh",
+        "selector_args": []
+      }
+    },
+    {
+      "id": "testnet",
+      "unit": {
+        "source": "systemd/x0xd-testnet.service",
+        "destination": "/etc/systemd/system/x0xd-testnet.service",
+        "dropins": []
+      },
+      "config": {
+        "source": "config/bootstrap-config-testnet.toml",
+        "destination": "/etc/x0x/config-testnet.toml"
+      },
+      "binary": {
+        "destination": "/opt/x0x/x0xd-testnet"
+      },
+      "installation": {
+        "entrypoint": "install.sh",
+        "selector_args": ["--instance", "testnet"]
+      }
+    },
+    {
+      "id": "443",
+      "unit": {
+        "source": "systemd/x0xd-443.service",
+        "destination": "/etc/systemd/system/x0xd-443.service",
+        "dropins": []
+      },
+      "config": {
+        "generator": "deploy-443.sh",
+        "input_instances": ["prod"],
+        "destination": "/etc/x0x/x0xd-443.toml"
+      },
+      "binary": {
+        "destination": "/opt/x0x/x0xd"
+      },
+      "installation": {
+        "entrypoint": "deploy-443.sh",
+        "selector_args": []
+      }
+    }
+  ]
+}
