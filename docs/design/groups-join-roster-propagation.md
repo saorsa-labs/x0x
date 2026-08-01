@@ -18,9 +18,10 @@ request-access causal-predecessor correction proposed
 
 This section is the mutable reference implementation for Proposed ADR 0028.
 It specifies one narrow recovery relationship:
-`JoinRequestCreated` is the causal predecessor of the matching
-`JoinRequestApproved`. It does not generalize the TreeKEM frontier log or
-change admission policy.
+`JoinRequestCreated` is an authenticated causal ancestor required by the
+matching `JoinRequestApproved`, but it need not be the approval's immediately
+preceding state commit. This mechanism does not generalize the TreeKEM frontier
+log or change admission policy.
 
 ### Security objects and bindings
 
@@ -30,10 +31,13 @@ change admission policy.
 - The **relay carrier** is an authenticated active admin that forwards the
   origin envelope unchanged. Carrier authorization controls relay resource
   use; it is never accepted as proof that the requester authored the payload.
-- The **causal key** is
-  `(group_id, request_id, requester_agent_id, request_commit.state_hash)`.
-- The approval depends on that key only when its requester identity matches
-  and `approval.commit.prev_state_hash == request_commit.state_hash`.
+- The **approval queue key** is the authenticated approval envelope digest,
+  computable at admission. Its signed group/revision/previous-hash/state-hash
+  coordinates and its `request_id` / `requester_agent_id` dependency identities
+  are stored and checked by ordinary apply.
+- `approval.commit.prev_state_hash` names the authority's group frontier
+  immediately before approval. It is not assumed to equal the matching request
+  commit's state hash.
 
 The receiver independently verifies the origin envelope, derives its sender
 from the embedded public key, requires that sender to equal
@@ -76,29 +80,39 @@ checks that do not depend on the missing request succeed:
 - the request and requester identities are syntactically valid and not already
   terminal locally.
 
-Queue admission never changes `GroupInfo`, roster revision, state hash, request
-status, or membership. The queue stores the exact approval envelope, its
-digest, first-seen time, absolute expiry, and causal identifiers.
+Admission writes only to the causal-queue sidecar; no call path from admission
+may reach stored group state. The queue stores the exact approval envelope, its
+digest, first-seen time, absolute expiry, queue key, request identity, and
+requester identity.
 
-After a `JoinRequestCreated` applies under the per-group membership lock, drain
-matching entries in revision order:
+After any accepted stateful group event advances the group under the per-group
+membership lock, and after restart restoration, drain entries in signed
+revision order:
 
 ```text
-for queued approval matching (group, request, requester):
-    require approval.prev_state_hash == applied_request.state_hash
-    require local pending request matches requester
-    rerun the full ordinary approval apply with queueing disabled
-    on success, persist group state before removing the queue entry
+for queued approval in signed revision order:
+    if approval is already the durable current state: remove as already applied
+    if approval revision is stale or conflicting: reject without mutation
+    if the matching pending request is absent: retain until advance or expiry
+    if approval.prev_state_hash != current.state_hash: retain until advance or expiry
+    otherwise rerun the full ordinary approval apply with queueing disabled
+    on success persist group state before removing the queue entry
 ```
 
 Every drain reruns signature, current-admin authority, pending-request,
 requester, revision, previous-hash, post-state-hash, and domain invariants.
 There is no reduced "queued apply" validator.
 
+No request-to-approval adjacency check exists outside that ordinary validator.
+For example, request(B), request(C), approve(B), approve(C) converges as the
+relayed request events advance a witness through both request commits; each
+queued approval is retried after the preceding apply and runs only when its own
+signed previous hash is the witness's current hash.
+
 If two non-identical approvals claim the same group, request, requester, and
-revision, mark the causal key conflicted and apply neither automatically. A
-wrong request, wrong requester, wrong previous hash, malformed signature, or
-expired predecessor is rejected and cannot become a queue success.
+revision, mark that conflict identity and apply neither automatically. A wrong
+request, wrong requester, wrong previous hash, malformed signature, or expired
+predecessor is rejected and cannot become a queue success.
 
 ### Bounds, expiry, and retry policy
 
@@ -171,20 +185,28 @@ resulting roster/state hash.
 
 | Option | Sender binding | Wire compatibility | Persistence/restart | Memory and scope |
 |---|---|---|---|---|
-| Authenticated relay + causal queue (selected) | Preserves the original requester-signed V2 envelope; separately authenticates the admin carrier | Existing request/approval schema and V2 envelope | Bounded relay outbox and approval sidecar survive restart | Narrow request/approval relationship; defaults cap retained bytes at 16 MiB |
+| Authenticated relay + causal queue (selected) | Preserves the original requester-signed V2 envelope; separately authenticates the admin carrier | Existing request/approval schema and V2 envelope | Bounded relay outbox and approval sidecar survive restart | Narrow request/approval relationship; defaults cap serialized event material at 32 MiB combined |
 | Predecessor carried inside approval | Can preserve requester evidence if the full signed envelope is embedded | Adds and versions approval fields; increases every approval | Bundles still need durable retention when an earlier state gap exists | Larger messages and duplicated predecessor bytes |
 | General signed-event gap log | Can model origin and authority for many event kinds | Likely requires a versioned generic envelope/protocol | Requires ordering, pruning, migration, and replay rules for every admitted event | Widest attack surface and resource budget; exceeds the proven gap |
 
 The selected mechanism may later be superseded by a general log, but this
 proposal does not treat future reuse as evidence for present complexity.
+Only requester-authored request events gain the new relay. The queue tolerates
+any number of intervening commits that arrive through existing delivery, but it
+does not recover an independently missing non-request transition; such an
+approval remains bounded and expires. A general signed-event log would address
+that wider case.
 
 ### Behavioural controls
 
 The implementation is not complete until independent controls demonstrate:
 
-1. ordered request then approval converges exactly once;
+1. ordered request then approval converges exactly once, including
+   request(B), request(C), approve(B), approve(C), and a case with a delivered
+   non-request state transition between request and approval;
 2. approval before request queues with no mutation and applies exactly once
-   after the matching signed predecessor arrives;
+   after the matching signed request and any earlier signed chain transitions
+   arrive;
 3. a permanently missing predecessor stays within count/byte/time bounds,
    expires, and never becomes success;
 4. tampered origin evidence, wrong request/requester, and wrong previous hash

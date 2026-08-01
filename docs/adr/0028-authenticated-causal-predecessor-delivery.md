@@ -3,8 +3,8 @@
 - **Status:** Proposed
 - **Date:** 2026-08-01
 - **Decision owners:** David Irvine
-- **Reviewers:** Sam (author); Dario (independent review pending); Watson
-  (orchestrator)
+- **Reviewers:** Sam (author); Dario (conditional review of `d904cba7`, tree
+  `131336d7`); Watson (orchestrator)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [frozen grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md);
@@ -51,10 +51,12 @@ authenticated identity controls who may consume relay resources; it cannot
 substitute for requester authentication.
 
 Queue admission requires every check possible without the predecessor,
-including structural signature, group, actor, and current authority. The
-approval applies exactly once only after the matching predecessor applies and
-its request identity and `prev_state_hash` match the resulting state. A
-missing, expired, conflicting, or invalid predecessor remains unapplied.
+including structural signature, group, actor, and current authority. The queue
+retries after each accepted group-state advance. An approval applies exactly
+once only when its matching request is pending and the ordinary validator
+accepts its signed `prev_state_hash` at the receiver's then-current frontier;
+the request and approval need not be adjacent. A missing, expired, conflicting,
+or invalid chain remains unapplied.
 
 The linked reference governs queue, retry, expiry, deduplication, persistence,
 restart, and observability. Those mechanisms may evolve while bounded,
@@ -75,6 +77,9 @@ fail-closed, origin-authenticated, and exactly-once application remain true.
   representation of carrier identity and cryptographic origin.
 - Finite retries cannot promise delivery across a partition longer than the
   retention policy.
+- Only requester-authored request transitions gain this relay. If a different
+  missing transition prevents the receiver reaching the approval's signed
+  frontier, the bounded approval expires fail closed.
 
 ### Neutral / Operational
 
@@ -86,9 +91,10 @@ fail-closed, origin-authenticated, and exactly-once application remain true.
 
 Acceptance requires independent behavioural controls showing:
 
-1. request then approval converges and mutates the witness roster once;
+1. request then approval converges once, including the batched order
+   request(B), request(C), approve(B), approve(C);
 2. approval before request performs no mutation, then applies once after the
-   matching signed predecessor arrives;
+   matching signed request and any earlier signed chain transitions arrive;
 3. a permanently missing predecessor stays bounded, expires, and never
    succeeds;
 4. a tampered predecessor, wrong request identity, or wrong
@@ -105,6 +111,8 @@ restart directly. Receipt traces or a longer timeout are insufficient.
 
 See the [frozen evidence](../grounding/0028-authenticated-causal-predecessor-delivery.md)
 and [mutable reference implementation](../design/groups-join-roster-propagation.md).
+The current governance script does not guard `docs/grounding/`; placement or a
+guard remains a decision-owner ruling before acceptance.
 
 ## Notes for AI-assisted work
 

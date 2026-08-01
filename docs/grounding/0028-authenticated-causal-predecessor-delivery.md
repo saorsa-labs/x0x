@@ -8,11 +8,14 @@
 - **Evidence union:** `0bf0da5b9c8a1a58594c027c0f472ad7c7ddf55d`
 - **Evidence tree:** `da690e07e6e4822bd971b6be290afbc2d68b7d7e`
 - **Preserved run:** `/tmp/x0x-union-runs/1785594802/`
+- **Independent review:** Dario, conditional PASS at `d904cba7` / tree
+  `131336d7`; all measurable claims in that revision reproduced
 
 This record freezes the facts used to propose ADR 0028. Repository citations
 below resolve at the evidence union unless a different pin is stated. Mutable
 mechanisms, constants, pseudocode, and rollout policy belong in the linked
-reference chapter, not here.
+reference chapter, not here. Citation ranges end on the final content line of
+the cited construct and omit an immediately following closing delimiter.
 
 ## G-001 — The complete family stopped at 3 passed / 2 failed
 
@@ -154,6 +157,24 @@ therefore neither classified nor recoverable through the current frontier log.
 Supports: choosing a narrow request-access causal queue instead of claiming
 the TreeKEM mechanism already solves the problem.
 
+## G-008 — Request ancestry is not state-chain adjacency
+
+In the failed PID `31458` row, Alice's observed order is request(B), approve(B),
+request(C), approve(C), with the middle events 58 milliseconds apart. That
+interleaving makes each captured approval adjacent to its matching request, but
+it does not establish adjacency as a valid mechanism rule.
+
+`GroupInfo::seal_commit` sets a new commit's `prev_state_hash` from the
+authority's last committed `state_hash`, after all earlier stateful events
+(`src/groups/mod.rs:525-535`). Apply independently requires that signed value
+to equal the receiver's current state hash
+(`src/groups/state_commit.rs:701-712`), and finalization advances the receiver
+to the commit's signed state (`src/groups/mod.rs:661-669`). Therefore a queued
+approval must be retried after state advances; its matching request need not be
+the immediately preceding commit.
+
+Supports: the non-adjacent drain rule and the batched multi-request control.
+
 ## Artifact manifest
 
 SHA-256 values freeze the 16 files inspected under the preserved run directory:
@@ -177,7 +198,7 @@ e6149132989fd4277ff2fcf4f90813704bd0b99cfc9834d0ada95ca6df66bafc  test-bob-29750
 69dc0f565f329ff9f717378184e54257e9dc87cb86905de89309ced22e107cdc  test-charlie-59693.start.log
 ```
 
-## G-008 — Scope and non-claims
+## G-009 — Scope and non-claims
 
 This evidence establishes one non-TreeKEM request-access causal-delivery gap on
 the exact union and preserved run above. It does not establish that every
@@ -186,6 +207,13 @@ cross an indefinitely long partition, or that the current TreeKEM gap log
 should become a general event log. It also does not authorize removal of the
 pending-request check or acceptance of an authority-authored substitute for a
 requester-authored predecessor.
+
+In both failed rows, the Alice and Charlie logs share one byte-identical
+`join_request_created` trace line, including its microsecond timestamp. Bob's
+log shares no such line. This unexplained attribution oddity does not affect
+the Alice-versus-Bob population claims above, but implementation validation
+must not assume every preserved filename proves a strictly independent trace
+source without additional process evidence.
 
 The proposal is not accepted and no production, testnet, deployment, push, or
 pull-request action is grounded by this record.
