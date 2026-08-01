@@ -118,6 +118,14 @@ pub(in crate::server) struct TreeKemCacheMutation {
 static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
     Vec<(String, String, Option<String>)>,
 > = StdMutex::new(Vec::new());
+#[cfg(test)]
+// Records each (recipient_hex, event_group_id, is_member_removed, kind)
+// delivery attempt — kind is "direct" or "delayed" — so the remove handler's
+// recipient set AND that BOTH paths fired per recipient are observable in a
+// deterministic unit test (the live send targets an absent daemon). Including
+// the removed member, who is no longer in active_members().
+static NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST: StdMutex<Vec<(String, String, bool, &'static str)>> =
+    StdMutex::new(Vec::new());
 
 #[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
@@ -1928,6 +1936,15 @@ pub(in crate::server) fn spawn_named_group_event_delivery(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+        rec.push((
+            recipient_hex.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+            matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. }),
+            "direct",
+        ));
+    }
     let payload = match serde_json::to_vec(event) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1966,6 +1983,15 @@ fn spawn_named_group_event_delivery_after(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+        rec.push((
+            recipient_hex.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+            matches!(event, NamedGroupMetadataEvent::MemberRemoved { .. }),
+            "delayed",
+        ));
+    }
     let payload = match serde_json::to_vec(event) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -8546,7 +8572,7 @@ pub(in crate::server) async fn remove_named_group_member(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
-    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes) = {
+    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes, delivery_roster) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -8650,6 +8676,7 @@ pub(in crate::server) async fn remove_named_group_member(
         };
         let metadata_topic = next.metadata_topic.clone();
         let members = named_group_member_values(&next);
+        let delivery_roster = next.clone();
         named_groups.insert(id.clone(), next);
         drop(named_groups);
 
@@ -8684,10 +8711,28 @@ pub(in crate::server) async fn remove_named_group_member(
             members,
             epoch,
             buffered_survivor_envelopes,
+            delivery_roster,
         )
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // Direct + delayed delivery of the signed MemberRemoved to active survivors
+    // AND the removed member. The removed member is no longer in
+    // active_members(), so it is passed via extra_recipients — the same shape
+    // the TreeKEM sibling uses (see remove_treekem_named_group_member :9513).
+    // The shared apply handler revalidates the signed commit and is idempotent,
+    // so a recipient that also saw the metadata-topic gossip publish applies
+    // the event once. SOURCE-SUPPORTED ORDERING: persistence and the metadata
+    // publish above precede these delivery calls and the survivor-envelope
+    // scheduling below. (Both the MemberRemoved delivery and the survivor
+    // envelopes run as independent background tasks, so call order is not a
+    // guaranteed recipient receipt order — no delivery barrier is claimed.)
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &delivery_roster,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     // F1 §5a step 5: publish the buffered survivor envelopes only after the
     // removal is live and persisted. Each is broadcast on the metadata topic
     // plus direct + delayed delivery, mirroring publish_secure_share's shape.
@@ -16718,11 +16763,11 @@ mod tests {
     //     withdrawn `:8570`), leaving only an ML-DSA signing fault
     //     (`state_commit.rs:448`).
     //
-    // Observed lane: the metadata-topic publish at `:8707` only. The direct
-    // (`:8708`) and delayed (`:8709`) delivery in
-    // `spawn_named_group_event_delivery` have no `#[cfg(test)]` hook (they
-    // spawn straight to `agent.send_direct_with_config`) and are named here as
-    // not-observed, not covered.
+    // Observed lane: the metadata-topic publish of the survivor envelopes only.
+    // The direct + delayed delivery of the MemberRemoved event itself is now
+    // recorded (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST) and covered by a
+    // dedicated test below; THIS test's scope remains the published survivor
+    // recipient set, not the MemberRemoved delivery.
     //
     // Mutation (Watson's M5): at `:8617` change `next.active_members()` to
     // `next.members_v2.values().filter(|m| !m.is_banned())`. The removed
@@ -16871,6 +16916,168 @@ mod tests {
             published_recipients.contains(&survivor_hex),
             "the survivor must appear in the published recipient set; \
              got {published_recipients:?}"
+        );
+        Ok(())
+    }
+    // ── Non-TreeKEM MemberRemoved direct delivery (the daemon-family gap):
+    // the non-TreeKEM remove handler published the signed MemberRemoved to the
+    // metadata topic only — a removed member not in the eager mesh could stay
+    // at the old roster revision with the group still present. The fix mirrors
+    // the TreeKEM sibling: after persist+publish, direct + delayed deliver the
+    // same signed event to every active survivor AND the removed member
+    // (passed via extra_recipients, since it is no longer in
+    // active_members()).
+    //
+    // Attribution scope: MiniMax's 1/5 run established Alice at R3 with Bob
+    // removed and Bob stuck at R1, but the family never proved Bob had first
+    // applied Charlie's R2 join. The missing direct MemberRemoved is a real
+    // source gap that CAN leave an off-mesh removed member stale; it is not
+    // yet proven to be the sole cause of that R1 observation. THIS handler
+    // unit gate pins the missing delivery schedule; the next daemon run —
+    // after MiniMax adds an R2 convergence barrier — decides the end-to-end
+    // attribution. The final proof remains MiniMax's five real-daemon tests.
+    //
+    // Observed lane: the direct + delayed delivery recorder
+    // (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST), which records
+    // (recipient_hex, group_id, is_member_removed, kind) per attempt — kind is
+    // "direct" or "delayed". The test asserts each recipient appears on BOTH
+    // paths, so loss of either one cannot hide behind the other.
+    //
+    // Mutation A (whole helper): remove the
+    // spawn_named_group_event_delivery_to_active_members call in
+    // remove_named_group_member → the removed member drops out of BOTH paths →
+    // the "victim delivered" assertion fails (gate red).
+    // Mutation B (one path): comment out the spawn_named_group_event_delivery
+    // _after call inside the helper → the "delayed" set loses every recipient
+    // → the "delayed non-empty / victim on delayed" assertion fails. REQUIRED
+    // red arms. Reverted.
+    #[tokio::test]
+    async fn non_treekem_remove_directly_delivers_member_removed_to_removed_member() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_id = state.agent.agent_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let survivor_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let survivor_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let victim_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+
+        let group_id = "mrem-delivery-local".to_string();
+        let stable_group_id = "mrem-delivery-stable".to_string();
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "member-removed direct delivery".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            local_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member_with_kem(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(survivor_kem_b64),
+        );
+        info.add_member_with_kem(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(victim_kem_b64),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive precondition: GSS plane, so the TreeKem dispatch cannot fire
+        // and the non-TreeKEM remove path (the one under test) is exercised.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "must exercise the non-TreeKEM (GSS) remove path, not the TreeKem dispatch"
+            );
+        }
+
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            remove_named_group_member(
+                State(Arc::clone(&state)),
+                Path((group_id.clone(), victim_hex.clone())),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin remove of a member must succeed, body: {body}"
+        );
+
+        // The MemberRemoved delivery set, split by path. The recorder appends
+        // from BOTH the immediate send (spawn_named_group_event_delivery) and
+        // the delayed retry (spawn_named_group_event_delivery_after), so a plain
+        // contains() would pass if only ONE path fired. Collect each path
+        // independently and assert the removed member AND a survivor appear in
+        // BOTH — loss of either path is caught (mutation B).
+        let recipients_for = |kind: &str| -> Vec<String> {
+            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+                .lock()
+                .expect("delivery recorder poisoned")
+                .iter()
+                .filter(|(_, gid, is_remove, k)| {
+                    gid == &stable_group_id && *is_remove && *k == kind
+                })
+                .map(|(recipient, _, _, _)| recipient.clone())
+                .collect()
+        };
+        let direct = recipients_for("direct");
+        let delayed = recipients_for("delayed");
+
+        assert!(
+            !direct.is_empty() && !delayed.is_empty(),
+            "the remove handler must deliver the MemberRemoved via BOTH paths; \
+             direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&victim_hex) && delayed.contains(&victim_hex),
+            "the REMOVED member must receive the MemberRemoved on BOTH the direct and delayed \
+             paths (the daemon-family gap: without it, a removed member off the eager mesh stays \
+             at the old roster revision); direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&survivor_hex) && delayed.contains(&survivor_hex),
+            "active survivors must also receive the MemberRemoved on BOTH paths; \
+             direct={direct:?} delayed={delayed:?}"
         );
         Ok(())
     }

@@ -136,7 +136,16 @@ PATH_FLAGS = {"--config", "--unit", "--binary", "--source", "--destination",
 def is_rel(p):
     if not isinstance(p, str) or not p or p.startswith("/"): return False
     return ".." not in p.split("/")
-def is_abs(p): return isinstance(p, str) and p.startswith("/")
+def is_abs(p):
+    # Canonical absolute: leading '/', never bare root, no '.'/'..' components,
+    # no empty segments (//), no trailing separator. Guards EVERY destination
+    # the manifest governs (unit/config/binary/dropin destinations) against
+    # path-escape (e.g. /../sibling) before any consumer concatenates it onto a
+    # staging root. A bare leading-slash check would let /../x escape.
+    if (not isinstance(p, str) or not p.startswith("/") or p == "/"
+            or "//" in p or p.endswith("/")):
+        return False
+    return all(seg not in (".", "..", "") for seg in p.split("/")[1:])
 ids = []
 rows = []
 for idx, inst in enumerate(insts):
@@ -236,6 +245,27 @@ unit_argv0() {  # full ExecStart argv0 path (e.g. /opt/x0x/x0xd), empty if absen
     grep -E '^[[:space:]]*ExecStart=' "$DEPLOYMENT_DIR/$1" \
         | head -1 | sed -E 's/^[[:space:]]*ExecStart=//' | awk '{print $1}'
 }
+# is_canonical_abs PATH: 0 iff PATH is absolute and canonical — leading '/',
+# never bare root, no '.'/'..' components, no empty segments (//), no trailing
+# separator. Guards the C8c staging write: a non-canonical argv0 such as
+# /../sibling/marker would, concatenated onto the temp --root tree, write
+# OUTSIDE it before C9 runs. Pure parameter expansion (no IFS/globbing state).
+is_canonical_abs() {
+    local p="$1" rest seg
+    [ -n "$p" ] || return 1
+    [ "${p:0:1}" = "/" ] || return 1            # absolute
+    [ "$p" != "/" ] || return 1                  # never bare root
+    [[ "$p" == *//* ]] && return 1               # no duplicate separators
+    [ "${p: -1}" != "/" ] || return 1            # no trailing separator
+    rest="${p#/}"                                # drop the leading '/'
+    while [ -n "$rest" ]; do
+        seg="${rest%%/*}"                        # segment up to next '/'
+        [ -n "$seg" ] || return 1                # no empty segment (also via //* above)
+        [ "$seg" != "." ] && [ "$seg" != ".." ] || return 1
+        [ "$rest" = "$seg" ] && rest="" || rest="${rest#*/}"
+    done
+    return 0
+}
 unit_name() {  # --name value on the unit's ExecStart, empty if absent
     # Anchored on ExecStart (like unit_binary) so prose mentions of --name in
     # comments/Description cannot supply the value (was reading 'testnet)' off
@@ -328,6 +358,23 @@ run_check() {
         echo "NOTE [C8] no python TOML parser (tomllib/tomli) — config syntax SKIPPED (disclosed platform bound)" >&2
         c8_cfg="skipped(no parser)"
     fi
+
+    # 8p — path safety: every unit's ExecStart argv0 must be a canonical
+    # absolute path before the hermetic C8c staging concatenates it onto the
+    # temp --root tree. Platform-independent (pure bash): runs whether or not
+    # systemd-analyze exists, so an escaping argv0 (e.g. /../sibling/marker) is
+    # refused before ANY mkdir/write — not only on Linux. Independent of C9:
+    # C9 compares argv0 to binary.destination; this control validates argv0's
+    # shape, so a non-canonical argv0 reds here regardless of the manifest
+    # value (and before C9). An empty argv0 is left to C9 (no binary to
+    # compare); only a present-but-non-canonical one reds here.
+    local _p_argv0
+    while IFS="$_FS" read -r id usrc _ _ _ _ _ _ _ _ _; do
+        [ -n "$id" ] || continue
+        _p_argv0="$(unit_argv0 "$usrc")"
+        [ -z "$_p_argv0" ] || is_canonical_abs "$_p_argv0" \
+            || fail C8-unit-path "unit '$usrc' (instance '$id') ExecStart argv0 '$_p_argv0' is not a canonical absolute path (path-escape risk before hermetic staging)"
+    done <<<"$MANIFEST_DUMP"
 
     # 8c — unit syntax: systemd-analyze verify over every declared unit.source,
     # run HERMETICALLY under a temporary --root tree so a host without the
@@ -636,6 +683,15 @@ run_self_test() {
     # Proves the C8c→C9 ordering gates the comparison behind syntax. Like C8c,
     # runtime-provable only where systemd-analyze exists.
     mut_C8c_first() { printf '[Service]\nExecStart=/opt/x0x/x0xd-mut --config "/etc/x0x/config.toml\n' > systemd/x0xd-443.service; }  # unbalanced quote (C8c) + argv0=/opt/x0x/x0xd-mut (C9 mismatch) → C8c must fire first
+    # 8p — path safety: an escaping unit ExecStart argv0 (e.g. /../sibling/x)
+    # would, concatenated onto the hermetic C8c --root tree, write OUTSIDE the
+    # stage before C9 runs. C8-unit-path (pure bash) catches it before ANY
+    # staging write — platform-independent (no systemd-analyze needed). The arm
+    # ALSO proves the negative: no marker is created outside the temp root.
+    mut_C8p() { _rewrite systemd/x0xd-443.service 's|ExecStart=/opt/x0x/x0xd |ExecStart=/../escape-glm/marker |'; }  # argv0 escapes the stage: /../escape-glm/marker → C8-unit-path sole-catches before staging
+    # manifest-side: a non-canonical absolute destination (contains '..') is
+    # rejected by the strict manifest_load validator (is_abs) before any control.
+    mut_C8m() { mut_manifest 443 binary.destination '"/opt/x0x/../escape"'; }  # canonical-absolute rejection: '..' segment → manifest_load fails closed
 
     # expect_fail NAME MUTATOR-FN [EXPECTED-TAG]: apply the mutator to a fresh
     # copy and expect the check red. When EXPECTED-TAG is given, the check's
@@ -690,6 +746,7 @@ run_self_test() {
     expect_fail C7-443-resolve-disagree          mut_C7d  C7-resolve-disagree
     expect_fail C8-shell-syntax-error            mut_C8a  C8-shell-syntax
     expect_fail C8-config-syntax-error           mut_C8b  C8-config-syntax
+    expect_fail C8-manifest-noncanonical      mut_C8m  manifest
     # 8c: platform-bound. Run + assert tag where systemd-analyze exists; else
     # report the arm skipped with its disclosed reason (never silently absent).
     if command -v systemd-analyze >/dev/null 2>&1; then
@@ -704,10 +761,50 @@ run_self_test() {
     fi
     expect_fail C9-unit-argv0-moved        mut_C9a  C9-bin-argv0
     expect_fail C9-bin-destination-moved   mut_C9b  C9-bin-argv0
+    # C8-unit-path proof: an escaping argv0 (/../escape-glm/marker) is caught by
+    # C8-unit-path (pure bash, platform-independent) BEFORE C8c's staging
+    # mkdir/write. The tag-firing is proven on every host. The no-outside-marker
+    # filesystem proof runs only where C8c staging actually executes
+    # (systemd-analyze present) — elsewhere C8c is skipped so no escape vector
+    # materialises (same disclosed platform bound as the C8c arm above). On Linux
+    # TMPDIR is pinned so the would-be escape target (<stage>/../escape-glm/marker,
+    # where stage=$work/tmp.X, collapsing to $work/escape-glm/marker) is
+    # deterministic; a leftover marker proves the gate failed OPEN.
+    {
+        local d8p out8p rc8p
+        d8p="$tmp/C8-unit-path-escape"; rm -rf "$d8p"; cp -r "$tmp/base" "$d8p"
+        if ! ( cd "$d8p" && mut_C8p ); then
+            echo "[self-test] FAIL: C8-unit-path-escape — mutator failed (no-op _rewrite)" >&2
+            failed=$((failed + 1))
+        else
+            if out8p="$("$SCRIPT_PATH" --root "$d8p" 2>&1)"; then rc8p=0; else rc8p=$?; fi
+            if [ "$rc8p" -eq 0 ] || ! grep -q "FAIL \[C8-unit-path\]" <<<"$out8p"; then
+                echo "[self-test] FAIL: C8-unit-path-escape — control did not fire (rc=$rc8p)" >&2
+                failed=$((failed + 1))
+            elif command -v systemd-analyze >/dev/null 2>&1; then
+                # C8c stages here: prove no marker escapes the temp root.
+                local work8p marker_parent
+                work8p="$(mktemp -d)"; marker_parent="$work8p/escape-glm"
+                rm -rf "$marker_parent"
+                if TMPDIR="$work8p" "$SCRIPT_PATH" --root "$d8p" >/dev/null 2>&1; then :; fi
+                if [ -e "$marker_parent" ]; then
+                    echo "[self-test] FAIL: C8-unit-path-escape — marker written OUTSIDE stage (gate failed open)" >&2
+                    failed=$((failed + 1))
+                else
+                    echo "[self-test] ok: C8-unit-path-escape — escaping argv0 rejected (C8-unit-path), no marker outside stage ✓"
+                    pass=$((pass + 1))
+                fi
+                rm -rf "$work8p"
+            else
+                echo "[self-test] ok: C8-unit-path-escape — escaping argv0 rejected (C8-unit-path) ✓; no-marker proof deferred to CI (C8c staging skipped: systemd-analyze absent)"
+                pass=$((pass + 1))
+            fi
+        fi
+    }
 
     rm -rf "$tmp"
     echo "[self-test] $pass control(s) fired, $failed failed to fire; C8c arm=$c8c_arm"
-    echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-syntax, C9-bin-argv0}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
+    echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-path, C8-unit-syntax, C9-bin-argv0}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; manifest={C8-manifest-noncanonical}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
     [ "$failed" -eq 0 ]
 }
 
