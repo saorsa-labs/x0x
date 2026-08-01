@@ -94,7 +94,11 @@ Acceptance requires independent behavioural controls showing:
 1. the authority authors request(B), request(C), approve(B), approve(C) while a
    witness receives approve(B), approve(C), request(B), request(C): no roster
    mutation occurs before either request, then both approvals apply exactly
-   once in signed revision order after request(C);
+   once in signed revision order after request(C). A separate row places a
+   delivered non-request state transition between request and approval: no
+   approval-driven roster mutation occurs before the signed transition arrives,
+   then the approval applies exactly once after that transition advances the
+   witness to the approval's signed frontier;
 2. for one requester with no intervening state transition, approval before
    request performs no mutation, then applies once after the matching signed
    request arrives;
