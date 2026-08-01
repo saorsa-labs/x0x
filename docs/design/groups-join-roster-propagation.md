@@ -1,12 +1,203 @@
-# Joiner membership not published to metadata topic
+# Named-Group Join and Roster Propagation
 
-**Status:** implemented — joiner request + inviter-signed commit, E2E hard gate
+**Status:** reference implementation — public-open path implemented;
+request-access causal-predecessor correction proposed
 **Filed:** 2026-05-01
 **Filed by:** dogfood harness team
-**Related:** [TEST_SUITE_GUIDE.md §7c](../../TEST_SUITE_GUIDE.md), `tests/e2e_dogfood_groups.py`, `tests/e2e_vps_groups.py`, commit `0ca5133` (related-but-different first-message-after-join fix)
-**Severity:** medium — application-correctness gap on `public_open` groups, no security impact
+**Governing decision:**
+[ADR 0028](../adr/0028-authenticated-causal-predecessor-delivery.md)
+**Frozen grounding:**
+[ADR 0028 grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md)
+**Source baseline for the request-access extension:**
+`0bf0da5b9c8a1a58594c027c0f472ad7c7ddf55d`
+**Related:** [TEST_SUITE_GUIDE.md §7c](../../TEST_SUITE_GUIDE.md),
+`tests/e2e_dogfood_groups.py`, `tests/e2e_vps_groups.py`, commit `0ca5133`
+(related-but-different first-message-after-join fix)
 
-## Symptom
+## Request-access causal predecessor delivery
+
+This section is the mutable reference implementation for Proposed ADR 0028.
+It specifies one narrow recovery relationship:
+`JoinRequestCreated` is the causal predecessor of the matching
+`JoinRequestApproved`. It does not generalize the TreeKEM frontier log or
+change admission policy.
+
+### Security objects and bindings
+
+- The **origin envelope** is the existing V2 pubsub wire envelope for the
+  group's metadata topic. Its ML-DSA-65 signature binds the requester AgentId,
+  public key, topic, and exact serialized `JoinRequestCreated` payload.
+- The **relay carrier** is an authenticated active admin that forwards the
+  origin envelope unchanged. Carrier authorization controls relay resource
+  use; it is never accepted as proof that the requester authored the payload.
+- The **causal key** is
+  `(group_id, request_id, requester_agent_id, request_commit.state_hash)`.
+- The approval depends on that key only when its requester identity matches
+  and `approval.commit.prev_state_hash == request_commit.state_hash`.
+
+The receiver independently verifies the origin envelope, derives its sender
+from the embedded public key, requires that sender to equal
+`requester_agent_id`, and then runs the ordinary `NonMemberRequest` apply.
+Decoded JSON re-published under an authority signature is not equivalent and
+must be rejected as predecessor evidence.
+
+### Producer and relay flow
+
+1. The requester creates the serialized event once, obtains its signed V2
+   metadata envelope, publishes it on the metadata topic, and directly offers
+   the same envelope to the group-card authority. The direct offer does not
+   create a second author.
+2. An authority verifies and applies the request before admitting a relay
+   obligation. It persists the exact origin envelope and the current active
+   witness target set before dispatch.
+3. Approval creation refreshes the target set from the post-approval active
+   roster and ensures the predecessor obligation is durable before approval
+   fan-out begins. This ordering protects crash recovery; it is not assumed to
+   determine receiver arrival order.
+4. The relay sends the unchanged origin envelope on the bounded schedule
+   below. A receiver verifies both the active-admin carrier and the requester's
+   origin signature before the event may reach state apply.
+
+The implementation must retain or expose the original V2 bytes before the
+current pubsub decoder discards signature bytes. Reconstructing a decoded
+message under the relay's key is forbidden. Existing event variants and fields
+remain unchanged.
+
+### Approval queue admission and drain
+
+An out-of-order `JoinRequestApproved` may enter the causal queue only when all
+checks that do not depend on the missing request succeed:
+
+- envelope and commit sizes are within bounds;
+- the group exists and is live;
+- the approval origin, `actor`, and `commit.committed_by` are the same agent;
+- the commit structure and signature verify;
+- the actor is an active admin in the receiver's current view; and
+- the request and requester identities are syntactically valid and not already
+  terminal locally.
+
+Queue admission never changes `GroupInfo`, roster revision, state hash, request
+status, or membership. The queue stores the exact approval envelope, its
+digest, first-seen time, absolute expiry, and causal identifiers.
+
+After a `JoinRequestCreated` applies under the per-group membership lock, drain
+matching entries in revision order:
+
+```text
+for queued approval matching (group, request, requester):
+    require approval.prev_state_hash == applied_request.state_hash
+    require local pending request matches requester
+    rerun the full ordinary approval apply with queueing disabled
+    on success, persist group state before removing the queue entry
+```
+
+Every drain reruns signature, current-admin authority, pending-request,
+requester, revision, previous-hash, post-state-hash, and domain invariants.
+There is no reduced "queued apply" validator.
+
+If two non-identical approvals claim the same group, request, requester, and
+revision, mark the causal key conflicted and apply neither automatically. A
+wrong request, wrong requester, wrong previous hash, malformed signature, or
+expired predecessor is rejected and cannot become a queue success.
+
+### Bounds, expiry, and retry policy
+
+These values are mutable implementation policy. The lower applicable limit
+wins.
+
+| Resource | Default bound |
+|---|---:|
+| One signed envelope | 64 KiB |
+| Queued approvals per group | 64 entries and 1 MiB serialized |
+| Queued approvals per daemon | 1,024 entries and 16 MiB serialized |
+| Relayed predecessor outbox per group | 64 envelopes and 1 MiB serialized |
+| Relayed predecessor outbox per daemon | 1,024 envelopes and 16 MiB serialized |
+| Relay target obligations per daemon | 4,096 |
+| Queue and relay retention | 5 minutes from first observation |
+| Retry offsets from first durable enqueue | 0, 1, 2, 4, 8, 16, 30, 60, 120, 240 seconds |
+
+On saturation, reject the new obligation or approval and record the bounded
+failure; never evict a live entry and report success. Exact duplicate digests
+coalesce and do not refresh the original expiry. Retry dispatch is
+at-least-once and finite. State application is exactly-once through the group
+lock, signed revision/hash checks, and durable completion ordering.
+
+The 64 KiB entry ceiling means the configured causal queue and relay outbox
+each retain at most 16 MiB of serialized untrusted event material per daemon
+(32 MiB combined), excluding bounded map/index overhead. Relay outboxes store
+one origin envelope plus a bounded target set rather than copying the envelope
+per target.
+
+### Persistence and restart
+
+Pending approvals and predecessor relay obligations live in a versioned
+sidecar under the daemon's effective data root, separate from the signed
+`GroupInfo` projection. Writes use the same atomic replace and parent-directory
+durability discipline as other daemon state.
+
+On restart:
+
+1. load with byte and count caps enforced before allocation;
+2. drop malformed, oversized, expired, unknown-group, and withdrawn-group
+   records;
+3. revalidate signatures, bindings, and current carrier/actor authority;
+4. resume remaining relay offsets from the absolute first-seen time; and
+5. drain only after reloading the durable group state.
+
+The group state must become durable before a successful queue entry is removed.
+If a crash occurs between those actions, replay observes the already-current
+approval `state_hash`, records it as previously applied, and removes the stale
+queue entry without a second mutation. No path deletes the only durable
+approval before its roster transition is durable.
+
+### Deduplication and observability
+
+Exact delivery duplicates key on the cryptographic envelope digest. Applied
+events additionally dedupe on signed group revision and state hash. A queued
+entry exposes only one terminal outcome: applied, expired, invalid, conflict,
+withdrawn, or capacity-rejected.
+
+Diagnostics expose per-group gauges for queue entries/bytes and relay
+obligations, plus counters for relayed, retried, queued, deduplicated, applied,
+expired, invalid, conflicted, and capacity-rejected events. Structured logs
+name group, request, revision, digest prefix, carrier, cryptographic origin,
+and outcome without logging request messages, key material, or full envelopes.
+
+An `apply_metadata_event_entry` trace remains a receipt marker, not proof of
+successful mutation. Validation must observe an apply-success outcome and the
+resulting roster/state hash.
+
+### Option comparison
+
+| Option | Sender binding | Wire compatibility | Persistence/restart | Memory and scope |
+|---|---|---|---|---|
+| Authenticated relay + causal queue (selected) | Preserves the original requester-signed V2 envelope; separately authenticates the admin carrier | Existing request/approval schema and V2 envelope | Bounded relay outbox and approval sidecar survive restart | Narrow request/approval relationship; defaults cap retained bytes at 16 MiB |
+| Predecessor carried inside approval | Can preserve requester evidence if the full signed envelope is embedded | Adds and versions approval fields; increases every approval | Bundles still need durable retention when an earlier state gap exists | Larger messages and duplicated predecessor bytes |
+| General signed-event gap log | Can model origin and authority for many event kinds | Likely requires a versioned generic envelope/protocol | Requires ordering, pruning, migration, and replay rules for every admitted event | Widest attack surface and resource budget; exceeds the proven gap |
+
+The selected mechanism may later be superseded by a general log, but this
+proposal does not treat future reuse as evidence for present complexity.
+
+### Behavioural controls
+
+The implementation is not complete until independent controls demonstrate:
+
+1. ordered request then approval converges exactly once;
+2. approval before request queues with no mutation and applies exactly once
+   after the matching signed predecessor arrives;
+3. a permanently missing predecessor stays within count/byte/time bounds,
+   expires, and never becomes success;
+4. tampered origin evidence, wrong request/requester, and wrong previous hash
+   each fail closed with no roster mutation;
+5. immediate, delayed, and post-restart duplicates are idempotent; and
+6. the unchanged five-daemon `active_recipient_sealing_gates` family reports
+   5 passed and 0 failed within its existing barrier.
+
+Each negative control must attribute the intended condition. A longer barrier,
+skipped row, changed roster observation, or receipt-only trace does not satisfy
+the control.
+
+## Historical public-open symptom
 
 In the Phase-B groups dogfood (`tests/e2e_dogfood_groups.sh`), once
 bob and charlie have joined alice's `public_open` group via invite,
@@ -37,7 +228,7 @@ But alice never picks up bob's or charlie's replies. The dogfood harness now rec
 the owner must first observe committed roster convergence and then cache each
 joiner's reply.
 
-## Root cause
+## Historical public-open root cause
 
 `join_group_via_invite` (`src/bin/x0xd.rs:~7578`) updates the
 joiner's **own** local view:
@@ -78,7 +269,7 @@ isn't in the owner's view of the roster.
 `grep "dropped public message" alice.x0xd.log` confirms the rejection
 cleanly.
 
-## Code path inspection
+## Historical public-open code-path inspection
 
 Owner (alice) state after bob joins:
 
@@ -96,7 +287,7 @@ $ curl /groups/<gid>/members      # on bob
 The asymmetry is the bug: bob's local `info.members_v2` reflects his
 join, but no gossip event ever reaches alice's metadata listener.
 
-## Proposed fix
+## Implemented public-open mechanism
 
 ### 1. Publish a `MemberJoined` metadata event on join
 
@@ -163,7 +354,7 @@ The `messages_dropped { write_policy_violation }` counter would have
 caught this bug at first observation. Today the only signal is a
 DEBUG-level `tracing::warn!` line.
 
-## Acceptance criteria
+## Public-open acceptance record
 
 The bug is fixed when **all** of these hold on a fresh local 3-daemon
 setup (no persisted state) and on the live VPS fleet:
@@ -193,7 +384,7 @@ setup (no persisted state) and on the live VPS fleet:
 
 5. No regression in the existing 30+ named-group integration tests.
 
-## Out of scope
+## Public-open historical scope
 
 - MLS-encrypted groups (this is the `SignedPublic` / `Public` path
   only — encrypted groups update membership via Welcome messages).
