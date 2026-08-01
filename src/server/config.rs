@@ -65,7 +65,7 @@ pub struct SectionMisplacement {
     pub key: String,
     /// The section it was found under (e.g. `history`).
     pub found_under: String,
-    /// Where it actually belongs — always [`ROOT_SECTION`] today.
+    /// Where it actually belongs — always `ROOT_SECTION` today.
     pub expected_section: String,
 }
 

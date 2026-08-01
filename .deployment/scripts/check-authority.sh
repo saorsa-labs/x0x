@@ -28,8 +28,12 @@
 #       absent on disk, or a selector that does not bind to its instance, also
 #       reds. Evidence class is uniform execution (no reading/exec split);
 #   C8  shell/unit/config syntax error in a tracked deployment artifact
-#       (§3:67). Config/unit syntax run under a disclosed platform bound:
-#       skipped WITH a printed note where the tool is absent, never silent.
+#       (§3:67). Unit syntax runs HERMETICALLY under a temp systemd-analyze
+#       --root tree (placeholders from each unit's own ExecStart argv0) and
+#       under a disclosed platform bound: skipped WITH a printed note where
+#       the tool is absent, never silent.
+#   C9  a unit whose ExecStart argv0 differs from its manifest binary.destination
+#       (§1a: the binary the unit runs is the binary the manifest ships).
 #
 # The inventory is the single source of truth (§1a). This check, install.sh,
 # and deploy-443.sh are consumers: they derive binary/--name/--config/roots
@@ -224,6 +228,14 @@ unit_binary() {  # ExecStart argv0 basename
         | head -1 | sed -E 's/^[[:space:]]*ExecStart=//' | awk '{print $1}')"
     basename "$exe"
 }
+unit_argv0() {  # full ExecStart argv0 path (e.g. /opt/x0x/x0xd), empty if absent
+    # Anchored on ExecStart (like unit_binary) so a prose mention in comments or
+    # Description cannot supply it. §1a: derive from the unit. Returns the FULL
+    # path (unlike unit_binary's basename) so C9 can compare it to binary.destination
+    # and C8c can place a placeholder at the resolved --root path.
+    grep -E '^[[:space:]]*ExecStart=' "$DEPLOYMENT_DIR/$1" \
+        | head -1 | sed -E 's/^[[:space:]]*ExecStart=//' | awk '{print $1}'
+}
 unit_name() {  # --name value on the unit's ExecStart, empty if absent
     # Anchored on ExecStart (like unit_binary) so prose mentions of --name in
     # comments/Description cannot supply the value (was reading 'testnet)' off
@@ -317,19 +329,56 @@ run_check() {
         c8_cfg="skipped(no parser)"
     fi
 
-    # 8c — unit syntax: systemd-analyze verify over every declared unit.source.
-    local un c8_unit="verified" uerr
+    # 8c — unit syntax: systemd-analyze verify over every declared unit.source,
+    # run HERMETICALLY under a temporary --root tree so a host without the
+    # deployed binary installed does not false-red on the missing ExecStart
+    # target. Each unit is staged with an executable placeholder created from
+    # the unit's OWN ExecStart argv0 (unit_argv0) — not the manifest
+    # binary.destination — so syntax verification stays independent of the C9
+    # argv0↔binary.destination authority comparison below (a C9 argv0 drift
+    # moves the placeholder too, keeping C8c green). --recursive-errors=no
+    # limits non-zero exit to the specified unit's own warnings (isolates absent
+    # system deps like network-online.target under the temp root); --man=no
+    # skips Documentation= URL man-page checks. Platform-bound: skipped WITH a
+    # printed note where systemd-analyze is absent.
+    local c8_unit="verified" uerr stage argv0 bin
     if command -v systemd-analyze >/dev/null 2>&1; then
+        stage="$(mktemp -d)"
         while IFS="$_FS" read -r id usrc _ _ _ _ _ _ _ _ _; do
             [ -n "$id" ] || continue
-            if ! uerr="$(systemd-analyze verify "$DEPLOYMENT_DIR/$usrc" 2>&1)"; then
-                fail C8-unit-syntax "unit '$usrc' (instance '$id') fails systemd-analyze verify: $uerr"
+            mkdir -p "$stage/etc/systemd/system"
+            cp "$DEPLOYMENT_DIR/$usrc" "$stage/etc/systemd/system/"
+            argv0="$(unit_argv0 "$usrc")"
+            if [ -n "$argv0" ]; then
+                mkdir -p "$stage$(dirname "$argv0")"
+                printf '#!/bin/sh\nexit 0\n' > "$stage$argv0"
+                chmod +x "$stage$argv0"
             fi
         done <<<"$MANIFEST_DUMP"
+        if ! uerr="$(systemd-analyze verify --root="$stage" --man=no --recursive-errors=no "$stage"/etc/systemd/system/*.service 2>&1)"; then
+            rm -rf "$stage"
+            fail C8-unit-syntax "systemd-analyze verify (hermetic --root) failed: $uerr"
+        fi
+        rm -rf "$stage"
     else
         echo "NOTE [C8] systemd-analyze absent — unit syntax SKIPPED (disclosed platform bound, e.g. macOS dev)" >&2
         c8_unit="skipped(no systemd-analyze)"
     fi
+
+    # C9 — each unit's ExecStart argv0 must equal its manifest binary.destination.
+    # Reads BOTH sides: argv0 derived from the unit's ExecStart (unit_argv0),
+    # binary.destination from the manifest (field 9). Independent of C8c — C8c
+    # builds its placeholder FROM the unit's argv0, so an argv0 drift passes
+    # syntax but reds here. Placed after C8 so a syntactically broken unit does
+    # not reach this comparison. Sole-catcher: no earlier control reads argv0 or
+    # binary.destination (C2 reads --config, not the binary path).
+    while IFS="$_FS" read -r id usrc _ _ _ _ _ _ bin _ _; do
+        [ -n "$id" ] || continue
+        argv0="$(unit_argv0 "$usrc")"
+        [ -n "$argv0" ] || fail C9-bin-argv0 "unit '$usrc' (instance '$id') ExecStart has no argv0"
+        [ "$argv0" = "$bin" ] \
+            || fail C9-bin-argv0 "unit '$usrc' (instance '$id') ExecStart argv0 '$argv0' != manifest binary.destination '$bin'"
+    done <<<"$MANIFEST_DUMP"
 
     # C1 — one production authority, reached as the install default. install.sh
     # exists and the manifest designates exactly one install-default instance
@@ -494,7 +543,7 @@ run_check() {
     done < <(cd "$DEPLOYMENT_DIR" && find ./config -type f -name '*.toml' 2>/dev/null | sed 's|^\./||' | sort)
 
     local ids; ids="$(awk -F"$_FS" '{print $1}' <<<"$MANIFEST_DUMP" | paste -sd, -)"
-    echo "OK [authority] inventory reconciles ($ids); install↔prod --config agree; roots distinct; deploy-443 LIVE resolved; reachability C7 executed (root-guard + resolve); evidence-class:${ev_classes}; syntax shell=verified config=$c8_cfg unit=$c8_unit (§3:67)."
+    echo "OK [authority] inventory reconciles ($ids); install↔prod --config agree; roots distinct; deploy-443 LIVE resolved; reachability C7 executed (root-guard + resolve); evidence-class:${ev_classes}; syntax shell=verified config=$c8_cfg unit=$c8_unit; binary argv0↔destination verified (C9) (§3:67)."
 }
 
 # Portable in-place rewrite: sed -E EXPR FILE > tmp && mv (BSD+GNU safe). Fails
@@ -578,7 +627,15 @@ run_self_test() {
     # WITH a printed note where absent (disclosed platform bound). The self-test
     # runs in two contexts — macOS dev (absent) and the ubuntu-latest CI runner
     # (present) — so the arm reports its own status per context.
-    mut_C8c() { printf '[Service]\nExecStart=/opt/x0x/x0xd --config\n' > systemd/x0xd-443.service; }
+    mut_C8c() { printf '[Service]\nExecStart=/opt/x0x/x0xd --config "/etc/x0x/config.toml\n' > systemd/x0xd-443.service; }  # unbalanced ExecStart quote → genuine systemd-analyze syntax error (was: bare --config = valid systemd syntax, inert)
+    mut_C9a() { _rewrite systemd/x0xd-443.service 's|ExecStart=/opt/x0x/x0xd |ExecStart=/opt/x0x/x0xd-mut |'; }  # unit ExecStart argv0 moved; C8c placeholder follows argv0 (green) → C9 sole-catches (reads unit side)
+    mut_C9b() { mut_manifest 443 binary.destination '"/opt/x0x/x0xd-mut-bin"'; }  # manifest binary.destination moved; no earlier control reads field 9 → C9 sole-catches (reads manifest side)
+    # 8c-before-C9 fail-fast ordering: a unit with BOTH a C8c syntax error
+    # (unbalanced ExecStart quote) AND a C9 argv0 mismatch (argv0 moved off the
+    # manifest binary.destination) must fail at C8c (syntax) and never reach C9.
+    # Proves the C8c→C9 ordering gates the comparison behind syntax. Like C8c,
+    # runtime-provable only where systemd-analyze exists.
+    mut_C8c_first() { printf '[Service]\nExecStart=/opt/x0x/x0xd-mut --config "/etc/x0x/config.toml\n' > systemd/x0xd-443.service; }  # unbalanced quote (C8c) + argv0=/opt/x0x/x0xd-mut (C9 mismatch) → C8c must fire first
 
     # expect_fail NAME MUTATOR-FN [EXPECTED-TAG]: apply the mutator to a fresh
     # copy and expect the check red. When EXPECTED-TAG is given, the check's
@@ -637,15 +694,20 @@ run_self_test() {
     # report the arm skipped with its disclosed reason (never silently absent).
     if command -v systemd-analyze >/dev/null 2>&1; then
         expect_fail C8-unit-syntax-error         mut_C8c  C8-unit-syntax
+        # Fail-fast ordering: a unit with BOTH a C8c syntax error and a C9
+        # argv0 mismatch must fail at C8c (C8-unit-syntax), never reaching C9.
+        expect_fail C8c-before-C9-failfast       mut_C8c_first  C8-unit-syntax
         c8c_arm="verified"
     else
-        echo "[self-test] skip: C8-unit-syntax-error — systemd-analyze absent on this host (CI runner proves it red)" >&2
+        echo "[self-test] skip: C8-unit-syntax-error + C8c-before-C9-failfast — systemd-analyze absent on this host (CI runner proves them red)" >&2
         c8c_arm="skipped(no systemd-analyze)"
     fi
+    expect_fail C9-unit-argv0-moved        mut_C9a  C9-bin-argv0
+    expect_fail C9-bin-destination-moved   mut_C9b  C9-bin-argv0
 
     rm -rf "$tmp"
     echo "[self-test] $pass control(s) fired, $failed failed to fire; C8c arm=$c8c_arm"
-    echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-syntax}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
+    echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-syntax, C9-bin-argv0}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
     [ "$failed" -eq 0 ]
 }
 
