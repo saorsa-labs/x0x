@@ -66,6 +66,49 @@ where
     }
 }
 
+/// R2 convergence barrier for rows whose terminal observation depends on
+/// the removed member having first applied a prior roster revision (the
+/// Charlie R2 join in the active-recipient family).
+///
+/// Polls `node`'s authenticated `GET /groups/{group_id}/members` until
+/// the returned `members[].agent_id` set contains every id in `expected`.
+/// Without this barrier, a delivered R3 removal can be rejected on the
+/// removed member merely because that member never observed the prior
+/// roster. This is an attribution barrier, not a timeout increase: the
+/// 30-second removal/404 observation window is unchanged and starts only
+/// after the barrier succeeds.
+async fn await_group_members_contain(
+    node: &AgentInstance,
+    group_id: &str,
+    expected: &[&str],
+    timeout: Duration,
+) -> bool {
+    wait_until(timeout, || async {
+        let resp = match authed_client(node)
+            .get(node.url(&format!("/groups/{group_id}/members")))
+            .send()
+            .await
+        {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        if resp.status() != StatusCode::OK {
+            return false;
+        }
+        let body: Value = match resp.json().await {
+            Ok(b) => b,
+            Err(_) => return false,
+        };
+        let Some(arr) = body["members"].as_array() else {
+            return false;
+        };
+        let have: std::collections::HashSet<&str> =
+            arr.iter().filter_map(|m| m["agent_id"].as_str()).collect();
+        expected.iter().all(|id| have.contains(*id))
+    })
+    .await
+}
+
 async fn agent_card_link(d: &AgentInstance) -> String {
     let card: Value = authed_client(d)
         .get(d.url("/agent/card?include_local_addresses=true"))
@@ -844,6 +887,23 @@ async fn active_recipient_production_gate_and_predicate_reversion_mutation() {
     admit_member(alice, bob, &group_id, &remote_group_id, &bob_id).await;
     admit_member(alice, charlie, &group_id, &remote_group_id, &charlie_id).await;
 
+    // R2 convergence barrier: bob must have applied Charlie's R2 join before
+    // Alice's R3 removal is treated as the terminal observation. Without
+    // this barrier, a delivered R3 removal can be rejected on bob merely
+    // because bob never observed Charlie's prior roster.
+    let r2_converged = await_group_members_contain(
+        bob,
+        &remote_group_id,
+        &[bob_id.as_str(), charlie_id.as_str()],
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        r2_converged,
+        "R2 convergence barrier failed: bob's authenticated /members did not \
+         contain both bob and charlie within 30 s before the admin DELETE"
+    );
+
     // F1: admin remove bob.
     let removed = authed_client(alice)
         .delete(alice.url(&format!("/groups/{group_id}/members/{bob_id}")))
@@ -931,25 +991,29 @@ async fn active_recipient_production_gate_and_predicate_reversion_mutation() {
     // reviewer then reverts, re-runs, and the test returns 409.
 }
 
-/// 4. KEM open path round-trips a bob-sealed envelope pre-removal. Seals E+1
-/// to bob's KEM pubkey using the public production sealer + AAD, delivers it
-/// to bob's `/groups/secure/open-envelope` endpoint, and asserts the endpoint
-/// recovers E+1. This proves the bob-sealed envelope + the production sealer
-/// + the wire-compatible AAD + the open_envelope endpoint all round-trip
-/// correctly.
+/// 4. Post-remove membership-independent KEM open-path round-trip. After
+/// Alice's admin DELETE on Bob, the test seals E+1 to Bob's KEM pubkey
+/// using the public production sealer + AAD, delivers it to Bob's
+/// `/groups/secure/open-envelope` endpoint, and asserts the endpoint
+/// recovers E+1. This proves the bob-sealed envelope + the production
+/// sealer + the wire-compatible AAD + the open_envelope endpoint
+/// round-trip correctly when Bob's group record is already deleted.
 ///
-/// SCOPE: this test exercises the open_envelope endpoint, which is a pure
-/// crypto (KEM-only) path that does NOT check group membership. It does NOT
-/// exercise the gossip install path, which is the membership-checking gate.
-/// A bob-sealed envelope that opens here does NOT imply the gossip install
-/// path would succeed — those are distinct paths. A pre-terminal "install"
-/// claim and a "phase barrier" claim would overstate what this test
-/// observes; this test is the membership-independent KEM round-trip and
-/// nothing more. The membership-checking gate lives in a separate
-/// dedicated test once the production delivery fix lands.
+/// SCOPE: this test exercises the open_envelope endpoint, which is a
+/// pure crypto (KEM-only) path that does NOT check group membership.
+/// It does NOT exercise the gossip install path, which is the
+/// membership-checking gate. A bob-sealed envelope that opens here
+/// does NOT imply the gossip install path would succeed — those are
+/// distinct paths. The membership-checking gate lives in a separate
+/// dedicated test once the production delivery fix lands. The earlier
+/// pre-remove baseline in the test body (epoch-E install via the
+/// production reseal path) is incidental: it gives the test harness a
+/// starting epoch and a sanity check that both active members
+/// received the shared secret before the remove; it is not part of
+/// the property this test pins.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns real x0xd daemons"]
-async fn pre_remove_kem_open_path_round_trips_bob_sealed_envelope() {
+async fn post_remove_kem_open_path_round_trips_bob_sealed_envelope() {
     let trio = trio_with_extra_config("").await;
     let (alice, bob, charlie) = (&trio.alice, &trio.bob, &trio.charlie);
     bootstrap_agent_cards(&[alice, bob, charlie]).await;
@@ -1027,21 +1091,23 @@ async fn pre_remove_kem_open_path_round_trips_bob_sealed_envelope() {
         .await;
         assert!(
             got,
-            "{who} never received the epoch-{pre_epoch} secret; the install-arm test would be vacuous"
+            "{who} never received the epoch-{pre_epoch} secret; the post-remove \
+             round-trip below depends on the active members having applied the \
+             shared secret before the admin DELETE"
         );
     }
 
-    // === Test 4 proper: KEM open path round-trip. Build a valid E+1 envelope
-    // sealed to bob's KEM pubkey using the public production sealer + AAD,
-    // then verify the open_envelope endpoint on bob's daemon can recover the
-    // E+1 secret. This proves the bob-sealed envelope + the production sealer
-    // + the wire-compatible AAD + the open_envelope endpoint round-trip
-    // correctly. Membership is NOT in scope here: the open_envelope endpoint
-    // is a pure KEM crypto path that does not check group membership, and
-    // this test does not claim a pre-terminal install or a phase barrier.
-    // The gossip install path is a separate membership-checking gate; a
-    // dedicated test for that gate is out of scope until the production
-    // delivery fix lands.
+    // === Test 4 proper: post-remove membership-independent KEM round-trip.
+    // After Alice's admin DELETE on Bob, the test seals E+1 to Bob's KEM
+    // pubkey using the public production sealer + AAD, then verifies that
+    // Bob's open_envelope endpoint can recover E+1. This proves the
+    // bob-sealed envelope + the production sealer + the wire-compatible
+    // AAD + the open_envelope endpoint all round-trip correctly when
+    // Bob's group record is already deleted. Membership is NOT in scope
+    // here: the open_envelope endpoint is a pure KEM crypto path that
+    // does not check group membership. The gossip install path is a
+    // separate membership-checking gate and is not exercised by this
+    // test.
     let removed = authed_client(alice)
         .delete(alice.url(&format!("/groups/{group_id}/members/{bob_id}")))
         .send()
@@ -1136,25 +1202,28 @@ async fn pre_remove_kem_open_path_round_trips_bob_sealed_envelope() {
 /// 5. Post-remove active-recipient gate and persisted-state pin. After F1
 /// admin remove: alice's reseal to the retained-but-Removed bob returns 409
 /// + `recipient_not_active` (the active-recipient gate); bob's persisted
-/// KEM key SHA is unchanged (no KEM operation ran on bob's side); bob's
-/// group record returns 404; bob's open_envelope against charlie's
-/// envelope returns 403 (the KEM key gates content, independent of group
-/// membership).
+/// KEM key bytes are byte-identical to the pre-remove read; bob's group
+/// record returns 404; bob's open_envelope against charlie's envelope
+/// returns 403 (the KEM key gates content, independent of group membership).
 ///
-/// SCOPE: this test does NOT pin the gossip `unknown_group` reject at
-/// `named_groups.rs:4627`. It does not deliver a Bob-sealed
-/// `SecureShareDelivered` event to the gossip/direct apply handler, so it
-/// cannot show whether decapsulation ran, and the wrong-KEM-key 403 at
-/// the end measures wrong-key crypto, not the `unknown_group` gate. A
-/// genuine non-resurrection pin requires a real apply-seam test
-/// exercising the production delivery path with a valid Bob-sealed
-/// event, plus a mutation arm that proves the `unknown_group` reject
-/// fires. Both arms depend on the production-side fix for direct
-/// delivery of the non-TreeKEM `MemberRemoved` event; until that lands
-/// the test is intentionally restricted to the narrower properties it
-/// actually observes. The "non_resurrection" naming is removed for the
-/// same reason — a non-resurrection receipt from proxy assertions is
-/// not what this test produces.
+/// SCOPE: the byte-stability assertion proves only that no code path
+/// rewrote `agent_kem.key` between the pre-remove read and the
+/// post-terminal read. Decapsulation reads the key without rewriting it,
+/// so a stable SHA does not prove that decapsulation did or did not run;
+/// the test does not deliver a Bob-sealed `SecureShareDelivered` event
+/// to the gossip/direct apply handler, so the `unknown_group` reject
+/// before KEM decap is not exercised here, and the wrong-KEM-key 403 at
+/// the end measures wrong-key crypto on the membership-independent
+/// open_envelope path, not the `unknown_group` gate. A genuine
+/// non-resurrection pin requires a real apply-seam test exercising the
+/// production delivery path with a valid Bob-sealed event, plus a
+/// mutation arm that proves the `unknown_group` reject fires. Both arms
+/// depend on the production-side fix for direct delivery of the
+/// non-TreeKEM `MemberRemoved` event; until that lands the test is
+/// intentionally restricted to the narrower properties it actually
+/// observes. The "non_resurrection" naming is removed for the same
+/// reason — a non-resurrection receipt from proxy assertions is not
+/// what this test produces.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns real x0xd daemons"]
 async fn removed_member_recipient_not_active_and_persisted_state_pin() {
@@ -1185,7 +1254,24 @@ async fn removed_member_recipient_not_active_and_persisted_state_pin() {
     admit_member(alice, bob, &group_id, &remote_group_id, &bob_id).await;
     admit_member(alice, charlie, &group_id, &remote_group_id, &charlie_id).await;
 
-    // Capture bob's persisted KEM key SHA-256 for the no-touch assertion.
+    // R2 convergence barrier: bob must have applied Charlie's R2 join before
+    // Alice's R3 removal is treated as the terminal observation. Without
+    // this barrier, a delivered R3 removal can be rejected on bob merely
+    // because bob never observed Charlie's prior roster.
+    let r2_converged = await_group_members_contain(
+        bob,
+        &remote_group_id,
+        &[bob_id.as_str(), charlie_id.as_str()],
+        Duration::from_secs(30),
+    )
+    .await;
+    assert!(
+        r2_converged,
+        "R2 convergence barrier failed: bob's authenticated /members did not \
+         contain both bob and charlie within 30 s before the admin DELETE"
+    );
+
+    // Capture bob's persisted KEM key SHA-256 for the byte-stability assertion.
     let bob_kem_path = bob.data_dir().join("agent_kem.key");
     let bob_kem_bytes_before = tokio::fs::read(&bob_kem_path)
         .await
@@ -1231,18 +1317,22 @@ async fn removed_member_recipient_not_active_and_persisted_state_pin() {
     //      reason="recipient_not_active" — the active-recipient gate.
     //   2. Bob's daemon has no group record for the deleted group (terminal
     //      404).
-    //   3. Bob's persisted KEM key SHA is unchanged across the remove
-    //      (no KEM operation ran on bob's side).
+    //   3. Bob's persisted KEM key bytes are byte-identical to the
+    //      pre-remove read.
     //
-    // SCOPE: this test does NOT pin the gossip `unknown_group` reject at
-    // `named_groups.rs:4627`. It never delivers a Bob-sealed
-    // `SecureShareDelivered` event to the gossip/direct apply handler, so
-    // it cannot show whether decapsulation ran. The wrong-KEM-key 403
-    // further down measures wrong-key crypto on the membership-independent
-    // open_envelope path, not the `unknown_group` gate. A genuine
-    // non-resurrection pin is out of scope here and will live in a
-    // separate test once the production delivery fix lands; the test is
-    // intentionally restricted to the properties it actually observes.
+    // SCOPE: the byte-stability assertion proves only that no code path
+    // rewrote `agent_kem.key` between the pre-remove read and the
+    // post-terminal read. Decapsulation reads the key without rewriting
+    // it, so a stable SHA does not prove that decapsulation did or did
+    // not run. This test does not deliver a Bob-sealed
+    // `SecureShareDelivered` event to the gossip/direct apply handler,
+    // so the `unknown_group` reject before KEM decap is not exercised,
+    // and the wrong-KEM-key 403 further down measures wrong-key crypto
+    // on the membership-independent open_envelope path, not the
+    // `unknown_group` gate. A genuine non-resurrection pin is out of
+    // scope here and will live in a separate test once the production
+    // delivery fix lands; the test is intentionally restricted to the
+    // properties it actually observes.
     let (bob_reseal_status, bob_reseal_body) = reseal_to(alice, &group_id, &bob_id).await;
     assert_eq!(
         bob_reseal_status,
@@ -1256,14 +1346,10 @@ async fn removed_member_recipient_not_active_and_persisted_state_pin() {
         bob_reseal_body
     );
 
-    // bob's persisted KEM key must not have been touched by any operation
-    // between the pre-remove read and the post-terminal read. The
-    // persisted-state pin is weaker than a `unknown_group` reject proof:
-    // the test does not deliver a Bob-sealed `SecureShareDelivered` event
-    // to the gossip/direct apply handler, so it cannot show whether
-    // decapsulation ran. A byte-identical KEM key only shows that no KEM
-    // operation landed on bob's side; it does not show that the gossip
-    // install path rejected an envelope before KEM decap.
+    // bob's persisted KEM key must be byte-identical to the pre-remove
+    // read. This proves only that no code path rewrote the persisted key
+    // bytes; decapsulation reads the key without rewriting it, so this
+    // SHA equality does not characterise whether decapsulation ran.
     let bob_kem_bytes_after = tokio::fs::read(&bob_kem_path)
         .await
         .expect("read bob kem key after");
@@ -1274,9 +1360,9 @@ async fn removed_member_recipient_not_active_and_persisted_state_pin() {
     };
     assert_eq!(
         bob_kem_sha_before, bob_kem_sha_after,
-        "bob's persisted KEM key was modified after admin remove — no KEM \
-         operation should have run on bob's side after his group record \
-         was deleted"
+        "bob's persisted KEM key bytes changed between the pre-remove read \
+         and the post-terminal read; the only assertion supported here is \
+         byte-stability — a code path rewrote the persisted key"
     );
 
     // The group record itself is gone for bob: the group endpoint returns 404.

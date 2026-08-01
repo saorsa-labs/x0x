@@ -70,17 +70,13 @@ impl DaemonFixture {
             .arg("--skip-update-check")
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        // Forward RUST_LOG and X0X_LOG_DIR to the spawned daemon so a test
-        // session can enable tracing without modifying the harness per-test.
-        // X0X_TEST_LOG_DIR is accepted as a convenience alias for X0X_LOG_DIR
-        // so test scripts (and the build team's runbooks) don't need to know
-        // the daemon's actual log-dir env var name. Both are opt-in: when
-        // neither is set, the daemon behaves exactly as before.
-        for var in ["RUST_LOG", "X0X_LOG_DIR"] {
-            if let Some(v) = std::env::var_os(var) {
-                process_cmd.env(var, v);
-            }
-        }
+        // `Command` inherits the parent environment by default, so `RUST_LOG`
+        // and `X0X_LOG_DIR` set in the test parent's env reach the daemon
+        // without explicit forwarding. The single non-redundant behavior
+        // here is the `X0X_TEST_LOG_DIR` alias: when set, map it to the
+        // daemon's actual log-dir env var so test scripts don't need to
+        // know the daemon's variable name. When neither is set, the
+        // daemon behaves exactly as before.
         if let Some(v) = std::env::var_os("X0X_TEST_LOG_DIR") {
             process_cmd.env("X0X_LOG_DIR", v);
         }
