@@ -6,7 +6,7 @@ request-access causal-predecessor correction proposed
 **Filed by:** dogfood harness team
 **Governing decision:**
 [ADR 0028](../adr/0028-authenticated-causal-predecessor-delivery.md)
-**Frozen grounding:**
+**Proposed grounding (freezes with ADR acceptance):**
 [ADR 0028 grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md)
 **Source baseline for the request-access extension:**
 `0bf0da5b9c8a1a58594c027c0f472ad7c7ddf55d`
@@ -91,6 +91,7 @@ revision order:
 
 ```text
 for queued approval in signed revision order:
+    current := reread the durable group state
     if approval is already the durable current state: remove as already applied
     if approval revision is stale or conflicting: reject without mutation
     if the matching pending request is absent: retain until advance or expiry
@@ -103,16 +104,19 @@ Every drain reruns signature, current-admin authority, pending-request,
 requester, revision, previous-hash, post-state-hash, and domain invariants.
 There is no reduced "queued apply" validator.
 
-No request-to-approval adjacency check exists outside that ordinary validator.
-For example, request(B), request(C), approve(B), approve(C) converges as the
-relayed request events advance a witness through both request commits; each
-queued approval is retried after the preceding apply and runs only when its own
-signed previous hash is the witness's current hash.
+The only chain check is the ordinary validator's
+`approval.prev_state_hash == current.state_hash`; no request-to-approval
+adjacency check exists. For example, authority order request(B), request(C),
+approve(B), approve(C) converges even when witness arrival order is approve(B),
+approve(C), request(B), request(C). The requests advance the witness through
+both request commits; the drain re-reads `current` after every successful
+queued apply, so each approval runs against its own signed previous hash.
 
 If two non-identical approvals claim the same group, request, requester, and
-revision, mark that conflict identity and apply neither automatically. A wrong
-request, wrong requester, wrong previous hash, malformed signature, or expired
-predecessor is rejected and cannot become a queue success.
+revision, mark the `(group, request, requester, revision)` conflict identity
+and apply neither automatically. A wrong request, wrong requester, wrong
+previous hash, malformed signature, or expired predecessor is rejected and
+cannot become a queue success.
 
 ### Bounds, expiry, and retry policy
 
@@ -197,13 +201,26 @@ does not recover an independently missing non-request transition; such an
 approval remains bounded and expires. A general signed-event log would address
 that wider case.
 
+### Acceptance governance prerequisite
+
+The separate same-stem grounding remains amendable while ADR 0028 is Proposed
+and must become immutable with it on acceptance. Following decision-owner
+approval, the first implementation step is to repair repository governance so
+changing or deleting an Accepted ADR's grounding fails while Proposed
+grounding remains amendable. The repair must also match required headings
+exactly and compare against the branch/pull-request base so a newly introduced
+ADR remains structurally checked across amendment commits. ADR 0028 must not be
+marked Accepted before those controls and their positive/negative tests land.
+
 ### Behavioural controls
 
 The implementation is not complete until independent controls demonstrate:
 
-1. ordered request then approval converges exactly once, including
-   request(B), request(C), approve(B), approve(C), and a case with a delivered
-   non-request state transition between request and approval;
+1. the authority authors request(B), request(C), approve(B), approve(C), while
+   the witness receives approve(B), approve(C), request(B), request(C): neither
+   approval mutates the roster before the requests; after request(C), both
+   apply exactly once in signed revision order. A sibling case places a
+   delivered non-request state transition between request and approval;
 2. approval before request queues with no mutation and applies exactly once
    after the matching signed request and any earlier signed chain transitions
    arrive;
@@ -218,6 +235,11 @@ The implementation is not complete until independent controls demonstrate:
 Each negative control must attribute the intended condition. A longer barrier,
 skipped row, changed roster observation, or receipt-only trace does not satisfy
 the control.
+
+Sensitivity is mandatory: restoring the deleted equality between an
+approval's previous hash and its matching request's state hash must fail
+control 1, while the single-request control and unchanged five-daemon family
+remain green.
 
 ## Historical public-open symptom
 

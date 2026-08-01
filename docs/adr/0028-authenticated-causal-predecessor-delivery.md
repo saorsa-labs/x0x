@@ -3,11 +3,11 @@
 - **Status:** Proposed
 - **Date:** 2026-08-01
 - **Decision owners:** David Irvine
-- **Reviewers:** Sam (author); Dario (conditional review of `d904cba7`, tree
-  `131336d7`); Watson (orchestrator)
+- **Reviewers:** Sam (author); Dario (PASS of `fff09133`, tree `abe947d5`);
+  Watson (orchestrator)
 - **Supersedes:** none
 - **Superseded by:** none
-- **Related:** [frozen grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md);
+- **Related:** [proposed grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md);
   [join and roster propagation reference](../design/groups-join-roster-propagation.md);
   ADR 0025
 
@@ -91,8 +91,10 @@ fail-closed, origin-authenticated, and exactly-once application remain true.
 
 Acceptance requires independent behavioural controls showing:
 
-1. request then approval converges once, including the batched order
-   request(B), request(C), approve(B), approve(C);
+1. the authority authors request(B), request(C), approve(B), approve(C) while a
+   witness receives approve(B), approve(C), request(B), request(C): no roster
+   mutation occurs before either request, then both approvals apply exactly
+   once in signed revision order after request(C);
 2. approval before request performs no mutation, then applies once after the
    matching signed request and any earlier signed chain transitions arrive;
 3. a permanently missing predecessor stays bounded, expires, and never
@@ -106,13 +108,18 @@ Acceptance requires independent behavioural controls showing:
 
 Controls must observe mutation, rejection, bounds, expiry, deduplication, and
 restart directly. Receipt traces or a longer timeout are insufficient.
+Restoring the deleted request/approval-adjacency equality must make control 1
+fail while the single-request and unchanged five-daemon controls remain green.
 
 ## Grounding
 
-See the [frozen evidence](../grounding/0028-authenticated-causal-predecessor-delivery.md)
+See the [proposed grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md)
 and [mutable reference implementation](../design/groups-join-roster-propagation.md).
-The current governance script does not guard `docs/grounding/`; placement or a
-guard remains a decision-owner ruling before acceptance.
+The grounding remains amendable while this ADR is Proposed and freezes with
+acceptance. Acceptance is blocked until governance pairs same-stem ADR and
+grounding files, protects accepted grounding, and continuously enforces exact
+required sections across amendment commits. The reproduced checker gaps and
+required repair are pinned in the grounding and reference.
 
 ## Notes for AI-assisted work
 

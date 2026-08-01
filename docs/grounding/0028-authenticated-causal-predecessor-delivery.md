@@ -1,21 +1,23 @@
 # Grounding for ADR 0028: Authenticated Causal-Predecessor Delivery
 
-- **Status:** Frozen proposal grounding
-- **Frozen:** 2026-08-01
+- **Status:** Proposed grounding (freezes with ADR acceptance)
+- **Recorded:** 2026-08-01
 - **Decision:** [ADR 0028](../adr/0028-authenticated-causal-predecessor-delivery.md)
 - **Reference implementation:**
   [join and roster propagation](../design/groups-join-roster-propagation.md)
 - **Evidence union:** `0bf0da5b9c8a1a58594c027c0f472ad7c7ddf55d`
 - **Evidence tree:** `da690e07e6e4822bd971b6be290afbc2d68b7d7e`
 - **Preserved run:** `/tmp/x0x-union-runs/1785594802/`
-- **Independent review:** Dario, conditional PASS at `d904cba7` / tree
-  `131336d7`; all measurable claims in that revision reproduced
+- **Independent review:** Dario, PASS at `fff09133` / tree `abe947d5`; the
+  evidence and corrected non-adjacent drain rule reproduced
 
-This record freezes the facts used to propose ADR 0028. Repository citations
-below resolve at the evidence union unless a different pin is stated. Mutable
-mechanisms, constants, pseudocode, and rollout policy belong in the linked
-reference chapter, not here. Citation ranges end on the final content line of
-the cited construct and omit an immediately following closing delimiter.
+This record pins the facts used to propose ADR 0028. It remains amendable while
+the ADR is Proposed and freezes only with acceptance, after the same-stem
+governance guard lands. Repository citations below resolve at the evidence
+union unless a different pin is stated. Mutable mechanisms, constants,
+pseudocode, and rollout policy belong in the linked reference chapter, not
+here. Citation ranges cover the cited construct and may omit an enclosing
+closing brace where the construct's meaning is complete without it.
 
 ## G-001 — The complete family stopped at 3 passed / 2 failed
 
@@ -177,7 +179,7 @@ Supports: the non-adjacent drain rule and the batched multi-request control.
 
 ## Artifact manifest
 
-SHA-256 values freeze the 16 files inspected under the preserved run directory:
+SHA-256 values pin the 16 files inspected under the preserved run directory:
 
 ```text
 3cc53d69ead2723d1183d02c55d5b739717c8192bb2acd0add6f97983692822a  family-stdout.log
@@ -214,6 +216,30 @@ log shares no such line. This unexplained attribution oddity does not affect
 the Alice-versus-Bob population claims above, but implementation validation
 must not assume every preserved filename proves a strictly independent trace
 source without additional process evidence.
+
+## G-010 — Current governance does not yet protect this pairing or structure
+
+The checker recognizes ADR paths only under `docs/adr/` and has no same-stem
+pairing with `docs/grounding/` (`scripts/adr-governance.py:22-31,165-181`). It
+therefore does not reject changing or deleting this grounding if ADR 0028 were
+Accepted.
+
+Two separate structural gaps were independently reproduced. Required headings
+use a leading-word regular expression, so `## Validation Notes` satisfies the
+`Validation` requirement (`scripts/adr-governance.py:49-50,160-163`). Default
+local validation selects `HEAD^1` as its base, then checks required sections
+only when the ADR is absent from that base
+(`scripts/adr-governance.py:85-93,131-138,156-163`). At `fff09133`, renaming all
+four required headings still produced exit 0; the output's count is the number
+of discovered ADR files, not the number structurally validated
+(`scripts/adr-governance.py:188`; Dario review event
+`52ffbd5fa6192819783513bd1b03288ad51370daac18815230e5f708c7b96997`).
+
+Acceptance is blocked until governance computes the same-stem ADR/grounding
+pair, proves that changing or deleting an Accepted grounding fails while a
+Proposed grounding remains amendable, matches required headings exactly, and
+uses the branch/pull-request base so a newly introduced ADR stays structurally
+checked throughout amendment commits.
 
 The proposal is not accepted and no production, testnet, deployment, push, or
 pull-request action is grounded by this record.
