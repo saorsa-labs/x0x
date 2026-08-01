@@ -63,14 +63,28 @@ impl DaemonFixture {
             .expect("home dir")
             .join(format!(".x0x-{name}"));
 
-        let process = Command::new(&binary)
+        let mut process_cmd = Command::new(&binary);
+        process_cmd
             .arg("--config")
             .arg(&config_path)
             .arg("--skip-update-check")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start x0xd");
+            .stderr(Stdio::null());
+        // Forward RUST_LOG and X0X_LOG_DIR to the spawned daemon so a test
+        // session can enable tracing without modifying the harness per-test.
+        // X0X_TEST_LOG_DIR is accepted as a convenience alias for X0X_LOG_DIR
+        // so test scripts (and the build team's runbooks) don't need to know
+        // the daemon's actual log-dir env var name. Both are opt-in: when
+        // neither is set, the daemon behaves exactly as before.
+        for var in ["RUST_LOG", "X0X_LOG_DIR"] {
+            if let Some(v) = std::env::var_os(var) {
+                process_cmd.env(var, v);
+            }
+        }
+        if let Some(v) = std::env::var_os("X0X_TEST_LOG_DIR") {
+            process_cmd.env("X0X_LOG_DIR", v);
+        }
+        let process = process_cmd.spawn().expect("Failed to start x0xd");
 
         let mut fixture = Self {
             process,

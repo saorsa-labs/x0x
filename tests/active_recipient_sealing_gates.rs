@@ -382,7 +382,7 @@ async fn agent_kem_pub_b64(d: &AgentInstance) -> String {
         .json()
         .await
         .expect("/agent json");
-    resp["data"]["kem_public_key_b64"]
+    resp["kem_public_key_b64"]
         .as_str()
         .expect("kem_public_key_b64 field")
         .to_string()
@@ -717,12 +717,41 @@ async fn bob_lane_vacuity_sensitivity_proves_kem_key_compromises_content() {
     }
     let (post_ct, post_nonce, post_epoch) = post;
     assert!(post_epoch > pre_e_epoch);
-
     // === Test 2 proper: in the test target, seal the live E+1 secret to bob's
     // KEM pubkey using the public production sealer + AAD, open with bob's
     // persisted KEM key, decrypt the post-epoch ciphertext. This proves that
     // possession of bob's retained KEM key is sufficient to compromise E+1
     // content — the active-recipient gate is what blocks this in production.
+    //
+    // E+1 lives on charlie's survivor envelope. Reseal to charlie to obtain
+    // it, then open via charlie's persisted KEM key (the same machinery
+    // test 1 uses to recover E+1 for the survivor sensitivity lane).
+    let mut post_reseal = (StatusCode::OK, Value::Null);
+    for _ in 0..60 {
+        post_reseal = reseal_to(alice, &group_id, &charlie_id).await;
+        if post_reseal.0 == StatusCode::OK && post_reseal.1["ok"] == true {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    assert_eq!(
+        post_reseal.0,
+        StatusCode::OK,
+        "reseal to charlie (active survivor) failed: status={}, body={:?}",
+        post_reseal.0,
+        post_reseal.1,
+    );
+    let e_plus_one = open_envelope_on_persisted_kem(
+        charlie,
+        &remote_group_id,
+        &charlie_id,
+        post_epoch,
+        post_reseal.1["kem_ciphertext_b64"].as_str().expect("kem"),
+        post_reseal.1["aead_nonce_b64"].as_str().expect("nonce"),
+        post_reseal.1["aead_ciphertext_b64"].as_str().expect("aead"),
+    )
+    .await;
+
     let (_bob_kem_pub, bob_priv_kp) = {
         let pub_b64 = agent_kem_pub_b64(bob).await;
         let pub_bytes = base64::engine::general_purpose::STANDARD
@@ -736,9 +765,9 @@ async fn bob_lane_vacuity_sensitivity_proves_kem_key_compromises_content() {
     let (kem_ct, aead_nonce, aead_ct) = x0x::groups::kem_envelope::seal_group_secret_to_recipient(
         &bob_priv_kp.public_bytes,
         &aad,
-        &e_secret_arr,
+        &e_plus_one,
     )
-    .expect("test-target seal to bob");
+    .expect("test-target seal E+1 to bob");
 
     let recovered = x0x::groups::kem_envelope::open_group_secret(
         &bob_priv_kp,
@@ -748,16 +777,19 @@ async fn bob_lane_vacuity_sensitivity_proves_kem_key_compromises_content() {
         &aead_ct,
     )
     .expect("test-target open with bob's persisted private key");
-    let recovered_hex = base64::engine::general_purpose::STANDARD
-        .encode(recovered);
+    let recovered_arr: [u8; 32] = recovered
+        .as_slice()
+        .try_into()
+        .expect("recovered secret must be 32 bytes");
+    let recovered_hex = base64::engine::general_purpose::STANDARD.encode(recovered_arr);
     assert_eq!(
-        recovered, e_secret_arr,
-        "recovered secret must round-trip the test-target seal (got {recovered_hex})"
+        recovered_arr, e_plus_one,
+        "recovered secret must round-trip the test-target seal to the E+1 secret (got {recovered_hex})"
     );
 
     // Decrypt the post-epoch ciphertext using the recovered E+1 secret.
     let decrypted = decrypt_payload_with_secret(
-        &recovered,
+        &e_plus_one,
         post_epoch,
         &remote_group_id,
         &post_nonce,
@@ -767,7 +799,7 @@ async fn bob_lane_vacuity_sensitivity_proves_kem_key_compromises_content() {
     let decrypted_payload = base64::engine::general_purpose::STANDARD.encode(&decrypted);
     assert_eq!(
         decrypted_payload, post_payload,
-        "recovered E+1 secret must round-trip the post-epoch payload"
+        "E+1 secret must round-trip the post-epoch payload"
     );
 
     let _ = alice_id;
@@ -828,7 +860,7 @@ async fn active_recipient_production_gate_and_predicate_reversion_mutation() {
     // Wait for bob's terminal 404 (group record entirely deleted on bob's daemon).
     let bob_terminal_404 = wait_until(Duration::from_secs(30), || async {
         let resp = authed_client(bob)
-            .get(bob.url(&format!("/groups/{remote_group_id}/secure/decrypt")))
+            .get(bob.url(&format!("/groups/{remote_group_id}")))
             .send()
             .await;
         resp.is_ok_and(|r| r.status() == StatusCode::NOT_FOUND)
@@ -899,15 +931,25 @@ async fn active_recipient_production_gate_and_predicate_reversion_mutation() {
     // reviewer then reverts, re-runs, and the test returns 409.
 }
 
-/// 4. Pre-terminal delayed-envelope installation arm — a valid erroneous
-/// E+1 envelope delivered before Bob reaches terminal removal can install
-/// the secret; the test uses a phase barrier to prove installation and
-/// E+1 decrypt before releasing the removal. This is an installation
-/// sensitivity arm, not the product-rule mutation. After terminal 404,
-/// the same envelope must NOT install.
+/// 4. KEM open path round-trips a bob-sealed envelope pre-removal. Seals E+1
+/// to bob's KEM pubkey using the public production sealer + AAD, delivers it
+/// to bob's `/groups/secure/open-envelope` endpoint, and asserts the endpoint
+/// recovers E+1. This proves the bob-sealed envelope + the production sealer
+/// + the wire-compatible AAD + the open_envelope endpoint all round-trip
+/// correctly.
+///
+/// SCOPE: this test exercises the open_envelope endpoint, which is a pure
+/// crypto (KEM-only) path that does NOT check group membership. It does NOT
+/// exercise the gossip install path, which is the membership-checking gate.
+/// A bob-sealed envelope that opens here does NOT imply the gossip install
+/// path would succeed — those are distinct paths. A pre-terminal "install"
+/// claim and a "phase barrier" claim would overstate what this test
+/// observes; this test is the membership-independent KEM round-trip and
+/// nothing more. The membership-checking gate lives in a separate
+/// dedicated test once the production delivery fix lands.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns real x0xd daemons"]
-async fn pre_terminal_delayed_envelope_installs_then_404_locks_it() {
+async fn pre_remove_kem_open_path_round_trips_bob_sealed_envelope() {
     let trio = trio_with_extra_config("").await;
     let (alice, bob, charlie) = (&trio.alice, &trio.bob, &trio.charlie);
     bootstrap_agent_cards(&[alice, bob, charlie]).await;
@@ -989,24 +1031,17 @@ async fn pre_terminal_delayed_envelope_installs_then_404_locks_it() {
         );
     }
 
-    // === Test 4 proper: pre-terminal install. Build a valid E+1 envelope
+    // === Test 4 proper: KEM open path round-trip. Build a valid E+1 envelope
     // sealed to bob's KEM pubkey using the public production sealer + AAD,
     // then verify the open_envelope endpoint on bob's daemon can recover the
-    // E+1 secret — this proves the envelope is a valid pre-terminal fixture
-    // (bob's KEM key, the wire-compatible AAD, the public sealer). The
-    // gossip install path is the same code branch; this endpoint is the
-    // production mirror that consumes the same envelope shape, so a fixture
-    // that opens here is the same one that would install via gossip.
-    //
-    // Phase barrier: capture the install-valid envelope and confirm bob can
-    // open it BEFORE we trigger removal. After F1 admin remove, the same
-    // envelope (delivered to bob's daemon) would be rejected by the gossip
-    // install path because bob's group record is gone — the install path
-    // returns false at the "unknown_group" reject stage (named_groups.rs:4627)
-    // before any KEM open or secret install.
-    let post_placeholder = "YWN0aXZlLXJlY2lwaWVudC1wb3N0LXBob2Jhcg=="; // "active-recipient-post-phobar"
-                                                                       // We need the E+1 secret. Easiest: reseal to charlie (the survivor) AFTER
-                                                                       // the admin remove to obtain the E+1 envelope, then store its secret.
+    // E+1 secret. This proves the bob-sealed envelope + the production sealer
+    // + the wire-compatible AAD + the open_envelope endpoint round-trip
+    // correctly. Membership is NOT in scope here: the open_envelope endpoint
+    // is a pure KEM crypto path that does not check group membership, and
+    // this test does not claim a pre-terminal install or a phase barrier.
+    // The gossip install path is a separate membership-checking gate; a
+    // dedicated test for that gate is out of scope until the production
+    // delivery fix lands.
     let removed = authed_client(alice)
         .delete(alice.url(&format!("/groups/{group_id}/members/{bob_id}")))
         .send()
@@ -1019,6 +1054,9 @@ async fn pre_terminal_delayed_envelope_installs_then_404_locks_it() {
         removed.text().await
     );
 
+    // Reseal to charlie (the active survivor) to obtain the E+1 envelope, then
+    // open it via charlie's persisted KEM key (the same machinery test 1 uses
+    // for the survivor sensitivity lane).
     let mut post_reseal = (StatusCode::OK, Value::Null);
     for _ in 0..60 {
         post_reseal = reseal_to(alice, &group_id, &charlie_id).await;
@@ -1031,7 +1069,6 @@ async fn pre_terminal_delayed_envelope_installs_then_404_locks_it() {
     let post_epoch = post_reseal.1["secret_epoch"].as_u64().expect("epoch");
     assert!(post_epoch > pre_e_epoch);
 
-    // Open the survivor envelope on charlie's daemon to recover E+1.
     let e_plus_one = open_envelope_on_persisted_kem(
         charlie,
         &remote_group_id,
@@ -1043,35 +1080,84 @@ async fn pre_terminal_delayed_envelope_installs_then_404_locks_it() {
     )
     .await;
 
-    // Build a "delayed" envelope sealed to bob's KEM pubkey using the actual
-    // E+1 secret and the production AAD. PRE-TERMINALLY (before now), this
-    // envelope would have installed bob's daemon, but admin remove has already
-    // happened — bob's daemon is mid-404 transition. The test asserts that
-    // the open_envelope endpoint on bob's daemon either (a) opens the
-    // envelope (the KEM path is independent of group membership) or (b)
-    // returns 409 if bob's group is in the withdrawn state. The gossip
-    // install path, however, MUST reject the same envelope before KEM open
-    // or install — that's the non-resurrection pin in test 5.
-    let _ = e_secret_arr;
-    let _ = post_placeholder;
-    let _ = e_plus_one;
+    // Build a "delayed" envelope sealed to bob's KEM pubkey using the real
+    // E+1 secret and the production AAD. Deliver it to bob's open_envelope
+    // endpoint and assert bob's persisted KEM key recovers the E+1 secret.
+    //
+    // SCOPE: this test exercises the open_envelope endpoint, which is a
+    // pure crypto (KEM-only) path that does NOT check group membership. The
+    // gossip install path is a separate membership-checking gate and is
+    // NOT exercised here. A failure here means the wire binding, the
+    // public sealer, or the AAD changed in a way that breaks the KEM
+    // decap path's membership independence — it is not evidence about
+    // the gossip install gate.
+    let bob_pub_b64 = agent_kem_pub_b64(bob).await;
+    let bob_pub_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&bob_pub_b64)
+        .expect("decode bob kem pub");
+    let aad = x0x::groups::aad::secure_share_aad(&remote_group_id, &bob_id, post_epoch);
+    let (delayed_kem, delayed_nonce, delayed_aead) =
+        x0x::groups::kem_envelope::seal_group_secret_to_recipient(
+            &bob_pub_bytes,
+            &aad,
+            &e_plus_one,
+        )
+        .expect("test 4 seal E+1 to bob");
 
-    // The pre-terminal install arm is asserted by the F1 R2 path: charlie
-    // (the survivor) successfully installs the post-epoch envelope via the
-    // gossip mesh and decrypts post-epoch ciphertext. The test relies on that
-    // earlier fact (the survivor_reads assertion above) and pins the same
-    // contract — a valid envelope + a recipient whose group record survives
-    // → install and decrypt succeed. For terminal 404, see test 5.
+    let (bob_open_status, bob_open_body) = open_envelope_on(
+        bob,
+        &remote_group_id,
+        &bob_id,
+        post_epoch,
+        &base64::engine::general_purpose::STANDARD.encode(&delayed_kem),
+        &base64::engine::general_purpose::STANDARD.encode(delayed_nonce),
+        &base64::engine::general_purpose::STANDARD.encode(&delayed_aead),
+    )
+    .await;
+    assert_eq!(
+        bob_open_status,
+        StatusCode::OK,
+        "bob's open_envelope endpoint must accept the bob-sealed E+1 envelope \
+         (KEM-only path is membership-independent): status={bob_open_status}, body={bob_open_body:?}"
+    );
+    let recovered = base64::engine::general_purpose::STANDARD
+        .decode(bob_open_body["secret_b64"].as_str().expect("secret_b64"))
+        .expect("decode recovered secret");
+    let mut recovered_arr = [0u8; 32];
+    recovered_arr.copy_from_slice(&recovered);
+    assert_eq!(
+        recovered_arr, e_plus_one,
+        "open_envelope must recover the E+1 secret bob was sealed to"
+    );
+
+    let _ = e_secret_arr;
 }
 
-/// 5. Post-terminal `unknown_group` non-resurrection pin — after terminal
-/// 404, a `SecureShareDelivered` envelope for the deleted group must be
-/// rejected before KEM open or install. This arm pins non-resurrection
-/// only; it must NOT be counted as key-exclusion evidence or attributed
-/// to `ensure_named_group_key_material_install_allowed`.
+/// 5. Post-remove active-recipient gate and persisted-state pin. After F1
+/// admin remove: alice's reseal to the retained-but-Removed bob returns 409
+/// + `recipient_not_active` (the active-recipient gate); bob's persisted
+/// KEM key SHA is unchanged (no KEM operation ran on bob's side); bob's
+/// group record returns 404; bob's open_envelope against charlie's
+/// envelope returns 403 (the KEM key gates content, independent of group
+/// membership).
+///
+/// SCOPE: this test does NOT pin the gossip `unknown_group` reject at
+/// `named_groups.rs:4627`. It does not deliver a Bob-sealed
+/// `SecureShareDelivered` event to the gossip/direct apply handler, so it
+/// cannot show whether decapsulation ran, and the wrong-KEM-key 403 at
+/// the end measures wrong-key crypto, not the `unknown_group` gate. A
+/// genuine non-resurrection pin requires a real apply-seam test
+/// exercising the production delivery path with a valid Bob-sealed
+/// event, plus a mutation arm that proves the `unknown_group` reject
+/// fires. Both arms depend on the production-side fix for direct
+/// delivery of the non-TreeKEM `MemberRemoved` event; until that lands
+/// the test is intentionally restricted to the narrower properties it
+/// actually observes. The "non_resurrection" naming is removed for the
+/// same reason — a non-resurrection receipt from proxy assertions is
+/// not what this test produces.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "spawns real x0xd daemons"]
-async fn post_terminal_unknown_group_non_resurrection_pin() {
+async fn removed_member_recipient_not_active_and_persisted_state_pin() {
     let trio = trio_with_extra_config("").await;
     let (alice, bob, charlie) = (&trio.alice, &trio.bob, &trio.charlie);
     bootstrap_agent_cards(&[alice, bob, charlie]).await;
@@ -1138,27 +1224,25 @@ async fn post_terminal_unknown_group_non_resurrection_pin() {
         "bob's daemon never reached terminal 404 after admin remove"
     );
 
-    // === Test 5 proper: post-terminal non-resurrection pin.
+    // === Test 5 proper: post-remove active-recipient gate and persisted-state
+    // pin. Observed properties:
     //
-    // The gossip install path (named_groups.rs:4627) rejects envelopes for
-    // unknown groups with reason="unknown_group" BEFORE any KEM open or
-    // install. The test cannot directly invoke the gossip handler, but the
-    // production reseal endpoint + the open_envelope endpoint on bob's
-    // daemon together pin the contract:
+    //   1. Alice's reseal to retained-but-Removed bob returns 409 +
+    //      reason="recipient_not_active" — the active-recipient gate.
+    //   2. Bob's daemon has no group record for the deleted group (terminal
+    //      404).
+    //   3. Bob's persisted KEM key SHA is unchanged across the remove
+    //      (no KEM operation ran on bob's side).
     //
-    //   1. alice's reseal to retained-but-Removed bob returns 409 +
-    //      reason="recipient_not_active" (the active-recipient gate).
-    //   2. bob's daemon no longer has a group record for the deleted group
-    //      (terminal 404); any gossip-delivered SecureShareDelivered event
-    //      for the deleted group is rejected at the unknown_group check
-    //      (named_groups.rs:4627) before KEM open or install.
-    //
-    // We verify (1) directly. We verify (2) by checking that alice's reseal
-    // CANNOT deliver a valid envelope to bob (since bob's group is gone, the
-    // gossip install path cannot work even if alice tried to publish an
-    // event), and that bob's persisted KEM key is untouched (no KEM
-    // operation occurred on bob's daemon between the pre-remove read and the
-    // post-terminal read).
+    // SCOPE: this test does NOT pin the gossip `unknown_group` reject at
+    // `named_groups.rs:4627`. It never delivers a Bob-sealed
+    // `SecureShareDelivered` event to the gossip/direct apply handler, so
+    // it cannot show whether decapsulation ran. The wrong-KEM-key 403
+    // further down measures wrong-key crypto on the membership-independent
+    // open_envelope path, not the `unknown_group` gate. A genuine
+    // non-resurrection pin is out of scope here and will live in a
+    // separate test once the production delivery fix lands; the test is
+    // intentionally restricted to the properties it actually observes.
     let (bob_reseal_status, bob_reseal_body) = reseal_to(alice, &group_id, &bob_id).await;
     assert_eq!(
         bob_reseal_status,
@@ -1172,9 +1256,14 @@ async fn post_terminal_unknown_group_non_resurrection_pin() {
         bob_reseal_body
     );
 
-    // bob's persisted KEM key must not have been touched by any KEM operation
-    // since the pre-remove read — this is the no-touch assertion that the
-    // install path rejected the envelope before KEM decap.
+    // bob's persisted KEM key must not have been touched by any operation
+    // between the pre-remove read and the post-terminal read. The
+    // persisted-state pin is weaker than a `unknown_group` reject proof:
+    // the test does not deliver a Bob-sealed `SecureShareDelivered` event
+    // to the gossip/direct apply handler, so it cannot show whether
+    // decapsulation ran. A byte-identical KEM key only shows that no KEM
+    // operation landed on bob's side; it does not show that the gossip
+    // install path rejected an envelope before KEM decap.
     let bob_kem_bytes_after = tokio::fs::read(&bob_kem_path)
         .await
         .expect("read bob kem key after");
@@ -1185,9 +1274,9 @@ async fn post_terminal_unknown_group_non_resurrection_pin() {
     };
     assert_eq!(
         bob_kem_sha_before, bob_kem_sha_after,
-        "bob's persisted KEM key was modified after admin remove — the \
-         gossip install path must have run a KEM operation it should have \
-         rejected at the unknown_group check"
+        "bob's persisted KEM key was modified after admin remove — no KEM \
+         operation should have run on bob's side after his group record \
+         was deleted"
     );
 
     // The group record itself is gone for bob: the group endpoint returns 404.
@@ -1213,16 +1302,15 @@ async fn post_terminal_unknown_group_non_resurrection_pin() {
         "sanity: reseal to active charlie must succeed in post-terminal state: status={charlie_reseal_status}, body={charlie_reseal_body:?}"
     );
 
-    // The survivor envelope must NOT be deliverable to bob via the
-    // open-envelope endpoint in a way that resurrects bob's group: the
-    // endpoint opens the envelope (KEM decap is independent of group
-    // membership) but the GOSSIP install path (group lookup at the top of
-    // the handler) rejects the envelope before KEM open — bob's daemon
-    // returns the secret to the test caller because the open_envelope
-    // endpoint is a pure crypto endpoint, but the daemon's group state
-    // remains unchanged (no record for the deleted group). This is the
-    // distinguishing evidence: the KEM operation is decoupled from group
-    // install, and the install gate is the unknown_group check.
+    // The open_envelope endpoint is a pure crypto (KEM-only) path. Bob's
+    // daemon is asked to open charlie's envelope (sealed to charlie's
+    // KEM pubkey), and the endpoint returns 403 because bob's daemon
+    // does not hold charlie's private key. This measures wrong-key
+    // crypto, not the `unknown_group` gate. The endpoint does not
+    // install a group record on bob's side regardless of outcome, so
+    // the test does not assert a non-resurrection property here — that
+    // requires a real apply-seam test (out of scope until the production
+    // delivery fix lands).
     let post_epoch = charlie_reseal_body["secret_epoch"].as_u64().expect("epoch");
     let survivor_key_b64 = charlie_reseal_body["kem_ciphertext_b64"]
         .as_str()
