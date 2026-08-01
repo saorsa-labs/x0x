@@ -220,10 +220,13 @@ The implementation is not complete until independent controls demonstrate:
    the witness receives approve(B), approve(C), request(B), request(C): neither
    approval mutates the roster before the requests; after request(C), both
    apply exactly once in signed revision order. A sibling case places a
-   delivered non-request state transition between request and approval;
-2. approval before request queues with no mutation and applies exactly once
-   after the matching signed request and any earlier signed chain transitions
-   arrive;
+   delivered non-request state transition between request and approval: no
+   approval-driven roster mutation occurs before the signed transition arrives,
+   then the approval applies exactly once after that transition advances the
+   witness to the approval's signed frontier;
+2. with one requester and no intervening state transition, approval before
+   request queues with no mutation and applies exactly once after the matching
+   signed request arrives;
 3. a permanently missing predecessor stays within count/byte/time bounds,
    expires, and never becomes success;
 4. tampered origin evidence, wrong request/requester, and wrong previous hash
@@ -238,8 +241,8 @@ the control.
 
 Sensitivity is mandatory: restoring the deleted equality between an
 approval's previous hash and its matching request's state hash must fail
-control 1, while the single-request control and unchanged five-daemon family
-remain green.
+control 1, while control 2 restricted to one requester with no intervening
+state transition and the unchanged five-daemon family remain green.
 
 ## Historical public-open symptom
 

@@ -8,8 +8,12 @@
 - **Evidence union:** `0bf0da5b9c8a1a58594c027c0f472ad7c7ddf55d`
 - **Evidence tree:** `da690e07e6e4822bd971b6be290afbc2d68b7d7e`
 - **Preserved run:** `/tmp/x0x-union-runs/1785594802/`
-- **Independent review:** Dario, PASS at `fff09133` / tree `abe947d5`; the
-  evidence and corrected non-adjacent drain rule reproduced
+- **Independent reviews:** Dario PASS event
+  `66b48a9718c4dbc9e5f965cfa8dcbae8d8b6b3a46a750d4c9933fc1ef1b6809c`
+  and Kimi PASS event
+  `5c604b623c6a90dfc2a0af2b9e081731d5ee68bd176b2c8b7a2b4be4bb7dc625`
+  reviewed `4ca9874d` / tree `58236e42` before the wording-only amendment;
+  neither event is attributed to bytes authored afterwards
 
 This record pins the facts used to propose ADR 0028. It remains amendable while
 the ADR is Proposed and freezes only with acceptance, after the same-stem

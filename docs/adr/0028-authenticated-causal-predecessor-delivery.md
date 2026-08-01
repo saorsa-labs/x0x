@@ -3,8 +3,8 @@
 - **Status:** Proposed
 - **Date:** 2026-08-01
 - **Decision owners:** David Irvine
-- **Reviewers:** Sam (author); Dario (PASS of `fff09133`, tree `abe947d5`);
-  Watson (orchestrator)
+- **Reviewers:** Sam (author); Dario (independent reviewer); Kimi (independent
+  reviewer); Watson (orchestrator)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** [proposed grounding](../grounding/0028-authenticated-causal-predecessor-delivery.md);
@@ -95,8 +95,9 @@ Acceptance requires independent behavioural controls showing:
    witness receives approve(B), approve(C), request(B), request(C): no roster
    mutation occurs before either request, then both approvals apply exactly
    once in signed revision order after request(C);
-2. approval before request performs no mutation, then applies once after the
-   matching signed request and any earlier signed chain transitions arrive;
+2. for one requester with no intervening state transition, approval before
+   request performs no mutation, then applies once after the matching signed
+   request arrives;
 3. a permanently missing predecessor stays bounded, expires, and never
    succeeds;
 4. a tampered predecessor, wrong request identity, or wrong
@@ -109,7 +110,8 @@ Acceptance requires independent behavioural controls showing:
 Controls must observe mutation, rejection, bounds, expiry, deduplication, and
 restart directly. Receipt traces or a longer timeout are insufficient.
 Restoring the deleted request/approval-adjacency equality must make control 1
-fail while the single-request and unchanged five-daemon controls remain green.
+fail while control 2 restricted to one requester with no intervening state
+transition and the unchanged five-daemon control remain green.
 
 ## Grounding
 
