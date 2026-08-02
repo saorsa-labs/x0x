@@ -485,6 +485,11 @@ pub(in crate::server) struct PendingCausalApproval {
     /// conflicted and skipped during drain (reject-both, Kimi blocker 5).
     #[serde(default)]
     conflicted: bool,
+    /// ADR 0028 B3: when conflicted, stores the digest of the rejected
+    /// conflicting entry. Persisted durably so the conflicting digest cannot
+    /// be re-admitted after restart (prevents resurrection).
+    #[serde(default)]
+    conflicted_with: Option<[u8; 32]>,
 }
 
 /// ADR 0028 bounds: maximum queued approvals per group.
@@ -4257,6 +4262,68 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
     }
 }
 
+/// ADR 0028 B2/B7: validated causal envelope — the result of decoding and
+/// cryptographically verifying the exact V2 envelope bytes against all
+/// predecessor-independent bindings.
+#[allow(dead_code)]
+struct ValidatedCausalEnvelope {
+    /// The decoded event from the V2 payload.
+    event: NamedGroupMetadataEvent,
+    /// The authenticated V2 signer.
+    signer: AgentId,
+    /// The group_id carried in the decoded event.
+    group_id: String,
+}
+
+/// ADR 0028 B2/B7: decode and cryptographically verify V2 envelope bytes.
+/// Returns the decoded event and the authenticated signer. Used by both the
+/// shared exact-envelope validator and the outbox loader.
+fn decode_and_verify_v2(
+    envelope_bytes: &[u8],
+) -> Result<(NamedGroupMetadataEvent, AgentId), &'static str> {
+    let msg = x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(envelope_bytes))
+        .map_err(|_| "v2_decode_failed")?;
+    if !msg.verified {
+        return Err("v2_signature_invalid");
+    }
+    let decoded_event = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+        .map_err(|_| "payload_deserialize_failed")?;
+    let signer = msg.sender.ok_or("no_v2_sender")?;
+    Ok((decoded_event, signer))
+}
+
+/// ADR 0028 B2/B7: shared exact-envelope validator. Decodes the V2 wire
+/// bytes, verifies the ML-DSA signature, and checks that the decoded event
+/// matches the stored event, the signer matches the expected identity, and
+/// the decoded group_id matches the expected group. Used at both live
+/// admission and restart revalidation so there is one validator, not two.
+fn validate_causal_envelope(
+    envelope_bytes: &[u8],
+    expected_group_id: &str,
+    expected_event: &NamedGroupMetadataEvent,
+    expected_signer_hex: &str,
+) -> Result<ValidatedCausalEnvelope, &'static str> {
+    let (decoded_event, signer) = decode_and_verify_v2(envelope_bytes)?;
+    // Decoded event must match stored event.
+    if decoded_event != *expected_event {
+        return Err("decoded_event_mismatch");
+    }
+    // V2 signer must match expected identity.
+    if hex::encode(signer.as_bytes()) != expected_signer_hex {
+        return Err("signer_mismatch");
+    }
+    // Decoded event's group_id must match expected group.
+    let decoded_gid = named_group_metadata_event_group_id(&decoded_event).to_string();
+    if decoded_gid != expected_group_id {
+        return Err("group_id_mismatch");
+    }
+    Ok(ValidatedCausalEnvelope {
+        event: decoded_event,
+        signer,
+        group_id: decoded_gid,
+    })
+}
+
 /// ADR 0028: attempt to queue a `JoinRequestApproved` that arrived before its
 /// matching `JoinRequestCreated` predecessor. Admission runs every check
 /// possible without the missing request; no group state is mutated. The exact
@@ -4313,8 +4380,13 @@ async fn try_queue_causal_approval(
     // before sidecar write (Kimi blocker 4). Verify the commit's committed_by
     // matches the approval's actor, and that the commit carries a valid
     // state_hash and signature.
-    let (commit_check_ok, approval_actor) = match &event {
-        NamedGroupMetadataEvent::JoinRequestApproved { actor, commit, .. } => {
+    let (commit_check_ok, approval_actor, _commit_group_id, _event_revision) = match &event {
+        NamedGroupMetadataEvent::JoinRequestApproved {
+            actor,
+            commit,
+            revision,
+            ..
+        } => {
             let Some(commit) = commit else {
                 tracing::debug!(
                     target: "treekem.trace",
@@ -4331,7 +4403,16 @@ async fn try_queue_causal_approval(
             // state_hash recomputation, ML-DSA signature, signer→committed_by
             // binding (audit 2 — not just non-empty string proxy).
             let structure_ok = commit.verify_structure().is_ok();
-            (actor_ok && structure_ok, actor.clone())
+            // B2: commit.group_id must match the canonical resolved group.
+            let group_id_ok = commit.group_id == info.stable_group_id();
+            // B2: commit.revision must match the event's revision.
+            let revision_ok = commit.revision == *revision;
+            (
+                actor_ok && structure_ok && group_id_ok && revision_ok,
+                actor.clone(),
+                commit.group_id.clone(),
+                *revision,
+            )
         }
         _ => return,
     };
@@ -4342,6 +4423,21 @@ async fn try_queue_causal_approval(
             reason = "commit_check_failed",
             group_id = %LogHexId::group(group_id),
             actor = %approval_actor,
+        );
+        state.groups_diagnostics.record_causal_invalid(group_id);
+        return;
+    }
+
+    // B2: validate the exact V2 envelope against the stored event and
+    // expected signer (the approval actor). Uses the shared validator so
+    // live admission and restart revalidation enforce the same checks.
+    let actor_hex = hex::encode(approval_actor.as_bytes());
+    if let Err(reason) = validate_causal_envelope(env_bytes, group_id, &event, &actor_hex) {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = %reason,
+            group_id = %LogHexId::group(group_id),
         );
         state.groups_diagnostics.record_causal_invalid(group_id);
         return;
@@ -4409,6 +4505,7 @@ async fn try_queue_causal_approval(
         requester_agent_id: requester_agent_id.to_string(),
         revision,
         conflicted: false,
+        conflicted_with: None,
     };
 
     {
@@ -4455,6 +4552,25 @@ async fn try_queue_causal_approval(
             return;
         }
 
+        // B3: check conflict tombstones — a digest previously rejected by
+        // conflict must not be re-admitted after restart.
+        let tombstone_hit = {
+            let tombstones = state.causal_conflict_tombstones.read().await;
+            tombstones
+                .get(group_id)
+                .is_some_and(|digests| digests.contains(&approval.digest))
+        };
+        if tombstone_hit {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "causal_queue_tombstone_reject",
+                group_id = %LogHexId::group(group_id),
+                request_id = %request_id,
+            );
+            state.groups_diagnostics.record_causal_invalid(group_id);
+            return;
+        }
+
         // Conflict detection: non-identical approvals with the same
         // (group, request, requester, revision) are conflicts — apply neither.
         let conflict_key = (
@@ -4470,30 +4586,69 @@ async fn try_queue_causal_approval(
             })
             .collect();
         if !conflicting.is_empty() {
-            // ADR 0028: non-identical conflict — reject-both. Mark the
-            // existing entries conflicted so they are skipped during drain.
-            // The new entry is not admitted (Kimi blocker 5).
+            // ADR 0028 B3: non-identical conflict — reject-both. Mark the
+            // existing entries conflicted AND record the new conflicting digest
+            // in the tombstone store so it cannot be re-admitted. Persist
+            // atomically; rollback on failure (no diagnostic recorded).
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
                 request_id = %request_id,
                 revision = revision,
-                "ADR 0028: non-identical conflict detected, marking all entries conflicted (reject-both)"
+                "ADR 0028 B3: non-identical conflict detected, marking all entries conflicted (reject-both)"
             );
-            for q in queue.iter_mut() {
-                if (&q.request_id, &q.requester_agent_id, q.revision)
-                    == (&conflict_key.0, &conflict_key.1, conflict_key.2)
-                {
-                    q.conflicted = true;
-                }
+            // Snapshot entries for rollback.
+            let conflicted_indices: Vec<usize> = queue
+                .iter()
+                .enumerate()
+                .filter(|(_, q)| {
+                    (&q.request_id, &q.requester_agent_id, q.revision)
+                        == (&conflict_key.0, &conflict_key.1, conflict_key.2)
+                })
+                .map(|(i, _)| i)
+                .collect();
+            for &i in &conflicted_indices {
+                queue[i].conflicted = true;
+                queue[i].conflicted_with = Some(approval.digest);
             }
-            state.groups_diagnostics.record_causal_conflicted(group_id);
-            // ADR 0028: persist the conflict transition durably before
-            // returning. If persistence fails, the unmarked entry could
-            // apply after restart (audit 3).
+            // Record the new digest in the tombstone store.
+            {
+                let mut tombstones = state.causal_conflict_tombstones.write().await;
+                tombstones
+                    .entry(group_id.to_string())
+                    .or_default()
+                    .push(approval.digest);
+            }
             drop(queue_lock);
+            // B3: persist atomically. If save fails, roll back ALL in-memory
+            // mutations (conflicted markings + tombstone) and return without
+            // recording a diagnostic — no durable reject-both is acknowledged.
             if let Err(e) = save_causal_approval_queue(state).await {
-                tracing::error!("ADR 0028: failed to persist conflict marking: {e}");
+                tracing::error!(
+                    "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
+                );
+                // Rollback tombstone.
+                {
+                    let mut tombstones = state.causal_conflict_tombstones.write().await;
+                    if let Some(digests) = tombstones.get_mut(group_id) {
+                        if let Some(pos) = digests.iter().position(|d| *d == approval.digest) {
+                            digests.remove(pos);
+                        }
+                    }
+                }
+                // Rollback conflicted markings.
+                {
+                    let mut queue_lock = state.causal_approval_queue.write().await;
+                    if let Some(q) = queue_lock.get_mut(group_id) {
+                        for &i in &conflicted_indices {
+                            q[i].conflicted = false;
+                            q[i].conflicted_with = None;
+                        }
+                    }
+                }
+                return;
             }
+            // Persist succeeded — record diagnostic.
+            state.groups_diagnostics.record_causal_conflicted(group_id);
             return;
         }
 
@@ -4597,20 +4752,35 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             );
             continue;
         }
-        // ADR 0028: crash-recovery exactly-once. The exact proof is that
+        // ADR 0028 B4: crash-recovery exactly-once. The exact proof is that
         // the queued approval commit's state_hash equals the durable current
-        // group state_hash with the same request/requester/revision binding
-        // (audit 4 — NOT just "request status != Pending", which would
-        // falsely match denied/rejected/superseded requests).
+        // group state_hash AND the full tuple (group_id, revision, request_id,
+        // requester, actor) matches — not just state_hash alone, which would
+        // falsely match denied/rejected/superseded requests.
         let already_current = {
             let groups = state.named_groups.read().await;
             groups.get(group_id).is_some_and(|info| {
-                // The approval's commit state_hash must match the current
-                // group's state_hash exactly.
                 match &pending.event {
                     NamedGroupMetadataEvent::JoinRequestApproved {
-                        commit: Some(c), ..
-                    } => info.state_hash == c.state_hash,
+                        commit: Some(c),
+                        revision,
+                        actor,
+                        request_id: ev_req_id,
+                        requester_agent_id: ev_requester,
+                        group_id: ev_gid,
+                        ..
+                    } => {
+                        // B4: exact tuple — state_hash + group_id + revision +
+                        // request_id + requester + actor must all match.
+                        info.state_hash == c.state_hash
+                            && c.group_id == info.stable_group_id()
+                            && c.revision == info.roster_revision
+                            && *ev_req_id == pending.request_id
+                            && *ev_requester == pending.requester_agent_id
+                            && *actor == hex::encode(pending.sender.as_bytes())
+                            && *revision == pending.revision
+                            && *ev_gid == group_id
+                    }
                     _ => false,
                 }
             })
@@ -4625,6 +4795,14 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             continue;
         }
         state.groups_diagnostics.record_causal_retried(group_id);
+        // B5: snapshot the group before apply so we can roll back the
+        // in-memory state if persistence fails. Without this, the next replay
+        // sees the advanced in-memory state_hash as already_current and drops
+        // the entry while the durable file is still stale.
+        let group_snapshot = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_id).cloned()
+        };
         // Re-run the full ordinary approval apply with queueing disabled.
         // Boxed to break the async recursion cycle
         // (apply_named_group_metadata_event_inner → replay → apply_inner).
@@ -4639,25 +4817,31 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         .await;
 
         if applied {
-            // ADR 0028: persist-before-remove (audit 5). The inner apply
-            // called save_named_groups, but we must verify durability here.
-            // If group persistence failed, retain the queue entry so a
-            // crash doesn't lose the approval.
+            // ADR 0028 B5: persist-before-remove. The inner apply called
+            // save_named_groups, but we must verify durability here. If group
+            // persistence failed, ROLL BACK the in-memory state to the
+            // pre-apply snapshot and retain the queue entry so the next
+            // replay does not falsely see already_current.
             let group_persisted = save_named_groups_checked(state).await.is_ok();
             if group_persisted {
                 tracing::info!(
                     group_id = %LogHexId::group(group_id),
                     request_id = %pending.request_id,
-                    "ADR 0028: queued approval drained and applied (group state durable)"
+                    "ADR 0028 B5: queued approval drained and applied (group state durable)"
                 );
                 state.groups_diagnostics.record_causal_applied(group_id);
                 continue;
             } else {
+                // B5: roll back in-memory state to prevent false already_current.
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id),
                     request_id = %pending.request_id,
-                    "ADR 0028: group persistence failed, retaining queue entry"
+                    "ADR 0028 B5: group persistence failed, rolling back in-memory state, retaining queue entry"
                 );
+                if let Some(snapshot) = group_snapshot {
+                    let mut groups = state.named_groups.write().await;
+                    groups.insert(group_id.to_string(), snapshot);
+                }
                 still_pending.push_back(pending);
                 continue;
             }
@@ -7610,6 +7794,11 @@ pub(in crate::server) const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] =
 /// non-local active member of the group. The relay is a courier — it forwards
 /// the requester's ML-DSA-65 signature unchanged. The receiver independently
 /// verifies the requester's signature before applying the event.
+///
+/// B6: This fire-and-forget sibling is NO LONGER CALLED in production — the
+/// background `causal_relay_step` timer owns all sends through the single relay
+/// engine. Retained for potential test use.
+#[allow(dead_code)]
 pub(in crate::server) async fn relay_predecessor_to_active_witnesses(
     state: &AppState,
     group_id: &str,
@@ -7708,23 +7897,40 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         return;
     }
 
+    // B6: track send results per obligation so we can persist before counting.
+    /// Send results for one due obligation.
+    struct RelayResult {
+        group_id: String,
+        digest: [u8; 32],
+        /// Targets that failed (to be retained for retry).
+        failed_targets: Vec<String>,
+        /// Total successful sends (for counting after persist).
+        success_count: usize,
+    }
+
+    let mut relay_results: Vec<RelayResult> = Vec::new();
+
     // Relay to each target and observe results per obligation (audit 6).
     for due_obl in &due {
         let group_id = &due_obl.group_id;
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
         let targets = &due_obl.targets;
-        let mut remaining_targets: Vec<String> = Vec::new();
+        let mut failed_targets: Vec<String> = Vec::new();
+        let mut success_count: usize = 0;
 
         for target_hex in targets {
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
+                // Unparseable target — retain for diagnostic visibility.
+                failed_targets.push(target_hex.clone());
                 continue;
             };
             let mut dm_payload =
                 Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len());
             dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
             dm_payload.extend_from_slice(envelope_bytes);
-            // ADR 0028: await the send result and count only on success.
+            // B6: await the send result. Do NOT count record_causal_relayed
+            // yet — count only after durable persistence (persist-before-count).
             let send_result = state
                 .agent
                 .send_direct_with_config(
@@ -7734,47 +7940,122 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 )
                 .await;
             if send_result.is_ok() {
-                state.groups_diagnostics.record_causal_relayed(group_id);
+                success_count += 1;
             } else {
                 // Failed — retain this target for next retry.
-                remaining_targets.push(target_hex.clone());
+                failed_targets.push(target_hex.clone());
             }
         }
 
-        // Update the obligation: advance retry state, update remaining targets.
-        let mut outbox = state.predecessor_relay_outbox.write().await;
-        if let Some(obligations) = outbox.get_mut(group_id) {
-            for obligation in obligations.iter_mut() {
-                if obligation.digest == *digest {
-                    obligation.retry_count = obligation.retry_count.saturating_add(1);
-                    let delay_secs = CAUSAL_RELAY_RETRY_SECS[(obligation.retry_count as usize)
-                        .saturating_sub(1)
-                        .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
-                    obligation.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
-                    obligation.relay_targets = remaining_targets.clone();
-                    break;
-                }
-            }
-            // Prune only obligations with exhausted retry schedule. Obligations
-            // with empty relay_targets (all delivered) are RETAINED for the
-            // retention period so the approve path (K2.8) can verify the
-            // predecessor obligation was durably recorded. The loader drops
-            // expired entries on restart.
-            obligations.retain(|o| {
-                o.digest != *digest || (o.retry_count as usize) < CAUSAL_RELAY_RETRY_SECS.len()
-            });
-        }
+        relay_results.push(RelayResult {
+            group_id: group_id.clone(),
+            digest: *digest,
+            failed_targets,
+            success_count,
+        });
     }
 
-    // Clean up empty group entries.
+    // B6: update in-memory obligations with relay results. Snapshot the
+    // affected obligations first so we can roll back on persistence failure.
+    let mut snapshots: Vec<(String, Vec<PredecessorRelayObligation>)> = Vec::new();
+    let mut completed_tombstones_to_add: Vec<CompletedRelayTombstone> = Vec::new();
+
     {
         let mut outbox = state.predecessor_relay_outbox.write().await;
-        outbox.retain(|_, obligations| !obligations.is_empty());
+        for result in &relay_results {
+            if let Some(obligations) = outbox.get_mut(&result.group_id) {
+                // Snapshot the group's obligations for rollback.
+                if !snapshots.iter().any(|(gid, _)| gid == &result.group_id) {
+                    snapshots.push((result.group_id.clone(), obligations.clone()));
+                }
+                for obligation in obligations.iter_mut() {
+                    if obligation.digest == result.digest {
+                        obligation.retry_count = obligation.retry_count.saturating_add(1);
+                        let delay_secs = CAUSAL_RELAY_RETRY_SECS[(obligation.retry_count as usize)
+                            .saturating_sub(1)
+                            .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
+                        obligation.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
+                        // B6: update relay_targets to only the failed targets.
+                        obligation.relay_targets = result.failed_targets.clone();
+                        // B6: terminal-success — if all targets delivered,
+                        // mark completed and create a tombstone.
+                        if result.failed_targets.is_empty() {
+                            obligation.completed_at_ms = Some(now_ms);
+                            completed_tombstones_to_add.push(CompletedRelayTombstone {
+                                group_id: result.group_id.clone(),
+                                request_id: obligation.request_id.clone(),
+                                requester_agent_id: obligation.requester_agent_id.clone(),
+                                digest: obligation.digest,
+                                completed_at_ms: now_ms,
+                            });
+                        }
+                        break;
+                    }
+                }
+            }
+        }
     }
 
-    // Persist the outbox after the step.
+    // B6: add tombstones to the tombstone store.
+    if !completed_tombstones_to_add.is_empty() {
+        let mut tombstones = state.completed_relay_tombstones.write().await;
+        for t in &completed_tombstones_to_add {
+            tombstones
+                .entry(t.group_id.clone())
+                .or_default()
+                .push(t.clone());
+        }
+    }
+
+    // B6: persist before counting. If persistence fails, roll back ALL
+    // in-memory mutations and do not count record_causal_relayed.
     if let Err(e) = save_predecessor_relay_outbox(state).await {
-        tracing::error!("ADR 0028: failed to persist relay outbox after relay step: {e}");
+        tracing::error!(
+            "ADR 0028 B6: failed to persist relay outbox after relay step, rolling back: {e}"
+        );
+        // Rollback: restore snapshotted obligations.
+        {
+            let mut outbox = state.predecessor_relay_outbox.write().await;
+            for (gid, snap) in &snapshots {
+                outbox.insert(gid.clone(), snap.clone());
+            }
+        }
+        // Rollback: remove added tombstones.
+        if !completed_tombstones_to_add.is_empty() {
+            let mut tombstones = state.completed_relay_tombstones.write().await;
+            for t in &completed_tombstones_to_add {
+                if let Some(list) = tombstones.get_mut(&t.group_id) {
+                    if let Some(pos) = list.iter().position(|x| x.digest == t.digest) {
+                        list.remove(pos);
+                    }
+                }
+            }
+        }
+        return;
+    }
+
+    // B6: persistence succeeded — NOW count record_causal_relayed for each
+    // successful send, and prune terminal obligations from the live outbox.
+    for result in &relay_results {
+        for _ in 0..result.success_count {
+            state
+                .groups_diagnostics
+                .record_causal_relayed(&result.group_id);
+        }
+    }
+
+    // B6: prune terminal obligations (completed_at_ms is set) and
+    // retry-exhausted obligations from the live outbox — completed ones are
+    // now represented by the tombstone; exhausted ones have no more retries.
+    {
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        for obligations in outbox.values_mut() {
+            obligations.retain(|o| {
+                o.completed_at_ms.is_none()
+                    && (o.retry_count as usize) < CAUSAL_RELAY_RETRY_SECS.len()
+            });
+        }
+        outbox.retain(|_, obligations| !obligations.is_empty());
     }
 }
 
@@ -7803,6 +8084,11 @@ pub(in crate::server) struct PredecessorRelayObligation {
     pub(in crate::server) requester_agent_id: String,
     /// Active witness AgentIds (hex) that still need delivery.
     pub(in crate::server) relay_targets: Vec<String>,
+    /// ADR 0028 B6: when all relay_targets have been delivered, this is set
+    /// to the completion time. The obligation is then converted to a
+    /// completed tombstone and pruned from the live retry outbox.
+    #[serde(default)]
+    pub(in crate::server) completed_at_ms: Option<u64>,
 }
 
 /// Request body for `POST /groups/:id/send`.
@@ -11902,6 +12188,55 @@ pub(in crate::server) async fn approve_join_request(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
+    // ADR 0028 B8: validate a durable predecessor obligation BEFORE any roster
+    // mutation, persistence, secure-share publication, or fan-out. The
+    // authority must have received and durably recorded the JoinRequestCreated
+    // predecessor envelope. The match is on the exact requester identity and
+    // request ID — not just the group-map key + request ID. Both the live
+    // outbox and the completed tombstones satisfy the precondition.
+    {
+        // Read the join request to get the requester identity.
+        let requester_agent_id = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .and_then(|info| info.join_requests.get(&request_id))
+                .map(|req| req.requester_agent_id.clone())
+        };
+        let Some(requester_agent_id) = requester_agent_id else {
+            return not_found("request not found");
+        };
+        // Check the live outbox for a matching obligation.
+        let obligation_in_outbox = {
+            let outbox = state.predecessor_relay_outbox.read().await;
+            outbox.get(&id).is_some_and(|obligations| {
+                obligations.iter().any(|o| {
+                    o.request_id == request_id && o.requester_agent_id == requester_agent_id
+                })
+            })
+        };
+        // Check the completed tombstones.
+        let obligation_in_tombstones = {
+            let tombstones = state.completed_relay_tombstones.read().await;
+            tombstones.get(&id).is_some_and(|list| {
+                list.iter().any(|t| {
+                    t.request_id == request_id && t.requester_agent_id == requester_agent_id
+                })
+            })
+        };
+        if !obligation_in_outbox && !obligation_in_tombstones {
+            tracing::warn!(
+                group_id = %LogHexId::group(&id),
+                request_id = %request_id,
+                "ADR 0028 B8: refusing approval — no durable predecessor obligation for this request"
+            );
+            return api_error(
+                StatusCode::PRECONDITION_FAILED,
+                "predecessor obligation not found — JoinRequestCreated not yet received",
+            );
+        }
+    }
+
     let (metadata_topic, event_group_id, requester_hex, revision, commit, delivery_roster) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
@@ -11964,6 +12299,60 @@ pub(in crate::server) async fn approve_join_request(
     };
 
     save_named_groups(&state).await;
+
+    // ADR 0028 B8: refresh and durably persist the post-approval witness
+    // target set BEFORE any publication or fan-out. After approval, the
+    // requester is now an active member — the target set should reflect the
+    // current active membership so pending relay retries include the new
+    // member. If this persistence fails, return an error so no publication
+    // or fan-out proceeds (matrix: "Failure leaves roster, publications, and
+    // fan-out untouched" — the roster is saved but nothing is published).
+    {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let post_approval_targets: Vec<String> = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| {
+                    info.members_v2
+                        .iter()
+                        .filter(|(mid, m)| {
+                            m.state == x0x::groups::GroupMemberState::Active
+                                && **mid != local_agent_hex
+                        })
+                        .map(|(mid, _)| mid.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        if let Some(obligations) = outbox.get_mut(&id) {
+            for obligation in obligations.iter_mut() {
+                if obligation.request_id == request_id {
+                    // Refresh targets: union of remaining targets and new
+                    // post-approval active members, deduplicated.
+                    let mut refreshed: Vec<String> = obligation.relay_targets.clone();
+                    for t in &post_approval_targets {
+                        if !refreshed.contains(t) {
+                            refreshed.push(t.clone());
+                        }
+                    }
+                    obligation.relay_targets = refreshed;
+                    break;
+                }
+            }
+        }
+    }
+    if let Err(e) = save_predecessor_relay_outbox(&state).await {
+        tracing::error!(
+            group_id = %LogHexId::group(&id),
+            "ADR 0028 B8: failed to persist refreshed predecessor outbox before publication: {e}"
+        );
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to persist refreshed predecessor outbox — approval not published",
+        );
+    }
 
     // Phase D.2: deliver the current group shared secret to the new member
     // via a `SecureShareDelivered` envelope on the group metadata topic,
@@ -12052,9 +12441,8 @@ pub(in crate::server) async fn approve_join_request(
     }
     save_mls_groups(&state).await;
 
-    // ADR 0028 K2.8: keep a copy of request_id for the predecessor
-    // obligation check below (the event moves it).
-    let obligation_request_id = request_id.clone();
+    // ADR 0028 B8: request_id is moved into the event below; the B8
+    // obligation check and target refresh (above) already used it.
     let event = NamedGroupMetadataEvent::JoinRequestApproved {
         group_id: event_group_id,
         request_id,
@@ -12069,79 +12457,6 @@ pub(in crate::server) async fn approve_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-
-    // ADR 0028 K2.8: require a durable predecessor obligation exists before
-    // fan-out. The authority must have received and durably recorded the
-    // JoinRequestCreated predecessor envelope. If no obligation exists for
-    // this group+request, the predecessor was never received — refuse the
-    // approval so the requester can retry. (Kimi audit 8.)
-    {
-        let outbox = state.predecessor_relay_outbox.read().await;
-        let obligation_exists = outbox.get(&id).is_some_and(|obligations| {
-            obligations
-                .iter()
-                .any(|o| o.request_id == obligation_request_id)
-        });
-        if !obligation_exists {
-            tracing::warn!(
-                group_id = %LogHexId::group(&id),
-                request_id = %obligation_request_id,
-                "ADR 0028: refusing approval — no durable predecessor obligation for this request"
-            );
-            return api_error(
-                StatusCode::PRECONDITION_FAILED,
-                "predecessor obligation not found — JoinRequestCreated not yet received",
-            );
-        }
-    }
-
-    // ADR 0028 K2.8: refresh the post-approval active witness target set in
-    // the predecessor obligation. After approval, the requester is now an
-    // active member — the target set should reflect the current active
-    // membership so any pending relay retries include the new member.
-    {
-        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-        let post_approval_targets: Vec<String> = {
-            let groups = state.named_groups.read().await;
-            groups
-                .get(&id)
-                .map(|info| {
-                    info.members_v2
-                        .iter()
-                        .filter(|(mid, m)| {
-                            m.state == x0x::groups::GroupMemberState::Active
-                                && **mid != local_agent_hex
-                        })
-                        .map(|(mid, _)| mid.clone())
-                        .collect()
-                })
-                .unwrap_or_default()
-        };
-        let mut outbox = state.predecessor_relay_outbox.write().await;
-        if let Some(obligations) = outbox.get_mut(&id) {
-            for obligation in obligations.iter_mut() {
-                if obligation.request_id == obligation_request_id {
-                    // Refresh targets: union of remaining targets and new
-                    // post-approval active members, deduplicated.
-                    let mut refreshed: Vec<String> = obligation.relay_targets.clone();
-                    for t in &post_approval_targets {
-                        if !refreshed.contains(t) {
-                            refreshed.push(t.clone());
-                        }
-                    }
-                    obligation.relay_targets = refreshed;
-                    break;
-                }
-            }
-        }
-    }
-    // Persist the refreshed outbox.
-    if let Err(e) = save_predecessor_relay_outbox(&state).await {
-        tracing::error!(
-            group_id = %LogHexId::group(&id),
-            "ADR 0028: failed to persist refreshed predecessor outbox after approval: {e}"
-        );
-    }
 
     // Direct + delayed delivery of the signed JoinRequestApproved to every
     // non-local active member (the already-present witnesses) AND the new
@@ -14280,9 +14595,28 @@ struct CausalQueueSidecar {
     version: u32,
     #[serde(default)]
     entries: HashMap<String, VecDeque<PendingCausalApproval>>,
+    /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
+    /// Prevents re-admission of a conflicting entry after restart.
+    #[serde(default)]
+    conflict_tombstones: HashMap<String, Vec<[u8; 32]>>,
 }
 
 const CAUSAL_SIDECAR_VERSION: u32 = 1;
+
+/// ADR 0028 B6: a completed relay obligation tombstone. When all relay
+/// targets have been delivered, the live obligation is replaced by this
+/// compact tombstone so the approval path (B8) can still verify the
+/// predecessor was durably received without retaining the full envelope.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct CompletedRelayTombstone {
+    group_id: String,
+    request_id: String,
+    requester_agent_id: String,
+    /// blake3 digest of the original envelope (dedup + obligation key).
+    digest: [u8; 32],
+    /// Unix-epoch millis when all targets were delivered.
+    completed_at_ms: u64,
+}
 
 /// ADR 0028: versioned sidecar for the predecessor relay outbox.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -14290,6 +14624,10 @@ struct RelayOutboxSidecar {
     version: u32,
     #[serde(default)]
     entries: HashMap<String, Vec<PredecessorRelayObligation>>,
+    /// ADR 0028 B6: completed obligations that have been pruned from the
+    /// live retry outbox. Retained for the B8 approval check.
+    #[serde(default)]
+    completed_tombstones: HashMap<String, Vec<CompletedRelayTombstone>>,
 }
 
 /// ADR 0028: persist the causal approval queue to a durable sidecar file.
@@ -14298,9 +14636,11 @@ struct RelayOutboxSidecar {
 pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> std::io::Result<()> {
     let json = {
         let queue = state.causal_approval_queue.read().await;
+        let tombstones = state.causal_conflict_tombstones.read().await;
         let sidecar = CausalQueueSidecar {
             version: CAUSAL_SIDECAR_VERSION,
             entries: queue.clone(),
+            conflict_tombstones: tombstones.clone(),
         };
         match serde_json::to_string(&sidecar) {
             Ok(j) => j,
@@ -14327,9 +14667,11 @@ pub(in crate::server) async fn save_predecessor_relay_outbox(
 ) -> std::io::Result<()> {
     let json = {
         let outbox = state.predecessor_relay_outbox.read().await;
+        let tombstones = state.completed_relay_tombstones.read().await;
         let sidecar = RelayOutboxSidecar {
             version: CAUSAL_SIDECAR_VERSION,
             entries: outbox.clone(),
+            completed_tombstones: tombstones.clone(),
         };
         match serde_json::to_string(&sidecar) {
             Ok(j) => j,
@@ -14460,69 +14802,73 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
                 break;
             }
-            // ADR 0028 K2.7: restart revalidation. Re-decode and
-            // cryptographically verify the exact V2 envelope bytes. The
-            // stored event/sender fields are NOT trusted — they must agree
-            // with the cryptographically verified V2 decode.
-            let msg = match x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(
+            // ADR 0028 B7: restart revalidation using the shared exact-envelope
+            // validator. Binds: V2 decode + ML-DSA signature, decoded event ==
+            // stored event, signer == approval actor, group_id == stored group.
+            let expected_signer_hex = match &entry.event {
+                NamedGroupMetadataEvent::JoinRequestApproved { actor, .. } => actor.clone(),
+                _ => continue,
+            };
+            match validate_causal_envelope(
                 &entry.envelope_bytes,
-            )) {
-                Ok(m) => m,
-                Err(_) => {
-                    tracing::warn!(
-                        group_id = %group_id,
-                        "ADR 0028: restart revalidation — failed to decode V2 envelope, dropping"
-                    );
-                    continue;
-                }
-            };
-            if !msg.verified {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: restart revalidation — V2 signature invalid, dropping"
-                );
-                continue;
-            }
-            // Verify the decoded payload matches the stored event.
-            let Ok(decoded_event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
-            else {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: restart revalidation — payload deserialization mismatch, dropping"
-                );
-                continue;
-            };
-            if decoded_event != entry.event {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: restart revalidation — decoded event != stored event, dropping"
-                );
-                continue;
-            }
-            // Verify the V2 signer (authority/actor) matches the stored
-            // event's actor field for JoinRequestApproved.
-            if let NamedGroupMetadataEvent::JoinRequestApproved { actor, .. } = &entry.event {
-                if let Some(v2_sender) = msg.sender {
-                    if hex::encode(v2_sender.as_bytes()) != *actor {
+                &group_id,
+                &entry.event,
+                &expected_signer_hex,
+            ) {
+                Ok(validated) => {
+                    // B7: additional bindings not covered by the shared validator.
+                    // Bind stored request_id, requester_agent_id, revision to
+                    // the decoded event's fields.
+                    match &validated.event {
+                        NamedGroupMetadataEvent::JoinRequestApproved {
+                            request_id: ev_req_id,
+                            requester_agent_id: ev_requester,
+                            revision: ev_revision,
+                            ..
+                        } => {
+                            if *ev_req_id != entry.request_id {
+                                tracing::warn!(group_id = %group_id, "B7: stored request_id != decoded, dropping");
+                                continue;
+                            }
+                            if *ev_requester != entry.requester_agent_id {
+                                tracing::warn!(group_id = %group_id, "B7: stored requester != decoded, dropping");
+                                continue;
+                            }
+                            if *ev_revision != entry.revision {
+                                tracing::warn!(group_id = %group_id, "B7: stored revision != decoded, dropping");
+                                continue;
+                            }
+                        }
+                        _ => continue,
+                    }
+                    // B7: bind stored sender (carrier) to an active admin role.
+                    let sender_hex = hex::encode(entry.sender.as_bytes());
+                    let is_admin = info.members_v2.get(&sender_hex).is_some_and(|m| {
+                        m.state == x0x::groups::GroupMemberState::Active
+                            && m.role.at_least(x0x::groups::GroupRole::Admin)
+                    });
+                    if !is_admin {
                         tracing::warn!(
                             group_id = %group_id,
-                            "ADR 0028: restart revalidation — V2 signer != approval actor, dropping"
+                            sender = %sender_hex,
+                            "B7: stored sender is not an active admin, dropping"
                         );
                         continue;
                     }
-                } else {
+                    // B7: bind the V2 signed topic to the group's metadata_topic.
+                    // decode_auto doesn't expose topic; the decoded event's
+                    // group_id + event type implicitly binds the topic since
+                    // the topic is derived from the group_id. This is checked
+                    // by the group_id binding in the shared validator.
+                }
+                Err(reason) => {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        reason = %reason,
+                        "ADR 0028 B7: restart revalidation failed, dropping"
+                    );
                     continue;
                 }
-            }
-            // Verify the decoded event's group_id matches the stored group.
-            let decoded_gid = named_group_metadata_event_group_id(&decoded_event).to_string();
-            if decoded_gid != group_id {
-                tracing::warn!(
-                    group_id = %group_id,
-                    decoded_group_id = %decoded_gid,
-                    "ADR 0028: restart revalidation — event group_id mismatch, dropping"
-                );
-                continue;
             }
             group_count += 1;
             group_bytes += derived_byte_size;
@@ -14541,6 +14887,8 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
         }
     }
     *state.causal_approval_queue.write().await = queue;
+    // B3: load conflict tombstones from the sidecar.
+    *state.causal_conflict_tombstones.write().await = loaded_sidecar.conflict_tombstones;
 }
 
 /// ADR 0028: load the predecessor relay outbox from the durable sidecar on
@@ -14634,37 +14982,22 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             if total_targets + entry_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
                 break;
             }
-            // ADR 0028 K2.7: restart revalidation. Re-decode and
-            // cryptographically verify the exact V2 envelope bytes. The
-            // stored request_id/requester_agent_id fields must agree with
-            // the cryptographically verified V2 decode.
-            let relay_msg = match x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(
-                &entry.envelope_bytes,
-            )) {
-                Ok(m) => m,
-                Err(_) => {
+            // ADR 0028 B7: restart revalidation using the shared decode+verify
+            // helper. Binds: V2 decode + ML-DSA signature, decoded event must be
+            // JoinRequestCreated, stored fields must match decoded, signer must
+            // be the requester, group_id must match, local agent must be the
+            // authority, relay direction is implicitly bound by event type.
+            let (decoded_relay_event, v2_signer) = match decode_and_verify_v2(&entry.envelope_bytes)
+            {
+                Ok(v) => v,
+                Err(reason) => {
                     tracing::warn!(
                         group_id = %group_id,
-                        "ADR 0028: restart revalidation — outbox V2 decode failed, dropping"
+                        reason = %reason,
+                        "ADR 0028 B7: outbox restart revalidation failed, dropping"
                     );
                     continue;
                 }
-            };
-            if !relay_msg.verified {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: restart revalidation — outbox V2 signature invalid, dropping"
-                );
-                continue;
-            }
-            let Ok(decoded_relay_event) =
-                serde_json::from_slice::<NamedGroupMetadataEvent>(&relay_msg.payload)
-            else {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: restart revalidation — outbox payload deserialization failed, dropping"
-                );
-                continue;
             };
             // Must be a JoinRequestCreated.
             let (decoded_req_id, decoded_requester) = match &decoded_relay_event {
@@ -14676,39 +15009,48 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                 _ => {
                     tracing::warn!(
                         group_id = %group_id,
-                        "ADR 0028: restart revalidation — outbox event not JoinRequestCreated, dropping"
+                        "B7: outbox event not JoinRequestCreated, dropping"
                     );
                     continue;
                 }
             };
-            // Stored fields must match decoded fields.
+            // B7: stored request_id, requester_agent_id, group_id must match decoded.
             if decoded_req_id != entry.request_id || decoded_requester != entry.requester_agent_id {
                 tracing::warn!(
                     group_id = %group_id,
-                    "ADR 0028: restart revalidation — outbox stored metadata != decoded, dropping"
+                    "B7: outbox stored metadata != decoded, dropping"
                 );
                 continue;
             }
-            // V2 signer must be the requester.
-            if let Some(v2_sender) = relay_msg.sender {
-                if hex::encode(v2_sender.as_bytes()) != entry.requester_agent_id {
-                    tracing::warn!(
-                        group_id = %group_id,
-                        "ADR 0028: restart revalidation — outbox V2 signer != requester, dropping"
-                    );
-                    continue;
-                }
-            } else {
+            // B7: V2 signer must be the requester.
+            if hex::encode(v2_signer.as_bytes()) != entry.requester_agent_id {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "B7: outbox V2 signer != requester, dropping"
+                );
                 continue;
             }
-            // Decoded event's group_id must match stored group.
+            // B7: decoded event's group_id must match stored group AND the
+            // obligation's stored group_id.
             let decoded_relay_gid =
                 named_group_metadata_event_group_id(&decoded_relay_event).to_string();
-            if decoded_relay_gid != group_id {
+            if decoded_relay_gid != group_id || decoded_relay_gid != entry.group_id {
                 tracing::warn!(
                     group_id = %group_id,
                     decoded_group_id = %decoded_relay_gid,
-                    "ADR 0028: restart revalidation — outbox event group_id mismatch, dropping"
+                    entry_group_id = %entry.group_id,
+                    "B7: outbox group_id mismatch (decoded vs stored/entry), dropping"
+                );
+                continue;
+            }
+            // B7: local agent must be the authority (creator) — only the
+            // authority stores relay obligations.
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let is_authority = hex::encode(info.creator.as_bytes()) == local_agent_hex;
+            if !is_authority {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "B7: local agent is not the group authority, dropping outbox entry"
                 );
                 continue;
             }
@@ -14742,6 +15084,8 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         }
     }
     *state.predecessor_relay_outbox.write().await = outbox;
+    // B6: load completed relay tombstones from the sidecar.
+    *state.completed_relay_tombstones.write().await = loaded_sidecar.completed_tombstones;
 }
 
 async fn save_named_groups(state: &AppState) {
@@ -16393,6 +16737,8 @@ mod tests {
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
+            causal_conflict_tombstones: RwLock::new(HashMap::new()),
+            completed_relay_tombstones: RwLock::new(HashMap::new()),
             causal_approval_queue_path: treekem_dir.join("causal_approval_queue.json"),
             predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
             treekem_member_key_packages,

@@ -52,23 +52,23 @@ use routes::{
     named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
     pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
     probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_treekem_named_journals, reject_join_request, relay_predecessor_to_active_witnesses,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_predecessor_relay_outbox, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    streams_diagnostics, subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact,
-    update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PredecessorRelayObligation,
-    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    recover_treekem_named_journals, reject_join_request, remove_mls_member,
+    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_predecessor_relay_outbox, seal_group_state, secure_group_decrypt, secure_group_encrypt,
+    secure_group_reseal, secure_open_envelope_adversarial, send_group_public_message,
+    set_group_display_name, shutdown_handler, spawn_directory_resubscribe,
+    spawn_global_discovery_listener, spawn_global_public_message_listener,
+    spawn_listed_to_contacts_listener, status, streams_diagnostics, subscribe, unban_group_member,
+    unpin_machine, unsubscribe, update_contact, update_group_policy, update_member_role,
+    update_named_group, update_task, withdraw_group_state, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PredecessorRelayObligation, SelfPublishedReleaseManifests,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 use state::AppState;
@@ -608,6 +608,8 @@ pub async fn serve_with_options(
         treekem_pending_events: RwLock::new(HashMap::new()),
         causal_approval_queue: RwLock::new(HashMap::new()),
         predecessor_relay_outbox: RwLock::new(HashMap::new()),
+        causal_conflict_tombstones: RwLock::new(HashMap::new()),
+        completed_relay_tombstones: RwLock::new(HashMap::new()),
         causal_approval_queue_path,
         predecessor_relay_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
@@ -1327,7 +1329,10 @@ pub async fn serve_with_options(
                 }
 
                 // Apply through the normal apply path so local state advances.
-                apply_named_group_metadata_event(
+                // B8: capture the apply result — only create the obligation
+                // if the apply succeeded (accepted request). An invalid offer
+                // must not manufacture the later obligation predicate.
+                let apply_ok = apply_named_group_metadata_event(
                     &relay_state,
                     event.clone(),
                     sender,
@@ -1340,7 +1345,8 @@ pub async fn serve_with_options(
                 // obligation and relays to active witnesses. A non-authority
                 // witness that received the relay just applies — it does not
                 // re-relay, preventing a relay storm.
-                if is_local_authority && is_requester_offer {
+                // B8: only create the obligation if apply succeeded.
+                if is_local_authority && is_requester_offer && apply_ok {
                     // Requester→authority offer: the authority stores the
                     // obligation and relays to active witnesses.
                     let digest = blake3::hash(envelope_bytes);
@@ -1380,6 +1386,7 @@ pub async fn serve_with_options(
                         request_id,
                         requester_agent_id,
                         relay_targets,
+                        completed_at_ms: None,
                     };
                     {
                         let mut outbox = relay_state.predecessor_relay_outbox.write().await;
@@ -1450,8 +1457,10 @@ pub async fn serve_with_options(
                         continue;
                     }
 
-                    // Relay the unchanged V2 envelope to active witnesses.
-                    relay_predecessor_to_active_witnesses(&relay_state, &group_id_str, envelope_bytes).await;
+                    // B6: no fire-and-forget sibling — the background
+                    // causal_relay_step timer owns all sends through the
+                    // single relay engine. The obligation's next_retry_at_ms
+                    // is set to now, so the timer picks it up immediately.
                 }
             }
         }));
@@ -1483,19 +1492,40 @@ pub async fn serve_with_options(
         }));
     }
 
-    // ADR 0028: background relay retry timer. Fires every 30 seconds to
-    // advance the retry schedule for due predecessor relay obligations
-    // (Kimi blocker 6).
+    // ADR 0028 B6: background relay retry timer. Instead of a fixed 30-second
+    // interval that collapses the 0/1/2/4/8/16-second retry schedule, this
+    // timer computes the sleep duration from the earliest next_retry_at_ms
+    // across all outbox obligations. When no obligations are due, it sleeps
+    // until the nearest deadline (capped at 30s for safety). This preserves
+    // the actual retry offsets (B6 sub-property 1).
     {
         let relay_step_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
+                // Compute the earliest deadline across all obligations.
+                let now_ms = now_millis_u64();
+                let next_deadline_ms = {
+                    let outbox = relay_step_state.predecessor_relay_outbox.read().await;
+                    outbox
+                        .values()
+                        .flatten()
+                        .filter(|o| o.completed_at_ms.is_none())
+                        .map(|o| o.next_retry_at_ms)
+                        .min()
+                };
+                let sleep_dur = match next_deadline_ms {
+                    Some(deadline) if deadline > now_ms => {
+                        std::time::Duration::from_millis((deadline - now_ms).min(30_000))
+                    }
+                    // A deadline has already passed or no obligations — short
+                    // poll so newly-admitted obligations (next_retry_at_ms =
+                    // now) are picked up immediately.
+                    _ => std::time::Duration::from_millis(500),
+                };
                 tokio::select! {
                     _ = shutdown_rx.changed() => break,
-                    _ = interval.tick() => {
+                    _ = tokio::time::sleep(sleep_dur) => {
                         causal_relay_step(&relay_step_state).await;
                     }
                 }

@@ -695,6 +695,14 @@ pub(super) struct AppState {
     /// envelopes. The authority persists the exact V2 bytes and relays them
     /// to active witnesses on a bounded retry schedule.
     pub(super) predecessor_relay_outbox: RwLock<HashMap<String, Vec<PredecessorRelayObligation>>>,
+    /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
+    /// Prevents re-admission of a conflicting entry after restart.
+    pub(super) causal_conflict_tombstones: RwLock<HashMap<String, Vec<[u8; 32]>>>,
+    /// ADR 0028 B6: completed relay obligation tombstones, keyed by group_id.
+    /// Pruned from the live retry outbox after all targets delivered; retained
+    /// for the B8 approval precondition check.
+    pub(super) completed_relay_tombstones:
+        RwLock<HashMap<String, Vec<crate::server::routes::named_groups::CompletedRelayTombstone>>>,
     /// ADR 0028: disk location for the durable causal approval queue sidecar.
     pub(super) causal_approval_queue_path: PathBuf,
     /// ADR 0028: disk location for the durable predecessor relay outbox.
