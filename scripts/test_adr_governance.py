@@ -138,16 +138,31 @@ def _init_repo(work: Path) -> None:
     subprocess.run(["git", "commit", "-q", "-m", "base"], cwd=work, check=True)
 
 
-def _run_validator(work: Path) -> tuple[int, str]:
+def _run_validator(
+    work: Path,
+    env_overrides: dict[str, str] | None = None,
+    *,
+    strip: tuple[str, ...] = (
+        "GITHUB_BASE_REF",
+        "GITHUB_BEFORE",
+        "GITHUB_BASE_SHA",
+    ),
+) -> tuple[int, str]:
     """Invoke the production ``adr-governance.py`` from ``work``.
 
-    Returns ``(exit_code, combined_stdout_stderr)``. The GitHub-Actions
-    environment variables that would force a different ``base_ref()`` are
-    stripped so the validator picks the local merge-base path.
+    The default strip removes all GitHub-Actions vars that influence
+    ``base_ref()`` so the validator picks the local merge-base path.
+    Tests that need a different code path (e.g. on-main exercises the
+    ``HEAD^1`` fallback, unresolved-base exercises the fail-closed
+    error) pass ``env_overrides`` to set the vars they want.
+
+    Returns ``(exit_code, combined_stdout_stderr)``.
     """
     env = os.environ.copy()
-    env.pop("GITHUB_BASE_REF", None)
-    env.pop("GITHUB_BEFORE", None)
+    for var in strip:
+        env.pop(var, None)
+    if env_overrides:
+        env.update(env_overrides)
     p = subprocess.run(
         [sys.executable, str(_VALIDATOR_PATH)],
         cwd=work,
@@ -485,10 +500,16 @@ def main() -> int:
 
     # -----------------------------------------------------------------------
     # File-count accuracy: the success message must state what it counts.
-    # ADRs are counted from docs/adr/*.md; groundings from docs/grounding/
-    # *.md whose same-stem ADR exists. Both clauses appear when at least
-    # one grounding is present; the grounding clause is dropped when no
-    # grounding files survive at HEAD.
+    # The contract is:
+    #   ADR governance passed (N ADR file(s) discovered[,
+    #   M ADR(s) structurally validated][, K grounding file(s) paired]).
+    # - N = ADR files discovered under docs/adr/.
+    # - M = ADRs structurally validated (files_to_validate); the clause
+    #   is dropped when M == N.
+    # - K = paired grounding files; the clause is dropped when no
+    #   groundings exist.
+    # These tests assert the exact quantities — discovery and validation
+    # are distinguishable, not rolled into one number.
     # -----------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -507,10 +528,57 @@ def main() -> int:
         )
         subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
         rc, out = _run_validator(work)
+        # Both ADRs land in 'changed' (they don't exist at the placeholder
+        # commit), so n_validated == n_discovered and the validated clause
+        # is dropped. The paired clause is present.
+        expected = (
+            "ADR governance passed "
+            "(2 ADR file(s) discovered, 2 grounding file(s) paired)."
+        )
         results.append(check(
-            "count: success message names 2 ADRs and 2 groundings when both exist",
+            "count: 2 ADRs + 2 groundings reports exact message",
             rc == 0
-            and "2 ADR file(s) and 2 grounding file(s) checked" in out,
+            and expected in out
+            and "ADR(s) structurally validated" not in out,
+        ))
+
+    # Discriminating arm: 3 ADRs on the base commit, 1 of 3 edited on
+    # the branch. The pre-fix message rolled discovery + validation into
+    # one number; the post-fix contract separates them. The validator
+    # must report discovered=3 and validated=1, not 3 in both columns.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        for n in ("0001-a", "0002-b", "0003-c"):
+            (work / "docs" / "adr" / f"{n}.md").write_text(_ADR_PROPOSED)
+            (work / "docs" / "grounding" / f"{n}.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "3 ADRs + 3 groundings on base"],
+            cwd=work,
+            check=True,
+        )
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        # Edit only 1 of 3 ADRs on the branch.
+        edited = _ADR_PROPOSED.replace("Test decision body.", "Edited body.")
+        (work / "docs" / "adr" / "0002-b.md").write_text(edited)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "edit one ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(work)
+        expected = (
+            "ADR governance passed "
+            "(3 ADR file(s) discovered, 1 ADR(s) structurally validated, "
+            "3 grounding file(s) paired)."
+        )
+        results.append(check(
+            "count: 3 ADRs/discovered, 1 changed, reports discovered=3 validated=1",
+            rc == 0 and expected in out,
         ))
 
     # No grounding directory: the success message must drop the grounding
@@ -521,14 +589,135 @@ def main() -> int:
         (work / "docs" / "adr").mkdir(parents=True)
         (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
         subprocess.run(["git", "add", "."], cwd=work, check=True)
-        subprocess.run(["git", "commit", "-q", "-m", "1 ADR only"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR only"], cwd=work, check=True,
+        )
         subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
         rc, out = _run_validator(work)
+        expected = "ADR governance passed (1 ADR file(s) discovered)."
         results.append(check(
-            "count: success message names only ADRs when no grounding dir exists",
+            "count: no grounding dir drops the paired clause",
             rc == 0
-            and "1 ADR file(s) checked" in out
+            and expected in out
             and "grounding" not in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Property 6 — on-main: a mutation on the default branch must be
+    # caught. The pre-fix ``base_ref()`` resolved ``merge-base main HEAD``
+    # to HEAD on main, diffing HEAD...HEAD and returning an empty change
+    # set so the validator passed silently. The fix rejects base == HEAD
+    # and falls back to ``HEAD^1``, which exposes the mutation commit.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # Commit 1: Accepted ADR + grounding on main.
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add accepted ADR on main"],
+            cwd=work,
+            check=True,
+        )
+        # Commit 2 (still on main): mutate both the ADR body and the
+        # grounding. The body change breaks is_template_repair so the
+        # immutability check fires; the grounding is paired with an
+        # Accepted ADR so the grounding check fires too.
+        mutated = _ADR_ACCEPTED.replace(
+            "Test decision body.", "Mutated decision body."
+        )
+        (work / "docs" / "adr" / "0042-test.md").write_text(mutated)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(
+            _GROUNDING + "\nMUTATED: grounding content.\n"
+        )
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "mutate accepted ADR + grounding on main"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "P6 pass: on-main mutation of Accepted ADR + grounding fails closed",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "cannot modify grounding for Accepted ADR "
+            "docs/adr/0042-test.md" in out,
+        ))
+
+    # Discriminating arm — on-main, but the only change is a branch-new
+    # ADR with valid structure. The validator must pass, proving the
+    # P6 failure is gated on the mutation shape and not on the on-main
+    # topology (the HEAD^1 fallback still produces a usable base).
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0050-test.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "branch-new ADR on main"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "P6 fail-arm: on-main branch-new valid ADR passes",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Property 7 — unresolved/invalid base: an event-derived base SHA
+    # that cannot be resolved to a commit must fail closed. The pre-fix
+    # code returned an empty change set and exited 0, silently disabling
+    # every change-specific check.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(
+            work,
+            env_overrides={
+                "GITHUB_BASE_SHA": "deadbeef" * 5,  # 40 hex chars, non-existent
+            },
+        )
+        results.append(check(
+            "P7 pass: invalid GITHUB_BASE_SHA fails closed",
+            rc == 1
+            and "Cannot resolve base ref 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'"
+            in out,
+        ))
+
+    # Discriminating arm — same fixture with a clean base (no env
+    # override, local merge-base). The validator must pass, proving the
+    # P7 failure is gated on the invalid base and not on the fixture.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "P7 fail-arm: clean base passes",
+            rc == 0 and "ADR governance passed" in out,
         ))
 
     failed = results.count(False)
