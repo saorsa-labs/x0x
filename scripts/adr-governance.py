@@ -232,14 +232,14 @@ def changed_files_against_base(base: str, is_push: bool = False) -> list[str] | 
     """
     if is_push:
         try:
-            return run(["git", "diff", "--name-only", f"{base}", "HEAD"]).splitlines()
+            return run(["git", "diff", "--no-renames", "--name-only", f"{base}", "HEAD"]).splitlines()
         except Exception:
             return None
     try:
-        return run(["git", "diff", "--name-only", f"{base}...HEAD"]).splitlines()
+        return run(["git", "diff", "--no-renames", "--name-only", f"{base}...HEAD"]).splitlines()
     except Exception:
         try:
-            return run(["git", "diff", "--name-only", f"{base}", "HEAD"]).splitlines()
+            return run(["git", "diff", "--no-renames", "--name-only", f"{base}", "HEAD"]).splitlines()
         except Exception:
             return None
 
