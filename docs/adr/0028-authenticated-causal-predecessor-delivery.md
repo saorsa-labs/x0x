@@ -1,6 +1,8 @@
 # ADR 0028: Authenticated Causal-Predecessor Delivery
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-08-02, approved by David Irvine at commit
+  `1792c73c6565bfc69414719d3d867adba016ed2d`, recorded as Buzz event
+  `c0cb0e9256ee4997871b472eec95a2e617bae21dc0ce8e7d74412cc7b22a8898`)
 - **Date:** 2026-08-01
 - **Decision owners:** David Irvine
 - **Reviewers:** Sam (author); Dario (independent reviewer); Kimi (independent
