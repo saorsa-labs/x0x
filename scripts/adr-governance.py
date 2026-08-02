@@ -98,48 +98,94 @@ def is_template_repair(old: str, new: str) -> bool:
     return non_heading_lines(old) == non_heading_lines(new)
 
 
+_ZERO_SHA_PREFIX = "0000000"
+
+
+def _is_valid_base(candidate: str, head: str) -> bool:
+    """True when *candidate* is a non-empty, non-zero, non-HEAD SHA."""
+    return (
+        bool(candidate)
+        and not candidate.startswith(_ZERO_SHA_PREFIX)
+        and candidate != head
+    )
+
+
 def base_ref() -> str | None:
     """Return the ref to diff against for ``is_new`` and immutability checks.
+
+    Every candidate is validated against HEAD: a base that equals HEAD
+    always yields an empty diff, so it is rejected and the next selector
+    is tried.  This prevents a push-to-main regression where
+    ``merge-base main HEAD`` resolves to HEAD itself.
 
     Resolution order:
 
     1. ``GITHUB_BASE_REF`` — set on pull requests, points at the target
-       branch.  Using ``origin/{ref}`` captures every commit on the PR
-       branch, so a new ADR added in an early commit and amended later
-       is always treated as ``is_new``.
-    2. ``GITHUB_BEFORE`` — set on push events, points at the previous
-       branch tip before the push.  Correct for multi-commit pushes,
-       unlike ``HEAD^1`` which only sees the immediate parent.
-    3. ``git merge-base <default> HEAD`` — for local runs, find the
+       branch.  ``origin/{ref}`` captures every commit on the PR branch,
+       so a new ADR added in an early commit and amended later is always
+       treated as ``is_new``.
+    2. ``GITHUB_BASE_SHA`` — the exact PR base SHA, supplied by the
+       workflow from ``github.event.pull_request.base.sha``.
+    3. ``GITHUB_BEFORE`` — the previous branch tip on push events,
+       supplied by the workflow from ``github.event.before``.  An
+       all-zero SHA (branch creation / force-push) is rejected.
+    4. ``git merge-base <default> HEAD`` — for local runs, find the
        fork point from ``main`` or ``master`` so the entire branch is
        covered, not just the last commit.
-    4. ``HEAD^1`` — last resort, correct only for single-commit changes.
+    5. ``HEAD^1`` — last resort, correct only for single-commit changes.
     """
-    ref = os.environ.get("GITHUB_BASE_REF")
-    if ref:
-        return f"origin/{ref}"
-    before = os.environ.get("GITHUB_BEFORE")
-    if before:
-        return before
-    for default in ("main", "master", "origin/main", "origin/master"):
-        try:
-            return run(["git", "merge-base", default, "HEAD"])
-        except Exception:
-            continue
     try:
-        return run(["git", "rev-parse", "HEAD^1"])
+        head = run(["git", "rev-parse", "HEAD"])
     except Exception:
         return None
 
+    ref = os.environ.get("GITHUB_BASE_REF")
+    if ref:
+        try:
+            resolved = run(["git", "rev-parse", f"origin/{ref}"])
+            if _is_valid_base(resolved, head):
+                return resolved
+        except Exception:
+            pass
 
-def changed_files_against_base(base: str) -> list[str]:
+    base_sha = os.environ.get("GITHUB_BASE_SHA")
+    if base_sha and _is_valid_base(base_sha, head):
+        return base_sha
+
+    before = os.environ.get("GITHUB_BEFORE")
+    if before and _is_valid_base(before, head):
+        return before
+
+    for default in ("main", "master", "origin/main", "origin/master"):
+        try:
+            mb = run(["git", "merge-base", default, "HEAD"])
+            if _is_valid_base(mb, head):
+                return mb
+        except Exception:
+            continue
+
+    try:
+        parent = run(["git", "rev-parse", "HEAD^1"])
+        if _is_valid_base(parent, head):
+            return parent
+    except Exception:
+        pass
+
+    return None
+
+
+def changed_files_against_base(base: str) -> list[str] | None:
+    """Return changed file paths relative to *base*, or ``None`` when the
+    base cannot be resolved (fail-closed signal so the caller can reject
+    rather than silently treating a broken diff as an empty change set).
+    """
     try:
         return run(["git", "diff", "--name-only", f"{base}...HEAD"]).splitlines()
     except Exception:
         try:
             return run(["git", "diff", "--name-only", f"{base}", "HEAD"]).splitlines()
         except Exception:
-            return []
+            return None
 
 
 def file_at(ref: str, path: str) -> str | None:
@@ -202,7 +248,16 @@ def main() -> int:
             grounding_files.append(path)
 
     base = base_ref()
-    changed = changed_files_against_base(base) if base else []
+    if base:
+        changed = changed_files_against_base(base)
+        if changed is None:
+            errors.append(
+                f"Cannot resolve base ref '{base}'. "
+                f"Change-specific structural and immutability checks cannot run."
+            )
+            changed = []
+    else:
+        changed = []
     changed_adr_paths = {Path(name) for name in changed if ADR_PATH_RE.match(name)}
 
     # Grandfather legacy ADRs when first installing governance. Enforce full
@@ -284,13 +339,14 @@ def main() -> int:
         for e in errors:
             print(f"- {e}")
         return 1
+    n_discovered = len(adr_files)
+    n_validated = len(files_to_validate)
+    parts = [f"{n_discovered} ADR file(s) discovered"]
+    if n_validated != n_discovered:
+        parts.append(f"{n_validated} ADR(s) structurally validated")
     if grounding_files:
-        print(
-            f"ADR governance passed ({len(adr_files)} ADR file(s) "
-            f"and {len(grounding_files)} grounding file(s) checked)."
-        )
-    else:
-        print(f"ADR governance passed ({len(adr_files)} ADR file(s) checked).")
+        parts.append(f"{len(grounding_files)} grounding file(s) paired")
+    print(f"ADR governance passed ({', '.join(parts)}).")
     return 0
 
 if __name__ == "__main__":
