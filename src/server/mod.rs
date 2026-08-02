@@ -26,36 +26,37 @@ use routes::{
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
     agents_by_user_handler, announce_identity, apply_direct_kv_store_delta,
     apply_named_group_metadata_event, apply_upgrade, approve_join_request, ban_group_member,
-    bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request, check_upgrade,
-    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
-    create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
-    create_mls_group, create_mls_welcome, create_named_group, create_task_list, delete_contact,
-    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
-    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
-    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
-    ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics, exec_run,
-    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
-    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
-    get_group_card, get_group_public_messages, get_group_state, get_group_state_commits,
-    get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
-    groups_diagnostics, handle_file_message, handle_join_result_message,
-    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    health, history_diagnostics, history_list, history_purge, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
-    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
-    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
-    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
-    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, relay_predecessor_to_active_witnesses, remove_mls_member,
-    remove_named_group_member, restore_treekem_groups, revoke_contact, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, save_predecessor_relay_outbox,
-    seal_group_state, secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request, causal_relay_step,
+    check_upgrade, connect_agent, connect_diagnostics_handler, connect_machine,
+    connectivity_diagnostics, create_discovery_subscription, create_group_invite,
+    create_join_request, create_kv_store, create_mls_group, create_mls_welcome, create_named_group,
+    create_task_list, delete_contact, delete_discovery_subscription, delete_kv_value,
+    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
+    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
+    discovered_machines, dm_diagnostics, ensure_named_group_listeners, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
+    get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
+    get_named_group_members, gossip_diagnostics, groups_diagnostics, handle_file_message,
+    handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
+    handle_welcome_blob_message, health, history_diagnostics, history_list, history_purge,
+    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
+    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
+    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
+    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
+    list_task_lists, list_tasks, load_causal_approval_queue, load_named_groups,
+    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
+    named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_treekem_named_journals, reject_join_request, relay_predecessor_to_active_witnesses,
+    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
+    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
+    run_startup_update_check, save_predecessor_relay_outbox, seal_group_state,
+    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
     secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
     shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
@@ -63,10 +64,11 @@ use routes::{
     update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
     JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PredecessorRelayObligation,
     SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 use state::AppState;
@@ -681,6 +683,18 @@ pub async fn serve_with_options(
     load_causal_approval_queue(&state).await;
     load_predecessor_relay_outbox(&state).await;
 
+    // ADR 0028: post-restore queue drain — any queued approvals whose
+    // predecessors arrived during downtime can now be drained (Kimi blocker 9).
+    {
+        let queue_groups: Vec<String> = {
+            let queue = state.causal_approval_queue.read().await;
+            queue.keys().cloned().collect()
+        };
+        for group_id in queue_groups {
+            replay_pending_causal_approvals(&state, &group_id).await;
+        }
+    }
+
     // P0-1: subscribe to the global group discovery topic so remote public
     // groups populate the local card cache without manual import.
     bg_tasks.extend(spawn_global_discovery_listener(Arc::clone(&state)).await);
@@ -1201,7 +1215,116 @@ pub async fn serve_with_options(
                     continue;
                 };
 
+                // ADR 0028: reject non-JoinRequestCreated before apply
+                // (Kimi blocker 3 — carrier authorization).
+                if !matches!(event, NamedGroupMetadataEvent::JoinRequestCreated { .. }) {
+                    tracing::warn!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "ADR 0028: predecessor relay envelope is not JoinRequestCreated, rejecting"
+                    );
+                    continue;
+                }
+
                 let group_id_str = named_group_metadata_event_group_id(&event).to_string();
+                let dm_sender_hex = hex::encode(typed.sender.as_bytes());
+                let v2_sender_hex = hex::encode(sender.as_bytes());
+
+                // ADR 0028: carrier authorization + relay direction enforcement
+                // (Kimi blocker 3). Two directions are allowed:
+                //   1. requester→authority offer: carrier == signed requester
+                //      AND local receiver is the current authority (active admin+).
+                //   2. authority→witness relay: carrier is an active admin/authority
+                //      for the group, local receiver is a witness (not authority).
+                // The signed V2 envelope author is always the requester.
+                // Every other combination rejects before ordinary apply.
+                let (requester_agent_id_str, _) = match &event {
+                    NamedGroupMetadataEvent::JoinRequestCreated { request_id, requester_agent_id, .. } => {
+                        (requester_agent_id.clone(), request_id.clone())
+                    }
+                    _ => continue,
+                };
+                if v2_sender_hex != requester_agent_id_str {
+                    tracing::warn!(
+                        v2_sender = %v2_sender_hex,
+                        requester = %requester_agent_id_str,
+                        "ADR 0028: V2 envelope signer does not match JoinRequestCreated requester, rejecting"
+                    );
+                    continue;
+                }
+
+                // Load group info once to determine: local authority status,
+                // metadata topic, group exists/active, carrier role.
+                let (is_local_authority, metadata_topic, carrier_is_admin, group_exists_active) = {
+                    let groups = relay_state.named_groups.read().await;
+                    groups.get(&group_id_str).map(|info| {
+                        let local_is_auth = info
+                            .caller_role(&local_agent_hex)
+                            .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+                        let carrier_admin = info
+                            .caller_role(&dm_sender_hex)
+                            .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+                        let exists_active = !info.withdrawn;
+                        (
+                            local_is_auth,
+                            info.metadata_topic.clone(),
+                            carrier_admin,
+                            exists_active,
+                        )
+                    })
+                    .unwrap_or((false, String::new(), false, false))
+                };
+
+                // ADR 0028: group must exist and be active (Kimi blocker 3).
+                if !group_exists_active {
+                    tracing::warn!(
+                        group_id = %group_id_str,
+                        "ADR 0028: predecessor relay for unknown or withdrawn group, rejecting"
+                    );
+                    continue;
+                }
+
+                // ADR 0028: bind signed V2 topic to the group's metadata topic
+                // exactly — empty topic is a rejection, not a bypass (Kimi
+                // blocker 3).
+                if msg.topic != metadata_topic {
+                    tracing::warn!(
+                        v2_topic = %msg.topic,
+                        expected = %metadata_topic,
+                        "ADR 0028: predecessor relay V2 topic does not match group metadata topic, rejecting"
+                    );
+                    continue;
+                }
+
+                // ADR 0028: direction enforcement (Kimi blocker 3).
+                let is_requester_offer = dm_sender_hex == v2_sender_hex;
+                let is_authority_relay = !is_requester_offer && carrier_is_admin;
+
+                if is_requester_offer && !is_local_authority {
+                    // Requester offered directly to a non-authority witness —
+                    // reject. Only the authority accepts offers.
+                    tracing::warn!(
+                        carrier = %dm_sender_hex,
+                        "ADR 0028: requester offer to non-authority, rejecting"
+                    );
+                    continue;
+                }
+                if is_authority_relay && is_local_authority {
+                    // Authority relaying to itself — reject (authority already
+                    // has the event from its own publish).
+                    tracing::warn!(
+                        carrier = %dm_sender_hex,
+                        "ADR 0028: authority→authority relay, rejecting"
+                    );
+                    continue;
+                }
+                if !is_requester_offer && !is_authority_relay {
+                    // Carrier is neither the requester nor an active admin — reject.
+                    tracing::warn!(
+                        carrier = %dm_sender_hex,
+                        "ADR 0028: predecessor relay carrier is neither requester nor active admin, rejecting"
+                    );
+                    continue;
+                }
 
                 // Apply through the normal apply path so local state advances.
                 apply_named_group_metadata_event(
@@ -1217,15 +1340,11 @@ pub async fn serve_with_options(
                 // obligation and relays to active witnesses. A non-authority
                 // witness that received the relay just applies — it does not
                 // re-relay, preventing a relay storm.
-                let is_authority = {
-                    let groups = relay_state.named_groups.read().await;
-                    groups.get(&group_id_str).is_some_and(|info| {
-                        hex::encode(info.creator.as_bytes()) == local_agent_hex
-                    })
-                };
-
-                if is_authority {
+                if is_local_authority && is_requester_offer {
+                    // Requester→authority offer: the authority stores the
+                    // obligation and relays to active witnesses.
                     let digest = blake3::hash(envelope_bytes);
+                    let digest_bytes: [u8; 32] = digest.into();
                     let byte_size = envelope_bytes.len();
                     let now_ms = now_millis_u64();
                     let (request_id, requester_agent_id) = match &event {
@@ -1262,6 +1381,15 @@ pub async fn serve_with_options(
                     };
                     {
                         let mut outbox = relay_state.predecessor_relay_outbox.write().await;
+                        // Compute daemon-wide caps BEFORE borrowing a specific
+                        // group's outbox mutably (Kimi blocker 7).
+                        let (daemon_count, daemon_bytes, total_targets): (usize, usize, usize) =
+                            outbox
+                                .values()
+                                .flatten()
+                                .fold((0, 0, 0), |(c, b, t), o| {
+                                    (c + 1, b + o.byte_size, t + o.relay_targets.len())
+                                });
                         let group_outbox = outbox.entry(group_id_str.clone()).or_default();
                         // Dedup by digest.
                         if group_outbox.iter().any(|o| o.digest == obligation.digest) {
@@ -1284,10 +1412,41 @@ pub async fn serve_with_options(
                             );
                             continue;
                         }
+                        // ADR 0028: daemon-wide count cap (Kimi blocker 7).
+                        if daemon_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+                            tracing::warn!(
+                                "ADR 0028: predecessor relay outbox at daemon count capacity, rejecting"
+                            );
+                            continue;
+                        }
+                        // ADR 0028: daemon-wide byte cap (Kimi blocker 7).
+                        if daemon_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+                            tracing::warn!(
+                                "ADR 0028: predecessor relay outbox at daemon byte capacity, rejecting"
+                            );
+                            continue;
+                        }
+                        // ADR 0028: 4096 total relay-target cap (Kimi blocker 7).
+                        if total_targets + obligation.relay_targets.len() > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+                            tracing::warn!(
+                                "ADR 0028: predecessor relay outbox at 4096 total relay-target cap, rejecting"
+                            );
+                            continue;
+                        }
                         group_outbox.push(obligation);
                     }
-                    // Persist the relay outbox.
-                    save_predecessor_relay_outbox(&relay_state).await;
+                    // ADR 0028: persist the relay outbox. Roll back on failure
+                    // (Kimi blocker 8).
+                    if let Err(e) = save_predecessor_relay_outbox(&relay_state).await {
+                        tracing::error!(
+                            "ADR 0028: relay outbox save failed after admission, rolling back: {e}"
+                        );
+                        let mut outbox = relay_state.predecessor_relay_outbox.write().await;
+                        if let Some(group_outbox) = outbox.get_mut(&group_id_str) {
+                            group_outbox.retain(|o| o.digest != digest_bytes);
+                        }
+                        continue;
+                    }
 
                     // Relay the unchanged V2 envelope to active witnesses.
                     relay_predecessor_to_active_witnesses(&relay_state, &group_id_str, envelope_bytes).await;
@@ -1318,6 +1477,26 @@ pub async fn serve_with_options(
                     continue;
                 };
                 apply_direct_kv_store_delta(&kv_delta_state, typed.sender, delta_msg).await;
+            }
+        }));
+    }
+
+    // ADR 0028: background relay retry timer. Fires every 30 seconds to
+    // advance the retry schedule for due predecessor relay obligations
+    // (Kimi blocker 6).
+    {
+        let relay_step_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = relay_step_state.shutdown_notify.subscribe();
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = interval.tick() => {
+                        causal_relay_step(&relay_step_state).await;
+                    }
+                }
             }
         }));
     }
