@@ -10,13 +10,27 @@ Enforces:
   not.
 - Status is present and starts with an allowed lifecycle value. Annotations
   after the status are fine, e.g. "Accepted (2026-06-07). Follow-up in ...".
-- Accepted ADRs are immutable after acceptance. If a decision changes, create a
-  new ADR and supersede by reference rather than editing the Accepted ADR.
+- Accepted ADRs are immutable after acceptance. The first commit in the
+  compared history (base..HEAD) where an ADR becomes Accepted establishes
+  the frozen ADR bytes as well as its grounding snapshot. At every later
+  HEAD, the ADR must remain byte-identical to that snapshot; body edits,
+  status rollback (Accepted→Proposed), deletion, and rename fail closed —
+  even when the PR base predates the ADR entirely. If a decision changes,
+  create a new ADR and supersede by reference rather than editing the
+  Accepted ADR.
 - Same-stem grounding files in docs/grounding/ are paired with their ADR by
-  NNNN-short-title stem.  Grounding for an Accepted ADR is frozen: mutation and
-  deletion both fail closed.  Grounding for a Proposed ADR remains amendable.
+  NNNN-short-title stem.  Grounding freezes at the first commit in the compared
+  history (base..HEAD) where the paired ADR is Accepted, or at the base if the
+  ADR is already Accepted there.  The frozen snapshot includes any grounding
+  amendment made in the transition commit.  After freezing, mutation, deletion,
+  rename, and first-time addition all fail closed — even when the PR base
+  predates the ADR entirely.  Grounding for a Proposed ADR remains amendable.
 - The branch/PR base selector ensures a branch-new ADR is treated as ``is_new``
   across amendment commits, so structural checks always run on the final state.
+- The helper ``is_template_repair`` operates on ``str``.  Byte-level comparison
+  of snapshot/HEAD happens in the caller; the helper is only consulted on a
+  byte difference.  Decoding is strict UTF-8 — a non-UTF-8 ADR file surfaces
+  as a governance error rather than silently changing the lifecycle predicate.
 """
 from __future__ import annotations
 
@@ -75,6 +89,12 @@ def non_heading_lines(text: str) -> list[str]:
 def is_template_repair(old: str, new: str) -> bool:
     """True when the only change to an Accepted ADR is editing headings to
     restore previously-missing required template sections.
+
+    Operates on already-decoded ``str`` copies; the caller is responsible
+    for byte-exact comparison of snapshot/HEAD first and only invoking this
+    helper on a confirmed byte difference.  Strict UTF-8 decoding at the
+    call site ensures a non-UTF-8 ADR surfaces as a governance error
+    rather than silently changing the lifecycle predicate.
 
     This narrowly permits fixing a mistitled heading on an already-Accepted
     ADR (e.g. renaming '## Acceptance criteria' to the required
@@ -244,11 +264,56 @@ def changed_files_against_base(base: str, is_push: bool = False) -> list[str] | 
             return None
 
 
-def file_at(ref: str, path: str) -> str | None:
+def file_at(ref: str, path: str) -> bytes | None:
+    """Return the exact raw blob bytes of *path* at *ref*, or ``None``
+    when the path does not exist at that ref.
+
+    Uses ``subprocess.check_output`` without ``text=True`` so that
+    universal-newline translation does NOT normalise CRLF to LF.
+    The immutability and grounding-freeze comparisons are byte-exact.
+
+    Raises on operational failures (e.g. a PATH shim that fails the
+    ``git show`` command) so the caller can surface a governance error
+    rather than silently treating the read as file absence.  Only a
+    genuine git "path does not exist" result maps to ``None``.
+    """
     try:
-        return run(["git", "show", f"{ref}:{path}"])
-    except Exception:
+        return subprocess.check_output(
+            ["git", "show", f"{ref}:{path}"],
+            stderr=subprocess.PIPE,
+        )
+    except subprocess.CalledProcessError as exc:
+        stderr = exc.stderr or b""
+        # Strict UTF-8 decode: if the error message is not valid UTF-8 we
+        # cannot run the absence check, so fall through to re-raise as an
+        # operational error.  This avoids silently masking a real failure
+        # as file absence.
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode("utf-8")
+        # Git has two distinct messages for "path absent at this ref":
+        #   "path '...' does not exist in '...'"
+        #   "path '...' exists on disk, but not in '...'"
+        # Both are legitimate absence — return None so callers treat
+        # the file as not present at that ref.
+        if "does not exist" in stderr or "exists on disk, but not in" in stderr:
+            return None
+        raise
+
+
+def file_at_text(ref: str, path: str) -> str | None:
+    """Like :func:`file_at` but returns a decoded ``str``.
+
+    Decoding is strict UTF-8 — a non-UTF-8 file raises
+    :class:`UnicodeDecodeError` so the caller can surface it as a
+    governance error rather than silently changing a downstream
+    predicate via replacement characters.  Use this only where text
+    parsing (status, section headings) is needed; byte comparisons
+    must use :func:`file_at` directly.
+    """
+    raw = file_at(ref, path)
+    if raw is None:
         return None
+    return raw.decode("utf-8")
 
 
 def adr_status_for_grounding(grounding_name: str, ref: str = "HEAD") -> str | None:
@@ -261,11 +326,114 @@ def adr_status_for_grounding(grounding_name: str, ref: str = "HEAD") -> str | No
     """
     stem = Path(grounding_name).stem
     adr_path = f"docs/adr/{stem}.md"
-    text = file_at(ref, adr_path)
+    text = file_at_text(ref, adr_path)
     if text is None:
         return None
     st = status_of(text)
     return status_token(st) if st else None
+
+
+def _frozen_grounding_snapshot(
+    grounding_name: str, base: str
+) -> tuple[str | None, bytes | None, str | None]:
+    """Return ``(snapshot_commit, snapshot_text, error)`` for the frozen
+    grounding.
+
+    The frozen snapshot is the grounding content at the first commit in the
+    compared history (base..HEAD) where the paired ADR is Accepted, or at
+    *base* if the ADR is already Accepted there.  The snapshot includes any
+    grounding amendment made in the transition commit itself.
+
+    Returns ``(None, None, None)`` when the ADR is never Accepted in the
+    compared history (grounding remains amendable).  *snapshot_text* may be
+    ``None`` when the grounding file did not exist at the snapshot commit
+    (first-time grounding addition after acceptance must fail closed).
+
+    *error* is set when the history scan, a blob read, or the strict
+    UTF-8 decode of the paired ADR's status text fails (e.g. ``git log``
+    raises, a ``git show`` for the snapshot blob is forced to fail by a
+    PATH shim, or the ADR file is not valid UTF-8) so the caller can
+    report a governance error rather than silently treating the grounding
+    as amendable or advancing to a later, already-mutated snapshot.
+    """
+    try:
+        # Fast path: ADR is already Accepted at the comparison base.
+        if adr_status_for_grounding(grounding_name, base) == "Accepted":
+            return (base, file_at(base, grounding_name), None)
+
+        # Walk base..HEAD in chronological order to locate the transition.
+        commits = run(
+            ["git", "log", "--reverse", "--format=%H", f"{base}..HEAD"]
+        ).splitlines()
+
+        for commit in commits:
+            if adr_status_for_grounding(grounding_name, commit) == "Accepted":
+                return (commit, file_at(commit, grounding_name), None)
+
+        return (None, None, None)
+    except Exception as exc:
+        return (None, None, f"Failed to scan history for {grounding_name}: {exc}")
+
+
+def _frozen_adr_snapshot(
+    adr_name: str, base: str
+) -> tuple[str | None, bytes | None, str | None]:
+    """Return ``(snapshot_commit, snapshot_text, error)`` for the frozen
+    ADR bytes.
+
+    The frozen snapshot is the ADR content at the first commit in the
+    compared history (base..HEAD) where the ADR is Accepted, or at *base*
+    if the ADR is already Accepted there.  The snapshot includes any body
+    or status change made in the transition commit itself.
+
+    Returns ``(None, None, None)`` when the ADR is never Accepted in the
+    compared history (amendable).  *error* is set when the history scan,
+    a blob read, or the strict UTF-8 decode of the status text fails
+    (e.g. ``git log`` raises, a ``git show`` for the snapshot blob is
+    forced to fail by a PATH shim, or the ADR file is not valid UTF-8)
+    so the caller can report a governance error rather than silently
+    treating the ADR as amendable or advancing to a later,
+    already-mutated snapshot.
+    """
+    try:
+        # Fast path: ADR is already Accepted at the comparison base.
+        adr_bytes = file_at(base, adr_name)
+        if adr_bytes is not None:
+            try:
+                adr_text = adr_bytes.decode("utf-8")
+            except UnicodeDecodeError as exc:
+                return (
+                    None,
+                    None,
+                    f"Failed to scan history for {adr_name}: not valid UTF-8 ({exc})",
+                )
+            st = status_of(adr_text)
+            if st and status_token(st) == "Accepted":
+                return (base, adr_bytes, None)
+
+        # Walk base..HEAD in chronological order to locate the transition.
+        commits = run(
+            ["git", "log", "--reverse", "--format=%H", f"{base}..HEAD"]
+        ).splitlines()
+
+        for commit in commits:
+            raw = file_at(commit, adr_name)
+            if raw is not None:
+                try:
+                    raw_text = raw.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    return (
+                        None,
+                        None,
+                        f"Failed to scan history for {adr_name}: not valid UTF-8 ({exc})",
+                    )
+                st = status_of(raw_text)
+                if st and status_token(st) == "Accepted":
+                    return (commit, raw, None)
+
+        return (None, None, None)
+    except Exception as exc:
+        return (None, None, f"Failed to scan history for {adr_name}: {exc}")
 
 
 def main() -> int:
@@ -346,7 +514,11 @@ def main() -> int:
         # Full template structure is required for ADRs new in this change.
         # Edited pre-existing ADRs keep their original structure (the
         # immutability check below still guards Accepted ones).
-        is_new = base is not None and file_at(base, path.as_posix()) is None
+        try:
+            is_new = base is not None and file_at(base, path.as_posix()) is None
+        except Exception as exc:
+            errors.append(f"Failed to read {path.as_posix()} at base {base}: {exc}")
+            continue
         if is_new:
             n_structurally_validated += 1
             for section in REQUIRED_SECTIONS:
@@ -354,48 +526,268 @@ def main() -> int:
                     errors.append(f"{path}: missing required section '## {section}'")
 
     if base:
+        # Accepted-ADR immutability: for every ADR at HEAD, derive the frozen
+        # ADR snapshot (first Accepted commit in base..HEAD, or base if
+        # already Accepted there).  HEAD must be byte-identical to the
+        # frozen snapshot.  Body edits, status rollback (Accepted→Proposed),
+        # deletion, and rename all fail closed — even when the PR base
+        # predates the ADR entirely.  The legitimate Proposed→Accepted
+        # commit passes because it creates the snapshot.
+        #
+        # The check is unconditional: for every ADR at HEAD, derive its
+        # frozen snapshot and compare HEAD directly to that snapshot
+        # regardless of membership in `changed`.  The old base-relative
+        # lookup (`old = file_at(base, name)`) missed ADRs that transitioned
+        # to Accepted within the branch, because the base predates the ADR
+        # and `file_at(base, name)` returns None.
+        for adr_path in adr_files:
+            adr_name = adr_path.as_posix()
+            snapshot_commit, snapshot_text, snap_error = _frozen_adr_snapshot(
+                adr_name, base
+            )
+            if snap_error is not None:
+                errors.append(snap_error)
+                continue
+            if snapshot_commit is None:
+                # ADR is never Accepted in the compared history → amendable.
+                continue
+            try:
+                head_text = file_at("HEAD", adr_name)
+            except Exception as exc:
+                errors.append(f"Failed to read {adr_name} at HEAD: {exc}")
+                continue
+            if head_text is None:
+                # ADR exists on disk but not at HEAD?  Should not happen for
+                # files in adr_files, but fail closed if it does.
+                errors.append(
+                    f"{adr_name}: Accepted ADRs are immutable and cannot be deleted. "
+                    f"Create a new superseding ADR instead."
+                )
+                continue
+            if head_text != snapshot_text:
+                # Byte diff: decode strict UTF-8 copies and let
+                # ``is_template_repair`` adjudicate.  A decode failure here
+                # is itself a governance violation: a non-UTF-8 ADR file
+                # cannot be evaluated against the lifecycle predicate, so
+                # surface the failure and skip the template-repair check.
+                try:
+                    snapshot_text_str = snapshot_text.decode("utf-8")
+                    head_text_str = head_text.decode("utf-8")
+                except UnicodeDecodeError as exc:
+                    errors.append(
+                        f"{adr_name}: Accepted ADR is not valid UTF-8 ({exc}). "
+                        f"Accepted ADRs are immutable and cannot be edited."
+                    )
+                    continue
+                if is_template_repair(snapshot_text_str, head_text_str):
+                    # Heading-only repair restoring a missing required
+                    # section; allowed without superseding.
+                    continue
+                errors.append(
+                    f"{adr_name}: Accepted ADRs are immutable. "
+                    f"Create a new superseding ADR instead of editing this file."
+                )
+
+        # Supplementary pass: catch ADRs that were Accepted at some point in
+        # the compared history but are deleted at HEAD (absent from
+        # `adr_files`).  These appear in `changed` as deleted ADR paths.
+        checked_adr_stems = {p.stem for p in adr_files}
         for name in changed:
             if not ADR_PATH_RE.match(name):
                 continue
-            old = file_at(base, name)
-            if old is None:
+            if Path(name).stem in checked_adr_stems:
+                continue  # ADR exists at HEAD, already checked above
+            snapshot_commit, _snapshot_text, snap_error = _frozen_adr_snapshot(
+                name, base
+            )
+            if snap_error is not None:
+                errors.append(snap_error)
                 continue
-            old_status = status_of(old)
-            if old_status and status_token(old_status) == "Accepted":
-                new = file_at("HEAD", name)
-                if new is not None and is_template_repair(old, new):
-                    # Heading-only repair restoring a missing required
-                    # section; allowed without superseding. See is_template_repair.
-                    continue
+            if snapshot_commit is None:
+                continue  # Never Accepted, no immutability violation
+            errors.append(
+                f"{name}: Accepted ADRs are immutable and cannot be deleted. "
+                f"Create a new superseding ADR instead."
+            )
+
+        # Grounding file protection: freeze grounding at the first commit in
+        # the compared history (base..HEAD) where the paired ADR is Accepted,
+        # or at the base if the ADR is already Accepted there.  The frozen
+        # snapshot includes any grounding amendment made in the transition
+        # commit.  After freezing, mutation, deletion, rename, and first-time
+        # addition all fail closed — even when the PR base predates the ADR
+        # entirely.  Grounding for a Proposed ADR remains amendable.
+        #
+        # The check is driven from the history scan, not from HEAD status:
+        # for every ADR at HEAD (regardless of its current status), derive
+        # its same-stem grounding path and frozen snapshot.  If the ADR was
+        # Accepted at any commit in base..HEAD (or at base), the grounding is
+        # frozen and HEAD must match the snapshot.  This catches status
+        # rollback (Accepted→Proposed): the ADR is still in the frozen set
+        # because it was Accepted in history, even though it is Proposed at
+        # HEAD.  Membership in `changed` (which is relative to the comparison
+        # base, not the acceptance snapshot) must NOT be the selector.
+        for adr_path in adr_files:
+            stem = adr_path.stem
+            gname = f"docs/grounding/{stem}.md"
+            snapshot_commit, snapshot_text, snap_error = _frozen_grounding_snapshot(gname, base)
+            if snap_error is not None:
+                errors.append(snap_error)
+                continue
+            if snapshot_commit is None:
+                # ADR is never Accepted in the compared history → amendable.
+                continue
+            try:
+                head_grounding = file_at("HEAD", gname)
+            except Exception as exc:
+                errors.append(f"Failed to read {gname} at HEAD: {exc}")
+                continue
+            adr_ref = f"docs/adr/{stem}.md"
+            if snapshot_text is None and head_grounding is None:
+                # No grounding existed at the snapshot and none exists now —
+                # the ADR predates the grounding convention.  Not a violation.
+                continue
+            elif head_grounding is None:
                 errors.append(
-                    f"{name}: Accepted ADRs are immutable. Create a new superseding ADR instead of editing this file."
+                    f"{gname}: cannot delete grounding for Accepted ADR "
+                    f"{adr_ref}. "
+                    f"Grounding files freeze with ADR acceptance."
+                )
+            elif snapshot_text is None:
+                # Grounding did not exist at the acceptance commit but exists
+                # at HEAD — first-time addition after acceptance.
+                errors.append(
+                    f"{gname}: cannot add grounding for Accepted ADR "
+                    f"{adr_ref} after acceptance. "
+                    f"Grounding files freeze with ADR acceptance."
+                )
+            elif head_grounding != snapshot_text:
+                errors.append(
+                    f"{gname}: cannot modify grounding for Accepted ADR "
+                    f"{adr_ref}. "
+                    f"Grounding files freeze with ADR acceptance."
                 )
 
-        # Grounding file protection: a grounding file paired with an Accepted
-        # ADR is frozen — mutation and deletion both fail closed.  Grounding
-        # for a Proposed ADR remains amendable.
+        # Supplementary pass: catch grounding files for ADRs that were
+        # Accepted at the base but deleted at HEAD (so they are absent from
+        # `adr_files` and the unconditional loop above misses them).  These
+        # appear in `changed` as deleted grounding paths.
+        checked_stems = {p.stem for p in adr_files}
         for name in changed:
             if not GROUNDING_PATH_RE.match(name):
                 continue
-            adr_status = adr_status_for_grounding(name, "HEAD")
-            if adr_status is None:
-                # ADR might have been deleted in this change; check the base.
-                adr_status = adr_status_for_grounding(name, base)
-            if adr_status != "Accepted":
+            if Path(name).stem in checked_stems:
                 continue
-            new_grounding = file_at("HEAD", name)
-            if new_grounding is None:
+            snapshot_commit, snapshot_text, snap_error = _frozen_grounding_snapshot(name, base)
+            if snap_error is not None:
+                errors.append(snap_error)
+                continue
+            if snapshot_commit is None:
+                continue
+            try:
+                head_grounding = file_at("HEAD", name)
+            except Exception as exc:
+                errors.append(f"Failed to read {name} at HEAD: {exc}")
+                continue
+            adr_ref = f"docs/adr/{Path(name).stem}.md"
+            if snapshot_text is None and head_grounding is None:
+                continue
+            elif head_grounding is None and snapshot_text is not None:
                 errors.append(
                     f"{name}: cannot delete grounding for Accepted ADR "
-                    f"docs/adr/{Path(name).stem}.md. "
+                    f"{adr_ref}. "
                     f"Grounding files freeze with ADR acceptance."
                 )
-            else:
+            elif head_grounding is not None and snapshot_text is None:
+                errors.append(
+                    f"{name}: cannot add grounding for Accepted ADR "
+                    f"{adr_ref} after acceptance. "
+                    f"Grounding files freeze with ADR acceptance."
+                )
+            elif head_grounding is not None and snapshot_text is not None and head_grounding != snapshot_text:
                 errors.append(
                     f"{name}: cannot modify grounding for Accepted ADR "
-                    f"docs/adr/{Path(name).stem}.md. "
+                    f"{adr_ref}. "
                     f"Grounding files freeze with ADR acceptance."
                 )
+
+        # History-driven discovery pass: catch ADRs and groundings that were
+        # ever added in base..HEAD (and thus may have been Accepted) but are
+        # absent from both `adr_files` (not at HEAD) and `changed` (net-zero:
+        # added and deleted within the branch produces no net diff entry).
+        # Without this pass, a branch-new directly-Accepted ADR that is later
+        # deleted passes undetected.  `git log --diff-filter=A` finds every
+        # file added in any commit in the range, regardless of later deletion.
+        all_checked_stems = {p.stem for p in adr_files}
+        # Also include stems already checked via the changed-based passes
+        for name in changed:
+            if ADR_PATH_RE.match(name) or GROUNDING_PATH_RE.match(name):
+                all_checked_stems.add(Path(name).stem)
+
+        try:
+            ever_added = run([
+                "git", "log", "--no-renames", "--diff-filter=A",
+                "--name-only", "--format=", f"{base}..HEAD"
+            ]).splitlines()
+        except Exception as exc:
+            errors.append(
+                f"Failed to scan history for added ADR/grounding files: {exc}"
+            )
+            ever_added = []
+
+        for name in ever_added:
+            if ADR_PATH_RE.match(name):
+                if Path(name).stem in all_checked_stems:
+                    continue  # Already checked above
+                snapshot_commit, _snapshot_text, snap_error = _frozen_adr_snapshot(
+                    name, base
+                )
+                if snap_error is not None:
+                    errors.append(snap_error)
+                    continue
+                if snapshot_commit is None:
+                    continue  # Never Accepted
+                errors.append(
+                    f"{name}: Accepted ADRs are immutable and cannot be deleted. "
+                    f"Create a new superseding ADR instead."
+                )
+            elif GROUNDING_PATH_RE.match(name):
+                if Path(name).stem in all_checked_stems:
+                    continue  # Already checked above
+                snapshot_commit, snapshot_text, snap_error = _frozen_grounding_snapshot(
+                    name, base
+                )
+                if snap_error is not None:
+                    errors.append(snap_error)
+                    continue
+                if snapshot_commit is None:
+                    continue  # Paired ADR never Accepted
+                try:
+                    head_grounding = file_at("HEAD", name)
+                except Exception as exc:
+                    errors.append(f"Failed to read {name} at HEAD: {exc}")
+                    continue
+                adr_ref = f"docs/adr/{Path(name).stem}.md"
+                if snapshot_text is None and head_grounding is None:
+                    continue
+                elif head_grounding is None and snapshot_text is not None:
+                    errors.append(
+                        f"{name}: cannot delete grounding for Accepted ADR "
+                        f"{adr_ref}. "
+                        f"Grounding files freeze with ADR acceptance."
+                    )
+                elif head_grounding is not None and snapshot_text is None:
+                    errors.append(
+                        f"{name}: cannot add grounding for Accepted ADR "
+                        f"{adr_ref} after acceptance. "
+                        f"Grounding files freeze with ADR acceptance."
+                    )
+                elif head_grounding is not None and snapshot_text is not None and head_grounding != snapshot_text:
+                    errors.append(
+                        f"{name}: cannot modify grounding for Accepted ADR "
+                        f"{adr_ref}. "
+                        f"Grounding files freeze with ADR acceptance."
+                    )
 
     if errors:
         print("ADR governance failed:")
