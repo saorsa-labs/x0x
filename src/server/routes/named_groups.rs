@@ -406,7 +406,7 @@ pub(in crate::server) struct AddNamedGroupMemberRequest {
     treekem_key_package_b64: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub(in crate::server) struct WelcomeRef {
     welcome_id: String,
     byte_len: u64,
@@ -682,6 +682,7 @@ pub(in crate::server) enum WelcomeBlobMessage {
 // wire format breaks; the in-memory size delta is irrelevant compared
 // to the gossip plumbing cost.
 #[allow(clippy::large_enum_variant)]
+#[derive(PartialEq)]
 pub(in crate::server) enum NamedGroupMetadataEvent {
     MemberAdded {
         group_id: String,
@@ -4326,8 +4327,10 @@ async fn try_queue_causal_approval(
             };
             // commit.committed_by == actor (Kimi blocker 4).
             let actor_ok = commit.committed_by == *actor;
-            // Commit must have a non-empty state_hash and signature.
-            let structure_ok = !commit.state_hash.is_empty() && !commit.signature.is_empty();
+            // Cryptographic structure validation: verify_structure checks
+            // state_hash recomputation, ML-DSA signature, signer→committed_by
+            // binding (audit 2 — not just non-empty string proxy).
+            let structure_ok = commit.verify_structure().is_ok();
             (actor_ok && structure_ok, actor.clone())
         }
         _ => return,
@@ -4484,6 +4487,13 @@ async fn try_queue_causal_approval(
                 }
             }
             state.groups_diagnostics.record_causal_conflicted(group_id);
+            // ADR 0028: persist the conflict transition durably before
+            // returning. If persistence fails, the unmarked entry could
+            // apply after restart (audit 3).
+            drop(queue_lock);
+            if let Err(e) = save_causal_approval_queue(state).await {
+                tracing::error!("ADR 0028: failed to persist conflict marking: {e}");
+            }
             return;
         }
 
@@ -4587,16 +4597,22 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             );
             continue;
         }
-        // ADR 0028: crash-recovery exactly-once. If the approval's request
-        // already has a non-Pending status, the approval was already applied
-        // (or superseded) — record and remove WITHOUT a second mutation
-        // (Kimi blocker 10).
+        // ADR 0028: crash-recovery exactly-once. The exact proof is that
+        // the queued approval commit's state_hash equals the durable current
+        // group state_hash with the same request/requester/revision binding
+        // (audit 4 — NOT just "request status != Pending", which would
+        // falsely match denied/rejected/superseded requests).
         let already_current = {
             let groups = state.named_groups.read().await;
             groups.get(group_id).is_some_and(|info| {
-                info.join_requests
-                    .get(&pending.request_id)
-                    .is_some_and(|r| r.status != x0x::groups::JoinRequestStatus::Pending)
+                // The approval's commit state_hash must match the current
+                // group's state_hash exactly.
+                match &pending.event {
+                    NamedGroupMetadataEvent::JoinRequestApproved {
+                        commit: Some(c), ..
+                    } => info.state_hash == c.state_hash,
+                    _ => false,
+                }
             })
         };
         if already_current {
@@ -4623,13 +4639,28 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         .await;
 
         if applied {
-            tracing::info!(
-                group_id = %LogHexId::group(group_id),
-                request_id = %pending.request_id,
-                "ADR 0028: queued approval drained and applied"
-            );
-            state.groups_diagnostics.record_causal_applied(group_id);
-            continue;
+            // ADR 0028: persist-before-remove (audit 5). The inner apply
+            // called save_named_groups, but we must verify durability here.
+            // If group persistence failed, retain the queue entry so a
+            // crash doesn't lose the approval.
+            let group_persisted = save_named_groups_checked(state).await.is_ok();
+            if group_persisted {
+                tracing::info!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0028: queued approval drained and applied (group state durable)"
+                );
+                state.groups_diagnostics.record_causal_applied(group_id);
+                continue;
+            } else {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0028: group persistence failed, retaining queue entry"
+                );
+                still_pending.push_back(pending);
+                continue;
+            }
         }
 
         // Not applied — retain if still within expiry and group is live.
@@ -7629,14 +7660,23 @@ pub(in crate::server) async fn relay_predecessor_to_active_witnesses(
 }
 
 /// ADR 0028: finite relay retry step. Advances the retry schedule for all
-/// outbox obligations whose `next_retry_at_ms` has elapsed. Relays to
-/// remaining targets, advances `retry_count`/`next_retry_at_ms`, prunes
-/// obligations that have exhausted the retry schedule, and calls
-/// `record_causal_relayed` per successful relay attempt (Kimi blocker 6).
+/// outbox obligations whose `next_retry_at_ms` has elapsed. Relays to each
+/// stored target, observes the send result, removes successful targets,
+/// counts `record_causal_relayed` only on real success, advances
+/// `retry_count`/`next_retry_at_ms`, prunes obligations that have exhausted
+/// the retry schedule or have no remaining targets, and persists remaining
+/// state (audit 6).
 pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     let now_ms = now_millis_u64();
-    let mut to_relay: Vec<(String, Vec<u8>)> = Vec::new();
-    let mut to_prune: Vec<(String, [u8; 32])> = Vec::new();
+    // Collect due obligations (group_id, digest, envelope bytes, targets).
+    /// Due obligation payload for relay.
+    struct DueObligation {
+        group_id: String,
+        digest: [u8; 32],
+        envelope_bytes: Vec<u8>,
+        targets: Vec<String>,
+    }
+    let mut due: Vec<DueObligation> = Vec::new();
 
     {
         let mut outbox = state.predecessor_relay_outbox.write().await;
@@ -7645,36 +7685,91 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 if now_ms < obligation.next_retry_at_ms {
                     continue;
                 }
-                // Exhausted retry schedule — prune (terminal).
+                // Exhausted retry schedule — skip (will be pruned below).
                 if obligation.retry_count as usize >= CAUSAL_RELAY_RETRY_SECS.len() {
-                    to_prune.push((group_id.clone(), obligation.digest));
                     continue;
                 }
-                // Relay to remaining targets.
-                to_relay.push((group_id.clone(), obligation.envelope_bytes.clone()));
-                state.groups_diagnostics.record_causal_relayed(group_id);
-
-                // Advance retry state.
-                obligation.retry_count = obligation.retry_count.saturating_add(1);
-                let delay_secs = CAUSAL_RELAY_RETRY_SECS[(obligation.retry_count as usize)
-                    .saturating_sub(1)
-                    .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
-                obligation.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
+                // All targets delivered — skip (retain for K2.8 obligation
+                // check, but no relay work to do).
+                if obligation.relay_targets.is_empty() {
+                    continue;
+                }
+                due.push(DueObligation {
+                    group_id: group_id.clone(),
+                    digest: obligation.digest,
+                    envelope_bytes: obligation.envelope_bytes.clone(),
+                    targets: obligation.relay_targets.clone(),
+                });
             }
         }
-        // Prune exhausted obligations.
-        for (group_id, digest) in &to_prune {
-            if let Some(obligations) = outbox.get_mut(group_id) {
-                obligations.retain(|o| o.digest != *digest);
-            }
-        }
-        // Clean up empty group entries.
-        outbox.retain(|_, obligations| !obligations.is_empty());
     }
 
-    // Fire-and-forget relay to active witnesses for each due obligation.
-    for (group_id, envelope_bytes) in to_relay {
-        relay_predecessor_to_active_witnesses(state, &group_id, &envelope_bytes).await;
+    if due.is_empty() {
+        return;
+    }
+
+    // Relay to each target and observe results per obligation (audit 6).
+    for due_obl in &due {
+        let group_id = &due_obl.group_id;
+        let digest = &due_obl.digest;
+        let envelope_bytes = &due_obl.envelope_bytes;
+        let targets = &due_obl.targets;
+        let mut remaining_targets: Vec<String> = Vec::new();
+
+        for target_hex in targets {
+            let Ok(target_id) = parse_agent_id_hex(target_hex) else {
+                continue;
+            };
+            let mut dm_payload =
+                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len());
+            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+            dm_payload.extend_from_slice(envelope_bytes);
+            // ADR 0028: await the send result and count only on success.
+            let send_result = state
+                .agent
+                .send_direct_with_config(
+                    &target_id,
+                    dm_payload,
+                    named_group_direct_delivery_config(),
+                )
+                .await;
+            if send_result.is_ok() {
+                state.groups_diagnostics.record_causal_relayed(group_id);
+            } else {
+                // Failed — retain this target for next retry.
+                remaining_targets.push(target_hex.clone());
+            }
+        }
+
+        // Update the obligation: advance retry state, update remaining targets.
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        if let Some(obligations) = outbox.get_mut(group_id) {
+            for obligation in obligations.iter_mut() {
+                if obligation.digest == *digest {
+                    obligation.retry_count = obligation.retry_count.saturating_add(1);
+                    let delay_secs = CAUSAL_RELAY_RETRY_SECS[(obligation.retry_count as usize)
+                        .saturating_sub(1)
+                        .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
+                    obligation.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
+                    obligation.relay_targets = remaining_targets.clone();
+                    break;
+                }
+            }
+            // Prune only obligations with exhausted retry schedule. Obligations
+            // with empty relay_targets (all delivered) are RETAINED for the
+            // retention period so the approve path (K2.8) can verify the
+            // predecessor obligation was durably recorded. The loader drops
+            // expired entries on restart.
+            obligations.retain(|o| {
+                o.digest != *digest || (o.retry_count as usize) < CAUSAL_RELAY_RETRY_SECS.len()
+            });
+        }
+    }
+
+    // Clean up empty group entries.
+    {
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        outbox.retain(|_, obligations| !obligations.is_empty());
     }
 
     // Persist the outbox after the step.
@@ -11957,6 +12052,9 @@ pub(in crate::server) async fn approve_join_request(
     }
     save_mls_groups(&state).await;
 
+    // ADR 0028 K2.8: keep a copy of request_id for the predecessor
+    // obligation check below (the event moves it).
+    let obligation_request_id = request_id.clone();
     let event = NamedGroupMetadataEvent::JoinRequestApproved {
         group_id: event_group_id,
         request_id,
@@ -11971,6 +12069,80 @@ pub(in crate::server) async fn approve_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+
+    // ADR 0028 K2.8: require a durable predecessor obligation exists before
+    // fan-out. The authority must have received and durably recorded the
+    // JoinRequestCreated predecessor envelope. If no obligation exists for
+    // this group+request, the predecessor was never received — refuse the
+    // approval so the requester can retry. (Kimi audit 8.)
+    {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        let obligation_exists = outbox.get(&id).is_some_and(|obligations| {
+            obligations
+                .iter()
+                .any(|o| o.request_id == obligation_request_id)
+        });
+        if !obligation_exists {
+            tracing::warn!(
+                group_id = %LogHexId::group(&id),
+                request_id = %obligation_request_id,
+                "ADR 0028: refusing approval — no durable predecessor obligation for this request"
+            );
+            return api_error(
+                StatusCode::PRECONDITION_FAILED,
+                "predecessor obligation not found — JoinRequestCreated not yet received",
+            );
+        }
+    }
+
+    // ADR 0028 K2.8: refresh the post-approval active witness target set in
+    // the predecessor obligation. After approval, the requester is now an
+    // active member — the target set should reflect the current active
+    // membership so any pending relay retries include the new member.
+    {
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let post_approval_targets: Vec<String> = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&id)
+                .map(|info| {
+                    info.members_v2
+                        .iter()
+                        .filter(|(mid, m)| {
+                            m.state == x0x::groups::GroupMemberState::Active
+                                && **mid != local_agent_hex
+                        })
+                        .map(|(mid, _)| mid.clone())
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        if let Some(obligations) = outbox.get_mut(&id) {
+            for obligation in obligations.iter_mut() {
+                if obligation.request_id == obligation_request_id {
+                    // Refresh targets: union of remaining targets and new
+                    // post-approval active members, deduplicated.
+                    let mut refreshed: Vec<String> = obligation.relay_targets.clone();
+                    for t in &post_approval_targets {
+                        if !refreshed.contains(t) {
+                            refreshed.push(t.clone());
+                        }
+                    }
+                    obligation.relay_targets = refreshed;
+                    break;
+                }
+            }
+        }
+    }
+    // Persist the refreshed outbox.
+    if let Err(e) = save_predecessor_relay_outbox(&state).await {
+        tracing::error!(
+            group_id = %LogHexId::group(&id),
+            "ADR 0028: failed to persist refreshed predecessor outbox after approval: {e}"
+        );
+    }
+
     // Direct + delayed delivery of the signed JoinRequestApproved to every
     // non-local active member (the already-present witnesses) AND the new
     // requester. Before this, the non-TreeKEM approval delivered only to the
@@ -14288,6 +14460,70 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
                 break;
             }
+            // ADR 0028 K2.7: restart revalidation. Re-decode and
+            // cryptographically verify the exact V2 envelope bytes. The
+            // stored event/sender fields are NOT trusted — they must agree
+            // with the cryptographically verified V2 decode.
+            let msg = match x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(
+                &entry.envelope_bytes,
+            )) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        "ADR 0028: restart revalidation — failed to decode V2 envelope, dropping"
+                    );
+                    continue;
+                }
+            };
+            if !msg.verified {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — V2 signature invalid, dropping"
+                );
+                continue;
+            }
+            // Verify the decoded payload matches the stored event.
+            let Ok(decoded_event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+            else {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — payload deserialization mismatch, dropping"
+                );
+                continue;
+            };
+            if decoded_event != entry.event {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — decoded event != stored event, dropping"
+                );
+                continue;
+            }
+            // Verify the V2 signer (authority/actor) matches the stored
+            // event's actor field for JoinRequestApproved.
+            if let NamedGroupMetadataEvent::JoinRequestApproved { actor, .. } = &entry.event {
+                if let Some(v2_sender) = msg.sender {
+                    if hex::encode(v2_sender.as_bytes()) != *actor {
+                        tracing::warn!(
+                            group_id = %group_id,
+                            "ADR 0028: restart revalidation — V2 signer != approval actor, dropping"
+                        );
+                        continue;
+                    }
+                } else {
+                    continue;
+                }
+            }
+            // Verify the decoded event's group_id matches the stored group.
+            let decoded_gid = named_group_metadata_event_group_id(&decoded_event).to_string();
+            if decoded_gid != group_id {
+                tracing::warn!(
+                    group_id = %group_id,
+                    decoded_group_id = %decoded_gid,
+                    "ADR 0028: restart revalidation — event group_id mismatch, dropping"
+                );
+                continue;
+            }
             group_count += 1;
             group_bytes += derived_byte_size;
             total_count += 1;
@@ -14398,14 +14634,107 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             if total_targets + entry_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
                 break;
             }
+            // ADR 0028 K2.7: restart revalidation. Re-decode and
+            // cryptographically verify the exact V2 envelope bytes. The
+            // stored request_id/requester_agent_id fields must agree with
+            // the cryptographically verified V2 decode.
+            let relay_msg = match x0x::gossip::pubsub::decode_auto(bytes::Bytes::copy_from_slice(
+                &entry.envelope_bytes,
+            )) {
+                Ok(m) => m,
+                Err(_) => {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        "ADR 0028: restart revalidation — outbox V2 decode failed, dropping"
+                    );
+                    continue;
+                }
+            };
+            if !relay_msg.verified {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — outbox V2 signature invalid, dropping"
+                );
+                continue;
+            }
+            let Ok(decoded_relay_event) =
+                serde_json::from_slice::<NamedGroupMetadataEvent>(&relay_msg.payload)
+            else {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — outbox payload deserialization failed, dropping"
+                );
+                continue;
+            };
+            // Must be a JoinRequestCreated.
+            let (decoded_req_id, decoded_requester) = match &decoded_relay_event {
+                NamedGroupMetadataEvent::JoinRequestCreated {
+                    request_id,
+                    requester_agent_id,
+                    ..
+                } => (request_id.clone(), requester_agent_id.clone()),
+                _ => {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        "ADR 0028: restart revalidation — outbox event not JoinRequestCreated, dropping"
+                    );
+                    continue;
+                }
+            };
+            // Stored fields must match decoded fields.
+            if decoded_req_id != entry.request_id || decoded_requester != entry.requester_agent_id {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — outbox stored metadata != decoded, dropping"
+                );
+                continue;
+            }
+            // V2 signer must be the requester.
+            if let Some(v2_sender) = relay_msg.sender {
+                if hex::encode(v2_sender.as_bytes()) != entry.requester_agent_id {
+                    tracing::warn!(
+                        group_id = %group_id,
+                        "ADR 0028: restart revalidation — outbox V2 signer != requester, dropping"
+                    );
+                    continue;
+                }
+            } else {
+                continue;
+            }
+            // Decoded event's group_id must match stored group.
+            let decoded_relay_gid =
+                named_group_metadata_event_group_id(&decoded_relay_event).to_string();
+            if decoded_relay_gid != group_id {
+                tracing::warn!(
+                    group_id = %group_id,
+                    decoded_group_id = %decoded_relay_gid,
+                    "ADR 0028: restart revalidation — outbox event group_id mismatch, dropping"
+                );
+                continue;
+            }
+            // Verify relay_targets are parseable hex agent IDs (K2.1 fix
+            // means they are canonical hex strings; validate on restart).
+            let valid_targets: Vec<String> = entry
+                .relay_targets
+                .iter()
+                .filter(|t| parse_agent_id_hex(t).is_ok())
+                .cloned()
+                .collect();
+            if valid_targets.len() != entry.relay_targets.len() {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: restart revalidation — outbox has unparseable relay targets, trimming"
+                );
+            }
             group_count += 1;
             group_bytes += derived_byte_size;
             total_count += 1;
             total_bytes += derived_byte_size;
-            total_targets += entry_targets;
+            total_targets += valid_targets.len();
             let mut entry = entry;
             entry.byte_size = derived_byte_size;
             entry.digest = derived_digest.into();
+            entry.relay_targets = valid_targets;
             filtered.push(entry);
         }
         if !filtered.is_empty() {
@@ -14416,6 +14745,13 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
 }
 
 async fn save_named_groups(state: &AppState) {
+    let _ = save_named_groups_checked(state).await;
+}
+
+/// ADR 0028: checked version of save_named_groups that returns an error on
+/// write failure so the causal replay path can refuse to drop a queue entry
+/// when group-state persistence failed (audit 5).
+async fn save_named_groups_checked(state: &AppState) -> std::io::Result<()> {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let json = {
         let groups = state.named_groups.read().await;
@@ -14433,12 +14769,16 @@ async fn save_named_groups(state: &AppState) {
         }
     }
     match json {
-        Ok(json) => {
-            if let Err(e) = write_named_groups_json_atomic(&state.named_groups_path, &json).await {
+        Ok(json) => write_named_groups_json_atomic(&state.named_groups_path, &json)
+            .await
+            .map_err(|e| {
                 tracing::error!("Failed to save named groups: {e}");
-            }
+                e
+            }),
+        Err(e) => {
+            tracing::error!("Failed to serialize named groups: {e}");
+            Err(std::io::Error::other(format!("serialize: {e}")))
         }
-        Err(e) => tracing::error!("Failed to serialize named groups: {e}"),
     }
 }
 

@@ -1354,6 +1354,8 @@ pub async fn serve_with_options(
                         _ => continue,
                     };
                     // Collect active witness targets (non-local active members).
+                    // members_v2 keys are already canonical hex agent-id strings;
+                    // do NOT re-encode with hex::encode (Kimi audit 1 — double-hex).
                     let relay_targets = {
                         let groups = relay_state.named_groups.read().await;
                         groups.get(&group_id_str).map(|info| {
@@ -1361,9 +1363,9 @@ pub async fn serve_with_options(
                                 .iter()
                                 .filter(|(id, m)| {
                                     m.state == x0x::groups::GroupMemberState::Active
-                                        && hex::encode(id) != local_agent_hex
+                                        && **id != local_agent_hex
                                 })
-                                .map(|(id, _)| hex::encode(id))
+                                .map(|(id, _)| id.clone())
                                 .collect::<Vec<_>>()
                         }).unwrap_or_default()
                     };
