@@ -196,6 +196,128 @@ def _seed_base(
     subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
 
 
+def _seed_transition(
+    work: Path,
+    *,
+    base_adr_text: str = _ADR_PROPOSED,
+    base_grounding: str = _GROUNDING,
+    trans_adr_text: str = _ADR_ACCEPTED,
+    trans_grounding: str | None = None,
+) -> None:
+    """Two-stage seed: base ADR is Proposed + grounding A, then branch to
+    ``feature`` and commit a transition that flips the ADR to Accepted
+    and (by default) edits the grounding A->B.
+
+    The base ADR is Proposed so the snapshot selector must walk
+    ``base..HEAD`` to find the transition commit. Tests that need this
+    selector behaviour (Dario rollback, snapshot-advance, blob-read
+    PATH-shim) use this helper; tests where the base is already
+    Accepted can use :func:`_seed_base` directly.
+
+    Pass ``trans_grounding=base_grounding`` to keep the grounding
+    unchanged at the transition commit, leaving a follow-up commit to
+    introduce the grounding mutation the arm exercises.
+    """
+    (work / "docs" / "adr").mkdir(parents=True)
+    (work / "docs" / "grounding").mkdir(parents=True)
+    (work / "docs" / "adr" / "0042-test.md").write_text(base_adr_text)
+    (work / "docs" / "grounding" / "0042-test.md").write_text(base_grounding)
+    subprocess.run(["git", "add", "."], cwd=work, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "base: proposed + grounding A"],
+        cwd=work, check=True,
+    )
+    subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+    (work / "docs" / "adr" / "0042-test.md").write_text(trans_adr_text)
+    if trans_grounding is None:
+        trans_grounding = base_grounding + "\nB: transition commit edit.\n"
+    (work / "docs" / "grounding" / "0042-test.md").write_text(trans_grounding)
+    subprocess.run(["git", "add", "."], cwd=work, check=True)
+    subprocess.run(
+        ["git", "commit", "-q", "-m", "c1: accept ADR + grounding A->B"],
+        cwd=work, check=True,
+    )
+
+
+def _setup_path_shim(work: Path, fail_pattern: str) -> Path:
+    """Install a PATH shim that exits 86 when a ``git`` argument equals
+    *fail_pattern* exactly. All other invocations delegate to the real
+    git binary via ``exec``. Returns the shim directory so the caller
+    can prepend it to ``PATH``.
+    """
+    shim_dir = work / "shim"
+    shim_dir.mkdir()
+    real_git = subprocess.check_output(
+        ["which", "git"], text=True
+    ).strip()
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'real_git="{real_git}"\n'
+        "for arg in \"$@\"; do\n"
+        f'    if [ "$arg" = "{fail_pattern}" ]; then\n'
+        '        echo "shim: failed $arg" >&2\n'
+        "        exit 86\n"
+        "    fi\n"
+        "done\n"
+        'exec "$real_git" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim_dir
+
+
+def _setup_path_shim_matching(work: Path, fail_substr: str) -> Path:
+    """Like :func:`_setup_path_shim` but matches *fail_substr* as a
+    substring of any single argument using a shell case-glob. Useful
+    for failing an arg like ``--diff-filter=A`` regardless of position.
+    """
+    shim_dir = work / "shim"
+    shim_dir.mkdir()
+    real_git = subprocess.check_output(
+        ["which", "git"], text=True
+    ).strip()
+    shim = shim_dir / "git"
+    shim.write_text(
+        "#!/bin/sh\n"
+        f'real_git="{real_git}"\n'
+        "for arg in \"$@\"; do\n"
+        f'        case "$arg" in\n'
+        f'            *{fail_substr}*) echo "shim: matched $arg" >&2; exit 86 ;;\n'
+        f"        esac\n"
+        "done\n"
+        'exec "$real_git" "$@"\n'
+    )
+    shim.chmod(0o755)
+    return shim_dir
+
+
+def _run_validator_with_shim(
+    work: Path,
+    shim_dir: Path,
+    *,
+    env_overrides: dict[str, str] | None = None,
+) -> tuple[int, str]:
+    """Invoke the production validator with the shim ``git`` prepended
+    to ``PATH``. The default behaviour strips the GitHub-Actions vars
+    so the validator picks the local merge-base path.
+    """
+    env = os.environ.copy()
+    for var in ("GITHUB_BASE_REF", "GITHUB_BEFORE", "GITHUB_BASE_SHA"):
+        env.pop(var, None)
+    if env_overrides:
+        env.update(env_overrides)
+    env["PATH"] = f"{shim_dir}:" + env.get("PATH", "")
+    p = subprocess.run(
+        [sys.executable, str(_VALIDATOR_PATH)],
+        cwd=work,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    return p.returncode, (p.stdout or "") + (p.stderr or "")
+
+
 def main() -> int:
     results: list[bool] = []
 
@@ -1003,16 +1125,16 @@ def main() -> int:
 
     # -----------------------------------------------------------------------
     # Dario control: PR-path ADR rename evasion (pins the three-dot
-    # diff branch at scripts/adr-governance.py :239). The push-path
-    # rename red arm above only exercises GITHUB_BEFORE (:235). A
+    # diff branch at scripts/adr-governance.py :259). The push-path
+    # rename red arm above only exercises GITHUB_BEFORE (:255). A
     # regression that drops --no-renames from the three-dot site only
     # would pass every existing test in this file but re-open the
     # evasion on every PR run, because PRs use the three-dot
     # merge-base diff. This arm sets GITHUB_BASE_SHA=<base> with
     # GITHUB_BEFORE and GITHUB_BASE_REF unset, so the validator
-    # reaches :239 and the deleted-source Accepted immutability
+    # reaches :259 and the deleted-source Accepted immutability
     # check must fire on docs/adr/0042-test.md. Mutation proof:
-    # removing --no-renames from :239 only must make THIS row red
+    # removing --no-renames from :259 only must make THIS row red
     # while the push-path rename row above (GITHUB_BEFORE) stays
     # green. The grounding half rides the same code path; one arm
     # is sufficient to pin the PR site.
@@ -1041,7 +1163,7 @@ def main() -> int:
         ).strip()
         # GITHUB_BEFORE and GITHUB_BASE_REF are absent - the helper's
         # default strip removes them - so the validator reaches
-        # changed_files_against_base's three-dot branch (:239)
+        # changed_files_against_base's three-dot branch (:259)
         # exclusively via GITHUB_BASE_SHA=base_sha here.
         rc, out = _run_validator(
             work, env_overrides={"GITHUB_BASE_SHA": base_sha},
@@ -1219,6 +1341,709 @@ def main() -> int:
             rc == 1
             and f"GITHUB_BEFORE={head_abbrev}" in out
             and "could not resolve to a valid non-HEAD commit" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Dario rollback arms (a)/(b)/(c) — required by `559e8ce2` and refined
+    # by `c3a2ccec`. The selector must be history-driven; gating it on
+    # HEAD lifecycle status is self-disabling because the edit that
+    # leaves the Accepted state is precisely the edit the control
+    # exists to forbid.
+    #
+    # Two-stage fixture: base ADR is Proposed so the snapshot is at the
+    # transition commit (c1), not at base. The transition flips to
+    # Accepted and edits the grounding (A->B). The rollback commit on
+    # the feature branch walks the snapshot back.
+    #
+    # Mutations cited per Kimi `c3a2ccec` and Dario `2aa663d7`:
+    #   MUT2a — disable the freeze in `_frozen_adr_snapshot` only when
+    #           the ADR *exists* at HEAD and is no longer Accepted;
+    #           absent-at-HEAD still falls through to the history
+    #           scan. Under this restricted shape arm (a) goes red
+    #           AND arm (b) goes red — both rely on the
+    #           ADR-immutability row. Applied literally as "gate on
+    #           HEAD status" without the exists-at-HEAD restriction,
+    #           the mutation is MUT1 (which is self-disabling on
+    #           absent-at-HEAD paths and reddens unrelated
+    #           delete/rename arms).
+    #   MUT2b — disable the freeze in `_frozen_grounding_snapshot`
+    #           only when the ADR *exists* at HEAD and is no longer
+    #           Accepted; absent-at-HEAD still falls through to the
+    #           history scan. Under this restricted shape only arm
+    #           (b) goes red — its grounding-freeze row assertion is
+    #           the load-bearing discriminator. Arm (b) keeps exit 1
+    #           via the ADR row from the same fixture, so the row
+    #           assertion (not just the exit code) is what proves the
+    #           freeze engaged.
+    # -----------------------------------------------------------------------
+    # Dario rollback (a): rollback Accepted->Proposed + body edit. The
+    # grounding row must NOT fire (the rollback did not touch it), so
+    # the sole catcher is the ADR-immutability row. Cite MUT2a.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        rolled_back = _ADR_ACCEPTED.replace(
+            "- Status: Accepted (2026-08-02)", "- Status: Proposed"
+        ).replace("Test decision body.", "ROLLED BACK decision body.")
+        (work / "docs" / "adr" / "0042-test.md").write_text(rolled_back)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rollback: accepted -> proposed + body edit"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "Dario rollback (a): rollback + body edit fires ADR-immutability (MUT2a)",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    # Dario rollback (b): rollback + grounding reverted to base bytes.
+    # The grounding-freeze row MUST be present (not just exit 1) — an
+    # exit-code-only arm (b) would stay green under MUT2b because the
+    # ADR-immutability row from the same fixture would still fire to
+    # exit 1. Cite MUT2b.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        rolled_back = _ADR_ACCEPTED.replace(
+            "- Status: Accepted (2026-08-02)", "- Status: Proposed"
+        )
+        (work / "docs" / "adr" / "0042-test.md").write_text(rolled_back)
+        # Revert the grounding to its base bytes (A).
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rollback + grounding revert to base A"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        has_adr_row = (
+            "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out
+        )
+        has_grounding_row = (
+            "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out
+        )
+        results.append(check(
+            "Dario rollback (b): rollback + grounding revert fires ADR + grounding rows (MUT2b)",
+            rc == 1 and has_adr_row and has_grounding_row,
+        ))
+
+    # Dario rollback (c) — revert-control: same grounding revert, ADR
+    # left Accepted. The grounding row fires (snapshot is B, head is A)
+    # but the ADR row does NOT (HEAD body == snapshot body). The
+    # control isolates rollback as the sole variable between (b) and
+    # (c). Correct as an exit-1 + grounding-row assertion; the ADR
+    # row must be absent to prove the control is doing its job.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        # Revert the grounding to base bytes (A) — NOT touching the ADR.
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "revert-control: grounding revert only"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "Dario rollback (c): revert-control fires grounding-freeze (no ADR row)",
+            rc == 1
+            and "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out
+            and "Accepted ADRs are immutable" not in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Directly-Accepted — branch-new ADR added in a single commit with
+    # status Accepted. The snapshot selector must find the transition
+    # when the transition commit is the only commit in base..HEAD, and
+    # the freeze must catch post-acceptance mutations.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "directly-Accepted ADR + grounding A"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "directly-Accepted: branch-new accepted in one commit, no mutation passes",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+        # Mutate the grounding on a follow-up commit and confirm the
+        # snapshot at the transition commit catches the mutation. The
+        # selector must walk base..HEAD to find the transition even
+        # though it is the only commit in the range.
+        mutated = _GROUNDING + "\nMUTATED: post-acceptance grounding edit.\n"
+        (work / "docs" / "grounding" / "0042-test.md").write_text(mutated)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "mutate frozen grounding post-acceptance"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "directly-Accepted: post-acceptance grounding mutation fails closed",
+            rc == 1
+            and "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # CRLF rows — both unconditional. Both rows are MANDATORY and
+    # UNCONDITIONAL: each CRLF row pins a byte-exact successor-7 snapshot
+    # comparison site against a text-mode regression. A text-mode read
+    # (`text=True`) at either site universal-newline normalises CRLF to
+    # LF, making the mutated values text-equal; the byte-exact
+    # implementation must reject them. The rows are unconditional rather
+    # than conditional on the loader because the two consumers — the
+    # grounding snapshot and the ADR snapshot — may diverge later: today
+    # `file_at` is the single loader every comparison reads, so the
+    # grounding row alone would pin the loader; the ADR row exists for
+    # that consumer-specific divergence case, not because both rows
+    # individually pin the loader today. Each row has its own mutation:
+    #   MUT-grounding — text=True on the grounding read path only.
+    #   MUT-ADR       — newline normalisation (e.g. replace b"\r\n" with
+    #                   b"\n" on the read bytes) at the ADR comparison
+    #                   site :567 only, leaving grounding byte-exact.
+    #
+    # -----------------------------------------------------------------------
+    # CRLF grounding row: grounding frozen at base (Accepted); branch
+    # converts the grounding from LF to CRLF. The post-fix byte-exact
+    # comparison must detect the change and fire the grounding-freeze row.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        gr_path = work / "docs" / "grounding" / "0042-test.md"
+        content_bytes = gr_path.read_bytes()
+        crlf_bytes = content_bytes.replace(b"\n", b"\r\n")
+        assert b"\r\n" in crlf_bytes, "fixture must actually introduce CRLF"
+        gr_path.write_bytes(crlf_bytes)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "convert grounding LF->CRLF"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "CRLF grounding row: LF->CRLF conversion of frozen grounding fails closed (MUT-grounding)",
+            rc == 1
+            and "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # CRLF ADR row: ADR frozen at base (Accepted); branch converts the
+    # ADR from LF to CRLF. The post-fix byte-exact comparison at the
+    # ADR comparison site must fire the ADR-immutability row.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        adr_path = work / "docs" / "adr" / "0042-test.md"
+        content_bytes = adr_path.read_bytes()
+        crlf_bytes = content_bytes.replace(b"\n", b"\r\n")
+        assert b"\r\n" in crlf_bytes, "fixture must actually introduce CRLF"
+        adr_path.write_bytes(crlf_bytes)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "convert ADR LF->CRLF"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "CRLF ADR row: LF->CRLF conversion of frozen ADR fails closed (MUT-ADR)",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Leading-newline rows (B1/B2) — pinning the successor-7 byte-exact
+    # comparison sites against a whitespace-stripping regression. Successor-7
+    # introduced these comparisons. Successor-7 reads the historical blob
+    # as RAW BYTES via `file_at()` → `subprocess.check_output(
+    # ["git","show", <ref>:<path>], stderr=subprocess.PIPE)`: no `run()`,
+    # no text mode, no `.strip()` at that historical-blob read. (The
+    # `run()` → `check_output(text=True, stderr=DEVNULL).strip()` chain
+    # belongs to the predecessor f1d4d8b loader; successor-7's `run()` at
+    # scripts/adr-governance.py:57-58 STILL EXISTS and is still
+    # `text=True` with `.strip()`, used by `_resolve`, `base_ref`, the
+    # three diff sites, the history scans, and the discovery scan. Only
+    # `file_at`'s historical-blob read is raw.) `git show <ref>:<path>`
+    # returns the blob bytes exactly; the `0x0a` in these fixtures is
+    # inserted below into the blob. In the deliberate regression
+    # mutation, `.strip()` is applied at the new comparison sites and
+    # removes that fixture-added leading LF before comparison, so the
+    # byte-exact contract is lost. This is a regression pin, not a claim
+    # about a bypass in the pre-successor validator. The measured 52/54
+    # disjoint pair is: `.strip()` at both comparison sites leaves only
+    # B1/B2 red, while `text=True` at both sites leaves only the CRLF
+    # rows red.
+    # -----------------------------------------------------------------------
+    # B1: leading 0x0a inserted into the grounding after the freeze.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        gr_path = work / "docs" / "grounding" / "0042-test.md"
+        content_bytes = gr_path.read_bytes()
+        gr_path.write_bytes(b"\n" + content_bytes)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "insert leading 0x0a into grounding"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "B1 leading-newline grounding: leading 0x0a in grounding fails closed",
+            rc == 1
+            and "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # B2: leading 0x0a inserted into the ADR after the freeze.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        adr_path = work / "docs" / "adr" / "0042-test.md"
+        content_bytes = adr_path.read_bytes()
+        adr_path.write_bytes(b"\n" + content_bytes)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "insert leading 0x0a into ADR"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "B2 leading-newline ADR: leading 0x0a in ADR fails closed",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # PATH-shim tests — pin that operational failures of the loader
+    # (a fake ``git`` that exits 86 for a specific argument) are typed
+    # as operational errors and fail closed, NOT treated as file
+    # absence. The pre-fix `file_at` and `_resolve` had a single
+    # `subprocess.check_output` call; without a typed distinction
+    # between "blob does not exist" and "blob read failed", a failure
+    # would silently look like absence and the freeze would not engage.
+    # The successor-7 typed error/absence distinction is the property
+    # these tests pin.
+    # -----------------------------------------------------------------------
+    # Blob-read PATH-shim: fail `git show <C1>:docs/adr/0042-test.md`
+    # (the transition commit's ADR blob read inside
+    # `_frozen_adr_snapshot`). The validator must fail closed and
+    # surface the operational error rather than treating the read as
+    # absence (which would let the freeze switch off).
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        c1 = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=work, text=True
+        ).strip()
+        shim_dir = _setup_path_shim(work, f"{c1}:docs/adr/0042-test.md")
+        rc, out = _run_validator_with_shim(work, shim_dir)
+        results.append(check(
+            "blob-read PATH-shim: fail `git show <C1>:docs/adr/0042-test.md` fails closed (operational error)",
+            rc == 1
+            and "Failed to scan history" in out
+            and "docs/adr/0042-test.md" in out
+            and "returned non-zero exit status 86" in out,
+        ))
+
+    # Companion: fail `git show <C1>:docs/grounding/0042-test.md` (the
+    # transition commit's grounding blob read inside
+    # `_frozen_grounding_snapshot`). Same fail-closed contract on the
+    # grounding path. The companion pins a second loader site so a
+    # regression that only handles the ADR path is caught.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        c1 = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=work, text=True
+        ).strip()
+        shim_dir = _setup_path_shim(work, f"{c1}:docs/grounding/0042-test.md")
+        rc, out = _run_validator_with_shim(work, shim_dir)
+        results.append(check(
+            "blob-read PATH-shim companion: fail `git show <C1>:docs/grounding/0042-test.md` fails closed",
+            rc == 1
+            and "Failed to scan history" in out
+            and "docs/grounding/0042-test.md" in out
+            and "returned non-zero exit status 86" in out,
+        ))
+
+    # PATH-shim discovery-fail: fail `git log --diff-filter=A`
+    # (the history-driven added-path discovery scan inside
+    # ``main()``). The validator must fail closed and surface a
+    # governance error rather than silently treating the discovery
+    # scan as empty — an empty discovery would let a branch-new
+    # directly-Accepted ADR that was later deleted slip through.
+    # Substring match on `--diff-filter=A` covers the exact flag
+    # regardless of position.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work)
+        shim_dir = _setup_path_shim_matching(work, "--diff-filter=A")
+        rc, out = _run_validator_with_shim(work, shim_dir)
+        results.append(check(
+            "PATH-shim discovery-fail: fail `git log --diff-filter=A` fails closed",
+            rc == 1
+            and "Failed to scan history for added ADR/grounding files" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Net-zero delete-both — base lacks the ADR/grounding pair; branch
+    # adds an ADR directly Accepted with grounding, then deletes both
+    # before HEAD. Final base-relative diff is empty (net-zero). The
+    # history-driven discovery pass (which uses `git log
+    # --diff-filter=A`) is the SOLE mechanism that catches the
+    # deletions; the supplementary ADR/grounding passes iterate
+    # `changed` which is empty. Without this arm a branch-new
+    # directly-Accepted ADR that was later deleted would pass
+    # undetected.
+    #
+    # Mutation proof: discarding the successful history-driven
+    # discovery result after the real `git log` returns (so
+    # `ever_added` is empty for this fixture while preserving the
+    # discovery exception path) turns this row red — the validator
+    # passes incorrectly — the source path is not in `changed`
+    # (the three-dot diff is empty for net-zero), so no ADR or
+    # grounding read fires — and the row's expected error message
+    # is absent, failing the `rc == 1` / `out` assertions. The
+    # row passes only when history-driven discovery is the sole
+    # mechanism catching the deletion.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add directly-Accepted ADR + grounding"],
+            cwd=work, check=True,
+        )
+        # Delete both files in a follow-up commit (net-zero diff vs base).
+        (work / "docs" / "adr" / "0042-test.md").unlink()
+        (work / "docs" / "grounding" / "0042-test.md").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "delete both files (net-zero diff)"],
+            cwd=work, check=True,
+        )
+        # Sanity: HEAD must not contain either file — git won't carry
+        # empty directories, so a successful delete commit here proves
+        # the deletion actually landed.
+        head_files = subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=work, text=True,
+        ).strip().splitlines()
+        assert "docs/adr/0042-test.md" not in head_files, (
+            "fixture invariant: HEAD must not contain the deleted ADR"
+        )
+        assert "docs/grounding/0042-test.md" not in head_files, (
+            "fixture invariant: HEAD must not contain the deleted grounding"
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "net-zero delete-both: history-driven discovery catches both deletions",
+            rc == 1
+            and "Accepted ADRs are immutable and cannot be deleted" in out
+            and "docs/adr/0042-test.md" in out
+            and "cannot delete grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Net-zero rename — base lacks the pair; branch adds an ADR
+    # directly Accepted with grounding, then renames both to a new
+    # stem before HEAD. `--diff-filter=A` over history surfaces
+    # the source paths as adds and `ever_added` collects them.
+    # Both freezes (source ADR
+    # immutability and source grounding immutability) come from the
+    # single history-driven discovery pass: the source paths are
+    # absent at both base and HEAD, so they are NOT in `changed`;
+    # the only path that surfaces them is `--diff-filter=A` over
+    # history, which adds them to `ever_added`. Existing rename
+    # and delete tests start with an Accepted ADR at base, so they
+    # do not exercise historical added-path discovery.
+    #
+    # Mutation proof: discarding the successful history-driven
+    # discovery result after the real `git log` returns (so
+    # `ever_added` is empty for this fixture while preserving the
+    # discovery exception path) turns BOTH rows red, failing the
+    # dual-row assertion. The row passes only when history-driven
+    # discovery is the sole mechanism.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add directly-Accepted ADR + grounding"],
+            cwd=work, check=True,
+        )
+        # Rename both via `git mv`. The source paths/stem are absent at
+        # base and HEAD and therefore absent from `changed`; `changed`
+        # still contains the two destination paths. Both source freezes
+        # come from the single history-driven discovery pass via
+        # `--diff-filter=A`: the source paths were added in C1 and enter
+        # `ever_added`, so only history-driven discovery surfaces them
+        # after the rename.
+        subprocess.run(
+            ["git", "mv", "docs/adr/0042-test.md", "docs/adr/0043-renamed.md"],
+            cwd=work, check=True,
+        )
+        subprocess.run(
+            ["git", "mv", "docs/grounding/0042-test.md", "docs/grounding/0043-renamed.md"],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rename both to new stems"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "net-zero rename: source paths caught by history-driven discovery",
+            rc == 1
+            and "Accepted ADRs are immutable and cannot be deleted" in out
+            and "docs/adr/0042-test.md" in out
+            and "cannot delete grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Net-zero delete-both with PATH shim forcing `git log
+    # --diff-filter=A` to fail (exit 86). The validator must fail
+    # closed and surface the "Failed to scan history" error rather
+    # than silently treating the discovery scan as empty.
+    #
+    # Adjacent real-git control: the net-zero delete-both arm above
+    # exercises the same fixture WITHOUT the shim. The discriminator
+    # is a fail-open wrapper that silently returns `ever_added = []`
+    # from the discovery-scan except branch (without appending to
+    # `errors`) — under that wrapper this shim row goes green (no
+    # scan error) while the real-git net-zero delete-both arm
+    # above stays red (the deletion errors come from successful
+    # discovery, which the fail-open wrapper does not affect).
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "add directly-Accepted ADR + grounding"],
+            cwd=work, check=True,
+        )
+        (work / "docs" / "adr" / "0042-test.md").unlink()
+        (work / "docs" / "grounding" / "0042-test.md").unlink()
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "delete both files (net-zero diff)"],
+            cwd=work, check=True,
+        )
+        shim_dir = _setup_path_shim_matching(work, "--diff-filter=A")
+        rc, out = _run_validator_with_shim(work, shim_dir)
+        results.append(check(
+            "net-zero + discovery-scan PATH-shim: fail `git log --diff-filter=A` fails closed",
+            rc == 1
+            and "Failed to scan history for added ADR/grounding files" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Genuine absence control — branch adds an ADR directly Accepted
+    # with NO grounding file at any commit. The validator must pass:
+    # the "no grounding at snapshot AND no grounding at HEAD" branch
+    # in the grounding loop is a legitimate not-a-violation case
+    # (ADR predates the grounding convention).
+    #
+    # Mutation proof: changing that branch to fire an error ("always
+    # error when no grounding exists for an Accepted ADR") makes this
+    # row red — proving the legitimate-not-a-violation path is
+    # specifically being exercised. The previously committed
+    # "companion" was a second failing `git show` shim, not this
+    # absence control.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        # Note: docs/grounding/ is intentionally NOT created.
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "directly-Accepted ADR, never-existing grounding"],
+            cwd=work, check=True,
+        )
+        # Sanity: HEAD must contain the ADR but no grounding file.
+        head_files = subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=work, text=True,
+        ).strip().splitlines()
+        assert "docs/adr/0042-test.md" in head_files
+        assert not any(p.startswith("docs/grounding/") for p in head_files), (
+            "fixture invariant: grounding must never exist for this absence control"
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "absence control: Accepted ADR with never-existing grounding passes",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Snapshot-advance blob-read topology — C1 adds an ADR Accepted
+    # with grounding A (unchanged from base); C2 changes grounding
+    # A→B. The PATH shim fails only
+    # `git show <C1>:docs/adr/0042-test.md` (the transition
+    # commit's ADR blob read inside `_frozen_adr_snapshot`). The
+    # validator must fail closed with a read error rather than
+    # silently advancing the snapshot to C2 (which would let the
+    # A→B grounding change pass undetected). The previously
+    # committed shim row stopped at C1 and so did not pin the false
+    # advance to C2.
+    #
+    # Mutation proof: changing the operational-error handler in
+    # `file_at` from `raise` to `return None` makes the shim row
+    # below green (snapshot advances to C2 silently, the freeze
+    # doesn't engage on the A→B change) while the no-shim A→B run
+    # further below remains red (the no-shim path is unaffected by
+    # the mutation because `file_at` doesn't raise on it).
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # C1: ADR Accepted + grounding A (unchanged from base).
+        _seed_transition(work, trans_grounding=_GROUNDING)
+        # C2: edit grounding A→B (different bytes).
+        mutated_grounding = _GROUNDING + "\nB: post-acceptance grounding A->B.\n"
+        (work / "docs" / "grounding" / "0042-test.md").write_text(mutated_grounding)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "c2: grounding A->B"],
+            cwd=work, check=True,
+        )
+        c1 = subprocess.check_output(
+            ["git", "rev-parse", "HEAD~1"], cwd=work, text=True
+        ).strip()
+        shim_dir = _setup_path_shim(work, f"{c1}:docs/adr/0042-test.md")
+        rc, out = _run_validator_with_shim(work, shim_dir)
+        results.append(check(
+            "snapshot-advance: shim on C1 ADR read fails closed (no silent advance to C2)",
+            rc == 1
+            and "Failed to scan history" in out
+            and "docs/adr/0042-test.md" in out
+            and "returned non-zero exit status 86" in out,
+        ))
+
+    # No-shim A→B run — must fire grounding-freeze error (proves the
+    # A→B grounding change is detected when the loader works). The
+    # companion row is the discriminator anchor: under the
+    # `except: return None` mutation in `file_at`, this run stays
+    # red while the shimmed run above goes green.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_transition(work, trans_grounding=_GROUNDING)
+        mutated_grounding = _GROUNDING + "\nB: post-acceptance grounding A->B.\n"
+        (work / "docs" / "grounding" / "0042-test.md").write_text(mutated_grounding)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "c2: grounding A->B"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "snapshot-advance no-shim control: A→B grounding change fails closed",
+            rc == 1
+            and "cannot modify grounding for Accepted ADR" in out
+            and "docs/grounding/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Directly-Accepted ADR-bytes mutation — branch-new ADR added in
+    # one commit with status Accepted, then a follow-up commit edits
+    # the ADR body (the grounding is untouched). The
+    # ADR-immutability row must fire on the body change.
+    #
+    # Mutation proof: reverting to base-only `old = file_at(base)`
+    # selection — i.e., changing the unconditional ADR loop to use
+    # the base bytes instead of the history-driven snapshot — makes
+    # THIS row fail (the pre-fix code would skip the freeze entirely
+    # because `file_at(base, adr)` returns None for a branch-new
+    # ADR). The grounding row stays independent (the grounding is
+    # unchanged in this arm, so the grounding freeze doesn't engage
+    # either before or after the mutation).
+    #
+    # The existing directly-Accepted arms above cover the pass case
+    # and the grounding mutation case; this row extends the
+    # directly-Accepted coverage to the ADR body mutation that the
+    # previous suite did not exercise.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "directly-Accepted ADR + grounding A"],
+            cwd=work, check=True,
+        )
+        # Edit ADR body, keep status Accepted, don't touch grounding.
+        mutated = _ADR_ACCEPTED.replace(
+            "Test decision body.", "MUTATED decision body."
+        )
+        (work / "docs" / "adr" / "0042-test.md").write_text(mutated)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "mutate directly-Accepted ADR body"],
+            cwd=work, check=True,
+        )
+        rc, out = _run_validator(work)
+        results.append(check(
+            "directly-Accepted ADR-bytes: post-acceptance ADR body mutation fails closed",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
         ))
 
     failed = results.count(False)
