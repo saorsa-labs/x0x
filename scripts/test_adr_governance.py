@@ -504,12 +504,13 @@ def main() -> int:
     #   ADR governance passed (N ADR file(s) discovered[,
     #   M ADR(s) structurally validated][, K grounding file(s) paired]).
     # - N = ADR files discovered under docs/adr/.
-    # - M = ADRs structurally validated (files_to_validate); the clause
-    #   is dropped when M == N.
+    # - M = ADRs that actually ran the required-section loop (is_new at
+    #   base_ref); the clause is dropped when M == 0, so an edited
+    #   pre-existing ADR is not counted as "structurally validated".
     # - K = paired grounding files; the clause is dropped when no
     #   groundings exist.
-    # These tests assert the exact quantities — discovery and validation
-    # are distinguishable, not rolled into one number.
+    # These tests assert the exact quantities — discovery, validation,
+    # and pairing are three independent counts.
     # -----------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -526,26 +527,28 @@ def main() -> int:
             cwd=work,
             check=True,
         )
-        subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
         rc, out = _run_validator(work)
-        # Both ADRs land in 'changed' (they don't exist at the placeholder
-        # commit), so n_validated == n_discovered and the validated clause
-        # is dropped. The paired clause is present.
+        # Both ADRs are is_new at base (they don't exist at the placeholder
+        # commit), so n_structurally_validated == 2 and the validated
+        # clause IS present. The paired clause is present.
         expected = (
             "ADR governance passed "
-            "(2 ADR file(s) discovered, 2 grounding file(s) paired)."
+            "(2 ADR file(s) discovered, 2 ADR(s) structurally validated, "
+            "2 grounding file(s) paired)."
         )
         results.append(check(
             "count: 2 ADRs + 2 groundings reports exact message",
-            rc == 0
-            and expected in out
-            and "ADR(s) structurally validated" not in out,
+            rc == 0 and expected in out,
         ))
 
     # Discriminating arm: 3 ADRs on the base commit, 1 of 3 edited on
-    # the branch. The pre-fix message rolled discovery + validation into
-    # one number; the post-fix contract separates them. The validator
-    # must report discovered=3 and validated=1, not 3 in both columns.
+    # the branch. The edited ADR is pre-existing so is_new is False at
+    # base_ref and the required-section loop does NOT run for it.
+    # n_structurally_validated is 0; the validated clause is dropped
+    # entirely from the success message. This arm proves the fix
+    # counts only ADRs that ran the structural check — the pre-fix
+    # message reported n_validated = len(files_to_validate) which
+    # would have included the edited ADR.
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         _init_repo(work)
@@ -573,16 +576,18 @@ def main() -> int:
         rc, out = _run_validator(work)
         expected = (
             "ADR governance passed "
-            "(3 ADR file(s) discovered, 1 ADR(s) structurally validated, "
-            "3 grounding file(s) paired)."
+            "(3 ADR file(s) discovered, 3 grounding file(s) paired)."
         )
         results.append(check(
-            "count: 3 ADRs/discovered, 1 changed, reports discovered=3 validated=1",
-            rc == 0 and expected in out,
+            "count: 3 ADRs/discovered, 1 edited, drops validated clause",
+            rc == 0
+            and expected in out
+            and "ADR(s) structurally validated" not in out,
         ))
 
-    # No grounding directory: the success message must drop the grounding
+    # No grounding directory: the success message drops the grounding
     # clause entirely so it never states a grounding count of zero.
+    # The 1 ADR is is_new at base, so the validated clause IS present.
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
         _init_repo(work)
@@ -594,7 +599,10 @@ def main() -> int:
         )
         subprocess.run(["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True)
         rc, out = _run_validator(work)
-        expected = "ADR governance passed (1 ADR file(s) discovered)."
+        expected = (
+            "ADR governance passed "
+            "(1 ADR file(s) discovered, 1 ADR(s) structurally validated)."
+        )
         results.append(check(
             "count: no grounding dir drops the paired clause",
             rc == 0
@@ -671,10 +679,13 @@ def main() -> int:
         ))
 
     # -----------------------------------------------------------------------
-    # Property 7 — unresolved/invalid base: an event-derived base SHA
-    # that cannot be resolved to a commit must fail closed. The pre-fix
-    # code returned an empty change set and exited 0, silently disabling
-    # every change-specific check.
+    # Property 7 — unresolved/invalid base: an event-derived base that
+    # cannot resolve to a valid non-HEAD commit must fail closed. The
+    # pre-fix code returned an empty change set and exited 0, silently
+    # disabling every change-specific check. The fix resolves every
+    # candidate through ``git rev-parse --verify`` and fails closed
+    # with a message naming the attempted selectors when none resolves
+    # to a valid non-HEAD commit.
     # -----------------------------------------------------------------------
     with tempfile.TemporaryDirectory() as tmp:
         work = Path(tmp)
@@ -696,8 +707,9 @@ def main() -> int:
         results.append(check(
             "P7 pass: invalid GITHUB_BASE_SHA fails closed",
             rc == 1
-            and "Cannot resolve base ref 'deadbeefdeadbeefdeadbeefdeadbeefdeadbeef'"
-            in out,
+            and "Event base selector(s) could not resolve to a valid "
+            "non-HEAD commit: GITHUB_BASE_SHA="
+            "deadbeefdeadbeefdeadbeefdeadbeefdeadbeef" in out,
         ))
 
     # Discriminating arm — same fixture with a clean base (no env
@@ -718,6 +730,184 @@ def main() -> int:
         results.append(check(
             "P7 fail-arm: clean base passes",
             rc == 0 and "ADR governance passed" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # P7 control: unresolved GITHUB_BASE_REF (Sam #1). The production
+    # resolver attempts ``git rev-parse --verify origin/{ref}``. A repo
+    # without an ``origin`` remote (the temporary fixture) cannot
+    # resolve any ref, so the validator must fail closed and name the
+    # attempted selector — local fallbacks are NOT consulted when an
+    # event selector was explicitly provided.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(
+            work,
+            env_overrides={"GITHUB_BASE_REF": "definitely-missing-base"},
+        )
+        results.append(check(
+            "P7 control: unresolved GITHUB_BASE_REF fails closed",
+            rc == 1
+            and "Event base selector(s) could not resolve to a valid "
+            "non-HEAD commit: GITHUB_BASE_REF=definitely-missing-base" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # P7 control: all-zero GITHUB_BASE_SHA (Watson). GitHub emits an
+    # all-zero SHA when no base commit is selected. The production
+    # _is_valid_base guard rejects any candidate starting with
+    # ``0000000`` (7 zeros), so this never resolves to a usable base.
+    # The validator must fail closed and name the attempted selector.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(
+            work,
+            env_overrides={"GITHUB_BASE_SHA": "0" * 40},
+        )
+        results.append(check(
+            "P7 control: all-zero GITHUB_BASE_SHA fails closed",
+            rc == 1
+            and "Event base selector(s) could not resolve to a valid "
+            "non-HEAD commit: GITHUB_BASE_SHA=" + "0" * 40 in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # P7 control: all-zero GITHUB_BEFORE (Watson). Same GitHub default
+    # but for push events. The validator must fail closed; the message
+    # names the attempted selector.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "0001-a.md").write_text(_ADR_PROPOSED)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "1 ADR"],
+            cwd=work,
+            check=True,
+        )
+        rc, out = _run_validator(
+            work,
+            env_overrides={"GITHUB_BEFORE": "0" * 40},
+        )
+        results.append(check(
+            "P7 control: all-zero GITHUB_BEFORE fails closed",
+            rc == 1
+            and "Event base selector(s) could not resolve to a valid "
+            "non-HEAD commit: GITHUB_BEFORE=" + "0" * 40 in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # P7 control: divergent-history push (Watson #2). The push event
+    # has GITHUB_BEFORE = the old tip on ``main`` (which contains an
+    # Accepted ADR + paired grounding) and HEAD = a force-pushed commit
+    # on a divergent branch that deletes both files. Three-dot diff
+    # resolves merge-base to the empty ancestor commit (which never had
+    # the ADR), so the deletion is invisible — exit 0. Two-dot diff
+    # (used for push events) compares the old tip directly to HEAD and
+    # sees the deletion — exit 1 with "Accepted ADRs are immutable".
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # Commit A: empty (just placeholder). main == A.
+        # Branch old_main and add an Accepted ADR + paired grounding.
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "old_main"], cwd=work, check=True
+        )
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        (work / "docs" / "adr" / "0042-test.md").write_text(_ADR_ACCEPTED)
+        (work / "docs" / "grounding" / "0042-test.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "B: add accepted ADR + grounding"],
+            cwd=work,
+            check=True,
+        )
+        old_tip = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=work, text=True
+        ).strip()
+        # Create divergent history: branch from the empty ancestor A
+        # (NOT from B) and produce a new tip that does NOT contain the
+        # Accepted ADR but DOES have a docs/adr/ directory (the
+        # production validator early-returns when docs/adr/ is absent
+        # at HEAD). This simulates a force-push that rewrites main's
+        # history away from the Accepted ADR.
+        ancestor = subprocess.check_output(
+            ["git", "rev-parse", "old_main^"], cwd=work, text=True
+        ).strip()
+        subprocess.run(
+            ["git", "checkout", "-q", ancestor], cwd=work, check=True
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "new_tip"], cwd=work, check=True
+        )
+        # A different ADR file (with deliberately dissimilar content
+        # so git's auto-rename detection does not collapse it with the
+        # deleted 0042-test.md) so docs/adr/ exists at HEAD; the
+        # deletion target (0042-test.md) is absent. This is what a real
+        # force-push of an unrelated branch over main looks like: the
+        # push target lost the ADR but the directory remained.
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "adr" / "9999-other.md").write_text("# stub\n")
+        (work / "newfile.txt").write_text("force-push noise\n")
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "C: divergent tip, no 0042 ADR"],
+            cwd=work,
+            check=True,
+        )
+        # Sanity: divergent branch (new_tip) does not see the deleted
+        # ADR; merge-base with old_tip is the empty ancestor (so three-
+        # dot diff will not see the 0042 deletion).
+        files_visible = subprocess.check_output(
+            ["git", "ls-tree", "-r", "--name-only", "HEAD"],
+            cwd=work,
+            text=True,
+        ).strip().splitlines()
+        assert "docs/adr/0042-test.md" not in files_visible, (
+            "fixture invariant: new_tip must not contain the Accepted ADR"
+        )
+        merge_base = subprocess.check_output(
+            ["git", "merge-base", old_tip, "HEAD"], cwd=work, text=True
+        ).strip()
+        assert merge_base == ancestor, (
+            "fixture invariant: merge-base must be the empty ancestor "
+            "for three-dot diff to mask the 0042 deletion"
+        )
+        # Run the validator as a push event: GITHUB_BEFORE = old tip.
+        rc, out = _run_validator(
+            work,
+            env_overrides={"GITHUB_BEFORE": old_tip},
+        )
+        results.append(check(
+            "P7 control: divergent-history push catches deleted Accepted ADR",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "cannot delete grounding for Accepted ADR "
+            "docs/adr/0042-test.md" in out,
         ))
 
     failed = results.count(False)
