@@ -910,6 +910,317 @@ def main() -> int:
             "docs/adr/0042-test.md" in out,
         ))
 
+    # -----------------------------------------------------------------------
+    # Sam control: delete the COMPLETE docs/adr + docs/grounding trees in
+    # one commit so both directories are absent at HEAD (no-empty-dir
+    # post-checkout). Pre-fix code early-returned exit 0 when docs/adr/
+    # was absent, masking every deletion against the immutable-set
+    # check. Post-fix code falls through with an empty ADR set and the
+    # base/change analysis still inspects the deleted paths so both the
+    # Accepted-ADR immutability and grounding-freeze errors fire.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        # Sanity: the seed-base commit on the feature branch has the
+        # ADR + grounding in place.
+        assert (work / "docs" / "adr" / "0042-test.md").exists()
+        assert (work / "docs" / "grounding" / "0042-test.md").exists()
+        # Delete the entire docs/ tree (both directories) and commit.
+        subprocess.run(
+            ["rm", "-rf", "docs/adr", "docs/grounding"], cwd=work, check=True
+        )
+        subprocess.run(["git", "add", "-A"], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "delete entire docs tree"],
+            cwd=work, check=True,
+        )
+        # Sanity: the directories must be absent at HEAD — git won't
+        # carry empty dirs, so a successful commit here proves the
+        # deletion actually landed in the tracked tree.
+        assert not (work / "docs" / "adr").exists(), (
+            "fixture invariant: docs/adr/ must be absent at HEAD"
+        )
+        assert not (work / "docs" / "grounding").exists(), (
+            "fixture invariant: docs/grounding/ must be absent at HEAD"
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": base_sha},
+        )
+        results.append(check(
+            "Sam: delete-whole-tree fails closed (ADR immutability + grounding freeze)",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "cannot delete grounding for Accepted ADR "
+            "docs/adr/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Dario control: ADR rename evasion (BLOCKING 1, half A). ``git mv``
+    # an Accepted ADR to a new stem and rewrite the Decision body so the
+    # rewrite intent is unambiguous. Pre-fix git diff (with rename
+    # detection on) collapsed the rename to the destination path only;
+    # the deleted source was invisible, so the immutability check was
+    # dodged and the validator passed silently. The 20ea0a2 fix adds
+    # --no-renames so both halves of the rename appear in the diff and
+    # the Accepted-source immutability check fires on the deleted path.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # No grounding to avoid orphan noise on the deletion half.
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=False)
+        subprocess.run(
+            ["git", "mv", "docs/adr/0042-test.md", "docs/adr/0043-renamed.md"],
+            cwd=work, check=True,
+        )
+        mutated = (
+            (work / "docs/adr/0043-renamed.md").read_text()
+            .replace("Test decision body.", "COMPLETELY DIFFERENT DECISION.")
+        )
+        (work / "docs/adr/0043-renamed.md").write_text(mutated)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rename + rewrite accepted ADR"],
+            cwd=work, check=True,
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": base_sha},
+        )
+        results.append(check(
+            "Dario: rename + rewrite of Accepted ADR fails closed",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Dario control: PR-path ADR rename evasion (pins the three-dot
+    # diff branch at scripts/adr-governance.py :239). The push-path
+    # rename red arm above only exercises GITHUB_BEFORE (:235). A
+    # regression that drops --no-renames from the three-dot site only
+    # would pass every existing test in this file but re-open the
+    # evasion on every PR run, because PRs use the three-dot
+    # merge-base diff. This arm sets GITHUB_BASE_SHA=<base> with
+    # GITHUB_BEFORE and GITHUB_BASE_REF unset, so the validator
+    # reaches :239 and the deleted-source Accepted immutability
+    # check must fire on docs/adr/0042-test.md. Mutation proof:
+    # removing --no-renames from :239 only must make THIS row red
+    # while the push-path rename row above (GITHUB_BEFORE) stays
+    # green. The grounding half rides the same code path; one arm
+    # is sufficient to pin the PR site.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # No grounding to avoid orphan noise on the deletion half.
+        _seed_base(work, adr_text=_ADR_ACCEPTED, with_grounding=False)
+        subprocess.run(
+            ["git", "mv", "docs/adr/0042-test.md", "docs/adr/0043-renamed.md"],
+            cwd=work, check=True,
+        )
+        mutated = (
+            (work / "docs/adr/0043-renamed.md").read_text()
+            .replace("Test decision body.", "COMPLETELY DIFFERENT DECISION.")
+        )
+        (work / "docs/adr/0043-renamed.md").write_text(mutated)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rename + rewrite accepted ADR"],
+            cwd=work, check=True,
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        # GITHUB_BEFORE and GITHUB_BASE_REF are absent - the helper's
+        # default strip removes them - so the validator reaches
+        # changed_files_against_base's three-dot branch (:239)
+        # exclusively via GITHUB_BASE_SHA=base_sha here.
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BASE_SHA": base_sha},
+        )
+        results.append(check(
+            "Dario: PR-path rename + rewrite of Accepted ADR fails closed",
+            rc == 1
+            and "Accepted ADRs are immutable" in out
+            and "docs/adr/0042-test.md" in out,
+        ))
+
+    # Discriminating arm — same rename on a Proposed ADR (no rewrite).
+    # The validator must pass, proving the red-arm failure is gated on
+    # the Accepted status and not on the rename mechanism itself.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_PROPOSED, with_grounding=False)
+        subprocess.run(
+            ["git", "mv", "docs/adr/0042-test.md", "docs/adr/0043-renamed.md"],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rename proposed ADR"],
+            cwd=work, check=True,
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": base_sha},
+        )
+        results.append(check(
+            "Dario fail-arm: rename of Proposed ADR is allowed",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Dario control: grounding rename evasion (BLOCKING 1, half B).
+    # ``git mv`` the grounding of an Accepted ADR onto the stem of a
+    # Proposed ADR so the source path is deleted and the destination
+    # path is on a non-Accepted ADR. Pre-fix git diff collapsed the
+    # rename to the destination only; the deleted source was invisible
+    # so the grounding-freeze check was dodged. With --no-renames the
+    # deleted source is reported and the freeze fires on the deleted
+    # path. The destination is paired with a Proposed ADR so the
+    # orphan check does not produce noise.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        # Add a Proposed ADR at the destination stem so the renamed
+        # grounding will be paired (avoids orphan noise). Do NOT
+        # pre-create the destination grounding file — ``git mv`` will
+        # create it from the source content. Pre-creating the
+        # destination would also conflict with ``git mv``'s refusal
+        # to overwrite an existing destination.
+        (work / "docs/adr" / "0050-other.md").write_text(_ADR_PROPOSED)
+        subprocess.run(
+            [
+                "git", "mv",
+                "docs/grounding/0042-test.md",
+                "docs/grounding/0050-other.md",
+            ],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "rename grounding 0042 onto 0050 stem"],
+            cwd=work, check=True,
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": base_sha},
+        )
+        results.append(check(
+            "Dario: grounding rename (Accepted source) fails closed",
+            rc == 1
+            and "cannot delete grounding for Accepted ADR "
+            "docs/adr/0042-test.md" in out,
+        ))
+
+    # Discriminating arm — same cross-stem rename but on a Proposed
+    # ADR's grounding. The validator must pass, proving the red-arm
+    # failure is gated on the Accepted source and not on the rename
+    # itself or on the orphan check.
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        # Two Proposed ADRs at the base; only the source ADR has a
+        # paired grounding so the destination stem is unoccupied at
+        # base — ``git mv`` then creates the destination grounding
+        # cleanly (it refuses to overwrite an existing destination).
+        (work / "docs" / "adr").mkdir(parents=True)
+        (work / "docs" / "grounding").mkdir(parents=True)
+        for stem in ("0050-a", "0051-b"):
+            (work / "docs" / "adr" / f"{stem}.md").write_text(_ADR_PROPOSED)
+        (work / "docs/grounding" / "0050-a.md").write_text(_GROUNDING)
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            ["git", "commit", "-q", "-m", "2 proposed ADRs, 1 grounding"],
+            cwd=work, check=True,
+        )
+        subprocess.run(
+            ["git", "checkout", "-q", "-b", "feature"], cwd=work, check=True,
+        )
+        subprocess.run(
+            [
+                "git", "mv",
+                "docs/grounding/0050-a.md",
+                "docs/grounding/0051-b.md",
+            ],
+            cwd=work, check=True,
+        )
+        subprocess.run(["git", "add", "."], cwd=work, check=True)
+        subprocess.run(
+            [
+                "git", "commit", "-q",
+                "-m",
+                "rename proposed grounding 0050-a -> 0051-b",
+            ],
+            cwd=work, check=True,
+        )
+        base_sha = subprocess.check_output(
+            ["git", "rev-parse", "HEAD^"], cwd=work, text=True
+        ).strip()
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": base_sha},
+        )
+        results.append(check(
+            "Dario fail-arm: grounding rename between Proposed stems is allowed",
+            rc == 0 and "ADR governance passed" in out,
+        ))
+
+    # -----------------------------------------------------------------------
+    # Dario BLOCKING 2 control: abbreviated GITHUB_BEFORE that resolves
+    # to HEAD must fail closed. The pre-existing P7 controls use
+    # unresolvable selectors (random hex / all-zero) and the all-zero
+    # GITHUB_BASE_SHA — every one of them is rejected by raw string
+    # comparison without ever exercising _resolve, so a regression
+    # that drops _resolve(before) would still pass all 28 existing
+    # tests. Abbreviated HEAD is the discriminating input: under the
+    # raw-string regression the abbrev differs from the full HEAD SHA,
+    # _is_valid_base accepts it, changed_files_against_base runs
+    # ``git diff abbrev HEAD`` (which resolves to an empty diff) and
+    # the validator returns 0 — exactly the failure this control
+    # guards against.
+    # -----------------------------------------------------------------------
+    with tempfile.TemporaryDirectory() as tmp:
+        work = Path(tmp)
+        _init_repo(work)
+        _seed_base(work, adr_text=_ADR_ACCEPTED)
+        head_full = subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=work, text=True
+        ).strip()
+        head_abbrev = head_full[:8]
+        # Sanity: the abbreviated SHA must resolve to the full HEAD
+        # SHA — otherwise this control is not actually exercising the
+        # _resolve path.
+        resolved = subprocess.check_output(
+            ["git", "rev-parse", head_abbrev], cwd=work, text=True
+        ).strip()
+        assert resolved == head_full, (
+            "fixture invariant: abbreviated HEAD SHA must resolve to full HEAD"
+        )
+        rc, out = _run_validator(
+            work, env_overrides={"GITHUB_BEFORE": head_abbrev},
+        )
+        results.append(check(
+            "Dario: abbreviated GITHUB_BEFORE resolves to HEAD and fails closed",
+            rc == 1
+            and f"GITHUB_BEFORE={head_abbrev}" in out
+            and "could not resolve to a valid non-HEAD commit" in out,
+        ))
+
     failed = results.count(False)
     print(f"\n{len(results) - failed}/{len(results)} passed")
     return 1 if failed else 0
