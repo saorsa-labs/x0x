@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 pub use self::diagnostics::{
-    GroupCounters, GroupDiagnostic, GroupsDiagnostics, GroupsDiagnosticsSnapshot,
+    CausalGauges, GroupCounters, GroupDiagnostic, GroupsDiagnostics, GroupsDiagnosticsSnapshot,
 };
 pub use self::directory::GroupCard;
 pub use self::discovery::{

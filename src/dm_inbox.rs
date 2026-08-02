@@ -1058,6 +1058,7 @@ mod tests {
             sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
             verified: true,
             trust_level: Some(TrustLevel::Trusted),
+            raw_envelope: None,
         }
     }
 

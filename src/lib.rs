@@ -7539,6 +7539,33 @@ impl Agent {
             })
     }
 
+    /// Publish to a topic and return the signed V2 envelope bytes when
+    /// signing is enabled.
+    ///
+    /// ADR 0028: the caller needs the exact requester-signed V2 wire bytes to
+    /// offer to the authority for predecessor relay.
+    pub async fn publish_and_get_envelope(
+        &self,
+        topic: &str,
+        payload: Vec<u8>,
+    ) -> error::Result<Option<bytes::Bytes>> {
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "gossip runtime not initialized - configure agent with network first",
+            ))
+        })?;
+        runtime
+            .pubsub()
+            .publish_and_get_envelope(topic.to_string(), bytes::Bytes::from(payload))
+            .await
+            .map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "publish failed: {}",
+                    e
+                )))
+            })
+    }
+
     /// Get connected peer IDs.
     ///
     /// Returns the list of peers currently connected via the gossip network.
@@ -16053,6 +16080,7 @@ fn verified_identity_origin_message(sender: &identity::AgentKeypair) -> gossip::
         sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
         verified: true,
         trust_level: None,
+        raw_envelope: None,
     }
 }
 

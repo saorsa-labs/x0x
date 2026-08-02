@@ -705,9 +705,15 @@ async fn group_deleted_tombstone_prunes_recovery_cache_memory_and_disk() -> Resu
         commit: Some(commit),
     };
 
-    let applied =
-        apply_named_group_metadata_event_inner(state, event, state.agent.agent_id(), true, true)
-            .await;
+    let applied = apply_named_group_metadata_event_inner(
+        state,
+        event,
+        state.agent.agent_id(),
+        true,
+        true,
+        None,
+    )
+    .await;
     assert!(
         applied,
         "GroupDeleted committed through the production apply path"
@@ -748,7 +754,7 @@ async fn group_deleted_tombstone_prunes_independent_witness_memory_and_disk() ->
     let raw = without_recovery_attestation(fixture.event.clone());
     let cache_key = join_result_key(&fixture.group_id, &fixture.member_hex);
     assert!(
-        !apply_named_group_metadata_event(&witness, raw, fixture.member_id, true).await,
+        !apply_named_group_metadata_event(&witness, raw, fixture.member_id, true, None).await,
         "independent witness retains without authoring membership"
     );
     assert!(witness
@@ -787,7 +793,7 @@ async fn group_deleted_tombstone_prunes_independent_witness_memory_and_disk() ->
         commit: Some(commit),
     };
     assert!(
-        apply_named_group_metadata_event_inner(&witness, event, authority, true, true).await,
+        apply_named_group_metadata_event_inner(&witness, event, authority, true, true, None).await,
         "signed GroupDeleted commits on the independent witness"
     );
     assert!(witness
@@ -1570,7 +1576,7 @@ async fn non_inviter_witness_insert_blocks_terminal_pruning_at_membership_bounda
     let apply_state = Arc::clone(&witness);
     let apply_member = fixture.member_id;
     let witness_apply = tokio::spawn(async move {
-        apply_named_group_metadata_event(&apply_state, raw, apply_member, true).await
+        apply_named_group_metadata_event(&apply_state, raw, apply_member, true, None).await
     });
     entered.notified().await;
 
@@ -1609,8 +1615,14 @@ async fn non_inviter_witness_insert_blocks_terminal_pruning_at_membership_bounda
     let terminal_state = Arc::clone(&witness);
     let terminal_authority = authority;
     let terminal = tokio::spawn(async move {
-        apply_named_group_metadata_event(&terminal_state, terminal_event, terminal_authority, true)
-            .await
+        apply_named_group_metadata_event(
+            &terminal_state,
+            terminal_event,
+            terminal_authority,
+            true,
+            None,
+        )
+        .await
     });
 
     // Prove the membership boundary is held: a direct probe of the same

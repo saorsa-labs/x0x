@@ -449,6 +449,66 @@ pub(in crate::server) struct PendingTreeKemMetadataEvent {
     queued_at: Instant,
 }
 
+/// ADR 0028: a `JoinRequestApproved` that arrived before its matching
+/// `JoinRequestCreated` predecessor. The approval is durably queued without
+/// mutating group state until the predecessor arrives and the ordinary
+/// validator accepts the approval's signed `prev_state_hash` at the
+/// receiver's then-current frontier.
+/// A durably-persisted causal approval entry. Stores the exact signed V2
+/// envelope, its blake3 digest, byte size, and absolute time coordinates so
+/// the queue survives restart and rejects non-identical conflicts.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct PendingCausalApproval {
+    /// The exact signed V2 wire envelope bytes for the approval.
+    envelope_bytes: Vec<u8>,
+    /// blake3 digest of `envelope_bytes` (dedup + conflict key component).
+    digest: [u8; 32],
+    /// Serialized byte size of `envelope_bytes`.
+    pub(in crate::server) byte_size: usize,
+    /// The `JoinRequestApproved` event decoded from the envelope.
+    event: NamedGroupMetadataEvent,
+    /// The authenticated carrier (active admin) who sent the approval.
+    /// Transport-level sender, NOT the requester.
+    sender: AgentId,
+    /// Unix-epoch millis when first observed (serializable absolute time).
+    first_seen_ms: u64,
+    /// Unix-epoch millis when the entry expires (first_seen_ms + retention).
+    expires_at_ms: u64,
+    /// The request identity the approval depends on.
+    request_id: String,
+    /// The requester identity the approval depends on.
+    requester_agent_id: String,
+    /// The signed group revision of the approval (for ordering + conflict).
+    revision: u64,
+}
+
+/// ADR 0028 bounds: maximum queued approvals per group.
+const CAUSAL_APPROVAL_PER_GROUP_CAP: usize = 64;
+/// ADR 0028 bounds: maximum queued approvals per daemon.
+const CAUSAL_APPROVAL_PER_DAEMON_CAP: usize = 1024;
+/// ADR 0028 bounds: maximum serialized bytes per group in the queue.
+const CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP: usize = 1024 * 1024; // 1 MiB
+/// ADR 0028 bounds: maximum serialized bytes per daemon in the queue.
+const CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP: usize = 16 * 1024 * 1024; // 16 MiB
+/// ADR 0028 retention: 5 minutes from first observation.
+const CAUSAL_APPROVAL_RETENTION_MS: u64 = 5 * 60 * 1000;
+/// ADR 0028: max signed envelope size.
+pub(in crate::server) const CAUSAL_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
+/// ADR 0028 relay retry offsets (seconds): 0, 1, 2, 4, 8, 16, 30, 60, 120, 240.
+#[allow(dead_code)]
+const CAUSAL_RELAY_RETRY_SECS: &[u64] = &[0, 1, 2, 4, 8, 16, 30, 60, 120, 240];
+/// ADR 0028: max relayed predecessor outbox envelopes per group.
+pub(in crate::server) const CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP: usize = 64;
+/// ADR 0028: max relayed predecessor outbox bytes per group.
+pub(in crate::server) const CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP: usize = 1024 * 1024; // 1 MiB
+/// ADR 0028: max relayed predecessor outbox bytes per daemon.
+pub(in crate::server) const CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP: usize = 16 * 1024 * 1024;
+/// ADR 0028: max relayed predecessor outbox envelopes per daemon.
+pub(in crate::server) const CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP: usize = 1024;
+/// ADR 0028: max relay target obligations per daemon.
+#[allow(dead_code)]
+const CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP: usize = 4096;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct TreeKemCatchupRequest {
     pub(in crate::server) message_type: String,
@@ -510,7 +570,9 @@ pub(in crate::server) fn named_group_metadata_event_kind(
     }
 }
 
-fn named_group_metadata_event_group_id(event: &NamedGroupMetadataEvent) -> &str {
+pub(in crate::server) fn named_group_metadata_event_group_id(
+    event: &NamedGroupMetadataEvent,
+) -> &str {
     match event {
         NamedGroupMetadataEvent::MemberAdded { group_id, .. }
         | NamedGroupMetadataEvent::MemberRemoved { group_id, .. }
@@ -1905,6 +1967,53 @@ async fn publish_named_group_metadata_event(
         }
         Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
     }
+}
+
+/// Publish a named-group metadata event and return the signed V2 envelope
+/// bytes when signing is enabled.
+///
+/// ADR 0028: `create_join_request` uses this to obtain the exact
+/// requester-signed V2 wire bytes so they can be offered to the authority for
+/// predecessor relay. The authority relays these bytes unchanged — the relay
+/// is a courier, not an author.
+async fn publish_named_group_metadata_event_with_envelope(
+    state: &AppState,
+    metadata_topic: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Option<Bytes> {
+    #[cfg(test)]
+    if let Ok(mut attempts) = NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST.lock() {
+        attempts.push((
+            metadata_topic.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+            named_group_metadata_event_recipient(event).map(str::to_string),
+        ));
+    }
+
+    match serde_json::to_vec(event) {
+        Ok(bytes) => {
+            match tokio::time::timeout(
+                NAMED_GROUP_METADATA_PUBLISH_TIMEOUT,
+                state.agent.publish_and_get_envelope(metadata_topic, bytes),
+            )
+            .await
+            {
+                Ok(Ok(envelope)) => return envelope,
+                Ok(Err(e)) => {
+                    tracing::warn!(topic = %LogHexId::topic(&metadata_topic), "failed to publish named-group metadata event: {e}");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        topic = %LogHexId::topic(&metadata_topic),
+                        timeout_ms = NAMED_GROUP_METADATA_PUBLISH_TIMEOUT.as_millis() as u64,
+                        "timed out publishing named-group metadata event"
+                    );
+                }
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize named-group metadata event: {e}"),
+    }
+    None
 }
 
 /// Schedule best-effort delivery of a named-group metadata event directly to a
@@ -4107,6 +4216,7 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
             pending.sender,
             true,
             false,
+            None,
         )
         .await;
         if !applied && treekem_membership_event_frontier(&pending.event).is_some() {
@@ -4141,6 +4251,301 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
             queue.pop_front();
         }
     }
+}
+
+/// ADR 0028: attempt to queue a `JoinRequestApproved` that arrived before its
+/// matching `JoinRequestCreated` predecessor. Admission runs every check
+/// possible without the missing request; no group state is mutated. The exact
+/// V2 envelope bytes are stored for durable persistence and digest dedup.
+#[allow(clippy::too_many_arguments)]
+async fn try_queue_causal_approval(
+    state: &Arc<AppState>,
+    group_id: &str,
+    info: &x0x::groups::GroupInfo,
+    event: NamedGroupMetadataEvent,
+    sender: AgentId,
+    request_id: &str,
+    requester_agent_id: &str,
+    envelope_bytes: Option<&[u8]>,
+) {
+    // Admission: syntactically valid identities.
+    if request_id.is_empty() || requester_agent_id.is_empty() {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = "empty_identity",
+            group_id = %LogHexId::group(group_id),
+        );
+        return;
+    }
+
+    // Admission: envelope bytes must be available for durable persistence.
+    let Some(env_bytes) = envelope_bytes else {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = "no_envelope",
+            group_id = %LogHexId::group(group_id),
+        );
+        return;
+    };
+
+    // Admission: envelope within byte limit.
+    if env_bytes.len() > CAUSAL_ENVELOPE_MAX_BYTES {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = "envelope_too_large",
+            group_id = %LogHexId::group(group_id),
+            size = env_bytes.len(),
+        );
+        return;
+    }
+
+    // Admission: requester not already an active member (already approved).
+    if info.has_active_member(requester_agent_id) {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = "already_member",
+            group_id = %LogHexId::group(group_id),
+            requester = %LogHexId::agent(requester_agent_id),
+        );
+        return;
+    }
+
+    // Admission: requester not banned.
+    if info.is_banned(requester_agent_id) {
+        tracing::debug!(
+            target: "treekem.trace",
+            stage = "causal_queue_reject",
+            reason = "banned",
+            group_id = %LogHexId::group(group_id),
+            requester = %LogHexId::agent(requester_agent_id),
+        );
+        state.groups_diagnostics.record_causal_invalid(group_id);
+        return;
+    }
+
+    // Extract the signed revision for ordering and conflict detection.
+    let revision = match &event {
+        NamedGroupMetadataEvent::JoinRequestApproved { revision, .. } => *revision,
+        _ => return,
+    };
+
+    let now_ms = now_millis_u64();
+    let digest = blake3::hash(env_bytes);
+    let byte_size = env_bytes.len();
+
+    let approval = PendingCausalApproval {
+        envelope_bytes: env_bytes.to_vec(),
+        digest: digest.into(),
+        byte_size,
+        event,
+        sender,
+        first_seen_ms: now_ms,
+        expires_at_ms: now_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS),
+        request_id: request_id.to_string(),
+        requester_agent_id: requester_agent_id.to_string(),
+        revision,
+    };
+
+    {
+        let mut queue_lock = state.causal_approval_queue.write().await;
+
+        // Pre-check per-daemon count and byte caps.
+        let (total_count, total_bytes): (usize, usize) = queue_lock
+            .values()
+            .flat_map(|q| q.iter())
+            .fold((0, 0), |(c, b), e| (c + 1, b + e.byte_size));
+
+        if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
+            tracing::warn!(
+                "ADR 0028: causal approval queue at daemon count capacity ({CAUSAL_APPROVAL_PER_DAEMON_CAP}), rejecting"
+            );
+            state
+                .groups_diagnostics
+                .record_causal_capacity_rejected(group_id);
+            return;
+        }
+        if total_bytes + byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
+            tracing::warn!(
+                "ADR 0028: causal approval queue at daemon byte capacity ({CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP}), rejecting"
+            );
+            state
+                .groups_diagnostics
+                .record_causal_capacity_rejected(group_id);
+            return;
+        }
+
+        let queue = queue_lock.entry(group_id.to_string()).or_default();
+
+        // Dedup: exact duplicate digests coalesce, do not refresh expiry.
+        if let Some(_existing) = queue.iter().find(|q| q.digest == approval.digest) {
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "causal_queue_dedup",
+                group_id = %LogHexId::group(group_id),
+                request_id = %request_id,
+            );
+            state
+                .groups_diagnostics
+                .record_causal_deduplicated(group_id);
+            return;
+        }
+
+        // Conflict detection: non-identical approvals with the same
+        // (group, request, requester, revision) are conflicts — apply neither.
+        let conflict_key = (
+            request_id.to_string(),
+            requester_agent_id.to_string(),
+            revision,
+        );
+        let conflicting: Vec<_> = queue
+            .iter()
+            .filter(|q| {
+                (&q.request_id, &q.requester_agent_id, q.revision)
+                    == (&conflict_key.0, &conflict_key.1, conflict_key.2)
+            })
+            .collect();
+        if !conflicting.is_empty() {
+            // Non-identical conflict — reject the new entry. The existing
+            // entry remains; both are marked conflicted on drain.
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                request_id = %request_id,
+                revision = revision,
+                "ADR 0028: non-identical conflict detected, rejecting new approval"
+            );
+            state.groups_diagnostics.record_causal_conflicted(group_id);
+            return;
+        }
+
+        // Pre-check per-group count and byte caps.
+        let (group_count, group_bytes): (usize, usize) = queue
+            .iter()
+            .fold((0, 0), |(c, b), e| (c + 1, b + e.byte_size));
+        if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "ADR 0028: causal approval queue at per-group count capacity ({CAUSAL_APPROVAL_PER_GROUP_CAP}), rejecting"
+            );
+            state
+                .groups_diagnostics
+                .record_causal_capacity_rejected(group_id);
+            return;
+        }
+        if group_bytes + byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "ADR 0028: causal approval queue at per-group byte capacity ({CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP}), rejecting"
+            );
+            state
+                .groups_diagnostics
+                .record_causal_capacity_rejected(group_id);
+            return;
+        }
+
+        queue.push_back(approval);
+        // Sort by signed revision for ordered drain.
+        queue.make_contiguous().sort_by_key(|a| a.revision);
+    }
+
+    // Persist the queue sidecar after admission.
+    save_causal_approval_queue(state).await;
+
+    state.groups_diagnostics.record_causal_queued(group_id);
+
+    tracing::info!(
+        group_id = %LogHexId::group(group_id),
+        request_id = %request_id,
+        requester = %LogHexId::agent(requester_agent_id),
+        "ADR 0028: queued JoinRequestApproved awaiting predecessor JoinRequestCreated"
+    );
+}
+
+/// ADR 0028: drain queued causal approvals after a group-state advance. Each
+/// entry is retried with the full ordinary validator (queueing disabled). An
+/// approval applies exactly once only when its matching request is pending and
+/// the ordinary validator accepts its signed `prev_state_hash` at the
+/// receiver's then-current frontier. Group state is persisted before removing
+/// an applied queue entry so a crash between the two leaves the entry stale
+/// rather than lost.
+async fn replay_pending_causal_approvals(state: &Arc<AppState>, group_id: &str) {
+    let entries = {
+        let mut queue_lock = state.causal_approval_queue.write().await;
+        let Some(queue) = queue_lock.get_mut(group_id) else {
+            return;
+        };
+        let now_ms = now_millis_u64();
+        // Drop expired entries and count them for diagnostics.
+        let expired_count = queue.iter().filter(|q| q.expires_at_ms <= now_ms).count();
+        if expired_count > 0 {
+            state.groups_diagnostics.record_causal_expired(group_id);
+        }
+        queue.retain(|q| q.expires_at_ms > now_ms);
+        // Drain remaining for retry (already sorted by revision).
+        let entries: Vec<_> = queue.drain(..).collect();
+        entries
+    };
+
+    if entries.is_empty() {
+        return;
+    }
+
+    let mut still_pending = VecDeque::new();
+    for pending in entries {
+        state.groups_diagnostics.record_causal_retried(group_id);
+        // Re-run the full ordinary approval apply with queueing disabled.
+        // Boxed to break the async recursion cycle
+        // (apply_named_group_metadata_event_inner → replay → apply_inner).
+        let applied = Box::pin(apply_named_group_metadata_event_inner(
+            state,
+            pending.event.clone(),
+            pending.sender,
+            true,
+            false, // disable causal queue to prevent re-admission
+            None,  // no envelope bytes on replay (event is already decoded)
+        ))
+        .await;
+
+        if applied {
+            tracing::info!(
+                group_id = %LogHexId::group(group_id),
+                request_id = %pending.request_id,
+                "ADR 0028: queued approval drained and applied"
+            );
+            state.groups_diagnostics.record_causal_applied(group_id);
+            continue;
+        }
+
+        // Not applied — retain if still within expiry and group is live.
+        let now_ms = now_millis_u64();
+        if now_ms < pending.expires_at_ms {
+            let group_live = {
+                let groups = state.named_groups.read().await;
+                groups.get(group_id).is_some_and(|g| !g.withdrawn)
+            };
+            if group_live {
+                still_pending.push_back(pending);
+            }
+        }
+    }
+
+    if !still_pending.is_empty() {
+        let mut queue_lock = state.causal_approval_queue.write().await;
+        let queue = queue_lock.entry(group_id.to_string()).or_default();
+        for item in still_pending {
+            queue.push_back(item);
+        }
+        // Keep sorted by revision.
+        queue.make_contiguous().sort_by_key(|a| a.revision);
+    }
+
+    // Persist after drain — applied entries are removed, retained entries stay.
+    // Group state was already persisted by the inner apply before we got here;
+    // now persist the queue sidecar.
+    save_causal_approval_queue(state).await;
 }
 
 async fn member_keyed_treekem_catchup_response(
@@ -4339,7 +4744,7 @@ pub(in crate::server) async fn handle_treekem_catchup_response(
         let recovery_event = member_joined_kp_cache_entry(&event)
             .map(|(_, ev)| ev)
             .filter(|ev| verify_authority_attested_member_joined_recovery(&response_info, ev));
-        apply_named_group_metadata_event(state, event, *sender, true).await;
+        apply_named_group_metadata_event(state, event, *sender, true, None).await;
         if let Some(ev) = recovery_event {
             apply_recovered_member_key_package(state, &ev).await;
         }
@@ -4532,12 +4937,21 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     event: NamedGroupMetadataEvent,
     sender: AgentId,
     verified: bool,
+    envelope_bytes: Option<&[u8]>,
 ) -> bool {
     // A non-inviter may retain the first fully member-authenticated join event
     // as provisional evidence, but it cannot replace an existing entry. The
     // inviter's post-acceptance countersigned event (distributed in MemberAdded)
     // upgrades this cache authoritatively after the roster mutation succeeds.
-    apply_named_group_metadata_event_inner_serialized(state, event, sender, verified, true).await
+    apply_named_group_metadata_event_inner_serialized(
+        state,
+        event,
+        sender,
+        verified,
+        true,
+        envelope_bytes,
+    )
+    .await
 }
 
 async fn apply_named_group_metadata_event_inner(
@@ -4546,17 +4960,27 @@ async fn apply_named_group_metadata_event_inner(
     sender: AgentId,
     verified: bool,
     allow_queue: bool,
+    envelope_bytes: Option<&[u8]>,
 ) -> bool {
-    apply_named_group_metadata_event_inner_serialized(state, event, sender, verified, allow_queue)
-        .await
+    apply_named_group_metadata_event_inner_serialized(
+        state,
+        event,
+        sender,
+        verified,
+        allow_queue,
+        envelope_bytes,
+    )
+    .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn apply_named_group_metadata_event_inner_serialized(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
     verified: bool,
     allow_queue: bool,
+    envelope_bytes: Option<&[u8]>,
 ) -> bool {
     let event_kind = named_group_metadata_event_kind(&event);
     let sender_hex = hex::encode(sender.as_bytes());
@@ -5016,6 +5440,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
             true
@@ -5123,6 +5548,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 )
                 .await;
                 save_named_groups(state).await;
+                replay_pending_causal_approvals(state, &resolved_group_key).await;
                 save_mls_groups(state).await;
                 let _ =
                     prune_treekem_cache_groups(state, &cache_aliases, "member_removed_self").await;
@@ -5161,6 +5587,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
             let _ =
@@ -5259,6 +5686,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::MemberRoleUpdated {
@@ -5309,6 +5737,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::MemberBanned {
@@ -5411,6 +5840,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             remember_treekem_membership_event(state, &event_for_log).await;
             if banned_self {
                 let _ =
@@ -5467,6 +5897,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::JoinRequestCreated {
@@ -5556,6 +5987,9 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
             save_named_groups(state).await;
+            // ADR 0028: a JoinRequestCreated just advanced the group state.
+            // Drain queued approvals that may now have their predecessor.
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
@@ -5581,6 +6015,24 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
             let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
+                // ADR 0028: the pending request is absent — the predecessor
+                // JoinRequestCreated may not have arrived yet. Attempt to
+                // queue the approval in the causal approval queue. No group
+                // state is mutated at admission. The approval will be
+                // retried after each accepted state advance.
+                if allow_queue && info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+                    try_queue_causal_approval(
+                        state,
+                        &resolved_group_key,
+                        &info,
+                        event_for_log.clone(),
+                        sender,
+                        &request_id,
+                        &requester_agent_id,
+                        envelope_bytes,
+                    )
+                    .await;
+                }
                 return false;
             };
             if !req_snapshot.is_pending() {
@@ -5751,7 +6203,12 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             remember_treekem_membership_event(state, &event_for_log).await;
+            // ADR 0028: a successful JoinRequestApproved advanced the group
+            // state. Drain queued approvals — a multi-request batch may have
+            // the next approval's frontier now reachable.
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             true
         }
         NamedGroupMetadataEvent::JoinRequestRejected {
@@ -5794,6 +6251,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::JoinRequestCancelled {
@@ -5831,6 +6289,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::GroupCardPublished { card, .. } => {
@@ -5898,6 +6357,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             false
         }
         NamedGroupMetadataEvent::SecureShareDelivered {
@@ -5996,6 +6456,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 return false;
             }
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             tracing::info!(
                 group_id = %ev_group_id,
                 secret_epoch,
@@ -6367,6 +6828,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // /groups/:id/members and /diagnostics/groups as the acceptance
             // signal for this path.
             save_named_groups(state).await;
+            replay_pending_causal_approvals(state, &resolved_group_key).await;
             state
                 .groups_diagnostics
                 .record_member_joined(&resolved_group_key);
@@ -6518,7 +6980,14 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                     let Some(msg) = maybe_msg else { break; };
                     let Some(sender) = msg.sender else { continue; };
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
-                    let should_exit = apply_named_group_metadata_event(&state_for_task, event, sender, msg.verified).await;
+                    let should_exit = apply_named_group_metadata_event(
+                        &state_for_task,
+                        event,
+                        sender,
+                        msg.verified,
+                        msg.raw_envelope.as_deref(),
+                    )
+                    .await;
                     if should_exit { break; }
                 }
             }
@@ -6960,6 +7429,93 @@ const PUBLIC_MESSAGE_HISTORY_CAP: usize = 512;
 const GLOBAL_PUBLIC_MESSAGE_TOPIC: &str = "x0x.groups.public.v1";
 
 pub(in crate::server) const GROUP_PUBLIC_MESSAGE_DM_PREFIX: &[u8] = b"X0X-GROUP-PUBLIC-V1\n";
+
+/// ADR 0028: typed DM prefix for a relayed predecessor envelope. The payload
+/// after this prefix is the original requester-signed V2 pubsub wire bytes —
+/// NOT decoded JSON. The receiver decodes the V2 envelope to verify the
+/// requester's ML-DSA-65 signature independently of the carrier's identity.
+pub(in crate::server) const GROUP_PREDECESSOR_RELAY_DM_PREFIX: &[u8] =
+    b"X0X-GROUP-PREDECESSOR-RELAY-V1\n";
+
+/// ADR 0028: relay the exact requester-signed V2 envelope bytes to every
+/// non-local active member of the group. The relay is a courier — it forwards
+/// the requester's ML-DSA-65 signature unchanged. The receiver independently
+/// verifies the requester's signature before applying the event.
+pub(in crate::server) async fn relay_predecessor_to_active_witnesses(
+    state: &AppState,
+    group_id: &str,
+    envelope_bytes: &[u8],
+) {
+    let (recipients, info) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return;
+        };
+        let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let recipients: Vec<String> = info
+            .active_members()
+            .filter(|m| !m.agent_id.eq_ignore_ascii_case(&local_agent_hex))
+            .map(|m| m.agent_id.clone())
+            .collect();
+        (recipients, info.clone())
+    };
+
+    let agent = Arc::clone(&state.agent);
+    for recipient_hex in recipients {
+        let Ok(recipient_id) = parse_agent_id_hex(&recipient_hex) else {
+            continue;
+        };
+        let mut dm_payload =
+            Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope_bytes.len());
+        dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+        dm_payload.extend_from_slice(envelope_bytes);
+        let recipient = recipient_hex.clone();
+        let agent = Arc::clone(&agent);
+        tokio::spawn(async move {
+            if let Err(e) = agent
+                .send_direct_with_config(
+                    &recipient_id,
+                    dm_payload,
+                    named_group_direct_delivery_config(),
+                )
+                .await
+            {
+                tracing::warn!(
+                    recipient = %LogHexId::agent(&recipient),
+                    "ADR 0028: failed to relay predecessor envelope to witness: {e}"
+                );
+            }
+        });
+    }
+    let _ = info; // suppress unused warning if no recipients
+}
+
+/// A durably-persisted predecessor relay obligation. Stores the exact
+/// requester-signed V2 envelope, relay targets, and retry progress so the
+/// outbox survives restart and resumes from absolute time.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct PredecessorRelayObligation {
+    /// The exact requester-signed V2 wire envelope bytes.
+    pub(in crate::server) envelope_bytes: Vec<u8>,
+    /// blake3 digest of the envelope bytes (dedup key).
+    pub(in crate::server) digest: [u8; 32],
+    /// Serialized byte size of `envelope_bytes`.
+    pub(in crate::server) byte_size: usize,
+    /// Unix-epoch millis when the obligation was first created (for retry).
+    pub(in crate::server) first_seen_ms: u64,
+    /// Unix-epoch millis for the next scheduled relay attempt.
+    pub(in crate::server) next_retry_at_ms: u64,
+    /// Number of relay attempts completed so far.
+    pub(in crate::server) retry_count: u32,
+    /// The group id this obligation belongs to.
+    pub(in crate::server) group_id: String,
+    /// The request id this predecessor carries.
+    pub(in crate::server) request_id: String,
+    /// The requester agent id this predecessor carries.
+    pub(in crate::server) requester_agent_id: String,
+    /// Active witness AgentIds (hex) that still need delivery.
+    pub(in crate::server) relay_targets: Vec<String>,
+}
 
 /// Request body for `POST /groups/:id/send`.
 #[derive(Debug, Deserialize)]
@@ -9998,7 +10554,7 @@ pub(in crate::server) struct CreateJoinRequestBody {
     message: Option<String>,
 }
 
-fn now_millis_u64() -> u64 {
+pub(in crate::server) fn now_millis_u64() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
@@ -10994,7 +11550,39 @@ pub(in crate::server) async fn create_join_request(
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
-    let _ = creator_hex; // reserved for direct-notification future enhancement
+
+    // ADR 0028: offer the requester-signed predecessor envelope to the group
+    // authority (creator) for relay to active witnesses. The authority is the
+    // courier — it forwards the exact V2 bytes unchanged; the requester's
+    // ML-DSA-65 signature is preserved. The direct offer does not create a
+    // second author.
+    let envelope_bytes =
+        publish_named_group_metadata_event_with_envelope(&state, &metadata_topic, &event).await;
+    if let Some(envelope) = envelope_bytes {
+        if let Ok(creator_id) = parse_agent_id_hex(&creator_hex) {
+            let mut dm_payload =
+                Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + envelope.len());
+            dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+            dm_payload.extend_from_slice(&envelope);
+            let agent = Arc::clone(&state.agent);
+            let creator = creator_hex.clone();
+            tokio::spawn(async move {
+                if let Err(e) = agent
+                    .send_direct_with_config(
+                        &creator_id,
+                        dm_payload,
+                        named_group_direct_delivery_config(),
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        creator = %LogHexId::agent(&creator),
+                        "ADR 0028: failed to offer predecessor envelope to authority: {e}"
+                    );
+                }
+            });
+        }
+    }
 
     (
         StatusCode::CREATED,
@@ -13323,6 +13911,170 @@ pub(in crate::server) async fn load_named_groups(
     }
 }
 
+/// ADR 0028: persist the causal approval queue to a durable sidecar file.
+/// Uses the same atomic-replace discipline as `save_named_groups`.
+pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) {
+    let json = {
+        let queue = state.causal_approval_queue.read().await;
+        match serde_json::to_string(&*queue) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize causal approval queue: {e}");
+                return;
+            }
+        }
+    };
+    if let Err(e) = write_named_groups_json_atomic(&state.causal_approval_queue_path, &json).await {
+        tracing::error!("Failed to save causal approval queue: {e}");
+    }
+}
+
+/// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
+pub(in crate::server) async fn save_predecessor_relay_outbox(state: &AppState) {
+    let json = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        match serde_json::to_string(&*outbox) {
+            Ok(j) => j,
+            Err(e) => {
+                tracing::error!("Failed to serialize predecessor relay outbox: {e}");
+                return;
+            }
+        }
+    };
+    if let Err(e) =
+        write_named_groups_json_atomic(&state.predecessor_relay_outbox_path, &json).await
+    {
+        tracing::error!("Failed to save predecessor relay outbox: {e}");
+    }
+}
+
+/// ADR 0028: load the causal approval queue from the durable sidecar on
+/// restart. Enforces byte and count caps, drops expired/malformed records.
+pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
+    let path = &state.causal_approval_queue_path;
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return; // no sidecar yet — fresh start
+    };
+    let Ok(json_str) = std::str::from_utf8(&bytes) else {
+        tracing::warn!("causal approval queue sidecar not UTF-8, ignoring");
+        return;
+    };
+    let Ok(loaded): Result<HashMap<String, VecDeque<PendingCausalApproval>>, _> =
+        serde_json::from_str(json_str)
+    else {
+        tracing::warn!("causal approval queue sidecar malformed, ignoring");
+        return;
+    };
+    let now_ms = now_millis_u64();
+    let mut total_count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut queue = HashMap::new();
+    for (group_id, entries) in loaded {
+        let mut filtered = VecDeque::new();
+        let mut group_count = 0usize;
+        let mut group_bytes = 0usize;
+        for entry in entries {
+            // Drop expired.
+            if entry.expires_at_ms <= now_ms {
+                continue;
+            }
+            // Drop oversized.
+            if entry.byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
+                continue;
+            }
+            // Enforce per-group caps.
+            if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
+                break;
+            }
+            if group_bytes + entry.byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
+                break;
+            }
+            // Enforce per-daemon caps.
+            if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
+                break;
+            }
+            if total_bytes + entry.byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
+                break;
+            }
+            group_count += 1;
+            group_bytes += entry.byte_size;
+            total_count += 1;
+            total_bytes += entry.byte_size;
+            filtered.push_back(entry);
+        }
+        if !filtered.is_empty() {
+            // Keep sorted by revision.
+            filtered.make_contiguous().sort_by_key(|a| a.revision);
+            queue.insert(group_id, filtered);
+        }
+    }
+    *state.causal_approval_queue.write().await = queue;
+}
+
+/// ADR 0028: load the predecessor relay outbox from the durable sidecar on
+/// restart. Enforces byte and count caps, drops expired/malformed records.
+pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
+    let path = &state.predecessor_relay_outbox_path;
+    let Ok(bytes) = tokio::fs::read(path).await else {
+        return; // no sidecar yet — fresh start
+    };
+    let Ok(json_str) = std::str::from_utf8(&bytes) else {
+        tracing::warn!("predecessor relay outbox sidecar not UTF-8, ignoring");
+        return;
+    };
+    let Ok(loaded): Result<HashMap<String, Vec<PredecessorRelayObligation>>, _> =
+        serde_json::from_str(json_str)
+    else {
+        tracing::warn!("predecessor relay outbox sidecar malformed, ignoring");
+        return;
+    };
+    let now_ms = now_millis_u64();
+    let mut total_count = 0usize;
+    let mut total_bytes = 0usize;
+    let mut outbox = HashMap::new();
+    for (group_id, entries) in loaded {
+        let mut filtered = Vec::new();
+        let mut group_count = 0usize;
+        let mut group_bytes = 0usize;
+        for entry in entries {
+            // Drop expired (5-minute retention from first_seen_ms).
+            let expires_at = entry
+                .first_seen_ms
+                .saturating_add(CAUSAL_APPROVAL_RETENTION_MS);
+            if expires_at <= now_ms {
+                continue;
+            }
+            // Drop oversized.
+            if entry.byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
+                continue;
+            }
+            // Enforce per-group caps.
+            if group_count >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+                break;
+            }
+            if group_bytes + entry.byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
+                break;
+            }
+            // Enforce per-daemon caps.
+            if total_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+                break;
+            }
+            if total_bytes + entry.byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+                break;
+            }
+            group_count += 1;
+            group_bytes += entry.byte_size;
+            total_count += 1;
+            total_bytes += entry.byte_size;
+            filtered.push(entry);
+        }
+        if !filtered.is_empty() {
+            outbox.insert(group_id, filtered);
+        }
+    }
+    *state.predecessor_relay_outbox.write().await = outbox;
+}
+
 async fn save_named_groups(state: &AppState) {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let json = {
@@ -13676,7 +14428,7 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
                 return;
             }
-            if apply_named_group_metadata_event(state, event, *sender, true).await {
+            if apply_named_group_metadata_event(state, event, *sender, true, None).await {
                 clear_expected_join_result_inviter(state.as_ref(), &expected_key);
             }
         }
@@ -14959,6 +15711,10 @@ mod tests {
             pending_welcome_waiters: RwLock::new(HashMap::new()),
             pending_welcome_acks: RwLock::new(HashMap::new()),
             treekem_pending_events: RwLock::new(HashMap::new()),
+            causal_approval_queue: RwLock::new(HashMap::new()),
+            predecessor_relay_outbox: RwLock::new(HashMap::new()),
+            causal_approval_queue_path: treekem_dir.join("causal_approval_queue.json"),
+            predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -15658,6 +16414,7 @@ mod tests {
             state.agent.agent_id(),
             true,
             true,
+            None,
         )
         .await;
         assert!(!applied, "non-GroupDeleted withdrawal commit must reject");
@@ -15702,6 +16459,7 @@ mod tests {
             state.agent.agent_id(),
             true,
             true,
+            None,
         )
         .await;
         assert!(!applied, "only GroupDeleted may terminalize a live group");
@@ -15746,6 +16504,7 @@ mod tests {
             state.agent.agent_id(),
             true,
             true,
+            None,
         )
         .await;
         assert!(applied, "GroupDeleted is the terminal withdrawal path");
@@ -15801,7 +16560,7 @@ mod tests {
             commit: Some(commit_b),
         };
         let applied_b = apply_named_group_metadata_event_inner(
-            &state, event_b, committer, /* verified = */ false, true,
+            &state, event_b, committer, /* verified = */ false, true, None,
         )
         .await;
         assert!(
@@ -15853,7 +16612,7 @@ mod tests {
             commit: Some(commit_a),
         };
         let applied_a = apply_named_group_metadata_event_inner(
-            &state, event_a, committer, /* verified = */ false, true,
+            &state, event_a, committer, /* verified = */ false, true, None,
         )
         .await;
         assert!(
@@ -16163,6 +16922,7 @@ mod tests {
             state.agent.agent_id(),
             true,
             true,
+            None,
         )
         .await;
 
@@ -16384,7 +17144,8 @@ mod tests {
         // wipes `shared_secret` to `None`) but advances epoch/binding from
         // the signed commit alone.
         let removed =
-            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
         assert!(
             removed,
             "MemberRemoved with a valid signed commit must apply (returns true)"
@@ -16407,9 +17168,14 @@ mod tests {
         // The envelope then delivers the fresh secret to the survivor. The
         // strict-< stale check accepts equal-epoch delivery while the secret
         // is still absent.
-        let delivered =
-            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
-                .await;
+        let delivered = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
         // SecureShareDelivered signals "no rebroadcast" (returns false);
         // success is observed in stored state, not in this boolean.
         assert!(
@@ -16436,9 +17202,14 @@ mod tests {
 
         // Envelope-first: the fresh secret lands before the signed remove.
         // The strict-< stale check accepts the newer epoch and installs S1.
-        let delivered =
-            apply_named_group_metadata_event(&f.state, f.envelope_event.clone(), sender, true)
-                .await;
+        let delivered = apply_named_group_metadata_event(
+            &f.state,
+            f.envelope_event.clone(),
+            sender,
+            true,
+            None,
+        )
+        .await;
         assert!(
             !delivered,
             "SecureShareDelivered returns false; success is observed in stored state"
@@ -16462,7 +17233,8 @@ mod tests {
         // equals the commit's epoch, the strict `old < new` wipe is a no-op
         // and the just-installed S1 survives (the secret is preserved).
         let removed =
-            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true).await;
+            apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
+                .await;
         assert!(
             removed,
             "MemberRemoved with a valid signed commit must apply (returns true)"
@@ -17782,7 +18554,7 @@ mod tests {
         let empty_topics = HashSet::new();
         state
             .groups_diagnostics
-            .snapshot(&groups, &empty_topics, &empty_topics)
+            .snapshot(&groups, &empty_topics, &empty_topics, &HashMap::new())
             .groups
             .into_iter()
             .find(|row| row.group_id == group_id)
@@ -17828,9 +18600,15 @@ mod tests {
                 &invite_secret,
                 x0x::groups::GroupRole::Admin,
             )?;
-        let should_exit =
-            apply_named_group_metadata_event_inner(&state, forged_admin, forger_id, true, true)
-                .await;
+        let should_exit = apply_named_group_metadata_event_inner(
+            &state,
+            forged_admin,
+            forger_id,
+            true,
+            true,
+            None,
+        )
+        .await;
         assert!(!should_exit);
         let counters = group_counters_for_test(&state, &group_id).await;
         assert_eq!(
@@ -17851,6 +18629,7 @@ mod tests {
             forger_id,
             true,
             true,
+            None,
         )
         .await;
         assert!(!should_exit);
@@ -18245,6 +19024,7 @@ mod tests {
             fixture.member_id,
             true,
             true,
+            None,
         )
         .await;
 
@@ -18283,6 +19063,7 @@ mod tests {
             fixture.member_id,
             true,
             true,
+            None,
         )
         .await;
 
@@ -20490,6 +21271,7 @@ mod tests {
             without_recovery_attestation(fixture.event.clone()),
             fixture.member_id,
             true,
+            None,
         )
         .await;
         assert_eq!(
@@ -20900,6 +21682,7 @@ mod tests {
             raw_join_event.clone(),
             fixture.member_id,
             true,
+            None,
         )
         .await;
 
@@ -20944,6 +21727,7 @@ mod tests {
             raw_join_event,
             fixture.member_id,
             true,
+            None,
         )
         .await;
         let authority_event = {
@@ -20981,6 +21765,7 @@ mod tests {
                 authority_event,
                 fixture.state.agent.agent_id(),
                 true,
+                None
             )
             .await,
             "W applies O's compact authority commit without gaining authority"
@@ -20991,6 +21776,7 @@ mod tests {
                 authority_recovery,
                 fixture.state.agent.agent_id(),
                 true,
+                None
             )
             .await,
             "independent recovery delivery never mutates the roster"
@@ -21052,6 +21838,7 @@ mod tests {
                 raw_join_event.clone(),
                 fixture.member_id,
                 true,
+                None
             )
             .await,
             "W retains B's signed event without exercising inviter mutation authority"
@@ -21065,8 +21852,14 @@ mod tests {
             "independent witness W retained B's recovery record"
         );
 
-        let _ = apply_named_group_metadata_event(&o_state, raw_join_event, fixture.member_id, true)
-            .await;
+        let _ = apply_named_group_metadata_event(
+            &o_state,
+            raw_join_event,
+            fixture.member_id,
+            true,
+            None,
+        )
+        .await;
         let authority_event = {
             let logs = o_state.treekem_event_log.read().await;
             logs.get(&stable_group_id)
@@ -21093,6 +21886,7 @@ mod tests {
                 authority_event,
                 o_state.agent.agent_id(),
                 true,
+                None
             )
             .await,
             "W upgrades its provisional cache from O's authority commit"
@@ -21103,6 +21897,7 @@ mod tests {
                 authority_recovery,
                 o_state.agent.agent_id(),
                 true,
+                None
             )
             .await,
             "separate recovery delivery upgrades W's cache without roster mutation"
@@ -21624,8 +22419,14 @@ mod tests {
             .remove_member(&aliases, &member_hex)
             .await;
         assert!(
-            !apply_named_group_metadata_event(state, valid_event.clone(), fixture.member_id, true,)
-                .await,
+            !apply_named_group_metadata_event(
+                state,
+                valid_event.clone(),
+                fixture.member_id,
+                true,
+                None
+            )
+            .await,
             "self-delivered recovery evidence never exercises roster mutation authority"
         );
         assert!(
@@ -21867,7 +22668,8 @@ mod tests {
         // (2) Receiver W applies the authority commit/hash through the
         // production apply path, even though its local snapshot held B.
         assert!(
-            apply_named_group_metadata_event(&w_state, approval_event, authority_id, true).await,
+            apply_named_group_metadata_event(&w_state, approval_event, authority_id, true, None)
+                .await,
             "receiver applies the authority JoinRequestApproved commit"
         );
         {
@@ -22220,7 +23022,8 @@ mod tests {
         let stable_group_id = fixture.stable_group_id.clone();
         let first_member = fixture.member_hex.clone();
         let raw_first = without_recovery_attestation(fixture.event.clone());
-        let _ = apply_named_group_metadata_event(state, raw_first, fixture.member_id, true).await;
+        let _ =
+            apply_named_group_metadata_event(state, raw_first, fixture.member_id, true, None).await;
 
         let later_keypair = x0x::identity::AgentKeypair::generate()?;
         let later_id = later_keypair.agent_id();
@@ -22277,7 +23080,7 @@ mod tests {
             recovery_authority_commit: None,
             signature_b64: BASE64.encode(signature.as_bytes()),
         };
-        let _ = apply_named_group_metadata_event(state, later_join, later_id, true).await;
+        let _ = apply_named_group_metadata_event(state, later_join, later_id, true, None).await;
 
         let later_added = {
             let logs = state.treekem_event_log.read().await;
@@ -22780,4 +23583,24 @@ mod tests {
         let parsed: BTreeMap<String, serde_json::Value> = serde_json::from_str(&on_disk)?;
         Ok(parsed.into_keys().collect())
     }
+}
+
+// ─── ADR 0028 cfg(test) child module ──────────────────────────────────────
+// Controls 1–5 call private decode/apply/queue/drain/persistence functions
+// directly. No route in any shipped binary. Control 5 reconstructs state
+// from the durable sidecar to exercise restart. Control 6 is the unchanged
+// five-daemon family in tests/active_recipient_sealing_gates.rs.
+
+#[cfg(test)]
+mod adr0028 {
+    // This module is a child of named_groups, so it has access to all
+    // private functions: try_queue_causal_approval, replay_pending_causal_approvals,
+    // apply_named_group_metadata_event_inner, save_causal_approval_queue,
+    // load_causal_approval_queue, save_predecessor_relay_outbox,
+    // load_predecessor_relay_outbox, and the PendingCausalApproval /
+    // PredecessorRelayObligation structs.
+    //
+    // MiniMax will implement controls 1–5 here calling these private
+    // functions directly per Watson event 838a1e92 and Kimi event
+    // 63d135aa.
 }

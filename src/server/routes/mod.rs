@@ -16,7 +16,7 @@ mod history;
 mod identity;
 mod machines;
 mod messaging;
-mod named_groups;
+pub(crate) mod named_groups;
 mod network;
 mod presence;
 mod status;
@@ -70,18 +70,23 @@ pub(super) use named_groups::{
     get_named_group_members, handle_join_result_message, handle_treekem_catchup_request,
     handle_treekem_catchup_response, handle_welcome_blob_message, import_group_card,
     ingest_public_message, join_group_via_invite, leave_group, list_discovery_subscriptions,
-    list_join_requests, list_named_groups, load_named_groups, load_treekem_member_key_packages,
-    named_group_metadata_event_kind, publish_group_card_to_discovery,
-    recover_treekem_named_journals, reject_join_request, remove_named_group_member,
-    restore_treekem_groups, seal_group_state, secure_group_decrypt, secure_group_encrypt,
+    list_join_requests, list_named_groups, load_causal_approval_queue, load_named_groups,
+    load_predecessor_relay_outbox, load_treekem_member_key_packages,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, now_millis_u64,
+    publish_group_card_to_discovery, recover_treekem_named_journals, reject_join_request,
+    relay_predecessor_to_active_witnesses, remove_named_group_member, restore_treekem_groups,
+    save_predecessor_relay_outbox, seal_group_state, secure_group_decrypt, secure_group_encrypt,
     secure_group_reseal, secure_open_envelope_adversarial, send_group_public_message,
     set_group_display_name, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, unban_group_member,
     update_group_policy, update_member_role, update_named_group, withdraw_group_state,
-    ExpectedJoinResultInviter, JoinResultMessage, NamedGroupMetadataEvent, PendingJoinResult,
-    PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    ExpectedJoinResultInviter, JoinResultMessage, NamedGroupMetadataEvent, PendingCausalApproval,
+    PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
+    PredecessorRelayObligation, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    TreeKemMemberKeyPackageCache, WelcomeBlobMessage, WelcomeFetchWaiter,
+    CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
     GROUP_PUBLIC_MESSAGE_DM_PREFIX,
 };
 pub(super) use network::{

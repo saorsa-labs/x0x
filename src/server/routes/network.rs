@@ -632,9 +632,28 @@ pub(in crate::server) async fn groups_diagnostics(
         let groups = state.named_groups.read().await;
         groups.clone()
     };
-    let snap = state
-        .groups_diagnostics
-        .snapshot(&groups_view, &metadata_keys, &public_keys);
+    // ADR 0028: build per-group causal gauges from live queue/outbox state.
+    let causal_gauges: HashMap<String, x0x::groups::CausalGauges> = {
+        let queue = state.causal_approval_queue.read().await;
+        let outbox = state.predecessor_relay_outbox.read().await;
+        let mut gauges: HashMap<String, x0x::groups::CausalGauges> = HashMap::new();
+        for (group_id, entries) in queue.iter() {
+            let g = gauges.entry(group_id.clone()).or_default();
+            g.queue_entries = entries.len();
+            g.queue_bytes = entries.iter().map(|e| e.byte_size).sum();
+        }
+        for (group_id, obligations) in outbox.iter() {
+            let g = gauges.entry(group_id.clone()).or_default();
+            g.relay_obligations = obligations.len();
+        }
+        gauges
+    };
+    let snap = state.groups_diagnostics.snapshot(
+        &groups_view,
+        &metadata_keys,
+        &public_keys,
+        &causal_gauges,
+    );
     let treekem_recovery_cache = state.treekem_member_key_packages.diagnostics().await;
     (
         StatusCode::OK,

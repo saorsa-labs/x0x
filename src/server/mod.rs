@@ -46,22 +46,26 @@ use routes::{
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_named_groups, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mls_decrypt, mls_encrypt, named_group_metadata_event_kind,
-    network_status, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
+    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, remove_mls_member, remove_named_group_member, restore_treekem_groups,
-    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    reject_join_request, relay_predecessor_to_active_witnesses, remove_mls_member,
+    remove_named_group_member, restore_treekem_groups, revoke_contact, run_fallback_github_poll,
+    run_gossip_update_listener, run_startup_update_check, save_predecessor_relay_outbox,
     seal_group_state, secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
     secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
     shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     streams_diagnostics, subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact,
     update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PredecessorRelayObligation,
+    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
@@ -393,6 +397,8 @@ pub async fn serve_with_options(
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
+    let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
+    let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
     let treekem_dir = config.data_dir.join("treekem");
     if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
         tracing::warn!(
@@ -477,6 +483,8 @@ pub async fn serve_with_options(
     let (group_public_dm_tx, mut group_public_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (kv_store_delta_dm_tx, mut kv_store_delta_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (predecessor_relay_dm_tx, mut predecessor_relay_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let exec_service = x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
@@ -596,6 +604,10 @@ pub async fn serve_with_options(
         pending_welcome_waiters: RwLock::new(HashMap::new()),
         pending_welcome_acks: RwLock::new(HashMap::new()),
         treekem_pending_events: RwLock::new(HashMap::new()),
+        causal_approval_queue: RwLock::new(HashMap::new()),
+        predecessor_relay_outbox: RwLock::new(HashMap::new()),
+        causal_approval_queue_path,
+        predecessor_relay_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -663,6 +675,11 @@ pub async fn serve_with_options(
         // is nothing to collect into `bg_tasks` from this call.
         ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
+
+    // ADR 0028: load durable causal approval queue and predecessor relay
+    // outbox from sidecar files before starting listeners.
+    load_causal_approval_queue(&state).await;
+    load_predecessor_relay_outbox(&state).await;
 
     // P0-1: subscribe to the global group discovery topic so remote public
     // groups populate the local card cache without manual import.
@@ -741,12 +758,14 @@ pub async fn serve_with_options(
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
     let dm_inbox_group_public_route_tx = group_public_dm_tx.clone();
     let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
+    let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
         dm_inbox_exec_route_tx,
         dm_inbox_group_public_route_tx,
         dm_inbox_kv_store_delta_route_tx,
+        dm_inbox_predecessor_relay_route_tx,
     )));
 
     // Restart-amnesia fix: re-register every persisted task-list/kv-store
@@ -1081,8 +1100,14 @@ pub async fn serve_with_options(
                     verified = msg.verified,
                     event = named_group_metadata_event_kind(&event),
                 );
-                apply_named_group_metadata_event(&meta_state, event, msg.sender, msg.verified)
-                    .await;
+                apply_named_group_metadata_event(
+                    &meta_state,
+                    event,
+                    msg.sender,
+                    msg.verified,
+                    None, // direct DM path — no V2 envelope bytes available
+                )
+                .await;
             }
         }));
     }
@@ -1117,6 +1142,156 @@ pub async fn serve_with_options(
                     "direct-delivered public group message received"
                 );
                 ingest_public_message(&public_dm_state, msg, &group_id).await;
+            }
+        }));
+    }
+
+    // ADR 0028: predecessor relay listener. When a requester offers their signed
+    // V2 JoinRequestCreated envelope to the authority via typed DM, the
+    // authority decodes the V2 envelope, independently verifies the requester's
+    // signature, extracts the NamedGroupMetadataEvent, applies it through the
+    // normal apply path, and stores the obligation for relay to active
+    // witnesses. The relay is a courier — it forwards the exact V2 bytes
+    // unchanged; the requester's ML-DSA-65 signature is preserved.
+    //
+    // When a witness receives the relayed envelope from the authority, it
+    // decodes and applies the JoinRequestCreated through the normal apply path
+    // but does NOT re-relay (only the authority relays, preventing storms).
+    {
+        let relay_state = Arc::clone(&state);
+        let local_agent_hex = hex::encode(relay_state.agent.agent_id().as_bytes());
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = predecessor_relay_dm_rx.recv().await {
+                if !typed.verified {
+                    continue;
+                }
+                let Some(envelope_bytes) = typed.payload.strip_prefix(GROUP_PREDECESSOR_RELAY_DM_PREFIX)
+                else {
+                    continue;
+                };
+                // Size check: reject oversized envelopes (ADR 0028 bound).
+                if envelope_bytes.len() > CAUSAL_ENVELOPE_MAX_BYTES {
+                    tracing::warn!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        size = envelope_bytes.len(),
+                        "ADR 0028: predecessor relay envelope exceeds 64 KiB bound, rejecting"
+                    );
+                    continue;
+                }
+                // Decode the V2 envelope to verify the requester's signature
+                // and extract the NamedGroupMetadataEvent payload.
+                let Ok(msg) = x0x::gossip::pubsub::decode_auto(Bytes::copy_from_slice(envelope_bytes))
+                else {
+                    tracing::warn!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "ADR 0028: failed to decode predecessor relay V2 envelope"
+                    );
+                    continue;
+                };
+                if !msg.verified {
+                    tracing::warn!(
+                        sender = %hex::encode(typed.sender.as_bytes()),
+                        "ADR 0028: predecessor relay V2 envelope signature verification failed"
+                    );
+                    continue;
+                }
+                let Some(sender) = msg.sender else { continue };
+                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+                else {
+                    continue;
+                };
+
+                let group_id_str = named_group_metadata_event_group_id(&event).to_string();
+
+                // Apply through the normal apply path so local state advances.
+                apply_named_group_metadata_event(
+                    &relay_state,
+                    event.clone(),
+                    sender,
+                    msg.verified,
+                    Some(envelope_bytes),
+                )
+                .await;
+
+                // Only the authority (group creator) stores the relay
+                // obligation and relays to active witnesses. A non-authority
+                // witness that received the relay just applies — it does not
+                // re-relay, preventing a relay storm.
+                let is_authority = {
+                    let groups = relay_state.named_groups.read().await;
+                    groups.get(&group_id_str).is_some_and(|info| {
+                        hex::encode(info.creator.as_bytes()) == local_agent_hex
+                    })
+                };
+
+                if is_authority {
+                    let digest = blake3::hash(envelope_bytes);
+                    let byte_size = envelope_bytes.len();
+                    let now_ms = now_millis_u64();
+                    let (request_id, requester_agent_id) = match &event {
+                        NamedGroupMetadataEvent::JoinRequestCreated { request_id, requester_agent_id, .. } => {
+                            (request_id.clone(), requester_agent_id.clone())
+                        }
+                        _ => continue,
+                    };
+                    // Collect active witness targets (non-local active members).
+                    let relay_targets = {
+                        let groups = relay_state.named_groups.read().await;
+                        groups.get(&group_id_str).map(|info| {
+                            info.members_v2
+                                .iter()
+                                .filter(|(id, m)| {
+                                    m.state == x0x::groups::GroupMemberState::Active
+                                        && hex::encode(id) != local_agent_hex
+                                })
+                                .map(|(id, _)| hex::encode(id))
+                                .collect::<Vec<_>>()
+                        }).unwrap_or_default()
+                    };
+                    let obligation = PredecessorRelayObligation {
+                        envelope_bytes: envelope_bytes.to_vec(),
+                        digest: digest.into(),
+                        byte_size,
+                        first_seen_ms: now_ms,
+                        next_retry_at_ms: now_ms,
+                        retry_count: 0,
+                        group_id: group_id_str.clone(),
+                        request_id,
+                        requester_agent_id,
+                        relay_targets,
+                    };
+                    {
+                        let mut outbox = relay_state.predecessor_relay_outbox.write().await;
+                        let group_outbox = outbox.entry(group_id_str.clone()).or_default();
+                        // Dedup by digest.
+                        if group_outbox.iter().any(|o| o.digest == obligation.digest) {
+                            continue;
+                        }
+                        // Per-group count cap.
+                        if group_outbox.len() >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+                            tracing::warn!(
+                                group_id = %group_id_str,
+                                "ADR 0028: predecessor relay outbox at per-group count capacity, rejecting"
+                            );
+                            continue;
+                        }
+                        // Per-group byte cap.
+                        let group_bytes: usize = group_outbox.iter().map(|o| o.byte_size).sum();
+                        if group_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
+                            tracing::warn!(
+                                group_id = %group_id_str,
+                                "ADR 0028: predecessor relay outbox at per-group byte capacity, rejecting"
+                            );
+                            continue;
+                        }
+                        group_outbox.push(obligation);
+                    }
+                    // Persist the relay outbox.
+                    save_predecessor_relay_outbox(&relay_state).await;
+
+                    // Relay the unchanged V2 envelope to active witnesses.
+                    relay_predecessor_to_active_witnesses(&relay_state, &group_id_str, envelope_bytes).await;
+                }
             }
         }));
     }
@@ -1605,6 +1780,7 @@ async fn start_dm_inbox_when_gossip_ready(
     exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     group_public_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
     for attempt in 1..=DM_INBOX_START_MAX_ATTEMPTS {
         let dm_inbox_config = x0x::dm_inbox::DmInboxConfig::default()
@@ -1613,7 +1789,11 @@ async fn start_dm_inbox_when_gossip_ready(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,
                 group_public_route_tx.clone(),
             )
-            .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone());
+            .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone())
+            .with_typed_payload_route(
+                GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+                predecessor_relay_route_tx.clone(),
+            );
         match agent
             .start_dm_inbox(Arc::clone(&kem_keypair), dm_inbox_config)
             .await

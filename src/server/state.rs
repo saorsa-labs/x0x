@@ -25,9 +25,9 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
 use super::routes::{
-    ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingJoinResult,
-    PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, RestSubscription,
-    WelcomeFetchWaiter,
+    ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingCausalApproval,
+    PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
+    PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -686,6 +686,19 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
+    /// arrived before their matching `JoinRequestCreated` predecessor. The
+    /// approval is retained without mutating group state and drained after
+    /// each accepted state advance or restart restoration.
+    pub(super) causal_approval_queue: RwLock<HashMap<String, VecDeque<PendingCausalApproval>>>,
+    /// ADR 0028: per-group relay outbox for requester-signed predecessor
+    /// envelopes. The authority persists the exact V2 bytes and relays them
+    /// to active witnesses on a bounded retry schedule.
+    pub(super) predecessor_relay_outbox: RwLock<HashMap<String, Vec<PredecessorRelayObligation>>>,
+    /// ADR 0028: disk location for the durable causal approval queue sidecar.
+    pub(super) causal_approval_queue_path: PathBuf,
+    /// ADR 0028: disk location for the durable predecessor relay outbox.
+    pub(super) predecessor_relay_outbox_path: PathBuf,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,

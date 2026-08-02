@@ -174,6 +174,13 @@ pub struct PubSubMessage {
     pub verified: bool,
     /// Trust level from the local contact store (populated during incoming handling).
     pub trust_level: Option<TrustLevel>,
+    /// The raw V2 wire envelope bytes for signed messages (`None` for v1).
+    ///
+    /// ADR 0028: an authority relays the requester-authored predecessor
+    /// envelope unchanged to active witnesses. The relay is a courier, not an
+    /// author — these bytes carry the requester's ML-DSA-65 signature and
+    /// must be forwarded verbatim, never reconstructed from decoded fields.
+    pub raw_envelope: Option<Bytes>,
 }
 
 /// Subscription to a topic.
@@ -554,6 +561,23 @@ impl PubSubManager {
         self.publish_topic_id(topic, topic_id, payload).await
     }
 
+    /// Publish to a topic and return the signed V2 envelope bytes when
+    /// signing is enabled.
+    ///
+    /// ADR 0028: the authority relays the requester-authored predecessor
+    /// envelope unchanged to active witnesses. The caller needs the exact V2
+    /// wire bytes (including the requester's ML-DSA-65 signature) to offer to
+    /// the authority for relay. Returns `None` for v1 (unsigned) publishes.
+    pub async fn publish_and_get_envelope(
+        &self,
+        topic: String,
+        payload: Bytes,
+    ) -> NetworkResult<Option<Bytes>> {
+        let topic_id = TopicId::from_entity(topic.as_bytes());
+        self.publish_topic_id_with_envelope(topic, topic_id, payload)
+            .await
+    }
+
     /// Publish to a topic with an explicit transport `TopicId`.
     ///
     /// The signed x0x payload still embeds `topic`; only the underlying
@@ -564,16 +588,33 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
     ) -> NetworkResult<()> {
+        self.publish_topic_id_with_envelope(topic, topic_id, payload)
+            .await
+            .map(|_| ())
+    }
+
+    /// Publish to a topic with an explicit transport `TopicId`, returning the
+    /// signed V2 envelope bytes when signing is enabled.
+    ///
+    /// The signed x0x payload still embeds `topic`; only the underlying
+    /// PlumTree topic id is supplied by the caller.
+    pub async fn publish_topic_id_with_envelope(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<Option<Bytes>> {
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
-            return self.publish_local(topic, payload).await;
+            self.publish_local(topic, payload).await?;
+            return Ok(None);
         }
 
-        let encoded_result = if let Some(ref ctx) = self.signing {
+        let (encoded, envelope_bytes) = if let Some(ref ctx) = self.signing {
             let signing_payload =
                 build_signing_payload(ctx.agent_id.as_bytes(), topic.as_bytes(), &payload);
-            ctx.sign(&signing_payload).and_then(|signature| {
+            let result = ctx.sign(&signing_payload).and_then(|signature| {
                 encode_v2(
                     &ctx.agent_id,
                     &ctx.public_key_bytes,
@@ -581,17 +622,20 @@ impl PubSubManager {
                     &topic,
                     &payload,
                 )
-            })
-        } else {
-            encode_v1(&topic, &payload)
-        };
-
-        let encoded = match encoded_result {
-            Ok(e) => e,
-            Err(err) => {
-                self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
-                return Err(err);
+            });
+            match result {
+                Ok(encoded) => {
+                    let envelope = Bytes::clone(&encoded);
+                    (encoded, Some(envelope))
+                }
+                Err(err) => {
+                    self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
+                    return Err(err);
+                }
             }
+        } else {
+            let encoded = encode_v1(&topic, &payload)?;
+            (encoded, None)
         };
 
         self.register_dynamic_topic_priority(&topic, topic_id);
@@ -600,7 +644,7 @@ impl PubSubManager {
         match self.plumtree.publish(topic_id, encoded).await {
             Ok(()) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
-                Ok(())
+                Ok(envelope_bytes)
             }
             Err(e) => {
                 self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
@@ -630,6 +674,7 @@ impl PubSubManager {
             // API caller on this daemon — trusted by construction.
             verified: true,
             trust_level: None,
+            raw_envelope: None,
         };
         let mut topics = self.local_topics.write().await;
         if let Some(senders) = topics.get_mut(&topic) {
@@ -1003,6 +1048,7 @@ fn decode_v1(data: &[u8]) -> NetworkResult<PubSubMessage> {
         sender_public_key: None,
         verified: false,
         trust_level: None,
+        raw_envelope: None,
     })
 }
 
@@ -1136,6 +1182,7 @@ fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
         sender_public_key: Some(public_key_bytes),
         verified,
         trust_level: None,
+        raw_envelope: Some(Bytes::copy_from_slice(data)),
     })
 }
 
@@ -1144,7 +1191,7 @@ fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
 /// The first byte distinguishes the format:
 /// - `0x02` → v2 (signed)
 /// - Anything else → v1 (legacy unsigned, where byte is high byte of topic_len)
-fn decode_auto(data: Bytes) -> NetworkResult<PubSubMessage> {
+pub fn decode_auto(data: Bytes) -> NetworkResult<PubSubMessage> {
     if data.is_empty() {
         return Err(NetworkError::SerializationError(
             "Empty message".to_string(),
