@@ -270,21 +270,23 @@ def adr_status_for_grounding(grounding_name: str, ref: str = "HEAD") -> str | No
 
 def main() -> int:
     errors: list[str] = []
-    if not ADR_DIR.exists():
-        print("No docs/adr directory; nothing to validate.")
-        return 0
+    # Do NOT early-return when docs/adr/ is absent.  If the directory was
+    # deleted in this change, the base/change analysis below must still run
+    # so Accepted-ADR immutability and grounding freeze are enforced on
+    # the deleted paths.  Fall through with an empty ADR set instead.
 
     # Every markdown file in docs/adr/ must either be a known support file or
     # follow the NNNN-short-title.md convention. This catches misnamed new
     # ADRs that would otherwise dodge validation entirely.
     adr_files: list[Path] = []
-    for path in sorted(ADR_DIR.glob("*.md")):
-        if path.name in NON_ADR_FILES:
-            continue
-        if not FILENAME_RE.match(path.name):
-            errors.append(f"{path}: filename must match NNNN-short-title.md")
-            continue
-        adr_files.append(path)
+    if ADR_DIR.exists():
+        for path in sorted(ADR_DIR.glob("*.md")):
+            if path.name in NON_ADR_FILES:
+                continue
+            if not FILENAME_RE.match(path.name):
+                errors.append(f"{path}: filename must match NNNN-short-title.md")
+                continue
+            adr_files.append(path)
 
     # Collect same-stem grounding files from docs/grounding/.  Each grounding
     # file must pair with a same-stem ADR; the ADR's lifecycle status
