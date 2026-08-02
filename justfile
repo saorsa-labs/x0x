@@ -56,7 +56,22 @@ clean:
 
 quick-check: fmt-check lint test
 
-check: fmt-check lint build test doc
+# ── Deployment authority (ADR 0026, design chapter §3) ────────────────────
+
+# Reconcile .deployment/ against the authoritative instance inventory: fails
+# on a competing/second production authority, a flag-less or disagreeing prod
+# unit --config (§6 step 2), a missing declared artifact, an orphan unit or
+# config, a duplicate root, or deploy-443.sh cloning a non-authoritative
+# config. Pure bash — no fleet contact, no Rust. Reached by `just check` and
+# by pull-request CI.
+deploy-check:
+    bash .deployment/scripts/check-authority.sh
+
+# Exercise every disclosed control against temp copies (each must flip red).
+deploy-check-selftest:
+    bash .deployment/scripts/check-authority.sh --self-test
+
+check: fmt-check deploy-check lint build test doc
 
 # KV append-only REST/e2e suite (#[ignore] — boots real x0xd daemons, so it
 # needs a built binary and cannot run hermetically under plain `just test`).

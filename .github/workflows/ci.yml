@@ -312,3 +312,23 @@ jobs:
           name: gui-named-groups-coverage
           path: tests/proof-reports/parity/gui-named-groups-coverage.txt
           if-no-files-found: ignore
+
+  deployment-authority:
+    # Static repository authority check for managed x0xd deployment (ADR 0026,
+    # design chapter §3). Pure bash — no Rust toolchain, no fleet contact.
+    # Invokes the SAME `just deploy-check` recipe that `just check` reaches
+    # locally, then exercises every disclosed control via the self-test so the
+    # refusal is witnessed in CI, not just written.
+    name: Deployment Authority Gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Install just
+        uses: taiki-e/install-action@just
+
+      - name: Authority check (same recipe as `just check`)
+        run: just deploy-check
+
+      - name: Control self-test (each disclosed condition must flip red)
+        run: just deploy-check-selftest

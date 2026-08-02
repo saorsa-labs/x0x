@@ -8,7 +8,8 @@
 
 use super::super::state::AppState;
 use super::super::{
-    api_error, bad_request, forbidden, not_found, parse_agent_id_hex, parse_optional_json,
+    api_error, api_error_with_reason, bad_request, forbidden, not_found, parse_agent_id_hex,
+    parse_optional_json,
 };
 use super::direct::direct_message_send_config;
 use super::files::{
@@ -17,6 +18,7 @@ use super::files::{
 use super::groups::save_mls_groups;
 use super::identity::populate_invite_base_state_from_group_info;
 use crate as x0x;
+use crate::groups::aad::secure_share_aad;
 use anyhow::{Context, Result};
 use axum::body::Bytes;
 use axum::extract::{Path, Query, State};
@@ -115,6 +117,18 @@ pub(in crate::server) struct TreeKemCacheMutation {
 #[cfg(test)]
 static NAMED_GROUP_METADATA_PUBLISH_ATTEMPTS_FOR_TEST: StdMutex<
     Vec<(String, String, Option<String>)>,
+> = StdMutex::new(Vec::new());
+#[cfg(test)]
+// Records each (recipient_hex, event_group_id, event_kind, path) delivery
+// attempt — event_kind is the named-group event variant tag (e.g.
+// "member_removed", "join_request_approved") and path is "direct" or "delayed"
+// — so a handler's recipient set AND that BOTH paths fired per recipient are
+// observable in a deterministic unit test (the live send targets an absent
+// daemon). The full event kind (not just a MemberRemoved boolean) is recorded
+// so an approval-delivery test can distinguish a JoinRequestApproved delivery
+// from a MemberRemoved one and cannot infer the event from recipient presence.
+static NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST: StdMutex<
+    Vec<(String, String, &'static str, &'static str)>,
 > = StdMutex::new(Vec::new());
 
 #[cfg(test)]
@@ -870,20 +884,6 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// Hex agent_id of the distributor (actor) — for authority checks.
         actor: String,
     },
-}
-
-/// Construct the AEAD additional-authenticated-data binding for a
-/// `SecureShareDelivered` envelope. Must match exactly between sealer and
-/// opener.
-fn secure_share_aad(group_id: &str, recipient_hex: &str, secret_epoch: u64) -> Vec<u8> {
-    let mut aad = Vec::with_capacity(128);
-    aad.extend_from_slice(b"x0x.group.share.v2|");
-    aad.extend_from_slice(group_id.as_bytes());
-    aad.push(b'|');
-    aad.extend_from_slice(recipient_hex.as_bytes());
-    aad.push(b'|');
-    aad.extend_from_slice(&secret_epoch.to_le_bytes());
-    aad
 }
 
 /// Failure constructing a `SecureShareDelivered` envelope without side effects.
@@ -1940,6 +1940,15 @@ pub(in crate::server) fn spawn_named_group_event_delivery(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+        rec.push((
+            recipient_hex.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+            named_group_metadata_event_kind(event),
+            "direct",
+        ));
+    }
     let payload = match serde_json::to_vec(event) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1978,6 +1987,15 @@ fn spawn_named_group_event_delivery_after(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
+        rec.push((
+            recipient_hex.to_string(),
+            named_group_metadata_event_group_id(event).to_string(),
+            named_group_metadata_event_kind(event),
+            "delayed",
+        ));
+    }
     let payload = match serde_json::to_vec(event) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -8558,7 +8576,7 @@ pub(in crate::server) async fn remove_named_group_member(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
-    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes) = {
+    let (metadata_topic, event, members, epoch, buffered_survivor_envelopes, delivery_roster) = {
         let mut named_groups = state.named_groups.write().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -8662,6 +8680,7 @@ pub(in crate::server) async fn remove_named_group_member(
         };
         let metadata_topic = next.metadata_topic.clone();
         let members = named_group_member_values(&next);
+        let delivery_roster = next.clone();
         named_groups.insert(id.clone(), next);
         drop(named_groups);
 
@@ -8696,10 +8715,28 @@ pub(in crate::server) async fn remove_named_group_member(
             members,
             epoch,
             buffered_survivor_envelopes,
+            delivery_roster,
         )
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // Direct + delayed delivery of the signed MemberRemoved to active survivors
+    // AND the removed member. The removed member is no longer in
+    // active_members(), so it is passed via extra_recipients — the same shape
+    // the TreeKEM sibling uses (see remove_treekem_named_group_member :9513).
+    // The shared apply handler revalidates the signed commit and is idempotent,
+    // so a recipient that also saw the metadata-topic gossip publish applies
+    // the event once. SOURCE-SUPPORTED ORDERING: persistence and the metadata
+    // publish above precede these delivery calls and the survivor-envelope
+    // scheduling below. (Both the MemberRemoved delivery and the survivor
+    // envelopes run as independent background tasks, so call order is not a
+    // guaranteed recipient receipt order — no delivery barrier is claimed.)
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &delivery_roster,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     // F1 §5a step 5: publish the buffered survivor envelopes only after the
     // removal is live and persisted. Each is broadcast on the metadata topic
     // plus direct + delayed delivery, mirroring publish_secure_share's shape.
@@ -10992,7 +11029,7 @@ pub(in crate::server) async fn approve_join_request(
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
 
-    let (metadata_topic, event_group_id, requester_hex, revision, commit) = {
+    let (metadata_topic, event_group_id, requester_hex, revision, commit, delivery_roster) = {
         let mut groups = state.named_groups.write().await;
         let Some(info) = groups.get_mut(&id) else {
             return not_found("group not found");
@@ -11035,6 +11072,13 @@ pub(in crate::server) async fn approve_join_request(
         let metadata_topic = info.metadata_topic.clone();
         let event_group_id = info.stable_group_id().to_string();
         let revision = info.roster_revision;
+        // Post-approval roster snapshot: the requester has been added and the
+        // signed commit sealed, so active_members() now includes the requester.
+        // Cloned before the write lock is dropped so the direct+delayed
+        // delivery below delivers the JoinRequestApproved to every non-local
+        // active member (the already-present witnesses) — same shape the
+        // TreeKEM approval sibling (:11381) and remove handler (:8730) use.
+        let delivery_roster = info.clone();
         drop(groups);
         (
             metadata_topic,
@@ -11042,6 +11086,7 @@ pub(in crate::server) async fn approve_join_request(
             requester_hex,
             revision,
             commit,
+            delivery_roster,
         )
     };
 
@@ -11148,7 +11193,26 @@ pub(in crate::server) async fn approve_join_request(
         commit: Some(commit),
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    spawn_named_group_event_delivery(&state, &requester_hex, &event);
+    // Direct + delayed delivery of the signed JoinRequestApproved to every
+    // non-local active member (the already-present witnesses) AND the new
+    // requester. Before this, the non-TreeKEM approval delivered only to the
+    // requester, so a witness off the eager mesh never learned of a peer's
+    // approval and stayed at the old roster revision (the daemon-family R2
+    // barrier gap — Bob received his own approval but not Charlie's). The
+    // requester is already in the post-approval roster's active_members(), so
+    // passing it as extra_recipients is redundant but harmless (HashSet
+    // de-duplicates and excludes the local authority). The shared apply
+    // handler revalidates the signed commit and is idempotent. SOURCE-SUPPORTED
+    // ORDERING: persistence (save_named_groups) and the metadata publish above
+    // precede this delivery call. Mirrors the TreeKEM sibling (:11461) and the
+    // remove handler (:8730). (The delivery runs as background tasks, so call
+    // order is not a guaranteed recipient receipt order.)
+    spawn_named_group_event_delivery_to_active_members(
+        &state,
+        &delivery_roster,
+        &event,
+        std::slice::from_ref(&requester_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -12426,8 +12490,11 @@ pub(in crate::server) async fn secure_group_decrypt(
 /// delivered envelope arrives; in that window `info.shared_secret` is None
 /// and this endpoint returns 424.
 ///
-/// The recipient must be a known member of the group with a published KEM
-/// public key (404 / 424 otherwise).
+/// The recipient must be an active member of the group with a published KEM
+/// public key. An absent recipient yields 404 `"recipient is not a member"`;
+/// a present-but-inactive entry (e.g. soft-deleted) yields 409 with
+/// `reason: "recipient_not_active"`; a recipient without a published KEM key
+/// yields 424.
 ///
 /// Used by the D.2 adversarial E2E proof to obtain a **real live-path
 /// envelope** (produced via the same `seal_group_secret_to_recipient` +
@@ -12459,10 +12526,21 @@ pub(in crate::server) async fn secure_group_reseal(
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
-    // Recipient must be a known member with a KEM pubkey.
+    // Recipient must be an ACTIVE member with a published KEM pubkey. A
+    // present-but-inactive entry (soft-deleted by removal, which retains the
+    // KEM key) is rejected with a distinct 409 + reason so it stays
+    // machine-separable from an absent recipient (404) and from the
+    // withdrawn-group 409 (which carries no reason).
     let Some(recipient_member) = info.members_v2.get(&req.recipient) else {
         return not_found("recipient is not a member");
     };
+    if !recipient_member.is_active() {
+        return api_error_with_reason(
+            StatusCode::CONFLICT,
+            "recipient is not an active member",
+            "recipient_not_active",
+        );
+    }
     let Some(recipient_kem_b64) = recipient_member.kem_public_key_b64.clone() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -15930,6 +16008,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secure_reseal_rejects_inactive_and_absent_recipient() -> Result<()> {
+        // Active-recipient sealing contract (cleanup item a):
+        //   present-but-inactive (Removed) recipient -> 409 + reason "recipient_not_active"
+        //   absent recipient                          -> 404, no reason
+        //   active recipient                          -> 200 (seal succeeds)
+        // The two 409 conditions stay machine-separable: the withdrawn-group
+        // 409 carries no `reason`; the inactive-recipient 409 carries it.
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gss-reseal-active-recipient";
+        install_secure_endpoint_group(&state, group_id, group_id, x0x::mls::SecureGroupPlane::Gss)
+            .await;
+        let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let kem_b64 = BASE64.encode(&state.agent_kem_keypair.public_bytes);
+        let charlie = "33".repeat(32);
+        let bob = "44".repeat(32);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups.get_mut(group_id).expect("group installed");
+            // Charlie: active member with a published KEM key.
+            info.add_member_with_kem(
+                charlie.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(caller_hex.clone()),
+                None,
+                Some(kem_b64.clone()),
+            );
+            // Bob: added with a KEM key, then soft-deleted (Removed). The entry
+            // and KEM key are retained — the retained-but-inactive state the
+            // active-recipient predicate must reject before sealing.
+            info.add_member_with_kem(
+                bob.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(caller_hex.clone()),
+                None,
+                Some(kem_b64.clone()),
+            );
+            info.remove_member(&bob, Some(caller_hex.clone()));
+            info.recompute_state_hash();
+        }
+
+        // Absent recipient -> 404, no reason.
+        let absent = "55".repeat(32);
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest { recipient: absent }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        assert_eq!(body.0["ok"].as_bool(), Some(false));
+        assert_eq!(body.0["error"].as_str(), Some("recipient is not a member"));
+        assert!(body.0.get("reason").is_none());
+
+        // Present-but-inactive (Removed) recipient -> 409 + reason.
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest {
+                recipient: bob.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT);
+        assert_eq!(body.0["ok"].as_bool(), Some(false));
+        assert_eq!(body.0["reason"].as_str(), Some("recipient_not_active"));
+
+        // Active recipient -> 200, real secret envelope produced.
+        let (status, body) = secure_group_reseal(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(ResealRequest {
+                recipient: charlie.clone(),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body.0["ok"].as_bool(), Some(true));
+        assert!(body.0.get("kem_ciphertext_b64").is_some());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn secure_open_envelope_endpoint_lost_race_drops_opened_secret() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let group_id = "open-envelope-stable";
@@ -16633,11 +16794,11 @@ mod tests {
     //     withdrawn `:8570`), leaving only an ML-DSA signing fault
     //     (`state_commit.rs:448`).
     //
-    // Observed lane: the metadata-topic publish at `:8707` only. The direct
-    // (`:8708`) and delayed (`:8709`) delivery in
-    // `spawn_named_group_event_delivery` have no `#[cfg(test)]` hook (they
-    // spawn straight to `agent.send_direct_with_config`) and are named here as
-    // not-observed, not covered.
+    // Observed lane: the metadata-topic publish of the survivor envelopes only.
+    // The direct + delayed delivery of the MemberRemoved event itself is now
+    // recorded (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST) and covered by a
+    // dedicated test below; THIS test's scope remains the published survivor
+    // recipient set, not the MemberRemoved delivery.
     //
     // Mutation (Watson's M5): at `:8617` change `next.active_members()` to
     // `next.members_v2.values().filter(|m| !m.is_banned())`. The removed
@@ -16786,6 +16947,332 @@ mod tests {
             published_recipients.contains(&survivor_hex),
             "the survivor must appear in the published recipient set; \
              got {published_recipients:?}"
+        );
+        Ok(())
+    }
+    // ── Non-TreeKEM MemberRemoved direct delivery (the daemon-family gap):
+    // the non-TreeKEM remove handler published the signed MemberRemoved to the
+    // metadata topic only — a removed member not in the eager mesh could stay
+    // at the old roster revision with the group still present. The fix mirrors
+    // the TreeKEM sibling: after persist+publish, direct + delayed deliver the
+    // same signed event to every active survivor AND the removed member
+    // (passed via extra_recipients, since it is no longer in
+    // active_members()).
+    //
+    // Attribution scope: MiniMax's 1/5 run established Alice at R3 with Bob
+    // removed and Bob stuck at R1, but the family never proved Bob had first
+    // applied Charlie's R2 join. The missing direct MemberRemoved is a real
+    // source gap that CAN leave an off-mesh removed member stale; it is not
+    // yet proven to be the sole cause of that R1 observation. THIS handler
+    // unit gate pins the missing delivery schedule; the next daemon run —
+    // after MiniMax adds an R2 convergence barrier — decides the end-to-end
+    // attribution. The final proof remains MiniMax's five real-daemon tests.
+    //
+    // Observed lane: the direct + delayed delivery recorder
+    // (NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST), which records
+    // (recipient_hex, group_id, is_member_removed, kind) per attempt — kind is
+    // "direct" or "delayed". The test asserts each recipient appears on BOTH
+    // paths, so loss of either one cannot hide behind the other.
+    //
+    // Mutation A (whole helper): remove the
+    // spawn_named_group_event_delivery_to_active_members call in
+    // remove_named_group_member → the removed member drops out of BOTH paths →
+    // the "victim delivered" assertion fails (gate red).
+    // Mutation B (one path): comment out the spawn_named_group_event_delivery
+    // _after call inside the helper → the "delayed" set loses every recipient
+    // → the "delayed non-empty / victim on delayed" assertion fails. REQUIRED
+    // red arms. Reverted.
+    #[tokio::test]
+    async fn non_treekem_remove_directly_delivers_member_removed_to_removed_member() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_id = state.agent.agent_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        let survivor_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let survivor_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+        let victim_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let victim_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+
+        let group_id = "mrem-delivery-local".to_string();
+        let stable_group_id = "mrem-delivery-stable".to_string();
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "member-removed direct delivery".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            local_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member_with_kem(
+            survivor_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(survivor_kem_b64),
+        );
+        info.add_member_with_kem(
+            victim_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(victim_kem_b64),
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive precondition: GSS plane, so the TreeKem dispatch cannot fire
+        // and the non-TreeKEM remove path (the one under test) is exercised.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "must exercise the non-TreeKEM (GSS) remove path, not the TreeKem dispatch"
+            );
+        }
+
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            remove_named_group_member(
+                State(Arc::clone(&state)),
+                Path((group_id.clone(), victim_hex.clone())),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin remove of a member must succeed, body: {body}"
+        );
+
+        // The MemberRemoved delivery set, split by path. The recorder appends
+        // from BOTH the immediate send (spawn_named_group_event_delivery) and
+        // the delayed retry (spawn_named_group_event_delivery_after), so a plain
+        // contains() would pass if only ONE path fired. Collect each path
+        // independently and assert the removed member AND a survivor appear in
+        // BOTH — loss of either path is caught (mutation B).
+        let recipients_for = |kind: &str| -> Vec<String> {
+            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+                .lock()
+                .expect("delivery recorder poisoned")
+                .iter()
+                .filter(|(_, gid, ev_kind, k)| {
+                    gid == &stable_group_id && *ev_kind == "member_removed" && *k == kind
+                })
+                .map(|(recipient, _, _, _)| recipient.clone())
+                .collect()
+        };
+        let direct = recipients_for("direct");
+        let delayed = recipients_for("delayed");
+
+        assert!(
+            !direct.is_empty() && !delayed.is_empty(),
+            "the remove handler must deliver the MemberRemoved via BOTH paths; \
+             direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&victim_hex) && delayed.contains(&victim_hex),
+            "the REMOVED member must receive the MemberRemoved on BOTH the direct and delayed \
+             paths (the daemon-family gap: without it, a removed member off the eager mesh stays \
+             at the old roster revision); direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&survivor_hex) && delayed.contains(&survivor_hex),
+            "active survivors must also receive the MemberRemoved on BOTH paths; \
+             direct={direct:?} delayed={delayed:?}"
+        );
+        Ok(())
+    }
+    // ── Non-TreeKEM JoinRequestApproved fan-out: the approval handler must
+    // deliver the signed JoinRequestApproved to EVERY non-local active member
+    // (the already-present witnesses) AND the new requester, on BOTH the direct
+    // and delayed paths — the same property the TreeKEM approval sibling
+    // (:11461) and the remove handler (:8730) already satisfy. Before the fix,
+    // `approve_join_request` delivered only to the requester, so a witness off
+    // the eager mesh never learned a peer had been approved and stayed at the
+    // old roster revision. This is the source-pinned root cause of MiniMax's
+    // daemon-family R2 barrier failure: Alice approved Charlie, but Bob (an
+    // already-active witness) never received Charlie's JoinRequestApproved and
+    // so never saw Charlie in his /members — not a window-too-short problem.
+    //
+    // The recorder now carries the full event kind, so this test filters on
+    // "join_request_approved" and cannot infer the event from recipient
+    // presence alone (a MemberRemoved or SecureShareDelivered to the same
+    // recipient would not satisfy it).
+    //
+    // Sensitivity arms (mutated separately, then restored — REQUIRED red):
+    //   Arm 1 (requester-only regression): restore the old requester-only
+    //     delivery `spawn_named_group_event_delivery(&state, &requester_hex,
+    //     &event)` (direct, no active-member fan-out) → the WITNESS
+    //     assertions fail on both paths; requester-direct stays green (it was
+    //     already delivered) and requester-delayed also fails because the old
+    //     path had no delayed retry. The witness is the catcher for the new
+    //     active-member-delivery property.
+    //   Arm 2 (drop delayed path): inside
+    //     spawn_named_group_event_delivery_to_active_members, comment out the
+    //     spawn_named_group_event_delivery_after call → the delayed set loses
+    //     every recipient while the direct set is unchanged; the delayed
+    //     assertions fail, immediate delivery remains.
+    #[tokio::test]
+    async fn non_treekem_approve_directly_delivers_join_request_approved_to_witness_and_requester(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_id = state.agent.agent_id();
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+        // One already-active witness and one pending requester (not yet a
+        // member — the handler adds them on approval).
+        let witness_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+        let witness_kem_b64 =
+            BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
+        let requester_hex = hex::encode(
+            crate::identity::AgentKeypair::generate()?
+                .agent_id()
+                .as_bytes(),
+        );
+
+        let group_id = "approve-delivery-local".to_string();
+        let stable_group_id = "approve-delivery-stable".to_string();
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "join-approval direct delivery".to_string(),
+            String::new(),
+            admin_id,
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PrivateSecure.to_policy(),
+        );
+        info.genesis = Some(x0x::groups::state_commit::GroupGenesis::with_existing_id(
+            stable_group_id.clone(),
+            local_hex.clone(),
+            info.created_at,
+            String::new(),
+        ));
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        // The witness is already an active member; the requester is pending.
+        info.add_member_with_kem(
+            witness_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            None,
+            Some(witness_kem_b64),
+        );
+        let request = x0x::groups::JoinRequest::new(
+            group_id.clone(),
+            requester_hex.clone(),
+            None,
+            now_millis_u64(),
+        );
+        let request_id = request.request_id.clone();
+        info.join_requests.insert(request_id.clone(), request);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // Positive precondition: GSS plane, so the TreeKem dispatch at the top
+        // of approve_join_request cannot fire and the non-TreeKEM path (the one
+        // under test) is exercised.
+        {
+            let groups = state.named_groups.read().await;
+            let stored = groups.get(&group_id).expect("group present");
+            assert_eq!(
+                stored.secure_plane,
+                x0x::mls::SecureGroupPlane::Gss,
+                "must exercise the non-TreeKEM (GSS) approve path, not the TreeKem dispatch"
+            );
+        }
+
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            approve_join_request(
+                State(Arc::clone(&state)),
+                Path((group_id.clone(), request_id.clone())),
+            )
+            .await
+            .into_response(),
+        )
+        .await?;
+
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "admin approval of a pending request must succeed, body: {body}"
+        );
+
+        // The JoinRequestApproved delivery set, split by path. Filter on the
+        // event kind so a SecureShareDelivered or MemberRemoved to the same
+        // recipient cannot satisfy the assertion. Collect each path
+        // independently and assert the witness AND requester appear in BOTH —
+        // loss of either path or either recipient is caught.
+        let recipients_for = |kind: &str| -> Vec<String> {
+            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+                .lock()
+                .expect("delivery recorder poisoned")
+                .iter()
+                .filter(|(_, gid, ev_kind, k)| {
+                    gid == &stable_group_id && *ev_kind == "join_request_approved" && *k == kind
+                })
+                .map(|(recipient, _, _, _)| recipient.clone())
+                .collect()
+        };
+        let direct = recipients_for("direct");
+        let delayed = recipients_for("delayed");
+
+        assert!(
+            !direct.is_empty() && !delayed.is_empty(),
+            "the approve handler must deliver the JoinRequestApproved via BOTH paths; \
+             direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&witness_hex) && delayed.contains(&witness_hex),
+            "an already-active WITNESS must receive the JoinRequestApproved on BOTH the direct \
+             and delayed paths (the daemon-family R2 gap: without active-member fan-out, a \
+             witness off the eager mesh never learns a peer was approved and stays at the old \
+             roster revision); direct={direct:?} delayed={delayed:?}"
+        );
+        assert!(
+            direct.contains(&requester_hex) && delayed.contains(&requester_hex),
+            "the new REQUESTER must receive the JoinRequestApproved on BOTH the direct and \
+             delayed paths; direct={direct:?} delayed={delayed:?}"
         );
         Ok(())
     }

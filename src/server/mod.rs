@@ -10,6 +10,7 @@
 use crate as x0x;
 
 mod auth;
+pub mod config;
 mod crdt_subscriptions;
 mod routes;
 mod sse;
@@ -19,6 +20,7 @@ mod ws;
 // Re-export the public server API surface so `x0x::server::*` paths are
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
+pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
@@ -1678,6 +1680,21 @@ fn api_error(status: StatusCode, msg: impl Into<String>) -> (StatusCode, Json<se
     (
         status,
         Json(serde_json::json!({ "ok": false, "error": msg.into() })),
+    )
+}
+
+/// Like [`api_error`], but adds a machine-readable `reason` field to the
+/// response body. Use when two responses share an HTTP status yet must stay
+/// machine-separable (e.g. two distinct 409 CONFLICT conditions). Existing
+/// `api_error` callers keep their `{ "ok": false, "error": <msg> }` body.
+fn api_error_with_reason(
+    status: StatusCode,
+    msg: impl Into<String>,
+    reason: &str,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        status,
+        Json(serde_json::json!({ "ok": false, "error": msg.into(), "reason": reason })),
     )
 }
 

@@ -14102,12 +14102,18 @@ mod tests {
     /// Admin teardown, revocation, and shutdown must suppress proactive
     /// reconnect. For each reason: alice connects bob (so bob is in alice's
     /// bootstrap cache — the Phase-2 fallback path that restored rejected
-    /// peers pre-fix), issues the disconnect with the reason, and asserts the
-    /// tombstone is set immediately AND bob stays disconnected past the first
-    /// two backoff attempts (1 s + 2 s), which is where the pre-fix
-    /// cache-fallback redial would have re-established the connection.
-    /// `PolicyRejection` (full backoff window) and `PoolEviction` (real
-    /// eviction) have dedicated tests below.
+    /// peers pre-fix), issues the disconnect with the reason, asserts the
+    /// tombstone is set immediately, bounded-polls for the disconnected
+    /// state, then explicitly invokes the production `schedule_reconnect`
+    /// seam (alice's real network/cache/token, fresh tracker) as a
+    /// deliberate suppressed-redial attempt. With suppression intact the
+    /// scheduler's entry gate fires and no dial is spawned; bob stays
+    /// disconnected for the six-second no-redial guard. Sensitivity
+    /// (whole-policy mutation): bypass the scheduler's suppression gates
+    /// while leaving `is_reconnect_suppressed` observable to the tombstone
+    /// assertion → bob's cached address is dialled within ~1 s and the
+    /// final guard fails. `PolicyRejection` and `PoolEviction` have
+    /// dedicated tests below.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn admin_revocation_shutdown_disconnect_suppresses_proactive_reconnect() {
         let reasons = [
@@ -14126,8 +14132,11 @@ mod tests {
             .build()
             .await
             .expect("alice");
-        // Arm the proactive-reconnect scheduler so the gating is exercised for
-        // real, not just the tombstone lookup.
+        // Start the network event reconciliation listener (connection-registry
+        // promotion, reconnect-tracker cleanup on PeerConnected). The listener
+        // does NOT reliably trigger schedule_reconnect for a locally-initiated
+        // security disconnect — that path is exercised by the explicit
+        // schedule_reconnect call below.
         alice.start_network_event_listener();
         let alice_network = alice.network().expect("alice network");
 
@@ -14168,6 +14177,22 @@ mod tests {
                 alice_network.is_connected(&bob_peer).await,
                 "{tag}: alice connected to bob before disconnect"
             );
+            // Quiesce the connection before the intentional disconnect (issue
+            // #241): the initial dial can leave a duplicate/zombie leg whose
+            // delayed PeerConnected event arrives AFTER the security disconnect
+            // and makes is_connected read true — false-reding the
+            // disconnected-state observation and the no-redial guard below. The
+            // tombstone itself is untouched: disconnect_with_reason sets it and
+            // PeerConnected only aborts the pending reconnect TRACKER entry
+            // (src/lib.rs:8323), never the suppression record. Quiescing first
+            // guarantees no in-flight setup PeerConnected contaminates the
+            // post-disconnect reads. Same barrier the transport tests use.
+            await_quiesced_connection(
+                alice_network,
+                &bob_peer,
+                std::time::Duration::from_secs(1) * test_time_multiplier(),
+            )
+            .await;
             assert!(
                 !alice_network.is_reconnect_suppressed(bob_id),
                 "{tag}: no tombstone before disconnect"
@@ -14183,19 +14208,73 @@ mod tests {
                 .await
                 .expect("disconnect_with_reason");
 
-            assert!(
-                !alice_network.is_connected(&bob_peer).await,
-                "{tag}: bob disconnected immediately"
-            );
+            // The tombstone is set synchronously by disconnect_with_reason
+            // (before the close completes), so it is observable immediately.
+            // The connection registry's transition to disconnected is
+            // asynchronous: a one-shot !is_connected read here can race the
+            // in-flight close (the earlier full-suite failure site). Assert the
+            // tombstone first, then BOUNDED-poll for the disconnected state
+            // before starting the no-redial guard. The guard window is unchanged.
             assert!(
                 alice_network.is_reconnect_suppressed(bob_id),
                 "{tag}: suppression tombstone set"
             );
+            {
+                let disc = tokio::time::Instant::now()
+                    + std::time::Duration::from_secs(5) * test_time_multiplier();
+                while tokio::time::Instant::now() < disc {
+                    if !alice_network.is_connected(&bob_peer).await {
+                        break;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+                }
+                assert!(
+                    !alice_network.is_connected(&bob_peer).await,
+                    "{tag}: bob disconnected after bounded poll"
+                );
+            }
 
-            // Teeth: poll past the first two backoff attempts (1 s + 2 s).
-            // Pre-fix the generic PeerDisconnected fired schedule_reconnect
-            // and restored bob via the bootstrap cache within ~1 s. bob is
-            // still listening, so a redial WOULD succeed if the gate failed.
+            // Cached-peer precondition: the initial connect_addr populated
+            // alice's bootstrap cache (network.rs add_from_connection), so a
+            // redial via connect_cached_peer WOULD succeed if the suppression
+            // gate failed. Assert it so a missing cache entry fails loudly
+            // rather than masking a suppressed redial as "no redial happened".
+            let bootstrap_cache = alice_network
+                .bootstrap_cache()
+                .expect("bootstrap cache configured");
+            assert!(
+                bootstrap_cache.get_peer(&bob_peer).await.is_some(),
+                "{tag}: bob present in alice's bootstrap cache (cached-peer precondition)"
+            );
+
+            // Deliberate suppressed-redial attempt: invoke the production
+            // schedule_reconnect seam with alice's real network, discovery
+            // cache, shutdown token, and a fresh single-flight tracker. The
+            // disconnect above established the tombstone and disconnected
+            // baseline; THIS call is the redial attempt that suppression must
+            // defeat. With suppression intact the entry gate
+            // (is_reconnect_suppressed -> return) fires before any dial task
+            // is spawned, so no redial occurs. start_network_event_listener
+            // alone does not drive scheduling here — a locally-initiated
+            // Admin/Revocation/Shutdown close is not reconnect-eligible on the
+            // event stream (confirmed empirically by the prior mutation
+            // receipt that never reached this guard).
+            let fresh_tracker: ReconnectTracker =
+                std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+            schedule_reconnect(
+                std::sync::Arc::clone(alice_network),
+                std::sync::Arc::clone(&alice.machine_discovery_cache),
+                alice.shutdown_token.clone(),
+                bob_id,
+                std::sync::Arc::clone(&fresh_tracker),
+            );
+
+            // Teeth: the final six-second no-redial guard. With suppression
+            // intact the entry gate returned immediately and no dial was
+            // spawned, so bob stays disconnected for the full window. bob is
+            // still listening and cached, so a gate failure WOULD reconnect
+            // within ~1 s (the first backoff tick) — proven by the
+            // whole-policy mutation receipt.
             let guard = tokio::time::Instant::now() + std::time::Duration::from_secs(6);
             let mut redialed = false;
             while tokio::time::Instant::now() < guard {

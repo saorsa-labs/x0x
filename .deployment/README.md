@@ -40,23 +40,32 @@ ssh root@saorsa-2.saorsalabs.com  # Or use IP directly
 
 ## Deployment Scripts
 
-### deploy.sh
-Deploy binary and configuration to nodes.
+### install.sh
+Authoritative installer for the production `x0xd` instance (ADR 0026). Installs
+the tracked `systemd/x0xd.service` unit and the production config generated from
+`config/bootstrap-config.toml` to the same paths the unit reads, so a fresh host
+is brought up identically to the live fleet.
+
+Run **on the target host** as root:
 
 ```bash
-# Deploy to single node
-./deploy.sh nyc
+# Unit + config from the tracked sources
+./install.sh
 
-# Deploy to all nodes
-./deploy.sh all
+# Also install a freshly cross-compiled binary
+./install.sh --binary ../../target/x86_64-unknown-linux-gnu/release/x0xd
 ```
 
 **What it does:**
-1. Uploads binary to `/opt/x0x/x0xd`
-2. Uploads config to `/etc/x0x/bootstrap.toml`
-3. Installs systemd service
-4. Starts and enables service
-5. Verifies health
+1. Installs the binary (with `--binary`) to `/opt/x0x/x0xd`
+2. Installs the production config to `/etc/x0x/config.toml`
+3. Installs the tracked `systemd/x0xd.service` to `/etc/systemd/system/`
+4. Reloads systemd and enables `x0xd`
+
+The installer does **not** start the service; starting is a managed transition
+(`systemctl start x0xd`). The legacy `deploy.sh` (which uploaded a config path
+its own installed unit never read) and the contradictory top-level `x0xd.service`
+have been retired, leaving one tracked deployment authority.
 
 ### health-check.sh
 Check health status of nodes.
@@ -215,7 +224,7 @@ ssh root@<IP> 'journalctl -u x0xd -n 100 --no-pager'
 ssh root@<IP> 'ls -la /opt/x0x/x0xd'
 
 # Check if config is valid
-ssh root@<IP> 'cat /etc/x0x/bootstrap.toml'
+ssh root@<IP> 'cat /etc/x0x/config.toml'
 ```
 
 ### Network connectivity issues
@@ -229,8 +238,8 @@ ssh root@<IP> 'ufw status'
 
 ### Node can't reach peers
 ```bash
-# Verify known_peers in config
-ssh root@<IP> 'grep known_peers /etc/x0x/bootstrap.toml'
+# Verify bootstrap_peers in config
+ssh root@<IP> 'grep bootstrap_peers /etc/x0x/config.toml'
 
 # Test UDP connectivity to peer
 ssh root@<IP> 'nc -vzu <peer_ip> 5483'
@@ -238,9 +247,9 @@ ssh root@<IP> 'nc -vzu <peer_ip> 5483'
 
 ### Clean slate restart
 ```bash
-# Complete cleanup and redeploy
+# Complete cleanup, then bring the host up with the authoritative installer
 ./cleanup.sh <node_name>
-./deploy.sh <node_name>
+# then on the host: .deployment/install.sh --binary <built-x0xd>
 ```
 
 ## Security Notes
