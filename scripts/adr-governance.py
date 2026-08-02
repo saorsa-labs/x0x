@@ -101,84 +101,140 @@ def is_template_repair(old: str, new: str) -> bool:
 _ZERO_SHA_PREFIX = "0000000"
 
 
-def _is_valid_base(candidate: str, head: str) -> bool:
+def _resolve(candidate: str) -> str | None:
+    """Resolve *candidate* to a full 40-hex commit SHA via ``git rev-parse
+    --verify``.  Returns ``None`` when the candidate is not a valid commit.
+    """
+    try:
+        return run(["git", "rev-parse", "--verify", f"{candidate}^{{commit}}"])
+    except Exception:
+        return None
+
+
+def _is_valid_base(candidate: str | None, head: str) -> bool:
     """True when *candidate* is a non-empty, non-zero, non-HEAD SHA."""
     return (
-        bool(candidate)
+        candidate is not None
+        and bool(candidate)
         and not candidate.startswith(_ZERO_SHA_PREFIX)
         and candidate != head
     )
 
 
-def base_ref() -> str | None:
-    """Return the ref to diff against for ``is_new`` and immutability checks.
+def base_ref() -> tuple[str | None, str | None, bool]:
+    """Return ``(base_sha, error, is_push_event)``.
 
-    Every candidate is validated against HEAD: a base that equals HEAD
-    always yields an empty diff, so it is rejected and the next selector
-    is tried.  This prevents a push-to-main regression where
-    ``merge-base main HEAD`` resolves to HEAD itself.
+    *base_sha* is a resolved non-HEAD commit SHA to diff against, or ``None``.
+    *error* is a fail-closed message when an explicitly supplied event
+    selector could not resolve to a valid non-HEAD commit.  *is_push_event*
+    is ``True`` when the base came from ``GITHUB_BEFORE`` (a push event),
+    indicating the caller should use a direct two-dot diff instead of the
+    three-dot merge-base diff used for PRs.
 
-    Resolution order:
+    When any event selector (``GITHUB_BASE_REF``, ``GITHUB_BASE_SHA``,
+    ``GITHUB_BEFORE``) is explicitly provided, every candidate is resolved
+    through ``git rev-parse --verify`` and the resolved SHA is compared to
+    HEAD.  If none resolves to a valid non-HEAD commit, *error* is set and
+    the caller must fail closed — local fallbacks are not used.
 
-    1. ``GITHUB_BASE_REF`` — set on pull requests, points at the target
-       branch.  ``origin/{ref}`` captures every commit on the PR branch,
-       so a new ADR added in an early commit and amended later is always
-       treated as ``is_new``.
-    2. ``GITHUB_BASE_SHA`` — the exact PR base SHA, supplied by the
-       workflow from ``github.event.pull_request.base.sha``.
-    3. ``GITHUB_BEFORE`` — the previous branch tip on push events,
-       supplied by the workflow from ``github.event.before``.  An
-       all-zero SHA (branch creation / force-push) is rejected.
-    4. ``git merge-base <default> HEAD`` — for local runs, find the
-       fork point from ``main`` or ``master`` so the entire branch is
-       covered, not just the last commit.
-    5. ``HEAD^1`` — last resort, correct only for single-commit changes.
+    When no event selector is provided, local fallbacks (``merge-base``,
+    ``HEAD^1``) are used as before.
     """
     try:
         head = run(["git", "rev-parse", "HEAD"])
     except Exception:
-        return None
+        return (None, None, False)
+
+    # Track whether any event selector was explicitly provided.
+    has_event_selector = False
+    resolved_base: str | None = None
+    is_push = False
 
     ref = os.environ.get("GITHUB_BASE_REF")
     if ref:
-        try:
-            resolved = run(["git", "rev-parse", f"origin/{ref}"])
+        has_event_selector = True
+        resolved = _resolve(f"origin/{ref}")
+        if _is_valid_base(resolved, head):
+            resolved_base = resolved
+
+    if resolved_base is None:
+        base_sha = os.environ.get("GITHUB_BASE_SHA")
+        if base_sha:
+            has_event_selector = True
+            resolved = _resolve(base_sha)
             if _is_valid_base(resolved, head):
-                return resolved
-        except Exception:
-            pass
+                resolved_base = resolved
 
-    base_sha = os.environ.get("GITHUB_BASE_SHA")
-    if base_sha and _is_valid_base(base_sha, head):
-        return base_sha
+    if resolved_base is None:
+        before = os.environ.get("GITHUB_BEFORE")
+        if before:
+            has_event_selector = True
+            resolved = _resolve(before)
+            if _is_valid_base(resolved, head):
+                resolved_base = resolved
+                is_push = True
 
-    before = os.environ.get("GITHUB_BEFORE")
-    if before and _is_valid_base(before, head):
-        return before
+    if resolved_base is not None:
+        return (resolved_base, None, is_push)
 
+    if has_event_selector:
+        # An event selector was explicitly provided but none resolved to a
+        # valid non-HEAD commit.  Fail closed instead of falling to local
+        # heuristics.
+        attempted: list[str] = []
+        if ref:
+            attempted.append(f"GITHUB_BASE_REF={ref}")
+        base_sha = os.environ.get("GITHUB_BASE_SHA")
+        if base_sha:
+            attempted.append(f"GITHUB_BASE_SHA={base_sha}")
+        before = os.environ.get("GITHUB_BEFORE")
+        if before:
+            attempted.append(f"GITHUB_BEFORE={before}")
+        return (
+            None,
+            f"Event base selector(s) could not resolve to a valid non-HEAD "
+            f"commit: {'; '.join(attempted)}. "
+            f"Change-specific structural and immutability checks cannot run.",
+            False,
+        )
+
+    # No event selector: use local fallbacks.
     for default in ("main", "master", "origin/main", "origin/master"):
         try:
             mb = run(["git", "merge-base", default, "HEAD"])
             if _is_valid_base(mb, head):
-                return mb
+                return (mb, None, False)
         except Exception:
             continue
 
     try:
         parent = run(["git", "rev-parse", "HEAD^1"])
         if _is_valid_base(parent, head):
-            return parent
+            return (parent, None, False)
     except Exception:
         pass
 
-    return None
+    return (None, None, False)
 
 
-def changed_files_against_base(base: str) -> list[str] | None:
+def changed_files_against_base(base: str, is_push: bool = False) -> list[str] | None:
     """Return changed file paths relative to *base*, or ``None`` when the
     base cannot be resolved (fail-closed signal so the caller can reject
     rather than silently treating a broken diff as an empty change set).
+
+    For push events (*is_push* is ``True``), use a direct two-dot diff
+    (``git diff <base> HEAD``) to capture every file changed between the
+    old and new tips, including deletions on divergent history.
+
+    For PR events, use a three-dot merge-base diff
+    (``git diff <base>...HEAD``) to capture only the branch's own changes,
+    falling back to two-dot if three-dot fails.
     """
+    if is_push:
+        try:
+            return run(["git", "diff", "--name-only", f"{base}", "HEAD"]).splitlines()
+        except Exception:
+            return None
     try:
         return run(["git", "diff", "--name-only", f"{base}...HEAD"]).splitlines()
     except Exception:
@@ -247,9 +303,12 @@ def main() -> int:
                 continue
             grounding_files.append(path)
 
-    base = base_ref()
-    if base:
-        changed = changed_files_against_base(base)
+    base, base_error, is_push = base_ref()
+    if base_error:
+        errors.append(base_error)
+        changed = []
+    elif base:
+        changed = changed_files_against_base(base, is_push)
         if changed is None:
             errors.append(
                 f"Cannot resolve base ref '{base}'. "
@@ -272,6 +331,7 @@ def main() -> int:
             errors.append(f"{path}: duplicate ADR number also used by {seen_numbers[number]}")
         seen_numbers[number] = path
 
+    n_structurally_validated = 0
     for path in files_to_validate:
         text = path.read_text(encoding="utf-8")
         st = status_of(text)
@@ -286,6 +346,7 @@ def main() -> int:
         # immutability check below still guards Accepted ones).
         is_new = base is not None and file_at(base, path.as_posix()) is None
         if is_new:
+            n_structurally_validated += 1
             for section in REQUIRED_SECTIONS:
                 if not has_section(text, section):
                     errors.append(f"{path}: missing required section '## {section}'")
@@ -340,10 +401,9 @@ def main() -> int:
             print(f"- {e}")
         return 1
     n_discovered = len(adr_files)
-    n_validated = len(files_to_validate)
     parts = [f"{n_discovered} ADR file(s) discovered"]
-    if n_validated != n_discovered:
-        parts.append(f"{n_validated} ADR(s) structurally validated")
+    if n_structurally_validated > 0:
+        parts.append(f"{n_structurally_validated} ADR(s) structurally validated")
     if grounding_files:
         parts.append(f"{len(grounding_files)} grounding file(s) paired")
     print(f"ADR governance passed ({', '.join(parts)}).")
