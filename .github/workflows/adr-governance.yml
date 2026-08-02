@@ -4,6 +4,7 @@ on:
   pull_request:
     paths:
       - 'docs/adr/**'
+      - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
       - '.github/workflows/adr-governance.yml'
@@ -13,6 +14,7 @@ on:
       - master
     paths:
       - 'docs/adr/**'
+      - 'docs/grounding/**'
       - '.adr-kit.yaml'
       - 'scripts/adr-governance.py'
       - '.github/workflows/adr-governance.yml'

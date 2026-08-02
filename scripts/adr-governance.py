@@ -5,11 +5,18 @@ Enforces:
 - ADR files live under docs/adr/ and use NNNN-short-title.md (the established
   convention in this repository, e.g. 0001-bootstrap-peers-are-seed-hints-only.md).
 - Required template sections exist on ADRs added by the change (pre-existing
-  ADRs keep their original structure).
+  ADRs keep their original structure).  Section headings must match exactly:
+  ``## Validation`` satisfies the requirement but ``## Validation Notes`` does
+  not.
 - Status is present and starts with an allowed lifecycle value. Annotations
   after the status are fine, e.g. "Accepted (2026-06-07). Follow-up in ...".
 - Accepted ADRs are immutable after acceptance. If a decision changes, create a
   new ADR and supersede by reference rather than editing the Accepted ADR.
+- Same-stem grounding files in docs/grounding/ are paired with their ADR by
+  NNNN-short-title stem.  Grounding for an Accepted ADR is frozen: mutation and
+  deletion both fail closed.  Grounding for a Proposed ADR remains amendable.
+- The branch/PR base selector ensures a branch-new ADR is treated as ``is_new``
+  across amendment commits, so structural checks always run on the final state.
 """
 from __future__ import annotations
 
@@ -20,10 +27,12 @@ import sys
 from pathlib import Path
 
 ADR_DIR = Path("docs/adr")
+GROUNDING_DIR = Path("docs/grounding")
 ALLOWED_STATUSES = {"Proposed", "Accepted", "Superseded", "Deprecated", "Rejected"}
 REQUIRED_SECTIONS = ["Context", "Decision", "Consequences", "Validation"]
 FILENAME_RE = re.compile(r"^\d{4}-[a-z0-9][a-z0-9-]*\.md$")
 ADR_PATH_RE = re.compile(r"^docs/adr/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
+GROUNDING_PATH_RE = re.compile(r"^docs/grounding/\d{4}-[a-z0-9][a-z0-9-]*\.md$")
 # Existing ADRs use two status styles: a header bullet ("- Status: ...",
 # "- **Status:** ...") or a "## Status" section with the value on the next line.
 STATUS_BULLET_RE = re.compile(r"(?im)^\s*[-*]\s*\*{0,2}Status:?\*{0,2}:?\s*(.+?)\s*$")
@@ -47,7 +56,14 @@ def status_token(status: str) -> str:
 
 
 def has_section(text: str, section: str) -> bool:
-    return re.search(rf"(?im)^##\s+{re.escape(section)}\b", text) is not None
+    """True when ``## {section}`` appears as an exact ATX heading.
+
+    The match is exact: ``## Validation`` satisfies the ``Validation``
+    requirement but ``## Validation Notes`` does not, because a heading
+    with extra words is a different section.  Trailing whitespace on the
+    heading line is tolerated.
+    """
+    return re.search(rf"(?im)^##\s+{re.escape(section)}[ \t]*$", text) is not None
 
 
 def non_heading_lines(text: str) -> list[str]:
@@ -83,10 +99,33 @@ def is_template_repair(old: str, new: str) -> bool:
 
 
 def base_ref() -> str | None:
+    """Return the ref to diff against for ``is_new`` and immutability checks.
+
+    Resolution order:
+
+    1. ``GITHUB_BASE_REF`` — set on pull requests, points at the target
+       branch.  Using ``origin/{ref}`` captures every commit on the PR
+       branch, so a new ADR added in an early commit and amended later
+       is always treated as ``is_new``.
+    2. ``GITHUB_BEFORE`` — set on push events, points at the previous
+       branch tip before the push.  Correct for multi-commit pushes,
+       unlike ``HEAD^1`` which only sees the immediate parent.
+    3. ``git merge-base <default> HEAD`` — for local runs, find the
+       fork point from ``main`` or ``master`` so the entire branch is
+       covered, not just the last commit.
+    4. ``HEAD^1`` — last resort, correct only for single-commit changes.
+    """
     ref = os.environ.get("GITHUB_BASE_REF")
     if ref:
         return f"origin/{ref}"
-    # On push, compare against first parent where available.
+    before = os.environ.get("GITHUB_BEFORE")
+    if before:
+        return before
+    for default in ("main", "master", "origin/main", "origin/master"):
+        try:
+            return run(["git", "merge-base", default, "HEAD"])
+        except Exception:
+            continue
     try:
         return run(["git", "rev-parse", "HEAD^1"])
     except Exception:
@@ -110,6 +149,23 @@ def file_at(ref: str, path: str) -> str | None:
         return None
 
 
+def adr_status_for_grounding(grounding_name: str, ref: str = "HEAD") -> str | None:
+    """Return the lifecycle status token of the same-stem ADR for a
+    grounding file path, or ``None`` when no paired ADR exists.
+
+    ``grounding_name`` is a repo-relative path like
+    ``docs/grounding/0028-foo.md``.  The same-stem ADR is
+    ``docs/adr/0028-foo.md``.
+    """
+    stem = Path(grounding_name).stem
+    adr_path = f"docs/adr/{stem}.md"
+    text = file_at(ref, adr_path)
+    if text is None:
+        return None
+    st = status_of(text)
+    return status_token(st) if st else None
+
+
 def main() -> int:
     errors: list[str] = []
     if not ADR_DIR.exists():
@@ -127,6 +183,23 @@ def main() -> int:
             errors.append(f"{path}: filename must match NNNN-short-title.md")
             continue
         adr_files.append(path)
+
+    # Collect same-stem grounding files from docs/grounding/.  Each grounding
+    # file must pair with a same-stem ADR; the ADR's lifecycle status
+    # determines whether the grounding is amendable (Proposed) or frozen
+    # (Accepted).
+    grounding_files: list[Path] = []
+    if GROUNDING_DIR.exists():
+        for path in sorted(GROUNDING_DIR.glob("*.md")):
+            if not FILENAME_RE.match(path.name):
+                errors.append(f"{path}: filename must match NNNN-short-title.md")
+                continue
+            stem = path.stem
+            adr_path = ADR_DIR / f"{stem}.md"
+            if not adr_path.exists():
+                errors.append(f"{path}: grounding file has no same-stem ADR {adr_path.as_posix()}")
+                continue
+            grounding_files.append(path)
 
     base = base_ref()
     changed = changed_files_against_base(base) if base else []
@@ -159,7 +232,7 @@ def main() -> int:
         is_new = base is not None and file_at(base, path.as_posix()) is None
         if is_new:
             for section in REQUIRED_SECTIONS:
-                if not re.search(rf"(?im)^##\s+{re.escape(section)}\b", text):
+                if not has_section(text, section):
                     errors.append(f"{path}: missing required section '## {section}'")
 
     if base:
@@ -180,12 +253,44 @@ def main() -> int:
                     f"{name}: Accepted ADRs are immutable. Create a new superseding ADR instead of editing this file."
                 )
 
+        # Grounding file protection: a grounding file paired with an Accepted
+        # ADR is frozen — mutation and deletion both fail closed.  Grounding
+        # for a Proposed ADR remains amendable.
+        for name in changed:
+            if not GROUNDING_PATH_RE.match(name):
+                continue
+            adr_status = adr_status_for_grounding(name, "HEAD")
+            if adr_status is None:
+                # ADR might have been deleted in this change; check the base.
+                adr_status = adr_status_for_grounding(name, base)
+            if adr_status != "Accepted":
+                continue
+            new_grounding = file_at("HEAD", name)
+            if new_grounding is None:
+                errors.append(
+                    f"{name}: cannot delete grounding for Accepted ADR "
+                    f"docs/adr/{Path(name).stem}.md. "
+                    f"Grounding files freeze with ADR acceptance."
+                )
+            else:
+                errors.append(
+                    f"{name}: cannot modify grounding for Accepted ADR "
+                    f"docs/adr/{Path(name).stem}.md. "
+                    f"Grounding files freeze with ADR acceptance."
+                )
+
     if errors:
         print("ADR governance failed:")
         for e in errors:
             print(f"- {e}")
         return 1
-    print(f"ADR governance passed ({len(adr_files)} ADR file(s) checked).")
+    if grounding_files:
+        print(
+            f"ADR governance passed ({len(adr_files)} ADR file(s) "
+            f"and {len(grounding_files)} grounding file(s) checked)."
+        )
+    else:
+        print(f"ADR governance passed ({len(adr_files)} ADR file(s) checked).")
     return 0
 
 if __name__ == "__main__":
