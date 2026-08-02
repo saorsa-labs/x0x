@@ -581,6 +581,8 @@ pub async fn serve_with_options(
         named_groups: RwLock::new(named_groups),
         named_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
+        causal_approval_queue_persistence_lock: Mutex::new(()),
+        predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
         directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),

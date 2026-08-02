@@ -707,6 +707,12 @@ pub(super) struct AppState {
     pub(super) causal_approval_queue_path: PathBuf,
     /// ADR 0028: disk location for the durable predecessor relay outbox.
     pub(super) predecessor_relay_outbox_path: PathBuf,
+    /// Serializes snapshot-and-write of the causal approval queue sidecar so
+    /// an older snapshot cannot rename over a newer conflict tombstone.
+    pub(super) causal_approval_queue_persistence_lock: Mutex<()>,
+    /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
+    /// so an older snapshot cannot rename over a newer completed receipt.
+    pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
