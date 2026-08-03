@@ -6516,8 +6516,11 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // TreeKEM snapshots/queues and GSS shared_secret material; the
             // retained GroupInfo is the guard that blocks stale-card imports
             // from recreating a live authoring-capable group.
-            retain_withdrawn_group_tombstone(state, &resolved_group_key, next, "group_deleted")
-                .await;
+            if !retain_withdrawn_group_tombstone(state, &resolved_group_key, next, "group_deleted")
+                .await
+            {
+                return ApplyMetadataResult::REJECTED;
+            }
             ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::PolicyUpdated {
@@ -11094,7 +11097,7 @@ async fn retain_withdrawn_group_tombstone(
     group_id: &str,
     mut info: x0x::groups::GroupInfo,
     reason: &str,
-) {
+) -> bool {
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
@@ -11110,13 +11113,14 @@ async fn retain_withdrawn_group_tombstone(
     })
     .await;
     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-        return;
+        return false;
     }
     let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
     remove_directory_cache_entries_for_group_info(state, &info).await;
     refresh_group_card_cache_from_info(state, group_id, &info).await;
     save_mls_groups(state).await;
+    true
 }
 
 async fn drop_local_named_group_state(
@@ -11124,7 +11128,7 @@ async fn drop_local_named_group_state(
     id: &str,
     stable_group_id: Option<&str>,
     reason: &str,
-) {
+) -> bool {
     let cache_aliases = treekem_cache_group_aliases(state, id).await;
     let stable_group_id = stable_group_id.filter(|stable| *stable != id);
     if !matches!(
@@ -11138,7 +11142,7 @@ async fn drop_local_named_group_state(
         .await,
         Ok(AtomicWriteOutcome::Durable)
     ) {
-        return;
+        return false;
     }
     let _ = prune_treekem_cache_groups(state, &cache_aliases, reason).await;
     {
@@ -11171,6 +11175,7 @@ async fn drop_local_named_group_state(
     if let Some(stable_group_id) = stable_group_id {
         stop_named_group_metadata_listener(state, stable_group_id).await;
     }
+    true
 }
 
 async fn leave_treekem_group(
@@ -11202,13 +11207,19 @@ async fn leave_treekem_group(
     };
     match disposition {
         TreeKemLeaveDisposition::LocalOnlyDrop => {
-            drop_local_named_group_state(
+            if !drop_local_named_group_state(
                 &state,
                 &id,
                 Some(&event_group_id),
                 "treekem_non_active_leave",
             )
-            .await;
+            .await
+            {
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "named-group state is not directory-durable",
+                );
+            }
             return (
                 StatusCode::OK,
                 Json(serde_json::json!({ "ok": true, "left": name, "local_only": true })),
@@ -11714,7 +11725,12 @@ pub(in crate::server) async fn withdraw_group_state(
             terminal_info,
         )
     };
-    retain_withdrawn_group_tombstone(&state, &id, terminal_info, "withdraw_delete").await;
+    if !retain_withdrawn_group_tombstone(&state, &id, terminal_info, "withdraw_delete").await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
 
     // Refresh the withdrawn-card path for public discovery supersession after
     // stale local cards are gone. Hidden groups still do not publish public
@@ -13009,7 +13025,6 @@ pub(in crate::server) async fn approve_join_request(
         }
     }
     let signing_kp = state.agent.identity().agent_keypair();
-    let now_ms = now_millis_u64();
 
     // ADR 0028 B8: validate a durable predecessor obligation BEFORE any roster
     // mutation, persistence, secure-share publication, or fan-out. The
@@ -13052,6 +13067,25 @@ pub(in crate::server) async fn approve_join_request(
             "predecessor obligation has no durable first-observation time",
         );
     };
+
+    // One global order for this cross-file transaction: group membership,
+    // relay persistence, then roster persistence. Acquire both persistence
+    // guards before reading or authenticating predecessor proof. In
+    // particular, compute the expiry time only after both guards are held so
+    // waiting for either guard cannot authorize a proof that crossed the
+    // retention boundary or was pruned by relay maintenance meanwhile.
+    // Hold both guards through the outbox write, roster write, and every
+    // rollback outcome.
+    let relay_persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
+    let roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
+    if !confirm_named_groups_durability_unlocked(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is awaiting directory-durability confirmation",
+        );
+    }
+    let proof_read_now_ms = now_millis_u64();
+
     // R3: Check the live outbox first, then completed tombstones. Return the
     // validated digest so the refresh matches the exact record that passed.
     let validated_digest: Option<[u8; 32]> = {
@@ -13063,7 +13097,8 @@ pub(in crate::server) async fn approve_join_request(
                     continue;
                 }
                 if o.first_seen_ms != predecessor_first_seen_ms
-                    || o.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) <= now_ms
+                    || o.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+                        <= proof_read_now_ms
                 {
                     continue;
                 }
@@ -13123,7 +13158,8 @@ pub(in crate::server) async fn approve_join_request(
                         continue;
                     }
                     if t.first_seen_ms != predecessor_first_seen_ms
-                        || t.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) <= now_ms
+                        || t.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+                            <= proof_read_now_ms
                     {
                         continue;
                     }
@@ -13177,18 +13213,14 @@ pub(in crate::server) async fn approve_join_request(
             "predecessor obligation not found — JoinRequestCreated not yet received",
         );
     };
-
-    // One global order for this cross-file transaction: group membership,
-    // relay persistence, then roster persistence. Both persistence guards are
-    // acquired before the shared roster mutation and held through the outbox
-    // write, roster write, and every rollback outcome. This prevents another
-    // group writer from capturing the uncommitted approval candidate.
-    let relay_persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
-    let roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
-    if !confirm_named_groups_durability_unlocked(&state).await {
+    // Signature verification may itself cross the retention boundary. Check
+    // again after authentication while relay maintenance is still excluded,
+    // and use this instant as the approval candidate's review/commit time.
+    let now_ms = now_millis_u64();
+    if predecessor_first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) <= now_ms {
         return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "named-group state is awaiting directory-durability confirmation",
+            StatusCode::PRECONDITION_FAILED,
+            "predecessor obligation expired before approval authorization",
         );
     }
 
@@ -13283,6 +13315,21 @@ pub(in crate::server) async fn approve_join_request(
     // durable across both failure orders.
     // R4: hold the persistence lock from mutation through durable write.
     {
+        // Candidate construction is deliberately detached from persistence.
+        // Recheck immediately before creating the durable journal so an
+        // authorization that crossed the boundary meanwhile cannot begin the
+        // two-file transaction.
+        if predecessor_first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+            <= now_millis_u64()
+        {
+            if let Some(info) = state.named_groups.write().await.get_mut(&id) {
+                *info = pre_mutation_snapshot;
+            }
+            return api_error(
+                StatusCode::PRECONDITION_FAILED,
+                "predecessor obligation expired before approval persistence",
+            );
+        }
         let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let post_approval_targets: Vec<String> = {
             let groups = state.named_groups.read().await;
@@ -14271,9 +14318,19 @@ pub(in crate::server) async fn import_group_card(
                 protects_keyed_local_group,
             ) {
                 let mut next = info;
-                if apply_withdrawn_group_card_to_group_info(&mut next, &card) {
-                    retain_withdrawn_group_tombstone(&state, &key, next, "withdrawn_card_import")
-                        .await;
+                if apply_withdrawn_group_card_to_group_info(&mut next, &card)
+                    && !retain_withdrawn_group_tombstone(
+                        &state,
+                        &key,
+                        next,
+                        "withdrawn_card_import",
+                    )
+                    .await
+                {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    );
                 }
             } else if protects_keyed_local_group && group_card_supersedes_group_info(&card, &info) {
                 tracing::warn!(
