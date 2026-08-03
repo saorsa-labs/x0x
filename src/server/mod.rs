@@ -55,20 +55,21 @@ use routes::{
     recover_treekem_named_journals, reject_join_request, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
     revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
-    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
-    send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    save_named_groups_checked, save_predecessor_relay_outbox_unlocked, seal_group_state,
+    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
+    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
+    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    streams_diagnostics, subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact,
-    update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PredecessorRelayObligation,
-    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
+    unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
+    update_task, withdraw_group_state, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PredecessorRelayObligation, SelfPublishedReleaseManifests,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 use state::AppState;
@@ -1332,10 +1333,15 @@ pub async fn serve_with_options(
                 }
 
                 // Apply through the normal apply path so local state advances.
-                // B8: capture the apply result — only create the obligation
-                // if the apply succeeded (accepted request). An invalid offer
-                // must not manufacture the later obligation predicate.
-                let apply_ok = apply_named_group_metadata_event(
+                // B8: the typed ApplyMetadataResult separates `accepted`
+                // (was the event durably applied?) from `should_exit`
+                // (should the subscriber break?). The relay listener gates
+                // obligation creation on `.accepted` — a JoinRequestCreated
+                // returns ACCEPTED_CONTINUE (accepted: true, should_exit:
+                // false) so real requester offers now reach obligation
+                // admission. An invalid offer must not manufacture the
+                // later obligation predicate.
+                let apply_result = apply_named_group_metadata_event(
                     &relay_state,
                     event.clone(),
                     sender,
@@ -1348,10 +1354,16 @@ pub async fn serve_with_options(
                 // obligation and relays to active witnesses. A non-authority
                 // witness that received the relay just applies — it does not
                 // re-relay, preventing a relay storm.
-                // B8: only create the obligation if apply succeeded.
-                if is_local_authority && is_requester_offer && apply_ok {
-                    // Requester→authority offer: the authority stores the
-                    // obligation and relays to active witnesses.
+                // B8: only create the obligation if apply accepted the event.
+                // Finding B: ONE admission seam — request state + obligation
+                // together (or neither), reachable by exact replay. If the
+                // apply accepted a new JoinRequestCreated, we snapshot the
+                // pre-apply named-group state so we can roll back the request
+                // if obligation creation fails. If the apply rejected (e.g.
+                // request already exists from a prior failed attempt), we
+                // check for the repair case: request present, obligation
+                // absent → create the obligation without re-applying.
+                if is_local_authority && is_requester_offer {
                     let digest = blake3::hash(envelope_bytes);
                     let digest_bytes: [u8; 32] = digest.into();
                     let byte_size = envelope_bytes.len();
@@ -1362,9 +1374,45 @@ pub async fn serve_with_options(
                         }
                         _ => continue,
                     };
+
+                    // Idempotent skip: if the obligation already exists for
+                    // this digest, do nothing.
+                    let obligation_exists = {
+                        let outbox = relay_state.predecessor_relay_outbox.read().await;
+                        outbox.get(&group_id_str).is_some_and(|list| {
+                            list.iter().any(|o| o.digest == digest_bytes)
+                        })
+                    };
+                    if obligation_exists {
+                        continue;
+                    }
+
+                    // Determine whether to create the obligation:
+                    // - apply_result.accepted: new request was just applied
+                    // - !accepted but request exists + obligation missing: repair
+                    let request_exists_in_roster = {
+                        let groups = relay_state.named_groups.read().await;
+                        groups.get(&group_id_str).is_some_and(|info| {
+                            info.join_requests.contains_key(&request_id)
+                        })
+                    };
+
+                    let is_new_request = apply_result.accepted;
+                    let is_repair = !is_new_request && request_exists_in_roster;
+
+                    if !is_new_request && !is_repair {
+                        continue;
+                    }
+
+                    // For new requests: snapshot the group state for rollback.
+                    let group_snapshot = if is_new_request {
+                        let groups = relay_state.named_groups.read().await;
+                        groups.get(&group_id_str).cloned()
+                    } else {
+                        None
+                    };
+
                     // Collect active witness targets (non-local active members).
-                    // members_v2 keys are already canonical hex agent-id strings;
-                    // do NOT re-encode with hex::encode (Kimi audit 1 — double-hex).
                     let relay_targets = {
                         let groups = relay_state.named_groups.read().await;
                         groups.get(&group_id_str).map(|info| {
@@ -1392,17 +1440,14 @@ pub async fn serve_with_options(
                         completed_at_ms: None,
                     };
                     // Global lock order P→Q: persistence FIRST, then outbox
-                    // write. Held through mutation and durable save. Prevents
-                    // the dirty-write race where another writer snapshots and
-                    // saves between our mutation and our save.
+                    // write. Held through mutation and durable save.
                     let _relay_persistence_guard = relay_state
                         .predecessor_relay_outbox_persistence_lock
                         .lock()
                         .await;
+                    let mut admission_failed = false;
                     {
                         let mut outbox = relay_state.predecessor_relay_outbox.write().await;
-                        // Compute daemon-wide caps BEFORE borrowing a specific
-                        // group's outbox mutably (Kimi blocker 7).
                         let (daemon_count, daemon_bytes, total_targets): (usize, usize, usize) =
                             outbox
                                 .values()
@@ -1410,10 +1455,6 @@ pub async fn serve_with_options(
                                 .fold((0, 0, 0), |(c, b, t), o| {
                                     (c + 1, b + o.byte_size, t + o.relay_targets.len())
                                 });
-                        // ADR 0028 finding E: enforce a COMBINED live+completed
-                        // budget of CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP (1024) /
-                        // CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP (16 MiB), not
-                        // independent per-store budgets.
                         let (completed_count, completed_bytes): (usize, usize) = {
                             let tombstones = relay_state.completed_relay_tombstones.read().await;
                             tombstones.values().flatten().fold((0, 0), |(c, b), t| {
@@ -1427,51 +1468,96 @@ pub async fn serve_with_options(
                         if group_outbox.iter().any(|o| o.digest == obligation.digest) {
                             continue;
                         }
-                        // Per-group count cap.
-                        if group_outbox.len() >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+                        // Per-group combined count cap (live + completed).
+                        let group_completed_count = {
+                            let tombstones = relay_state.completed_relay_tombstones.read().await;
+                            tombstones.get(&group_id_str).map(|l| l.len()).unwrap_or(0)
+                        };
+                        if group_outbox.len() + group_completed_count
+                            >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP
+                        {
                             tracing::warn!(
                                 group_id = %group_id_str,
-                                "ADR 0028: predecessor relay outbox at per-group count capacity, rejecting"
+                                "ADR 0028: per-group combined count capacity, rejecting"
                             );
-                            continue;
+                            admission_failed = true;
                         }
-                        // Per-group byte cap.
-                        let group_bytes: usize = group_outbox.iter().map(|o| o.byte_size).sum();
-                        if group_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
-                            tracing::warn!(
-                                group_id = %group_id_str,
-                                "ADR 0028: predecessor relay outbox at per-group byte capacity, rejecting"
-                            );
-                            continue;
+                        // Per-group combined byte cap (live + completed).
+                        if !admission_failed {
+                            let group_live_bytes: usize =
+                                group_outbox.iter().map(|o| o.byte_size).sum();
+                            let group_completed_bytes: usize = {
+                                let tombstones =
+                                    relay_state.completed_relay_tombstones.read().await;
+                                tombstones.get(&group_id_str).map(|l| {
+                                    l.iter().map(|t| t.envelope_bytes.len()).sum()
+                                }).unwrap_or(0)
+                            };
+                            if group_live_bytes + group_completed_bytes + byte_size
+                                > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
+                            {
+                                tracing::warn!(
+                                    group_id = %group_id_str,
+                                    "ADR 0028: per-group combined byte capacity, rejecting"
+                                );
+                                admission_failed = true;
+                            }
                         }
-                        // ADR 0028: COMBINED daemon-wide count cap (live + completed).
-                        if combined_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+                        // Combined daemon-wide count cap (live + completed).
+                        if !admission_failed && combined_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP
+                        {
                             tracing::warn!(
                                 "ADR 0028: combined relay state at daemon count capacity, rejecting"
                             );
-                            continue;
+                            admission_failed = true;
                         }
-                        // ADR 0028: COMBINED daemon-wide byte cap (live + completed).
-                        if combined_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+                        // Combined daemon-wide byte cap (live + completed).
+                        if !admission_failed
+                            && combined_bytes + byte_size
+                                > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
+                        {
                             tracing::warn!(
                                 "ADR 0028: combined relay state at daemon byte capacity, rejecting"
                             );
-                            continue;
+                            admission_failed = true;
                         }
-                        // ADR 0028: 4096 total relay-target cap (Kimi blocker 7).
-                        if total_targets + obligation.relay_targets.len()
-                            > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP
+                        // 4096 total relay-target cap.
+                        if !admission_failed
+                            && total_targets + obligation.relay_targets.len()
+                                > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP
                         {
                             tracing::warn!(
                                 "ADR 0028: predecessor relay outbox at 4096 total relay-target cap, rejecting"
                             );
-                            continue;
+                            admission_failed = true;
                         }
-                        group_outbox.push(obligation);
+                        if !admission_failed {
+                            group_outbox.push(obligation);
+                        }
                     }
-                    // ADR 0028: persist the relay outbox. Persistence lock is
-                    // already held (P→Q) — use the unlocked save. Roll back on
-                    // failure (Kimi blocker 8).
+                    if admission_failed {
+                        // Finding B: roll back the request if this was a new
+                        // apply, so request state + obligation are "neither".
+                        // For repair (request already existed), just skip.
+                        if is_new_request {
+                            if let Some(snapshot) = group_snapshot {
+                                tracing::warn!(
+                                    group_id = %group_id_str,
+                                    "ADR 0028: rolling back JoinRequestCreated after obligation admission failure"
+                                );
+                                store_named_group_info(
+                                    &relay_state,
+                                    &group_id_str,
+                                    snapshot,
+                                )
+                                .await;
+                                let _ = save_named_groups_checked(&relay_state).await;
+                            }
+                        }
+                        continue;
+                    }
+                    // Persist the relay outbox. Persistence lock is already
+                    // held (P→Q). Roll back on failure.
                     if let Err(e) = save_predecessor_relay_outbox_unlocked(&relay_state).await {
                         tracing::error!(
                             "ADR 0028: relay outbox save failed after admission, rolling back: {e}"
@@ -1479,6 +1565,23 @@ pub async fn serve_with_options(
                         let mut outbox = relay_state.predecessor_relay_outbox.write().await;
                         if let Some(group_outbox) = outbox.get_mut(&group_id_str) {
                             group_outbox.retain(|o| o.digest != digest_bytes);
+                        }
+                        // Finding B: also roll back the request if new.
+                        if is_new_request {
+                            if let Some(snapshot) = group_snapshot {
+                                drop(outbox);
+                                tracing::warn!(
+                                    group_id = %group_id_str,
+                                    "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
+                                );
+                                store_named_group_info(
+                                    &relay_state,
+                                    &group_id_str,
+                                    snapshot,
+                                )
+                                .await;
+                                let _ = save_named_groups_checked(&relay_state).await;
+                            }
                         }
                         continue;
                     }

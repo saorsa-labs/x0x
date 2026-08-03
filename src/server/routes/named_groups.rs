@@ -517,6 +517,57 @@ pub(in crate::server) const CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP: usize = 1024;
 /// ADR 0028: max relay target obligations per daemon.
 pub(in crate::server) const CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP: usize = 4096;
 
+/// ADR 0028 Finding F: derived pre-parse file-size guard. `Vec<u8>` in JSON
+/// expands to at most 4 chars/byte (3 digits + comma). Both sidecars store
+/// envelope bytes for live AND completed stores, so the maximum valid file
+/// size is `byte_cap * 2 stores * 4 expansion + metadata_overhead`. We use
+/// a factor of 10 (2 × 4 + 2 for metadata/keys/IDs) to give explicit
+/// headroom. This admits every semantically valid population under the
+/// selected encoding, unlike the previous 2× or 5× proxy guards which could
+/// reject valid sidecars.
+const RELAY_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP * 10;
+const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP * 10;
+
+/// ADR 0028: Typed result for `apply_named_group_metadata_event` that
+/// separates "was the event accepted and durably applied?" (`accepted`)
+/// from "should the subscriber loop exit?" (`should_exit`). The former
+/// bool was conflated — the relay listener gated obligation creation on
+/// it (interpreting `false` as "not applied") while the subscriber
+/// treated it as "should exit" (interpreting `true` as "break"). The
+/// `JoinRequestCreated` arm returned `false` (continue) even after a
+/// successful apply, so real requester offers never reached obligation
+/// admission.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) struct ApplyMetadataResult {
+    /// `true` when the event was accepted and durably persisted.
+    pub accepted: bool,
+    /// `true` when the subscriber loop should exit (e.g. self-removal,
+    /// group deletion, membership change requiring re-subscription).
+    pub should_exit: bool,
+}
+
+impl ApplyMetadataResult {
+    /// Event rejected — not applied; subscriber continues.
+    pub const REJECTED: Self = Self {
+        accepted: false,
+        should_exit: false,
+    };
+
+    /// Event accepted and persisted; subscriber should exit (membership
+    /// roster changed, requiring re-subscription).
+    pub const ACCEPTED_EXIT: Self = Self {
+        accepted: true,
+        should_exit: true,
+    };
+
+    /// Event accepted and persisted; subscriber should continue
+    /// processing further events.
+    pub const ACCEPTED_CONTINUE: Self = Self {
+        accepted: true,
+        should_exit: false,
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct TreeKemCatchupRequest {
     pub(in crate::server) message_type: String,
@@ -2270,7 +2321,7 @@ fn store_named_group_info_locked(
     true
 }
 
-async fn store_named_group_info(
+pub(in crate::server) async fn store_named_group_info(
     state: &AppState,
     group_id: &str,
     info: x0x::groups::GroupInfo,
@@ -4229,10 +4280,10 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
             None,
         )
         .await;
-        if applied {
+        if applied.accepted {
             any_applied = true;
         }
-        if !applied && treekem_membership_event_frontier(&pending.event).is_some() {
+        if !applied.accepted && treekem_membership_event_frontier(&pending.event).is_some() {
             let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
             let info = {
                 let groups = state.named_groups.read().await;
@@ -4926,8 +4977,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         ))
         .await;
 
-        if applied {
-            // ADR 0028 B5: candidate→one checked persist→install. The inner
+        if applied.accepted {
             // apply mutated in-memory state (candidate) but did NOT save
             // (allow_queue=false skips save_named_groups in the inner apply).
             // This is the ONE checked persist. If it fails, ROLL BACK the
@@ -5390,7 +5440,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
     sender: AgentId,
     verified: bool,
     envelope_bytes: Option<&[u8]>,
-) -> bool {
+) -> ApplyMetadataResult {
     // A non-inviter may retain the first fully member-authenticated join event
     // as provisional evidence, but it cannot replace an existing entry. The
     // inviter's post-acceptance countersigned event (distributed in MemberAdded)
@@ -5424,7 +5474,7 @@ async fn apply_named_group_metadata_event_inner(
     verified: bool,
     allow_queue: bool,
     envelope_bytes: Option<&[u8]>,
-) -> bool {
+) -> ApplyMetadataResult {
     // ADR 0028: replay is called after _serialized returns (guard dropped).
     // Only when allow_queue is true (suppressed during replay itself to
     // prevent recursion).
@@ -5456,7 +5506,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
     allow_queue: bool,
     envelope_bytes: Option<&[u8]>,
     replay_group_id: &mut Option<String>,
-) -> bool {
+) -> ApplyMetadataResult {
     let event_kind = named_group_metadata_event_kind(&event);
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::debug!(
@@ -5486,7 +5536,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 sender = %sender_hex,
                 "group metadata event dropped: sender is revoked"
             );
-            return false;
+            return ApplyMetadataResult::REJECTED;
         }
     }
 
@@ -5522,7 +5572,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             event = event_kind,
             sender = %sender_hex,
         );
-        return false;
+        return ApplyMetadataResult::REJECTED;
     }
 
     let group_id = match &event {
@@ -5561,7 +5611,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 group_id = %group_id,
                 sender = %sender_hex,
             );
-            return false;
+            return ApplyMetadataResult::REJECTED;
         }
     };
     // Serialize every membership apply for this group across the concurrent
@@ -5577,7 +5627,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
     let info = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&resolved_group_key).cloned() else {
-            return false;
+            return ApplyMetadataResult::REJECTED;
         };
         info
     };
@@ -5590,7 +5640,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return false;
+        return ApplyMetadataResult::REJECTED;
     }
     if !info.withdrawn && !live_group_allows_metadata_withdrawal_commit(&event) {
         tracing::debug!(
@@ -5601,7 +5651,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return false;
+        return ApplyMetadataResult::REJECTED;
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem
@@ -5619,7 +5669,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             group_id = %resolved_group_key,
             sender = %sender_hex,
         );
-        return false;
+        return ApplyMetadataResult::REJECTED;
     }
 
     if allow_queue
@@ -5645,7 +5695,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             );
             queue_treekem_membership_event(state, &resolved_group_key, event, sender, &reason)
                 .await;
-            return false;
+            return ApplyMetadataResult::REJECTED;
         }
     }
 
@@ -5668,23 +5718,23 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 let Some(commit_b64) = treekem_commit_b64 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 let Some(epoch) = treekem_epoch else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 Some((commit_b64, treekem_welcome_b64, welcome_ref, epoch))
             } else {
@@ -5732,7 +5782,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         commit_prev_state_hash = ?commit.prev_state_hash,
                         error = %e,
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             let mut recovery_cache_entries = Vec::new();
@@ -5743,17 +5793,17 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         member = %LogHexId::agent(&agent_id),
                         "MemberAdded carried an invalid inviter recovery attestation"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 let Some((key, cached)) = member_joined_kp_cache_entry(recovery) else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 let NamedGroupMetadataEvent::MemberJoined {
                     treekem_key_package_b64: Some(kp_b64),
                     ..
                 } = recovery
                 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 next.set_member_treekem_key_package(&agent_id, kp_b64.clone());
                 recovery_cache_entries.push((key, cached));
@@ -5764,10 +5814,10 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %LogHexId::group(&resolved_group_key),
                         "MemberAdded carried invalid historical recovery evidence"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 let Some((key, cached)) = member_joined_kp_cache_entry(recovery) else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 let NamedGroupMetadataEvent::MemberJoined {
                     member_agent_id: recovered_member,
@@ -5775,7 +5825,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     ..
                 } = recovery
                 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 next.set_member_treekem_key_package(recovered_member, kp_b64.clone());
                 recovery_cache_entries.push((key, cached));
@@ -5784,13 +5834,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 if agent_id == local_agent_hex {
                     let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
                         match BASE64.decode(welcome_b64) {
                             Ok(bytes) => bytes,
-                            Err(_) => return false,
+                            Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
                         match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
@@ -5799,15 +5849,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
-                                return false;
+                                return ApplyMetadataResult::REJECTED;
                             }
                         }
                     } else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     let group_id_bytes = match hex::decode(&next.mls_group_id) {
                         Ok(bytes) => bytes,
-                        Err(_) => return false,
+                        Err(_) => return ApplyMetadataResult::REJECTED,
                     };
                     let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
                     let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
@@ -5817,7 +5867,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         Ok(prepared) => prepared,
                         Err(e) => {
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for MemberAdded Welcome: {e}");
-                            return false;
+                            return ApplyMetadataResult::REJECTED;
                         }
                     };
                     let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(
@@ -5827,11 +5877,11 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         Ok(group) => group,
                         Err(e) => {
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from MemberAdded Welcome: {e}");
-                            return false;
+                            return ApplyMetadataResult::REJECTED;
                         }
                     };
                     if tk.epoch() != epoch {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                     if let Err(e) = install_joined_treekem_group_after_crypto_recheck(
                         state,
@@ -5843,7 +5893,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     .await
                     {
                         tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install TreeKEM snapshot after MemberAdded Welcome: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 } else {
                     let group = {
@@ -5863,7 +5913,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         .await
                         {
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM MemberAdded commit: {e}");
-                            return false;
+                            return ApplyMetadataResult::REJECTED;
                         }
                     } else if !info.has_active_member(&local_agent_hex) {
                         // This daemon is a pre-Welcome joiner catching up on
@@ -5893,7 +5943,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                             revision,
                             epoch,
                         );
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 }
             } else {
@@ -5908,7 +5958,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 drop(mls_groups);
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             for (key, cached) in recovery_cache_entries {
                 cache_treekem_member_key_package(state, key, cached, true).await;
@@ -5918,7 +5968,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             *replay_group_id = Some(resolved_group_key.clone());
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
-            true
+            ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::MemberRemoved {
             revision,
@@ -5931,21 +5981,21 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let admin_remove_auth = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             let self_leave_auth = sender_hex == agent_id && actor == sender_hex;
             if !admin_remove_auth && !self_leave_auth {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             // F1 §4 Step 0: a self-leave commit carrying a GSS secret_epoch is
             // a crafted MemberSelf event — self-removal is rejected at the
             // sender (§1) and a self-leave never rotates. Reject before the
             // plane split so it cannot reach the GSS rekey branch.
             if self_leave_auth && secret_epoch.is_some() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let action_kind = if self_leave_auth {
                 x0x::groups::ActionKind::MemberSelf
@@ -5955,15 +6005,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 if self_leave_auth {
                     if treekem_commit_b64.is_some() || treekem_epoch.is_some() {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                     None
                 } else {
                     let Some(commit_b64) = treekem_commit_b64 else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     let Some(epoch) = treekem_epoch else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     Some((commit_b64, epoch))
                 }
@@ -5986,7 +6036,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 }
             }) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let removed_self = agent_id == local_agent_hex;
@@ -6027,20 +6077,20 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 save_mls_groups(state).await;
                 let _ =
                     prune_treekem_cache_groups(state, &cache_aliases, "member_removed_self").await;
-                return true;
+                return ApplyMetadataResult::ACCEPTED_EXIT;
             }
             if let Some((commit_b64, _epoch)) = treekem_payload {
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
                 let Some(group) = group else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 if let Err(e) = process_treekem_commit_after_crypto_recheck(
                     state,
@@ -6054,11 +6104,11 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 .await
                 {
                     tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM remove commit: {e}");
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -6068,7 +6118,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             let _ =
                 prune_treekem_cache_member(state, &resolved_group_key, &agent_id, "member_removed")
                     .await;
-            true
+            ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::GroupDeleted {
             revision,
@@ -6077,7 +6127,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             // Current delete propagation and legacy delete compatibility both
             // use GroupDeleted with a signed terminal withdrawal commit. DELETE
@@ -6087,10 +6137,10 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // and that `commit.committed_by` held an Admin-or-higher role. The
             // advisory `actor` field must name that verified signer.
             if actor != commit.committed_by {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if !commit.withdrawn {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let next = match apply_terminal_stateful_event_to_group(
@@ -6113,7 +6163,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %resolved_group_key,
                         sender = %sender_hex,
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             // Keep the signed terminal record as a keyless withdrawn tombstone.
@@ -6123,7 +6173,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // from recreating a live authoring-capable group.
             retain_withdrawn_group_tombstone(state, &resolved_group_key, next, "group_deleted")
                 .await;
-            true
+            ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::PolicyUpdated {
             revision,
@@ -6133,7 +6183,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6154,15 +6204,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     next.updated_at = commit.committed_at;
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::MemberRoleUpdated {
             revision,
@@ -6173,19 +6223,19 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let Some(target) = info.members_v2.get(&agent_id).cloned() else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if target.is_removed() || target.is_banned() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             // ADR-0016 reserved-role rationale: the REST authoring API rejects
             // Owner/Moderator/Guest assignments. Signed gossip apply rejects only
@@ -6193,7 +6243,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // Admin, grant no control authority, and remain replayable for
             // validly signed legacy/cross-version convergence.
             if role == x0x::groups::GroupRole::Owner {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6205,15 +6255,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     next.set_member_role(&agent_id, role);
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::MemberBanned {
             revision,
@@ -6226,20 +6276,20 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 let Some(commit_b64) = treekem_commit_b64 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 let Some(epoch) = treekem_epoch else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 Some((commit_b64, epoch))
             } else {
@@ -6266,7 +6316,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let banned_self = agent_id == local_agent_hex;
@@ -6286,14 +6336,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
                 let Some(group) = group else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 if let Err(e) = process_treekem_commit_after_crypto_recheck(
                     state,
@@ -6307,11 +6357,11 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 .await
                 {
                     tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM ban commit: {e}");
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
@@ -6329,7 +6379,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 )
                 .await;
             }
-            true
+            ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::MemberUnbanned {
             revision,
@@ -6339,13 +6389,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6365,15 +6415,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::JoinRequestCreated {
             request_id,
@@ -6386,29 +6436,29 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if sender_hex != requester_agent_id {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.policy.admission != x0x::groups::GroupAdmission::RequestAccess {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.has_active_member(&requester_agent_id) {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.is_banned(&requester_agent_id) {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info
                 .join_requests
                 .values()
                 .any(|r| r.requester_agent_id == requester_agent_id && r.is_pending())
             {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.join_requests.contains_key(&request_id) {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6456,16 +6506,27 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
-            save_named_groups(state).await;
+            // Finding A: `accepted: true` must mean durably persisted. Use the
+            // checked save and, on failure, restore the pre-mutation in-memory
+            // state so the listener does not create a relay obligation whose
+            // pinned request is absent on restart.
+            if save_named_groups_checked(state).await.is_err() {
+                tracing::error!(
+                    group_id = %resolved_group_key,
+                    "JoinRequestCreated: durable save failed, restoring in-memory state"
+                );
+                store_named_group_info(state, &resolved_group_key, current).await;
+                return ApplyMetadataResult::REJECTED;
+            }
             // ADR 0028: a JoinRequestCreated just advanced the group state.
             // Drain queued approvals that may now have their predecessor.
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
             request_id,
@@ -6481,13 +6542,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
                 // ADR 0028: the pending request is absent — the predecessor
@@ -6508,29 +6569,29 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     )
                     .await;
                 }
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !req_snapshot.is_pending() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if req_snapshot.requester_agent_id != requester_agent_id {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.is_banned(&requester_agent_id) {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let treekem_payload = if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                 let Some(commit_b64) = treekem_commit_b64 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 if treekem_welcome_b64.is_none() && welcome_ref.is_none() {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 let Some(epoch) = treekem_epoch else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 let Some(package_hash) = treekem_key_package_hash else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 Some((
                     commit_b64,
@@ -6579,7 +6640,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if let Some((commit_b64, welcome_b64, welcome_ref, _epoch, _package_hash)) =
                 treekem_payload
@@ -6587,13 +6648,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 use base64::Engine as _;
                 let commit_bytes = match BASE64.decode(commit_b64) {
                     Ok(bytes) => bytes,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 if requester_agent_id == local_agent_hex {
                     let welcome_bytes = if let Some(welcome_b64) = welcome_b64 {
                         match BASE64.decode(welcome_b64) {
                             Ok(bytes) => bytes,
-                            Err(_) => return false,
+                            Err(_) => return ApplyMetadataResult::REJECTED,
                         }
                     } else if let Some(welcome_ref) = welcome_ref {
                         match fetch_treekem_welcome_with_retries(state, &group_id, &welcome_ref)
@@ -6602,15 +6663,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                             Ok(bytes) => bytes,
                             Err(e) => {
                                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), welcome_id = %welcome_ref.welcome_id, "failed to fetch TreeKEM Welcome blob after retries: {e}");
-                                return false;
+                                return ApplyMetadataResult::REJECTED;
                             }
                         }
                     } else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     let group_id_bytes = match hex::decode(&next.mls_group_id) {
                         Ok(bytes) => bytes,
-                        Err(_) => return false,
+                        Err(_) => return ApplyMetadataResult::REJECTED,
                     };
                     let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
                     let prepared = match x0x::mls::TreeKemMlsGroup::prepare_member(
@@ -6620,7 +6681,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         Ok(prepared) => prepared,
                         Err(e) => {
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to prepare local TreeKEM identity for welcome: {e}");
-                            return false;
+                            return ApplyMetadataResult::REJECTED;
                         }
                     };
                     let tk = match x0x::mls::TreeKemMlsGroup::join_from_welcome(
@@ -6630,12 +6691,12 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         Ok(group) => group,
                         Err(e) => {
                             tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to join TreeKEM group from Welcome: {e}");
-                            return false;
+                            return ApplyMetadataResult::REJECTED;
                         }
                     };
                     if tk.epoch() != _epoch {
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), expected_epoch = _epoch, actual_epoch = tk.epoch(), "TreeKEM Welcome joined at unexpected epoch");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                     if let Err(e) = install_joined_treekem_group_after_crypto_recheck(
                         state,
@@ -6647,7 +6708,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     .await
                     {
                         tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to install joined TreeKEM snapshot: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 } else {
                     let group = {
@@ -6655,7 +6716,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         map.get(&resolved_group_key).cloned()
                     };
                     let Some(group) = group else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     if let Err(e) = process_treekem_commit_after_crypto_recheck(
                         state,
@@ -6669,12 +6730,12 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     .await
                     {
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "failed to process/install TreeKEM add commit: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 }
             }
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             // B5: for live admission (allow_queue=true) save here and refresh
             // card cache + record membership event. For replay (allow_queue=
@@ -6694,7 +6755,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // state. Drain queued approvals — a multi-request batch may have
             // the next approval's frontier now reachable.
             *replay_group_id = Some(resolved_group_key.clone());
-            true
+            ApplyMetadataResult::ACCEPTED_EXIT
         }
         NamedGroupMetadataEvent::JoinRequestRejected {
             request_id,
@@ -6703,19 +6764,19 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !req_snapshot.is_pending() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6730,14 +6791,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::JoinRequestCancelled {
             request_id,
@@ -6746,16 +6807,16 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if sender_hex != requester_agent_id {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let Some(req_snapshot) = info.join_requests.get(&request_id).cloned() else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if req_snapshot.requester_agent_id != requester_agent_id || !req_snapshot.is_pending() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6768,30 +6829,30 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     }
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::GroupCardPublished { card, .. } => {
             if info.withdrawn && !card.withdrawn {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let sender_is_admin = info
                 .caller_role(&sender_hex)
                 .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin));
             if !sender_is_admin {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if card.group_id != info.stable_group_id() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if !card.signature.is_empty() && card.verify_signature().is_err() {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let mut cache = state.group_card_cache.write().await;
             prune_expired_group_cards(&mut cache, now_millis_u64());
@@ -6800,7 +6861,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
             } else if cache_group_card_if_newer(&mut cache, card.group_id.clone(), card) {
                 enforce_group_card_cache_cap(&mut cache);
             }
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::GroupMetadataUpdated {
             revision,
@@ -6811,13 +6872,13 @@ async fn apply_named_group_metadata_event_inner_serialized(
             ..
         } => {
             let Some(commit) = commit else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
@@ -6835,15 +6896,15 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     next.updated_at = commit.committed_at;
                 },
             ) else {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             };
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::SecureShareDelivered {
             group_id: ref ev_group_id,
@@ -6861,21 +6922,21 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // performance optimisation, not a security boundary.
             let self_hex = hex::encode(state.agent.agent_id().as_bytes());
             if recipient != self_hex {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.withdrawn {
                 tracing::debug!(
                     group_id = %ev_group_id,
                     "ignoring SecureShareDelivered for withdrawn group"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             // Only accept from an active admin+.
             let actor_role = info.caller_role(&actor);
             let actor_authorized = actor == sender_hex
                 && actor_role.is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
             if !actor_authorized {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             // Ignore stale envelopes. Equal-epoch delivery is still accepted
             // if we only know the epoch/security_binding from a prior
@@ -6884,25 +6945,25 @@ async fn apply_named_group_metadata_event_inner_serialized(
             if secret_epoch < info.secret_epoch
                 || (secret_epoch == info.secret_epoch && info.shared_secret.is_some())
             {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             use base64::Engine as _;
             let kem_ct = match BASE64.decode(&kem_ciphertext_b64) {
                 Ok(b) => b,
-                Err(_) => return false,
+                Err(_) => return ApplyMetadataResult::REJECTED,
             };
             let aead_nonce = match BASE64.decode(&aead_nonce_b64) {
                 Ok(b) => b,
-                Err(_) => return false,
+                Err(_) => return ApplyMetadataResult::REJECTED,
             };
             if aead_nonce.len() != 12 {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let mut nonce_bytes = [0u8; 12];
             nonce_bytes.copy_from_slice(&aead_nonce);
             let aead_ct = match BASE64.decode(&aead_ciphertext_b64) {
                 Ok(b) => b,
-                Err(_) => return false,
+                Err(_) => return ApplyMetadataResult::REJECTED,
             };
             let aad = secure_share_aad(ev_group_id, &recipient, secret_epoch);
             let opened = x0x::groups::kem_envelope::open_group_secret(
@@ -6919,7 +6980,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %ev_group_id,
                         "KEM envelope decap/decrypt failed: {e}"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             if let Err(e) = ensure_named_group_key_material_install_allowed(
@@ -6931,14 +6992,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
             .await
             {
                 tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), "rejecting SecureShareDelivered after post-crypto terminality recheck: {e}");
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let mut next = info.clone();
             next.shared_secret = Some(secret.to_vec());
             next.secret_epoch = secret_epoch;
             next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
             if !store_named_group_info(state, &resolved_group_key, next).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
@@ -6947,7 +7008,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 secret_epoch,
                 "Phase D.2: stored new group shared secret (epoch {secret_epoch}) via KEM-sealed envelope"
             );
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
         NamedGroupMetadataEvent::MemberJoined {
             stable_group_id,
@@ -6976,17 +7037,17 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     member = %member_agent_id,
                     "MemberJoined: rejecting unauthorised recovery courier"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             if recovery_authority_signature_b64.is_some() {
                 if !verify_authority_attested_member_joined_recovery(&info, &event_for_log) {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 if let Some((key, cached)) = member_joined_kp_cache_entry(&event_for_log) {
                     cache_treekem_member_key_package(state, key, cached, true).await;
                 }
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 2. Decode the joiner's published public key + signature.
@@ -6998,7 +7059,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %resolved_group_key,
                         "MemberJoined: bad public key base64: {e}"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             let pubkey = match ant_quic::MlDsaPublicKey::from_bytes(&pubkey_bytes) {
@@ -7008,7 +7069,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %resolved_group_key,
                         "MemberJoined: bad public key bytes: {e:?}"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             let sig_bytes = match BASE64.decode(&signature_b64) {
@@ -7018,7 +7079,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %resolved_group_key,
                         "MemberJoined: bad signature base64: {e}"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
             let sig = match ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
@@ -7030,7 +7091,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         group_id = %resolved_group_key,
                         "MemberJoined: bad signature bytes: {e:?}"
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
             };
 
@@ -7057,7 +7118,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     group_id = %resolved_group_key,
                     "MemberJoined: signature did not verify: {e:?}"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 4. Derived AgentId must match the claimed member_agent_id.
@@ -7069,7 +7130,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     derived,
                     member_agent_id
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 5. Invite-join v1 is strictly role-capped. The joiner signs
@@ -7085,7 +7146,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 state
                     .groups_diagnostics
                     .record_member_joined_rejected_non_member_role(&resolved_group_key);
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 6. Only the original local inviter can validate and consume the
@@ -7109,7 +7170,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     local = %local_agent_hex,
                     "MemberJoined: retained authenticated recovery event without applying on non-inviter receiver"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let inviter_role = info.caller_role(&inviter_agent_id);
             let inviter_authorised =
@@ -7120,21 +7181,21 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     inviter = %inviter_agent_id,
                     "MemberJoined: local inviter is not an admin/owner"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             if info.withdrawn {
                 tracing::debug!(
                     group_id = %resolved_group_key,
                     "MemberJoined: rejecting — group is withdrawn"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 7. Idempotent — if the joiner is already active, a replayed
             //    MemberJoined after the inviter committed the add is a no-op and
             //    must not consume any fresh invite record.
             if info.has_active_member(&member_agent_id) {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // 8. Build the authoritative committed add on a clone first. If
@@ -7156,16 +7217,16 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     reason,
                     "MemberJoined: invite validation failed"
                 );
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
             let treekem_key_package_bytes =
                 if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                     let Some(kp_b64) = treekem_key_package_b64.clone() else {
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     };
                     match BASE64.decode(kp_b64) {
                         Ok(bytes) => Some(bytes),
-                        Err(_) => return false,
+                        Err(_) => return ApplyMetadataResult::REJECTED,
                     }
                 } else {
                     None
@@ -7211,14 +7272,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
             let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
                     Ok(id) => id,
-                    Err(_) => return false,
+                    Err(_) => return ApplyMetadataResult::REJECTED,
                 };
                 let group = {
                     let map = state.treekem_groups.read().await;
                     map.get(&resolved_group_key).cloned()
                 };
                 let Some(group) = group else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 let mut guard = group.lock().await;
                 let expected_epoch = guard.epoch().saturating_add(1);
@@ -7226,7 +7287,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     .as_ref()
                     .and_then(|event| treekem_recovery_security_binding(expected_epoch, event))
                 else {
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 };
                 next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
@@ -7238,21 +7299,21 @@ async fn apply_named_group_metadata_event_inner_serialized(
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 };
                 let rollback_snapshot = match guard.to_snapshot_bytes() {
                     Ok(snapshot) => snapshot,
                     Err(e) => {
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: failed to snapshot TreeKEM group before add: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 };
                 let out = match guard.add_member(member_id, kp_bytes) {
                     Ok(out) => out,
                     Err(e) => {
                         tracing::warn!(group_id = %LogHexId::group(&resolved_group_key), member = %LogHexId::agent(&member_agent_id), "MemberJoined: TreeKEM add_member failed: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 };
                 if guard.epoch() != expected_epoch {
@@ -7264,7 +7325,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         &mut guard,
                         "member_joined_add",
                     );
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 if let Err(e) = persist_treekem_and_named_groups_atomic_with_info(
                     state,
@@ -7283,7 +7344,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         "member_joined_add",
                     );
                     tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to persist TreeKEM snapshot after invite add: {e}");
-                    return false;
+                    return ApplyMetadataResult::REJECTED;
                 }
                 treekem_epoch = Some(expected_epoch);
                 treekem_commit = Some(out.commit);
@@ -7298,14 +7359,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
                             member = %LogHexId::agent(&member_agent_id),
                             "MemberJoined: failed to seal authoritative add: {e}"
                         );
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 }
             };
             let metadata_topic = next.metadata_topic.clone();
             let event_group_id = next.stable_group_id().to_string();
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return false;
+                return ApplyMetadataResult::REJECTED;
             }
 
             // Persist and expose the committed roster before any slower MLS or
@@ -7339,7 +7400,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                     Ok(attested) => Some(Box::new(attested)),
                     Err(e) => {
                         tracing::error!(group_id = %LogHexId::group(&resolved_group_key), "failed to attest accepted MemberJoined recovery record: {e}");
-                        return false;
+                        return ApplyMetadataResult::REJECTED;
                     }
                 }
             } else {
@@ -7418,7 +7479,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                 inviter = %inviter_agent_id,
                 "MemberJoined: accepted and published authoritative MemberAdded commit"
             );
-            false
+            ApplyMetadataResult::ACCEPTED_CONTINUE
         }
     }
 }
@@ -7465,7 +7526,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                     let Some(msg) = maybe_msg else { break; };
                     let Some(sender) = msg.sender else { continue; };
                     let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload) else { continue; };
-                    let should_exit = apply_named_group_metadata_event(
+                    let apply_result = apply_named_group_metadata_event(
                         &state_for_task,
                         event,
                         sender,
@@ -7473,7 +7534,7 @@ async fn ensure_named_group_metadata_listener(state: Arc<AppState>, group_id: &s
                         msg.raw_envelope.as_deref(),
                     )
                     .await;
-                    if should_exit { break; }
+                    if apply_result.should_exit { break; }
                 }
             }
         }
@@ -15195,111 +15256,155 @@ fn enforce_combined_relay_budget(
     outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
     tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
 ) {
-    // Combined count cap.
-    let total_count: usize =
-        outbox.values().flatten().count() + tombstones.values().flatten().count();
+    // Finding C: never evict a live obligation to make room for a completed
+    // receipt. Completed receipts may be shed oldest-first; live obligations
+    // are only removed by their own lifecycle (relay success, expiry, or
+    // explicit cancel). If live state alone exceeds a bound, fail closed:
+    // log and leave the state intact (the daemon is over-budget but no
+    // data is silently lost).
+
+    // ── Combined count cap ─────────────────────────────────────────────
+    let live_count: usize = outbox.values().flatten().count();
+    let completed_count: usize = tombstones.values().flatten().count();
+    let total_count = live_count + completed_count;
     if total_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
-        let mut all: Vec<(String, u64, usize, bool)> = Vec::new();
-        for (gid, list) in outbox.iter() {
-            for (i, o) in list.iter().enumerate() {
-                all.push((gid.clone(), o.first_seen_ms, i, true));
-            }
-        }
-        for (gid, list) in tombstones.iter() {
-            for (i, t) in list.iter().enumerate() {
-                all.push((gid.clone(), t.first_seen_ms, i, false));
-            }
-        }
-        // Sort newest-first (descending first_seen_ms) — keep the newest CAP.
-        all.sort_by_key(|e| std::cmp::Reverse(e.1));
-        let keep: std::collections::HashSet<(String, usize, bool)> = all
-            .iter()
-            .take(CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP)
-            .map(|e| (e.0.clone(), e.2, e.3))
-            .collect();
-        for (gid, list) in outbox.iter_mut() {
-            let mut new_list = Vec::with_capacity(list.len());
-            for (i, o) in list.iter().enumerate() {
-                if keep.contains(&(gid.clone(), i, true)) {
-                    new_list.push(o.clone());
+        if live_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+            // Live alone exceeds the cap — fail closed, do not evict.
+            tracing::error!(
+                live_count,
+                cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+                "ADR 0028: live obligations alone exceed daemon count cap, failing closed (no eviction)"
+            );
+            // Drop ALL completed receipts to free what we can.
+            tombstones.clear();
+        } else {
+            // Shed completed receipts oldest-first until within budget.
+            let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP - live_count;
+            let mut all_completed: Vec<(String, u64, usize)> = Vec::new();
+            for (gid, list) in tombstones.iter() {
+                for (i, t) in list.iter().enumerate() {
+                    all_completed.push((gid.clone(), t.first_seen_ms, i));
                 }
             }
-            *list = new_list;
-        }
-        outbox.retain(|_, list| !list.is_empty());
-        for (gid, list) in tombstones.iter_mut() {
-            let mut new_list = Vec::with_capacity(list.len());
-            for (i, t) in list.iter().enumerate() {
-                if keep.contains(&(gid.clone(), i, false)) {
-                    new_list.push(t.clone());
+            // Sort newest-first — keep the newest `budget_for_completed`.
+            all_completed.sort_by_key(|e| std::cmp::Reverse(e.1));
+            let keep: std::collections::HashSet<(String, usize)> = all_completed
+                .iter()
+                .take(budget_for_completed)
+                .map(|e| (e.0.clone(), e.2))
+                .collect();
+            for (gid, list) in tombstones.iter_mut() {
+                let mut new_list = Vec::with_capacity(list.len());
+                for (i, t) in list.iter().enumerate() {
+                    if keep.contains(&(gid.clone(), i)) {
+                        new_list.push(t.clone());
+                    }
                 }
+                *list = new_list;
             }
-            *list = new_list;
+            tombstones.retain(|_, list| !list.is_empty());
         }
-        tombstones.retain(|_, list| !list.is_empty());
     }
 
-    // Combined byte cap.
-    let total_bytes: usize = outbox
+    // ── Combined byte cap ──────────────────────────────────────────────
+    let live_bytes: usize = outbox
         .values()
         .flatten()
         .map(|o| o.byte_size)
-        .sum::<usize>()
-        + tombstones
-            .values()
-            .flatten()
-            .map(|t| t.envelope_bytes.len())
-            .sum::<usize>();
+        .sum::<usize>();
+    let completed_bytes: usize = tombstones
+        .values()
+        .flatten()
+        .map(|t| t.envelope_bytes.len())
+        .sum::<usize>();
+    let total_bytes = live_bytes + completed_bytes;
     if total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
-        let mut all: Vec<(String, u64, usize, usize, bool)> = Vec::new();
-        for (gid, list) in outbox.iter() {
-            for (i, o) in list.iter().enumerate() {
-                all.push((gid.clone(), o.first_seen_ms, i, o.byte_size, true));
-            }
-        }
-        for (gid, list) in tombstones.iter() {
-            for (i, t) in list.iter().enumerate() {
-                all.push((
-                    gid.clone(),
-                    t.first_seen_ms,
-                    i,
-                    t.envelope_bytes.len(),
-                    false,
-                ));
-            }
-        }
-        // Sort oldest-first (ascending first_seen_ms) for eviction.
-        all.sort_by_key(|e| e.1);
-        let mut current = total_bytes;
-        let mut evict: std::collections::HashSet<(String, usize, bool)> =
-            std::collections::HashSet::new();
-        for (gid, _, i, sz, is_live) in &all {
-            if current <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
-                break;
-            }
-            evict.insert((gid.clone(), *i, *is_live));
-            current = current.saturating_sub(*sz);
-        }
-        for (gid, list) in outbox.iter_mut() {
-            let mut new_list = Vec::with_capacity(list.len());
-            for (i, o) in list.iter().enumerate() {
-                if !evict.contains(&(gid.clone(), i, true)) {
-                    new_list.push(o.clone());
+        if live_bytes >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+            tracing::error!(
+                live_bytes,
+                cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+                "ADR 0028: live obligations alone exceed daemon byte cap, failing closed (no eviction)"
+            );
+            tombstones.clear();
+        } else {
+            let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP - live_bytes;
+            let mut all_completed: Vec<(String, u64, usize, usize)> = Vec::new();
+            for (gid, list) in tombstones.iter() {
+                for (i, t) in list.iter().enumerate() {
+                    all_completed.push((gid.clone(), t.first_seen_ms, i, t.envelope_bytes.len()));
                 }
             }
-            *list = new_list;
+            // Sort oldest-first for eviction.
+            all_completed.sort_by_key(|e| e.1);
+            let mut current = completed_bytes;
+            let mut evict: std::collections::HashSet<(String, usize)> =
+                std::collections::HashSet::new();
+            for (gid, _, i, sz) in &all_completed {
+                if current <= budget_for_completed {
+                    break;
+                }
+                evict.insert((gid.clone(), *i));
+                current = current.saturating_sub(*sz);
+            }
+            for (gid, list) in tombstones.iter_mut() {
+                let mut new_list = Vec::with_capacity(list.len());
+                for (i, t) in list.iter().enumerate() {
+                    if !evict.contains(&(gid.clone(), i)) {
+                        new_list.push(t.clone());
+                    }
+                }
+                *list = new_list;
+            }
+            tombstones.retain(|_, list| !list.is_empty());
         }
-        outbox.retain(|_, list| !list.is_empty());
-        for (gid, list) in tombstones.iter_mut() {
-            let mut new_list = Vec::with_capacity(list.len());
-            for (i, t) in list.iter().enumerate() {
-                if !evict.contains(&(gid.clone(), i, false)) {
-                    new_list.push(t.clone());
+    }
+
+    // ── Per-group combined count cap (live + completed) ────────────────
+    // Finding C/3: a single group can no longer hold 64 live + 64 completed.
+    // Protect live obligations: shed only completed receipts oldest-first.
+    let all_group_ids: std::collections::HashSet<String> =
+        outbox.keys().chain(tombstones.keys()).cloned().collect();
+    for gid in all_group_ids {
+        let live_n = outbox.get(&gid).map(|l| l.len()).unwrap_or(0);
+        let completed_n = tombstones.get(&gid).map(|l| l.len()).unwrap_or(0);
+        if live_n + completed_n > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+            let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP.saturating_sub(live_n);
+            if let Some(list) = tombstones.get_mut(&gid) {
+                list.sort_by_key(|t| std::cmp::Reverse(t.first_seen_ms));
+                list.truncate(budget_for_completed);
+            }
+            tombstones.retain(|_, list| !list.is_empty());
+        }
+    }
+
+    // ── Per-group combined byte cap (live + completed) ─────────────────
+    for gid in outbox
+        .keys()
+        .chain(tombstones.keys())
+        .cloned()
+        .collect::<std::collections::HashSet<_>>()
+    {
+        let live_bytes: usize = outbox
+            .get(&gid)
+            .map(|l| l.iter().map(|o| o.byte_size).sum())
+            .unwrap_or(0);
+        let completed_bytes: usize = tombstones
+            .get(&gid)
+            .map(|l| l.iter().map(|t| t.envelope_bytes.len()).sum())
+            .unwrap_or(0);
+        if live_bytes + completed_bytes > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
+            let budget_for_completed =
+                CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP.saturating_sub(live_bytes);
+            if let Some(list) = tombstones.get_mut(&gid) {
+                list.sort_by_key(|t| t.first_seen_ms);
+                let mut current = completed_bytes;
+                while current > budget_for_completed && !list.is_empty() {
+                    let removed = list.remove(0);
+                    current = current.saturating_sub(removed.envelope_bytes.len());
                 }
             }
-            *list = new_list;
+            tombstones.retain(|_, list| !list.is_empty());
         }
-        tombstones.retain(|_, list| !list.is_empty());
     }
 }
 
@@ -15429,10 +15534,11 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
         Err(_) => return, // no sidecar yet — fresh start
     };
     let file_size = metadata.len() as usize;
-    if file_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP * 2 {
+    if file_size > QUEUE_SIDECAR_FILE_SIZE_CAP {
         tracing::warn!(
             file_size,
-            "causal approval queue sidecar exceeds 2× daemon byte cap, ignoring"
+            cap = QUEUE_SIDECAR_FILE_SIZE_CAP,
+            "causal approval queue sidecar exceeds derived file-size cap, ignoring"
         );
         return;
     }
@@ -15612,10 +15718,11 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         Err(_) => return,
     };
     let file_size = metadata.len() as usize;
-    if file_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP * 2 {
+    if file_size > RELAY_SIDECAR_FILE_SIZE_CAP {
         tracing::warn!(
             file_size,
-            "predecessor relay outbox sidecar exceeds 2× daemon byte cap, ignoring"
+            cap = RELAY_SIDECAR_FILE_SIZE_CAP,
+            "predecessor relay outbox sidecar exceeds derived file-size cap, ignoring"
         );
         return;
     }
@@ -15818,15 +15925,18 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
     *state.completed_relay_tombstones.write().await = tombstones;
     // Fix 5: B8 journal recovery. If the sidecar has a pending B8
     // compensation, check whether the roster has the approval:
-    // - If yes: the cross-file operation completed (outbox refresh + roster
-    //   save both succeeded) — clear the journal, keep the refreshed outbox.
-    // - If no: the operation was aborted (roster save failed) but the outbox
-    //   refresh is durable — restore the outbox from the journal snapshot
-    //   to undo the refresh.
+    // - If yes AND the predecessor digest matches the exact outbox record:
+    //   the cross-file operation completed — clear the journal, keep the
+    //   refreshed outbox.
+    // - If no or the digest does not match: the operation was aborted or
+    //   the journal refers to a different predecessor — restore the outbox
+    //   from the journal snapshot, validating each entry through the same
+    //   loader path as ordinary load (Finding E).
     if let Some(journal) = loaded_sidecar.pending_compensation {
-        // Finding F: bind to the EXACT approved tuple — not just any
-        // `Approved` under the same request_id. A stale or different
-        // approval must not commit the refreshed outbox.
+        // Finding D: bind the journal digest to the EXACT outbox record
+        // for the journal's request_id/requester_agent_id, not set
+        // membership within the group. A wrong digest that happens to
+        // match a different record's digest must not commit the refresh.
         let roster_has_exact_approval = {
             let groups = state.named_groups.read().await;
             groups.get(&journal.group_id).is_some_and(|info| {
@@ -15842,33 +15952,155 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                         })
             })
         };
-        if roster_has_exact_approval {
+        // Finding D: the predecessor_digest in the journal must match the
+        // outbox obligation for THIS exact request_id/requester, not any
+        // obligation in the group.
+        let digest_matches_exact_record = {
+            let outbox = state.predecessor_relay_outbox.read().await;
+            outbox.get(&journal.group_id).is_some_and(|list| {
+                list.iter().any(|o| {
+                    o.request_id == journal.request_id
+                        && o.requester_agent_id == journal.requester_agent_id
+                        && o.digest == journal.predecessor_digest
+                })
+            })
+        };
+
+        if roster_has_exact_approval && digest_matches_exact_record {
             tracing::info!(
                 group_id = %LogHexId::group(&journal.group_id),
                 request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery — exact approval match, operation completed, clearing journal"
+                "ADR 0028 B8: journal recovery — exact approval + digest match, operation completed, clearing journal"
             );
-            // Keep the refreshed outbox (it's correct). Clear the journal.
             *state.pending_b8_compensation.lock().await = None;
         } else {
             tracing::warn!(
                 group_id = %LogHexId::group(&journal.group_id),
                 request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery — no exact approval match, restoring outbox from journal snapshot"
+                roster_match = roster_has_exact_approval,
+                digest_match = digest_matches_exact_record,
+                "ADR 0028 B8: journal recovery — approval or digest mismatch, restoring outbox from journal snapshot"
             );
-            // Restore the outbox from the journal snapshot to undo the refresh.
-            {
-                let mut outbox = state.predecessor_relay_outbox.write().await;
-                if journal.outbox_snapshot.is_empty() {
-                    outbox.remove(&journal.group_id);
+            // Finding E: restore the outbox from the journal snapshot,
+            // validating each entry through the same loader path as
+            // ordinary load (decode_and_verify_v2, group-id equality,
+            // local-authority, target cap, per-group/daemon caps).
+            let groups_view: HashMap<String, x0x::groups::GroupInfo> = {
+                let groups = state.named_groups.read().await;
+                groups.clone()
+            };
+            let restore_valid = if let Some(info) = groups_view.get(&journal.group_id) {
+                if info.withdrawn {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&journal.group_id),
+                        "ADR 0028 B8: journal group withdrawn, clearing journal without restore"
+                    );
+                    false
                 } else {
-                    outbox.insert(journal.group_id.clone(), journal.outbox_snapshot);
+                    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+                    let is_authority = hex::encode(info.creator.as_bytes()) == local_agent_hex;
+                    let now_ms = now_millis_u64();
+                    let mut filtered = Vec::new();
+                    let mut group_count = 0usize;
+                    let mut group_bytes = 0usize;
+                    for entry in &journal.outbox_snapshot {
+                        let expires_at = entry
+                            .first_seen_ms
+                            .saturating_add(CAUSAL_APPROVAL_RETENTION_MS);
+                        if expires_at <= now_ms {
+                            continue;
+                        }
+                        let derived_byte_size = entry.envelope_bytes.len();
+                        let derived_digest = blake3::hash(&entry.envelope_bytes);
+                        if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
+                            continue;
+                        }
+                        if group_count >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+                            break;
+                        }
+                        if group_bytes + derived_byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
+                        {
+                            break;
+                        }
+                        // Finding E: same V2 decode+verify as ordinary load.
+                        let (decoded_relay_event, v2_signer, v2_topic) = match decode_and_verify_v2(
+                            &entry.envelope_bytes,
+                        ) {
+                            Ok(v) => v,
+                            Err(reason) => {
+                                tracing::warn!(
+                                    group_id = %journal.group_id,
+                                    reason = %reason,
+                                    "ADR 0028 B8: journal restore V2 verification failed, dropping entry"
+                                );
+                                continue;
+                            }
+                        };
+                        if v2_topic != info.metadata_topic {
+                            continue;
+                        }
+                        let (decoded_req_id, decoded_requester) = match &decoded_relay_event {
+                            NamedGroupMetadataEvent::JoinRequestCreated {
+                                request_id,
+                                requester_agent_id,
+                                ..
+                            } => (request_id.clone(), requester_agent_id.clone()),
+                            _ => continue,
+                        };
+                        if decoded_req_id != entry.request_id
+                            || decoded_requester != entry.requester_agent_id
+                        {
+                            continue;
+                        }
+                        if hex::encode(v2_signer.as_bytes()) != entry.requester_agent_id {
+                            continue;
+                        }
+                        let decoded_gid =
+                            named_group_metadata_event_group_id(&decoded_relay_event).to_string();
+                        if decoded_gid != journal.group_id || decoded_gid != entry.group_id {
+                            continue;
+                        }
+                        if !is_authority {
+                            continue;
+                        }
+                        let valid_targets: Vec<String> = entry
+                            .relay_targets
+                            .iter()
+                            .filter(|t| parse_agent_id_hex(t).is_ok())
+                            .cloned()
+                            .collect();
+                        if valid_targets.len() != entry.relay_targets.len() {
+                            continue;
+                        }
+                        group_count += 1;
+                        group_bytes += derived_byte_size;
+                        let mut entry = entry.clone();
+                        entry.byte_size = derived_byte_size;
+                        entry.digest = derived_digest.into();
+                        entry.relay_targets = valid_targets;
+                        filtered.push(entry);
+                    }
+                    {
+                        let mut outbox = state.predecessor_relay_outbox.write().await;
+                        if filtered.is_empty() {
+                            outbox.remove(&journal.group_id);
+                        } else {
+                            outbox.insert(journal.group_id.clone(), filtered);
+                        }
+                    }
+                    true
                 }
-            }
+            } else {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&journal.group_id),
+                    "ADR 0028 B8: journal group unknown, clearing journal without restore"
+                );
+                false
+            };
+            let _ = restore_valid;
             *state.pending_b8_compensation.lock().await = None;
         }
-        // Finding F: persist the recovered state with a CHECKED result —
-        // a failed recovery write must not be silently ignored.
+        // Persist the recovered state with a CHECKED result.
         if let Err(e) = save_predecessor_relay_outbox(state).await {
             tracing::error!(
                 group_id = %LogHexId::group(&journal.group_id),
@@ -15886,7 +16118,7 @@ async fn save_named_groups(state: &AppState) {
 /// ADR 0028: checked version of save_named_groups that returns an error on
 /// write failure so the causal replay path can refuse to drop a queue entry
 /// when group-state persistence failed (audit 5).
-async fn save_named_groups_checked(state: &AppState) -> std::io::Result<()> {
+pub(in crate::server) async fn save_named_groups_checked(state: &AppState) -> std::io::Result<()> {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let json = {
         let groups = state.named_groups.read().await;
@@ -16243,7 +16475,10 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
                 return;
             }
-            if apply_named_group_metadata_event(state, event, *sender, true, None).await {
+            if apply_named_group_metadata_event(state, event, *sender, true, None)
+                .await
+                .accepted
+            {
                 clear_expected_join_result_inviter(state.as_ref(), &expected_key);
             }
         }
@@ -18237,7 +18472,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(!applied, "non-GroupDeleted withdrawal commit must reject");
+        assert!(
+            !applied.accepted,
+            "non-GroupDeleted withdrawal commit must reject"
+        );
         let groups = state.named_groups.read().await;
         let stored = groups.get(group_id).expect("group retained");
         assert!(!stored.withdrawn);
@@ -18282,7 +18520,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(!applied, "only GroupDeleted may terminalize a live group");
+        assert!(
+            !applied.accepted,
+            "only GroupDeleted may terminalize a live group"
+        );
         let groups = state.named_groups.read().await;
         let stored = groups.get(group_id).expect("group retained");
         assert!(!stored.withdrawn);
@@ -18327,7 +18568,10 @@ mod tests {
             None,
         )
         .await;
-        assert!(applied, "GroupDeleted is the terminal withdrawal path");
+        assert!(
+            applied.accepted,
+            "GroupDeleted is the terminal withdrawal path"
+        );
         let groups = state.named_groups.read().await;
         let stored = groups.get(group_id).expect("terminal tombstone retained");
         assert!(stored.withdrawn);
@@ -18384,7 +18628,7 @@ mod tests {
         )
         .await;
         assert!(
-            applied_b,
+            applied_b.accepted,
             "#99 non-regression: an UNVERIFIED (but not revoked) committer's \
              self-authenticating GroupDeleted must still apply via bypass_verified"
         );
@@ -18436,7 +18680,7 @@ mod tests {
         )
         .await;
         assert!(
-            !applied_a,
+            !applied_a.accepted,
             "crown jewel: a REVOKED committer's GroupDeleted must be denied \
              BEFORE bypass_verified — otherwise a revoked admin could still \
              terminate groups via the self-authenticating commit path"
@@ -18967,8 +19211,8 @@ mod tests {
             apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
                 .await;
         assert!(
-            removed,
-            "MemberRemoved with a valid signed commit must apply (returns true)"
+            removed.should_exit,
+            "MemberRemoved with a valid signed commit must apply (exits subscriber)"
         );
         {
             let groups = f.state.named_groups.read().await;
@@ -18999,8 +19243,8 @@ mod tests {
         // SecureShareDelivered signals "no rebroadcast" (returns false);
         // success is observed in stored state, not in this boolean.
         assert!(
-            !delivered,
-            "SecureShareDelivered returns false; convergence is asserted on stored state"
+            !delivered.should_exit,
+            "SecureShareDelivered does not exit the subscriber; convergence is asserted on stored state"
         );
 
         assert_gss_rotation_converged(
@@ -19031,8 +19275,8 @@ mod tests {
         )
         .await;
         assert!(
-            !delivered,
-            "SecureShareDelivered returns false; success is observed in stored state"
+            !delivered.should_exit,
+            "SecureShareDelivered does not exit the subscriber; success is observed in stored state"
         );
         {
             let groups = f.state.named_groups.read().await;
@@ -19056,8 +19300,8 @@ mod tests {
             apply_named_group_metadata_event(&f.state, f.remove_event.clone(), sender, true, None)
                 .await;
         assert!(
-            removed,
-            "MemberRemoved with a valid signed commit must apply (returns true)"
+            removed.should_exit,
+            "MemberRemoved with a valid signed commit must apply (exits subscriber)"
         );
 
         assert_gss_rotation_converged(
@@ -20429,7 +20673,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(!should_exit);
+        assert!(!should_exit.should_exit);
         let counters = group_counters_for_test(&state, &group_id).await;
         assert_eq!(
             counters.member_joined_events_rejected_non_member_role, 1,
@@ -20452,7 +20696,7 @@ mod tests {
             None,
         )
         .await;
-        assert!(!should_exit);
+        assert!(!should_exit.should_exit);
         let counters = group_counters_for_test(&state, &group_id).await;
         assert_eq!(
             counters.member_joined_events_rejected_invite_secret_unknown, 1,
@@ -20848,7 +21092,7 @@ mod tests {
         )
         .await;
 
-        assert!(!should_exit);
+        assert!(!should_exit.should_exit);
         assert_member_joined_treekem_did_not_install(&fixture).await?;
         let groups = fixture.state.named_groups.read().await;
         assert!(
@@ -20887,7 +21131,7 @@ mod tests {
         )
         .await;
 
-        assert!(!should_exit);
+        assert!(!should_exit.should_exit);
         assert_member_joined_treekem_did_not_install(&fixture).await?;
         let groups = fixture.state.named_groups.read().await;
         assert!(
@@ -23509,7 +23753,7 @@ mod tests {
         // (1) Non-inviter never consumes the invite nor authors a roster
         // mutation — the durable state-commit chain is untouched.
         assert!(
-            !applied,
+            !applied.accepted,
             "non-inviter witness must not apply — no roster/state-commit mutation"
         );
         {
@@ -23587,7 +23831,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "W applies O's compact authority commit without gaining authority"
         );
         assert!(
@@ -23598,7 +23843,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "independent recovery delivery never mutates the roster"
         );
 
@@ -23660,7 +23906,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "W retains B's signed event without exercising inviter mutation authority"
         );
         assert!(
@@ -23708,7 +23955,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "W upgrades its provisional cache from O's authority commit"
         );
         assert!(
@@ -23719,7 +23967,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "separate recovery delivery upgrades W's cache without roster mutation"
         );
         let original_kp = member_treekem_kp(&o_state, &group_id, &member_hex)
@@ -24246,7 +24495,8 @@ mod tests {
                 true,
                 None
             )
-            .await,
+            .await
+            .accepted,
             "self-delivered recovery evidence never exercises roster mutation authority"
         );
         assert!(
@@ -24489,7 +24739,8 @@ mod tests {
         // production apply path, even though its local snapshot held B.
         assert!(
             apply_named_group_metadata_event(&w_state, approval_event, authority_id, true, None)
-                .await,
+                .await
+                .accepted,
             "receiver applies the authority JoinRequestApproved commit"
         );
         {

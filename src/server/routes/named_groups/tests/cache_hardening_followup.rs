@@ -715,7 +715,7 @@ async fn group_deleted_tombstone_prunes_recovery_cache_memory_and_disk() -> Resu
     )
     .await;
     assert!(
-        applied,
+        applied.accepted,
         "GroupDeleted committed through the production apply path"
     );
     {
@@ -754,7 +754,9 @@ async fn group_deleted_tombstone_prunes_independent_witness_memory_and_disk() ->
     let raw = without_recovery_attestation(fixture.event.clone());
     let cache_key = join_result_key(&fixture.group_id, &fixture.member_hex);
     assert!(
-        !apply_named_group_metadata_event(&witness, raw, fixture.member_id, true, None).await,
+        !apply_named_group_metadata_event(&witness, raw, fixture.member_id, true, None)
+            .await
+            .accepted,
         "independent witness retains without authoring membership"
     );
     assert!(witness
@@ -793,7 +795,9 @@ async fn group_deleted_tombstone_prunes_independent_witness_memory_and_disk() ->
         commit: Some(commit),
     };
     assert!(
-        apply_named_group_metadata_event_inner(&witness, event, authority, true, true, None).await,
+        apply_named_group_metadata_event_inner(&witness, event, authority, true, true, None)
+            .await
+            .accepted,
         "signed GroupDeleted commits on the independent witness"
     );
     assert!(witness
@@ -1646,7 +1650,7 @@ async fn non_inviter_witness_insert_blocks_terminal_pruning_at_membership_bounda
         .await
         .context("witness apply did not complete after releasing the durable writer")??;
     assert!(
-        !witness_applied,
+        !witness_applied.accepted,
         "non-inviter witness retains without authoring membership"
     );
 
@@ -1656,7 +1660,7 @@ async fn non_inviter_witness_insert_blocks_terminal_pruning_at_membership_bounda
             "terminal GroupDeleted did not complete after the witness insert released the boundary",
         )??;
     assert!(
-        terminal_applied,
+        terminal_applied.accepted,
         "signed GroupDeleted committed through the production apply path"
     );
 
