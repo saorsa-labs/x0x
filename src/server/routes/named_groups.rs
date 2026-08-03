@@ -521,30 +521,28 @@ pub(in crate::server) const CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP: usize = 4096;
 /// expands to at most 4 chars/byte (3 digits + comma). Both sidecars store
 /// envelope bytes for live AND completed stores, so the maximum valid file
 /// size is `byte_cap * 2 stores * 4 expansion + metadata_overhead`. We use
-/// a factor of 10 (2 × 4 + 2 for metadata/keys/IDs) to give explicit
-/// headroom. This admits every semantically valid population under the
-/// selected encoding, unlike the previous 2× or 5× proxy guards which could
-/// reject valid sidecars.
+/// a factor of 16. Four independent 4× allowances cover the envelope byte
+/// array, the decoded event's byte/string representation, duplicated binding
+/// fields, and all per-entry/container metadata. Every duplicated binding
+/// field originates inside the capped envelope, so this is a derived upper
+/// bound rather than a percentage estimate.
 /// ADR 0028 Finding F: pre-parse file size cap for the relay outbox sidecar.
 /// The relay outbox sidecar stores `PredecessorRelayObligation` (envelope_bytes:
 /// Vec<u8>) and `CompletedRelayTombstone` (envelope_bytes: Vec<u8>). JSON
 /// encodes Vec<u8> as number arrays at ~4 chars/byte. With two stores (live +
-/// completed), the worst-case JSON expansion is 2 × 4 = 8× the raw envelope
-/// byte budget. The 10× factor provides 25% headroom for metadata overhead
-/// (digests, timestamps, target IDs, group IDs, version field). Post-parse
-/// derived envelope limits remain authoritative.
-const RELAY_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP * 10;
+/// completed), the byte arrays consume at most 2 × 4 = 8× the raw envelope
+/// budget. The remaining two 4× allowances bound authenticated binding fields,
+/// target IDs, timestamps, group IDs, and container syntax. Post-parse derived
+/// envelope limits remain authoritative.
+const RELAY_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP * 16;
 /// ADR 0028 Finding F: pre-parse file size cap for the causal approval queue
 /// sidecar. The queue sidecar stores `PendingCausalApproval` which carries
 /// BOTH `envelope_bytes: Vec<u8>` AND `event: NamedGroupMetadataEvent` (the
 /// decoded event). The decoded event's JSON is roughly the same order as the
-/// envelope's JSON (field names + string values ≈ 4 chars per byte of original
-/// envelope). So the queue sidecar has 2 × 4 = 8× expansion from the two
-/// Vec<u8>-equivalent fields, plus metadata (digest, sender, timestamps,
-/// revision, conflict flags, conflict_tombstones). The 10× factor provides
-/// 25% headroom over the 8× expansion. Post-parse derived envelope limits
-/// remain authoritative.
-const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP * 10;
+/// envelope's JSON. The 16× bound above assigns a full additional 4× envelope
+/// budget to duplicated binding fields and another 4× to container metadata;
+/// post-parse semantic limits remain authoritative.
+const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP * 16;
 
 /// ADR 0028: Typed result for `apply_named_group_metadata_event` that
 /// separates "was the event accepted and durably applied?" (`accepted`)
@@ -3765,10 +3763,29 @@ impl TreeKemMemberKeyPackageCache {
                         .await;
                 }
             };
-            if let Err(error) = write_treekem_cache_json_atomic(&self.path, &json).await {
-                return self
-                    .record_persistence_failure(revision, format!("write failed: {error}"))
-                    .await;
+            match write_treekem_cache_json_atomic(&self.path, &json).await {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    return self
+                        .record_persistence_failure(
+                            revision,
+                            "replacement visible but not directory-durable".to_string(),
+                        )
+                        .await;
+                }
+                Ok(AtomicWriteOutcome::NotReplaced) => {
+                    return self
+                        .record_persistence_failure(
+                            revision,
+                            "write did not replace file".to_string(),
+                        )
+                        .await;
+                }
+                Err(error) => {
+                    return self
+                        .record_persistence_failure(revision, error.to_string())
+                        .await;
+                }
             }
             let mut state = self.state.write().await;
             state.persisted_revision = state.persisted_revision.max(revision);
@@ -4808,40 +4825,52 @@ async fn try_queue_causal_approval(
             // recording a diagnostic — no durable reject-both is acknowledged.
             // Persistence lock is already held (P→Q) — use the unlocked save.
             let save_result = save_causal_approval_queue_unlocked(state).await;
-            if let Err(e) = save_result {
-                tracing::error!(
-                    "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
-                );
-                // Watson ruling: Err means NotReplaced. ReplacedNotDurable is
-                // Ok(outcome) — data IS on disk, no rollback needed.
-                // Finding 3 (Sam 4ea68a9): restore the FULL tombstone map
-                // (pre-prune state) so pre-existing receipts evicted during
-                // pruning are not lost. Then remove only the newly-inserted
-                // entries, which were added by this conflict path.
-                {
-                    let mut tombstones = state.causal_conflict_tombstones.write().await;
-                    *tombstones = tombstones_snapshot;
-                    // Now remove newly-inserted entries from the restored map.
-                    if let Some(entries) = tombstones.get_mut(group_id) {
-                        for d in &newly_inserted {
-                            if let Some(pos) = entries.iter().position(|e| e.digest == *d) {
-                                entries.remove(pos);
+            match save_result {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    // Watson ruling: data IS on disk but not dir-fsync'd.
+                    // Do NOT record success diagnostic. The conflict marking
+                    // is durable but not directory-durable. Return without
+                    // recording — the next replay will re-encounter the conflict.
+                    tracing::error!(
+                        "ADR 0028 B3: conflict marking replaced but not directory-durable — not recording success"
+                    );
+                    return;
+                }
+                _ => {
+                    let e = "not replaced or write failed";
+                    tracing::error!(
+                        "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
+                    );
+                    // Finding 3 (Sam 4ea68a9): restore the FULL tombstone map
+                    // (pre-prune state) so pre-existing receipts evicted during
+                    // pruning are not lost. Then remove only the newly-inserted
+                    // entries, which were added by this conflict path.
+                    {
+                        let mut tombstones = state.causal_conflict_tombstones.write().await;
+                        *tombstones = tombstones_snapshot;
+                        // Now remove newly-inserted entries from the restored map.
+                        if let Some(entries) = tombstones.get_mut(group_id) {
+                            for d in &newly_inserted {
+                                if let Some(pos) = entries.iter().position(|e| e.digest == *d) {
+                                    entries.remove(pos);
+                                }
+                            }
+                        }
+                        tombstones.retain(|_, list| !list.is_empty());
+                    }
+                    // Rollback conflicted markings.
+                    {
+                        let mut queue_lock = state.causal_approval_queue.write().await;
+                        if let Some(q) = queue_lock.get_mut(group_id) {
+                            for &i in &conflicted_indices {
+                                q[i].conflicted = false;
+                                q[i].conflicted_with = None;
                             }
                         }
                     }
-                    tombstones.retain(|_, list| !list.is_empty());
+                    return;
                 }
-                // Rollback conflicted markings.
-                {
-                    let mut queue_lock = state.causal_approval_queue.write().await;
-                    if let Some(q) = queue_lock.get_mut(group_id) {
-                        for &i in &conflicted_indices {
-                            q[i].conflicted = false;
-                            q[i].conflicted_with = None;
-                        }
-                    }
-                }
-                return;
             }
             // Persist succeeded — record diagnostic.
             state.groups_diagnostics.record_causal_conflicted(group_id);
@@ -4884,7 +4913,18 @@ async fn try_queue_causal_approval(
         // Persistence lock is already held (P→Q) — use the unlocked save.
         let save_result = save_causal_approval_queue_unlocked(state).await;
         match save_result {
-            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                tracing::warn!(
+                    "ADR 0028: sidecar replaced but not directory-durable — not recording queued"
+                );
+                // Watson ruling: do NOT record success. Return without
+                // recording queued — the entry IS on disk but not dir-fsync'd.
+                state
+                    .groups_diagnostics
+                    .record_causal_capacity_rejected(group_id);
+                return;
+            }
             _ => {
                 let e = std::io::Error::other("not replaced or pre-rename failure");
                 tracing::error!(
@@ -4923,10 +4963,13 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     state: &Arc<AppState>,
     group_id: &str,
 ) {
-    // Global lock order P→Q: acquire persistence FIRST, then queue write.
-    // Held through drain, re-insert, and durable save. No writer may hold
-    // a queue lock and wait for persistence — eliminates the deadlock cycle
-    // where replay held P→waited Qw while admission held Qw→waited P.
+    // Global lock order M→P→Q: admission already holds the per-group
+    // membership lock before it enters the causal queue writer, so replay
+    // must acquire that same membership lock BEFORE queue persistence. This
+    // closes the opposing admission M→P / replay P→M cycle while preserving
+    // persistence-before-queue-data for every causal sidecar writer.
+    let membership_lock = group_membership_lock(state, group_id).await;
+    let _replay_membership_guard = membership_lock.lock().await;
     let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
     let (entries, queue_snapshot) = {
         let mut queue_lock = state.causal_approval_queue.write().await;
@@ -4954,7 +4997,16 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // Expiry-only drain: persist the (now possibly empty) queue sidecar
         // so expired entries are not rediscovered on restart.
         match save_causal_approval_queue_unlocked(state).await {
-            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                // The replacement is visible, so memory must keep the same
+                // post-expiry state. Do not report success; a later queue
+                // writer will retry the parent-directory durability step by
+                // replacing the same state again.
+                tracing::warn!(
+                    "ADR 0028: expiry-only drain replaced but not directory-durable — keeping visible state, success withheld"
+                );
+            }
             _ => {
                 tracing::error!(
                     "ADR 0028: failed to persist causal approval queue after expiry-only drain"
@@ -5030,15 +5082,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             continue;
         }
         state.groups_diagnostics.record_causal_retried(group_id);
-        // Finding 5 (Watson 32c2d3a): hold the membership lock through
-        // apply + persist/rollback so a concurrent mutation cannot be
-        // included in the write or overwritten by rollback. Post-persist
-        // card/log effects happen AFTER the lock is released.
-        // Finding 2 (Sam 4ea68a9): capture group_snapshot AFTER acquiring
-        // the lock, not before. An intervening transition between snapshot
-        // and lock acquisition would be erased by a save-failure rollback.
-        let membership_lock = group_membership_lock(state, group_id).await;
-        let _replay_membership_guard = membership_lock.lock().await;
+        // Finding 5 (Watson 32c2d3a): the function-level membership guard is
+        // held through apply + persist/rollback so a concurrent mutation
+        // cannot be included in the write or overwritten by rollback.
+        // Finding 2 (Sam 4ea68a9): group_snapshot is captured after that
+        // guard was acquired, so an intervening transition cannot be erased.
         // Finding 3 (Sam 6664f60): also hold the global roster persistence
         // lock across mutation+persist+rollback so a concurrent cross-group
         // save cannot durably snapshot A's replay candidate before A's save.
@@ -5069,7 +5117,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         ))
         .await;
 
-        let (group_persisted, skip_post_effects) = if applied.accepted {
+        let (group_persisted, visible_not_durable) = if applied.accepted {
             // apply mutated in-memory state (candidate) but did NOT save
             // (allow_queue=false skips save_named_groups in the inner apply).
             // This is the ONE checked persist. If it fails, ROLL BACK the
@@ -5080,12 +5128,20 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             // data IS on disk, memory matches, but don't do post-persist effects.
             // NotReplaced/Err → rollback memory, retain queue entry.
             let persist_outcome = save_named_groups_checked_unlocked(state).await;
-            let (persisted, skip) = match persist_outcome {
+            let (persisted, visible_not_durable) = match persist_outcome {
                 Ok(AtomicWriteOutcome::Durable) => (true, false),
-                Ok(AtomicWriteOutcome::ReplacedNotDurable) => (true, true),
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    // Retry the identical visible candidate while the global
+                    // roster lock is still held. Only a Durable retry permits
+                    // post-effects or queue removal.
+                    match save_named_groups_checked_unlocked(state).await {
+                        Ok(AtomicWriteOutcome::Durable) => (true, false),
+                        _ => (false, true),
+                    }
+                }
                 Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
             };
-            if !persisted {
+            if !persisted && !visible_not_durable {
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id),
                     request_id = %pending.request_id,
@@ -5096,31 +5152,17 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     groups.insert(group_id.to_string(), snapshot);
                 }
             }
-            (persisted, skip)
+            (persisted, visible_not_durable)
         } else {
             (false, false)
         };
-        // Finding 5: release the membership lock before post-persist effects.
-        drop(_replay_membership_guard);
-
         if applied.accepted && group_persisted {
-            if skip_post_effects {
-                // Watson ruling: ReplacedNotDurable — data IS on disk but not
-                // dir-fsync'd. Do NOT publish, fan out, or record success.
-                // Retain the queue entry for retry.
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_id),
-                    request_id = %pending.request_id,
-                    "ADR 0028 B5: group state replaced but not directory-durable — retaining queue entry, skipping post-persist effects"
-                );
-                still_pending.push_back(pending);
-                continue;
-            }
             // B5: persist succeeded — now refresh the card cache and
             // record the membership event. These were deferred from the
             // inner apply (allow_queue=false) so a failed write leaves no
-            // card/log trace of the failed candidate. Finding 5: these
-            // post-persist effects run AFTER the lock is released.
+            // card/log trace of the failed candidate. The function-level
+            // membership guard keeps the replay serialized until the queue
+            // sidecar is persisted below.
             {
                 let groups = state.named_groups.read().await;
                 if let Some(info) = groups.get(group_id) {
@@ -5134,6 +5176,18 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                 "ADR 0028 B5: queued approval drained and applied (group state durable)"
             );
             state.groups_diagnostics.record_causal_applied(group_id);
+            continue;
+        }
+        if applied.accepted && visible_not_durable {
+            // The candidate is visible but still lacks directory durability.
+            // Keep memory on that candidate and retain the queue receipt; do
+            // not publish card/log effects or record success.
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                request_id = %pending.request_id,
+                "ADR 0028 B5: roster replacement remains non-durable after retry — retaining queue entry and withholding effects"
+            );
+            still_pending.push_back(pending);
             continue;
         }
         if applied.accepted && !group_persisted {
@@ -5169,7 +5223,16 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     // Persistence lock is already held (P→Q order). Use the unlocked save
     // helper to avoid re-acquiring the persistence mutex.
     match save_causal_approval_queue_unlocked(state).await {
-        Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            // The replacement is visible, so retain the post-drain memory
+            // image. Do not report this save as durable; the next queue write
+            // retries durability without resurrecting already-drained work in
+            // memory against a visibly replaced destination.
+            tracing::warn!(
+                "ADR 0028: final drain replaced but not directory-durable — keeping visible state, success withheld"
+            );
+        }
         _ => {
             tracing::error!("ADR 0028: failed to persist causal approval queue after drain");
             // Finding 9: restore the pre-drain queue so memory matches the
@@ -8247,9 +8310,14 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
             tombstones.clone()
         };
         let mut pruned = false;
-        // Prune expired/completed obligations from the live outbox.
+        // Promote zero-target obligations and prune expired/completed live
+        // work in one mutation boundary with the receipt store.
         {
             let mut outbox = state.predecessor_relay_outbox.write().await;
+            let mut tombstones = state.completed_relay_tombstones.write().await;
+            if promote_zero_target_obligations(&mut outbox, &mut tombstones, now_ms) {
+                pruned = true;
+            }
             for obligations in outbox.values_mut() {
                 let before = obligations.len();
                 obligations.retain(|o| {
@@ -8262,11 +8330,8 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 }
             }
             outbox.retain(|_, obligations| !obligations.is_empty());
-        }
-        // R2/Fix4: prune completed tombstones daemon-wide and set pruned
-        // so tombstone-only pruning is persisted (was: not saved).
-        {
-            let mut tombstones = state.completed_relay_tombstones.write().await;
+            // R2/Fix4: prune completed tombstones daemon-wide and set pruned
+            // so tombstone-only pruning is persisted (was: not saved).
             let before_count: usize = tombstones.values().map(|l| l.len()).sum();
             prune_completed_tombstones_daemon(&mut tombstones, now_ms);
             let after_count: usize = tombstones.values().map(|l| l.len()).sum();
@@ -8456,6 +8521,11 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     // frozen five-minute limit.
     {
         let mut outbox = state.predecessor_relay_outbox.write().await;
+        let mut tombstones = state.completed_relay_tombstones.write().await;
+        // Zero-witness obligations (including ones that coexist with due
+        // relay work in other groups) become authenticated receipts in the
+        // same persisted transaction as this relay step.
+        promote_zero_target_obligations(&mut outbox, &mut tombstones, now_ms);
         for obligations in outbox.values_mut() {
             obligations.retain(|o| {
                 o.completed_at_ms.is_none()
@@ -8470,7 +8540,11 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     let save_result = save_predecessor_relay_outbox_unlocked(state).await;
 
     match save_result {
-        Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            tracing::warn!("ADR 0028 B6: relay outbox replaced but not directory-durable — not recording relayed");
+            return;
+        }
         _ => {
             let e = std::io::Error::other("not replaced or pre-rename failure");
             tracing::error!(
@@ -10569,9 +10643,12 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     };
 
     remove_treekem_persistence_for_group_id(state, group_id, reason).await;
-    write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
         .await
         .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
+    if outcome != AtomicWriteOutcome::Durable {
+        anyhow::bail!("withdrawn named groups repair was not directory-durable");
+    }
     Ok(true)
 }
 
@@ -13012,8 +13089,13 @@ pub(in crate::server) async fn approve_join_request(
                 // loader will restore the outbox from the journal snapshot.
                 // Persistence lock is still held (P→Q) — use unlocked save.
                 match save_predecessor_relay_outbox_unlocked(&state).await {
-                    Ok(AtomicWriteOutcome::Durable)
-                    | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+                    Ok(AtomicWriteOutcome::Durable) => {}
+                    Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                        tracing::error!(
+                            group_id = %LogHexId::group(&id),
+                            "ADR 0028 B8: compensating outbox replacement is visible but not directory-durable; approval remains unavailable"
+                        );
+                    }
                     _ => {
                         let undo_e = std::io::Error::other("not replaced or pre-rename failure");
                         tracing::error!(
@@ -14857,9 +14939,12 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     {
         anyhow::bail!("refusing to persist key material for withdrawn group");
     }
-    write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &named_groups_json)
         .await
         .map_err(|e| anyhow::anyhow!("named groups write: {e}"))?;
+    if outcome != AtomicWriteOutcome::Durable {
+        anyhow::bail!("named groups replacement was not directory-durable");
+    }
     state
         .named_groups
         .write()
@@ -14996,9 +15081,12 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             journal.snapshot_envelope,
         )
         .await?;
-        write_named_groups_json_atomic(named_groups_path, &journal.named_groups_json)
+        let outcome = write_named_groups_json_atomic(named_groups_path, &journal.named_groups_json)
             .await
             .map_err(|e| anyhow::anyhow!("replay named groups journal: {e}"))?;
+        if outcome != AtomicWriteOutcome::Durable {
+            anyhow::bail!("replayed TreeKEM/named-groups journal was not directory-durable");
+        }
         tokio::fs::remove_file(&path)
             .await
             .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
@@ -15313,11 +15401,11 @@ const CAUSAL_SIDECAR_VERSION: u32 = 1;
 /// predecessor was durably received without retaining the full envelope.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct CompletedRelayTombstone {
-    group_id: String,
-    request_id: String,
-    requester_agent_id: String,
+    pub(in crate::server) group_id: String,
+    pub(in crate::server) request_id: String,
+    pub(in crate::server) requester_agent_id: String,
     /// blake3 digest of the original envelope (dedup + obligation key).
-    digest: [u8; 32],
+    pub(in crate::server) digest: [u8; 32],
     /// Unix-epoch millis when all targets were delivered.
     completed_at_ms: u64,
     /// B8/F1: authenticated evidence — the original requester-signed V2
@@ -15356,6 +15444,29 @@ struct RelayOutboxSidecar {
     /// than best-effort.
     #[serde(default)]
     pending_compensation: Option<PendingB8Compensation>,
+    /// Watson item 5: pending listener admission journal. Before applying
+    /// a JoinRequestCreated + creating the relay obligation, the listener
+    /// writes a journal entry here so restart can recover both-or-neither
+    /// without external re-delivery. If on restart the request is missing,
+    /// the loader re-applies the authenticated event; if the request exists
+    /// but the obligation is missing, it recreates the exact obligation.
+    #[serde(default)]
+    pending_listener_admission: Option<PendingListenerAdmission>,
+}
+
+/// Watson item 5: journal entry for a pending listener request+obligation
+/// admission. Records the envelope bytes and binding fields so the obligation
+/// can be re-created on restart if the request was applied but the obligation
+/// save failed or did not complete.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct PendingListenerAdmission {
+    pub(in crate::server) group_id: String,
+    pub(in crate::server) request_id: String,
+    pub(in crate::server) requester_agent_id: String,
+    pub(in crate::server) envelope_bytes: Vec<u8>,
+    pub(in crate::server) digest: [u8; 32],
+    pub(in crate::server) byte_size: usize,
+    pub(in crate::server) first_seen_ms: u64,
 }
 
 /// ADR 0028 B5: journal entry for a pending B8 cross-file operation.
@@ -15496,6 +15607,54 @@ fn prune_completed_tombstones_daemon(
     }
 }
 
+/// Promote obligations with no relay targets to authenticated completion
+/// receipts immediately. A single-authority group therefore has a durable B8
+/// predecessor receipt during the five-minute window, while the ordinary
+/// tombstone expiry removes that authorization at the boundary.
+fn promote_zero_target_obligations(
+    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
+    tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
+    now_ms: u64,
+) -> bool {
+    let mut promoted = Vec::new();
+    let mut removed_any = false;
+    for (group_id, obligations) in outbox.iter_mut() {
+        let before = obligations.len();
+        for obligation in obligations.iter() {
+            if obligation.relay_targets.is_empty()
+                && obligation
+                    .first_seen_ms
+                    .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+                    > now_ms
+            {
+                promoted.push(CompletedRelayTombstone {
+                    group_id: group_id.clone(),
+                    request_id: obligation.request_id.clone(),
+                    requester_agent_id: obligation.requester_agent_id.clone(),
+                    digest: obligation.digest,
+                    completed_at_ms: now_ms,
+                    envelope_bytes: obligation.envelope_bytes.clone(),
+                    first_seen_ms: obligation.first_seen_ms,
+                });
+            }
+        }
+        obligations.retain(|obligation| !obligation.relay_targets.is_empty());
+        removed_any |= obligations.len() != before;
+    }
+    outbox.retain(|_, obligations| !obligations.is_empty());
+    let changed = removed_any || !promoted.is_empty();
+    for receipt in promoted {
+        let entries = tombstones.entry(receipt.group_id.clone()).or_default();
+        if !entries.iter().any(|entry| entry.digest == receipt.digest) {
+            entries.push(receipt);
+        }
+    }
+    if changed {
+        prune_completed_tombstones_daemon(tombstones, now_ms);
+    }
+    changed
+}
+
 /// ADR 0028 Finding 8: bound the causal conflict tombstones map. Each group's
 /// conflict digest list is capped to CAUSAL_APPROVAL_PER_GROUP_CAP entries
 /// (oldest-first eviction), and the daemon-wide total is capped to
@@ -15521,19 +15680,21 @@ fn prune_conflict_tombstones(tombstones: &mut HashMap<String, Vec<ConflictTombst
     if total > CAUSAL_APPROVAL_PER_DAEMON_CAP {
         let drop_count = total - CAUSAL_APPROVAL_PER_DAEMON_CAP;
         // Collect all entries with their group_id and timestamp.
-        let mut all: Vec<(String, u64)> = Vec::new();
+        let mut all: Vec<(String, u64, [u8; 32])> = Vec::new();
         for (gid, list) in tombstones.iter() {
             for e in list.iter() {
-                all.push((gid.clone(), e.first_seen_ms));
+                all.push((gid.clone(), e.first_seen_ms, e.digest));
             }
         }
-        // Sort oldest-first (smallest first_seen_ms first).
-        all.sort_by_key(|e| e.1);
-        // Collect the oldest `drop_count` (group_id, timestamp) pairs.
-        let to_drop: std::collections::HashSet<(String, u64)> =
-            all.iter().take(drop_count).cloned().collect();
+        // Sort oldest-first with a deterministic digest tie-breaker.
+        all.sort_by_key(|entry| (entry.1, entry.2));
+        let to_drop: std::collections::HashSet<(String, [u8; 32])> = all
+            .iter()
+            .take(drop_count)
+            .map(|(group_id, _, digest)| (group_id.clone(), *digest))
+            .collect();
         for (gid, list) in tombstones.iter_mut() {
-            list.retain(|e| !to_drop.contains(&(gid.clone(), e.first_seen_ms)));
+            list.retain(|entry| !to_drop.contains(&(gid.clone(), entry.digest)));
         }
         tombstones.retain(|_, list| !list.is_empty());
     }
@@ -15789,10 +15950,20 @@ async fn write_causal_queue_sidecar(
 async fn save_causal_approval_queue_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    let json = {
+    let json_result = {
         let queue = state.causal_approval_queue.read().await;
         let tombstones = state.causal_conflict_tombstones.read().await;
-        serialize_causal_queue_sidecar(&queue, &tombstones)?
+        serialize_causal_queue_sidecar(&queue, &tombstones)
+    };
+    let json = match json_result {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "ADR 0028: causal queue serialization failed before replacement"
+            );
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
     };
     write_causal_queue_sidecar(state, &json).await
 }
@@ -15816,11 +15987,22 @@ pub(in crate::server) async fn save_causal_approval_queue(
 pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    let json = {
+    let json_result = {
         let outbox = state.predecessor_relay_outbox.read().await;
         let tombstones = state.completed_relay_tombstones.read().await;
         let pending = state.pending_b8_compensation.lock().await;
-        serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)?
+        let pending_admission = state.pending_listener_admission.lock().await;
+        serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending, &pending_admission)
+    };
+    let json = match json_result {
+        Ok(json) => json,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "ADR 0028: relay outbox serialization failed before replacement"
+            );
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
     };
     write_relay_outbox_sidecar(state, &json).await
 }
@@ -15842,12 +16024,14 @@ fn serialize_relay_outbox_sidecar(
     outbox: &HashMap<String, Vec<PredecessorRelayObligation>>,
     tombstones: &HashMap<String, Vec<CompletedRelayTombstone>>,
     pending_compensation: &Option<PendingB8Compensation>,
+    pending_listener_admission: &Option<PendingListenerAdmission>,
 ) -> std::io::Result<String> {
     let sidecar = RelayOutboxSidecar {
         version: CAUSAL_SIDECAR_VERSION,
         entries: outbox.clone(),
         completed_tombstones: tombstones.clone(),
         pending_compensation: pending_compensation.clone(),
+        pending_listener_admission: pending_listener_admission.clone(),
     };
     serde_json::to_string(&sidecar).map_err(|e| {
         tracing::error!("Failed to serialize predecessor relay outbox: {e}");
@@ -15896,39 +16080,47 @@ fn sync_parent_dir_for_path(path: &FsPath) -> std::io::Result<()> {
 /// byte_size and digest from the actual envelope bytes (not stored fields).
 /// Drops entries for unknown or withdrawn groups (Kimi blocker 9).
 pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> Result<(), String> {
+    // Startup loader contract: rejected input installs zero live work. Clear
+    // the destination before parsing; the sidecar bytes themselves are never
+    // modified on rejection.
+    *state.causal_approval_queue.write().await = HashMap::new();
+    *state.causal_conflict_tombstones.write().await = HashMap::new();
     let path = &state.causal_approval_queue_path;
     // Cap-before-allocation: check file size before reading (Kimi blocker 9).
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return Ok(()), // no sidecar yet — fresh start
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect causal approval queue sidecar: {error}"
+            ));
+        }
     };
     let file_size = metadata.len() as usize;
     if file_size > QUEUE_SIDECAR_FILE_SIZE_CAP {
-        tracing::warn!(
+        tracing::error!(
             file_size,
             cap = QUEUE_SIDECAR_FILE_SIZE_CAP,
-            "causal approval queue sidecar exceeds derived file-size cap, ignoring"
+            "causal approval queue sidecar exceeds derived file-size cap; refusing startup"
         );
-        return Ok(());
+        return Err("causal approval queue sidecar exceeds file-size cap".to_string());
     }
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Ok(());
-    };
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| format!("failed to read causal approval queue sidecar: {error}"))?;
     let Ok(json_str) = std::str::from_utf8(&bytes) else {
-        tracing::warn!("causal approval queue sidecar not UTF-8, ignoring");
-        return Ok(());
+        return Err("causal approval queue sidecar is not UTF-8".to_string());
     };
     // Versioned sidecar format (Kimi blocker 8/9).
     let Ok(loaded_sidecar): Result<CausalQueueSidecar, _> = serde_json::from_str(json_str) else {
-        tracing::warn!("causal approval queue sidecar malformed, ignoring");
-        return Ok(());
+        return Err("causal approval queue sidecar is malformed".to_string());
     };
     if loaded_sidecar.version != CAUSAL_SIDECAR_VERSION {
         tracing::warn!(
             version = loaded_sidecar.version,
             "causal approval queue sidecar version mismatch (expected {CAUSAL_SIDECAR_VERSION}), ignoring"
         );
-        return Ok(());
+        return Err("causal approval queue sidecar version mismatch".to_string());
     }
     let now_ms = now_millis_u64();
     let mut total_count = 0usize;
@@ -16131,41 +16323,111 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
 /// restart. Enforces byte and count caps, drops expired/malformed records.
 /// Cap-before-allocation, derive-not-trust, drop unknown/withdrawn groups,
 /// enforce 4096 total relay-target cap (Kimi blocker 9).
-pub(in crate::server) async fn load_predecessor_relay_outbox(
+fn validate_relay_obligation_for_restart(
     state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    expected_group_id: &str,
+    entry: &PredecessorRelayObligation,
+    now_ms: u64,
+) -> Result<Option<PredecessorRelayObligation>, String> {
+    if entry
+        .first_seen_ms
+        .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+        <= now_ms
+    {
+        return Ok(None);
+    }
+    let derived_byte_size = entry.envelope_bytes.len();
+    if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
+        return Err("relay envelope exceeds the semantic byte cap".to_string());
+    }
+    let derived_digest: [u8; 32] = blake3::hash(&entry.envelope_bytes).into();
+    let (decoded_event, signer, topic) = decode_and_verify_v2(&entry.envelope_bytes)
+        .map_err(|reason| format!("relay envelope verification failed: {reason}"))?;
+    if topic != info.metadata_topic {
+        return Err("relay envelope topic does not match group metadata topic".to_string());
+    }
+    let (decoded_group_id, decoded_request_id, decoded_requester) = match &decoded_event {
+        NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id,
+            request_id,
+            requester_agent_id,
+            ..
+        } => (group_id, request_id, requester_agent_id),
+        _ => return Err("relay envelope is not JoinRequestCreated".to_string()),
+    };
+    if decoded_group_id != expected_group_id
+        || entry.group_id != expected_group_id
+        || decoded_request_id != &entry.request_id
+        || decoded_requester != &entry.requester_agent_id
+        || hex::encode(signer.as_bytes()) != entry.requester_agent_id
+        || derived_digest != entry.digest
+    {
+        return Err("relay envelope identity binding mismatch".to_string());
+    }
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if info.withdrawn || hex::encode(info.creator.as_bytes()) != local_agent_hex {
+        return Err("local agent is not the active group authority".to_string());
+    }
+    let relay_targets = info
+        .members_v2
+        .iter()
+        .filter(|(id, member)| {
+            member.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    let mut validated = entry.clone();
+    validated.byte_size = derived_byte_size;
+    validated.digest = derived_digest;
+    validated.relay_targets = relay_targets;
+    Ok(Some(validated))
+}
+
+pub(in crate::server) async fn load_predecessor_relay_outbox(
+    state: &Arc<AppState>,
 ) -> Result<(), String> {
+    // Startup loader contract: any rejection leaves zero installed relay
+    // work while preserving the diagnostic sidecar byte-for-byte.
+    *state.predecessor_relay_outbox.write().await = HashMap::new();
+    *state.completed_relay_tombstones.write().await = HashMap::new();
+    *state.pending_b8_compensation.lock().await = None;
+    *state.pending_listener_admission.lock().await = None;
     let path = &state.predecessor_relay_outbox_path;
     // Cap-before-allocation: check file size before reading (Kimi blocker 9).
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(format!(
+                "failed to inspect predecessor relay outbox sidecar: {error}"
+            ));
+        }
     };
     let file_size = metadata.len() as usize;
     if file_size > RELAY_SIDECAR_FILE_SIZE_CAP {
-        tracing::warn!(
+        tracing::error!(
             file_size,
             cap = RELAY_SIDECAR_FILE_SIZE_CAP,
-            "predecessor relay outbox sidecar exceeds derived file-size cap, ignoring"
+            "predecessor relay outbox sidecar exceeds derived file-size cap; refusing startup"
         );
-        return Ok(());
+        return Err("predecessor relay outbox sidecar exceeds file-size cap".to_string());
     }
-    let Ok(bytes) = tokio::fs::read(path).await else {
-        return Ok(());
-    };
+    let bytes = tokio::fs::read(path)
+        .await
+        .map_err(|error| format!("failed to read predecessor relay sidecar: {error}"))?;
     let Ok(json_str) = std::str::from_utf8(&bytes) else {
-        tracing::warn!("predecessor relay outbox sidecar not UTF-8, ignoring");
-        return Ok(());
+        return Err("predecessor relay outbox sidecar is not UTF-8".to_string());
     };
     let Ok(loaded_sidecar): Result<RelayOutboxSidecar, _> = serde_json::from_str(json_str) else {
-        tracing::warn!("predecessor relay outbox sidecar malformed, ignoring");
-        return Ok(());
+        return Err("predecessor relay outbox sidecar is malformed".to_string());
     };
     if loaded_sidecar.version != CAUSAL_SIDECAR_VERSION {
         tracing::warn!(
             version = loaded_sidecar.version,
             "predecessor relay outbox sidecar version mismatch (expected {CAUSAL_SIDECAR_VERSION}), ignoring"
         );
-        return Ok(());
+        return Err("predecessor relay outbox sidecar version mismatch".to_string());
     }
     let now_ms = now_millis_u64();
     let mut outbox = HashMap::new();
@@ -16379,225 +16641,252 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 .to_string(),
         );
     }
-    *state.predecessor_relay_outbox.write().await = outbox;
-    *state.completed_relay_tombstones.write().await = tombstones;
-    // Fix 5: B8 journal recovery. If the sidecar has a pending B8
-    // compensation, check whether the roster has the approval:
-    // - If yes AND the predecessor digest matches the exact outbox record:
-    //   the cross-file operation completed — clear the journal, keep the
-    //   refreshed outbox.
-    // - If no or the digest does not match: the operation was aborted or
-    //   the journal refers to a different predecessor — restore the outbox
-    //   from the journal snapshot, validating each entry through the same
-    //   loader path as ordinary load (Finding E).
-    if let Some(journal) = loaded_sidecar.pending_compensation {
-        // Finding D: bind the journal digest to the EXACT outbox record
-        // for the journal's request_id/requester_agent_id, not set
-        // membership within the group. A wrong digest that happens to
-        // match a different record's digest must not commit the refresh.
-        let roster_has_exact_approval = {
-            let groups = state.named_groups.read().await;
-            groups.get(&journal.group_id).is_some_and(|info| {
-                info.roster_revision == journal.approved_revision
-                    && info.state_hash == journal.approved_state_hash
-                    && info
-                        .join_requests
-                        .get(&journal.request_id)
-                        .is_some_and(|jr| {
-                            jr.status == x0x::groups::JoinRequestStatus::Approved
-                                && jr.requester_agent_id == journal.requester_agent_id
-                                && jr.reviewed_by.as_deref() == Some(journal.actor.as_str())
-                        })
-            })
-        };
-        // Finding D: the predecessor_digest in the journal must match the
-        // outbox obligation for THIS exact request_id/requester, not any
-        // obligation in the group.
-        let digest_matches_exact_record = {
-            let outbox = state.predecessor_relay_outbox.read().await;
-            outbox.get(&journal.group_id).is_some_and(|list| {
-                list.iter().any(|o| {
-                    o.request_id == journal.request_id
-                        && o.requester_agent_id == journal.requester_agent_id
-                        && o.digest == journal.predecessor_digest
-                })
-            })
-        };
+    let mut pending_compensation = loaded_sidecar.pending_compensation.clone();
+    let mut pending_listener_admission = loaded_sidecar.pending_listener_admission.clone();
+    let mut recovery_changed = false;
 
-        if roster_has_exact_approval && digest_matches_exact_record {
-            tracing::info!(
-                group_id = %LogHexId::group(&journal.group_id),
-                request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery — exact approval + digest match, operation completed, clearing journal"
-            );
-            *state.pending_b8_compensation.lock().await = None;
-        } else {
-            tracing::warn!(
-                group_id = %LogHexId::group(&journal.group_id),
-                request_id = %journal.request_id,
-                roster_match = roster_has_exact_approval,
-                digest_match = digest_matches_exact_record,
-                "ADR 0028 B8: journal recovery — approval or digest mismatch, restoring outbox from journal snapshot"
-            );
-            // Finding E: restore the outbox from the journal snapshot,
-            // validating each entry through the same loader path as
-            // ordinary load (decode_and_verify_v2, group-id equality,
-            // local-authority, target cap, per-group/daemon caps).
-            let groups_view: HashMap<String, x0x::groups::GroupInfo> = {
-                let groups = state.named_groups.read().await;
-                groups.clone()
-            };
-            let restore_valid = if let Some(info) = groups_view.get(&journal.group_id) {
-                if info.withdrawn {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(&journal.group_id),
-                        "ADR 0028 B8: journal group withdrawn, clearing journal without restore"
-                    );
-                    false
-                } else {
-                    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-                    let is_authority = hex::encode(info.creator.as_bytes()) == local_agent_hex;
-                    let now_ms = now_millis_u64();
-                    let mut filtered = Vec::new();
-                    for entry in &journal.outbox_snapshot {
-                        let expires_at = entry
-                            .first_seen_ms
-                            .saturating_add(CAUSAL_APPROVAL_RETENTION_MS);
-                        if expires_at <= now_ms {
-                            continue;
-                        }
-                        let derived_byte_size = entry.envelope_bytes.len();
-                        let derived_digest = blake3::hash(&entry.envelope_bytes);
-                        if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
-                            continue;
-                        }
-                        // Finding 4: do NOT break on caps — load all valid
-                        // entries and enforce daemon-wide bounds after.
-                        // Finding E: same V2 decode+verify as ordinary load.
-                        let (decoded_relay_event, v2_signer, v2_topic) = match decode_and_verify_v2(
-                            &entry.envelope_bytes,
-                        ) {
-                            Ok(v) => v,
-                            Err(reason) => {
-                                tracing::warn!(
-                                    group_id = %journal.group_id,
-                                    reason = %reason,
-                                    "ADR 0028 B8: journal restore V2 verification failed, dropping entry"
-                                );
-                                continue;
-                            }
-                        };
-                        if v2_topic != info.metadata_topic {
-                            continue;
-                        }
-                        let (decoded_req_id, decoded_requester) = match &decoded_relay_event {
-                            NamedGroupMetadataEvent::JoinRequestCreated {
-                                request_id,
-                                requester_agent_id,
-                                ..
-                            } => (request_id.clone(), requester_agent_id.clone()),
-                            _ => continue,
-                        };
-                        if decoded_req_id != entry.request_id
-                            || decoded_requester != entry.requester_agent_id
-                        {
-                            continue;
-                        }
-                        if hex::encode(v2_signer.as_bytes()) != entry.requester_agent_id {
-                            continue;
-                        }
-                        let decoded_gid =
-                            named_group_metadata_event_group_id(&decoded_relay_event).to_string();
-                        if decoded_gid != journal.group_id || decoded_gid != entry.group_id {
-                            continue;
-                        }
-                        if !is_authority {
-                            continue;
-                        }
-                        // Finding 3 (Watson 32c2d3a): re-derive targets from
-                        // current active non-local witnesses (union, not
-                        // intersect). Do not trust sidecar target omissions.
-                        let active_witnesses: std::collections::HashSet<String> = info
-                            .members_v2
-                            .iter()
-                            .filter(|(id, m)| {
-                                m.state == x0x::groups::GroupMemberState::Active
-                                    && **id != local_agent_hex
-                            })
-                            .map(|(id, _)| id.clone())
-                            .collect();
-                        let valid_targets: Vec<String> = active_witnesses
-                            .iter()
-                            .filter(|t| parse_agent_id_hex(t).is_ok())
-                            .cloned()
-                            .collect();
-                        let mut entry = entry.clone();
-                        entry.byte_size = derived_byte_size;
-                        entry.digest = derived_digest.into();
-                        entry.relay_targets = valid_targets;
-                        filtered.push(entry);
-                    }
-                    // Watson ruling: validate BEFORE install. If the
-                    // restored entries, combined with already-live state,
-                    // would exceed any cap, do NOT install — install zero,
-                    // clear the journal, and log the error.
-                    {
-                        let mut outbox = state.predecessor_relay_outbox.write().await;
-                        let mut tombstones = state.completed_relay_tombstones.write().await;
-                        // Temporarily install to check budget.
-                        if filtered.is_empty() {
-                            outbox.remove(&journal.group_id);
-                        } else {
-                            outbox.insert(journal.group_id.clone(), filtered);
-                        }
-                        let within_budget =
-                            enforce_combined_relay_budget(&mut outbox, &mut tombstones);
-                        let live_targets: usize = outbox
-                            .values()
-                            .flatten()
-                            .map(|o| o.relay_targets.len())
-                            .sum();
-                        if !within_budget || live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
-                            tracing::error!(
-                                within_budget,
-                                live_targets,
-                                "ADR 0028 B8: journal restore — over-cap, rejecting restored entries (never evict live)"
-                            );
-                            // Remove the restored entries — install zero.
-                            outbox.remove(&journal.group_id);
-                            tombstones.remove(&journal.group_id);
-                        }
-                    }
-                    true
+    // Validate B8 recovery in detached maps. Nothing is installed until the
+    // complete candidate passes signature, identity, count, byte, and target
+    // checks. A bad journal leaves the original sidecar byte-identical and
+    // makes startup fail with zero relay state installed.
+    if let Some(journal) = pending_compensation.clone() {
+        let roster_has_exact_approval = groups_view.get(&journal.group_id).is_some_and(|info| {
+            info.roster_revision == journal.approved_revision
+                && info.state_hash == journal.approved_state_hash
+                && info
+                    .join_requests
+                    .get(&journal.request_id)
+                    .is_some_and(|request| {
+                        request.status == x0x::groups::JoinRequestStatus::Approved
+                            && request.requester_agent_id == journal.requester_agent_id
+                            && request.reviewed_by.as_deref() == Some(journal.actor.as_str())
+                    })
+        });
+        let digest_matches_exact_record =
+            outbox.get(&journal.group_id).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.request_id == journal.request_id
+                        && entry.requester_agent_id == journal.requester_agent_id
+                        && entry.digest == journal.predecessor_digest
+                })
+            }) || tombstones.get(&journal.group_id).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.request_id == journal.request_id
+                        && entry.requester_agent_id == journal.requester_agent_id
+                        && entry.digest == journal.predecessor_digest
+                })
+            });
+
+        if !(roster_has_exact_approval && digest_matches_exact_record) {
+            let info = groups_view
+                .get(&journal.group_id)
+                .ok_or_else(|| "B8 recovery journal references an unknown group".to_string())?;
+            let mut restored = Vec::new();
+            for entry in &journal.outbox_snapshot {
+                if let Some(entry) = validate_relay_obligation_for_restart(
+                    state,
+                    info,
+                    &journal.group_id,
+                    entry,
+                    now_ms,
+                )? {
+                    restored.push(entry);
                 }
+            }
+            let mut candidate_outbox = outbox.clone();
+            let mut candidate_tombstones = tombstones.clone();
+            if restored.is_empty() {
+                candidate_outbox.remove(&journal.group_id);
             } else {
-                tracing::warn!(
-                    group_id = %LogHexId::group(&journal.group_id),
-                    "ADR 0028 B8: journal group unknown, clearing journal without restore"
-                );
-                false
-            };
-            // Finding E: act on restore_valid — log if the restore was
-            // skipped (group unknown/withdrawn). The validated entries are
-            // already installed above; this is no longer discarded.
-            if !restore_valid {
-                tracing::warn!(
-                    group_id = %LogHexId::group(&journal.group_id),
-                    "ADR 0028 B8: journal restore skipped (group unknown or withdrawn), clearing journal"
+                candidate_outbox.insert(journal.group_id.clone(), restored);
+            }
+            let within_budget =
+                enforce_combined_relay_budget(&mut candidate_outbox, &mut candidate_tombstones);
+            let target_count: usize = candidate_outbox
+                .values()
+                .flatten()
+                .map(|entry| entry.relay_targets.len())
+                .sum();
+            if !within_budget || target_count > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+                *state.predecessor_relay_outbox.write().await = HashMap::new();
+                *state.completed_relay_tombstones.write().await = HashMap::new();
+                return Err(
+                    "B8 recovery journal rejected: detached candidate exceeds governed caps"
+                        .to_string(),
                 );
             }
-            *state.pending_b8_compensation.lock().await = None;
+            outbox = candidate_outbox;
+            tombstones = candidate_tombstones;
         }
-        // Persist the recovered state with a CHECKED result.
-        match save_predecessor_relay_outbox(state).await {
-            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
-            _ => {
-                let e = std::io::Error::other("not replaced or pre-rename failure");
-                tracing::error!(
-                    group_id = %LogHexId::group(&journal.group_id),
-                    request_id = %journal.request_id,
-                    "ADR 0028 B8: journal recovery persist failed: {e}"
+        pending_compensation = None;
+        recovery_changed = true;
+    }
+
+    // Recover listener request+obligation without external re-delivery. The
+    // marker is itself authenticated evidence; if the request write did not
+    // complete before the crash, apply it now, then construct the exact relay
+    // obligation in the detached outbox candidate.
+    if let Some(admission) = pending_listener_admission.clone() {
+        let info = groups_view
+            .get(&admission.group_id)
+            .ok_or_else(|| "listener admission journal references an unknown group".to_string())?;
+        if admission.byte_size != admission.envelope_bytes.len()
+            || admission.digest != <[u8; 32]>::from(blake3::hash(&admission.envelope_bytes))
+        {
+            return Err("listener admission journal digest/size mismatch".to_string());
+        }
+        let raw_obligation = PredecessorRelayObligation {
+            envelope_bytes: admission.envelope_bytes.clone(),
+            digest: admission.digest,
+            byte_size: admission.byte_size,
+            first_seen_ms: admission.first_seen_ms,
+            next_retry_at_ms: now_ms,
+            retry_count: 0,
+            group_id: admission.group_id.clone(),
+            request_id: admission.request_id.clone(),
+            requester_agent_id: admission.requester_agent_id.clone(),
+            relay_targets: Vec::new(),
+            completed_at_ms: None,
+        };
+        let Some(validated_obligation) = validate_relay_obligation_for_restart(
+            state,
+            info,
+            &admission.group_id,
+            &raw_obligation,
+            now_ms,
+        )?
+        else {
+            return Err("listener admission journal expired before recovery".to_string());
+        };
+        let (decoded_event, signer, _) = decode_and_verify_v2(&admission.envelope_bytes)
+            .map_err(|reason| format!("listener journal verification failed: {reason}"))?;
+        let exact_request_status = {
+            let groups = state.named_groups.read().await;
+            groups.get(&admission.group_id).and_then(|group| {
+                group
+                    .join_requests
+                    .get(&admission.request_id)
+                    .and_then(|request| {
+                        if request.requester_agent_id == admission.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(admission.digest)
+                        {
+                            Some(request.status)
+                        } else {
+                            None
+                        }
+                    })
+            })
+        };
+        if exact_request_status.is_none() {
+            let request_id_is_occupied = {
+                let groups = state.named_groups.read().await;
+                groups
+                    .get(&admission.group_id)
+                    .is_some_and(|group| group.join_requests.contains_key(&admission.request_id))
+            };
+            if request_id_is_occupied {
+                return Err(
+                    "listener admission journal conflicts with the durable request binding"
+                        .to_string(),
                 );
+            }
+            let mut replay_group_id = None;
+            let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
+                state,
+                decoded_event,
+                signer,
+                true,
+                true,
+                Some(&admission.envelope_bytes),
+                &mut replay_group_id,
+                false,
+            ))
+            .await;
+            if !applied.accepted {
+                return Err(
+                    "listener admission recovery could not durably apply request".to_string(),
+                );
+            }
+        }
+        let exact_obligation_exists = outbox.get(&admission.group_id).is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.group_id == admission.group_id
+                    && entry.request_id == admission.request_id
+                    && entry.requester_agent_id == admission.requester_agent_id
+                    && entry.digest == admission.digest
+            })
+        });
+        let exact_completion_receipt_exists =
+            tombstones.get(&admission.group_id).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.group_id == admission.group_id
+                        && entry.request_id == admission.request_id
+                        && entry.requester_agent_id == admission.requester_agent_id
+                        && entry.digest == admission.digest
+                })
+            });
+        let request_is_pending = {
+            let groups = state.named_groups.read().await;
+            groups.get(&admission.group_id).is_some_and(|group| {
+                group
+                    .join_requests
+                    .get(&admission.request_id)
+                    .is_some_and(|request| {
+                        request.requester_agent_id == admission.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(admission.digest)
+                            && request.is_pending()
+                    })
+            })
+        };
+        if !(request_is_pending || exact_obligation_exists || exact_completion_receipt_exists) {
+            return Err(
+                "listener admission recovery found terminal request without predecessor receipt"
+                    .to_string(),
+            );
+        }
+        if request_is_pending && !exact_obligation_exists && !exact_completion_receipt_exists {
+            outbox
+                .entry(admission.group_id.clone())
+                .or_default()
+                .push(validated_obligation);
+        }
+        let mut candidate_outbox = outbox.clone();
+        let mut candidate_tombstones = tombstones.clone();
+        let within_budget =
+            enforce_combined_relay_budget(&mut candidate_outbox, &mut candidate_tombstones);
+        let target_count: usize = candidate_outbox
+            .values()
+            .flatten()
+            .map(|entry| entry.relay_targets.len())
+            .sum();
+        if !within_budget || target_count > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+            *state.predecessor_relay_outbox.write().await = HashMap::new();
+            *state.completed_relay_tombstones.write().await = HashMap::new();
+            return Err(
+                "listener admission recovery rejected: candidate exceeds governed caps".to_string(),
+            );
+        }
+        outbox = candidate_outbox;
+        tombstones = candidate_tombstones;
+        pending_listener_admission = None;
+        recovery_changed = true;
+    }
+
+    *state.predecessor_relay_outbox.write().await = outbox;
+    *state.completed_relay_tombstones.write().await = tombstones;
+    *state.pending_b8_compensation.lock().await = pending_compensation;
+    *state.pending_listener_admission.lock().await = pending_listener_admission;
+
+    if recovery_changed {
+        match save_predecessor_relay_outbox(state).await {
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Err(
+                    "relay recovery replacement is visible but not directory-durable".to_string(),
+                );
+            }
+            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                return Err("relay recovery state was not persisted".to_string());
             }
         }
     }
@@ -16606,7 +16895,17 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
 }
 
 async fn save_named_groups(state: &AppState) {
-    let _ = save_named_groups_checked(state).await.map(|_| ());
+    match save_named_groups_checked(state).await {
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            tracing::error!(
+                "named-groups replacement is visible but not directory-durable; success is withheld"
+            );
+        }
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+            tracing::error!("named-groups replacement did not occur");
+        }
+    }
 }
 
 /// ADR 0028: checked version of save_named_groups that returns an error on
@@ -16654,7 +16953,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             }),
         Err(e) => {
             tracing::error!("Failed to serialize named groups: {e}");
-            Err(std::io::Error::other(format!("serialize: {e}")))
+            Ok(AtomicWriteOutcome::NotReplaced)
         }
     }
 }
@@ -16687,20 +16986,12 @@ async fn write_treekem_cache_json_atomic(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(in crate::server) enum AtomicWriteOutcome {
     /// Watson ruling: pre-rename failure. Destination unchanged.
-    #[allow(dead_code)]
     NotReplaced,
     /// Rename succeeded but parent-dir fsync failed. Destination holds
     /// the new content. Do NOT publish/fan-out/proceed.
     ReplacedNotDurable,
     /// Rename + parent fsync both succeeded.
     Durable,
-}
-
-impl AtomicWriteOutcome {
-    /// Returns true only if the replacement is fully durable.
-    pub(in crate::server) fn is_durable(self) -> bool {
-        matches!(self, Self::Durable)
-    }
 }
 
 async fn write_named_groups_json_atomic(
@@ -16715,19 +17006,53 @@ async fn write_named_groups_json_atomic(
 
     // Finding 1 (Sam 6664f60) / Watson ruling: stage-aware atomic
     // replacement. The rename is the point of no return.
-    let mut file = tokio::fs::OpenOptions::new()
+    let mut file = match tokio::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(&temp_path)
-        .await?;
-    file.write_all(json.as_bytes()).await?;
-    file.sync_all().await?;
+        .await
+    {
+        Ok(file) => file,
+        Err(error) => {
+            tracing::error!(
+                %error,
+                path = %path.display(),
+                "ADR 0028: atomic replacement failed before creating temp file"
+            );
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+    };
+    if let Err(error) = file.write_all(json.as_bytes()).await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        tracing::error!(
+            %error,
+            path = %path.display(),
+            "ADR 0028: atomic replacement failed while writing temp file"
+        );
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
+    if let Err(error) = file.sync_all().await {
+        drop(file);
+        let _ = tokio::fs::remove_file(&temp_path).await;
+        tracing::error!(
+            %error,
+            path = %path.display(),
+            "ADR 0028: atomic replacement failed while syncing temp file"
+        );
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    }
     drop(file);
 
     // Pre-rename failure: destination unchanged.
-    if let Err(e) = tokio::fs::rename(&temp_path, path).await {
+    if let Err(error) = tokio::fs::rename(&temp_path, path).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
-        return Err(e);
+        tracing::error!(
+            %error,
+            path = %path.display(),
+            "ADR 0028: atomic replacement failed before rename completed"
+        );
+        return Ok(AtomicWriteOutcome::NotReplaced);
     }
 
     // Post-rename: destination holds new content. Parent-dir fsync determines
@@ -18293,6 +18618,7 @@ mod tests {
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
             pending_b8_compensation: Mutex::new(None),
+            pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),
             group_card_cache: RwLock::new(HashMap::new()),
             directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),

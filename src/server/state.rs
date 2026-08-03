@@ -721,6 +721,11 @@ pub(super) struct AppState {
     /// compensation (restore outbox if roster lacks the approval).
     pub(super) pending_b8_compensation:
         Mutex<Option<crate::server::routes::named_groups::PendingB8Compensation>>,
+    /// Watson item 5: in-memory pending listener admission journal.
+    /// Mirrors the durable sidecar field. Cleared after both request apply
+    /// and obligation save complete.
+    pub(super) pending_listener_admission:
+        Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,

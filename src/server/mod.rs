@@ -64,13 +64,13 @@ use routes::{
     store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
     unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
     update_task, withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
-    NamedGroupMetadataEvent, PredecessorRelayObligation, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
+    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 use state::AppState;
@@ -586,6 +586,7 @@ pub async fn serve_with_options(
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         pending_b8_compensation: Mutex::new(None),
+        pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
         group_card_cache: RwLock::new(HashMap::new()),
         directory_cache: RwLock::new(x0x::groups::DirectoryShardCache::default()),
@@ -648,23 +649,7 @@ pub async fn serve_with_options(
         forward_service,
     });
 
-    // Fix A (Issue #110 Phase 2 + #116): the `api.port` advertisement is written
-    // here, before any long-lived server-owned task is spawned. The agent and the
-    // ExecService ARE already built/spawned by this point (both needed for
-    // AppState), so on the error path we must tear BOTH down — ExecService first
-    // (its loops use the agent transport), then `agent.shutdown()` — so a failed
-    // write does not leak the exec loops or the agent/network. The file is removed
-    // again in the shutdown tail.
     let port_file = config.data_dir.join("api.port");
-    if let Err(e) = tokio::fs::write(&port_file, actual_api_addr.to_string()).await {
-        exec_service.shutdown().await;
-        agent.shutdown().await;
-        return Err(anyhow::Error::new(e).context("failed to write api.port"));
-    }
-    tracing::info!(
-        "API server listening on {actual_api_addr} (port file: {})",
-        port_file.display()
-    );
 
     // Fix C (Issue #110 Phase 2): collect every server-owned background-task
     // `JoinHandle` spawned in the startup path so the shutdown tail can
@@ -673,18 +658,50 @@ pub async fn serve_with_options(
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // A previous daemon instance may have left an API advertisement behind.
+    // Remove it before any fallible causal-state loader runs so a rejected
+    // restart cannot leave clients pointing at an address this process never
+    // served.
+    match tokio::fs::remove_file(&port_file).await {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            exec_service.shutdown().await;
+            agent.shutdown().await;
+            return Err(anyhow::Error::new(error).context("failed to clear stale api.port"));
+        }
+    }
+
     // ADR 0028 / Watson ruling: load durable causal approval queue and
     // predecessor relay outbox from sidecar files BEFORE starting listeners.
     // If either loader rejects its sidecar (live exceeds governed caps),
     // propagate the error so the daemon does not report successful startup
     // with missing causal work. Sam finding 4: loaders must run before
     // listener spawn so a loader error exits before listeners self-register.
-    load_causal_approval_queue(&state)
-        .await
-        .map_err(|e| anyhow::anyhow!("ADR 0028 startup: {e}"))?;
-    load_predecessor_relay_outbox(&state)
-        .await
-        .map_err(|e| anyhow::anyhow!("ADR 0028 startup: {e}"))?;
+    if let Err(error) = load_causal_approval_queue(&state).await {
+        exec_service.shutdown().await;
+        agent.shutdown().await;
+        return Err(anyhow::anyhow!("ADR 0028 startup: {error}"));
+    }
+    if let Err(error) = load_predecessor_relay_outbox(&state).await {
+        exec_service.shutdown().await;
+        agent.shutdown().await;
+        return Err(anyhow::anyhow!("ADR 0028 startup: {error}"));
+    }
+
+    // Publish the API port only after every fallible causal-state loader has
+    // completed. A rejected sidecar therefore leaves no listener task and no
+    // API advertisement, and the agent/exec loops above are explicitly torn
+    // down before returning the startup error.
+    if let Err(error) = tokio::fs::write(&port_file, actual_api_addr.to_string()).await {
+        exec_service.shutdown().await;
+        agent.shutdown().await;
+        return Err(anyhow::Error::new(error).context("failed to write api.port"));
+    }
+    tracing::info!(
+        "API server listening on {actual_api_addr} (port file: {})",
+        port_file.display()
+    );
 
     let existing_group_ids: Vec<String> = {
         let groups = state.named_groups.read().await;
@@ -1272,9 +1289,8 @@ pub async fn serve_with_options(
                 let (is_local_authority, metadata_topic, carrier_is_admin, group_exists_active) = {
                     let groups = relay_state.named_groups.read().await;
                     groups.get(&group_id_str).map(|info| {
-                        let local_is_auth = info
-                            .caller_role(&local_agent_hex)
-                            .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
+                        let local_is_auth =
+                            hex::encode(info.creator.as_bytes()) == local_agent_hex;
                         let carrier_admin = info
                             .caller_role(&dm_sender_hex)
                             .is_some_and(|r| r.at_least(x0x::groups::GroupRole::Admin));
@@ -1356,15 +1372,310 @@ pub async fn serve_with_options(
                 // unlocked interval where replay or a concurrent mutation
                 // could be erased by a stale-snapshot rollback. Replay is
                 // deferred until after the lock is released.
-                let replay_after: Option<String>;
+                let mut replay_after: Option<String> = None;
                 let skip_iteration = 'admission: {
                     let membership_lock =
                         group_membership_lock(&relay_state, &group_id_str).await;
                     let _membership_guard = membership_lock.lock().await;
 
                     let mut replay_group_id: Option<String> = None;
-                    let mut apply_result =
-                        apply_named_group_metadata_event_inner_serialized(
+                    // Watson item 5: pre-state classification.
+                    enum AdmissionState {
+                        Complete,
+                        New,
+                        Repair,
+                        Inconsistent,
+                    }
+
+                    // Only the authority (group creator) stores the relay
+                    // obligation. A non-authority witness just applies.
+                    if !is_local_authority || !is_requester_offer {
+                        let apply_result =
+                            apply_named_group_metadata_event_inner_serialized(
+                                &relay_state,
+                                event.clone(),
+                                sender,
+                                msg.verified,
+                                true,
+                                Some(envelope_bytes),
+                                &mut replay_group_id,
+                                true,
+                            )
+                            .await;
+                        replay_after = replay_group_id;
+                        let _ = apply_result;
+                        break 'admission false;
+                    }
+
+                    // Watson item 5: classify durable state BEFORE any mutation.
+                    // Extract request identity and check durable request+obligation
+                    // existence without calling _inner_serialized.
+                    let (request_id, requester_agent_id) = match &event {
+                        NamedGroupMetadataEvent::JoinRequestCreated { request_id, requester_agent_id, .. } => {
+                            (request_id.clone(), requester_agent_id.clone())
+                        }
+                        _ => break 'admission false,
+                    };
+
+                    let digest = blake3::hash(envelope_bytes);
+                    let digest_bytes: [u8; 32] = digest.into();
+                    let byte_size = envelope_bytes.len();
+                    let now_ms = now_millis_u64();
+
+                    // A single unresolved marker makes this listener
+                    // unavailable until startup recovery (or an explicit
+                    // recovery loop) resolves it. Never overwrite recovery
+                    // evidence with a later admission.
+                    let existing_admission = relay_state
+                        .pending_listener_admission
+                        .lock()
+                        .await
+                        .clone();
+                    let marker_matches_event = existing_admission.as_ref().is_some_and(|marker| {
+                        marker.group_id == group_id_str
+                            && marker.request_id == request_id
+                            && marker.requester_agent_id == requester_agent_id
+                            && marker.digest == digest_bytes
+                            && marker.envelope_bytes.as_slice() == envelope_bytes
+                    });
+                    if existing_admission.is_some() && !marker_matches_event {
+                        tracing::error!(
+                            group_id = %group_id_str,
+                            request_id = %request_id,
+                            "ADR 0028: unresolved listener-admission journal blocks new admission"
+                        );
+                        replay_after = None;
+                        break 'admission true;
+                    }
+                    if marker_matches_event {
+                        // A matching in-memory marker is not proof that its
+                        // prior write reached directory durability. A
+                        // pre-rename failure leaves the marker in memory, and
+                        // a post-rename fsync failure leaves it merely visible.
+                        // Re-write the exact marker and require `Durable`
+                        // before using it as the transaction fence.
+                        let _journal_guard = relay_state
+                            .predecessor_relay_outbox_persistence_lock
+                            .lock()
+                            .await;
+                        if !matches!(
+                            save_predecessor_relay_outbox_unlocked(&relay_state).await,
+                            Ok(AtomicWriteOutcome::Durable)
+                        ) {
+                            tracing::error!(
+                                group_id = %group_id_str,
+                                request_id = %request_id,
+                                "ADR 0028: matching listener-admission marker is not directory-durable"
+                            );
+                            replay_after = None;
+                            break 'admission true;
+                        }
+                    }
+
+                    // Check durable request existence (non-mutating read).
+                    let request_info = {
+                        let groups = relay_state.named_groups.read().await;
+                        groups.get(&group_id_str).and_then(|info| {
+                            info.join_requests.get(&request_id).map(|jr| {
+                                (jr.requester_agent_id.clone(), jr.predecessor_envelope_digest, jr.is_pending())
+                            })
+                        })
+                    };
+
+                    // Check durable obligation existence (non-mutating read).
+                    let obligation_exists = {
+                        let outbox = relay_state.predecessor_relay_outbox.read().await;
+                        outbox.get(&group_id_str).is_some_and(|list| {
+                            list.iter().any(|o| {
+                                o.group_id == group_id_str
+                                    && o.request_id == request_id
+                                    && o.requester_agent_id == requester_agent_id
+                                    && o.digest == digest_bytes
+                            })
+                        })
+                    };
+                    let completion_receipt_exists = {
+                        let tombstones = relay_state.completed_relay_tombstones.read().await;
+                        tombstones.get(&group_id_str).is_some_and(|list| {
+                            list.iter().any(|receipt| {
+                                receipt.group_id == group_id_str
+                                    && receipt.request_id == request_id
+                                    && receipt.requester_agent_id == requester_agent_id
+                                    && receipt.digest == digest_bytes
+                            })
+                        })
+                    };
+                    let predecessor_receipt_exists =
+                        obligation_exists || completion_receipt_exists;
+
+                    // Classify the state.
+                    let admission_state =
+                        if let Some((req_agent, stored_digest, is_pending)) = &request_info {
+                            let request_matches = *req_agent == requester_agent_id
+                                && *stored_digest == Some(digest_bytes)
+                                && *is_pending;
+                            if request_matches && predecessor_receipt_exists {
+                                AdmissionState::Complete
+                            } else if request_matches {
+                                AdmissionState::Repair
+                            } else {
+                                AdmissionState::Inconsistent
+                            }
+                        } else if predecessor_receipt_exists {
+                            // An obligation without its exact durable request is
+                            // an inconsistent split, never an idempotent success.
+                            AdmissionState::Inconsistent
+                        } else {
+                            AdmissionState::New
+                        };
+
+                    let is_new_request;
+
+                    match admission_state {
+                        AdmissionState::Complete => {
+                            // If this exact pair is completing a journaled
+                            // admission, first re-establish directory
+                            // durability for both files, then durably clear
+                            // the marker. A merely visible prior replacement
+                            // is never promoted to success by inspection.
+                            if marker_matches_event {
+                                {
+                                    let _roster_persistence_guard = relay_state
+                                        .named_groups_persistence_lock
+                                        .lock()
+                                        .await;
+                                    if !matches!(
+                                        save_named_groups_checked_unlocked(&relay_state).await,
+                                        Ok(AtomicWriteOutcome::Durable)
+                                    ) {
+                                        replay_after = None;
+                                        break 'admission true;
+                                    }
+                                }
+                                let _relay_persistence_guard = relay_state
+                                    .predecessor_relay_outbox_persistence_lock
+                                    .lock()
+                                    .await;
+                                if !matches!(
+                                    save_predecessor_relay_outbox_unlocked(&relay_state).await,
+                                    Ok(AtomicWriteOutcome::Durable)
+                                ) {
+                                    replay_after = None;
+                                    break 'admission true;
+                                }
+                                *relay_state.pending_listener_admission.lock().await = None;
+                                if !matches!(
+                                    save_predecessor_relay_outbox_unlocked(&relay_state).await,
+                                    Ok(AtomicWriteOutcome::Durable)
+                                ) {
+                                    *relay_state.pending_listener_admission.lock().await =
+                                        existing_admission.clone();
+                                    replay_after = None;
+                                    break 'admission true;
+                                }
+                            }
+                            // Exact durable pair: idempotent success.
+                            replay_after = None;
+                            break 'admission false;
+                        }
+                        AdmissionState::Inconsistent => {
+                            tracing::warn!(
+                                group_id = %group_id_str,
+                                request_id = %request_id,
+                                "ADR 0028: inconsistent durable state — request exists but obligation absent with mismatched digest/requester"
+                            );
+                            replay_after = None;
+                            break 'admission false;
+                        }
+                        AdmissionState::New => {
+                            // Watson item 5: write the pending-admission journal
+                            // DURABLE before applying JoinRequestCreated.
+                            let admission = PendingListenerAdmission {
+                                group_id: group_id_str.clone(),
+                                request_id: request_id.clone(),
+                                requester_agent_id: requester_agent_id.clone(),
+                                envelope_bytes: envelope_bytes.to_vec(),
+                                digest: digest_bytes,
+                                byte_size,
+                                first_seen_ms: now_ms,
+                            };
+                            if !marker_matches_event {
+                                *relay_state.pending_listener_admission.lock().await =
+                                    Some(admission);
+                                let _journal_guard = relay_state
+                                    .predecessor_relay_outbox_persistence_lock
+                                    .lock()
+                                    .await;
+                                match save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                                    Ok(AtomicWriteOutcome::Durable) => {}
+                                    _ => {
+                                        tracing::error!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: listener admission journal save not durable — not proceeding"
+                                        );
+                                        break 'admission true;
+                                    }
+                                }
+                            }
+                            is_new_request = true;
+                        }
+                        AdmissionState::Repair => {
+                            // Watson item 5: for repair, also write the marker
+                            // DURABLE before creating the obligation.
+                            let admission = PendingListenerAdmission {
+                                group_id: group_id_str.clone(),
+                                request_id: request_id.clone(),
+                                requester_agent_id: requester_agent_id.clone(),
+                                envelope_bytes: envelope_bytes.to_vec(),
+                                digest: digest_bytes,
+                                byte_size,
+                                first_seen_ms: now_ms,
+                            };
+                            if !marker_matches_event {
+                                *relay_state.pending_listener_admission.lock().await =
+                                    Some(admission);
+                                let _journal_guard = relay_state
+                                    .predecessor_relay_outbox_persistence_lock
+                                    .lock()
+                                    .await;
+                                match save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                                    Ok(AtomicWriteOutcome::Durable) => {}
+                                    _ => {
+                                        tracing::error!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: listener repair journal save not durable — not proceeding"
+                                        );
+                                        break 'admission true;
+                                    }
+                                }
+                            }
+                            // A repair may be resuming a request whose roster
+                            // replacement was visible but not directory-
+                            // durable. Re-write the exact current roster and
+                            // require Durable before creating or acknowledging
+                            // its relay obligation.
+                            let _roster_persistence_guard = relay_state
+                                .named_groups_persistence_lock
+                                .lock()
+                                .await;
+                            match save_named_groups_checked_unlocked(&relay_state).await {
+                                Ok(AtomicWriteOutcome::Durable) => {}
+                                _ => {
+                                    tracing::error!(
+                                        group_id = %group_id_str,
+                                        request_id = %request_id,
+                                        "ADR 0028: listener repair could not make the roster directory-durable"
+                                    );
+                                    break 'admission true;
+                                }
+                            }
+                            is_new_request = false;
+                        }
+                    }
+
+                    // Now apply the request (only for New; Repair skips apply).
+                    let group_snapshot = if is_new_request {
+                        let mut apply_result = apply_named_group_metadata_event_inner_serialized(
                             &relay_state,
                             event.clone(),
                             sender,
@@ -1375,89 +1686,26 @@ pub async fn serve_with_options(
                             true, // lock_already_held
                         )
                         .await;
-                    replay_after = replay_group_id;
-
-                    // Only the authority (group creator) stores the relay
-                    // obligation and relays to active witnesses. A non-authority
-                    // witness that received the relay just applies — it does not
-                    // re-relay, preventing a relay storm.
-                    // B8: only create the obligation if apply accepted the event.
-                    // Finding B: ONE admission seam — request state + obligation
-                    // together (or neither), reachable by exact replay. If the
-                    // apply accepted a new JoinRequestCreated, we snapshot the
-                    // pre-apply named-group state so we can roll back the request
-                    // if obligation creation fails. If the apply rejected (e.g.
-                    // request already exists from a prior failed attempt), we
-                    // check for the repair case: request present, obligation
-                    // absent → create the obligation without re-applying.
-                    if !is_local_authority || !is_requester_offer {
-                        break 'admission false;
-                    }
-                    let digest = blake3::hash(envelope_bytes);
-                    let digest_bytes: [u8; 32] = digest.into();
-                    let byte_size = envelope_bytes.len();
-                    let now_ms = now_millis_u64();
-                    let (request_id, requester_agent_id) = match &event {
-                        NamedGroupMetadataEvent::JoinRequestCreated { request_id, requester_agent_id, .. } => {
-                            (request_id.clone(), requester_agent_id.clone())
+                        replay_after = replay_group_id;
+                        if !apply_result.accepted {
+                            tracing::error!(
+                                group_id = %group_id_str,
+                                request_id = %request_id,
+                                "ADR 0028: request apply did not become durable; keeping admission journal and stopping"
+                            );
+                            break 'admission true;
                         }
-                        _ => break 'admission false,
+                        apply_result.pre_mutation_group.take()
+                    } else {
+                        // Repair: request already applied, just create obligation.
+                        replay_after = None;
+                        None
                     };
-
-                    // Idempotent skip: if the obligation already exists for
-                    // this digest, do nothing.
-                    let obligation_exists = {
-                        let outbox = relay_state.predecessor_relay_outbox.read().await;
-                        outbox.get(&group_id_str).is_some_and(|list| {
-                            list.iter().any(|o| o.digest == digest_bytes)
-                        })
-                    };
-                    if obligation_exists {
-                        break 'admission false;
-                    }
-
-                    // Determine whether to create the obligation:
-                    // - apply_result.accepted: new request was just applied
-                    // - !accepted but request exists + obligation missing: repair
-                    // Finding 2: repair must bind to the exact durable
-                    // predecessor envelope digest, not just request-ID presence.
-                    let request_info = {
-                        let groups = relay_state.named_groups.read().await;
-                        groups.get(&group_id_str).and_then(|info| {
-                            info.join_requests.get(&request_id).map(|jr| {
-                                (jr.requester_agent_id.clone(), jr.predecessor_envelope_digest)
-                            })
-                        })
-                    };
-
-                    let is_new_request = apply_result.accepted;
-                    // Finding 2: repair only if the request exists, the
-                    // requester matches, AND the stored predecessor digest
-                    // matches this envelope's digest. A divergent
-                    // differently-signed envelope with the same request_id
-                    // cannot become the durable obligation.
-                    let is_repair = !is_new_request
-                        && request_info
-                            .is_some_and(|(req_agent, stored_digest)| {
-                                req_agent == requester_agent_id
-                                    && stored_digest == Some(digest_bytes)
-                            });
-
-                    if !is_new_request && !is_repair {
-                        break 'admission false;
-                    }
-
-                    // For new requests: use the pre-mutation group state
-                    // returned by apply (Finding B). This is the state BEFORE
+                    // The snapshot returned by apply (Finding B) is the state BEFORE
                     // the JoinRequestCreated was durably applied, so rollback
                     // actually undoes the request. The previous code read the
                     // post-apply state from named_groups, which already
                     // contained the applied request.
-                    let group_snapshot = if is_new_request {
-                        apply_result.pre_mutation_group.take()
-                    } else {
-                        None
-                    };
 
                     // Collect active witness targets (non-local active members).
                     let relay_targets = {
@@ -1481,8 +1729,8 @@ pub async fn serve_with_options(
                         next_retry_at_ms: now_ms,
                         retry_count: 0,
                         group_id: group_id_str.clone(),
-                        request_id,
-                        requester_agent_id,
+                        request_id: request_id.clone(),
+                        requester_agent_id: requester_agent_id.clone(),
                         relay_targets,
                         completed_at_ms: None,
                     };
@@ -1600,6 +1848,7 @@ pub async fn serve_with_options(
                         // state degrades to "request present, obligation absent"
                         // which the repair path (is_repair) services on
                         // re-delivery.
+                        let mut request_rollback_durable = false;
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
                                 let post_apply_state = {
@@ -1629,22 +1878,19 @@ pub async fn serve_with_options(
                                 )
                                 .await;
                                 match save_named_groups_checked_unlocked(&relay_state).await {
-                                    Ok(outcome) => {
-                                        // Watson ruling: Durable or ReplacedNotDurable
-                                        // both mean the rollback snapshot IS on disk.
-                                        // Memory already has the rollback snapshot.
-                                        // Do NOT restore post-apply.
-                                        if !outcome.is_durable() {
-                                            tracing::warn!(
-                                                group_id = %group_id_str,
-                                                "ADR 0028: rollback saved but not directory-durable after admission failure"
-                                            );
-                                        }
+                                    Ok(AtomicWriteOutcome::Durable) => {
+                                        request_rollback_durable = true;
                                     }
-                                    Err(e) => {
+                                    Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                                        tracing::warn!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: rollback is visible but not directory-durable after admission failure"
+                                        );
+                                    }
+                                    Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
                                         tracing::error!(
                                             group_id = %group_id_str,
-                                            "ADR 0028: rollback save failed after admission failure: {e}"
+                                            "ADR 0028: rollback was not replaced after admission failure"
                                         );
                                         // Watson ruling: NotReplaced — rollback did
                                         // not persist. Disk has the applied state.
@@ -1661,6 +1907,23 @@ pub async fn serve_with_options(
                                 }
                             }
                         }
+                        if request_rollback_durable {
+                            // Capacity rejection completed as durable
+                            // both-or-neither. Clear the admission marker only
+                            // after the roster rollback is directory-durable.
+                            let marker = relay_state
+                                .pending_listener_admission
+                                .lock()
+                                .await
+                                .clone();
+                            *relay_state.pending_listener_admission.lock().await = None;
+                            if !matches!(
+                                save_predecessor_relay_outbox_unlocked(&relay_state).await,
+                                Ok(AtomicWriteOutcome::Durable)
+                            ) {
+                                *relay_state.pending_listener_admission.lock().await = marker;
+                            }
+                        }
                         break 'admission true;
                     }
                     // Persist the relay outbox. Persistence lock is already
@@ -1669,13 +1932,16 @@ pub async fn serve_with_options(
                         Ok(AtomicWriteOutcome::Durable) => {}
                         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
                             // Watson ruling: outbox IS on disk but not dir-fsync'd.
-                            // The obligation is durable. Do NOT roll back. The
-                            // relay engine will pick it up; publication defers until
-                            // the parent dir is fsync'd on the next save cycle.
-                            tracing::warn!(
+                            // The obligation is durable but not directory-durable.
+                            // Do NOT proceed/succeed/fan out. Keep the listener
+                            // admission journal marker — the operation is not
+                            // fully durable. Return unavailable for retry.
+                            tracing::error!(
                                 group_id = %group_id_str,
-                                "ADR 0028: relay outbox replaced but not directory-durable after admission — obligation is durable, proceeding"
+                                "ADR 0028: relay outbox replaced but not directory-durable after admission — keeping journal, not proceeding"
                             );
+                            // Keep the marker — do NOT clear pending_listener_admission.
+                            break 'admission true;
                         }
                         _ => {
                         let e = std::io::Error::other("not replaced or pre-rename failure");
@@ -1693,6 +1959,7 @@ pub async fn serve_with_options(
                         // state before reverting, restore on save failure.
                         // Drop the outbox write lock first to respect P→Q
                         // ordering — no Q lock held during named_groups read.
+                        let mut request_rollback_durable = false;
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
                                 drop(outbox);
@@ -1717,18 +1984,19 @@ pub async fn serve_with_options(
                                 )
                                 .await;
                                 match save_named_groups_checked_unlocked(&relay_state).await {
-                                    Ok(outcome) => {
-                                        if !outcome.is_durable() {
-                                            tracing::warn!(
-                                                group_id = %group_id_str,
-                                                "ADR 0028: rollback saved but not directory-durable after outbox save failure"
-                                            );
-                                        }
+                                    Ok(AtomicWriteOutcome::Durable) => {
+                                        request_rollback_durable = true;
                                     }
-                                    Err(e) => {
+                                    Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                                        tracing::warn!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: rollback is visible but not directory-durable after outbox save failure"
+                                        );
+                                    }
+                                    Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
                                         tracing::error!(
                                             group_id = %group_id_str,
-                                            "ADR 0028: rollback save failed after outbox save failure: {e}"
+                                            "ADR 0028: rollback was not replaced after outbox save failure"
                                         );
                                         if let Some(post_apply) = post_apply_state {
                                             store_named_group_info(
@@ -1742,7 +2010,65 @@ pub async fn serve_with_options(
                                 }
                             }
                         }
+                        if request_rollback_durable {
+                            let marker = relay_state
+                                .pending_listener_admission
+                                .lock()
+                                .await
+                                .clone();
+                            *relay_state.pending_listener_admission.lock().await = None;
+                            if !matches!(
+                                save_predecessor_relay_outbox_unlocked(&relay_state).await,
+                                Ok(AtomicWriteOutcome::Durable)
+                            ) {
+                                *relay_state.pending_listener_admission.lock().await = marker;
+                            }
+                        }
                         break 'admission true;
+                        }
+                    }
+
+                    // Watson item 5: both request apply and obligation admission succeeded.
+                    // Clear the listener admission journal — but only if the
+                    // clear save itself is Durable. For ReplacedNotDurable,
+                    // the visible destination has ALREADY been replaced with a
+                    // sidecar lacking the marker. We must re-persist the marker
+                    // to Durable before proceeding. Never acknowledge from an
+                    // in-memory-only restore.
+                    let clear_outcome = {
+                        *relay_state.pending_listener_admission.lock().await = None;
+                        save_predecessor_relay_outbox_unlocked(&relay_state).await
+                    };
+                    match clear_outcome {
+                        Ok(AtomicWriteOutcome::Durable) => {}
+                        _ => {
+                            tracing::error!(
+                                group_id = %group_id_str,
+                                "ADR 0028: listener admission journal clear not durable — re-persisting marker, not proceeding"
+                            );
+                            // Re-persist the marker durably. If this also
+                            // fails, keep the in-memory marker and stay
+                            // unavailable — restart recovery will handle it.
+                            let marker = PendingListenerAdmission {
+                                group_id: group_id_str.clone(),
+                                request_id: request_id.clone(),
+                                requester_agent_id: requester_agent_id.clone(),
+                                envelope_bytes: envelope_bytes.to_vec(),
+                                digest: digest_bytes,
+                                byte_size,
+                                first_seen_ms: now_ms,
+                            };
+                            *relay_state.pending_listener_admission.lock().await = Some(marker);
+                            match save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                                Ok(AtomicWriteOutcome::Durable) => {}
+                                _ => {
+                                    tracing::error!(
+                                        group_id = %group_id_str,
+                                        "ADR 0028: listener admission marker re-persist failed — keeping in-memory marker, staying unavailable"
+                                    );
+                                }
+                            }
+                            break 'admission true;
                         }
                     }
 
@@ -2062,8 +2388,9 @@ pub async fn serve_with_options(
         ))
         .with_state(Arc::clone(&state));
 
-    // Note: the `api.port` advertisement is written above (Fix A), before any
-    // background task is spawned, so a failure there leaves nothing to tear down.
+    // The `api.port` advertisement is written only after causal-state loading
+    // succeeds. Startup failures before that point explicitly tear down the
+    // agent and exec service and leave no advertised API endpoint.
 
     // Lifecycle: a CancellationToken drives library-initiated shutdown
     // (ServerHandle::shutdown / Drop). The mpsc `/shutdown` HTTP path still
