@@ -165,7 +165,10 @@ install -m 0644 "$UNIT_SRC_PATH" "$UNIT_DST"
 systemctl daemon-reload
 # Enable by the service name the installed unit provides (basename minus .service).
 svc_name="$(basename "$UNIT_DST" .service)"
-systemctl enable "$svc_name" >/dev/null 2>&1 || true
+if ! systemctl enable "$svc_name" >/dev/null 2>&1; then
+    echo "[install] ERROR: systemctl enable $svc_name failed" >&2
+    exit 1
+fi
 
 echo "[install] done. unit enabled; service NOT started (managed transition)."
 echo "[install] start explicitly:  systemctl start $svc_name"

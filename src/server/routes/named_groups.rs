@@ -17795,7 +17795,8 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 *state.predecessor_relay_outbox.write().await = HashMap::new();
                 *state.completed_relay_tombstones.write().await = HashMap::new();
                 return Err(
-                    "listener admission recovery rejected: candidate exceeds governed caps".to_string(),
+                    "listener admission recovery rejected: candidate exceeds governed caps"
+                        .to_string(),
                 );
             }
             // Only after the complete detached request+obligation candidate passes

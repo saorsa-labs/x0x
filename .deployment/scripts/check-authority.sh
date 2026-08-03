@@ -601,9 +601,29 @@ run_check() {
 # without restoring the mode an executable script (install.sh/deploy-443.sh)
 # loses +x and the execution-based C6/C7 arms then fail on permission rather
 # than the mutation — a silent attribution bug.
+# Read a file's mode as an octal string, running GNU and BSD stat dialects
+# separately and accepting only a non-empty octal-only result. Never
+# concatenate failed-arm stdout: on Linux, GNU stat -f '%Lp' can output
+# the literal format string or unexpected filesystem fields and exit 0,
+# so a naive || fallback never triggers and the mode is silently lost.
+_read_mode() {
+    local f="$1" out
+    out="$(stat -c '%a' "$f" 2>/dev/null)"
+    if [ -n "$out" ] && printf '%s' "$out" | grep -qE '^[0-7]+$'; then
+        printf '%s' "$out"
+        return 0
+    fi
+    out="$(stat -f '%Lp' "$f" 2>/dev/null)"
+    if [ -n "$out" ] && printf '%s' "$out" | grep -qE '^[0-7]+$'; then
+        printf '%s' "$out"
+        return 0
+    fi
+    echo "_read_mode: could not read octal mode for $f" >&2
+    return 1
+}
 _rewrite() {
     local f="$1" expr="$2" mode
-    mode="$(stat -f '%Lp' "$f" 2>/dev/null || stat -c '%a' "$f" 2>/dev/null)"
+    mode="$(_read_mode "$f")" || return 1
     sed -E "$expr" "$f" > "$f.__t" || return 1
     if cmp -s "$f" "$f.__t"; then
         rm -f "$f.__t"
@@ -611,7 +631,7 @@ _rewrite() {
         return 1
     fi
     mv "$f.__t" "$f"
-    [ -n "$mode" ] && chmod "$mode" "$f"
+    chmod "$mode" "$f"
 }
 # mut_manifest ID FIELD JSON_LITERAL — edit one instance field in the manifest
 # (python-scoped by id; sed cannot safely target a single JSON record).
