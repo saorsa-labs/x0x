@@ -49,6 +49,12 @@ pub struct JoinRequest {
     /// transition, not just request-ID presence.
     #[serde(default)]
     pub predecessor_envelope_digest: Option<[u8; 32]>,
+    /// ADR 0028: local first-observation time for the authenticated
+    /// predecessor envelope. This is persisted with the request so exact
+    /// duplicate deliveries cannot recreate an expired relay obligation with
+    /// a fresh retention window.
+    #[serde(default)]
+    pub predecessor_first_seen_ms: Option<u64>,
 }
 
 impl JoinRequest {
@@ -73,6 +79,7 @@ impl JoinRequest {
             reviewed_by: None,
             status: JoinRequestStatus::Pending,
             predecessor_envelope_digest: None,
+            predecessor_first_seen_ms: None,
         }
     }
 

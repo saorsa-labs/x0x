@@ -21,6 +21,7 @@ mod ws;
 // unchanged after the #125 / WS1.4 extraction. Internal types (AppState,
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
 pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
+use routes::named_groups::CAUSAL_APPROVAL_RETENTION_MS;
 use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
@@ -1383,7 +1384,7 @@ pub async fn serve_with_options(
                     enum AdmissionState {
                         Complete,
                         New,
-                        Repair,
+                        Repair(u64),
                         Inconsistent,
                     }
 
@@ -1398,6 +1399,7 @@ pub async fn serve_with_options(
                                 msg.verified,
                                 true,
                                 Some(envelope_bytes),
+                                None,
                                 &mut replay_group_id,
                                 true,
                             )
@@ -1438,6 +1440,20 @@ pub async fn serve_with_options(
                             && marker.digest == digest_bytes
                             && marker.envelope_bytes.as_slice() == envelope_bytes
                     });
+                    if existing_admission.as_ref().is_some_and(|marker| {
+                        marker
+                            .first_seen_ms
+                            .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+                            <= now_ms
+                    }) {
+                        tracing::error!(
+                            group_id = %group_id_str,
+                            request_id = %request_id,
+                            "ADR 0028: expired listener-admission journal cannot refresh predecessor retention"
+                        );
+                        replay_after = None;
+                        break 'admission true;
+                    }
                     if existing_admission.is_some() && !marker_matches_event {
                         tracing::error!(
                             group_id = %group_id_str,
@@ -1477,47 +1493,81 @@ pub async fn serve_with_options(
                         let groups = relay_state.named_groups.read().await;
                         groups.get(&group_id_str).and_then(|info| {
                             info.join_requests.get(&request_id).map(|jr| {
-                                (jr.requester_agent_id.clone(), jr.predecessor_envelope_digest, jr.is_pending())
+                                (
+                                    jr.requester_agent_id.clone(),
+                                    jr.predecessor_envelope_digest,
+                                    jr.predecessor_first_seen_ms,
+                                    jr.is_pending(),
+                                )
                             })
                         })
                     };
 
                     // Check durable obligation existence (non-mutating read).
-                    let obligation_exists = {
+                    let obligation_first_seen_ms = {
                         let outbox = relay_state.predecessor_relay_outbox.read().await;
-                        outbox.get(&group_id_str).is_some_and(|list| {
-                            list.iter().any(|o| {
-                                o.group_id == group_id_str
+                        outbox.get(&group_id_str).and_then(|list| {
+                            list.iter().find_map(|o| {
+                                (o.group_id == group_id_str
                                     && o.request_id == request_id
                                     && o.requester_agent_id == requester_agent_id
-                                    && o.digest == digest_bytes
+                                    && o.digest == digest_bytes)
+                                    .then_some(o.first_seen_ms)
                             })
                         })
                     };
-                    let completion_receipt_exists = {
+                    let completion_receipt_first_seen_ms = {
                         let tombstones = relay_state.completed_relay_tombstones.read().await;
-                        tombstones.get(&group_id_str).is_some_and(|list| {
-                            list.iter().any(|receipt| {
-                                receipt.group_id == group_id_str
+                        tombstones.get(&group_id_str).and_then(|list| {
+                            list.iter().find_map(|receipt| {
+                                (receipt.group_id == group_id_str
                                     && receipt.request_id == request_id
                                     && receipt.requester_agent_id == requester_agent_id
-                                    && receipt.digest == digest_bytes
+                                    && receipt.digest == digest_bytes)
+                                    .then_some(receipt.first_seen_ms)
                             })
                         })
                     };
-                    let predecessor_receipt_exists =
-                        obligation_exists || completion_receipt_exists;
+                    let predecessor_receipt_exists = obligation_first_seen_ms.is_some()
+                        || completion_receipt_first_seen_ms.is_some();
 
                     // Classify the state.
-                    let admission_state =
-                        if let Some((req_agent, stored_digest, is_pending)) = &request_info {
+                    let admission_state = if let Some((
+                        req_agent,
+                        stored_digest,
+                        stored_first_seen_ms,
+                        is_pending,
+                    )) = &request_info
+                    {
                             let request_matches = *req_agent == requester_agent_id
                                 && *stored_digest == Some(digest_bytes)
                                 && *is_pending;
-                            if request_matches && predecessor_receipt_exists {
+                            let first_seen_is_live = stored_first_seen_ms.is_some_and(|first_seen| {
+                                first_seen.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) > now_ms
+                            });
+                            let receipt_matches_clock = stored_first_seen_ms.is_some_and(|expected| {
+                                obligation_first_seen_ms == Some(expected)
+                                    || completion_receipt_first_seen_ms == Some(expected)
+                            });
+                            let marker_matches_clock = existing_admission
+                                .as_ref()
+                                .is_none_or(|marker| {
+                                    *stored_first_seen_ms == Some(marker.first_seen_ms)
+                                });
+                            if request_matches
+                                && first_seen_is_live
+                                && receipt_matches_clock
+                                && marker_matches_clock
+                            {
                                 AdmissionState::Complete
-                            } else if request_matches {
-                                AdmissionState::Repair
+                            } else if request_matches
+                                && first_seen_is_live
+                                && !predecessor_receipt_exists
+                                && marker_matches_clock
+                            {
+                                AdmissionState::Repair(
+                                    stored_first_seen_ms.unwrap_or_default(),
+                                )
                             } else {
                                 AdmissionState::Inconsistent
                             }
@@ -1530,6 +1580,7 @@ pub async fn serve_with_options(
                         };
 
                     let is_new_request;
+                    let admission_first_seen_ms;
 
                     match admission_state {
                         AdmissionState::Complete => {
@@ -1590,6 +1641,9 @@ pub async fn serve_with_options(
                         AdmissionState::New => {
                             // Watson item 5: write the pending-admission journal
                             // DURABLE before applying JoinRequestCreated.
+                            admission_first_seen_ms = existing_admission
+                                .as_ref()
+                                .map_or(now_ms, |marker| marker.first_seen_ms);
                             let admission = PendingListenerAdmission {
                                 group_id: group_id_str.clone(),
                                 request_id: request_id.clone(),
@@ -1597,7 +1651,7 @@ pub async fn serve_with_options(
                                 envelope_bytes: envelope_bytes.to_vec(),
                                 digest: digest_bytes,
                                 byte_size,
-                                first_seen_ms: now_ms,
+                                first_seen_ms: admission_first_seen_ms,
                             };
                             if !marker_matches_event {
                                 *relay_state.pending_listener_admission.lock().await =
@@ -1619,9 +1673,10 @@ pub async fn serve_with_options(
                             }
                             is_new_request = true;
                         }
-                        AdmissionState::Repair => {
+                        AdmissionState::Repair(stored_first_seen_ms) => {
                             // Watson item 5: for repair, also write the marker
                             // DURABLE before creating the obligation.
+                            admission_first_seen_ms = stored_first_seen_ms;
                             let admission = PendingListenerAdmission {
                                 group_id: group_id_str.clone(),
                                 request_id: request_id.clone(),
@@ -1629,7 +1684,7 @@ pub async fn serve_with_options(
                                 envelope_bytes: envelope_bytes.to_vec(),
                                 digest: digest_bytes,
                                 byte_size,
-                                first_seen_ms: now_ms,
+                                first_seen_ms: admission_first_seen_ms,
                             };
                             if !marker_matches_event {
                                 *relay_state.pending_listener_admission.lock().await =
@@ -1682,6 +1737,7 @@ pub async fn serve_with_options(
                             msg.verified,
                             true,
                             Some(envelope_bytes),
+                            Some(admission_first_seen_ms),
                             &mut replay_group_id,
                             true, // lock_already_held
                         )
@@ -1725,8 +1781,8 @@ pub async fn serve_with_options(
                         envelope_bytes: envelope_bytes.to_vec(),
                         digest: digest.into(),
                         byte_size,
-                        first_seen_ms: now_ms,
-                        next_retry_at_ms: now_ms,
+                        first_seen_ms: admission_first_seen_ms,
+                        next_retry_at_ms: admission_first_seen_ms,
                         retry_count: 0,
                         group_id: group_id_str.clone(),
                         request_id: request_id.clone(),
@@ -2056,7 +2112,12 @@ pub async fn serve_with_options(
                                 envelope_bytes: envelope_bytes.to_vec(),
                                 digest: digest_bytes,
                                 byte_size,
-                                first_seen_ms: now_ms,
+                                // Preserve the authority's original local
+                                // observation clock. Re-persisting a marker
+                                // after an indeterminate journal-clear must
+                                // never refresh the five-minute validity
+                                // window.
+                                first_seen_ms: admission_first_seen_ms,
                             };
                             *relay_state.pending_listener_admission.lock().await = Some(marker);
                             match save_predecessor_relay_outbox_unlocked(&relay_state).await {

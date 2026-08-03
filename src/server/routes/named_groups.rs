@@ -501,7 +501,7 @@ const CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP: usize = 1024 * 1024; // 1 MiB
 /// ADR 0028 bounds: maximum serialized bytes per daemon in the queue.
 const CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP: usize = 16 * 1024 * 1024; // 16 MiB
 /// ADR 0028 retention: 5 minutes from first observation.
-const CAUSAL_APPROVAL_RETENTION_MS: u64 = 5 * 60 * 1000;
+pub(in crate::server) const CAUSAL_APPROVAL_RETENTION_MS: u64 = 5 * 60 * 1000;
 /// ADR 0028: max signed envelope size.
 pub(in crate::server) const CAUSAL_ENVELOPE_MAX_BYTES: usize = 64 * 1024;
 /// ADR 0028 relay retry offsets (seconds): 0, 1, 2, 4, 8, 16, 30, 60, 120, 240.
@@ -1262,8 +1262,8 @@ async fn publish_group_card_to_discovery_inner(
         (card, commit)
     };
 
-    if reseal {
-        save_named_groups(state).await;
+    if reseal && !save_named_groups(state).await {
+        return None;
     }
 
     // Phase C.2 privacy guard. Hidden and ListedToContacts MUST NEVER reach
@@ -4048,7 +4048,9 @@ async fn apply_recovered_member_key_package_locked(
         true
     };
     if installed {
-        save_named_groups(state).await;
+        if !save_named_groups(state).await {
+            return false;
+        }
         cache_treekem_member_key_package(
             state,
             join_result_key(group_id, member_agent_id),
@@ -4352,8 +4354,8 @@ async fn replay_pending_treekem_events(state: &Arc<AppState>, group_id: &str) {
     // skips save_named_groups when allow_queue=false (replay mode) for
     // JoinRequestApproved to avoid double-writes with the causal drain loop.
     // This single save covers all applied events in this replay batch.
-    if any_applied {
-        save_named_groups(state).await;
+    if any_applied && !save_named_groups(state).await {
+        return;
     }
     if !still_pending.is_empty() {
         let mut pending = state.treekem_pending_events.write().await;
@@ -4916,10 +4918,16 @@ async fn try_queue_causal_approval(
             Ok(AtomicWriteOutcome::Durable) => {}
             Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
                 tracing::warn!(
-                    "ADR 0028: sidecar replaced but not directory-durable — not recording queued"
+                    "ADR 0028: sidecar replaced but not directory-durable — removing replay eligibility"
                 );
-                // Watson ruling: do NOT record success. Return without
-                // recording queued — the entry IS on disk but not dir-fsync'd.
+                // The visible replacement may survive a later restart, but it
+                // cannot authorize replay in this process until startup has
+                // observed it as durable input. Remove the in-memory entry so
+                // a later JoinRequestCreated cannot drain it to success.
+                let mut queue_lock = state.causal_approval_queue.write().await;
+                if let Some(queue) = queue_lock.get_mut(group_id) {
+                    queue.retain(|queued| queued.digest != digest_bytes);
+                }
                 state
                     .groups_diagnostics
                     .record_causal_capacity_rejected(group_id);
@@ -5112,6 +5120,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             true,
             false, // disable causal queue to prevent re-admission
             None,  // no envelope bytes on replay (event is already decoded)
+            None,
             &mut replay_group_id,
             true, // lock_already_held
         ))
@@ -5655,6 +5664,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         verified,
         true,
         envelope_bytes,
+        None,
         &mut replay_group_id,
         false,
     )
@@ -5684,6 +5694,7 @@ async fn apply_named_group_metadata_event_inner(
         verified,
         allow_queue,
         envelope_bytes,
+        None,
         &mut replay_group_id,
         false,
     )
@@ -5704,9 +5715,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     verified: bool,
     allow_queue: bool,
     envelope_bytes: Option<&[u8]>,
+    predecessor_first_seen_ms: Option<u64>,
     replay_group_id: &mut Option<String>,
     lock_already_held: bool,
 ) -> ApplyMetadataResult {
+    let observed_predecessor_at_ms =
+        envelope_bytes.map(|_| predecessor_first_seen_ms.unwrap_or_else(now_millis_u64));
     let event_kind = named_group_metadata_event_kind(&event);
     let sender_hex = hex::encode(sender.as_bytes());
     tracing::debug!(
@@ -6174,11 +6188,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             for (key, cached) in recovery_cache_entries {
                 cache_treekem_member_key_package(state, key, cached, true).await;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
@@ -6286,7 +6302,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     "member_removed_self",
                 )
                 .await;
-                save_named_groups(state).await;
+                if !save_named_groups(state).await {
+                    return ApplyMetadataResult::REJECTED;
+                }
                 *replay_group_id = Some(resolved_group_key.clone());
                 save_mls_groups(state).await;
                 let _ =
@@ -6324,8 +6342,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             save_mls_groups(state).await;
             remember_treekem_membership_event(state, &event_for_log).await;
@@ -6423,8 +6443,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -6474,8 +6496,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -6577,8 +6601,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             remember_treekem_membership_event(state, &event_for_log).await;
             if banned_self {
@@ -6634,8 +6660,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -6693,6 +6721,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         reviewed_by: None,
                         status: x0x::groups::JoinRequestStatus::Pending,
                         predecessor_envelope_digest: envelope_bytes.map(|b| blake3::hash(b).into()),
+                        predecessor_first_seen_ms: observed_predecessor_at_ms,
                     };
                     next.join_requests.insert(request_id.clone(), req);
                     if let Some(kem_b64) = requester_kem_public_key_b64.clone() {
@@ -7057,7 +7086,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
-            save_named_groups(state).await;
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -7095,7 +7126,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
-            save_named_groups(state).await;
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -7162,8 +7195,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
                 return ApplyMetadataResult::REJECTED;
             }
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-            save_named_groups(state).await;
             *replay_group_id = Some(resolved_group_key.clone());
             ApplyMetadataResult::ACCEPTED_CONTINUE
         }
@@ -7262,7 +7297,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if !store_named_group_info(state, &resolved_group_key, next).await {
                 return ApplyMetadataResult::REJECTED;
             }
-            save_named_groups(state).await;
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             *replay_group_id = Some(resolved_group_key.clone());
             tracing::info!(
                 group_id = %ev_group_id,
@@ -7634,7 +7671,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // discovery-card side effects. Tests and operators poll
             // /groups/:id/members and /diagnostics/groups as the acceptance
             // signal for this path.
-            save_named_groups(state).await;
+            if !save_named_groups(state).await {
+                return ApplyMetadataResult::REJECTED;
+            }
             *replay_group_id = Some(resolved_group_key.clone());
             state
                 .groups_diagnostics
@@ -8053,7 +8092,12 @@ pub(in crate::server) async fn create_named_group(
                     }
                 }
             } else {
-                save_named_groups(&state).await;
+                if !save_named_groups(&state).await {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    );
+                }
             }
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
@@ -9354,7 +9398,16 @@ pub(in crate::server) async fn create_group_invite(
         let expires_at = invite.expires_at;
         (link, mls_group_id, group_name, expires_at)
     };
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "named-group state is not directory-durable"
+            })),
+        )
+            .into_response();
+    }
 
     (
         StatusCode::OK,
@@ -9602,7 +9655,12 @@ pub(in crate::server) async fn join_group_via_invite(
                 .write()
                 .await
                 .insert(group_id_hex.clone(), info.clone());
-            save_named_groups(&state).await;
+            if !save_named_groups(&state).await {
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "named-group state is not directory-durable",
+                );
+            }
             drop(membership_guard);
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
 
@@ -9802,7 +9860,12 @@ pub(in crate::server) async fn set_group_display_name(
     let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     info.set_display_name(&agent_hex, req.name.clone());
     drop(groups); // release write lock before saving
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     (
@@ -9899,7 +9962,12 @@ pub(in crate::server) async fn add_named_group_member(
             }
         }
         drop(mls_groups);
-        save_named_groups(&state).await;
+        if !save_named_groups(&state).await {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named-group state is not directory-durable",
+            );
+        }
         save_mls_groups(&state).await;
         let event = NamedGroupMetadataEvent::MemberAdded {
             group_id: event_group_id,
@@ -10106,7 +10174,6 @@ async fn add_treekem_named_group_member(
     let mut groups = state.named_groups.write().await;
     groups.insert(id.clone(), next.clone());
     drop(groups);
-    save_named_groups(&state).await;
 
     let welcome_ref = stage_treekem_welcome(&state, &event_group_id, &agent_hex, out.welcome).await;
     let event = NamedGroupMetadataEvent::MemberAdded {
@@ -10344,7 +10411,12 @@ pub(in crate::server) async fn remove_named_group_member(
             }
         }
         drop(mls_groups);
-        save_named_groups(&state).await;
+        if !save_named_groups(&state).await {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "named-group state is not directory-durable",
+            );
+        }
         save_mls_groups(&state).await;
         let event = NamedGroupMetadataEvent::MemberRemoved {
             group_id: event_group_id,
@@ -10907,7 +10979,9 @@ async fn retain_withdrawn_group_tombstone(
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
     remove_directory_cache_entries_for_group_info(state, &info).await;
     refresh_group_card_cache_from_info(state, group_id, &info).await;
-    save_named_groups(state).await;
+    if !save_named_groups(state).await {
+        return;
+    }
     save_mls_groups(state).await;
 }
 
@@ -10952,7 +11026,9 @@ async fn drop_local_named_group_state(
     if let Some(stable_group_id) = stable_group_id {
         remove_treekem_persistence_for_group_id(state, stable_group_id, reason).await;
     }
-    save_named_groups(state).await;
+    if !save_named_groups(state).await {
+        return;
+    }
     save_mls_groups(state).await;
     stop_named_group_metadata_listener(state, id).await;
     if let Some(stable_group_id) = stable_group_id {
@@ -11031,7 +11107,12 @@ async fn leave_treekem_group(
     state.mls_groups.write().await.remove(&id);
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "treekem_leave").await;
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     save_mls_groups(&state).await;
 
     let event = NamedGroupMetadataEvent::MemberRemoved {
@@ -11193,7 +11274,6 @@ async fn remove_treekem_named_group_member(
     let mut groups = state.named_groups.write().await;
     groups.insert(id.clone(), next.clone());
     drop(groups);
-    save_named_groups(&state).await;
     save_mls_groups(&state).await;
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_removed").await;
 
@@ -11590,7 +11670,12 @@ pub(in crate::server) async fn leave_group(
     };
     drop(groups);
 
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
@@ -11608,7 +11693,12 @@ pub(in crate::server) async fn leave_group(
     // (NotFound is ignored).
     state.treekem_groups.write().await.remove(&id);
     remove_treekem_persistence_for_group_id(&state, &id, "leave_group").await;
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     save_mls_groups(&state).await;
     stop_named_group_metadata_listener(&state, &id).await;
 
@@ -11924,7 +12014,12 @@ pub(in crate::server) async fn update_named_group(
     let event_group_id = info.stable_group_id().to_string();
     let delivery_roster = info.clone();
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
 
     let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
         group_id: event_group_id,
@@ -12025,7 +12120,12 @@ pub(in crate::server) async fn update_group_policy(
     let policy_clone = info.policy.clone();
     let delivery_roster = info.clone();
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::PolicyUpdated {
@@ -12124,7 +12224,12 @@ pub(in crate::server) async fn update_member_role(
     let event_group_id = info.stable_group_id().to_string();
     let delivery_roster = info.clone();
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::MemberRoleUpdated {
@@ -12216,7 +12321,12 @@ pub(in crate::server) async fn ban_group_member(
         return api_error(StatusCode::CONFLICT, "group is withdrawn");
     }
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
 
     // Deliver the rotated secret to each remaining member (skip self). Each
     // envelope is sealed to that member's published ML-KEM-768 public key
@@ -12420,7 +12530,8 @@ async fn ban_treekem_group_member(
     let mut groups = state.named_groups.write().await;
     groups.insert(id.clone(), next.clone());
     drop(groups);
-    save_named_groups(&state).await;
+    // `persist_treekem_and_named_groups_atomic_with_info` already made this
+    // exact roster snapshot durable before the in-memory install above.
     let _ = prune_treekem_cache_member(&state, &id, &agent_id_hex, "local_member_banned").await;
 
     let event = NamedGroupMetadataEvent::MemberBanned {
@@ -12495,7 +12606,12 @@ pub(in crate::server) async fn unban_group_member(
     let metadata_topic = info.metadata_topic.clone();
     let event_group_id = info.stable_group_id().to_string();
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::MemberUnbanned {
@@ -12625,7 +12741,12 @@ pub(in crate::server) async fn create_join_request(
         (metadata_topic, event_group_id, request, creator_hex, commit)
     };
 
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     // Include our ML-KEM-768 public key so the approver can seal the group
@@ -12721,21 +12842,33 @@ pub(in crate::server) async fn approve_join_request(
     // record that passed the precondition — not just request_id + requester.
     // Read the join request to get the requester identity and the
     // group's metadata topic (for B2/B7 topic binding on the envelope).
-    let (requester_agent_id, metadata_topic) = {
+    let (requester_agent_id, metadata_topic, predecessor_first_seen_ms) = {
         let groups = state.named_groups.read().await;
         match groups.get(&id) {
             Some(info) => {
-                let requester = info
-                    .join_requests
-                    .get(&request_id)
-                    .map(|req| req.requester_agent_id.clone());
-                (requester, info.metadata_topic.clone())
+                let request = info.join_requests.get(&request_id);
+                (
+                    request.map(|req| req.requester_agent_id.clone()),
+                    info.metadata_topic.clone(),
+                    request.and_then(|req| req.predecessor_first_seen_ms),
+                )
             }
-            None => (None, String::new()),
+            None => (None, String::new(), None),
         }
     };
     let Some(requester_agent_id) = requester_agent_id else {
         return not_found("request not found");
+    };
+    let Some(predecessor_first_seen_ms) = predecessor_first_seen_ms else {
+        tracing::warn!(
+            group_id = %LogHexId::group(&id),
+            request_id = %request_id,
+            "ADR 0028 B8: refusing approval — request has no durable predecessor first-observation time"
+        );
+        return api_error(
+            StatusCode::PRECONDITION_FAILED,
+            "predecessor obligation has no durable first-observation time",
+        );
     };
     // R3: Check the live outbox first, then completed tombstones. Return the
     // validated digest so the refresh matches the exact record that passed.
@@ -12745,6 +12878,11 @@ pub(in crate::server) async fn approve_join_request(
         if let Some(obligations) = outbox.get(&id) {
             for o in obligations {
                 if o.request_id != request_id || o.requester_agent_id != requester_agent_id {
+                    continue;
+                }
+                if o.first_seen_ms != predecessor_first_seen_ms
+                    || o.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) <= now_ms
+                {
                     continue;
                 }
                 let computed: [u8; 32] = blake3::hash(&o.envelope_bytes).into();
@@ -12799,6 +12937,11 @@ pub(in crate::server) async fn approve_join_request(
                     if t.request_id != request_id
                         || t.requester_agent_id != requester_agent_id
                         || t.group_id != id
+                    {
+                        continue;
+                    }
+                    if t.first_seen_ms != predecessor_first_seen_ms
+                        || t.first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS) <= now_ms
                     {
                         continue;
                     }
@@ -13426,7 +13569,8 @@ async fn approve_treekem_join_request(
     let mut groups = state.named_groups.write().await;
     groups.insert(id.clone(), next.clone());
     drop(groups);
-    save_named_groups(&state).await;
+    // `persist_treekem_and_named_groups_atomic_with_info` already made this
+    // exact roster snapshot durable before the in-memory install above.
 
     let welcome_ref =
         stage_treekem_welcome(&state, &event_group_id, &requester_hex, treekem_welcome).await;
@@ -13536,7 +13680,12 @@ pub(in crate::server) async fn reject_join_request(
         (metadata_topic, event_group_id, requester_hex, commit)
     };
 
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::JoinRequestRejected {
@@ -13598,7 +13747,12 @@ pub(in crate::server) async fn cancel_join_request(
         (metadata_topic, event_group_id, requester_hex, commit)
     };
 
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     drop(membership_guard);
 
     let event = NamedGroupMetadataEvent::JoinRequestCancelled {
@@ -14060,7 +14214,12 @@ pub(in crate::server) async fn import_group_card(
             });
     }
     drop(groups);
-    save_named_groups(&state).await;
+    if !save_named_groups(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is not directory-durable",
+        );
+    }
     ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
 
     (
@@ -16328,8 +16487,12 @@ fn validate_relay_obligation_for_restart(
     info: &x0x::groups::GroupInfo,
     expected_group_id: &str,
     entry: &PredecessorRelayObligation,
+    expected_first_seen_ms: u64,
     now_ms: u64,
 ) -> Result<Option<PredecessorRelayObligation>, String> {
+    if entry.first_seen_ms != expected_first_seen_ms {
+        return Err("relay first-observation time does not match durable request".to_string());
+    }
     if entry
         .first_seen_ms
         .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
@@ -16382,6 +16545,93 @@ fn validate_relay_obligation_for_restart(
     validated.digest = derived_digest;
     validated.relay_targets = relay_targets;
     Ok(Some(validated))
+}
+
+/// Build the roster half of a pending listener admission without mutating
+/// shared state. Startup recovery must validate the complete request + relay
+/// candidate against governed bounds before either half is installed.
+fn build_listener_request_candidate_for_restart(
+    current: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    signer: AgentId,
+    envelope_bytes: &[u8],
+    first_seen_ms: u64,
+) -> Result<x0x::groups::GroupInfo, String> {
+    let NamedGroupMetadataEvent::JoinRequestCreated {
+        group_id,
+        request_id,
+        requester_agent_id,
+        message,
+        ts,
+        requester_kem_public_key_b64,
+        treekem_key_package_b64,
+        commit,
+    } = event
+    else {
+        return Err("listener admission journal is not JoinRequestCreated".to_string());
+    };
+    let commit = commit
+        .as_ref()
+        .ok_or_else(|| "listener admission journal has no state commit".to_string())?;
+    if hex::encode(signer.as_bytes()) != *requester_agent_id
+        || current.policy.admission != x0x::groups::GroupAdmission::RequestAccess
+        || current.has_active_member(requester_agent_id)
+        || current.is_banned(requester_agent_id)
+        || current.join_requests.values().any(|request| {
+            request.requester_agent_id == *requester_agent_id && request.is_pending()
+        })
+        || current.join_requests.contains_key(request_id)
+    {
+        return Err("listener admission journal request is not admissible".to_string());
+    }
+    apply_stateful_event_to_group(
+        current,
+        commit,
+        x0x::groups::ActionKind::NonMemberRequest,
+        |next| {
+            next.join_requests.insert(
+                request_id.clone(),
+                x0x::groups::JoinRequest {
+                    request_id: request_id.clone(),
+                    group_id: group_id.clone(),
+                    requester_agent_id: requester_agent_id.clone(),
+                    requester_user_id: None,
+                    requested_role: x0x::groups::GroupRole::Member,
+                    message: message.clone(),
+                    treekem_key_package_b64: treekem_key_package_b64.clone(),
+                    created_at: *ts,
+                    reviewed_at: None,
+                    reviewed_by: None,
+                    status: x0x::groups::JoinRequestStatus::Pending,
+                    predecessor_envelope_digest: Some(blake3::hash(envelope_bytes).into()),
+                    predecessor_first_seen_ms: Some(first_seen_ms),
+                },
+            );
+            if let Some(kem_b64) = requester_kem_public_key_b64.clone() {
+                next.members_v2
+                    .entry(requester_agent_id.clone())
+                    .and_modify(|member| member.kem_public_key_b64 = Some(kem_b64.clone()))
+                    .or_insert_with(|| x0x::groups::GroupMember {
+                        agent_id: requester_agent_id.clone(),
+                        user_id: None,
+                        role: x0x::groups::GroupRole::Member,
+                        state: x0x::groups::GroupMemberState::Pending,
+                        display_name: None,
+                        joined_at: *ts,
+                        updated_at: *ts,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: Some(kem_b64),
+                        treekem_key_package_b64: treekem_key_package_b64.clone(),
+                        treekem_key_package_hash: None,
+                    });
+            }
+            if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                next.set_member_treekem_key_package(requester_agent_id, kp_b64);
+            }
+        },
+    )
+    .map_err(|error| format!("listener admission journal commit is invalid: {error}"))
 }
 
 pub(in crate::server) async fn load_predecessor_relay_outbox(
@@ -16544,6 +16794,25 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 );
                 continue;
             }
+            // The roster stores the authority's original local observation
+            // time. Bind the sidecar clock to it so a modified sidecar—or an
+            // exact duplicate received after expiry—cannot extend retention.
+            let request_clock_matches =
+                info.join_requests
+                    .get(&entry.request_id)
+                    .is_some_and(|request| {
+                        request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(derived_digest.into())
+                            && request.predecessor_first_seen_ms == Some(entry.first_seen_ms)
+                    });
+            if !request_clock_matches {
+                tracing::warn!(
+                    group_id = %group_id,
+                    request_id = %entry.request_id,
+                    "ADR 0028: relay sidecar first-observation binding mismatch, dropping"
+                );
+                continue;
+            }
             // Finding 3 (Watson 32c2d3a): re-derive relay targets from
             // current active non-local witnesses. Do NOT trust the sidecar's
             // remaining-target list — deleting a still-required active witness
@@ -16598,12 +16867,60 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     // B6/R2/Fix3: load completed relay tombstones from the sidecar, pruning
     // expired entries and enforcing per-store daemon-wide count/byte caps
     // as a first-pass filter.
-    let mut tombstones = {
-        let now_ms = now_millis_u64();
-        let mut tombstones = loaded_sidecar.completed_tombstones;
-        prune_completed_tombstones_daemon(&mut tombstones, now_ms);
-        tombstones
-    };
+    let mut tombstones = HashMap::new();
+    for (group_id, entries) in loaded_sidecar.completed_tombstones {
+        let Some(info) = groups_view.get(&group_id) else {
+            continue;
+        };
+        if info.withdrawn {
+            continue;
+        }
+        let mut validated_receipts = Vec::new();
+        for receipt in entries {
+            let Some(expected_first_seen_ms) = info
+                .join_requests
+                .get(&receipt.request_id)
+                .and_then(|request| {
+                    (request.requester_agent_id == receipt.requester_agent_id
+                        && request.predecessor_envelope_digest == Some(receipt.digest))
+                    .then_some(request.predecessor_first_seen_ms)
+                    .flatten()
+                })
+            else {
+                continue;
+            };
+            let receipt_as_obligation = PredecessorRelayObligation {
+                envelope_bytes: receipt.envelope_bytes.clone(),
+                digest: receipt.digest,
+                byte_size: receipt.envelope_bytes.len(),
+                first_seen_ms: receipt.first_seen_ms,
+                next_retry_at_ms: receipt.completed_at_ms,
+                retry_count: 0,
+                group_id: receipt.group_id.clone(),
+                request_id: receipt.request_id.clone(),
+                requester_agent_id: receipt.requester_agent_id.clone(),
+                relay_targets: Vec::new(),
+                completed_at_ms: Some(receipt.completed_at_ms),
+            };
+            if matches!(
+                validate_relay_obligation_for_restart(
+                    state,
+                    info,
+                    &group_id,
+                    &receipt_as_obligation,
+                    expected_first_seen_ms,
+                    now_ms,
+                ),
+                Ok(Some(_))
+            ) {
+                validated_receipts.push(receipt);
+            }
+        }
+        if !validated_receipts.is_empty() {
+            tombstones.insert(group_id, validated_receipts);
+        }
+    }
+    prune_completed_tombstones_daemon(&mut tombstones, now_ms);
     // ADR 0028 finding E / Watson ruling: enforce ONE combined live+completed
     // relay budget. If live alone exceeds any cap, REJECT the whole sidecar:
     // install zero entries, leave the file unchanged, return an error so
@@ -16683,11 +17000,25 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 .ok_or_else(|| "B8 recovery journal references an unknown group".to_string())?;
             let mut restored = Vec::new();
             for entry in &journal.outbox_snapshot {
+                let expected_first_seen_ms = info
+                    .join_requests
+                    .get(&entry.request_id)
+                    .and_then(|request| {
+                        (request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(entry.digest))
+                        .then_some(request.predecessor_first_seen_ms)
+                        .flatten()
+                    })
+                    .ok_or_else(|| {
+                        "B8 recovery snapshot does not match a durable predecessor clock"
+                            .to_string()
+                    })?;
                 if let Some(entry) = validate_relay_obligation_for_restart(
                     state,
                     info,
                     &journal.group_id,
                     entry,
+                    expected_first_seen_ms,
                     now_ms,
                 )? {
                     restored.push(entry);
@@ -16753,6 +17084,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             info,
             &admission.group_id,
             &raw_obligation,
+            admission.first_seen_ms,
             now_ms,
         )?
         else {
@@ -16760,54 +17092,37 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
         };
         let (decoded_event, signer, _) = decode_and_verify_v2(&admission.envelope_bytes)
             .map_err(|reason| format!("listener journal verification failed: {reason}"))?;
-        let exact_request_status = {
-            let groups = state.named_groups.read().await;
-            groups.get(&admission.group_id).and_then(|group| {
-                group
-                    .join_requests
-                    .get(&admission.request_id)
-                    .and_then(|request| {
-                        if request.requester_agent_id == admission.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(admission.digest)
-                        {
-                            Some(request.status)
-                        } else {
-                            None
-                        }
-                    })
-            })
-        };
-        if exact_request_status.is_none() {
-            let request_id_is_occupied = {
-                let groups = state.named_groups.read().await;
-                groups
-                    .get(&admission.group_id)
-                    .is_some_and(|group| group.join_requests.contains_key(&admission.request_id))
-            };
+        let exact_request_status =
+            info.join_requests
+                .get(&admission.request_id)
+                .and_then(|request| {
+                    if request.requester_agent_id == admission.requester_agent_id
+                        && request.predecessor_envelope_digest == Some(admission.digest)
+                        && request.predecessor_first_seen_ms == Some(admission.first_seen_ms)
+                    {
+                        Some(request.status)
+                    } else {
+                        None
+                    }
+                });
+        let recovered_group = if exact_request_status.is_none() {
+            let request_id_is_occupied = info.join_requests.contains_key(&admission.request_id);
             if request_id_is_occupied {
                 return Err(
                     "listener admission journal conflicts with the durable request binding"
                         .to_string(),
                 );
             }
-            let mut replay_group_id = None;
-            let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
-                state,
-                decoded_event,
+            Some(build_listener_request_candidate_for_restart(
+                info,
+                &decoded_event,
                 signer,
-                true,
-                true,
-                Some(&admission.envelope_bytes),
-                &mut replay_group_id,
-                false,
-            ))
-            .await;
-            if !applied.accepted {
-                return Err(
-                    "listener admission recovery could not durably apply request".to_string(),
-                );
-            }
-        }
+                &admission.envelope_bytes,
+                admission.first_seen_ms,
+            )?)
+        } else {
+            None
+        };
         let exact_obligation_exists = outbox.get(&admission.group_id).is_some_and(|entries| {
             entries.iter().any(|entry| {
                 entry.group_id == admission.group_id
@@ -16825,19 +17140,16 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         && entry.digest == admission.digest
                 })
             });
-        let request_is_pending = {
-            let groups = state.named_groups.read().await;
-            groups.get(&admission.group_id).is_some_and(|group| {
-                group
-                    .join_requests
-                    .get(&admission.request_id)
-                    .is_some_and(|request| {
-                        request.requester_agent_id == admission.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(admission.digest)
-                            && request.is_pending()
-                    })
-            })
-        };
+        let request_candidate = recovered_group.as_ref().unwrap_or(info);
+        let request_is_pending = request_candidate
+            .join_requests
+            .get(&admission.request_id)
+            .is_some_and(|request| {
+                request.requester_agent_id == admission.requester_agent_id
+                    && request.predecessor_envelope_digest == Some(admission.digest)
+                    && request.predecessor_first_seen_ms == Some(admission.first_seen_ms)
+                    && request.is_pending()
+            });
         if !(request_is_pending || exact_obligation_exists || exact_completion_receipt_exists) {
             return Err(
                 "listener admission recovery found terminal request without predecessor receipt"
@@ -16865,6 +17177,29 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             return Err(
                 "listener admission recovery rejected: candidate exceeds governed caps".to_string(),
             );
+        }
+        // Only after the complete detached request+obligation candidate passes
+        // validation and all governed caps may startup install the roster half.
+        if let Some(recovered_group) = recovered_group {
+            let membership_lock = group_membership_lock(state, &admission.group_id).await;
+            let _membership_guard = membership_lock.lock().await;
+            let _roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
+            if !store_named_group_info(state, &admission.group_id, recovered_group).await {
+                return Err("listener admission recovery could not install request".to_string());
+            }
+            match save_named_groups_checked_unlocked(state).await {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    return Err(
+                        "listener request recovery is visible but not directory-durable"
+                            .to_string(),
+                    );
+                }
+                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                    store_named_group_info(state, &admission.group_id, info.clone()).await;
+                    return Err("listener request recovery was not persisted".to_string());
+                }
+            }
         }
         outbox = candidate_outbox;
         tombstones = candidate_tombstones;
@@ -16894,16 +17229,19 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     Ok(())
 }
 
-async fn save_named_groups(state: &AppState) {
+#[must_use]
+async fn save_named_groups(state: &AppState) -> bool {
     match save_named_groups_checked(state).await {
-        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::Durable) => true,
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             tracing::error!(
                 "named-groups replacement is visible but not directory-durable; success is withheld"
             );
+            false
         }
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
             tracing::error!("named-groups replacement did not occur");
+            false
         }
     }
 }
@@ -21529,7 +21867,7 @@ mod tests {
             .write()
             .await
             .insert(group_id.clone(), info);
-        save_named_groups(&state).await;
+        assert!(save_named_groups(&state).await);
 
         let forger = x0x::identity::AgentKeypair::generate()?;
         let (forger_id, forger_hex, forger_public_key_b64, forged_admin) =
@@ -21720,7 +22058,7 @@ mod tests {
             .write()
             .await
             .insert(group_id.clone(), current.clone());
-        save_named_groups(&state).await;
+        assert!(save_named_groups(&state).await);
 
         let added_member = "58".repeat(32);
         let mut next = current;
