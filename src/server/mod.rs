@@ -1404,6 +1404,7 @@ pub async fn serve_with_options(
                         Complete,
                         New,
                         Repair(u64),
+                        PubsubFirst,
                         Inconsistent,
                     }
 
@@ -1588,6 +1589,21 @@ pub async fn serve_with_options(
                                 AdmissionState::Repair(
                                     stored_first_seen_ms.unwrap_or_default(),
                                 )
+                            } else if *req_agent == requester_agent_id
+                                && *stored_digest == Some(digest_bytes)
+                                && stored_first_seen_ms.is_none()
+                                && *is_pending
+                                && !predecessor_receipt_exists
+                            {
+                                // Pubsub-first partial state: the metadata
+                                // topic delivered JoinRequestCreated before
+                                // this direct envelope offer. The pubsub path
+                                // stored the byte-identical predecessor digest
+                                // but did not persist the first-seen clock. The
+                                // direct delivery carries the exact envelope;
+                                // admit by backfilling only the clock, not by
+                                // treating the request as inconsistent.
+                                AdmissionState::PubsubFirst
                             } else {
                                 AdmissionState::Inconsistent
                             }
@@ -1653,7 +1669,7 @@ pub async fn serve_with_options(
                             tracing::warn!(
                                 group_id = %group_id_str,
                                 request_id = %request_id,
-                                "ADR 0028: inconsistent durable state — request exists but obligation absent with mismatched digest/requester"
+                                "ADR 0028: inconsistent durable state — request does not match this envelope binding"
                             );
                             replay_after = None;
                             break 'admission false;
@@ -1740,6 +1756,83 @@ pub async fn serve_with_options(
                                         group_id = %group_id_str,
                                         request_id = %request_id,
                                         "ADR 0028: listener repair could not make the roster directory-durable"
+                                    );
+                                    break 'admission true;
+                                }
+                            }
+                            is_new_request = false;
+                        }
+                        AdmissionState::PubsubFirst => {
+                            // The request was applied by the pubsub listener,
+                            // which stored the byte-identical predecessor
+                            // digest but did not persist the first-seen clock.
+                            // This direct delivery carries the exact envelope;
+                            // backfill only the clock, then create the
+                            // obligation.
+                            admission_first_seen_ms = existing_admission
+                                .as_ref()
+                                .map_or(now_ms, |marker| marker.first_seen_ms);
+                            let admission = PendingListenerAdmission {
+                                group_id: group_id_str.clone(),
+                                request_id: request_id.clone(),
+                                requester_agent_id: requester_agent_id.clone(),
+                                envelope_bytes: envelope_bytes.to_vec(),
+                                digest: digest_bytes,
+                                byte_size,
+                                first_seen_ms: admission_first_seen_ms,
+                            };
+                            if !marker_matches_event {
+                                *relay_state.pending_listener_admission.lock().await =
+                                    Some(admission);
+                                let _journal_guard = relay_state
+                                    .predecessor_relay_outbox_persistence_lock
+                                    .lock()
+                                    .await;
+                                match save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                                    Ok(AtomicWriteOutcome::Durable) => {}
+                                    _ => {
+                                        tracing::error!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: pubsub-first admission journal save not durable — not proceeding"
+                                        );
+                                        break 'admission true;
+                                    }
+                                }
+                            }
+                            // Backfill only the first-seen clock — the digest
+                            // is already byte-identical from the pubsub path.
+                            // Hold the roster persistence lock across mutation
+                            // + save so a concurrent writer cannot snapshot
+                            // the pre-backfill state.
+                            let _roster_persistence_guard = relay_state
+                                .named_groups_persistence_lock
+                                .lock()
+                                .await;
+                            {
+                                let mut groups = relay_state.named_groups.write().await;
+                                if let Some(info) = groups.get_mut(&group_id_str) {
+                                    if let Some(request) =
+                                        info.join_requests.get_mut(&request_id)
+                                    {
+                                        if request.requester_agent_id == requester_agent_id
+                                            && request.is_pending()
+                                            && request.predecessor_envelope_digest
+                                                == Some(digest_bytes)
+                                            && request.predecessor_first_seen_ms.is_none()
+                                        {
+                                            request.predecessor_first_seen_ms =
+                                                Some(admission_first_seen_ms);
+                                        }
+                                    }
+                                }
+                            }
+                            match save_named_groups_checked_unlocked(&relay_state).await {
+                                Ok(AtomicWriteOutcome::Durable) => {}
+                                _ => {
+                                    tracing::error!(
+                                        group_id = %group_id_str,
+                                        request_id = %request_id,
+                                        "ADR 0028: pubsub-first roster clock backfill not directory-durable — not proceeding"
                                     );
                                     break 'admission true;
                                 }
