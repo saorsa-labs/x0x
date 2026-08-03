@@ -18925,6 +18925,7 @@ mod tests {
     use axum::response::Response;
     use tokio::sync::{broadcast, mpsc, watch};
 
+    mod adr0028_direct_controls;
     mod cache_hardening_followup;
 
     fn fake_group_state_commit(
