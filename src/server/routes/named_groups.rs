@@ -18964,6 +18964,7 @@ mod tests {
     mod adr0028_row6_recovery_controls;
     mod adr0028_sidecar_recovery_controls;
     mod cache_hardening_followup;
+    mod pr291_restart_marker_matrix;
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,
