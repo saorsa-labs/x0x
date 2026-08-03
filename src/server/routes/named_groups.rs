@@ -18928,6 +18928,8 @@ mod tests {
     mod adr0028_direct_controls;
     mod cache_hardening_followup;
     mod adr0028_restart_disposition;
+    mod adr0028_sidecar_recovery_controls;
+    mod adr0028_roster_replay_controls;
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,
