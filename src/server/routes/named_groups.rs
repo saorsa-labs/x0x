@@ -16493,13 +16493,6 @@ fn validate_relay_obligation_for_restart(
     if entry.first_seen_ms != expected_first_seen_ms {
         return Err("relay first-observation time does not match durable request".to_string());
     }
-    if entry
-        .first_seen_ms
-        .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
-        <= now_ms
-    {
-        return Ok(None);
-    }
     let derived_byte_size = entry.envelope_bytes.len();
     if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
         return Err("relay envelope exceeds the semantic byte cap".to_string());
@@ -16531,6 +16524,17 @@ fn validate_relay_obligation_for_restart(
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     if info.withdrawn || hex::encode(info.creator.as_bytes()) != local_agent_hex {
         return Err("local agent is not the active group authority".to_string());
+    }
+    // Authenticate legacy evidence before applying expiry. During an upgrade
+    // from the parent schema, the roster has no first-observation field yet;
+    // even an already-expired proof must be verified so its ORIGINAL clock can
+    // be migrated without minting a fresh window from upgrade/redelivery time.
+    if entry
+        .first_seen_ms
+        .saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+        <= now_ms
+    {
+        return Ok(None);
     }
     let relay_targets = info
         .members_v2
@@ -16681,10 +16685,236 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     }
     let now_ms = now_millis_u64();
     let mut outbox = HashMap::new();
-    let groups_view: HashMap<String, x0x::groups::GroupInfo> = {
+    let mut groups_view: HashMap<String, x0x::groups::GroupInfo> = {
         let groups = state.named_groups.read().await;
         groups.clone()
     };
+
+    // Upgrade migration for the durable first-observation clock introduced by
+    // ADR 0028. Parent-lineage roster records deserialize the new field as
+    // None, while their version-1 relay sidecar still carries the ORIGINAL
+    // first_seen_ms. Authenticate that exact live/terminal proof before using
+    // its local clock, reject conflicting clocks for one request binding, and
+    // durably backfill the roster before any API/listener advertisement. Never
+    // derive this value from `now_ms` or from a later duplicate delivery.
+    let original_groups_view = groups_view.clone();
+    let mut legacy_clocks: HashMap<(String, String, String, [u8; 32]), u64> = HashMap::new();
+    for (group_id, entries) in &loaded_sidecar.entries {
+        let Some(info) = groups_view.get(group_id) else {
+            continue;
+        };
+        for entry in entries {
+            let request_needs_migration =
+                info.join_requests
+                    .get(&entry.request_id)
+                    .is_some_and(|request| {
+                        request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(entry.digest)
+                            && request.predecessor_first_seen_ms.is_none()
+                    });
+            if !request_needs_migration
+                || validate_relay_obligation_for_restart(
+                    state,
+                    info,
+                    group_id,
+                    entry,
+                    entry.first_seen_ms,
+                    now_ms,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let key = (
+                group_id.clone(),
+                entry.request_id.clone(),
+                entry.requester_agent_id.clone(),
+                entry.digest,
+            );
+            if legacy_clocks
+                .get(&key)
+                .is_some_and(|existing| *existing != entry.first_seen_ms)
+            {
+                return Err(
+                    "legacy relay sidecar contains conflicting first-observation clocks"
+                        .to_string(),
+                );
+            }
+            legacy_clocks.entry(key).or_insert(entry.first_seen_ms);
+        }
+    }
+    for (group_id, receipts) in &loaded_sidecar.completed_tombstones {
+        let Some(info) = groups_view.get(group_id) else {
+            continue;
+        };
+        for receipt in receipts {
+            let request_needs_migration =
+                info.join_requests
+                    .get(&receipt.request_id)
+                    .is_some_and(|request| {
+                        request.requester_agent_id == receipt.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(receipt.digest)
+                            && request.predecessor_first_seen_ms.is_none()
+                    });
+            if !request_needs_migration {
+                continue;
+            }
+            let evidence = PredecessorRelayObligation {
+                envelope_bytes: receipt.envelope_bytes.clone(),
+                digest: receipt.digest,
+                byte_size: receipt.envelope_bytes.len(),
+                first_seen_ms: receipt.first_seen_ms,
+                next_retry_at_ms: receipt.completed_at_ms,
+                retry_count: 0,
+                group_id: receipt.group_id.clone(),
+                request_id: receipt.request_id.clone(),
+                requester_agent_id: receipt.requester_agent_id.clone(),
+                relay_targets: Vec::new(),
+                completed_at_ms: Some(receipt.completed_at_ms),
+            };
+            if validate_relay_obligation_for_restart(
+                state,
+                info,
+                group_id,
+                &evidence,
+                receipt.first_seen_ms,
+                now_ms,
+            )
+            .is_err()
+            {
+                continue;
+            }
+            let key = (
+                group_id.clone(),
+                receipt.request_id.clone(),
+                receipt.requester_agent_id.clone(),
+                receipt.digest,
+            );
+            if legacy_clocks
+                .get(&key)
+                .is_some_and(|existing| *existing != receipt.first_seen_ms)
+            {
+                return Err(
+                    "legacy relay sidecar contains conflicting first-observation clocks"
+                        .to_string(),
+                );
+            }
+            legacy_clocks.entry(key).or_insert(receipt.first_seen_ms);
+        }
+    }
+    if let Some(admission) = &loaded_sidecar.pending_listener_admission {
+        if let Some(info) = groups_view.get(&admission.group_id) {
+            let request_needs_migration = info
+                .join_requests
+                .get(&admission.request_id)
+                .is_some_and(|request| {
+                    request.requester_agent_id == admission.requester_agent_id
+                        && request.predecessor_envelope_digest == Some(admission.digest)
+                        && request.predecessor_first_seen_ms.is_none()
+                });
+            let evidence = PredecessorRelayObligation {
+                envelope_bytes: admission.envelope_bytes.clone(),
+                digest: admission.digest,
+                byte_size: admission.envelope_bytes.len(),
+                first_seen_ms: admission.first_seen_ms,
+                next_retry_at_ms: admission.first_seen_ms,
+                retry_count: 0,
+                group_id: admission.group_id.clone(),
+                request_id: admission.request_id.clone(),
+                requester_agent_id: admission.requester_agent_id.clone(),
+                relay_targets: Vec::new(),
+                completed_at_ms: None,
+            };
+            if request_needs_migration
+                && validate_relay_obligation_for_restart(
+                    state,
+                    info,
+                    &admission.group_id,
+                    &evidence,
+                    admission.first_seen_ms,
+                    now_ms,
+                )
+                .is_ok()
+            {
+                let key = (
+                    admission.group_id.clone(),
+                    admission.request_id.clone(),
+                    admission.requester_agent_id.clone(),
+                    admission.digest,
+                );
+                if legacy_clocks
+                    .get(&key)
+                    .is_some_and(|existing| *existing != admission.first_seen_ms)
+                {
+                    return Err(
+                        "legacy relay sidecar contains conflicting first-observation clocks"
+                            .to_string(),
+                    );
+                }
+                legacy_clocks.entry(key).or_insert(admission.first_seen_ms);
+            }
+        }
+    }
+    if let Some(compensation) = &loaded_sidecar.pending_compensation {
+        for entry in &compensation.outbox_snapshot {
+            let Some(info) = groups_view.get(&entry.group_id) else {
+                continue;
+            };
+            let request_needs_migration =
+                info.join_requests
+                    .get(&entry.request_id)
+                    .is_some_and(|request| {
+                        request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(entry.digest)
+                            && request.predecessor_first_seen_ms.is_none()
+                    });
+            if !request_needs_migration
+                || validate_relay_obligation_for_restart(
+                    state,
+                    info,
+                    &entry.group_id,
+                    entry,
+                    entry.first_seen_ms,
+                    now_ms,
+                )
+                .is_err()
+            {
+                continue;
+            }
+            let key = (
+                entry.group_id.clone(),
+                entry.request_id.clone(),
+                entry.requester_agent_id.clone(),
+                entry.digest,
+            );
+            if legacy_clocks
+                .get(&key)
+                .is_some_and(|existing| *existing != entry.first_seen_ms)
+            {
+                return Err(
+                    "legacy relay sidecar contains conflicting first-observation clocks"
+                        .to_string(),
+                );
+            }
+            legacy_clocks.entry(key).or_insert(entry.first_seen_ms);
+        }
+    }
+    let mut migrated_legacy_clock = false;
+    for ((group_id, request_id, requester_agent_id, digest), first_seen_ms) in legacy_clocks {
+        let Some(request) = groups_view
+            .get_mut(&group_id)
+            .and_then(|info| info.join_requests.get_mut(&request_id))
+        else {
+            continue;
+        };
+        if request.requester_agent_id == requester_agent_id
+            && request.predecessor_envelope_digest == Some(digest)
+            && request.predecessor_first_seen_ms.is_none()
+        {
+            request.predecessor_first_seen_ms = Some(first_seen_ms);
+            migrated_legacy_clock = true;
+        }
+    }
     for (group_id, entries) in loaded_sidecar.entries {
         // Drop unknown or withdrawn groups (Kimi blocker 9).
         let Some(info) = groups_view.get(&group_id) else {
@@ -16957,6 +17187,25 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             "predecessor relay outbox sidecar rejected: live relay targets exceed daemon cap"
                 .to_string(),
         );
+    }
+    // The authenticated legacy proof and complete ordinary relay candidate
+    // have now passed all governed caps. Persist the detached roster-clock
+    // migration before processing recovery journals or advertising service.
+    if migrated_legacy_clock {
+        let _roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
+        *state.named_groups.write().await = groups_view.clone();
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Err(
+                    "legacy relay-clock migration is visible but not directory-durable".to_string(),
+                );
+            }
+            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                *state.named_groups.write().await = original_groups_view;
+                return Err("legacy relay-clock migration was not persisted".to_string());
+            }
+        }
     }
     let mut pending_compensation = loaded_sidecar.pending_compensation.clone();
     let mut pending_listener_admission = loaded_sidecar.pending_listener_admission.clone();
