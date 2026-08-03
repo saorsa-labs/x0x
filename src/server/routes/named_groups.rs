@@ -21828,11 +21828,8 @@ mod tests {
         );
         let witness_kem_b64 =
             BASE64.encode(&x0x::groups::kem_envelope::AgentKemKeypair::generate()?.public_bytes);
-        let requester_hex = hex::encode(
-            crate::identity::AgentKeypair::generate()?
-                .agent_id()
-                .as_bytes(),
-        );
+        let requester_kp = crate::identity::AgentKeypair::generate()?;
+        let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
 
         let group_id = "approve-delivery-local".to_string();
         let stable_group_id = "approve-delivery-stable".to_string();
@@ -21873,6 +21870,14 @@ mod tests {
             .write()
             .await
             .insert(group_id.clone(), info);
+
+        adr0028_direct_controls::offer_predecessor_obligation_via_real_path(
+            &state,
+            &group_id,
+            &request_id,
+            &requester_kp,
+        )
+        .await;
 
         // Positive precondition: GSS plane, so the TreeKem dispatch at the top
         // of approve_join_request cannot fire and the non-TreeKEM path (the one
