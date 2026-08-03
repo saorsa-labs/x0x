@@ -13315,21 +13315,6 @@ pub(in crate::server) async fn approve_join_request(
     // durable across both failure orders.
     // R4: hold the persistence lock from mutation through durable write.
     {
-        // Candidate construction is deliberately detached from persistence.
-        // Recheck immediately before creating the durable journal so an
-        // authorization that crossed the boundary meanwhile cannot begin the
-        // two-file transaction.
-        if predecessor_first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
-            <= now_millis_u64()
-        {
-            if let Some(info) = state.named_groups.write().await.get_mut(&id) {
-                *info = pre_mutation_snapshot;
-            }
-            return api_error(
-                StatusCode::PRECONDITION_FAILED,
-                "predecessor obligation expired before approval persistence",
-            );
-        }
         let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
         let post_approval_targets: Vec<String> = {
             let groups = state.named_groups.read().await;
@@ -13349,20 +13334,55 @@ pub(in crate::server) async fn approve_join_request(
         };
         // B8 atomicity: snapshot the outbox for this group before mutation
         // so we can roll back the refresh on either persist failure.
-        let outbox_snapshot = {
-            let outbox = state.predecessor_relay_outbox.read().await;
-            outbox.get(&id).cloned().unwrap_or_default()
-        };
+        let outbox = state.predecessor_relay_outbox.read().await;
+        let outbox_snapshot = outbox.get(&id).cloned().unwrap_or_default();
+        let tombstones = state.completed_relay_tombstones.read().await;
         // Fix 5: set the B8 journal BEFORE mutating the outbox, so the
         // pre-refresh snapshot is captured in the journal and will be
-        // persisted alongside the outbox refresh.
+        // persisted alongside the outbox refresh. The final proof-presence
+        // and expiry check and the journal installation form one synchronous
+        // linearization section: every potentially suspending read/mutex
+        // acquisition has already completed before the clock is sampled.
         {
             let mut pending = state.pending_b8_compensation.lock().await;
+            let authorization_now_ms = now_millis_u64();
+            let proof_is_still_present = outbox.get(&id).is_some_and(|obligations| {
+                obligations.iter().any(|obligation| {
+                    obligation.group_id == id
+                        && obligation.request_id == request_id
+                        && obligation.requester_agent_id == requester_hex
+                        && obligation.first_seen_ms == predecessor_first_seen_ms
+                        && obligation.digest == validated_digest
+                })
+            }) || tombstones.get(&id).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.group_id == id
+                        && entry.request_id == request_id
+                        && entry.requester_agent_id == requester_hex
+                        && entry.first_seen_ms == predecessor_first_seen_ms
+                        && entry.digest == validated_digest
+                })
+            });
+            if !proof_is_still_present
+                || predecessor_first_seen_ms.saturating_add(CAUSAL_APPROVAL_RETENTION_MS)
+                    <= authorization_now_ms
+            {
+                drop(pending);
+                drop(tombstones);
+                drop(outbox);
+                if let Some(info) = state.named_groups.write().await.get_mut(&id) {
+                    *info = pre_mutation_snapshot;
+                }
+                return api_error(
+                    StatusCode::PRECONDITION_FAILED,
+                    "predecessor obligation expired or disappeared before approval persistence",
+                );
+            }
             *pending = Some(PendingB8Compensation {
                 group_id: id.clone(),
                 request_id: request_id.clone(),
                 outbox_snapshot: outbox_snapshot.clone(),
-                timestamp_ms: now_ms,
+                timestamp_ms: authorization_now_ms,
                 requester_agent_id: requester_hex.clone(),
                 actor: caller_hex.clone(),
                 predecessor_digest: validated_digest,
@@ -13370,6 +13390,8 @@ pub(in crate::server) async fn approve_join_request(
                 approved_state_hash: commit.state_hash.clone(),
             });
         }
+        drop(tombstones);
+        drop(outbox);
         {
             let mut outbox = state.predecessor_relay_outbox.write().await;
             if let Some(obligations) = outbox.get_mut(&id) {
