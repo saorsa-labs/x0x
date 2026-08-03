@@ -4812,6 +4812,8 @@ async fn try_queue_causal_approval(
                 tracing::error!(
                     "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
                 );
+                // Watson ruling: Err means NotReplaced. ReplacedNotDurable is
+                // Ok(outcome) — data IS on disk, no rollback needed.
                 // Finding 3 (Sam 4ea68a9): restore the FULL tombstone map
                 // (pre-prune state) so pre-existing receipts evicted during
                 // pruning are not lost. Then remove only the newly-inserted
@@ -4881,18 +4883,22 @@ async fn try_queue_causal_approval(
         // back the in-memory admission so memory and disk stay consistent.
         // Persistence lock is already held (P→Q) — use the unlocked save.
         let save_result = save_causal_approval_queue_unlocked(state).await;
-        if let Err(e) = save_result {
-            tracing::error!(
+        match save_result {
+            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+            _ => {
+                let e = std::io::Error::other("not replaced or pre-rename failure");
+                tracing::error!(
                 "ADR 0028: causal approval queue save failed after admission, rolling back: {e}"
             );
-            let mut queue_lock = state.causal_approval_queue.write().await;
-            if let Some(queue) = queue_lock.get_mut(group_id) {
-                queue.retain(|q| q.digest != digest_bytes);
+                let mut queue_lock = state.causal_approval_queue.write().await;
+                if let Some(queue) = queue_lock.get_mut(group_id) {
+                    queue.retain(|q| q.digest != digest_bytes);
+                }
+                state
+                    .groups_diagnostics
+                    .record_causal_capacity_rejected(group_id);
+                return;
             }
-            state
-                .groups_diagnostics
-                .record_causal_capacity_rejected(group_id);
-            return;
         }
     }
 
@@ -8264,18 +8270,29 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         }
         if pruned {
             // Persistence lock is already held (P→Q) — use unlocked save.
-            if let Err(e) = save_predecessor_relay_outbox_unlocked(state).await {
-                tracing::error!(
-                    "ADR 0028 B6: failed to persist pruned outbox (no-due path), rolling back: {e}"
-                );
-                // Rollback: restore the full pre-prune state for both stores.
-                {
-                    let mut outbox = state.predecessor_relay_outbox.write().await;
-                    *outbox = outbox_snapshot;
+            match save_predecessor_relay_outbox_unlocked(state).await {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    tracing::warn!(
+                        "ADR 0028 B6: pruned outbox replaced but not directory-durable (no-due path)"
+                    );
+                    // Data IS on disk; memory matches. No further action needed
+                    // — the relay step doesn't publish after this path.
                 }
-                {
-                    let mut tombstones = state.completed_relay_tombstones.write().await;
-                    *tombstones = tombstones_snapshot;
+                _ => {
+                    let e = std::io::Error::other("not replaced or pre-rename failure");
+                    tracing::error!(
+                        "ADR 0028 B6: failed to persist pruned outbox (no-due path), rolling back: {e}"
+                    );
+                    // Rollback: restore the full pre-prune state for both stores.
+                    {
+                        let mut outbox = state.predecessor_relay_outbox.write().await;
+                        *outbox = outbox_snapshot;
+                    }
+                    {
+                        let mut tombstones = state.completed_relay_tombstones.write().await;
+                        *tombstones = tombstones_snapshot;
+                    }
                 }
             }
         }
@@ -8446,22 +8463,26 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     // Persistence lock is already held (P→Q) — use the unlocked save.
     let save_result = save_predecessor_relay_outbox_unlocked(state).await;
 
-    if let Err(e) = save_result {
-        tracing::error!(
-            "ADR 0028 B6: failed to persist relay outbox after relay step, rolling back: {e}"
-        );
-        // Full-state rollback: restore ALL groups' obligations and tombstones
-        // from the pre-mutation snapshot. Pruning ran across all groups, so
-        // a narrow restore would lose unrelated pruned state.
-        {
-            let mut outbox = state.predecessor_relay_outbox.write().await;
-            *outbox = outbox_snapshot;
+    match save_result {
+        Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+        _ => {
+            let e = std::io::Error::other("not replaced or pre-rename failure");
+            tracing::error!(
+                "ADR 0028 B6: failed to persist relay outbox after relay step, rolling back: {e}"
+            );
+            // Full-state rollback: restore ALL groups' obligations and tombstones
+            // from the pre-mutation snapshot. Pruning ran across all groups, so
+            // a narrow restore would lose unrelated pruned state.
+            {
+                let mut outbox = state.predecessor_relay_outbox.write().await;
+                *outbox = outbox_snapshot;
+            }
+            {
+                let mut tombstones = state.completed_relay_tombstones.write().await;
+                *tombstones = tombstones_snapshot;
+            }
+            return;
         }
-        {
-            let mut tombstones = state.completed_relay_tombstones.write().await;
-            *tombstones = tombstones_snapshot;
-        }
-        return;
     }
 
     // B6: persistence succeeded — NOW count record_causal_relayed for each
@@ -12909,28 +12930,44 @@ pub(in crate::server) async fn approve_join_request(
         }
         // Persistence lock is already held (P→Q) — use the unlocked save.
         let outbox_save_result = save_predecessor_relay_outbox_unlocked(&state).await;
-        if let Err(e) = outbox_save_result {
-            // B8 atomicity: roll back BOTH the outbox refresh AND the roster.
-            // Clear the journal since the outbox save failed (nothing durable).
-            {
-                *state.pending_b8_compensation.lock().await = None;
+        match outbox_save_result {
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                // Watson ruling: data IS on disk but not dir-fsync'd.
+                // Block publication — do not proceed to dependent delivery.
+                tracing::error!(
+                    group_id = %LogHexId::group(&id),
+                    "ADR 0028 B8: outbox replaced but not directory-durable — blocking publication"
+                );
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "outbox replaced but not directory-durable — approval not published",
+                );
             }
-            {
-                let mut outbox = state.predecessor_relay_outbox.write().await;
-                outbox.insert(id.clone(), outbox_snapshot);
+            _ => {
+                let e = std::io::Error::other("not replaced or pre-rename failure");
+                // B8 atomicity: roll back BOTH the outbox refresh AND the roster.
+                // Clear the journal since the outbox save failed (nothing durable).
+                {
+                    *state.pending_b8_compensation.lock().await = None;
+                }
+                {
+                    let mut outbox = state.predecessor_relay_outbox.write().await;
+                    outbox.insert(id.clone(), outbox_snapshot);
+                }
+                let mut groups = state.named_groups.write().await;
+                if let Some(info) = groups.get_mut(&id) {
+                    *info = pre_mutation_snapshot;
+                }
+                tracing::error!(
+                    group_id = %LogHexId::group(&id),
+                    "ADR 0028 B8: failed to persist refreshed predecessor outbox before publication: {e}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to persist refreshed predecessor outbox — approval not published",
+                );
             }
-            let mut groups = state.named_groups.write().await;
-            if let Some(info) = groups.get_mut(&id) {
-                *info = pre_mutation_snapshot;
-            }
-            tracing::error!(
-                group_id = %LogHexId::group(&id),
-                "ADR 0028 B8: failed to persist refreshed predecessor outbox before publication: {e}"
-            );
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to persist refreshed predecessor outbox — approval not published",
-            );
         }
 
         // B8: roster persistence AFTER outbox persistence succeeded. Use the
@@ -12939,40 +12976,59 @@ pub(in crate::server) async fn approve_join_request(
         // outbox change. Fix 5: the journal is already durable from the
         // outbox save above, so if the compensating re-save also fails, the
         // restart loader can recover using the journal.
-        if let Err(e) = save_named_groups_checked(&state).await {
-            // Watson ruling: Err means NotReplaced (rename never happened).
-            // ReplacedNotDurable is Ok(outcome) — handled separately below.
-            // B8 atomicity: roll back the outbox refresh in memory.
-            {
-                let mut outbox = state.predecessor_relay_outbox.write().await;
-                outbox.insert(id.clone(), outbox_snapshot);
-            }
-            // Clear the journal — we're about to re-save without it.
-            {
-                *state.pending_b8_compensation.lock().await = None;
-            }
-            // Durably undo the outbox refresh. If this fails, the journal
-            // from the first outbox save is still durable and the restart
-            // loader will restore the outbox from the journal snapshot.
-            // Persistence lock is still held (P→Q) — use unlocked save.
-            if let Err(undo_e) = save_predecessor_relay_outbox_unlocked(&state).await {
+        match save_named_groups_checked(&state).await {
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                // Watson ruling: roster IS on disk but not dir-fsync'd.
+                // Block publication.
                 tracing::error!(
                     group_id = %LogHexId::group(&id),
-                    "ADR 0028 B8: compensating outbox re-save failed (journal was durable from first save): {undo_e}"
+                    "ADR 0028 B8: roster replaced but not directory-durable — blocking publication"
+                );
+                return api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "roster replaced but not directory-durable — approval not published",
                 );
             }
-            let mut groups = state.named_groups.write().await;
-            if let Some(info) = groups.get_mut(&id) {
-                *info = pre_mutation_snapshot;
+            _ => {
+                let e = std::io::Error::other("not replaced or pre-rename failure");
+                // B8 atomicity: roll back the outbox refresh in memory.
+                {
+                    let mut outbox = state.predecessor_relay_outbox.write().await;
+                    outbox.insert(id.clone(), outbox_snapshot);
+                }
+                // Clear the journal — we're about to re-save without it.
+                {
+                    *state.pending_b8_compensation.lock().await = None;
+                }
+                // Durably undo the outbox refresh. If this fails, the journal
+                // from the first outbox save is still durable and the restart
+                // loader will restore the outbox from the journal snapshot.
+                // Persistence lock is still held (P→Q) — use unlocked save.
+                match save_predecessor_relay_outbox_unlocked(&state).await {
+                    Ok(AtomicWriteOutcome::Durable)
+                    | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+                    _ => {
+                        let undo_e = std::io::Error::other("not replaced or pre-rename failure");
+                        tracing::error!(
+                            group_id = %LogHexId::group(&id),
+                            "ADR 0028 B8: compensating outbox re-save failed (journal was durable from first save): {undo_e}"
+                        );
+                    }
+                }
+                let mut groups = state.named_groups.write().await;
+                if let Some(info) = groups.get_mut(&id) {
+                    *info = pre_mutation_snapshot;
+                }
+                tracing::error!(
+                    group_id = %LogHexId::group(&id),
+                    "ADR 0028 B8: failed to persist roster after outbox refresh: {e}"
+                );
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "failed to persist roster — approval not published",
+                );
             }
-            tracing::error!(
-                group_id = %LogHexId::group(&id),
-                "ADR 0028 B8: failed to persist roster after outbox refresh: {e}"
-            );
-            return api_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "failed to persist roster — approval not published",
-            );
         }
         // Both saves succeeded — clear the journal in memory. The next
         // regular outbox save will clear it durably. If a crash happens
@@ -15505,29 +15561,32 @@ fn serialize_causal_queue_sidecar(
 /// `first_seen_ms`). Called at restart after loading both stores. The
 /// per-store caps applied during loading are first-pass filters; this
 /// function ensures the combined total never exceeds the accepted budget.
+/// Returns `true` if within all governed bounds after shedding completed
+/// receipts, `false` if live state alone exceeds any cap (reject-whole-sidecar
+/// signal per Watson ruling).
 fn enforce_combined_relay_budget(
     outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
     tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
-) {
+) -> bool {
     // Finding C: never evict a live obligation to make room for a completed
     // receipt. Completed receipts may be shed oldest-first; live obligations
     // are only removed by their own lifecycle (relay success, expiry, or
     // explicit cancel).
     //
-    // Finding 4 (Sam 6664f60): the governed rule is "never evict a live
-    // entry and report success" (groups-join-roster-propagation.md:137-39).
-    // If live state alone exceeds a bound, we do NOT truncate live and
-    // proceed — we clear completed and log an error. The over-budget live
-    // state is retained (it cannot be silently dropped), and the operator
-    // is alerted. This is the correct "fail closed" for live state: the
-    // state is not silently bounded, it is surfaced.
+    // Finding 4 (Sam 6664f60) / Watson ruling: the governed rule is "never
+    // evict a live entry and report success." If live state alone exceeds a
+    // bound, we do NOT truncate live and proceed. We clear completed, log
+    // the error, and return `false` so the caller rejects the whole sidecar
+    // (installs zero, propagates startup error).
+
+    let mut live_over_budget = false;
 
     // ── Combined count cap ─────────────────────────────────────────────
     let live_count: usize = outbox.values().flatten().count();
     let completed_count: usize = tombstones.values().flatten().count();
     let total_count = live_count + completed_count;
     if total_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
-        if live_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+        if live_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
             // Finding 4 (Sam 6664f60): never evict live. Clear completed,
             // log the error, retain the over-budget live set. The operator
             // is alerted; the live state is not silently dropped.
@@ -15537,6 +15596,7 @@ fn enforce_combined_relay_budget(
                 "ADR 0028: live obligations alone exceed daemon count cap — retaining live, clearing completed (never evict live)"
             );
             tombstones.clear();
+            live_over_budget = true;
         } else {
             // Shed completed receipts oldest-first until within budget.
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP - live_count;
@@ -15579,7 +15639,7 @@ fn enforce_combined_relay_budget(
         .sum::<usize>();
     let total_bytes = live_bytes + completed_bytes;
     if total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
-        if live_bytes >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+        if live_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
             // Finding 4 (Sam 6664f60): never evict live. Clear completed,
             // log the error, retain the over-budget live set.
             tracing::error!(
@@ -15588,6 +15648,7 @@ fn enforce_combined_relay_budget(
                 "ADR 0028: live obligations alone exceed daemon byte cap — retaining live, clearing completed (never evict live)"
             );
             tombstones.clear();
+            live_over_budget = true;
         } else {
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP - live_bytes;
             let mut all_completed: Vec<(String, u64, usize, usize)> = Vec::new();
@@ -15639,6 +15700,7 @@ fn enforce_combined_relay_budget(
                     "ADR 0028: per-group live count exceeds cap — retaining live, clearing completed (never evict live)"
                 );
                 tombstones.remove(&gid);
+                live_over_budget = true;
             } else {
                 let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP.saturating_sub(live_n);
                 if let Some(list) = tombstones.get_mut(&gid) {
@@ -15675,6 +15737,7 @@ fn enforce_combined_relay_budget(
                     "ADR 0028: per-group live bytes exceed cap — retaining live, clearing completed (never evict live)"
                 );
                 tombstones.remove(&gid);
+                live_over_budget = true;
             } else {
                 let budget_for_completed =
                     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP.saturating_sub(live_bytes);
@@ -15690,6 +15753,8 @@ fn enforce_combined_relay_budget(
             tombstones.retain(|_, list| !list.is_empty());
         }
     }
+
+    !live_over_budget
 }
 
 /// ADR 0028 R4: Write the causal approval queue sidecar JSON to disk. No data
@@ -15824,12 +15889,12 @@ fn sync_parent_dir_for_path(path: &FsPath) -> std::io::Result<()> {
 /// Cap-before-allocation: checks file size before deserializing. Derives
 /// byte_size and digest from the actual envelope bytes (not stored fields).
 /// Drops entries for unknown or withdrawn groups (Kimi blocker 9).
-pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
+pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> Result<(), String> {
     let path = &state.causal_approval_queue_path;
     // Cap-before-allocation: check file size before reading (Kimi blocker 9).
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return, // no sidecar yet — fresh start
+        Err(_) => return Ok(()), // no sidecar yet — fresh start
     };
     let file_size = metadata.len() as usize;
     if file_size > QUEUE_SIDECAR_FILE_SIZE_CAP {
@@ -15838,26 +15903,26 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             cap = QUEUE_SIDECAR_FILE_SIZE_CAP,
             "causal approval queue sidecar exceeds derived file-size cap, ignoring"
         );
-        return;
+        return Ok(());
     }
     let Ok(bytes) = tokio::fs::read(path).await else {
-        return;
+        return Ok(());
     };
     let Ok(json_str) = std::str::from_utf8(&bytes) else {
         tracing::warn!("causal approval queue sidecar not UTF-8, ignoring");
-        return;
+        return Ok(());
     };
     // Versioned sidecar format (Kimi blocker 8/9).
     let Ok(loaded_sidecar): Result<CausalQueueSidecar, _> = serde_json::from_str(json_str) else {
         tracing::warn!("causal approval queue sidecar malformed, ignoring");
-        return;
+        return Ok(());
     };
     if loaded_sidecar.version != CAUSAL_SIDECAR_VERSION {
         tracing::warn!(
             version = loaded_sidecar.version,
             "causal approval queue sidecar version mismatch (expected {CAUSAL_SIDECAR_VERSION}), ignoring"
         );
-        return;
+        return Ok(());
     }
     let now_ms = now_millis_u64();
     let mut total_count = 0usize;
@@ -15975,39 +16040,15 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
                     continue;
                 }
             }
-            // Finding 5 (Sam 6664f60): cap checks AFTER validation. The entry
-            // has passed exact-envelope validation. Now check caps: if over
-            // budget, log and drop with a diagnostic — no silent prefix.
-            if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: per-group causal queue count cap reached, dropping validated entry"
-                );
-                continue;
-            }
-            if group_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
-                tracing::warn!(
-                    group_id = %group_id,
-                    "ADR 0028: per-group causal queue byte cap reached, dropping validated entry"
-                );
-                continue;
-            }
-            if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
-                tracing::warn!(
-                    "ADR 0028: daemon causal queue count cap reached, dropping validated entry"
-                );
-                continue;
-            }
-            if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
-                tracing::warn!(
-                    "ADR 0028: daemon causal queue byte cap reached, dropping validated entry"
-                );
-                continue;
-            }
+            // Watson ruling: cap checks AFTER validation. Load ALL valid
+            // entries first (no survivor subset). After loading, if totals
+            // exceed any governed cap, reject the WHOLE sidecar — install
+            // zero, return Err. No per-entry continue-drop.
             group_count += 1;
             group_bytes += derived_byte_size;
             total_count += 1;
             total_bytes += derived_byte_size;
+            let _ = (group_count, group_bytes);
             // Update entry with derived values.
             let mut entry = entry;
             entry.byte_size = derived_byte_size;
@@ -16020,24 +16061,45 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             queue.insert(group_id, filtered);
         }
     }
+    // Watson ruling: reject the WHOLE sidecar if total valid entries exceed
+    // any governed cap. Install zero, leave file unchanged, return Err.
+    if total_count > CAUSAL_APPROVAL_PER_DAEMON_CAP
+        || total_bytes > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP
+    {
+        tracing::error!(
+            total_count,
+            total_bytes,
+            daemon_count_cap = CAUSAL_APPROVAL_PER_DAEMON_CAP,
+            daemon_byte_cap = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP,
+            "ADR 0028: causal approval queue sidecar rejected — total exceeds governed caps. Installing zero entries."
+        );
+        *state.causal_approval_queue.write().await = HashMap::new();
+        *state.causal_conflict_tombstones.write().await = HashMap::new();
+        return Err(
+            "causal approval queue sidecar rejected: total exceeds governed caps".to_string(),
+        );
+    }
     *state.causal_approval_queue.write().await = queue;
     // B3: load conflict tombstones from the sidecar.
     // Finding 8: prune to enforce daemon-wide and per-group caps on load.
     let mut conflict_tombstones = loaded_sidecar.conflict_tombstones;
     prune_conflict_tombstones(&mut conflict_tombstones);
     *state.causal_conflict_tombstones.write().await = conflict_tombstones;
+    Ok(())
 }
 
 /// ADR 0028: load the predecessor relay outbox from the durable sidecar on
 /// restart. Enforces byte and count caps, drops expired/malformed records.
 /// Cap-before-allocation, derive-not-trust, drop unknown/withdrawn groups,
 /// enforce 4096 total relay-target cap (Kimi blocker 9).
-pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
+pub(in crate::server) async fn load_predecessor_relay_outbox(
+    state: &AppState,
+) -> Result<(), String> {
     let path = &state.predecessor_relay_outbox_path;
     // Cap-before-allocation: check file size before reading (Kimi blocker 9).
     let metadata = match tokio::fs::metadata(path).await {
         Ok(m) => m,
-        Err(_) => return,
+        Err(_) => return Ok(()),
     };
     let file_size = metadata.len() as usize;
     if file_size > RELAY_SIDECAR_FILE_SIZE_CAP {
@@ -16046,25 +16108,25 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             cap = RELAY_SIDECAR_FILE_SIZE_CAP,
             "predecessor relay outbox sidecar exceeds derived file-size cap, ignoring"
         );
-        return;
+        return Ok(());
     }
     let Ok(bytes) = tokio::fs::read(path).await else {
-        return;
+        return Ok(());
     };
     let Ok(json_str) = std::str::from_utf8(&bytes) else {
         tracing::warn!("predecessor relay outbox sidecar not UTF-8, ignoring");
-        return;
+        return Ok(());
     };
     let Ok(loaded_sidecar): Result<RelayOutboxSidecar, _> = serde_json::from_str(json_str) else {
         tracing::warn!("predecessor relay outbox sidecar malformed, ignoring");
-        return;
+        return Ok(());
     };
     if loaded_sidecar.version != CAUSAL_SIDECAR_VERSION {
         tracing::warn!(
             version = loaded_sidecar.version,
             "predecessor relay outbox sidecar version mismatch (expected {CAUSAL_SIDECAR_VERSION}), ignoring"
         );
-        return;
+        return Ok(());
     }
     let now_ms = now_millis_u64();
     let mut outbox = HashMap::new();
@@ -16241,28 +16303,42 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         prune_completed_tombstones_daemon(&mut tombstones, now_ms);
         tombstones
     };
-    // ADR 0028 finding E: enforce ONE combined live+completed relay budget
-    // of 1,024 entries / 16 MiB — not two independent per-store budgets.
-    // The per-store caps above are first-pass filters; this ensures the
-    // combined total never exceeds the accepted untrusted-data budget.
-    enforce_combined_relay_budget(&mut outbox, &mut tombstones);
-    // Finding 4: post-load 4096 total relay-target cap. Fail closed: if live
-    // obligations alone exceed the target cap, log an error but do not drop
-    // any live entries. Shed completed tombstones to free target budget.
+    // ADR 0028 finding E / Watson ruling: enforce ONE combined live+completed
+    // relay budget. If live alone exceeds any cap, REJECT the whole sidecar:
+    // install zero entries, leave the file unchanged, return an error so
+    // startup does not report success with missing causal work.
+    let within_budget = enforce_combined_relay_budget(&mut outbox, &mut tombstones);
+    if !within_budget {
+        tracing::error!(
+            "ADR 0028: predecessor relay outbox sidecar rejected — live state exceeds governed caps. Installing zero entries. Sidecar file left unchanged for diagnosis."
+        );
+        // Install zero — do not install any entries from the rejected sidecar.
+        *state.predecessor_relay_outbox.write().await = HashMap::new();
+        *state.completed_relay_tombstones.write().await = HashMap::new();
+        return Err(
+            "predecessor relay outbox sidecar rejected: live state exceeds governed caps"
+                .to_string(),
+        );
+    }
+    // Post-load 4096 total relay-target cap.
     let live_targets: usize = outbox
         .values()
         .flatten()
         .map(|o| o.relay_targets.len())
         .sum();
     if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
-        // Finding 4 (Sam 6664f60): never evict live. Clear completed, log
-        // the error, retain the over-budget live state.
+        // Watson ruling: never evict live. Reject the whole sidecar.
         tracing::error!(
             live_targets,
             cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-            "ADR 0028: live relay targets exceed daemon cap on restart — retaining live, clearing completed (never evict live)"
+            "ADR 0028: live relay targets exceed daemon cap on restart — rejecting whole sidecar (never evict live)"
         );
-        tombstones.clear();
+        *state.predecessor_relay_outbox.write().await = HashMap::new();
+        *state.completed_relay_tombstones.write().await = HashMap::new();
+        return Err(
+            "predecessor relay outbox sidecar rejected: live relay targets exceed daemon cap"
+                .to_string(),
+        );
     }
     *state.predecessor_relay_outbox.write().await = outbox;
     *state.completed_relay_tombstones.write().await = tombstones;
@@ -16433,27 +16509,35 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                         } else {
                             outbox.insert(journal.group_id.clone(), filtered);
                         }
-                        // Finding E: enforce daemon-wide caps after journal
-                        // restore. The journal may install entries that,
-                        // combined with already-live groups, exceed daemon
-                        // count/byte/target budgets. Run the same combined
-                        // budget enforcer as ordinary load.
+                        // Watson ruling: enforce daemon-wide caps after journal
+                        // restore. If live exceeds any cap, do NOT install
+                        // the restored state — clear the outbox for this group
+                        // and mark the restore as invalid.
                         let mut tombstones = state.completed_relay_tombstones.write().await;
-                        enforce_combined_relay_budget(&mut outbox, &mut tombstones);
-                        // Finding 4: post-restore 4096 target cap (fail closed).
+                        let within_budget =
+                            enforce_combined_relay_budget(&mut outbox, &mut tombstones);
+                        if !within_budget {
+                            tracing::error!(
+                                "ADR 0028 B8: journal restore — live state exceeds governed caps. Rejecting restored entries."
+                            );
+                            outbox.remove(&journal.group_id);
+                            tombstones.remove(&journal.group_id);
+                        }
+                        // Post-restore 4096 target cap.
                         let live_targets: usize = outbox
                             .values()
                             .flatten()
                             .map(|o| o.relay_targets.len())
                             .sum();
                         if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
-                            // Finding 4 (Sam 6664f60): never evict live.
+                            // Watson ruling: never evict live. Reject restored entries.
                             tracing::error!(
                                 live_targets,
                                 cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-                                "ADR 0028 B8: journal restore pushes live targets over daemon cap — retaining live, clearing completed (never evict live)"
+                                "ADR 0028 B8: journal restore pushes live targets over daemon cap — rejecting restored entries (never evict live)"
                             );
-                            tombstones.clear();
+                            outbox.remove(&journal.group_id);
+                            tombstones.remove(&journal.group_id);
                         }
                     }
                     true
@@ -16477,14 +16561,20 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             *state.pending_b8_compensation.lock().await = None;
         }
         // Persist the recovered state with a CHECKED result.
-        if let Err(e) = save_predecessor_relay_outbox(state).await {
-            tracing::error!(
-                group_id = %LogHexId::group(&journal.group_id),
-                request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery persist failed: {e}"
-            );
+        match save_predecessor_relay_outbox(state).await {
+            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+            _ => {
+                let e = std::io::Error::other("not replaced or pre-rename failure");
+                tracing::error!(
+                    group_id = %LogHexId::group(&journal.group_id),
+                    request_id = %journal.request_id,
+                    "ADR 0028 B8: journal recovery persist failed: {e}"
+                );
+            }
         }
     }
+
+    Ok(())
 }
 
 async fn save_named_groups(state: &AppState) {

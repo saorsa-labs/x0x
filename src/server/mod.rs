@@ -63,7 +63,7 @@ use routes::{
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
     unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
-    update_task, withdraw_group_state, JoinResultMessage, KvStoreDirectDelta,
+    update_task, withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
     NamedGroupMetadataEvent, PredecessorRelayObligation, SelfPublishedReleaseManifests,
     TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
@@ -673,6 +673,19 @@ pub async fn serve_with_options(
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
 
+    // ADR 0028 / Watson ruling: load durable causal approval queue and
+    // predecessor relay outbox from sidecar files BEFORE starting listeners.
+    // If either loader rejects its sidecar (live exceeds governed caps),
+    // propagate the error so the daemon does not report successful startup
+    // with missing causal work. Sam finding 4: loaders must run before
+    // listener spawn so a loader error exits before listeners self-register.
+    load_causal_approval_queue(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("ADR 0028 startup: {e}"))?;
+    load_predecessor_relay_outbox(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("ADR 0028 startup: {e}"))?;
+
     let existing_group_ids: Vec<String> = {
         let groups = state.named_groups.read().await;
         groups.keys().cloned().collect()
@@ -684,11 +697,6 @@ pub async fn serve_with_options(
         // is nothing to collect into `bg_tasks` from this call.
         ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
-
-    // ADR 0028: load durable causal approval queue and predecessor relay
-    // outbox from sidecar files before starting listeners.
-    load_causal_approval_queue(&state).await;
-    load_predecessor_relay_outbox(&state).await;
 
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).
@@ -1657,7 +1665,20 @@ pub async fn serve_with_options(
                     }
                     // Persist the relay outbox. Persistence lock is already
                     // held (P→Q). Roll back on failure.
-                    if let Err(e) = save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                    match save_predecessor_relay_outbox_unlocked(&relay_state).await {
+                        Ok(AtomicWriteOutcome::Durable) => {}
+                        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                            // Watson ruling: outbox IS on disk but not dir-fsync'd.
+                            // The obligation is durable. Do NOT roll back. The
+                            // relay engine will pick it up; publication defers until
+                            // the parent dir is fsync'd on the next save cycle.
+                            tracing::warn!(
+                                group_id = %group_id_str,
+                                "ADR 0028: relay outbox replaced but not directory-durable after admission — obligation is durable, proceeding"
+                            );
+                        }
+                        _ => {
+                        let e = std::io::Error::other("not replaced or pre-rename failure");
                         tracing::error!(
                             "ADR 0028: relay outbox save failed after admission, rolling back: {e}"
                         );
@@ -1722,6 +1743,7 @@ pub async fn serve_with_options(
                             }
                         }
                         break 'admission true;
+                        }
                     }
 
                     // B6: no fire-and-forget sibling — the background
