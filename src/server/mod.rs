@@ -1421,6 +1421,7 @@ pub async fn serve_with_options(
                                 None,
                                 &mut replay_group_id,
                                 true,
+                                false,
                             )
                             .await;
                         replay_after = replay_group_id;
@@ -1759,6 +1760,7 @@ pub async fn serve_with_options(
                             Some(admission_first_seen_ms),
                             &mut replay_group_id,
                             true, // lock_already_held
+                            false,
                         )
                         .await;
                         replay_after = replay_group_id;
