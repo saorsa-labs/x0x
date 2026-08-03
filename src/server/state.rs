@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -636,6 +637,10 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of `named_groups.json` so an older
     /// snapshot cannot rename over a newer recovered KeyPackage.
     pub(super) named_groups_persistence_lock: Mutex<()>,
+    /// Set when a roster rename is visible but its parent-directory fsync did
+    /// not complete. Metadata applies must re-save the exact visible roster to
+    /// `Durable` before consulting it for another state transition.
+    pub(super) named_groups_requires_durability_confirmation: AtomicBool,
     /// Background metadata listeners for named groups (one per group id).
     pub(super) group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Cached group cards discovered via gossip or imported from peers.

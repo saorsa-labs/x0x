@@ -2354,6 +2354,95 @@ pub(in crate::server) async fn store_named_group_info(
     store_named_group_info_locked(&mut groups, group_id, info)
 }
 
+/// Apply one shared-roster mutation as a persistence transaction.
+///
+/// The global roster persistence lock is acquired before the shared map is
+/// changed and is retained through serialization, atomic replacement, and
+/// failure restoration. This prevents a concurrent cross-group save from
+/// durably capturing an uncommitted candidate. A pre-rename failure restores
+/// the exact full-map snapshot; a post-rename durability failure keeps memory
+/// aligned with the visible replacement while withholding success.
+async fn persist_named_groups_mutation<F>(
+    state: &AppState,
+    mutate: F,
+) -> std::io::Result<AtomicWriteOutcome>
+where
+    F: FnOnce(&mut HashMap<String, x0x::groups::GroupInfo>) -> bool,
+{
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release),
+            outcome => return outcome,
+        }
+    }
+    let snapshot = {
+        let mut groups = state.named_groups.write().await;
+        let snapshot = groups.clone();
+        if !mutate(&mut groups) {
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+        snapshot
+    };
+
+    let outcome = save_named_groups_checked_unlocked(state).await;
+    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+        *state.named_groups.write().await = snapshot;
+    }
+    match &outcome {
+        Ok(AtomicWriteOutcome::Durable) => state
+            .named_groups_requires_durability_confirmation
+            .store(false, Ordering::Release),
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release),
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+    }
+    outcome
+}
+
+/// Re-establish directory durability for a previously visible roster
+/// replacement before another metadata transition may inspect it.
+async fn confirm_named_groups_durability(state: &AppState) -> bool {
+    if !state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        return true;
+    }
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    confirm_named_groups_durability_unlocked(state).await
+}
+
+async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
+    match save_named_groups_checked_unlocked(state).await {
+        Ok(AtomicWriteOutcome::Durable) => {
+            state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release);
+            true
+        }
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => false,
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => false,
+    }
+}
+
+async fn persist_named_group_info(
+    state: &AppState,
+    group_id: &str,
+    info: x0x::groups::GroupInfo,
+) -> std::io::Result<AtomicWriteOutcome> {
+    persist_named_groups_mutation(state, |groups| {
+        store_named_group_info_locked(groups, group_id, info)
+    })
+    .await
+}
+
 fn restore_local_treekem_group_from_snapshot(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -5099,6 +5188,15 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // lock across mutation+persist+rollback so a concurrent cross-group
         // save cannot durably snapshot A's replay candidate before A's save.
         let _replay_roster_guard = state.named_groups_persistence_lock.lock().await;
+        if !confirm_named_groups_durability_unlocked(state).await {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                request_id = %pending.request_id,
+                "ADR 0028 B5: roster remains unavailable pending directory-durability confirmation"
+            );
+            still_pending.push_back(pending);
+            continue;
+        }
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -5852,6 +5950,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
     } else {
         None
     };
+    // Causal replay already holds the global roster lock and confirms through
+    // the unlocked helper immediately before entering this function.
+    if (allow_queue || !lock_already_held) && !confirm_named_groups_durability(state).await {
+        tracing::error!(
+            group_id = %resolved_group_key,
+            "named-groups roster remains unavailable pending directory-durability confirmation"
+        );
+        return ApplyMetadataResult::REJECTED;
+    }
     let info = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&resolved_group_key).cloned() else {
@@ -6185,10 +6292,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }
                 drop(mls_groups);
             }
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             for (key, cached) in recovery_cache_entries {
@@ -6270,9 +6377,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
             let removed_self = agent_id == local_agent_hex;
-            if removed_self {
-                state.named_groups.write().await.remove(&resolved_group_key);
-            }
             if treekem_payload.is_none() {
                 let mut mls_groups = state.mls_groups.write().await;
                 if let Some(group) = mls_groups.get_mut(&resolved_group_key) {
@@ -6302,7 +6406,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     "member_removed_self",
                 )
                 .await;
-                if !save_named_groups(state).await {
+                if !matches!(
+                    persist_named_groups_mutation(state, |groups| {
+                        groups.remove(&resolved_group_key).is_some()
+                    })
+                    .await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
                     return ApplyMetadataResult::REJECTED;
                 }
                 *replay_group_id = Some(resolved_group_key.clone());
@@ -6339,10 +6449,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -6440,10 +6550,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -6493,10 +6603,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -6598,10 +6708,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     return ApplyMetadataResult::REJECTED;
                 }
             }
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -6657,10 +6767,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -6752,19 +6862,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
             // Finding A: `accepted: true` must mean durably persisted. Use the
-            // checked save and, on failure, restore the pre-mutation in-memory
-            // state so the listener does not create a relay obligation whose
-            // pinned request is absent on restart.
+            // shared roster transaction so the persistence mutex spans the
+            // mutation, checked write, and failure restoration.
             // Watson ruling: ReplacedNotDurable means the request IS on disk
             // but not dir-fsync'd. Do NOT restore pre-mutation memory (that
             // would diverge from durable). Return REJECTED so the listener
             // does not create an obligation. The repair path services
             // "request present, obligation absent" on re-delivery.
-            match save_named_groups_checked(state).await {
+            match persist_named_group_info(state, &resolved_group_key, next.clone()).await {
                 Ok(AtomicWriteOutcome::Durable) => {}
                 Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
                     tracing::error!(
@@ -6778,7 +6884,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         group_id = %resolved_group_key,
                         "JoinRequestCreated: durable save failed, restoring in-memory state"
                     );
-                    store_named_group_info(state, &resolved_group_key, current).await;
                     return ApplyMetadataResult::REJECTED;
                 }
             }
@@ -7000,9 +7105,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             }
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
             // B5: for live admission (allow_queue=true) save here and refresh
             // card cache + record membership event. For replay (allow_queue=
             // false) skip save, card cache, and event log — the causal drain
@@ -7014,7 +7116,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // so the replay's already_current proof cannot read stale memory
             // that diverges from the durable roster file.
             if allow_queue {
-                match save_named_groups_checked(state).await {
+                match persist_named_group_info(state, &resolved_group_key, next.clone()).await {
                     Ok(AtomicWriteOutcome::Durable) => {}
                     Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
                         // Watson ruling: data IS on disk but not dir-fsync'd.
@@ -7031,11 +7133,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                             group_id = %resolved_group_key,
                             "JoinRequestApproved: durable save failed, restoring in-memory state"
                         );
-                        store_named_group_info(state, &resolved_group_key, current).await;
                         return ApplyMetadataResult::REJECTED;
                     }
                 }
                 refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
+            } else if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
+                return ApplyMetadataResult::REJECTED;
             }
             *replay_group_id = Some(resolved_group_key.clone());
             if allow_queue {
@@ -7083,10 +7186,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             *replay_group_id = Some(resolved_group_key.clone());
@@ -7123,10 +7226,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             *replay_group_id = Some(resolved_group_key.clone());
@@ -7192,10 +7295,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) else {
                 return ApplyMetadataResult::REJECTED;
             };
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
@@ -7294,10 +7397,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             next.shared_secret = Some(secret.to_vec());
             next.secret_epoch = secret_epoch;
             next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
-            if !store_named_group_info(state, &resolved_group_key, next).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             *replay_group_id = Some(resolved_group_key.clone());
@@ -7663,15 +7766,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let metadata_topic = next.metadata_topic.clone();
             let event_group_id = next.stable_group_id().to_string();
-            if !store_named_group_info(state, &resolved_group_key, next.clone()).await {
-                return ApplyMetadataResult::REJECTED;
-            }
-
             // Persist and expose the committed roster before any slower MLS or
             // discovery-card side effects. Tests and operators poll
             // /groups/:id/members and /diagnostics/groups as the acceptance
             // signal for this path.
-            if !save_named_groups(state).await {
+            if !matches!(
+                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
                 return ApplyMetadataResult::REJECTED;
             }
             *replay_group_id = Some(resolved_group_key.clone());
@@ -10964,24 +11066,24 @@ async fn retain_withdrawn_group_tombstone(
     let stable_group_id = info.stable_group_id().to_string();
     info.withdrawn = true;
     clear_group_info_key_material(&mut info);
-    let aliases = {
-        let mut groups = state.named_groups.write().await;
-        let mut aliases =
-            collect_same_stable_group_aliases(&groups, group_id, Some(&stable_group_id));
+    let mut aliases = HashSet::new();
+    let outcome = persist_named_groups_mutation(state, |groups| {
+        aliases = collect_same_stable_group_aliases(groups, group_id, Some(&stable_group_id));
         aliases.insert(group_id.to_string());
         aliases.insert(stable_group_id.clone());
         for alias in &aliases {
             groups.insert(alias.clone(), info.clone());
         }
-        aliases
-    };
+        true
+    })
+    .await;
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        return;
+    }
     let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
     remove_directory_cache_entries_for_group_info(state, &info).await;
     refresh_group_card_cache_from_info(state, group_id, &info).await;
-    if !save_named_groups(state).await {
-        return;
-    }
     save_mls_groups(state).await;
 }
 
@@ -12667,10 +12769,16 @@ pub(in crate::server) async fn create_join_request(
     let now_ms = now_millis_u64();
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
+    if !confirm_named_groups_durability(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is awaiting directory-durability confirmation",
+        );
+    }
 
-    let (metadata_topic, event_group_id, request, creator_hex, commit) = {
-        let mut groups = state.named_groups.write().await;
-        let Some(info) = groups.get_mut(&id) else {
+    let (metadata_topic, event_group_id, request, creator_hex, commit, next) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         if let Some(resp) = reject_withdrawn_group(info) {
@@ -12723,9 +12831,10 @@ pub(in crate::server) async fn create_join_request(
                 };
             request.treekem_key_package_b64 = Some(BASE64.encode(prepared.key_package_bytes()));
         }
-        info.join_requests
+        let mut next = info.clone();
+        next.join_requests
             .insert(request.request_id.clone(), request.clone());
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -12734,14 +12843,23 @@ pub(in crate::server) async fn create_join_request(
                 );
             }
         };
-        let creator_hex = hex::encode(info.creator.as_bytes());
-        let metadata_topic = info.metadata_topic.clone();
-        let event_group_id = info.stable_group_id().to_string();
-        drop(groups);
-        (metadata_topic, event_group_id, request, creator_hex, commit)
+        let creator_hex = hex::encode(next.creator.as_bytes());
+        let metadata_topic = next.metadata_topic.clone();
+        let event_group_id = next.stable_group_id().to_string();
+        (
+            metadata_topic,
+            event_group_id,
+            request,
+            creator_hex,
+            commit,
+            next,
+        )
     };
 
-    if !save_named_groups(&state).await {
+    if !matches!(
+        persist_named_group_info(&state, &id, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "named-group state is not directory-durable",
@@ -12817,6 +12935,12 @@ pub(in crate::server) async fn approve_join_request(
     // TreeKEM helper below, which must NOT re-acquire it (single-level lock).
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
+    if !confirm_named_groups_durability(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is awaiting directory-durability confirmation",
+        );
+    }
     {
         let groups = state.named_groups.read().await;
         if let Some(info) = groups.get(&id) {
@@ -13643,10 +13767,16 @@ pub(in crate::server) async fn reject_join_request(
     let now_ms = now_millis_u64();
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
+    if !confirm_named_groups_durability(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is awaiting directory-durability confirmation",
+        );
+    }
 
-    let (metadata_topic, event_group_id, requester_hex, commit) = {
-        let mut groups = state.named_groups.write().await;
-        let Some(info) = groups.get_mut(&id) else {
+    let (metadata_topic, event_group_id, requester_hex, commit, next) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         if let Err(e) = require_admin_or_above(info, &caller_hex) {
@@ -13655,7 +13785,8 @@ pub(in crate::server) async fn reject_join_request(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
-        let Some(req) = info.join_requests.get_mut(&request_id) else {
+        let mut next = info.clone();
+        let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };
         if !req.is_pending() {
@@ -13665,7 +13796,7 @@ pub(in crate::server) async fn reject_join_request(
         req.reviewed_by = Some(caller_hex.clone());
         req.reviewed_at = Some(now_ms);
         let requester_hex = req.requester_agent_id.clone();
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -13674,13 +13805,15 @@ pub(in crate::server) async fn reject_join_request(
                 );
             }
         };
-        let metadata_topic = info.metadata_topic.clone();
-        let event_group_id = info.stable_group_id().to_string();
-        drop(groups);
-        (metadata_topic, event_group_id, requester_hex, commit)
+        let metadata_topic = next.metadata_topic.clone();
+        let event_group_id = next.stable_group_id().to_string();
+        (metadata_topic, event_group_id, requester_hex, commit, next)
     };
 
-    if !save_named_groups(&state).await {
+    if !matches!(
+        persist_named_group_info(&state, &id, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "named-group state is not directory-durable",
@@ -13712,16 +13845,23 @@ pub(in crate::server) async fn cancel_join_request(
     let now_ms = now_millis_u64();
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
+    if !confirm_named_groups_durability(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-group state is awaiting directory-durability confirmation",
+        );
+    }
 
-    let (metadata_topic, event_group_id, requester_hex, commit) = {
-        let mut groups = state.named_groups.write().await;
-        let Some(info) = groups.get_mut(&id) else {
+    let (metadata_topic, event_group_id, requester_hex, commit, next) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
             return not_found("group not found");
         };
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
-        let Some(req) = info.join_requests.get_mut(&request_id) else {
+        let mut next = info.clone();
+        let Some(req) = next.join_requests.get_mut(&request_id) else {
             return not_found("request not found");
         };
         if req.requester_agent_id != caller_hex {
@@ -13732,7 +13872,7 @@ pub(in crate::server) async fn cancel_join_request(
         }
         req.status = x0x::groups::JoinRequestStatus::Cancelled;
         let requester_hex = req.requester_agent_id.clone();
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -13741,13 +13881,15 @@ pub(in crate::server) async fn cancel_join_request(
                 );
             }
         };
-        let metadata_topic = info.metadata_topic.clone();
-        let event_group_id = info.stable_group_id().to_string();
-        drop(groups);
-        (metadata_topic, event_group_id, requester_hex, commit)
+        let metadata_topic = next.metadata_topic.clone();
+        let event_group_id = next.stable_group_id().to_string();
+        (metadata_topic, event_group_id, requester_hex, commit, next)
     };
 
-    if !save_named_groups(&state).await {
+    if !matches!(
+        persist_named_group_info(&state, &id, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
         return api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "named-group state is not directory-durable",
@@ -17583,7 +17725,7 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             release.notified().await;
         }
     }
-    match json {
+    let outcome = match json {
         Ok(json) => write_named_groups_json_atomic(&state.named_groups_path, &json)
             .await
             .map_err(|e| {
@@ -17594,7 +17736,17 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             tracing::error!("Failed to serialize named groups: {e}");
             Ok(AtomicWriteOutcome::NotReplaced)
         }
+    };
+    match &outcome {
+        Ok(AtomicWriteOutcome::Durable) => state
+            .named_groups_requires_durability_confirmation
+            .store(false, Ordering::Release),
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release),
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
+    outcome
 }
 
 async fn write_treekem_cache_json_atomic(
@@ -19254,6 +19406,7 @@ mod tests {
             named_groups: RwLock::new(named_groups),
             named_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
+            named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
             pending_b8_compensation: Mutex::new(None),

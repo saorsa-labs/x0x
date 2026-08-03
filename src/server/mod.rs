@@ -57,10 +57,11 @@ use routes::{
     reject_join_request, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
     run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
-    secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
-    secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
-    shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
     unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
@@ -84,6 +85,7 @@ use ws::{serve_gui, ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, Instant};
 
@@ -584,6 +586,7 @@ pub async fn serve_with_options(
         named_groups: RwLock::new(named_groups),
         named_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
+        named_groups_requires_durability_confirmation: AtomicBool::new(false),
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
         pending_b8_compensation: Mutex::new(None),
@@ -671,6 +674,22 @@ pub async fn serve_with_options(
             agent.shutdown().await;
             return Err(anyhow::Error::new(error).context("failed to clear stale api.port"));
         }
+    }
+
+    // A prior process may have renamed a roster replacement whose parent-dir
+    // fsync then failed. Re-save the exact loaded roster and require a fresh
+    // Durable outcome before any causal loader or listener can inspect it as
+    // authority state. This is the supervisor-retry fence for ordinary roster
+    // transitions, including an evidence-free visible replacement.
+    if !matches!(
+        save_named_groups_checked(&state).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        exec_service.shutdown().await;
+        agent.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "ADR 0028 startup: named-groups roster is not directory-durable"
+        ));
     }
 
     // ADR 0028 / Watson ruling: load durable causal approval queue and
