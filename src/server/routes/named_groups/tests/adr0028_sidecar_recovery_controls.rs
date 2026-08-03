@@ -118,6 +118,25 @@ fn approval_event(
     }
 }
 
+fn approval_event_with_welcome_pad(
+    group_key: &str,
+    request_id: &str,
+    requester_hex: &str,
+    actor_hex: &str,
+    revision: u64,
+    pad_len: usize,
+) -> NamedGroupMetadataEvent {
+    let mut event = approval_event(group_key, request_id, requester_hex, actor_hex, revision);
+    if let NamedGroupMetadataEvent::JoinRequestApproved {
+        treekem_welcome_b64,
+        ..
+    } = &mut event
+    {
+        *treekem_welcome_b64 = Some("P".repeat(pad_len));
+    }
+    event
+}
+
 // ---- relay entry building -------------------------------------------------
 
 #[derive(Clone)]
@@ -296,6 +315,71 @@ fn build_entries(
         .collect()
 }
 
+fn build_relay_entry_exact_size(
+    requester_kp: &AgentKeypair,
+    topic: &str,
+    group_key: &str,
+    request_id: &str,
+    requester_hex: &str,
+    first_seen_ms: u64,
+    exact_bytes: usize,
+) -> RelayEntry {
+    let probe = build_relay_entry(
+        requester_kp,
+        topic,
+        group_key,
+        request_id,
+        requester_hex,
+        first_seen_ms,
+        1,
+    );
+    assert!(
+        probe.byte_size <= exact_bytes,
+        "exact envelope target {exact_bytes} is smaller than the valid probe {}",
+        probe.byte_size
+    );
+    let pad_len = 1 + exact_bytes - probe.byte_size;
+    let entry = build_relay_entry(
+        requester_kp,
+        topic,
+        group_key,
+        request_id,
+        requester_hex,
+        first_seen_ms,
+        pad_len,
+    );
+    assert_eq!(
+        entry.byte_size, exact_bytes,
+        "ASCII welcome padding must produce the requested semantic byte size"
+    );
+    entry
+}
+
+fn build_exact_relay_entries(
+    requester_kp: &AgentKeypair,
+    topic: &str,
+    group_key: &str,
+    requester_hex: &str,
+    first_seen_ms: u64,
+    count: usize,
+    exact_bytes: usize,
+) -> Vec<RelayEntry> {
+    (0..count)
+        .map(|index| {
+            let request_id = format!("x-{}-{index:04}", &group_key[..8]);
+            build_relay_entry_exact_size(
+                requester_kp,
+                topic,
+                group_key,
+                &request_id,
+                requester_hex,
+                first_seen_ms,
+                exact_bytes,
+            )
+        })
+        .collect()
+}
+
 // ---- sidecar I/O ----------------------------------------------------------
 
 async fn save_relay(state: &AppState) -> std::io::Result<AtomicWriteOutcome> {
@@ -334,6 +418,37 @@ async fn relay_outbox_for_group(state: &AppState, gk: &str) -> Vec<PredecessorRe
         .get(gk)
         .cloned()
         .unwrap_or_default()
+}
+
+async fn relay_semantic_bytes(state: &AppState) -> usize {
+    let live_bytes: usize = state
+        .predecessor_relay_outbox
+        .read()
+        .await
+        .values()
+        .flatten()
+        .map(|entry| entry.byte_size)
+        .sum();
+    let completed_bytes: usize = state
+        .completed_relay_tombstones
+        .read()
+        .await
+        .values()
+        .flatten()
+        .map(|entry| entry.envelope_bytes.len())
+        .sum();
+    live_bytes + completed_bytes
+}
+
+async fn relay_live_digests(state: &AppState) -> std::collections::HashSet<[u8; 32]> {
+    state
+        .predecessor_relay_outbox
+        .read()
+        .await
+        .values()
+        .flatten()
+        .map(|entry| entry.digest)
+        .collect()
 }
 
 // ---- causal queue helpers -------------------------------------------------
@@ -386,6 +501,80 @@ async fn install_queue_entries(state: &AppState, group_key: &str, count: usize) 
     }
 }
 
+async fn install_queue_entries_exact_size(
+    state: &AppState,
+    group_key: &str,
+    count: usize,
+    exact_bytes: usize,
+) {
+    let admin_kp = state.agent.identity().agent_keypair();
+    let admin_hex = local_hex(state);
+    let requester_hex = hex::encode(fresh_kp().agent_id().as_bytes());
+    let now = unix_ms();
+    let topic = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .expect("group")
+        .metadata_topic
+        .clone();
+    let sender = state.agent.agent_id();
+    let mut built = Vec::with_capacity(count);
+    for index in 0..count {
+        let request_id = format!("z-{}-{index:04}", &group_key[..8]);
+        let probe_event = approval_event_with_welcome_pad(
+            group_key,
+            &request_id,
+            &requester_hex,
+            &admin_hex,
+            1,
+            1,
+        );
+        let probe = sign_v2_envelope(admin_kp, &topic, &probe_event);
+        assert!(
+            probe.len() <= exact_bytes,
+            "exact queue envelope target {exact_bytes} is smaller than the valid probe {}",
+            probe.len()
+        );
+        let pad_len = 1 + exact_bytes - probe.len();
+        let event = approval_event_with_welcome_pad(
+            group_key,
+            &request_id,
+            &requester_hex,
+            &admin_hex,
+            1,
+            pad_len,
+        );
+        let envelope = sign_v2_envelope(admin_kp, &topic, &event);
+        assert_eq!(
+            envelope.len(),
+            exact_bytes,
+            "ASCII welcome padding must produce the requested queue byte size"
+        );
+        let digest: [u8; 32] = blake3::hash(&envelope).into();
+        built.push((envelope, digest, request_id, event));
+    }
+    let mut queue = state.causal_approval_queue.write().await;
+    let entries = queue.entry(group_key.to_string()).or_default();
+    for (envelope, digest, request_id, event) in built {
+        entries.push_back(PendingCausalApproval {
+            byte_size: envelope.len(),
+            envelope_bytes: envelope,
+            digest,
+            event,
+            sender,
+            first_seen_ms: now,
+            expires_at_ms: now + 300_000,
+            request_id,
+            requester_agent_id: requester_hex.clone(),
+            revision: 1,
+            conflicted: false,
+            conflicted_with: None,
+        });
+    }
+}
+
 async fn queue_total(state: &AppState) -> usize {
     state
         .causal_approval_queue
@@ -406,6 +595,33 @@ async fn queue_sidecar_bytes(state: &AppState) -> Vec<u8> {
     tokio::fs::read(&state.causal_approval_queue_path)
         .await
         .unwrap_or_default()
+}
+
+async fn save_queue(state: &AppState) -> std::io::Result<AtomicWriteOutcome> {
+    let _guard = state.causal_approval_queue_persistence_lock.lock().await;
+    save_causal_approval_queue_unlocked(state).await
+}
+
+async fn queue_semantic_bytes(state: &AppState) -> usize {
+    state
+        .causal_approval_queue
+        .read()
+        .await
+        .values()
+        .flatten()
+        .map(|entry| entry.byte_size)
+        .sum()
+}
+
+async fn queue_live_digests(state: &AppState) -> std::collections::HashSet<[u8; 32]> {
+    state
+        .causal_approval_queue
+        .read()
+        .await
+        .values()
+        .flatten()
+        .map(|entry| entry.digest)
+        .collect()
 }
 
 // ---- permission RAII ------------------------------------------------------
@@ -586,8 +802,8 @@ async fn relay_daemon_count_cap_1024_accepted_then_1025_rejected() {
 // Row 7 — relay outbox per-group BYTE cap boundary
 // ===========================================================================
 
-/// MUT2: drop the per-group byte check in `enforce_combined_relay_budget`
-/// (16363) and oversized entries survive restart.
+/// MUT2: add one maximum-envelope grace to the per-group byte check in
+/// `enforce_combined_relay_budget`; the minimal over-cap candidate survives.
 #[tokio::test]
 async fn relay_per_group_byte_cap_boundary() {
     let (state, _dir) = s_state().await;
@@ -604,49 +820,36 @@ async fn relay_per_group_byte_cap_boundary() {
     let requester_kp = fresh_kp();
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
-    let pad = 55_000usize;
-
-    // Measure one entry's envelope size.
-    let probe = build_relay_entry(
-        &requester_kp,
-        &topic,
-        &gk,
-        "probe",
-        &requester_hex,
-        now,
-        pad,
-    );
-    let s = probe.byte_size;
-    assert!(
-        s <= CAUSAL_ENVELOPE_MAX_BYTES,
-        "envelope within semantic cap"
-    );
     let cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP;
-    let max_under = cap / s;
-    assert!(
-        max_under < CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-        "count under per-group count cap"
-    );
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    let accepted_count = cap / exact_entry_bytes;
+    assert_eq!(accepted_count, 16, "1 MiB is exactly 16 × 64 KiB");
+    assert!(accepted_count < CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP);
 
-    // --- GREEN: max_under entries → total ≤ byte cap ---
-    let entries = build_entries(
+    // --- GREEN: exactly 16 × 64 KiB = 1 MiB ---
+    let entries = build_exact_relay_entries(
         &requester_kp,
         &topic,
         &gk,
         &requester_hex,
         now,
-        max_under,
-        pad,
+        accepted_count,
+        exact_entry_bytes,
     );
     let total_bytes: usize = entries.iter().map(|e| e.byte_size).sum();
-    assert!(total_bytes <= cap, "GREEN total within byte cap");
+    assert_eq!(total_bytes, cap, "accepted semantic total is exactly 1 MiB");
     install_relay_entries(&state, &gk, &entries, &requester_hex, now).await;
+    let accepted_digests = relay_live_digests(&state).await;
     save_relay(&state).await.expect("save under");
     let r = restart_relay(&state).await;
     assert!(r.is_ok(), "under per-group byte cap must load: {:?}", r);
-    assert_eq!(relay_outbox_for_group(&state, &gk).await.len(), max_under);
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        accepted_count
+    );
+    assert_eq!(relay_live_digests(&state).await, accepted_digests);
 
-    // --- RED: max_under + 1 → total > byte cap ---
+    // --- RED: exact 1 MiB plus one minimal valid envelope ---
     let mut over = entries.clone();
     over.push(build_relay_entry(
         &requester_kp,
@@ -655,10 +858,11 @@ async fn relay_per_group_byte_cap_boundary() {
         "over",
         &requester_hex,
         now,
-        pad,
+        0,
     ));
     let over_bytes: usize = over.iter().map(|e| e.byte_size).sum();
     assert!(over_bytes > cap, "RED total exceeds byte cap");
+    assert!(over.len() < CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP);
     // Reset roster + outbox for this group.
     state.predecessor_relay_outbox.write().await.clear();
     {
@@ -682,68 +886,26 @@ async fn relay_per_group_byte_cap_boundary() {
 // Row 7 — relay outbox daemon-wide BYTE cap boundary
 // ===========================================================================
 
-/// MUT2: raise CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP and the over-cap
-/// sidecar installs.
+/// MUT2: add one maximum-envelope grace to the daemon byte check in
+/// `enforce_combined_relay_budget`; the minimal over-cap candidate installs.
 #[tokio::test]
 async fn relay_daemon_byte_cap_boundary() {
     let (state, _dir) = s_state().await;
     let requester_kp = fresh_kp();
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
-    let pad = 55_000usize;
-
-    // Measure envelope size and compute how many fit under the daemon byte cap.
-    let gk0 = format!("{:032x}", 0u32);
-    install_group(&state, &gk0, 0).await;
-    let topic0 = state
-        .named_groups
-        .read()
-        .await
-        .get(&gk0)
-        .expect("g0")
-        .metadata_topic
-        .clone();
-    let probe = build_relay_entry(
-        &requester_kp,
-        &topic0,
-        &gk0,
-        "probe",
-        &requester_hex,
-        now,
-        pad,
-    );
-    let s = probe.byte_size;
     let daemon_cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP;
-    let max_under = daemon_cap / s;
-    // Per-group limits: count cap AND per-group byte cap.
-    let per_group = std::cmp::min(
-        CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-        CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP / s,
-    );
-    assert!(per_group > 0 && max_under > 0);
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    let accepted_count = daemon_cap / exact_entry_bytes;
+    let per_group = CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP / exact_entry_bytes;
+    assert_eq!(accepted_count, 256, "16 MiB is exactly 256 × 64 KiB");
+    assert_eq!(per_group, 16, "1 MiB is exactly 16 × 64 KiB");
 
-    // --- GREEN: max_under entries distributed across groups ---
-    let mut built = 0usize;
-    let mut gi = 0u32;
-    // Re-use gk0 for the first batch.
-    let first_batch = std::cmp::min(per_group, max_under);
-    let entries0 = build_entries(
-        &requester_kp,
-        &topic0,
-        &gk0,
-        &requester_hex,
-        now,
-        first_batch,
-        pad,
-    );
-    install_relay_entries(&state, &gk0, &entries0, &requester_hex, now).await;
-    built += first_batch;
-    gi += 1;
-    while built < max_under {
-        let gk = format!("{:032x}", gi);
-        gi += 1;
+    // --- GREEN: 16 groups × 16 exact-size envelopes = 16 MiB ---
+    for group_index in 0..16u32 {
+        let gk = format!("{:032x}", group_index);
         install_group(&state, &gk, 0).await;
-        let gtopic = state
+        let topic = state
             .named_groups
             .read()
             .await
@@ -751,27 +913,31 @@ async fn relay_daemon_byte_cap_boundary() {
             .expect("gk")
             .metadata_topic
             .clone();
-        let take = std::cmp::min(per_group, max_under - built);
-        let batch = build_entries(&requester_kp, &gtopic, &gk, &requester_hex, now, take, pad);
+        let batch = build_exact_relay_entries(
+            &requester_kp,
+            &topic,
+            &gk,
+            &requester_hex,
+            now,
+            per_group,
+            exact_entry_bytes,
+        );
         install_relay_entries(&state, &gk, &batch, &requester_hex, now).await;
-        built += take;
     }
-    let total_bytes: usize = state
-        .predecessor_relay_outbox
-        .read()
-        .await
-        .values()
-        .flatten()
-        .map(|o| o.byte_size)
-        .sum();
-    assert!(total_bytes <= daemon_cap, "GREEN: within daemon byte cap");
+    assert_eq!(
+        relay_semantic_bytes(&state).await,
+        daemon_cap,
+        "accepted semantic total is exactly 16 MiB"
+    );
+    let accepted_digests = relay_live_digests(&state).await;
     save_relay(&state).await.expect("save under");
     let r = restart_relay(&state).await;
     assert!(r.is_ok(), "within daemon byte cap must load: {:?}", r);
-    assert_eq!(relay_outbox_total(&state).await, max_under);
+    assert_eq!(relay_outbox_total(&state).await, accepted_count);
+    assert_eq!(relay_live_digests(&state).await, accepted_digests);
 
-    // --- RED: one more entry → over daemon byte cap ---
-    let gk_over = format!("{:032x}", gi);
+    // --- RED: exact 16 MiB plus one minimal valid envelope ---
+    let gk_over = format!("{:032x}", 16u32);
     install_group(&state, &gk_over, 0).await;
     let otopic = state
         .named_groups
@@ -788,7 +954,7 @@ async fn relay_daemon_byte_cap_boundary() {
         "db-over",
         &requester_hex,
         now,
-        pad,
+        0,
     );
     install_relay_entries(
         &state,
@@ -798,6 +964,8 @@ async fn relay_daemon_byte_cap_boundary() {
         now,
     )
     .await;
+    assert!(relay_semantic_bytes(&state).await > daemon_cap);
+    assert!(relay_outbox_total(&state).await < CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP);
     save_relay(&state).await.expect("save over");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
@@ -812,8 +980,8 @@ async fn relay_daemon_byte_cap_boundary() {
 
 /// The loader re-derives relay targets from active non-local witnesses.
 /// With 64 witnesses per group, N groups × 1 obligation × 64 targets =
-/// N×64 total targets. MUT2: drop the post-load 4096 cap (17538) and 4097
-/// targets survive restart. Asserts the SPECIFIC target-cap error to
+/// N×64 total targets. MUT2: raise the post-load cap from 4096 to 4097 and
+/// 4097 targets survive restart. Asserts the SPECIFIC target-cap error to
 /// distinguish from the 256 MiB file-size error.
 #[tokio::test]
 async fn relay_target_cap_4096_accepted_then_4097_rejected() {
@@ -867,9 +1035,9 @@ async fn relay_target_cap_4096_accepted_then_4097_rejected() {
     assert_eq!(total_targets, 4096, "exactly 4096 re-derived targets");
     assert_eq!(relay_outbox_total(&state).await, 64);
 
-    // --- RED: 65th group → 65 × 64 = 4160 > 4096 ---
+    // --- RED: 65th group contributes exactly one target → 4097 ---
     let gk65 = format!("{:032x}", 65u32);
-    install_group(&state, &gk65, witnesses).await;
+    install_group(&state, &gk65, 1).await;
     let topic65 = state
         .named_groups
         .read()
@@ -895,7 +1063,12 @@ async fn relay_target_cap_4096_accepted_then_4097_rejected() {
         now,
     )
     .await;
-    save_relay(&state).await.expect("save 4160");
+    let expected_derived_targets = 64 * witnesses + 1;
+    assert_eq!(
+        expected_derived_targets, 4097,
+        "the rejected arm crosses the target cap by exactly one"
+    );
+    save_relay(&state).await.expect("save 4097");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
     let err = r.expect_err("4097+ targets must be rejected");
@@ -993,6 +1166,297 @@ async fn relay_terminal_excess_sheds_oldest_to_live_budget() {
             j
         );
     }
+}
+
+/// MUT2: permit one extra combined per-group record before terminal pruning.
+/// The 64 live obligations must remain byte-for-byte represented by the same
+/// digest set while the single completed tombstone is shed.
+#[tokio::test]
+async fn relay_terminal_per_group_count_64_live_plus_1_completed() {
+    let (state, _dir) = s_state().await;
+    let group_key = format!("{:032x}", 0x41u32);
+    install_group(&state, &group_key, 0).await;
+    let topic = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .expect("group")
+        .metadata_topic
+        .clone();
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let now = unix_ms();
+    let live = build_entries(
+        &requester_kp,
+        &topic,
+        &group_key,
+        &requester_hex,
+        now,
+        CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+        0,
+    );
+    install_relay_entries(&state, &group_key, &live, &requester_hex, now).await;
+    let live_digests = relay_live_digests(&state).await;
+    let completed = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &group_key,
+        "terminal-count-group",
+        &requester_hex,
+        now + 1,
+        0,
+    );
+    install_relay_tombstones(
+        &state,
+        &group_key,
+        &[(completed, now + 1)],
+        &requester_hex,
+        now + 2,
+    )
+    .await;
+
+    save_relay(&state)
+        .await
+        .expect("save 64 live plus terminal");
+    restart_relay(&state)
+        .await
+        .expect("terminal-only count excess must be pruned");
+    assert_eq!(relay_outbox_total(&state).await, 64);
+    assert_eq!(relay_live_digests(&state).await, live_digests);
+    assert!(
+        state
+            .completed_relay_tombstones
+            .read()
+            .await
+            .values()
+            .all(Vec::is_empty),
+        "only the completed tombstone is shed"
+    );
+}
+
+/// MUT2: permit one extra combined daemon record before terminal pruning. The
+/// exact set of 1024 live obligations must survive while the 1025th terminal
+/// record is discarded.
+#[tokio::test]
+async fn relay_terminal_daemon_count_1024_live_plus_1_completed() {
+    let (state, _dir) = s_state().await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let now = unix_ms();
+    for group_index in 0..16u32 {
+        let group_key = format!("{:032x}", 0x100u32 + group_index);
+        install_group(&state, &group_key, 0).await;
+        let topic = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("group")
+            .metadata_topic
+            .clone();
+        let live = build_entries(
+            &requester_kp,
+            &topic,
+            &group_key,
+            &requester_hex,
+            now,
+            CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+            0,
+        );
+        install_relay_entries(&state, &group_key, &live, &requester_hex, now).await;
+    }
+    assert_eq!(relay_outbox_total(&state).await, 1024);
+    let live_digests = relay_live_digests(&state).await;
+
+    let terminal_group = format!("{:032x}", 0x200u32);
+    install_group(&state, &terminal_group, 0).await;
+    let terminal_topic = state
+        .named_groups
+        .read()
+        .await
+        .get(&terminal_group)
+        .expect("terminal group")
+        .metadata_topic
+        .clone();
+    let completed = build_relay_entry(
+        &requester_kp,
+        &terminal_topic,
+        &terminal_group,
+        "terminal-count-daemon",
+        &requester_hex,
+        now + 1,
+        0,
+    );
+    install_relay_tombstones(
+        &state,
+        &terminal_group,
+        &[(completed, now + 1)],
+        &requester_hex,
+        now + 2,
+    )
+    .await;
+
+    save_relay(&state)
+        .await
+        .expect("save 1024 live plus terminal");
+    restart_relay(&state)
+        .await
+        .expect("daemon terminal-only count excess must be pruned");
+    assert_eq!(relay_outbox_total(&state).await, 1024);
+    assert_eq!(relay_live_digests(&state).await, live_digests);
+    assert!(
+        state
+            .completed_relay_tombstones
+            .read()
+            .await
+            .values()
+            .all(Vec::is_empty),
+        "only the daemon-wide terminal excess is shed"
+    );
+}
+
+/// MUT2: add one maximum-envelope grace to combined per-group bytes before
+/// terminal pruning. Exactly 1 MiB of live envelope data must survive unchanged.
+#[tokio::test]
+async fn relay_terminal_per_group_byte_boundary() {
+    let (state, _dir) = s_state().await;
+    let group_key = format!("{:032x}", 0x301u32);
+    install_group(&state, &group_key, 0).await;
+    let topic = state
+        .named_groups
+        .read()
+        .await
+        .get(&group_key)
+        .expect("group")
+        .metadata_topic
+        .clone();
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let now = unix_ms();
+    let live = build_exact_relay_entries(
+        &requester_kp,
+        &topic,
+        &group_key,
+        &requester_hex,
+        now,
+        16,
+        CAUSAL_ENVELOPE_MAX_BYTES,
+    );
+    install_relay_entries(&state, &group_key, &live, &requester_hex, now).await;
+    assert_eq!(
+        relay_semantic_bytes(&state).await,
+        CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
+    );
+    let live_digests = relay_live_digests(&state).await;
+    let completed = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &group_key,
+        "terminal-byte-group",
+        &requester_hex,
+        now + 1,
+        0,
+    );
+    install_relay_tombstones(
+        &state,
+        &group_key,
+        &[(completed, now + 1)],
+        &requester_hex,
+        now + 2,
+    )
+    .await;
+    assert!(relay_semantic_bytes(&state).await > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP);
+
+    save_relay(&state)
+        .await
+        .expect("save 1 MiB live plus terminal");
+    restart_relay(&state)
+        .await
+        .expect("terminal-only per-group byte excess must be pruned");
+    assert_eq!(
+        relay_semantic_bytes(&state).await,
+        CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
+    );
+    assert_eq!(relay_live_digests(&state).await, live_digests);
+}
+
+/// MUT2: add one maximum-envelope grace to combined daemon bytes before
+/// terminal pruning. Exactly 16 MiB of live envelope data must survive unchanged.
+#[tokio::test]
+async fn relay_terminal_daemon_byte_boundary() {
+    let (state, _dir) = s_state().await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let now = unix_ms();
+    for group_index in 0..16u32 {
+        let group_key = format!("{:032x}", 0x400u32 + group_index);
+        install_group(&state, &group_key, 0).await;
+        let topic = state
+            .named_groups
+            .read()
+            .await
+            .get(&group_key)
+            .expect("group")
+            .metadata_topic
+            .clone();
+        let live = build_exact_relay_entries(
+            &requester_kp,
+            &topic,
+            &group_key,
+            &requester_hex,
+            now,
+            16,
+            CAUSAL_ENVELOPE_MAX_BYTES,
+        );
+        install_relay_entries(&state, &group_key, &live, &requester_hex, now).await;
+    }
+    assert_eq!(
+        relay_semantic_bytes(&state).await,
+        CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
+    );
+    let live_digests = relay_live_digests(&state).await;
+
+    let terminal_group = format!("{:032x}", 0x500u32);
+    install_group(&state, &terminal_group, 0).await;
+    let terminal_topic = state
+        .named_groups
+        .read()
+        .await
+        .get(&terminal_group)
+        .expect("terminal group")
+        .metadata_topic
+        .clone();
+    let completed = build_relay_entry(
+        &requester_kp,
+        &terminal_topic,
+        &terminal_group,
+        "terminal-byte-daemon",
+        &requester_hex,
+        now + 1,
+        0,
+    );
+    install_relay_tombstones(
+        &state,
+        &terminal_group,
+        &[(completed, now + 1)],
+        &requester_hex,
+        now + 2,
+    )
+    .await;
+    assert!(relay_semantic_bytes(&state).await > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP);
+
+    save_relay(&state)
+        .await
+        .expect("save 16 MiB live plus terminal");
+    restart_relay(&state)
+        .await
+        .expect("terminal-only daemon byte excess must be pruned");
+    assert_eq!(
+        relay_semantic_bytes(&state).await,
+        CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP
+    );
+    assert_eq!(relay_live_digests(&state).await, live_digests);
 }
 
 // ===========================================================================
@@ -1146,21 +1610,148 @@ async fn causal_queue_daemon_count_cap_1024_accepted_then_1025_rejected() {
 }
 
 // ===========================================================================
+// Row 7 — causal approval queue per-group BYTE cap (exact 1 MiB)
+// ===========================================================================
+
+/// MUT2: raise or omit the per-group byte rejection in
+/// `load_causal_approval_queue`; the exact 1 MiB plus one valid envelope arm
+/// then installs instead of rejecting the complete sidecar.
+#[tokio::test]
+async fn causal_queue_per_group_byte_cap_exact_1mib_accepted_rejected() {
+    let (state, _dir) = s_state().await;
+    let group_key = format!("{:032x}", 0x601u32);
+    install_group(&state, &group_key, 0).await;
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    let accepted_count = CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP / exact_entry_bytes;
+    assert_eq!(accepted_count, 16);
+    assert!(accepted_count < CAUSAL_APPROVAL_PER_GROUP_CAP);
+
+    install_queue_entries_exact_size(&state, &group_key, accepted_count, exact_entry_bytes).await;
+    assert_eq!(
+        queue_semantic_bytes(&state).await,
+        CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP,
+        "accepted causal semantic total is exactly 1 MiB"
+    );
+    let accepted_digests = queue_live_digests(&state).await;
+    save_queue(&state).await.expect("save exact 1 MiB queue");
+    restart_queue(&state)
+        .await
+        .expect("exact per-group causal byte cap must load");
+    assert_eq!(queue_total(&state).await, accepted_count);
+    assert_eq!(queue_live_digests(&state).await, accepted_digests);
+
+    state.causal_approval_queue.write().await.clear();
+    install_queue_entries_exact_size(&state, &group_key, accepted_count, exact_entry_bytes).await;
+    install_queue_entries(&state, &group_key, 1).await;
+    assert!(queue_semantic_bytes(&state).await > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP);
+    assert!(queue_total(&state).await < CAUSAL_APPROVAL_PER_GROUP_CAP);
+    save_queue(&state).await.expect("save over 1 MiB queue");
+    let before = queue_sidecar_bytes(&state).await;
+    let result = restart_queue(&state).await;
+    assert!(result.is_err(), "over-cap causal group must be rejected");
+    assert_eq!(queue_total(&state).await, 0, "zero entries installed");
+    assert_eq!(queue_sidecar_bytes(&state).await, before, "bytes preserved");
+}
+
+// ===========================================================================
+// Row 7 — causal approval queue daemon BYTE cap (exact 16 MiB)
+// ===========================================================================
+
+/// MUT2: raise or omit the daemon byte rejection in
+/// `load_causal_approval_queue`; the exact 16 MiB plus one valid envelope arm
+/// then installs instead of rejecting the complete sidecar.
+#[tokio::test]
+async fn causal_queue_daemon_byte_cap_exact_16mib_accepted_rejected() {
+    let (state, _dir) = s_state().await;
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    let per_group = CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP / exact_entry_bytes;
+    for group_index in 0..16u32 {
+        let group_key = format!("{:032x}", 0x700u32 + group_index);
+        install_group(&state, &group_key, 0).await;
+        install_queue_entries_exact_size(&state, &group_key, per_group, exact_entry_bytes).await;
+    }
+    assert_eq!(queue_total(&state).await, 256);
+    assert_eq!(
+        queue_semantic_bytes(&state).await,
+        CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP,
+        "accepted causal semantic total is exactly 16 MiB"
+    );
+    let accepted_digests = queue_live_digests(&state).await;
+    save_queue(&state).await.expect("save exact 16 MiB queue");
+    restart_queue(&state)
+        .await
+        .expect("exact daemon causal byte cap must load");
+    assert_eq!(queue_total(&state).await, 256);
+    assert_eq!(queue_live_digests(&state).await, accepted_digests);
+
+    let over_group = format!("{:032x}", 0x800u32);
+    install_group(&state, &over_group, 0).await;
+    install_queue_entries(&state, &over_group, 1).await;
+    assert!(queue_semantic_bytes(&state).await > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP);
+    assert!(queue_total(&state).await < CAUSAL_APPROVAL_PER_DAEMON_CAP);
+    save_queue(&state).await.expect("save over 16 MiB queue");
+    let before = queue_sidecar_bytes(&state).await;
+    let result = restart_queue(&state).await;
+    assert!(result.is_err(), "over-cap causal daemon must be rejected");
+    assert_eq!(queue_total(&state).await, 0, "zero entries installed");
+    assert_eq!(queue_sidecar_bytes(&state).await, before, "bytes preserved");
+}
+
+// ===========================================================================
+// Row 6 — causal high expansion under the derived ×16 file guard.
+// ===========================================================================
+
+/// Both the signed envelope and the decoded event carry the large welcome
+/// field. MUT2: tighten the queue loader threshold to half the semantic daemon
+/// byte cap; the authenticated, within-budget queue then fails before validation.
+#[tokio::test]
+async fn causal_queue_high_expansion_within_budget_reloads_under_file_guard() {
+    let (state, _dir) = s_state().await;
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    for group_index in 0..4u32 {
+        let group_key = format!("{:032x}", 0x900u32 + group_index);
+        install_group(&state, &group_key, 0).await;
+        install_queue_entries_exact_size(&state, &group_key, 16, exact_entry_bytes).await;
+    }
+    let raw_bytes = queue_semantic_bytes(&state).await;
+    assert_eq!(raw_bytes, 4 * 1024 * 1024);
+    assert!(raw_bytes < CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP);
+    let accepted_digests = queue_live_digests(&state).await;
+    save_queue(&state)
+        .await
+        .expect("save high-expansion causal queue");
+    let file_bytes = queue_sidecar_bytes(&state).await.len();
+    assert!(
+        file_bytes > raw_bytes * 2,
+        "numeric envelope arrays plus decoded events expand the file: {file_bytes} > {}",
+        raw_bytes * 2
+    );
+    assert!(file_bytes <= QUEUE_SIDECAR_FILE_SIZE_CAP);
+    restart_queue(&state)
+        .await
+        .expect("within-budget high-expansion causal queue must reload");
+    assert_eq!(queue_total(&state).await, 64);
+    assert_eq!(queue_live_digests(&state).await, accepted_digests);
+}
+
+// ===========================================================================
 // Row 6 — high-expansion within-budget reload under the derived ×16 guard.
 // ===========================================================================
 
 /// The file-size guard (RELAY_SIDECAR_FILE_SIZE_CAP = byte_cap × 16) must
 /// accommodate the ×4 JSON expansion of Vec<u8> as number arrays. A sidecar
 /// whose raw envelope bytes are within the daemon byte cap but whose JSON
-/// file is several times larger must load. MUT2: tighten the guard to ×2.
+/// file is several times larger must load. MUT2: tighten the relay loader
+/// threshold to half the semantic daemon byte cap.
 #[tokio::test]
 async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
     let (state, _dir) = s_state().await;
     let requester_kp = fresh_kp();
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
-    let pad = 55_000usize;
-    // 4 groups × 16 entries × ~55 KB → ~3.9 MB raw, ~16 MB JSON (×4).
+    let exact_entry_bytes = CAUSAL_ENVELOPE_MAX_BYTES;
+    // 4 groups × 16 entries × 64 KiB = 4 MiB raw, with Vec<u8> JSON
+    // number-array expansion well above ×2 but below the derived ×16 guard.
     for gi in 0..4u32 {
         let gk = format!("{:032x}", gi);
         install_group(&state, &gk, 0).await;
@@ -1172,7 +1763,15 @@ async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
             .expect("gk")
             .metadata_topic
             .clone();
-        let entries = build_entries(&requester_kp, &topic, &gk, &requester_hex, now, 16, pad);
+        let entries = build_exact_relay_entries(
+            &requester_kp,
+            &topic,
+            &gk,
+            &requester_hex,
+            now,
+            16,
+            exact_entry_bytes,
+        );
         let gp_bytes: usize = entries.iter().map(|e| e.byte_size).sum();
         assert!(
             gp_bytes <= CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
@@ -1188,6 +1787,7 @@ async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
         .flatten()
         .map(|o| o.byte_size)
         .sum();
+    assert_eq!(raw_bytes, 4 * 1024 * 1024);
     assert!(
         raw_bytes <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
         "raw within daemon byte cap"
