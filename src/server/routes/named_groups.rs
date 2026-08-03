@@ -16469,11 +16469,33 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
             );
         }
     }
-    *state.causal_approval_queue.write().await = queue;
     // B3: load conflict tombstones from the sidecar.
     // Finding 8: prune to enforce daemon-wide and per-group caps on load.
     let mut conflict_tombstones = loaded_sidecar.conflict_tombstones;
     prune_conflict_tombstones(&mut conflict_tombstones);
+
+    // A visible sidecar may be the result of a prior rename whose parent-dir
+    // fsync failed. Authenticate and bound the complete detached candidate,
+    // then replace + parent-fsync that exact candidate before it becomes
+    // replay-eligible. A supervisor retry therefore cannot promote a merely
+    // visible causal admission to authorization by inspection. Rejected
+    // inputs return above and remain byte-identical for diagnosis.
+    let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
+    let json = serialize_causal_queue_sidecar(&queue, &conflict_tombstones)
+        .map_err(|error| format!("failed to serialize accepted causal queue: {error}"))?;
+    match write_causal_queue_sidecar(state, &json).await {
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            return Err(
+                "causal queue replacement is visible but not directory-durable".to_string(),
+            );
+        }
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+            return Err("causal queue replacement was not persisted".to_string());
+        }
+    }
+
+    *state.causal_approval_queue.write().await = queue;
     *state.causal_conflict_tombstones.write().await = conflict_tombstones;
     Ok(())
 }
