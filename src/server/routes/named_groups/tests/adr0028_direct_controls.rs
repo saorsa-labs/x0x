@@ -67,7 +67,11 @@ fn fresh_kp() -> AgentKeypair {
 /// `decode_auto` to a `verified` `PubSubMessage` whose `sender` is
 /// `kp.agent_id()` — exactly the wire shape the production relay listener
 /// offers to the authority and the shape `decode_and_verify_v2` demands.
-fn sign_v2_envelope(kp: &AgentKeypair, topic: &str, event: &NamedGroupMetadataEvent) -> Vec<u8> {
+pub(super) fn sign_v2_envelope(
+    kp: &AgentKeypair,
+    topic: &str,
+    event: &NamedGroupMetadataEvent,
+) -> Vec<u8> {
     use ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa;
 
     let payload = serde_json::to_vec(event).expect("serialize event");
@@ -259,7 +263,7 @@ async fn bind_pending_request_to_predecessor(
 /// Install a GSS group keyed by `group_key` (map key == stable id, as
 /// production keys it) with the local agent as the sole admin and `requester`
 /// as a pending join request. Returns the request id.
-async fn install_group_with_pending_request(
+pub(super) async fn install_group_with_pending_request(
     state: &AppState,
     group_key: &str,
     requester_hex: &str,

@@ -18941,6 +18941,7 @@ mod tests {
     use tokio::sync::{broadcast, mpsc, watch};
 
     mod adr0028_direct_controls;
+    mod adr0028_roster_replay_controls;
     mod cache_hardening_followup;
 
     fn fake_group_state_commit(
