@@ -16699,30 +16699,44 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     // derive this value from `now_ms` or from a later duplicate delivery.
     let original_groups_view = groups_view.clone();
     let mut legacy_clocks: HashMap<(String, String, String, [u8; 32]), u64> = HashMap::new();
+    // A prior startup may have replaced named_groups.json but failed the
+    // parent-directory fsync. On a supervisor retry that visible roster clock
+    // must not be treated as durable merely because it is now `Some`. Any
+    // authenticated sidecar proof bound to the same original clock forces a
+    // fresh Durable roster replacement before startup may succeed.
+    let mut roster_requires_durability_confirmation = false;
     for (group_id, entries) in &loaded_sidecar.entries {
         let Some(info) = groups_view.get(group_id) else {
             continue;
         };
         for entry in entries {
-            let request_needs_migration =
+            let Some(existing_clock) =
                 info.join_requests
                     .get(&entry.request_id)
-                    .is_some_and(|request| {
-                        request.requester_agent_id == entry.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(entry.digest)
-                            && request.predecessor_first_seen_ms.is_none()
-                    });
-            if !request_needs_migration
-                || validate_relay_obligation_for_restart(
-                    state,
-                    info,
-                    group_id,
-                    entry,
-                    entry.first_seen_ms,
-                    now_ms,
-                )
-                .is_err()
+                    .and_then(|request| {
+                        (request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(entry.digest))
+                        .then_some(request.predecessor_first_seen_ms)
+                    })
+            else {
+                continue;
+            };
+            if validate_relay_obligation_for_restart(
+                state,
+                info,
+                group_id,
+                entry,
+                entry.first_seen_ms,
+                now_ms,
+            )
+            .is_err()
             {
+                continue;
+            }
+            if let Some(existing_clock) = existing_clock {
+                if existing_clock == entry.first_seen_ms {
+                    roster_requires_durability_confirmation = true;
+                }
                 continue;
             }
             let key = (
@@ -16748,17 +16762,17 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             continue;
         };
         for receipt in receipts {
-            let request_needs_migration =
+            let Some(existing_clock) =
                 info.join_requests
                     .get(&receipt.request_id)
-                    .is_some_and(|request| {
-                        request.requester_agent_id == receipt.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(receipt.digest)
-                            && request.predecessor_first_seen_ms.is_none()
-                    });
-            if !request_needs_migration {
+                    .and_then(|request| {
+                        (request.requester_agent_id == receipt.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(receipt.digest))
+                        .then_some(request.predecessor_first_seen_ms)
+                    })
+            else {
                 continue;
-            }
+            };
             let evidence = PredecessorRelayObligation {
                 envelope_bytes: receipt.envelope_bytes.clone(),
                 digest: receipt.digest,
@@ -16784,6 +16798,12 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             {
                 continue;
             }
+            if let Some(existing_clock) = existing_clock {
+                if existing_clock == receipt.first_seen_ms {
+                    roster_requires_durability_confirmation = true;
+                }
+                continue;
+            }
             let key = (
                 group_id.clone(),
                 receipt.request_id.clone(),
@@ -16804,14 +16824,14 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     }
     if let Some(admission) = &loaded_sidecar.pending_listener_admission {
         if let Some(info) = groups_view.get(&admission.group_id) {
-            let request_needs_migration = info
-                .join_requests
-                .get(&admission.request_id)
-                .is_some_and(|request| {
-                    request.requester_agent_id == admission.requester_agent_id
-                        && request.predecessor_envelope_digest == Some(admission.digest)
-                        && request.predecessor_first_seen_ms.is_none()
-                });
+            let existing_clock =
+                info.join_requests
+                    .get(&admission.request_id)
+                    .and_then(|request| {
+                        (request.requester_agent_id == admission.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(admission.digest))
+                        .then_some(request.predecessor_first_seen_ms)
+                    });
             let evidence = PredecessorRelayObligation {
                 envelope_bytes: admission.envelope_bytes.clone(),
                 digest: admission.digest,
@@ -16825,33 +16845,38 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 relay_targets: Vec::new(),
                 completed_at_ms: None,
             };
-            if request_needs_migration
-                && validate_relay_obligation_for_restart(
-                    state,
-                    info,
-                    &admission.group_id,
-                    &evidence,
-                    admission.first_seen_ms,
-                    now_ms,
-                )
-                .is_ok()
+            if validate_relay_obligation_for_restart(
+                state,
+                info,
+                &admission.group_id,
+                &evidence,
+                admission.first_seen_ms,
+                now_ms,
+            )
+            .is_ok()
             {
-                let key = (
-                    admission.group_id.clone(),
-                    admission.request_id.clone(),
-                    admission.requester_agent_id.clone(),
-                    admission.digest,
-                );
-                if legacy_clocks
-                    .get(&key)
-                    .is_some_and(|existing| *existing != admission.first_seen_ms)
-                {
-                    return Err(
-                        "legacy relay sidecar contains conflicting first-observation clocks"
-                            .to_string(),
+                if let Some(Some(existing_clock)) = existing_clock {
+                    if existing_clock == admission.first_seen_ms {
+                        roster_requires_durability_confirmation = true;
+                    }
+                } else if matches!(existing_clock, Some(None)) {
+                    let key = (
+                        admission.group_id.clone(),
+                        admission.request_id.clone(),
+                        admission.requester_agent_id.clone(),
+                        admission.digest,
                     );
+                    if legacy_clocks
+                        .get(&key)
+                        .is_some_and(|existing| *existing != admission.first_seen_ms)
+                    {
+                        return Err(
+                            "legacy relay sidecar contains conflicting first-observation clocks"
+                                .to_string(),
+                        );
+                    }
+                    legacy_clocks.entry(key).or_insert(admission.first_seen_ms);
                 }
-                legacy_clocks.entry(key).or_insert(admission.first_seen_ms);
             }
         }
     }
@@ -16860,25 +16885,33 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             let Some(info) = groups_view.get(&entry.group_id) else {
                 continue;
             };
-            let request_needs_migration =
+            let Some(existing_clock) =
                 info.join_requests
                     .get(&entry.request_id)
-                    .is_some_and(|request| {
-                        request.requester_agent_id == entry.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(entry.digest)
-                            && request.predecessor_first_seen_ms.is_none()
-                    });
-            if !request_needs_migration
-                || validate_relay_obligation_for_restart(
-                    state,
-                    info,
-                    &entry.group_id,
-                    entry,
-                    entry.first_seen_ms,
-                    now_ms,
-                )
-                .is_err()
+                    .and_then(|request| {
+                        (request.requester_agent_id == entry.requester_agent_id
+                            && request.predecessor_envelope_digest == Some(entry.digest))
+                        .then_some(request.predecessor_first_seen_ms)
+                    })
+            else {
+                continue;
+            };
+            if validate_relay_obligation_for_restart(
+                state,
+                info,
+                &entry.group_id,
+                entry,
+                entry.first_seen_ms,
+                now_ms,
+            )
+            .is_err()
             {
+                continue;
+            }
+            if let Some(existing_clock) = existing_clock {
+                if existing_clock == entry.first_seen_ms {
+                    roster_requires_durability_confirmation = true;
+                }
                 continue;
             }
             let key = (
@@ -17192,7 +17225,8 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     // and their complete relay candidates have passed validation and every
     // governed cap. Journal evidence must never mutate the durable roster
     // before that journal itself is accepted.
-    let mut roster_candidate_changed = migrated_legacy_clock;
+    let mut roster_candidate_changed =
+        migrated_legacy_clock || roster_requires_durability_confirmation;
     let mut pending_compensation = loaded_sidecar.pending_compensation.clone();
     let mut pending_listener_admission = loaded_sidecar.pending_listener_admission.clone();
     let mut recovery_changed = false;
