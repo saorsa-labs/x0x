@@ -5030,6 +5030,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         // and lock acquisition would be erased by a save-failure rollback.
         let membership_lock = group_membership_lock(state, group_id).await;
         let _replay_membership_guard = membership_lock.lock().await;
+        // Finding 3 (Sam 6664f60): also hold the global roster persistence
+        // lock across mutation+persist+rollback so a concurrent cross-group
+        // save cannot durably snapshot A's replay candidate before A's save.
+        let _replay_roster_guard = state.named_groups_persistence_lock.lock().await;
         // B5: snapshot the group AFTER lock acquisition so we can roll back
         // the in-memory state if persistence fails. Without this, the next
         // replay sees the advanced in-memory state_hash as already_current
@@ -5056,17 +5060,23 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         ))
         .await;
 
-        let group_persisted = if applied.accepted {
+        let (group_persisted, skip_post_effects) = if applied.accepted {
             // apply mutated in-memory state (candidate) but did NOT save
             // (allow_queue=false skips save_named_groups in the inner apply).
             // This is the ONE checked persist. If it fails, ROLL BACK the
             // in-memory state to the pre-apply snapshot and retain the queue
             // entry so the next replay retries — no split-brain.
             // Finding 5: persist while holding the membership lock.
-            let persisted = save_named_groups_checked(state).await.is_ok();
+            // Watson ruling: Durable → persisted, proceed. ReplacedNotDurable →
+            // data IS on disk, memory matches, but don't do post-persist effects.
+            // NotReplaced/Err → rollback memory, retain queue entry.
+            let persist_outcome = save_named_groups_checked_unlocked(state).await;
+            let (persisted, skip) = match persist_outcome {
+                Ok(AtomicWriteOutcome::Durable) => (true, false),
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => (true, true),
+                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => (false, false),
+            };
             if !persisted {
-                // B5: roll back in-memory state to prevent false already_current.
-                // Finding 5: rollback while holding the membership lock.
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id),
                     request_id = %pending.request_id,
@@ -5077,14 +5087,26 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     groups.insert(group_id.to_string(), snapshot);
                 }
             }
-            persisted
+            (persisted, skip)
         } else {
-            false
+            (false, false)
         };
         // Finding 5: release the membership lock before post-persist effects.
         drop(_replay_membership_guard);
 
         if applied.accepted && group_persisted {
+            if skip_post_effects {
+                // Watson ruling: ReplacedNotDurable — data IS on disk but not
+                // dir-fsync'd. Do NOT publish, fan out, or record success.
+                // Retain the queue entry for retry.
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    request_id = %pending.request_id,
+                    "ADR 0028 B5: group state replaced but not directory-durable — retaining queue entry, skipping post-persist effects"
+                );
+                still_pending.push_back(pending);
+                continue;
+            }
             // B5: persist succeeded — now refresh the card cache and
             // record the membership event. These were deferred from the
             // inner apply (allow_queue=false) so a failed write leaves no
@@ -6633,13 +6655,28 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // checked save and, on failure, restore the pre-mutation in-memory
             // state so the listener does not create a relay obligation whose
             // pinned request is absent on restart.
-            if save_named_groups_checked(state).await.is_err() {
-                tracing::error!(
-                    group_id = %resolved_group_key,
-                    "JoinRequestCreated: durable save failed, restoring in-memory state"
-                );
-                store_named_group_info(state, &resolved_group_key, current).await;
-                return ApplyMetadataResult::REJECTED;
+            // Watson ruling: ReplacedNotDurable means the request IS on disk
+            // but not dir-fsync'd. Do NOT restore pre-mutation memory (that
+            // would diverge from durable). Return REJECTED so the listener
+            // does not create an obligation. The repair path services
+            // "request present, obligation absent" on re-delivery.
+            match save_named_groups_checked(state).await {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    tracing::error!(
+                        group_id = %resolved_group_key,
+                        "JoinRequestCreated: replaced but not directory-durable — request is on disk, returning REJECTED (repair path will service)"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                    tracing::error!(
+                        group_id = %resolved_group_key,
+                        "JoinRequestCreated: durable save failed, restoring in-memory state"
+                    );
+                    store_named_group_info(state, &resolved_group_key, current).await;
+                    return ApplyMetadataResult::REJECTED;
+                }
             }
             // ADR 0028: a JoinRequestCreated just advanced the group state.
             // Drain queued approvals that may now have their predecessor.
@@ -6873,13 +6910,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // so the replay's already_current proof cannot read stale memory
             // that diverges from the durable roster file.
             if allow_queue {
-                if save_named_groups_checked(state).await.is_err() {
-                    tracing::error!(
-                        group_id = %resolved_group_key,
-                        "JoinRequestApproved: durable save failed, restoring in-memory state"
-                    );
-                    store_named_group_info(state, &resolved_group_key, current).await;
-                    return ApplyMetadataResult::REJECTED;
+                match save_named_groups_checked(state).await {
+                    Ok(AtomicWriteOutcome::Durable) => {}
+                    Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                        // Watson ruling: data IS on disk but not dir-fsync'd.
+                        // Do NOT restore pre-mutation memory. Do NOT refresh
+                        // card cache or record event. Return REJECTED.
+                        tracing::error!(
+                            group_id = %resolved_group_key,
+                            "JoinRequestApproved: replaced but not directory-durable — returning REJECTED"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                    Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                        tracing::error!(
+                            group_id = %resolved_group_key,
+                            "JoinRequestApproved: durable save failed, restoring in-memory state"
+                        );
+                        store_named_group_info(state, &resolved_group_key, current).await;
+                        return ApplyMetadataResult::REJECTED;
+                    }
                 }
                 refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
             }
@@ -12890,6 +12940,8 @@ pub(in crate::server) async fn approve_join_request(
         // outbox save above, so if the compensating re-save also fails, the
         // restart loader can recover using the journal.
         if let Err(e) = save_named_groups_checked(&state).await {
+            // Watson ruling: Err means NotReplaced (rename never happened).
+            // ReplacedNotDurable is Ok(outcome) — handled separately below.
             // B8 atomicity: roll back the outbox refresh in memory.
             {
                 let mut outbox = state.predecessor_relay_outbox.write().await;
@@ -15453,161 +15505,6 @@ fn serialize_causal_queue_sidecar(
 /// `first_seen_ms`). Called at restart after loading both stores. The
 /// per-store caps applied during loading are first-pass filters; this
 /// function ensures the combined total never exceeds the accepted budget.
-/// Finding 2 (Watson 32c2d3a): truncate the oldest live obligations across
-/// all groups until `excess` entries are removed. Oldest = smallest
-/// `first_seen_ms`. This makes "fail closed" actually bound the state
-/// instead of just logging and retaining over-budget live entries.
-fn truncate_live_oldest_first(
-    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
-    excess: usize,
-) {
-    if excess == 0 {
-        return;
-    }
-    // Collect (group_id, index, first_seen_ms) for all live obligations.
-    let mut all: Vec<(String, usize, u64)> = Vec::new();
-    for (gid, list) in outbox.iter() {
-        for (i, o) in list.iter().enumerate() {
-            all.push((gid.clone(), i, o.first_seen_ms));
-        }
-    }
-    // Sort oldest-first (smallest first_seen_ms first).
-    all.sort_by_key(|e| e.2);
-    // Mark the oldest `excess` entries for removal.
-    let to_remove: std::collections::HashSet<(String, usize)> = all
-        .iter()
-        .take(excess)
-        .map(|e| (e.0.clone(), e.1))
-        .collect();
-    // Remove by index, per-group, in reverse index order to keep indices valid.
-    let mut groups_to_remove: Vec<String> = Vec::new();
-    for (gid, list) in outbox.iter_mut() {
-        let mut indices: Vec<usize> = to_remove
-            .iter()
-            .filter(|(g, _)| g == gid)
-            .map(|(_, i)| *i)
-            .collect();
-        indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
-        for i in indices {
-            if i < list.len() {
-                list.remove(i);
-            }
-        }
-        if list.is_empty() {
-            groups_to_remove.push(gid.clone());
-        }
-    }
-    for gid in groups_to_remove {
-        outbox.remove(&gid);
-    }
-}
-
-/// Finding 2: truncate the oldest live obligations until total bytes are
-/// within `byte_cap`. Oldest = smallest `first_seen_ms`.
-fn truncate_live_bytes_oldest_first(
-    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
-    byte_cap: usize,
-) {
-    let total_bytes: usize = outbox.values().flatten().map(|o| o.byte_size).sum();
-    if total_bytes <= byte_cap {
-        return;
-    }
-    // Collect (group_id, index, first_seen_ms, byte_size).
-    let mut all: Vec<(String, usize, u64, usize)> = Vec::new();
-    for (gid, list) in outbox.iter() {
-        for (i, o) in list.iter().enumerate() {
-            all.push((gid.clone(), i, o.first_seen_ms, o.byte_size));
-        }
-    }
-    // Sort oldest-first.
-    all.sort_by_key(|e| e.2);
-    let mut current = total_bytes;
-    let mut to_remove: std::collections::HashSet<(String, usize)> =
-        std::collections::HashSet::new();
-    for (gid, i, _, sz) in &all {
-        if current <= byte_cap {
-            break;
-        }
-        to_remove.insert((gid.clone(), *i));
-        current = current.saturating_sub(*sz);
-    }
-    let mut groups_to_remove: Vec<String> = Vec::new();
-    for (gid, list) in outbox.iter_mut() {
-        let mut indices: Vec<usize> = to_remove
-            .iter()
-            .filter(|(g, _)| g == gid)
-            .map(|(_, i)| *i)
-            .collect();
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        for i in indices {
-            if i < list.len() {
-                list.remove(i);
-            }
-        }
-        if list.is_empty() {
-            groups_to_remove.push(gid.clone());
-        }
-    }
-    for gid in groups_to_remove {
-        outbox.remove(&gid);
-    }
-}
-
-/// Finding 2: truncate the oldest live obligations until total relay targets
-/// are within `target_cap`. Oldest = smallest `first_seen_ms`.
-fn truncate_live_targets_oldest_first(
-    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
-    target_cap: usize,
-) {
-    let total_targets: usize = outbox
-        .values()
-        .flatten()
-        .map(|o| o.relay_targets.len())
-        .sum();
-    if total_targets <= target_cap {
-        return;
-    }
-    // Collect (group_id, index, first_seen_ms, target_count).
-    let mut all: Vec<(String, usize, u64, usize)> = Vec::new();
-    for (gid, list) in outbox.iter() {
-        for (i, o) in list.iter().enumerate() {
-            all.push((gid.clone(), i, o.first_seen_ms, o.relay_targets.len()));
-        }
-    }
-    // Sort oldest-first.
-    all.sort_by_key(|e| e.2);
-    let mut current = total_targets;
-    let mut to_remove: std::collections::HashSet<(String, usize)> =
-        std::collections::HashSet::new();
-    for (gid, i, _, tc) in &all {
-        if current <= target_cap {
-            break;
-        }
-        to_remove.insert((gid.clone(), *i));
-        current = current.saturating_sub(*tc);
-    }
-    let mut groups_to_remove: Vec<String> = Vec::new();
-    for (gid, list) in outbox.iter_mut() {
-        let mut indices: Vec<usize> = to_remove
-            .iter()
-            .filter(|(g, _)| g == gid)
-            .map(|(_, i)| *i)
-            .collect();
-        indices.sort_unstable_by(|a, b| b.cmp(a));
-        for i in indices {
-            if i < list.len() {
-                list.remove(i);
-            }
-        }
-        if list.is_empty() {
-            groups_to_remove.push(gid.clone());
-        }
-    }
-    for gid in groups_to_remove {
-        outbox.remove(&gid);
-    }
-}
-
 fn enforce_combined_relay_budget(
     outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
     tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
@@ -15615,14 +15512,15 @@ fn enforce_combined_relay_budget(
     // Finding C: never evict a live obligation to make room for a completed
     // receipt. Completed receipts may be shed oldest-first; live obligations
     // are only removed by their own lifecycle (relay success, expiry, or
-    // explicit cancel). If live state alone exceeds a bound, fail closed:
-    // truncate oldest-first (first_seen_ms) — the oldest obligations are the
-    // most likely to have exhausted retries and be closest to expiry.
+    // explicit cancel).
     //
-    // Finding 2 (Watson 32c2d3a): "fail closed" means the over-budget state
-    // is actually bounded, not just logged. An over-budget live set is
-    // truncated oldest-first to the cap so a 1,025-obligation or 4,097-target
-    // sidecar does NOT become active retry state.
+    // Finding 4 (Sam 6664f60): the governed rule is "never evict a live
+    // entry and report success" (groups-join-roster-propagation.md:137-39).
+    // If live state alone exceeds a bound, we do NOT truncate live and
+    // proceed — we clear completed and log an error. The over-budget live
+    // state is retained (it cannot be silently dropped), and the operator
+    // is alerted. This is the correct "fail closed" for live state: the
+    // state is not silently bounded, it is surfaced.
 
     // ── Combined count cap ─────────────────────────────────────────────
     let live_count: usize = outbox.values().flatten().count();
@@ -15630,17 +15528,15 @@ fn enforce_combined_relay_budget(
     let total_count = live_count + completed_count;
     if total_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
         if live_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
-            // Live alone exceeds the cap — truncate oldest-first.
+            // Finding 4 (Sam 6664f60): never evict live. Clear completed,
+            // log the error, retain the over-budget live set. The operator
+            // is alerted; the live state is not silently dropped.
             tracing::error!(
                 live_count,
                 cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-                "ADR 0028: live obligations alone exceed daemon count cap, truncating oldest-first"
+                "ADR 0028: live obligations alone exceed daemon count cap — retaining live, clearing completed (never evict live)"
             );
-            // Drop ALL completed receipts to free what we can.
             tombstones.clear();
-            // Truncate live oldest-first to the cap.
-            let excess = live_count - CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP;
-            truncate_live_oldest_first(outbox, excess);
         } else {
             // Shed completed receipts oldest-first until within budget.
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP - live_count;
@@ -15684,14 +15580,14 @@ fn enforce_combined_relay_budget(
     let total_bytes = live_bytes + completed_bytes;
     if total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
         if live_bytes >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+            // Finding 4 (Sam 6664f60): never evict live. Clear completed,
+            // log the error, retain the over-budget live set.
             tracing::error!(
                 live_bytes,
                 cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-                "ADR 0028: live obligations alone exceed daemon byte cap, truncating oldest-first"
+                "ADR 0028: live obligations alone exceed daemon byte cap — retaining live, clearing completed (never evict live)"
             );
             tombstones.clear();
-            // Finding 2: truncate live oldest-first until within byte cap.
-            truncate_live_bytes_oldest_first(outbox, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP);
         } else {
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP - live_bytes;
             let mut all_completed: Vec<(String, u64, usize, usize)> = Vec::new();
@@ -15727,10 +15623,8 @@ fn enforce_combined_relay_budget(
 
     // ── Per-group combined count cap (live + completed) ────────────────
     // Finding C/3: a single group can no longer hold 64 live + 64 completed.
-    // Protect live obligations: shed only completed receipts oldest-first.
-    // Finding 4 (Sam 4ea68a9): when live alone exceeds the per-group cap,
-    // truncate live oldest-first to the cap — do not install over-budget
-    // live state. This matches the daemon-wide behavior.
+    // Finding 4 (Sam 6664f60): never evict live — if live alone exceeds the
+    // per-group cap, clear completed for that group and log the error.
     let all_group_ids: std::collections::HashSet<String> =
         outbox.keys().chain(tombstones.keys()).cloned().collect();
     for gid in all_group_ids {
@@ -15738,18 +15632,12 @@ fn enforce_combined_relay_budget(
         let completed_n = tombstones.get(&gid).map(|l| l.len()).unwrap_or(0);
         if live_n + completed_n > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
             if live_n > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
-                // Live alone exceeds per-group cap — truncate oldest-first.
                 tracing::error!(
                     group_id = %gid,
                     live_n,
                     cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-                    "ADR 0028: per-group live count exceeds cap, truncating oldest-first"
+                    "ADR 0028: per-group live count exceeds cap — retaining live, clearing completed (never evict live)"
                 );
-                if let Some(list) = outbox.get_mut(&gid) {
-                    list.sort_by_key(|o| o.first_seen_ms);
-                    list.truncate(CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP);
-                }
-                // Also shed all completed for this group.
                 tombstones.remove(&gid);
             } else {
                 let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP.saturating_sub(live_n);
@@ -15763,7 +15651,7 @@ fn enforce_combined_relay_budget(
     }
 
     // ── Per-group combined byte cap (live + completed) ─────────────────
-    // Finding 4: same per-group live truncation for byte cap.
+    // Finding 4: same never-evict-live policy for byte cap.
     for gid in outbox
         .keys()
         .chain(tombstones.keys())
@@ -15780,21 +15668,12 @@ fn enforce_combined_relay_budget(
             .unwrap_or(0);
         if live_bytes + completed_bytes > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
             if live_bytes > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
-                // Live alone exceeds per-group byte cap — truncate oldest-first.
                 tracing::error!(
                     group_id = %gid,
                     live_bytes,
                     cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-                    "ADR 0028: per-group live bytes exceed cap, truncating oldest-first"
+                    "ADR 0028: per-group live bytes exceed cap — retaining live, clearing completed (never evict live)"
                 );
-                if let Some(list) = outbox.get_mut(&gid) {
-                    list.sort_by_key(|o| o.first_seen_ms);
-                    let mut current = live_bytes;
-                    while current > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP && !list.is_empty() {
-                        let removed = list.remove(0);
-                        current = current.saturating_sub(removed.byte_size);
-                    }
-                }
                 tombstones.remove(&gid);
             } else {
                 let budget_for_completed =
@@ -15816,21 +15695,29 @@ fn enforce_combined_relay_budget(
 /// ADR 0028 R4: Write the causal approval queue sidecar JSON to disk. No data
 /// locks are acquired — caller serializes under data locks, then calls this
 /// while holding only the persistence lock.
-async fn write_causal_queue_sidecar(state: &AppState, json: &str) -> std::io::Result<()> {
+async fn write_causal_queue_sidecar(
+    state: &AppState,
+    json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    // Finding 2 (Sam 6664f60): parent-dir fsync is now handled inside
+    // write_named_groups_json_atomic. Do not fsync again here — a
+    // second fsync failure would return Err from an already-durable
+    // sidecar, causing callers to roll back memory from durable state.
     write_named_groups_json_atomic(&state.causal_approval_queue_path, json)
         .await
         .map_err(|e| {
             tracing::error!("Failed to save causal approval queue: {e}");
             e
-        })?;
-    sync_parent_dir_for_path(&state.causal_approval_queue_path)
+        })
 }
 
 /// ADR 0028: Write the causal approval queue sidecar WITHOUT acquiring the
 /// persistence lock. Caller MUST already hold
 /// `causal_approval_queue_persistence_lock`. Global lock order: persistence
 /// (P) → data (Q) — all writers acquire P first, then data locks.
-async fn save_causal_approval_queue_unlocked(state: &AppState) -> std::io::Result<()> {
+async fn save_causal_approval_queue_unlocked(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
     let json = {
         let queue = state.causal_approval_queue.read().await;
         let tombstones = state.causal_conflict_tombstones.read().await;
@@ -15844,7 +15731,9 @@ async fn save_causal_approval_queue_unlocked(state: &AppState) -> std::io::Resul
 /// locks (Q). Global lock order P→Q. Public wrapper for callers that do not
 /// already hold the persistence lock.
 #[allow(dead_code)]
-pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> std::io::Result<()> {
+pub(in crate::server) async fn save_causal_approval_queue(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
     let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
     save_causal_approval_queue_unlocked(state).await
 }
@@ -15855,7 +15744,7 @@ pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> s
 /// persistence (P) → data (Q) — all writers acquire P first, then data locks.
 pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
     state: &AppState,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicWriteOutcome> {
     let json = {
         let outbox = state.predecessor_relay_outbox.read().await;
         let tombstones = state.completed_relay_tombstones.read().await;
@@ -15871,7 +15760,7 @@ pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
 /// locks (Q). Global lock order P→Q.
 pub(in crate::server) async fn save_predecessor_relay_outbox(
     state: &AppState,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicWriteOutcome> {
     let _persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
     save_predecessor_relay_outbox_unlocked(state).await
 }
@@ -15898,14 +15787,18 @@ fn serialize_relay_outbox_sidecar(
 /// ADR 0028 R4: Write the relay outbox sidecar JSON to disk. No data locks
 /// are acquired — caller serializes under data locks, then calls this while
 /// holding only the persistence lock.
-async fn write_relay_outbox_sidecar(state: &AppState, json: &str) -> std::io::Result<()> {
+async fn write_relay_outbox_sidecar(
+    state: &AppState,
+    json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    // Finding 2 (Sam 6664f60): parent-dir fsync is now handled inside
+    // write_named_groups_json_atomic. Do not fsync again here.
     write_named_groups_json_atomic(&state.predecessor_relay_outbox_path, json)
         .await
         .map_err(|e| {
             tracing::error!("Failed to save predecessor relay outbox: {e}");
             e
-        })?;
-    sync_parent_dir_for_path(&state.predecessor_relay_outbox_path)
+        })
 }
 
 /// Synchronous parent-directory fsync after atomic rename. Required for
@@ -16007,23 +15900,12 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
                 continue;
             }
-            // Finding 4 (Sam 4ea68a9): do NOT break on per-group/per-daemon
-            // caps — break installs a live prefix and silently drops remaining
-            // entries. Use continue so all valid entries are considered;
-            // the caps are enforced after loading via the accounting below.
-            if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
-                continue;
-            }
-            if group_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
-                continue;
-            }
-            // Enforce per-daemon caps (derived).
-            if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
-                continue;
-            }
-            if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
-                continue;
-            }
+            // Finding 5 (Sam 6664f60): cap checks AFTER validation, not before.
+            // Previously, `continue` at cap checks sat before exact-envelope
+            // validation, so once capped every later entry was silently skipped
+            // and only the retained prefix was installed. Now: validate every
+            // entry first, then check caps. Over-cap entries are logged and
+            // dropped with a diagnostic — no silent prefix.
             // ADR 0028 B7: restart revalidation using the shared exact-envelope
             // validator. Binds: V2 decode + ML-DSA signature, decoded event ==
             // stored event, signer == approval actor, group_id == stored group.
@@ -16092,6 +15974,35 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
                     );
                     continue;
                 }
+            }
+            // Finding 5 (Sam 6664f60): cap checks AFTER validation. The entry
+            // has passed exact-envelope validation. Now check caps: if over
+            // budget, log and drop with a diagnostic — no silent prefix.
+            if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: per-group causal queue count cap reached, dropping validated entry"
+                );
+                continue;
+            }
+            if group_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "ADR 0028: per-group causal queue byte cap reached, dropping validated entry"
+                );
+                continue;
+            }
+            if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
+                tracing::warn!(
+                    "ADR 0028: daemon causal queue count cap reached, dropping validated entry"
+                );
+                continue;
+            }
+            if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
+                tracing::warn!(
+                    "ADR 0028: daemon causal queue byte cap reached, dropping validated entry"
+                );
+                continue;
             }
             group_count += 1;
             group_bytes += derived_byte_size;
@@ -16344,16 +16255,14 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         .map(|o| o.relay_targets.len())
         .sum();
     if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+        // Finding 4 (Sam 6664f60): never evict live. Clear completed, log
+        // the error, retain the over-budget live state.
         tracing::error!(
             live_targets,
             cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-            "ADR 0028: live relay targets exceed daemon cap on restart, truncating oldest-first"
+            "ADR 0028: live relay targets exceed daemon cap on restart — retaining live, clearing completed (never evict live)"
         );
-        // Shed completed tombstones — they also carry target-like overhead.
         tombstones.clear();
-        // Finding 2: truncate live obligations oldest-first until total
-        // targets are within the cap. Do not retain over-budget live state.
-        truncate_live_targets_oldest_first(&mut outbox, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP);
     }
     *state.predecessor_relay_outbox.write().await = outbox;
     *state.completed_relay_tombstones.write().await = tombstones;
@@ -16538,17 +16447,13 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                             .map(|o| o.relay_targets.len())
                             .sum();
                         if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+                            // Finding 4 (Sam 6664f60): never evict live.
                             tracing::error!(
                                 live_targets,
                                 cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-                                "ADR 0028 B8: journal restore pushes live targets over daemon cap, truncating oldest-first"
+                                "ADR 0028 B8: journal restore pushes live targets over daemon cap — retaining live, clearing completed (never evict live)"
                             );
                             tombstones.clear();
-                            // Finding 2: truncate to bound, not just log.
-                            truncate_live_targets_oldest_first(
-                                &mut outbox,
-                                CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-                            );
                         }
                     }
                     true
@@ -16583,13 +16488,18 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
 }
 
 async fn save_named_groups(state: &AppState) {
-    let _ = save_named_groups_checked(state).await;
+    let _ = save_named_groups_checked(state).await.map(|_| ());
 }
 
 /// ADR 0028: checked version of save_named_groups that returns an error on
 /// write failure so the causal replay path can refuse to drop a queue entry
 /// when group-state persistence failed (audit 5).
-pub(in crate::server) async fn save_named_groups_checked(state: &AppState) -> std::io::Result<()> {
+/// Watson ruling: returns `AtomicWriteOutcome` so callers can distinguish
+/// `NotReplaced` (destination unchanged) from `ReplacedNotDurable` (data
+/// on disk but not dir-fsync'd) from `Durable`.
+pub(in crate::server) async fn save_named_groups_checked(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     save_named_groups_checked_unlocked(state).await
 }
@@ -16601,7 +16511,7 @@ pub(in crate::server) async fn save_named_groups_checked(state: &AppState) -> st
 /// snapshotting the pre-revert state.
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
-) -> std::io::Result<()> {
+) -> std::io::Result<AtomicWriteOutcome> {
     let json = {
         let groups = state.named_groups.read().await;
         serde_json::to_string(&*groups)
@@ -16631,13 +16541,12 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
     }
 }
 
-async fn write_treekem_cache_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
+async fn write_treekem_cache_json_atomic(
+    path: &FsPath,
+    json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
     #[cfg(test)]
     if let Some(control) = take_treekem_cache_writer_hook_for_test(path) {
-        // The writer has entered the one-shot hook. Signal entry with a stored
-        // permit (notify_one keeps it until awaited, so observation is free of
-        // await-ordering races), then either inject a failure or park until the
-        // test releases a slow-disk simulation.
         control.entered.notify_one();
         if let Some(error) = control.force_error {
             return Err(error);
@@ -16649,37 +16558,72 @@ async fn write_treekem_cache_json_atomic(path: &FsPath, json: &str) -> std::io::
     write_named_groups_json_atomic(path, json).await
 }
 
-async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::Result<()> {
+/// Watson ruling (ADR 0028): tri-state outcome for atomic file replacement.
+/// A Boolean `Err` cannot encode the stages of atomic replacement.
+/// - `NotReplaced`: failure before/during rename; destination unchanged;
+///   caller may restore pre-mutation memory.
+/// - `ReplacedNotDurable`: rename succeeded but parent-dir fsync failed;
+///   destination holds the new content. Keep memory matching the visible
+///   destination; do NOT publish, fan out, record success, or proceed.
+/// - `Durable`: rename + parent fsync both succeeded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum AtomicWriteOutcome {
+    /// Watson ruling: pre-rename failure. Destination unchanged.
+    #[allow(dead_code)]
+    NotReplaced,
+    /// Rename succeeded but parent-dir fsync failed. Destination holds
+    /// the new content. Do NOT publish/fan-out/proceed.
+    ReplacedNotDurable,
+    /// Rename + parent fsync both succeeded.
+    Durable,
+}
+
+impl AtomicWriteOutcome {
+    /// Returns true only if the replacement is fully durable.
+    pub(in crate::server) fn is_durable(self) -> bool {
+        matches!(self, Self::Durable)
+    }
+}
+
+async fn write_named_groups_json_atomic(
+    path: &FsPath,
+    json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
     use tokio::io::AsyncWriteExt;
 
     let mut temp_os = path.as_os_str().to_owned();
     temp_os.push(format!(".{}.tmp", uuid::Uuid::new_v4()));
     let temp_path = PathBuf::from(temp_os);
 
-    let write_result = async {
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&temp_path)
-            .await?;
-        file.write_all(json.as_bytes()).await?;
-        file.sync_all().await?;
-        drop(file);
-        tokio::fs::rename(&temp_path, path).await?;
-        // Finding 5 (Sam 4ea68a9): fsync the parent directory after rename
-        // so the rename is durable before any dependent publication
-        // (B8 approval fan-out) proceeds. Without this, a crash can expose
-        // an approval whose authority roster was never directory-durable.
-        sync_parent_dir_for_path(path)?;
-        Ok::<(), std::io::Error>(())
-    }
-    .await;
+    // Finding 1 (Sam 6664f60) / Watson ruling: stage-aware atomic
+    // replacement. The rename is the point of no return.
+    let mut file = tokio::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&temp_path)
+        .await?;
+    file.write_all(json.as_bytes()).await?;
+    file.sync_all().await?;
+    drop(file);
 
-    if write_result.is_err() {
+    // Pre-rename failure: destination unchanged.
+    if let Err(e) = tokio::fs::rename(&temp_path, path).await {
         let _ = tokio::fs::remove_file(&temp_path).await;
+        return Err(e);
     }
 
-    write_result
+    // Post-rename: destination holds new content. Parent-dir fsync determines
+    // durability, not whether the data is on disk.
+    match sync_parent_dir_for_path(path) {
+        Ok(()) => Ok(AtomicWriteOutcome::Durable),
+        Err(e) => {
+            tracing::error!(
+                error = %e,
+                "ADR 0028: parent-dir fsync failed after rename — data is replaced but not directory-durable (ReplacedNotDurable)"
+            );
+            Ok(AtomicWriteOutcome::ReplacedNotDurable)
+        }
+    }
 }
 
 const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);

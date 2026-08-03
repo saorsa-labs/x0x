@@ -1620,22 +1620,35 @@ pub async fn serve_with_options(
                                     snapshot,
                                 )
                                 .await;
-                                if let Err(e) = save_named_groups_checked_unlocked(&relay_state).await {
-                                    tracing::error!(
-                                        group_id = %group_id_str,
-                                        "ADR 0028: rollback save failed after admission failure: {e}"
-                                    );
-                                    // Restore post-apply state to memory so it
-                                    // matches durable. The repair path can
-                                    // service "request present, obligation absent"
-                                    // on re-delivery.
-                                    if let Some(post_apply) = post_apply_state {
-                                        store_named_group_info(
-                                            &relay_state,
-                                            &group_id_str,
-                                            post_apply,
-                                        )
-                                        .await;
+                                match save_named_groups_checked_unlocked(&relay_state).await {
+                                    Ok(outcome) => {
+                                        // Watson ruling: Durable or ReplacedNotDurable
+                                        // both mean the rollback snapshot IS on disk.
+                                        // Memory already has the rollback snapshot.
+                                        // Do NOT restore post-apply.
+                                        if !outcome.is_durable() {
+                                            tracing::warn!(
+                                                group_id = %group_id_str,
+                                                "ADR 0028: rollback saved but not directory-durable after admission failure"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: rollback save failed after admission failure: {e}"
+                                        );
+                                        // Watson ruling: NotReplaced — rollback did
+                                        // not persist. Disk has the applied state.
+                                        // Restore post-apply to match durable.
+                                        if let Some(post_apply) = post_apply_state {
+                                            store_named_group_info(
+                                                &relay_state,
+                                                &group_id_str,
+                                                post_apply,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
@@ -1682,18 +1695,28 @@ pub async fn serve_with_options(
                                     snapshot,
                                 )
                                 .await;
-                                if let Err(e) = save_named_groups_checked_unlocked(&relay_state).await {
-                                    tracing::error!(
-                                        group_id = %group_id_str,
-                                        "ADR 0028: rollback save failed after outbox save failure: {e}"
-                                    );
-                                    if let Some(post_apply) = post_apply_state {
-                                        store_named_group_info(
-                                            &relay_state,
-                                            &group_id_str,
-                                            post_apply,
-                                        )
-                                        .await;
+                                match save_named_groups_checked_unlocked(&relay_state).await {
+                                    Ok(outcome) => {
+                                        if !outcome.is_durable() {
+                                            tracing::warn!(
+                                                group_id = %group_id_str,
+                                                "ADR 0028: rollback saved but not directory-durable after outbox save failure"
+                                            );
+                                        }
+                                    }
+                                    Err(e) => {
+                                        tracing::error!(
+                                            group_id = %group_id_str,
+                                            "ADR 0028: rollback save failed after outbox save failure: {e}"
+                                        );
+                                        if let Some(post_apply) = post_apply_state {
+                                            store_named_group_info(
+                                                &relay_state,
+                                                &group_id_str,
+                                                post_apply,
+                                            )
+                                            .await;
+                                        }
                                     }
                                 }
                             }
