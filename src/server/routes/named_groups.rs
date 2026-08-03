@@ -17188,25 +17188,11 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                 .to_string(),
         );
     }
-    // The authenticated legacy proof and complete ordinary relay candidate
-    // have now passed all governed caps. Persist the detached roster-clock
-    // migration before processing recovery journals or advertising service.
-    if migrated_legacy_clock {
-        let _roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
-        *state.named_groups.write().await = groups_view.clone();
-        match save_named_groups_checked_unlocked(state).await {
-            Ok(AtomicWriteOutcome::Durable) => {}
-            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
-                return Err(
-                    "legacy relay-clock migration is visible but not directory-durable".to_string(),
-                );
-            }
-            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
-                *state.named_groups.write().await = original_groups_view;
-                return Err("legacy relay-clock migration was not persisted".to_string());
-            }
-        }
-    }
+    // Keep the roster-clock migration detached until both recovery journals
+    // and their complete relay candidates have passed validation and every
+    // governed cap. Journal evidence must never mutate the durable roster
+    // before that journal itself is accepted.
+    let mut roster_candidate_changed = migrated_legacy_clock;
     let mut pending_compensation = loaded_sidecar.pending_compensation.clone();
     let mut pending_listener_admission = loaded_sidecar.pending_listener_admission.clone();
     let mut recovery_changed = false;
@@ -17428,32 +17414,39 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             );
         }
         // Only after the complete detached request+obligation candidate passes
-        // validation and all governed caps may startup install the roster half.
+        // validation and all governed caps may it update the detached roster
+        // candidate. The candidate is installed and persisted once below,
+        // after every recovery journal has been accepted.
         if let Some(recovered_group) = recovered_group {
-            let membership_lock = group_membership_lock(state, &admission.group_id).await;
-            let _membership_guard = membership_lock.lock().await;
-            let _roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
-            if !store_named_group_info(state, &admission.group_id, recovered_group).await {
-                return Err("listener admission recovery could not install request".to_string());
-            }
-            match save_named_groups_checked_unlocked(state).await {
-                Ok(AtomicWriteOutcome::Durable) => {}
-                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
-                    return Err(
-                        "listener request recovery is visible but not directory-durable"
-                            .to_string(),
-                    );
-                }
-                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
-                    store_named_group_info(state, &admission.group_id, info.clone()).await;
-                    return Err("listener request recovery was not persisted".to_string());
-                }
-            }
+            groups_view.insert(admission.group_id.clone(), recovered_group);
+            roster_candidate_changed = true;
         }
         outbox = candidate_outbox;
         tombstones = candidate_tombstones;
         pending_listener_admission = None;
         recovery_changed = true;
+    }
+
+    // All ordinary state and both recovery journals have now passed detached
+    // validation and governed caps. Install and durably persist the complete
+    // roster candidate exactly once before exposing relay work. The original
+    // sidecar still contains the recovery marker, so a crash after this write
+    // but before marker clearing remains recoverable without re-delivery.
+    if roster_candidate_changed {
+        let _roster_persistence_guard = state.named_groups_persistence_lock.lock().await;
+        *state.named_groups.write().await = groups_view;
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                return Err(
+                    "relay recovery roster is visible but not directory-durable".to_string()
+                );
+            }
+            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                *state.named_groups.write().await = original_groups_view;
+                return Err("relay recovery roster was not persisted".to_string());
+            }
+        }
     }
 
     *state.predecessor_relay_outbox.write().await = outbox;
