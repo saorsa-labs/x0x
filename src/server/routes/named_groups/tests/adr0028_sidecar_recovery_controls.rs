@@ -248,8 +248,10 @@ async fn install_relay_tombstones(
         let mut groups = state.named_groups.write().await;
         let info = groups.get_mut(group_key).expect("group exists");
         for (entry, fsm) in entries {
-            info.join_requests
-                .insert(entry.request_id.clone(), bound_join_request(entry, group_key, requester_hex, *fsm));
+            info.join_requests.insert(
+                entry.request_id.clone(),
+                bound_join_request(entry, group_key, requester_hex, *fsm),
+            );
         }
         info.recompute_state_hash();
     }
@@ -281,7 +283,15 @@ fn build_entries(
     (0..count)
         .map(|j| {
             let rid = format!("r-{}-{:04}", &group_key[..8], j);
-            build_relay_entry(requester_kp, topic, group_key, &rid, requester_hex, first_seen_ms, msg_pad)
+            build_relay_entry(
+                requester_kp,
+                topic,
+                group_key,
+                &rid,
+                requester_hex,
+                first_seen_ms,
+                msg_pad,
+            )
         })
         .collect()
 }
@@ -450,15 +460,38 @@ async fn relay_per_group_count_cap_64_accepted_then_65_rejected() {
     assert_eq!(relay_outbox_total(&state).await, 64);
 
     // --- RED: 65 in the SAME group ---
-    let extra = build_relay_entry(&requester_kp, &topic, &gk, "extra-65", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk, std::slice::from_ref(&extra), &requester_hex, now).await;
+    let extra = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "extra-65",
+        &requester_hex,
+        now,
+        0,
+    );
+    install_relay_entries(
+        &state,
+        &gk,
+        std::slice::from_ref(&extra),
+        &requester_hex,
+        now,
+    )
+    .await;
     assert_eq!(relay_outbox_for_group(&state, &gk).await.len(), 65);
     save_relay(&state).await.expect("save 65");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
     assert!(r.is_err(), "65 in one group must be rejected: {:?}", r);
-    assert_eq!(relay_outbox_total(&state).await, 0, "zero installed on rejection");
-    assert_eq!(relay_sidecar_bytes(&state).await, before, "diagnostic bytes preserved");
+    assert_eq!(
+        relay_outbox_total(&state).await,
+        0,
+        "zero installed on rejection"
+    );
+    assert_eq!(
+        relay_sidecar_bytes(&state).await,
+        before,
+        "diagnostic bytes preserved"
+    );
 }
 
 // ===========================================================================
@@ -487,7 +520,15 @@ async fn relay_daemon_count_cap_1024_accepted_then_1025_rejected() {
             .expect("gk")
             .metadata_topic
             .clone();
-        let entries = build_entries(&requester_kp, &topic, &gk, &requester_hex, now, per_group, 0);
+        let entries = build_entries(
+            &requester_kp,
+            &topic,
+            &gk,
+            &requester_hex,
+            now,
+            per_group,
+            0,
+        );
         install_relay_entries(&state, &gk, &entries, &requester_hex, now).await;
     }
     assert_eq!(relay_outbox_total(&state).await, 1024);
@@ -507,15 +548,38 @@ async fn relay_daemon_count_cap_1024_accepted_then_1025_rejected() {
         .expect("g17")
         .metadata_topic
         .clone();
-    let extra = build_relay_entry(&requester_kp, &topic17, &gk17, "extra-1025", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk17, std::slice::from_ref(&extra), &requester_hex, now).await;
+    let extra = build_relay_entry(
+        &requester_kp,
+        &topic17,
+        &gk17,
+        "extra-1025",
+        &requester_hex,
+        now,
+        0,
+    );
+    install_relay_entries(
+        &state,
+        &gk17,
+        std::slice::from_ref(&extra),
+        &requester_hex,
+        now,
+    )
+    .await;
     assert_eq!(relay_outbox_total(&state).await, 1025);
     save_relay(&state).await.expect("save 1025");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
     assert!(r.is_err(), "1025 must exceed daemon count cap: {:?}", r);
-    assert_eq!(relay_outbox_total(&state).await, 0, "zero installed on rejection");
-    assert_eq!(relay_sidecar_bytes(&state).await, before, "diagnostic bytes preserved");
+    assert_eq!(
+        relay_outbox_total(&state).await,
+        0,
+        "zero installed on rejection"
+    );
+    assert_eq!(
+        relay_sidecar_bytes(&state).await,
+        before,
+        "diagnostic bytes preserved"
+    );
 }
 
 // ===========================================================================
@@ -543,15 +607,37 @@ async fn relay_per_group_byte_cap_boundary() {
     let pad = 55_000usize;
 
     // Measure one entry's envelope size.
-    let probe = build_relay_entry(&requester_kp, &topic, &gk, "probe", &requester_hex, now, pad);
+    let probe = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "probe",
+        &requester_hex,
+        now,
+        pad,
+    );
     let s = probe.byte_size;
-    assert!(s <= CAUSAL_ENVELOPE_MAX_BYTES, "envelope within semantic cap");
+    assert!(
+        s <= CAUSAL_ENVELOPE_MAX_BYTES,
+        "envelope within semantic cap"
+    );
     let cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP;
     let max_under = cap / s;
-    assert!(max_under + 1 <= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, "count under per-group count cap");
+    assert!(
+        max_under < CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+        "count under per-group count cap"
+    );
 
     // --- GREEN: max_under entries → total ≤ byte cap ---
-    let entries = build_entries(&requester_kp, &topic, &gk, &requester_hex, now, max_under, pad);
+    let entries = build_entries(
+        &requester_kp,
+        &topic,
+        &gk,
+        &requester_hex,
+        now,
+        max_under,
+        pad,
+    );
     let total_bytes: usize = entries.iter().map(|e| e.byte_size).sum();
     assert!(total_bytes <= cap, "GREEN total within byte cap");
     install_relay_entries(&state, &gk, &entries, &requester_hex, now).await;
@@ -562,7 +648,15 @@ async fn relay_per_group_byte_cap_boundary() {
 
     // --- RED: max_under + 1 → total > byte cap ---
     let mut over = entries.clone();
-    over.push(build_relay_entry(&requester_kp, &topic, &gk, "over", &requester_hex, now, pad));
+    over.push(build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "over",
+        &requester_hex,
+        now,
+        pad,
+    ));
     let over_bytes: usize = over.iter().map(|e| e.byte_size).sum();
     assert!(over_bytes > cap, "RED total exceeds byte cap");
     // Reset roster + outbox for this group.
@@ -575,7 +669,11 @@ async fn relay_per_group_byte_cap_boundary() {
     save_relay(&state).await.expect("save over");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
-    assert!(r.is_err(), "over per-group byte cap must be rejected: {:?}", r);
+    assert!(
+        r.is_err(),
+        "over per-group byte cap must be rejected: {:?}",
+        r
+    );
     assert_eq!(relay_outbox_total(&state).await, 0, "zero installed");
     assert_eq!(relay_sidecar_bytes(&state).await, before, "bytes preserved");
 }
@@ -605,7 +703,15 @@ async fn relay_daemon_byte_cap_boundary() {
         .expect("g0")
         .metadata_topic
         .clone();
-    let probe = build_relay_entry(&requester_kp, &topic0, &gk0, "probe", &requester_hex, now, pad);
+    let probe = build_relay_entry(
+        &requester_kp,
+        &topic0,
+        &gk0,
+        "probe",
+        &requester_hex,
+        now,
+        pad,
+    );
     let s = probe.byte_size;
     let daemon_cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP;
     let max_under = daemon_cap / s;
@@ -621,7 +727,15 @@ async fn relay_daemon_byte_cap_boundary() {
     let mut gi = 0u32;
     // Re-use gk0 for the first batch.
     let first_batch = std::cmp::min(per_group, max_under);
-    let entries0 = build_entries(&requester_kp, &topic0, &gk0, &requester_hex, now, first_batch, pad);
+    let entries0 = build_entries(
+        &requester_kp,
+        &topic0,
+        &gk0,
+        &requester_hex,
+        now,
+        first_batch,
+        pad,
+    );
     install_relay_entries(&state, &gk0, &entries0, &requester_hex, now).await;
     built += first_batch;
     gi += 1;
@@ -667,8 +781,23 @@ async fn relay_daemon_byte_cap_boundary() {
         .expect("gk_over")
         .metadata_topic
         .clone();
-    let extra = build_relay_entry(&requester_kp, &otopic, &gk_over, "db-over", &requester_hex, now, pad);
-    install_relay_entries(&state, &gk_over, std::slice::from_ref(&extra), &requester_hex, now).await;
+    let extra = build_relay_entry(
+        &requester_kp,
+        &otopic,
+        &gk_over,
+        "db-over",
+        &requester_hex,
+        now,
+        pad,
+    );
+    install_relay_entries(
+        &state,
+        &gk_over,
+        std::slice::from_ref(&extra),
+        &requester_hex,
+        now,
+    )
+    .await;
     save_relay(&state).await.expect("save over");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
@@ -706,8 +835,23 @@ async fn relay_target_cap_4096_accepted_then_4097_rejected() {
             .expect("gk")
             .metadata_topic
             .clone();
-        let entry = build_relay_entry(&requester_kp, &topic, &gk, &format!("t-{}", gi), &requester_hex, now, 0);
-        install_relay_entries(&state, &gk, std::slice::from_ref(&entry), &requester_hex, now).await;
+        let entry = build_relay_entry(
+            &requester_kp,
+            &topic,
+            &gk,
+            &format!("t-{}", gi),
+            &requester_hex,
+            now,
+            0,
+        );
+        install_relay_entries(
+            &state,
+            &gk,
+            std::slice::from_ref(&entry),
+            &requester_hex,
+            now,
+        )
+        .await;
     }
     save_relay(&state).await.expect("save 4096");
     let r = restart_relay(&state).await;
@@ -734,8 +878,23 @@ async fn relay_target_cap_4096_accepted_then_4097_rejected() {
         .expect("g65")
         .metadata_topic
         .clone();
-    let entry65 = build_relay_entry(&requester_kp, &topic65, &gk65, "t-65", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk65, std::slice::from_ref(&entry65), &requester_hex, now).await;
+    let entry65 = build_relay_entry(
+        &requester_kp,
+        &topic65,
+        &gk65,
+        "t-65",
+        &requester_hex,
+        now,
+        0,
+    );
+    install_relay_entries(
+        &state,
+        &gk65,
+        std::slice::from_ref(&entry65),
+        &requester_hex,
+        now,
+    )
+    .await;
     save_relay(&state).await.expect("save 4160");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
@@ -744,7 +903,11 @@ async fn relay_target_cap_4096_accepted_then_4097_rejected() {
         err.contains("live relay targets exceed daemon cap"),
         "must be the specific target-cap error, not file-size or count: got {err}",
     );
-    assert_eq!(relay_outbox_total(&state).await, 0, "zero installed on rejection");
+    assert_eq!(
+        relay_outbox_total(&state).await,
+        0,
+        "zero installed on rejection"
+    );
     assert_eq!(relay_sidecar_bytes(&state).await, before, "bytes preserved");
 }
 
@@ -781,7 +944,15 @@ async fn relay_terminal_excess_sheds_oldest_to_live_budget() {
     let mut tombs: Vec<(RelayEntry, u64)> = Vec::new();
     for j in 0..60u32 {
         let fsm = base + 100 + j as u64;
-        let e = build_relay_entry(&requester_kp, &topic, &gk, &format!("tmb-{}", j), &requester_hex, fsm, 0);
+        let e = build_relay_entry(
+            &requester_kp,
+            &topic,
+            &gk,
+            &format!("tmb-{}", j),
+            &requester_hex,
+            fsm,
+            0,
+        );
         tombs.push((e, fsm));
     }
     install_relay_tombstones(&state, &gk, &tombs, &requester_hex, base + 1000).await;
@@ -791,7 +962,11 @@ async fn relay_terminal_excess_sheds_oldest_to_live_budget() {
     assert!(r.is_ok(), "within budget after shedding: {:?}", r);
 
     // All 10 live survive (never-evict-live).
-    assert_eq!(relay_outbox_for_group(&state, &gk).await.len(), 10, "all live survive");
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        10,
+        "all live survive"
+    );
     // Tombstones pruned to 64 - 10 = 54.
     let surviving = state
         .completed_relay_tombstones
@@ -805,10 +980,18 @@ async fn relay_terminal_excess_sheds_oldest_to_live_budget() {
         surviving.iter().map(|t| t.first_seen_ms).collect();
     // Oldest 6 (indices 0..5) shed; newest 54 (indices 6..59) survive.
     for j in 0..6u32 {
-        assert!(!surviving_fsms.contains(&(base + 100 + j as u64)), "oldest shed: {}", j);
+        assert!(
+            !surviving_fsms.contains(&(base + 100 + j as u64)),
+            "oldest shed: {}",
+            j
+        );
     }
     for j in 6..60u32 {
-        assert!(surviving_fsms.contains(&(base + 100 + j as u64)), "newer survives: {}", j);
+        assert!(
+            surviving_fsms.contains(&(base + 100 + j as u64)),
+            "newer survives: {}",
+            j
+        );
     }
 }
 
@@ -853,14 +1036,26 @@ async fn conflict_tombstones_prune_oldest_first_with_timestamps() {
         .get(&gk)
         .cloned()
         .unwrap_or_default();
-    assert_eq!(surviving.len(), CAUSAL_APPROVAL_PER_GROUP_CAP, "pruned to per-group cap");
+    assert_eq!(
+        surviving.len(),
+        CAUSAL_APPROVAL_PER_GROUP_CAP,
+        "pruned to per-group cap"
+    );
     let surviving_fsms: std::collections::HashSet<u64> =
         surviving.iter().map(|t| t.first_seen_ms).collect();
     for j in 0..6u32 {
-        assert!(!surviving_fsms.contains(&(base + j as u64)), "oldest shed: {}", j);
+        assert!(
+            !surviving_fsms.contains(&(base + j as u64)),
+            "oldest shed: {}",
+            j
+        );
     }
     for j in 6..70u32 {
-        assert!(surviving_fsms.contains(&(base + j as u64)), "newer survives: {}", j);
+        assert!(
+            surviving_fsms.contains(&(base + j as u64)),
+            "newer survives: {}",
+            j
+        );
     }
 }
 
@@ -880,7 +1075,9 @@ async fn causal_queue_per_group_count_64_accepted_then_65_rejected() {
     install_queue_entries(&state, &gk, 64).await;
     {
         let _g = state.causal_approval_queue_persistence_lock.lock().await;
-        save_causal_approval_queue_unlocked(&state).await.expect("save 64");
+        save_causal_approval_queue_unlocked(&state)
+            .await
+            .expect("save 64");
     }
     let r = restart_queue(&state).await;
     assert!(r.is_ok(), "64 queue entries at cap must load: {:?}", r);
@@ -891,7 +1088,9 @@ async fn causal_queue_per_group_count_64_accepted_then_65_rejected() {
     install_queue_entries(&state, &gk, 65).await;
     {
         let _g = state.causal_approval_queue_persistence_lock.lock().await;
-        save_causal_approval_queue_unlocked(&state).await.expect("save 65");
+        save_causal_approval_queue_unlocked(&state)
+            .await
+            .expect("save 65");
     }
     let before = queue_sidecar_bytes(&state).await;
     let r = restart_queue(&state).await;
@@ -917,10 +1116,16 @@ async fn causal_queue_daemon_count_cap_1024_accepted_then_1025_rejected() {
     }
     {
         let _g = state.causal_approval_queue_persistence_lock.lock().await;
-        save_causal_approval_queue_unlocked(&state).await.expect("save 1024");
+        save_causal_approval_queue_unlocked(&state)
+            .await
+            .expect("save 1024");
     }
     let r = restart_queue(&state).await;
-    assert!(r.is_ok(), "1024 queue entries at daemon cap must load: {:?}", r);
+    assert!(
+        r.is_ok(),
+        "1024 queue entries at daemon cap must load: {:?}",
+        r
+    );
     assert_eq!(queue_total(&state).await, 1024);
 
     // --- RED: one more in a 17th group → 1025 ---
@@ -929,7 +1134,9 @@ async fn causal_queue_daemon_count_cap_1024_accepted_then_1025_rejected() {
     install_queue_entries(&state, &gk17, 1).await;
     {
         let _g = state.causal_approval_queue_persistence_lock.lock().await;
-        save_causal_approval_queue_unlocked(&state).await.expect("save 1025");
+        save_causal_approval_queue_unlocked(&state)
+            .await
+            .expect("save 1025");
     }
     let before = queue_sidecar_bytes(&state).await;
     let r = restart_queue(&state).await;
@@ -967,7 +1174,10 @@ async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
             .clone();
         let entries = build_entries(&requester_kp, &topic, &gk, &requester_hex, now, 16, pad);
         let gp_bytes: usize = entries.iter().map(|e| e.byte_size).sum();
-        assert!(gp_bytes <= CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, "per-group bytes OK");
+        assert!(
+            gp_bytes <= CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+            "per-group bytes OK"
+        );
         install_relay_entries(&state, &gk, &entries, &requester_hex, now).await;
     }
     let raw_bytes: usize = state
@@ -978,7 +1188,10 @@ async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
         .flatten()
         .map(|o| o.byte_size)
         .sum();
-    assert!(raw_bytes <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, "raw within daemon byte cap");
+    assert!(
+        raw_bytes <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+        "raw within daemon byte cap"
+    );
     save_relay(&state).await.expect("save high-expansion");
     let file_bytes = relay_sidecar_bytes(&state).await.len();
     assert!(
@@ -987,10 +1200,21 @@ async fn relay_high_expansion_within_budget_reloads_under_file_guard() {
         file_bytes,
         raw_bytes
     );
-    assert!(file_bytes <= RELAY_SIDECAR_FILE_SIZE_CAP, "within ×16 guard");
+    assert!(
+        file_bytes <= RELAY_SIDECAR_FILE_SIZE_CAP,
+        "within ×16 guard"
+    );
     let r = restart_relay(&state).await;
-    assert!(r.is_ok(), "high-expansion within-budget sidecar must load: {:?}", r);
-    assert_eq!(relay_outbox_total(&state).await, 64, "all 64 entries installed");
+    assert!(
+        r.is_ok(),
+        "high-expansion within-budget sidecar must load: {:?}",
+        r
+    );
+    assert_eq!(
+        relay_outbox_total(&state).await,
+        64,
+        "all 64 entries installed"
+    );
 }
 
 // ===========================================================================
@@ -1011,7 +1235,11 @@ async fn atomic_write_pre_rename_0o500_leaves_seed_unchanged() {
     let outcome = write_named_groups_json_atomic(&path, "{\"replaced\":true}")
         .await
         .expect("no io err");
-    assert_eq!(outcome, AtomicWriteOutcome::NotReplaced, "pre-rename failure");
+    assert_eq!(
+        outcome,
+        AtomicWriteOutcome::NotReplaced,
+        "pre-rename failure"
+    );
     let after = tokio::fs::read(&path).await.expect("read seed");
     assert_eq!(after, b"SEED_BYTES_NOT_REPLACED", "destination unchanged");
 }
@@ -1035,7 +1263,10 @@ async fn atomic_write_post_rename_0o300_reports_replaced_not_durable() {
         "rename OK, parent-fsync failed (RND)"
     );
     let after = tokio::fs::read(&path).await.expect("read replaced");
-    assert_eq!(after, b"{\"replaced\":true}", "destination visibly replaced");
+    assert_eq!(
+        after, b"{\"replaced\":true}",
+        "destination visibly replaced"
+    );
 }
 
 // ===========================================================================
@@ -1061,7 +1292,14 @@ async fn relay_b8_journal_unknown_group_rejected_zero_installed() {
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
     let entry = build_relay_entry(&requester_kp, &topic, &gk, "seed-1", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk, std::slice::from_ref(&entry), &requester_hex, now).await;
+    install_relay_entries(
+        &state,
+        &gk,
+        std::slice::from_ref(&entry),
+        &requester_hex,
+        now,
+    )
+    .await;
 
     *state.pending_b8_compensation.lock().await = Some(PendingB8Compensation {
         group_id: format!("{:032x}", 0xDEADu32),
@@ -1077,7 +1315,11 @@ async fn relay_b8_journal_unknown_group_rejected_zero_installed() {
     save_relay(&state).await.expect("save with bad B8 journal");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
-    assert!(r.is_err(), "B8 journal for unknown group must be rejected: {:?}", r);
+    assert!(
+        r.is_err(),
+        "B8 journal for unknown group must be rejected: {:?}",
+        r
+    );
     assert_eq!(relay_outbox_total(&state).await, 0, "zero installed");
     assert_eq!(relay_sidecar_bytes(&state).await, before, "bytes preserved");
 }
@@ -1105,7 +1347,14 @@ async fn relay_listener_journal_digest_mismatch_rejected_zero_installed() {
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
     let entry = build_relay_entry(&requester_kp, &topic, &gk, "seed-1", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk, std::slice::from_ref(&entry), &requester_hex, now).await;
+    install_relay_entries(
+        &state,
+        &gk,
+        std::slice::from_ref(&entry),
+        &requester_hex,
+        now,
+    )
+    .await;
 
     let env = sign_v2_envelope(
         &requester_kp,
@@ -1121,10 +1370,16 @@ async fn relay_listener_journal_digest_mismatch_rejected_zero_installed() {
         byte_size: 999,    // wrong
         first_seen_ms: now,
     });
-    save_relay(&state).await.expect("save with bad listener journal");
+    save_relay(&state)
+        .await
+        .expect("save with bad listener journal");
     let before = relay_sidecar_bytes(&state).await;
     let r = restart_relay(&state).await;
-    assert!(r.is_err(), "listener journal digest mismatch must be rejected: {:?}", r);
+    assert!(
+        r.is_err(),
+        "listener journal digest mismatch must be rejected: {:?}",
+        r
+    );
     assert_eq!(relay_outbox_total(&state).await, 0, "zero installed");
     assert_eq!(relay_sidecar_bytes(&state).await, before, "bytes preserved");
 }
@@ -1153,7 +1408,14 @@ async fn relay_dual_journal_b8_validated_before_listener() {
     let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
     let now = unix_ms();
     let entry = build_relay_entry(&requester_kp, &topic, &gk, "seed-1", &requester_hex, now, 0);
-    install_relay_entries(&state, &gk, std::slice::from_ref(&entry), &requester_hex, now).await;
+    install_relay_entries(
+        &state,
+        &gk,
+        std::slice::from_ref(&entry),
+        &requester_hex,
+        now,
+    )
+    .await;
 
     *state.pending_b8_compensation.lock().await = Some(PendingB8Compensation {
         group_id: format!("{:032x}", 0xBADC0DEu32),
