@@ -713,6 +713,12 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
     /// so an older snapshot cannot rename over a newer completed receipt.
     pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
+    /// ADR 0028 B5: write-ahead journal for the cross-file B8 operation
+    /// (outbox refresh + roster save). Set before the outbox refresh save;
+    /// cleared after both saves succeed. On restart, a pending entry triggers
+    /// compensation (restore outbox if roster lacks the approval).
+    pub(super) pending_b8_compensation:
+        Mutex<Option<crate::server::routes::named_groups::PendingB8Compensation>>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,
