@@ -4699,7 +4699,7 @@ async fn try_queue_causal_approval(
             let tombstones = state.causal_conflict_tombstones.read().await;
             tombstones
                 .get(group_id)
-                .is_some_and(|digests| digests.contains(&approval.digest))
+                .is_some_and(|entries| entries.iter().any(|e| e.digest == approval.digest))
         };
         if tombstone_hit {
             tracing::debug!(
@@ -4758,6 +4758,9 @@ async fn try_queue_causal_approval(
             // conflicted queue entries and can be re-admitted after expiry.
             // Track only the digests that are actually NEW (not already in the
             // store) so rollback removes only what we inserted.
+            // Finding 4: entries carry first_seen_ms timestamps for
+            // deterministic oldest-first eviction.
+            let now_ms = now_millis_u64();
             let existing_digests: Vec<[u8; 32]> = conflicted_indices
                 .iter()
                 .map(|&i| queue[i].digest)
@@ -4767,17 +4770,31 @@ async fn try_queue_causal_approval(
                 let mut tombstones = state.causal_conflict_tombstones.write().await;
                 let store = tombstones.entry(group_id.to_string()).or_default();
                 for d in &existing_digests {
-                    if !store.contains(d) {
-                        store.push(*d);
+                    if !store.iter().any(|e| e.digest == *d) {
+                        store.push(ConflictTombstoneEntry {
+                            digest: *d,
+                            first_seen_ms: now_ms,
+                        });
                         newly_inserted.push(*d);
                     }
                 }
-                if !store.contains(&approval.digest) {
-                    store.push(approval.digest);
+                if !store.iter().any(|e| e.digest == approval.digest) {
+                    store.push(ConflictTombstoneEntry {
+                        digest: approval.digest,
+                        first_seen_ms: now_ms,
+                    });
                     newly_inserted.push(approval.digest);
                 }
             }
             drop(queue_lock);
+            // Finding 4: prune BEFORE persist so the durable sidecar is always
+            // bounded. Previously the enlarged map was persisted first, then
+            // pruned only in memory with no re-save — saturation/restart could
+            // exceed the durable bound.
+            {
+                let mut tombstones = state.causal_conflict_tombstones.write().await;
+                prune_conflict_tombstones(&mut tombstones);
+            }
             // B3: persist atomically. If save fails, roll back ALL in-memory
             // mutations (conflicted markings + tombstones) and return without
             // recording a diagnostic — no durable reject-both is acknowledged.
@@ -4790,10 +4807,10 @@ async fn try_queue_causal_approval(
                 // Rollback only newly-inserted tombstones (not pre-existing ones).
                 {
                     let mut tombstones = state.causal_conflict_tombstones.write().await;
-                    if let Some(digests) = tombstones.get_mut(group_id) {
+                    if let Some(entries) = tombstones.get_mut(group_id) {
                         for d in &newly_inserted {
-                            if let Some(pos) = digests.iter().position(|x| x == d) {
-                                digests.remove(pos);
+                            if let Some(pos) = entries.iter().position(|e| e.digest == *d) {
+                                entries.remove(pos);
                             }
                         }
                     }
@@ -4809,12 +4826,6 @@ async fn try_queue_causal_approval(
                     }
                 }
                 return;
-            }
-            // Finding 8: cap conflict tombstones AFTER successful persist so
-            // the rollback path only needs to undo newly-inserted entries.
-            {
-                let mut tombstones = state.causal_conflict_tombstones.write().await;
-                prune_conflict_tombstones(&mut tombstones);
             }
             // Persist succeeded — record diagnostic.
             state.groups_diagnostics.record_causal_conflicted(group_id);
@@ -5004,47 +5015,41 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             let groups = state.named_groups.read().await;
             groups.get(group_id).cloned()
         };
+        // Finding 5 (Watson 32c2d3a): hold the membership lock through
+        // apply + persist/rollback so a concurrent mutation cannot be
+        // included in the write or overwritten by rollback. Post-persist
+        // card/log effects happen AFTER the lock is released.
+        let membership_lock = group_membership_lock(state, group_id).await;
+        let _replay_membership_guard = membership_lock.lock().await;
         // Re-run the full ordinary approval apply with queueing disabled.
         // Boxed to break the async recursion cycle
-        // (apply_named_group_metadata_event_inner → replay → apply_inner).
-        let applied = Box::pin(apply_named_group_metadata_event_inner(
+        // (apply_named_group_metadata_event_inner → replay → apply_inner)
+        // AND to avoid stack overflow — _inner_serialized is a large async
+        // function whose future state machine is too big for the stack.
+        let mut replay_group_id: Option<String> = None;
+        let applied = Box::pin(apply_named_group_metadata_event_inner_serialized(
             state,
             pending.event.clone(),
             pending.sender,
             true,
             false, // disable causal queue to prevent re-admission
             None,  // no envelope bytes on replay (event is already decoded)
+            &mut replay_group_id,
+            true, // lock_already_held
         ))
         .await;
 
-        if applied.accepted {
+        let group_persisted = if applied.accepted {
             // apply mutated in-memory state (candidate) but did NOT save
             // (allow_queue=false skips save_named_groups in the inner apply).
             // This is the ONE checked persist. If it fails, ROLL BACK the
             // in-memory state to the pre-apply snapshot and retain the queue
             // entry so the next replay retries — no split-brain.
-            let group_persisted = save_named_groups_checked(state).await.is_ok();
-            if group_persisted {
-                // B5: persist succeeded — now refresh the card cache and
-                // record the membership event. These were deferred from the
-                // inner apply (allow_queue=false) so a failed write leaves no
-                // card/log trace of the failed candidate.
-                {
-                    let groups = state.named_groups.read().await;
-                    if let Some(info) = groups.get(group_id) {
-                        refresh_group_card_cache_from_info(state, group_id, info).await;
-                    }
-                }
-                remember_treekem_membership_event(state, &pending.event).await;
-                tracing::info!(
-                    group_id = %LogHexId::group(group_id),
-                    request_id = %pending.request_id,
-                    "ADR 0028 B5: queued approval drained and applied (group state durable)"
-                );
-                state.groups_diagnostics.record_causal_applied(group_id);
-                continue;
-            } else {
+            // Finding 5: persist while holding the membership lock.
+            let persisted = save_named_groups_checked(state).await.is_ok();
+            if !persisted {
                 // B5: roll back in-memory state to prevent false already_current.
+                // Finding 5: rollback while holding the membership lock.
                 tracing::warn!(
                     group_id = %LogHexId::group(group_id),
                     request_id = %pending.request_id,
@@ -5054,9 +5059,39 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
                     let mut groups = state.named_groups.write().await;
                     groups.insert(group_id.to_string(), snapshot);
                 }
-                still_pending.push_back(pending);
-                continue;
             }
+            persisted
+        } else {
+            false
+        };
+        // Finding 5: release the membership lock before post-persist effects.
+        drop(_replay_membership_guard);
+
+        if applied.accepted && group_persisted {
+            // B5: persist succeeded — now refresh the card cache and
+            // record the membership event. These were deferred from the
+            // inner apply (allow_queue=false) so a failed write leaves no
+            // card/log trace of the failed candidate. Finding 5: these
+            // post-persist effects run AFTER the lock is released.
+            {
+                let groups = state.named_groups.read().await;
+                if let Some(info) = groups.get(group_id) {
+                    refresh_group_card_cache_from_info(state, group_id, info).await;
+                }
+            }
+            remember_treekem_membership_event(state, &pending.event).await;
+            tracing::info!(
+                group_id = %LogHexId::group(group_id),
+                request_id = %pending.request_id,
+                "ADR 0028 B5: queued approval drained and applied (group state durable)"
+            );
+            state.groups_diagnostics.record_causal_applied(group_id);
+            continue;
+        }
+        if applied.accepted && !group_persisted {
+            // Rollback already done above; retain for retry.
+            still_pending.push_back(pending);
+            continue;
         }
 
         // Not applied — retain if still within expiry and group is live.
@@ -5507,6 +5542,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event(
         true,
         envelope_bytes,
         &mut replay_group_id,
+        false,
     )
     .await;
     if let Some(gid) = replay_group_id {
@@ -5535,6 +5571,7 @@ async fn apply_named_group_metadata_event_inner(
         allow_queue,
         envelope_bytes,
         &mut replay_group_id,
+        false,
     )
     .await;
     if allow_queue {
@@ -5546,7 +5583,7 @@ async fn apply_named_group_metadata_event_inner(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn apply_named_group_metadata_event_inner_serialized(
+pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized(
     state: &Arc<AppState>,
     event: NamedGroupMetadataEvent,
     sender: AgentId,
@@ -5554,6 +5591,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
     allow_queue: bool,
     envelope_bytes: Option<&[u8]>,
     replay_group_id: &mut Option<String>,
+    lock_already_held: bool,
 ) -> ApplyMetadataResult {
     let event_kind = named_group_metadata_event_kind(&event);
     let sender_hex = hex::encode(sender.as_bytes());
@@ -5670,8 +5708,22 @@ async fn apply_named_group_metadata_event_inner_serialized(
     // same `MemberJoined` on two independent tasks at once; without this guard
     // they double-add to the MLS tree and clobber the roster. `info` is loaded
     // *under* the guard so no stale clone from a racing apply is in flight.
-    let membership_lock = group_membership_lock(state, &resolved_group_key).await;
-    let _membership_guard = membership_lock.lock().await;
+    //
+    // Finding 1/5 (Watson 32c2d3a): when `lock_already_held` is true, the
+    // caller (relay listener or causal replay) has already acquired the
+    // membership lock and will hold it through obligation admission and
+    // persist/rollback — closing the unlocked interval where replay or a
+    // concurrent mutation could be erased by a stale-snapshot rollback.
+    let membership_lock_arc = if !lock_already_held {
+        Some(group_membership_lock(state, &resolved_group_key).await)
+    } else {
+        None
+    };
+    let _membership_guard = if let Some(ref arc) = membership_lock_arc {
+        Some(arc.lock().await)
+    } else {
+        None
+    };
     let info = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&resolved_group_key).cloned() else {
@@ -15099,6 +15151,15 @@ pub(in crate::server) async fn load_named_groups(
 
 /// ADR 0028: versioned sidecar for the causal approval queue. The version
 /// field lets future format changes be detected and rejected cleanly.
+/// Finding 4 (Watson 32c2d3a): conflict tombstone entry with timestamp for
+/// deterministic oldest-first eviction. Bare digests have no ordering, making
+/// "oldest" undefined under HashMap iteration.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct ConflictTombstoneEntry {
+    digest: [u8; 32],
+    first_seen_ms: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CausalQueueSidecar {
     version: u32,
@@ -15106,8 +15167,11 @@ struct CausalQueueSidecar {
     entries: HashMap<String, VecDeque<PendingCausalApproval>>,
     /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
     /// Prevents re-admission of a conflicting entry after restart.
+    /// Finding 4: entries carry timestamps for deterministic oldest-first
+    /// eviction. Deserialized from older sidecars that have bare `[u8; 32]`
+    /// arrays via the default first_seen_ms = 0.
     #[serde(default)]
-    conflict_tombstones: HashMap<String, Vec<[u8; 32]>>,
+    conflict_tombstones: HashMap<String, Vec<ConflictTombstoneEntry>>,
 }
 
 const CAUSAL_SIDECAR_VERSION: u32 = 1;
@@ -15307,29 +15371,38 @@ fn prune_completed_tombstones_daemon(
 /// CAUSAL_APPROVAL_PER_DAEMON_CAP entries. Without this, an adversary can
 /// grow the map with distinct conflict digests until the sidecar exceeds the
 /// pre-parse file guard and the entire causal queue is rejected on restart.
-fn prune_conflict_tombstones(tombstones: &mut HashMap<String, Vec<[u8; 32]>>) {
-    // Per-group cap: keep the newest CAUSAL_APPROVAL_PER_GROUP_CAP digests.
+/// Finding 4 (Watson 32c2d3a): prune conflict tombstones with deterministic
+/// oldest-first eviction using first_seen_ms timestamps. Per-group cap keeps
+/// the newest entries; daemon-wide cap evicts oldest across all groups.
+fn prune_conflict_tombstones(tombstones: &mut HashMap<String, Vec<ConflictTombstoneEntry>>) {
+    // Per-group cap: keep the newest CAUSAL_APPROVAL_PER_GROUP_CAP entries.
     for list in tombstones.values_mut() {
         if list.len() > CAUSAL_APPROVAL_PER_GROUP_CAP {
-            let drop = list.len() - CAUSAL_APPROVAL_PER_GROUP_CAP;
-            list.drain(..drop);
+            // Sort newest-first (largest first_seen_ms first).
+            list.sort_by_key(|e| std::cmp::Reverse(e.first_seen_ms));
+            list.truncate(CAUSAL_APPROVAL_PER_GROUP_CAP);
         }
     }
     tombstones.retain(|_, list| !list.is_empty());
 
-    // Daemon-wide cap: keep the newest CAUSAL_APPROVAL_PER_DAEMON_CAP digests.
+    // Daemon-wide cap: keep the newest CAUSAL_APPROVAL_PER_DAEMON_CAP entries.
     let total: usize = tombstones.values().map(|l| l.len()).sum();
     if total > CAUSAL_APPROVAL_PER_DAEMON_CAP {
         let drop_count = total - CAUSAL_APPROVAL_PER_DAEMON_CAP;
-        // Drop oldest entries group-by-group (insertion order ≈ age).
-        let mut to_drop = drop_count;
-        for list in tombstones.values_mut() {
-            if to_drop == 0 {
-                break;
+        // Collect all entries with their group_id and timestamp.
+        let mut all: Vec<(String, u64)> = Vec::new();
+        for (gid, list) in tombstones.iter() {
+            for e in list.iter() {
+                all.push((gid.clone(), e.first_seen_ms));
             }
-            let take = to_drop.min(list.len());
-            list.drain(..take);
-            to_drop -= take;
+        }
+        // Sort oldest-first (smallest first_seen_ms first).
+        all.sort_by_key(|e| e.1);
+        // Collect the oldest `drop_count` (group_id, timestamp) pairs.
+        let to_drop: std::collections::HashSet<(String, u64)> =
+            all.iter().take(drop_count).cloned().collect();
+        for (gid, list) in tombstones.iter_mut() {
+            list.retain(|e| !to_drop.contains(&(gid.clone(), e.first_seen_ms)));
         }
         tombstones.retain(|_, list| !list.is_empty());
     }
@@ -15343,7 +15416,7 @@ fn prune_conflict_tombstones(tombstones: &mut HashMap<String, Vec<[u8; 32]>>) {
 /// held by another writer waiting for the persistence lock.
 fn serialize_causal_queue_sidecar(
     queue: &HashMap<String, VecDeque<PendingCausalApproval>>,
-    tombstones: &HashMap<String, Vec<[u8; 32]>>,
+    tombstones: &HashMap<String, Vec<ConflictTombstoneEntry>>,
 ) -> std::io::Result<String> {
     let sidecar = CausalQueueSidecar {
         version: CAUSAL_SIDECAR_VERSION,
@@ -15363,6 +15436,161 @@ fn serialize_causal_queue_sidecar(
 /// `first_seen_ms`). Called at restart after loading both stores. The
 /// per-store caps applied during loading are first-pass filters; this
 /// function ensures the combined total never exceeds the accepted budget.
+/// Finding 2 (Watson 32c2d3a): truncate the oldest live obligations across
+/// all groups until `excess` entries are removed. Oldest = smallest
+/// `first_seen_ms`. This makes "fail closed" actually bound the state
+/// instead of just logging and retaining over-budget live entries.
+fn truncate_live_oldest_first(
+    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
+    excess: usize,
+) {
+    if excess == 0 {
+        return;
+    }
+    // Collect (group_id, index, first_seen_ms) for all live obligations.
+    let mut all: Vec<(String, usize, u64)> = Vec::new();
+    for (gid, list) in outbox.iter() {
+        for (i, o) in list.iter().enumerate() {
+            all.push((gid.clone(), i, o.first_seen_ms));
+        }
+    }
+    // Sort oldest-first (smallest first_seen_ms first).
+    all.sort_by_key(|e| e.2);
+    // Mark the oldest `excess` entries for removal.
+    let to_remove: std::collections::HashSet<(String, usize)> = all
+        .iter()
+        .take(excess)
+        .map(|e| (e.0.clone(), e.1))
+        .collect();
+    // Remove by index, per-group, in reverse index order to keep indices valid.
+    let mut groups_to_remove: Vec<String> = Vec::new();
+    for (gid, list) in outbox.iter_mut() {
+        let mut indices: Vec<usize> = to_remove
+            .iter()
+            .filter(|(g, _)| g == gid)
+            .map(|(_, i)| *i)
+            .collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a)); // descending
+        for i in indices {
+            if i < list.len() {
+                list.remove(i);
+            }
+        }
+        if list.is_empty() {
+            groups_to_remove.push(gid.clone());
+        }
+    }
+    for gid in groups_to_remove {
+        outbox.remove(&gid);
+    }
+}
+
+/// Finding 2: truncate the oldest live obligations until total bytes are
+/// within `byte_cap`. Oldest = smallest `first_seen_ms`.
+fn truncate_live_bytes_oldest_first(
+    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
+    byte_cap: usize,
+) {
+    let total_bytes: usize = outbox.values().flatten().map(|o| o.byte_size).sum();
+    if total_bytes <= byte_cap {
+        return;
+    }
+    // Collect (group_id, index, first_seen_ms, byte_size).
+    let mut all: Vec<(String, usize, u64, usize)> = Vec::new();
+    for (gid, list) in outbox.iter() {
+        for (i, o) in list.iter().enumerate() {
+            all.push((gid.clone(), i, o.first_seen_ms, o.byte_size));
+        }
+    }
+    // Sort oldest-first.
+    all.sort_by_key(|e| e.2);
+    let mut current = total_bytes;
+    let mut to_remove: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    for (gid, i, _, sz) in &all {
+        if current <= byte_cap {
+            break;
+        }
+        to_remove.insert((gid.clone(), *i));
+        current = current.saturating_sub(*sz);
+    }
+    let mut groups_to_remove: Vec<String> = Vec::new();
+    for (gid, list) in outbox.iter_mut() {
+        let mut indices: Vec<usize> = to_remove
+            .iter()
+            .filter(|(g, _)| g == gid)
+            .map(|(_, i)| *i)
+            .collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        for i in indices {
+            if i < list.len() {
+                list.remove(i);
+            }
+        }
+        if list.is_empty() {
+            groups_to_remove.push(gid.clone());
+        }
+    }
+    for gid in groups_to_remove {
+        outbox.remove(&gid);
+    }
+}
+
+/// Finding 2: truncate the oldest live obligations until total relay targets
+/// are within `target_cap`. Oldest = smallest `first_seen_ms`.
+fn truncate_live_targets_oldest_first(
+    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
+    target_cap: usize,
+) {
+    let total_targets: usize = outbox
+        .values()
+        .flatten()
+        .map(|o| o.relay_targets.len())
+        .sum();
+    if total_targets <= target_cap {
+        return;
+    }
+    // Collect (group_id, index, first_seen_ms, target_count).
+    let mut all: Vec<(String, usize, u64, usize)> = Vec::new();
+    for (gid, list) in outbox.iter() {
+        for (i, o) in list.iter().enumerate() {
+            all.push((gid.clone(), i, o.first_seen_ms, o.relay_targets.len()));
+        }
+    }
+    // Sort oldest-first.
+    all.sort_by_key(|e| e.2);
+    let mut current = total_targets;
+    let mut to_remove: std::collections::HashSet<(String, usize)> =
+        std::collections::HashSet::new();
+    for (gid, i, _, tc) in &all {
+        if current <= target_cap {
+            break;
+        }
+        to_remove.insert((gid.clone(), *i));
+        current = current.saturating_sub(*tc);
+    }
+    let mut groups_to_remove: Vec<String> = Vec::new();
+    for (gid, list) in outbox.iter_mut() {
+        let mut indices: Vec<usize> = to_remove
+            .iter()
+            .filter(|(g, _)| g == gid)
+            .map(|(_, i)| *i)
+            .collect();
+        indices.sort_unstable_by(|a, b| b.cmp(a));
+        for i in indices {
+            if i < list.len() {
+                list.remove(i);
+            }
+        }
+        if list.is_empty() {
+            groups_to_remove.push(gid.clone());
+        }
+    }
+    for gid in groups_to_remove {
+        outbox.remove(&gid);
+    }
+}
+
 fn enforce_combined_relay_budget(
     outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
     tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
@@ -15371,8 +15599,13 @@ fn enforce_combined_relay_budget(
     // receipt. Completed receipts may be shed oldest-first; live obligations
     // are only removed by their own lifecycle (relay success, expiry, or
     // explicit cancel). If live state alone exceeds a bound, fail closed:
-    // log and leave the state intact (the daemon is over-budget but no
-    // data is silently lost).
+    // truncate oldest-first (first_seen_ms) — the oldest obligations are the
+    // most likely to have exhausted retries and be closest to expiry.
+    //
+    // Finding 2 (Watson 32c2d3a): "fail closed" means the over-budget state
+    // is actually bounded, not just logged. An over-budget live set is
+    // truncated oldest-first to the cap so a 1,025-obligation or 4,097-target
+    // sidecar does NOT become active retry state.
 
     // ── Combined count cap ─────────────────────────────────────────────
     let live_count: usize = outbox.values().flatten().count();
@@ -15380,14 +15613,17 @@ fn enforce_combined_relay_budget(
     let total_count = live_count + completed_count;
     if total_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
         if live_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
-            // Live alone exceeds the cap — fail closed, do not evict.
+            // Live alone exceeds the cap — truncate oldest-first.
             tracing::error!(
                 live_count,
                 cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-                "ADR 0028: live obligations alone exceed daemon count cap, failing closed (no eviction)"
+                "ADR 0028: live obligations alone exceed daemon count cap, truncating oldest-first"
             );
             // Drop ALL completed receipts to free what we can.
             tombstones.clear();
+            // Truncate live oldest-first to the cap.
+            let excess = live_count - CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP;
+            truncate_live_oldest_first(outbox, excess);
         } else {
             // Shed completed receipts oldest-first until within budget.
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP - live_count;
@@ -15434,9 +15670,11 @@ fn enforce_combined_relay_budget(
             tracing::error!(
                 live_bytes,
                 cap = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-                "ADR 0028: live obligations alone exceed daemon byte cap, failing closed (no eviction)"
+                "ADR 0028: live obligations alone exceed daemon byte cap, truncating oldest-first"
             );
             tombstones.clear();
+            // Finding 2: truncate live oldest-first until within byte cap.
+            truncate_live_bytes_oldest_first(outbox, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP);
         } else {
             let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP - live_bytes;
             let mut all_completed: Vec<(String, u64, usize, usize)> = Vec::new();
@@ -15973,13 +16211,15 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                 );
                 continue;
             }
-            // Finding 6: re-derive relay targets from current active non-local
-            // witnesses, not just trim unparseable hex. A valid-hex target
-            // inserted or removed in the sidecar must not survive unless it is
-            // currently an active non-local group member. Intersect the stored
-            // remaining targets (not-yet-delivered) with the current active
-            // membership to preserve delivery tracking while re-establishing
-            // direction.
+            // Finding 3 (Watson 32c2d3a): re-derive relay targets from
+            // current active non-local witnesses. Do NOT trust the sidecar's
+            // remaining-target list — deleting a still-required active witness
+            // from the sidecar would survive restart with no later refresh to
+            // re-add it. Use UNION: start from all current active non-local
+            // witnesses, then intersect with the stored targets only to preserve
+            // delivery-completion tracking (targets already fully delivered are
+            // not in the stored remaining set). Targets removed from the
+            // sidecar but still active are re-added.
             let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
             let active_witnesses: std::collections::HashSet<String> = info
                 .members_v2
@@ -15989,10 +16229,21 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                 })
                 .map(|(id, _)| id.clone())
                 .collect();
-            let valid_targets: Vec<String> = entry
-                .relay_targets
+            // Union: every active witness is a valid target. The stored
+            // remaining-target list is authoritative for "not yet delivered"
+            // — if a target was already fully delivered (removed from stored),
+            // do NOT re-add it. So: active_witnesses ∩ (active_witnesses ∪
+            // stored_remaining) = active_witnesses minus those explicitly
+            // removed from stored as completed.
+            //
+            // But we cannot distinguish "removed because delivered" from
+            // "removed by sidecar tampering". So the safe choice is: re-derive
+            // ALL active non-local witnesses as targets. The relay engine
+            // already idempotently skips targets that have acknowledged. This
+            // re-establishes direction without trusting the untrusted sidecar.
+            let valid_targets: Vec<String> = active_witnesses
                 .iter()
-                .filter(|t| parse_agent_id_hex(t).is_ok() && active_witnesses.contains(*t))
+                .filter(|t| parse_agent_id_hex(t).is_ok())
                 .cloned()
                 .collect();
             if valid_targets.len() != entry.relay_targets.len() {
@@ -16037,10 +16288,13 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         tracing::error!(
             live_targets,
             cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-            "ADR 0028: live relay targets exceed daemon cap on restart, failing closed (no live eviction)"
+            "ADR 0028: live relay targets exceed daemon cap on restart, truncating oldest-first"
         );
         // Shed completed tombstones — they also carry target-like overhead.
         tombstones.clear();
+        // Finding 2: truncate live obligations oldest-first until total
+        // targets are within the cap. Do not retain over-budget live state.
+        truncate_live_targets_oldest_first(&mut outbox, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP);
     }
     *state.predecessor_relay_outbox.write().await = outbox;
     *state.completed_relay_tombstones.write().await = tombstones;
@@ -16177,8 +16431,9 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                         if !is_authority {
                             continue;
                         }
-                        // Finding 6: re-derive targets from current active
-                        // non-local witnesses, not just trim unparseable hex.
+                        // Finding 3 (Watson 32c2d3a): re-derive targets from
+                        // current active non-local witnesses (union, not
+                        // intersect). Do not trust sidecar target omissions.
                         let active_witnesses: std::collections::HashSet<String> = info
                             .members_v2
                             .iter()
@@ -16188,17 +16443,11 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                             })
                             .map(|(id, _)| id.clone())
                             .collect();
-                        let valid_targets: Vec<String> = entry
-                            .relay_targets
+                        let valid_targets: Vec<String> = active_witnesses
                             .iter()
-                            .filter(|t| {
-                                parse_agent_id_hex(t).is_ok() && active_witnesses.contains(*t)
-                            })
+                            .filter(|t| parse_agent_id_hex(t).is_ok())
                             .cloned()
                             .collect();
-                        if valid_targets.len() != entry.relay_targets.len() {
-                            continue;
-                        }
                         let mut entry = entry.clone();
                         entry.byte_size = derived_byte_size;
                         entry.digest = derived_digest.into();
@@ -16233,9 +16482,14 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                             tracing::error!(
                                 live_targets,
                                 cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-                                "ADR 0028 B8: journal restore pushes live targets over daemon cap, failing closed"
+                                "ADR 0028 B8: journal restore pushes live targets over daemon cap, truncating oldest-first"
                             );
                             tombstones.clear();
+                            // Finding 2: truncate to bound, not just log.
+                            truncate_live_targets_oldest_first(
+                                &mut outbox,
+                                CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+                            );
                         }
                     }
                     true

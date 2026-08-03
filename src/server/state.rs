@@ -697,7 +697,9 @@ pub(super) struct AppState {
     pub(super) predecessor_relay_outbox: RwLock<HashMap<String, Vec<PredecessorRelayObligation>>>,
     /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
     /// Prevents re-admission of a conflicting entry after restart.
-    pub(super) causal_conflict_tombstones: RwLock<HashMap<String, Vec<[u8; 32]>>>,
+    /// Finding 4: entries carry timestamps for deterministic oldest-first.
+    pub(super) causal_conflict_tombstones:
+        RwLock<HashMap<String, Vec<crate::server::routes::named_groups::ConflictTombstoneEntry>>>,
     /// ADR 0028 B6: completed relay obligation tombstones, keyed by group_id.
     /// Pruned from the live retry outbox after all targets delivered; retained
     /// for the B8 approval precondition check.

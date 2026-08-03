@@ -25,33 +25,33 @@ use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
     agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
     agents_by_user_handler, announce_identity, apply_direct_kv_store_delta,
-    apply_named_group_metadata_event, apply_upgrade, approve_join_request, ban_group_member,
-    bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request, causal_relay_step,
-    check_upgrade, connect_agent, connect_diagnostics_handler, connect_machine,
-    connectivity_diagnostics, create_discovery_subscription, create_group_invite,
-    create_join_request, create_kv_store, create_mls_group, create_mls_welcome, create_named_group,
-    create_task_list, delete_contact, delete_discovery_subscription, delete_kv_value,
-    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
-    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, ensure_named_group_listeners, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
-    get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
-    get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
-    history_list, history_purge, history_search, history_stats, identity_revocations,
-    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
-    load_named_groups, load_predecessor_relay_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler, mls_decrypt, mls_encrypt,
-    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
-    now_millis_u64, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    apply_named_group_metadata_event, apply_named_group_metadata_event_inner_serialized,
+    apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
+    broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
+    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
+    create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
+    create_mls_group, create_mls_welcome, create_named_group, create_task_list, delete_contact,
+    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
+    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
+    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
+    ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics, exec_run,
+    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
+    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
+    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
+    get_group_card, get_group_public_messages, get_group_state, get_group_state_commits,
+    get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
+    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
+    health, history_diagnostics, history_list, history_purge, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
+    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
     reject_join_request, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
@@ -1342,29 +1342,49 @@ pub async fn serve_with_options(
                 // false) so real requester offers now reach obligation
                 // admission. An invalid offer must not manufacture the
                 // later obligation predicate.
-                let mut apply_result = apply_named_group_metadata_event(
-                    &relay_state,
-                    event.clone(),
-                    sender,
-                    msg.verified,
-                    Some(envelope_bytes),
-                )
-                .await;
+                //
+                // Finding 1 (Watson 32c2d3a): hold the membership lock from
+                // apply through obligation admission + rollback, closing the
+                // unlocked interval where replay or a concurrent mutation
+                // could be erased by a stale-snapshot rollback. Replay is
+                // deferred until after the lock is released.
+                let replay_after: Option<String>;
+                let skip_iteration = 'admission: {
+                    let membership_lock =
+                        group_membership_lock(&relay_state, &group_id_str).await;
+                    let _membership_guard = membership_lock.lock().await;
 
-                // Only the authority (group creator) stores the relay
-                // obligation and relays to active witnesses. A non-authority
-                // witness that received the relay just applies — it does not
-                // re-relay, preventing a relay storm.
-                // B8: only create the obligation if apply accepted the event.
-                // Finding B: ONE admission seam — request state + obligation
-                // together (or neither), reachable by exact replay. If the
-                // apply accepted a new JoinRequestCreated, we snapshot the
-                // pre-apply named-group state so we can roll back the request
-                // if obligation creation fails. If the apply rejected (e.g.
-                // request already exists from a prior failed attempt), we
-                // check for the repair case: request present, obligation
-                // absent → create the obligation without re-applying.
-                if is_local_authority && is_requester_offer {
+                    let mut replay_group_id: Option<String> = None;
+                    let mut apply_result =
+                        apply_named_group_metadata_event_inner_serialized(
+                            &relay_state,
+                            event.clone(),
+                            sender,
+                            msg.verified,
+                            true,
+                            Some(envelope_bytes),
+                            &mut replay_group_id,
+                            true, // lock_already_held
+                        )
+                        .await;
+                    replay_after = replay_group_id;
+
+                    // Only the authority (group creator) stores the relay
+                    // obligation and relays to active witnesses. A non-authority
+                    // witness that received the relay just applies — it does not
+                    // re-relay, preventing a relay storm.
+                    // B8: only create the obligation if apply accepted the event.
+                    // Finding B: ONE admission seam — request state + obligation
+                    // together (or neither), reachable by exact replay. If the
+                    // apply accepted a new JoinRequestCreated, we snapshot the
+                    // pre-apply named-group state so we can roll back the request
+                    // if obligation creation fails. If the apply rejected (e.g.
+                    // request already exists from a prior failed attempt), we
+                    // check for the repair case: request present, obligation
+                    // absent → create the obligation without re-applying.
+                    if !is_local_authority || !is_requester_offer {
+                        break 'admission false;
+                    }
                     let digest = blake3::hash(envelope_bytes);
                     let digest_bytes: [u8; 32] = digest.into();
                     let byte_size = envelope_bytes.len();
@@ -1373,7 +1393,7 @@ pub async fn serve_with_options(
                         NamedGroupMetadataEvent::JoinRequestCreated { request_id, requester_agent_id, .. } => {
                             (request_id.clone(), requester_agent_id.clone())
                         }
-                        _ => continue,
+                        _ => break 'admission false,
                     };
 
                     // Idempotent skip: if the obligation already exists for
@@ -1385,7 +1405,7 @@ pub async fn serve_with_options(
                         })
                     };
                     if obligation_exists {
-                        continue;
+                        break 'admission false;
                     }
 
                     // Determine whether to create the obligation:
@@ -1416,7 +1436,7 @@ pub async fn serve_with_options(
                             });
 
                     if !is_new_request && !is_repair {
-                        continue;
+                        break 'admission false;
                     }
 
                     // For new requests: use the pre-mutation group state
@@ -1485,7 +1505,7 @@ pub async fn serve_with_options(
                         let group_outbox = outbox.entry(group_id_str.clone()).or_default();
                         // Dedup by digest.
                         if group_outbox.iter().any(|o| o.digest == obligation.digest) {
-                            continue;
+                            break 'admission false;
                         }
                         // Per-group combined count cap (live + completed).
                         let group_completed_count = {
@@ -1560,13 +1580,10 @@ pub async fn serve_with_options(
                         // For repair (request already existed), just skip.
                         // The pre-mutation snapshot is the state BEFORE the
                         // durable apply, so this actually removes the request.
-                        // Hold the membership lock during rollback to prevent
-                        // a concurrent apply from being overwritten.
+                        // Finding 1: membership lock is already held — no need
+                        // to reacquire. The rollback is atomic with the apply.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
-                                let membership_lock =
-                                    group_membership_lock(&relay_state, &group_id_str).await;
-                                let _membership_guard = membership_lock.lock().await;
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after obligation admission failure"
@@ -1585,7 +1602,7 @@ pub async fn serve_with_options(
                                 }
                             }
                         }
-                        continue;
+                        break 'admission true;
                     }
                     // Persist the relay outbox. Persistence lock is already
                     // held (P→Q). Roll back on failure.
@@ -1598,13 +1615,10 @@ pub async fn serve_with_options(
                             group_outbox.retain(|o| o.digest != digest_bytes);
                         }
                         // Finding B: also roll back the request if new.
-                        // Hold the membership lock during rollback.
+                        // Finding 1: membership lock is already held.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
                                 drop(outbox);
-                                let membership_lock =
-                                    group_membership_lock(&relay_state, &group_id_str).await;
-                                let _membership_guard = membership_lock.lock().await;
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
@@ -1623,13 +1637,24 @@ pub async fn serve_with_options(
                                 }
                             }
                         }
-                        continue;
+                        break 'admission true;
                     }
 
                     // B6: no fire-and-forget sibling — the background
                     // causal_relay_step timer owns all sends through the
                     // single relay engine. The obligation's next_retry_at_ms
                     // is set to now, so the timer picks it up immediately.
+                    break 'admission false;
+                };
+                // Membership lock released here (dropped at end of labeled block).
+
+                // Finding 1: replay deferred until after lock release. The
+                // replay acquires its own membership lock via _inner_serialized.
+                if let Some(gid) = replay_after {
+                    replay_pending_causal_approvals(&relay_state, &gid).await;
+                }
+                if skip_iteration {
+                    continue;
                 }
             }
         }));

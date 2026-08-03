@@ -62,10 +62,11 @@ pub(super) use machines::{
 };
 pub(super) use messaging::{publish, subscribe, unsubscribe, RestSubscription};
 pub(super) use named_groups::{
-    add_named_group_member, apply_named_group_metadata_event, approve_join_request,
-    ban_group_member, cancel_join_request, causal_relay_step, create_discovery_subscription,
-    create_group_invite, create_join_request, create_named_group, delete_discovery_subscription,
-    discover_groups, discover_groups_nearby, ensure_named_group_listeners, get_group_card,
+    add_named_group_member, apply_named_group_metadata_event,
+    apply_named_group_metadata_event_inner_serialized, approve_join_request, ban_group_member,
+    cancel_join_request, causal_relay_step, create_discovery_subscription, create_group_invite,
+    create_join_request, create_named_group, delete_discovery_subscription, discover_groups,
+    discover_groups_nearby, ensure_named_group_listeners, get_group_card,
     get_group_public_messages, get_group_state, get_group_state_commits, get_named_group,
     get_named_group_members, group_membership_lock, handle_join_result_message,
     handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
