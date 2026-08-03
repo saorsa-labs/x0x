@@ -1582,8 +1582,22 @@ pub async fn serve_with_options(
                         // durable apply, so this actually removes the request.
                         // Finding 1: membership lock is already held — no need
                         // to reacquire. The rollback is atomic with the apply.
+                        //
+                        // Residual (Kimi e2431e2): if the rollback save itself
+                        // fails, durable retains the applied JoinRequestCreated
+                        // but memory has the pre-request snapshot — a divergence
+                        // the repair path cannot service. Fix: capture the
+                        // post-apply state BEFORE reverting memory, and on save
+                        // failure restore it so memory matches durable. The
+                        // state degrades to "request present, obligation absent"
+                        // which the repair path (is_repair) services on
+                        // re-delivery.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
+                                let post_apply_state = {
+                                    let groups = relay_state.named_groups.read().await;
+                                    groups.get(&group_id_str).cloned()
+                                };
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after obligation admission failure"
@@ -1599,6 +1613,18 @@ pub async fn serve_with_options(
                                         group_id = %group_id_str,
                                         "ADR 0028: rollback save failed after admission failure: {e}"
                                     );
+                                    // Restore post-apply state to memory so it
+                                    // matches durable. The repair path can
+                                    // service "request present, obligation absent"
+                                    // on re-delivery.
+                                    if let Some(post_apply) = post_apply_state {
+                                        store_named_group_info(
+                                            &relay_state,
+                                            &group_id_str,
+                                            post_apply,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         }
@@ -1616,9 +1642,18 @@ pub async fn serve_with_options(
                         }
                         // Finding B: also roll back the request if new.
                         // Finding 1: membership lock is already held.
+                        // Residual (Kimi e2431e2): same rollback-save-failure
+                        // fix as the admission-failure path — capture post-apply
+                        // state before reverting, restore on save failure.
+                        // Drop the outbox write lock first to respect P→Q
+                        // ordering — no Q lock held during named_groups read.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
                                 drop(outbox);
+                                let post_apply_state = {
+                                    let groups = relay_state.named_groups.read().await;
+                                    groups.get(&group_id_str).cloned()
+                                };
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
@@ -1634,6 +1669,14 @@ pub async fn serve_with_options(
                                         group_id = %group_id_str,
                                         "ADR 0028: rollback save failed after outbox save failure: {e}"
                                     );
+                                    if let Some(post_apply) = post_apply_state {
+                                        store_named_group_info(
+                                            &relay_state,
+                                            &group_id_str,
+                                            post_apply,
+                                        )
+                                        .await;
+                                    }
                                 }
                             }
                         }
