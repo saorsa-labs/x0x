@@ -4642,7 +4642,7 @@ async fn try_queue_causal_approval(
     // expected signer (the approval actor). Uses the shared validator so
     // live admission and restart revalidation enforce the same checks.
     // B2/B7: the signed topic must match the group's metadata topic.
-    let actor_hex = hex::encode(approval_actor.as_bytes());
+    let actor_hex = approval_actor.clone();
     let validated = validate_causal_envelope(
         env_bytes,
         group_id,
