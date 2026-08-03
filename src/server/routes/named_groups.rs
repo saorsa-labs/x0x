@@ -17229,7 +17229,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
         migrated_legacy_clock || roster_requires_durability_confirmation;
     let mut pending_compensation = loaded_sidecar.pending_compensation.clone();
     let mut pending_listener_admission = loaded_sidecar.pending_listener_admission.clone();
-    let mut recovery_changed = false;
 
     // Validate B8 recovery in detached maps. Nothing is installed until the
     // complete candidate passes signature, identity, count, byte, and target
@@ -17319,7 +17318,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             tombstones = candidate_tombstones;
         }
         pending_compensation = None;
-        recovery_changed = true;
     }
 
     // Recover listener request+obligation without external re-delivery. The
@@ -17458,7 +17456,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
         outbox = candidate_outbox;
         tombstones = candidate_tombstones;
         pending_listener_admission = None;
-        recovery_changed = true;
     }
 
     // All ordinary state and both recovery journals have now passed detached
@@ -17488,17 +17485,23 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
     *state.pending_b8_compensation.lock().await = pending_compensation;
     *state.pending_listener_admission.lock().await = pending_listener_admission;
 
-    if recovery_changed {
-        match save_predecessor_relay_outbox(state).await {
-            Ok(AtomicWriteOutcome::Durable) => {}
-            Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
-                return Err(
-                    "relay recovery replacement is visible but not directory-durable".to_string(),
-                );
-            }
-            Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
-                return Err("relay recovery state was not persisted".to_string());
-            }
+    // Re-save every accepted, existing sidecar and require a directory-durable
+    // outcome before startup succeeds, even when this pass found no recovery
+    // marker. This is the retry evidence for a prior ReplacedNotDurable
+    // recovery clear: the visible file may already be empty on supervisor
+    // retry, so inspecting its contents cannot prove that the prior rename was
+    // durable. Replacing and parent-fsyncing the exact accepted state again
+    // closes that evidence-empty retry path without minting a new causal
+    // window or relying on external re-delivery.
+    match save_predecessor_relay_outbox(state).await {
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            return Err(
+                "relay recovery replacement is visible but not directory-durable".to_string(),
+            );
+        }
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+            return Err("relay recovery state was not persisted".to_string());
         }
     }
 
