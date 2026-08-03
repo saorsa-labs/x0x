@@ -147,6 +147,11 @@ static NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY: StdMutex<
 > = StdMutex::new(None);
 
 #[cfg(test)]
+static B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY: StdMutex<
+    Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
+> = StdMutex::new(None);
+
+#[cfg(test)]
 pub(in crate::server) struct TreeKemCacheWriterHookControl {
     // Signalled with a stored permit once the writer has entered the hook, so a
     // test can deterministically observe that the write is in flight regardless
@@ -13345,6 +13350,16 @@ pub(in crate::server) async fn approve_join_request(
         // acquisition has already completed before the clock is sampled.
         {
             let mut pending = state.pending_b8_compensation.lock().await;
+            #[cfg(test)]
+            let final_authorization_hook = B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY
+                .lock()
+                .expect("B8 final-authorization test hook poisoned")
+                .take();
+            #[cfg(test)]
+            if let Some((entered, release)) = final_authorization_hook {
+                entered.notify_one();
+                release.notified().await;
+            }
             let authorization_now_ms = now_millis_u64();
             let proof_is_still_present = outbox.get(&id).is_some_and(|obligations| {
                 obligations.iter().any(|obligation| {

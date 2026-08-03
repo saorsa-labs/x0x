@@ -1430,6 +1430,103 @@ async fn b7_isolated_failed_save_leaves_no_durable_trace() {
 // reported as aborted. At 277505c only the roster is rolled back in each order;
 // the outbox refresh is left inconsistent — RED in both.
 
+// MUT-B8-final-clock-before-journal: move `authorization_now_ms` above the
+// `B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY` barrier (or remove the final
+// expiry check). The handler then authorizes with the stale pre-boundary time,
+// installs PendingB8Compensation, and approves after the five-minute window.
+// GREEN keeps the final clock sample and journal installation in the same
+// non-suspending section after every potentially blocking lock acquisition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn b8_final_expiry_check_linearizes_with_journal_installation() {
+    use std::time::Duration;
+    use tokio::time::{sleep, timeout};
+
+    let (state, _dir) = d_state().await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let witness_hex = hex::encode(fresh_kp().agent_id().as_bytes());
+    let group_key = "b8f1".repeat(8);
+    let request_id =
+        install_group_with_witness(&state, &group_key, &requester_hex, &witness_hex).await;
+
+    offer_predecessor_obligation_via_real_path(&state, &group_key, &request_id, &requester_kp)
+        .await;
+
+    // Leave enough time for the first authenticated proof read to finish, but
+    // little enough that the deterministic barrier crosses the retention edge.
+    let first_seen_ms = unix_ms()
+        .saturating_sub(CAUSAL_APPROVAL_RETENTION_MS)
+        .saturating_add(1_500);
+    {
+        let mut groups = state.named_groups.write().await;
+        let request = groups
+            .get_mut(&group_key)
+            .and_then(|group| group.join_requests.get_mut(&request_id))
+            .expect("pending request");
+        request.predecessor_first_seen_ms = Some(first_seen_ms);
+    }
+    {
+        let mut outbox = state.predecessor_relay_outbox.write().await;
+        let obligation = outbox
+            .get_mut(&group_key)
+            .and_then(|entries| entries.first_mut())
+            .expect("live predecessor obligation");
+        obligation.first_seen_ms = first_seen_ms;
+        obligation.next_retry_at_ms = first_seen_ms.saturating_add(60_000);
+    }
+    assert!(matches!(
+        save_predecessor_relay_outbox(&state).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ));
+    assert!(matches!(
+        save_named_groups_checked(&state).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ));
+
+    let entered = Arc::new(tokio::sync::Notify::new());
+    let release = Arc::new(tokio::sync::Notify::new());
+    *B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY
+        .lock()
+        .expect("B8 final-authorization test hook poisoned") =
+        Some((Arc::clone(&entered), Arc::clone(&release)));
+
+    let approve_state = Arc::clone(&state);
+    let approve_group = group_key.clone();
+    let approve_request = request_id.clone();
+    let approval = tokio::spawn(async move {
+        approve_status(&approve_state, &approve_group, &approve_request).await
+    });
+
+    timeout(Duration::from_secs(5), entered.notified())
+        .await
+        .expect("B8 reached the final authorization barrier within 5s");
+    sleep(Duration::from_millis(1_600)).await;
+    release.notify_one();
+
+    let status = timeout(Duration::from_secs(5), approval)
+        .await
+        .expect("B8 approval completed within 5s")
+        .expect("B8 approval task did not panic");
+    assert_eq!(
+        status,
+        StatusCode::PRECONDITION_FAILED,
+        "MUT-B8-final-clock-before-journal: approval must be refused when the proof expires after lock acquisition but before the journal linearization point"
+    );
+    assert!(
+        state.pending_b8_compensation.lock().await.is_none(),
+        "an expired proof must never install PendingB8Compensation"
+    );
+    let groups = state.named_groups.read().await;
+    let request = groups
+        .get(&group_key)
+        .and_then(|group| group.join_requests.get(&request_id))
+        .expect("request survives refused approval");
+    assert!(
+        request.is_pending(),
+        "the refused approval must restore the pending roster state"
+    );
+}
+
 // --- B8 order 1: outbox-refresh save failure (RED) ------------------------
 //
 // MUT-b8-outbox-refresh-no-rollback: when `save_predecessor_relay_outbox`
