@@ -39,22 +39,23 @@ use routes::{
     forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
     get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, gossip_diagnostics, groups_diagnostics, handle_file_message,
-    handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
-    handle_welcome_blob_message, health, history_diagnostics, history_list, history_purge,
-    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
-    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
-    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
-    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
-    list_task_lists, list_tasks, load_causal_approval_queue, load_named_groups,
-    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
-    named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_treekem_named_journals, reject_join_request, remove_mls_member,
-    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
-    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    history_list, history_purge, history_search, history_stats, identity_revocations,
+    identity_revoke, import_agent_card, import_group_card, ingest_public_message, introduction,
+    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
+    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
+    load_named_groups, load_predecessor_relay_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
+    now_millis_u64, peer_health_handler, peers, pin_machine, presence, presence_find,
+    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
+    reject_join_request, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
     save_named_groups_checked, save_predecessor_relay_outbox_unlocked, seal_group_state,
     secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
     secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
@@ -1341,7 +1342,7 @@ pub async fn serve_with_options(
                 // false) so real requester offers now reach obligation
                 // admission. An invalid offer must not manufacture the
                 // later obligation predicate.
-                let apply_result = apply_named_group_metadata_event(
+                let mut apply_result = apply_named_group_metadata_event(
                     &relay_state,
                     event.clone(),
                     sender,
@@ -1390,24 +1391,42 @@ pub async fn serve_with_options(
                     // Determine whether to create the obligation:
                     // - apply_result.accepted: new request was just applied
                     // - !accepted but request exists + obligation missing: repair
-                    let request_exists_in_roster = {
+                    // Finding 2: repair must bind to the exact durable
+                    // predecessor envelope digest, not just request-ID presence.
+                    let request_info = {
                         let groups = relay_state.named_groups.read().await;
-                        groups.get(&group_id_str).is_some_and(|info| {
-                            info.join_requests.contains_key(&request_id)
+                        groups.get(&group_id_str).and_then(|info| {
+                            info.join_requests.get(&request_id).map(|jr| {
+                                (jr.requester_agent_id.clone(), jr.predecessor_envelope_digest)
+                            })
                         })
                     };
 
                     let is_new_request = apply_result.accepted;
-                    let is_repair = !is_new_request && request_exists_in_roster;
+                    // Finding 2: repair only if the request exists, the
+                    // requester matches, AND the stored predecessor digest
+                    // matches this envelope's digest. A divergent
+                    // differently-signed envelope with the same request_id
+                    // cannot become the durable obligation.
+                    let is_repair = !is_new_request
+                        && request_info
+                            .is_some_and(|(req_agent, stored_digest)| {
+                                req_agent == requester_agent_id
+                                    && stored_digest == Some(digest_bytes)
+                            });
 
                     if !is_new_request && !is_repair {
                         continue;
                     }
 
-                    // For new requests: snapshot the group state for rollback.
+                    // For new requests: use the pre-mutation group state
+                    // returned by apply (Finding B). This is the state BEFORE
+                    // the JoinRequestCreated was durably applied, so rollback
+                    // actually undoes the request. The previous code read the
+                    // post-apply state from named_groups, which already
+                    // contained the applied request.
                     let group_snapshot = if is_new_request {
-                        let groups = relay_state.named_groups.read().await;
-                        groups.get(&group_id_str).cloned()
+                        apply_result.pre_mutation_group.take()
                     } else {
                         None
                     };
@@ -1539,8 +1558,15 @@ pub async fn serve_with_options(
                         // Finding B: roll back the request if this was a new
                         // apply, so request state + obligation are "neither".
                         // For repair (request already existed), just skip.
+                        // The pre-mutation snapshot is the state BEFORE the
+                        // durable apply, so this actually removes the request.
+                        // Hold the membership lock during rollback to prevent
+                        // a concurrent apply from being overwritten.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
+                                let membership_lock =
+                                    group_membership_lock(&relay_state, &group_id_str).await;
+                                let _membership_guard = membership_lock.lock().await;
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after obligation admission failure"
@@ -1551,7 +1577,12 @@ pub async fn serve_with_options(
                                     snapshot,
                                 )
                                 .await;
-                                let _ = save_named_groups_checked(&relay_state).await;
+                                if let Err(e) = save_named_groups_checked(&relay_state).await {
+                                    tracing::error!(
+                                        group_id = %group_id_str,
+                                        "ADR 0028: rollback save failed after admission failure: {e}"
+                                    );
+                                }
                             }
                         }
                         continue;
@@ -1567,9 +1598,13 @@ pub async fn serve_with_options(
                             group_outbox.retain(|o| o.digest != digest_bytes);
                         }
                         // Finding B: also roll back the request if new.
+                        // Hold the membership lock during rollback.
                         if is_new_request {
                             if let Some(snapshot) = group_snapshot {
                                 drop(outbox);
+                                let membership_lock =
+                                    group_membership_lock(&relay_state, &group_id_str).await;
+                                let _membership_guard = membership_lock.lock().await;
                                 tracing::warn!(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
@@ -1580,7 +1615,12 @@ pub async fn serve_with_options(
                                     snapshot,
                                 )
                                 .await;
-                                let _ = save_named_groups_checked(&relay_state).await;
+                                if let Err(e) = save_named_groups_checked(&relay_state).await {
+                                    tracing::error!(
+                                        group_id = %group_id_str,
+                                        "ADR 0028: rollback save failed after outbox save failure: {e}"
+                                    );
+                                }
                             }
                         }
                         continue;

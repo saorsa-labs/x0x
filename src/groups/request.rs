@@ -43,6 +43,12 @@ pub struct JoinRequest {
     #[serde(default)]
     pub reviewed_by: Option<String>,
     pub status: JoinRequestStatus,
+    /// ADR 0028: blake3 digest of the predecessor relay envelope that
+    /// created this request. Stored at apply time so the relay listener's
+    /// repair path can verify an exact replay matches the durable
+    /// transition, not just request-ID presence.
+    #[serde(default)]
+    pub predecessor_envelope_digest: Option<[u8; 32]>,
 }
 
 impl JoinRequest {
@@ -66,6 +72,7 @@ impl JoinRequest {
             reviewed_at: None,
             reviewed_by: None,
             status: JoinRequestStatus::Pending,
+            predecessor_envelope_digest: None,
         }
     }
 

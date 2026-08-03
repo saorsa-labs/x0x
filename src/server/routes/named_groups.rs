@@ -525,7 +525,25 @@ pub(in crate::server) const CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP: usize = 4096;
 /// headroom. This admits every semantically valid population under the
 /// selected encoding, unlike the previous 2× or 5× proxy guards which could
 /// reject valid sidecars.
+/// ADR 0028 Finding F: pre-parse file size cap for the relay outbox sidecar.
+/// The relay outbox sidecar stores `PredecessorRelayObligation` (envelope_bytes:
+/// Vec<u8>) and `CompletedRelayTombstone` (envelope_bytes: Vec<u8>). JSON
+/// encodes Vec<u8> as number arrays at ~4 chars/byte. With two stores (live +
+/// completed), the worst-case JSON expansion is 2 × 4 = 8× the raw envelope
+/// byte budget. The 10× factor provides 25% headroom for metadata overhead
+/// (digests, timestamps, target IDs, group IDs, version field). Post-parse
+/// derived envelope limits remain authoritative.
 const RELAY_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP * 10;
+/// ADR 0028 Finding F: pre-parse file size cap for the causal approval queue
+/// sidecar. The queue sidecar stores `PendingCausalApproval` which carries
+/// BOTH `envelope_bytes: Vec<u8>` AND `event: NamedGroupMetadataEvent` (the
+/// decoded event). The decoded event's JSON is roughly the same order as the
+/// envelope's JSON (field names + string values ≈ 4 chars per byte of original
+/// envelope). So the queue sidecar has 2 × 4 = 8× expansion from the two
+/// Vec<u8>-equivalent fields, plus metadata (digest, sender, timestamps,
+/// revision, conflict flags, conflict_tombstones). The 10× factor provides
+/// 25% headroom over the 8× expansion. Post-parse derived envelope limits
+/// remain authoritative.
 const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP * 10;
 
 /// ADR 0028: Typed result for `apply_named_group_metadata_event` that
@@ -537,13 +555,18 @@ const QUEUE_SIDECAR_FILE_SIZE_CAP: usize = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP *
 /// `JoinRequestCreated` arm returned `false` (continue) even after a
 /// successful apply, so real requester offers never reached obligation
 /// admission.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(in crate::server) struct ApplyMetadataResult {
     /// `true` when the event was accepted and durably persisted.
     pub accepted: bool,
     /// `true` when the subscriber loop should exit (e.g. self-removal,
     /// group deletion, membership change requiring re-subscription).
     pub should_exit: bool,
+    /// ADR 0028 Finding B: pre-mutation group state for rollback. Set by
+    /// JoinRequestCreated so the relay listener can restore the pre-apply
+    /// state (without the request) if obligation admission fails. `None`
+    /// for all other event types and for rejected applies.
+    pub(in crate::server) pre_mutation_group: Option<x0x::groups::GroupInfo>,
 }
 
 impl ApplyMetadataResult {
@@ -551,6 +574,7 @@ impl ApplyMetadataResult {
     pub const REJECTED: Self = Self {
         accepted: false,
         should_exit: false,
+        pre_mutation_group: None,
     };
 
     /// Event accepted and persisted; subscriber should exit (membership
@@ -558,6 +582,7 @@ impl ApplyMetadataResult {
     pub const ACCEPTED_EXIT: Self = Self {
         accepted: true,
         should_exit: true,
+        pre_mutation_group: None,
     };
 
     /// Event accepted and persisted; subscriber should continue
@@ -565,6 +590,7 @@ impl ApplyMetadataResult {
     pub const ACCEPTED_CONTINUE: Self = Self {
         accepted: true,
         should_exit: false,
+        pre_mutation_group: None,
     };
 }
 
@@ -4784,6 +4810,12 @@ async fn try_queue_causal_approval(
                 }
                 return;
             }
+            // Finding 8: cap conflict tombstones AFTER successful persist so
+            // the rollback path only needs to undo newly-inserted entries.
+            {
+                let mut tombstones = state.causal_conflict_tombstones.write().await;
+                prune_conflict_tombstones(&mut tombstones);
+            }
             // Persist succeeded — record diagnostic.
             state.groups_diagnostics.record_causal_conflicted(group_id);
             return;
@@ -4865,13 +4897,17 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     // a queue lock and wait for persistence — eliminates the deadlock cycle
     // where replay held P→waited Qw while admission held Qw→waited P.
     let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
-    let entries = {
+    let (entries, queue_snapshot) = {
         let mut queue_lock = state.causal_approval_queue.write().await;
         let Some(queue) = queue_lock.get_mut(group_id) else {
             // No queue for this group — nothing to persist.
             return;
         };
         let now_ms = now_millis_u64();
+        // Finding 9: snapshot the queue before mutation so a save failure
+        // can restore the pre-drain state. Without this, the in-memory
+        // queue diverges from the durable sidecar.
+        let queue_snapshot: VecDeque<PendingCausalApproval> = queue.clone();
         // Drop expired entries and count them for diagnostics.
         let expired_count = queue.iter().filter(|q| q.expires_at_ms <= now_ms).count();
         if expired_count > 0 {
@@ -4880,7 +4916,7 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         queue.retain(|q| q.expires_at_ms > now_ms);
         // Drain remaining for retry (already sorted by revision).
         let entries: Vec<_> = queue.drain(..).collect();
-        entries
+        (entries, queue_snapshot)
     };
 
     if entries.is_empty() {
@@ -4890,6 +4926,10 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             tracing::error!(
                 "ADR 0028: failed to persist causal approval queue after expiry-only drain: {e}"
             );
+            // Finding 9: restore the pre-drain queue so memory matches the
+            // durable sidecar. On the next retry, the drain re-attempts.
+            let mut queue_lock = state.causal_approval_queue.write().await;
+            queue_lock.insert(group_id.to_string(), queue_snapshot);
         }
         return;
     }
@@ -5047,6 +5087,11 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     // helper to avoid re-acquiring the persistence mutex.
     if let Err(e) = save_causal_approval_queue_unlocked(state).await {
         tracing::error!("ADR 0028: failed to persist causal approval queue after drain: {e}");
+        // Finding 9: restore the pre-drain queue so memory matches the
+        // durable sidecar. Applied entries that were removed from memory
+        // are still in the durable sidecar and will be re-drained on retry.
+        let mut queue_lock = state.causal_approval_queue.write().await;
+        queue_lock.insert(group_id.to_string(), queue_snapshot);
     }
 }
 
@@ -5404,7 +5449,10 @@ async fn request_member_key_package_catchup(
 /// Get-or-create the per-group membership serialization mutex. See
 /// [`AppState::group_membership_locks`] for why membership applies must be
 /// serialized per group.
-async fn group_membership_lock(state: &AppState, group_key: &str) -> Arc<Mutex<()>> {
+pub(in crate::server) async fn group_membership_lock(
+    state: &AppState,
+    group_key: &str,
+) -> Arc<Mutex<()>> {
     let lock_key = {
         let groups = state.named_groups.read().await;
         groups
@@ -6478,6 +6526,7 @@ async fn apply_named_group_metadata_event_inner_serialized(
                         reviewed_at: None,
                         reviewed_by: None,
                         status: x0x::groups::JoinRequestStatus::Pending,
+                        predecessor_envelope_digest: envelope_bytes.map(|b| blake3::hash(b).into()),
                     };
                     next.join_requests.insert(request_id.clone(), req);
                     if let Some(kem_b64) = requester_kem_public_key_b64.clone() {
@@ -6526,7 +6575,14 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // ADR 0028: a JoinRequestCreated just advanced the group state.
             // Drain queued approvals that may now have their predecessor.
             *replay_group_id = Some(resolved_group_key.clone());
-            ApplyMetadataResult::ACCEPTED_CONTINUE
+            // Finding B: return the pre-mutation group state so the relay
+            // listener can roll back the request if obligation admission
+            // fails. The `current` clone was captured before any mutation.
+            ApplyMetadataResult {
+                accepted: true,
+                should_exit: false,
+                pre_mutation_group: Some(current),
+            }
         }
         NamedGroupMetadataEvent::JoinRequestApproved {
             request_id,
@@ -6743,9 +6799,20 @@ async fn apply_named_group_metadata_event_inner_serialized(
             // loop does the one checked persist and then refreshes these
             // surfaces only after successful persist, so a failed write leaves
             // no card/log trace of the failed candidate.
+            // Finding 7: use the CHECKED save, not the discarding wrapper. On
+            // durable-write failure, restore the pre-mutation in-memory state
+            // so the replay's already_current proof cannot read stale memory
+            // that diverges from the durable roster file.
             if allow_queue {
+                if save_named_groups_checked(state).await.is_err() {
+                    tracing::error!(
+                        group_id = %resolved_group_key,
+                        "JoinRequestApproved: durable save failed, restoring in-memory state"
+                    );
+                    store_named_group_info(state, &resolved_group_key, current).await;
+                    return ApplyMetadataResult::REJECTED;
+                }
                 refresh_group_card_cache_from_info(state, &resolved_group_key, &next).await;
-                save_named_groups(state).await;
             }
             *replay_group_id = Some(resolved_group_key.clone());
             if allow_queue {
@@ -8101,8 +8168,8 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
     struct RelayResult {
         group_id: String,
         digest: [u8; 32],
-        /// Targets that failed (to be retained for retry).
-        failed_targets: Vec<String>,
+        /// Targets that succeeded (to be removed from the current set).
+        successful_targets: Vec<String>,
         /// Total successful sends (for counting after persist).
         success_count: usize,
     }
@@ -8115,13 +8182,12 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         let digest = &due_obl.digest;
         let envelope_bytes = &due_obl.envelope_bytes;
         let targets = &due_obl.targets;
-        let mut failed_targets: Vec<String> = Vec::new();
+        let mut successful_targets: Vec<String> = Vec::new();
         let mut success_count: usize = 0;
 
         for target_hex in targets {
             let Ok(target_id) = parse_agent_id_hex(target_hex) else {
-                // Unparseable target — retain for diagnostic visibility.
-                failed_targets.push(target_hex.clone());
+                // Unparseable target — skip (not added to success set).
                 continue;
             };
             let mut dm_payload =
@@ -8140,16 +8206,17 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                 .await;
             if send_result.is_ok() {
                 success_count += 1;
-            } else {
-                // Failed — retain this target for next retry.
-                failed_targets.push(target_hex.clone());
+                successful_targets.push(target_hex.clone());
             }
+            // Failed targets are simply not added to the success set —
+            // they remain in the obligation's relay_targets after
+            // subtraction (Finding 5).
         }
 
         relay_results.push(RelayResult {
             group_id: group_id.clone(),
             digest: *digest,
-            failed_targets,
+            successful_targets,
             success_count,
         });
     }
@@ -8183,11 +8250,21 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                             .saturating_sub(1)
                             .min(CAUSAL_RELAY_RETRY_SECS.len() - 1)];
                         obligation.next_retry_at_ms = now_ms.saturating_add(delay_secs * 1000);
-                        // B6: update relay_targets to only the failed targets.
-                        obligation.relay_targets = result.failed_targets.clone();
-                        // B6: terminal-success — if all targets delivered,
-                        // mark completed and create a tombstone.
-                        if result.failed_targets.is_empty() {
+                        // Finding 5: subtract successful targets from the
+                        // CURRENT target set, not overwrite with the stale
+                        // pre-lock snapshot. A B8 refresh that durably added
+                        // a target during the network I/O window is preserved
+                        // — only targets that were actually sent successfully
+                        // are removed.
+                        let success_set: std::collections::HashSet<String> =
+                            result.successful_targets.iter().cloned().collect();
+                        obligation
+                            .relay_targets
+                            .retain(|t| !success_set.contains(t));
+                        // B6: terminal-success — if ALL current targets are
+                        // now delivered (including any added by a concurrent
+                        // B8 refresh), mark completed and create a tombstone.
+                        if obligation.relay_targets.is_empty() {
                             obligation.completed_at_ms = Some(now_ms);
                             completed_tombstones_to_add.push(CompletedRelayTombstone {
                                 group_id: result.group_id.clone(),
@@ -15224,6 +15301,40 @@ fn prune_completed_tombstones_daemon(
     }
 }
 
+/// ADR 0028 Finding 8: bound the causal conflict tombstones map. Each group's
+/// conflict digest list is capped to CAUSAL_APPROVAL_PER_GROUP_CAP entries
+/// (oldest-first eviction), and the daemon-wide total is capped to
+/// CAUSAL_APPROVAL_PER_DAEMON_CAP entries. Without this, an adversary can
+/// grow the map with distinct conflict digests until the sidecar exceeds the
+/// pre-parse file guard and the entire causal queue is rejected on restart.
+fn prune_conflict_tombstones(tombstones: &mut HashMap<String, Vec<[u8; 32]>>) {
+    // Per-group cap: keep the newest CAUSAL_APPROVAL_PER_GROUP_CAP digests.
+    for list in tombstones.values_mut() {
+        if list.len() > CAUSAL_APPROVAL_PER_GROUP_CAP {
+            let drop = list.len() - CAUSAL_APPROVAL_PER_GROUP_CAP;
+            list.drain(..drop);
+        }
+    }
+    tombstones.retain(|_, list| !list.is_empty());
+
+    // Daemon-wide cap: keep the newest CAUSAL_APPROVAL_PER_DAEMON_CAP digests.
+    let total: usize = tombstones.values().map(|l| l.len()).sum();
+    if total > CAUSAL_APPROVAL_PER_DAEMON_CAP {
+        let drop_count = total - CAUSAL_APPROVAL_PER_DAEMON_CAP;
+        // Drop oldest entries group-by-group (insertion order ≈ age).
+        let mut to_drop = drop_count;
+        for list in tombstones.values_mut() {
+            if to_drop == 0 {
+                break;
+            }
+            let take = to_drop.min(list.len());
+            list.drain(..take);
+            to_drop -= take;
+        }
+        tombstones.retain(|_, list| !list.is_empty());
+    }
+}
+
 /// ADR 0028 R4: Serialize the causal approval queue sidecar to JSON. Caller
 /// must hold the queue + tombstones locks (or write lock) so the snapshot is
 /// consistent. This splits serialization from disk I/O so callers can drop
@@ -15703,7 +15814,10 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
     }
     *state.causal_approval_queue.write().await = queue;
     // B3: load conflict tombstones from the sidecar.
-    *state.causal_conflict_tombstones.write().await = loaded_sidecar.conflict_tombstones;
+    // Finding 8: prune to enforce daemon-wide and per-group caps on load.
+    let mut conflict_tombstones = loaded_sidecar.conflict_tombstones;
+    prune_conflict_tombstones(&mut conflict_tombstones);
+    *state.causal_conflict_tombstones.write().await = conflict_tombstones;
 }
 
 /// ADR 0028: load the predecessor relay outbox from the durable sidecar on
@@ -15745,9 +15859,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
         return;
     }
     let now_ms = now_millis_u64();
-    let mut total_count = 0usize;
-    let mut total_bytes = 0usize;
-    let mut total_targets = 0usize;
     let mut outbox = HashMap::new();
     let groups_view: HashMap<String, x0x::groups::GroupInfo> = {
         let groups = state.named_groups.read().await;
@@ -15762,8 +15873,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             continue;
         }
         let mut filtered = Vec::new();
-        let mut group_count = 0usize;
-        let mut group_bytes = 0usize;
         for entry in entries {
             // Drop expired (5-minute retention from first_seen_ms).
             let expires_at = entry
@@ -15779,25 +15888,11 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
                 continue;
             }
-            // Enforce per-group caps.
-            if group_count >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
-                break;
-            }
-            if group_bytes + derived_byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
-                break;
-            }
-            // Enforce per-daemon caps.
-            if total_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
-                break;
-            }
-            if total_bytes + derived_byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
-                break;
-            }
-            // Enforce 4096 total relay-target cap (Kimi blocker 7/9).
-            let entry_targets = entry.relay_targets.len();
-            if total_targets + entry_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
-                break;
-            }
+            // Finding 4: do NOT break on per-group/per-daemon/target caps.
+            // Breaking silently drops remaining live obligations. Instead,
+            // load all valid entries and let enforce_combined_relay_budget
+            // handle over-cap with its live-safe policy (fail closed, never
+            // evict live). Per-entry validity checks above use continue.
             // ADR 0028 B7: restart revalidation using the shared decode+verify
             // helper. Binds: V2 decode + ML-DSA signature, decoded event must be
             // JoinRequestCreated, stored fields must match decoded, signer must
@@ -15878,25 +15973,34 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                 );
                 continue;
             }
-            // Verify relay_targets are parseable hex agent IDs (K2.1 fix
-            // means they are canonical hex strings; validate on restart).
+            // Finding 6: re-derive relay targets from current active non-local
+            // witnesses, not just trim unparseable hex. A valid-hex target
+            // inserted or removed in the sidecar must not survive unless it is
+            // currently an active non-local group member. Intersect the stored
+            // remaining targets (not-yet-delivered) with the current active
+            // membership to preserve delivery tracking while re-establishing
+            // direction.
+            let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let active_witnesses: std::collections::HashSet<String> = info
+                .members_v2
+                .iter()
+                .filter(|(id, m)| {
+                    m.state == x0x::groups::GroupMemberState::Active && **id != local_agent_hex
+                })
+                .map(|(id, _)| id.clone())
+                .collect();
             let valid_targets: Vec<String> = entry
                 .relay_targets
                 .iter()
-                .filter(|t| parse_agent_id_hex(t).is_ok())
+                .filter(|t| parse_agent_id_hex(t).is_ok() && active_witnesses.contains(*t))
                 .cloned()
                 .collect();
             if valid_targets.len() != entry.relay_targets.len() {
                 tracing::warn!(
                     group_id = %group_id,
-                    "ADR 0028: restart revalidation — outbox has unparseable relay targets, trimming"
+                    "ADR 0028: restart revalidation — relay targets trimmed to current active witnesses"
                 );
             }
-            group_count += 1;
-            group_bytes += derived_byte_size;
-            total_count += 1;
-            total_bytes += derived_byte_size;
-            total_targets += valid_targets.len();
             let mut entry = entry;
             entry.byte_size = derived_byte_size;
             entry.digest = derived_digest.into();
@@ -15921,6 +16025,23 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
     // The per-store caps above are first-pass filters; this ensures the
     // combined total never exceeds the accepted untrusted-data budget.
     enforce_combined_relay_budget(&mut outbox, &mut tombstones);
+    // Finding 4: post-load 4096 total relay-target cap. Fail closed: if live
+    // obligations alone exceed the target cap, log an error but do not drop
+    // any live entries. Shed completed tombstones to free target budget.
+    let live_targets: usize = outbox
+        .values()
+        .flatten()
+        .map(|o| o.relay_targets.len())
+        .sum();
+    if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+        tracing::error!(
+            live_targets,
+            cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+            "ADR 0028: live relay targets exceed daemon cap on restart, failing closed (no live eviction)"
+        );
+        // Shed completed tombstones — they also carry target-like overhead.
+        tombstones.clear();
+    }
     *state.predecessor_relay_outbox.write().await = outbox;
     *state.completed_relay_tombstones.write().await = tombstones;
     // Fix 5: B8 journal recovery. If the sidecar has a pending B8
@@ -16001,8 +16122,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                     let is_authority = hex::encode(info.creator.as_bytes()) == local_agent_hex;
                     let now_ms = now_millis_u64();
                     let mut filtered = Vec::new();
-                    let mut group_count = 0usize;
-                    let mut group_bytes = 0usize;
                     for entry in &journal.outbox_snapshot {
                         let expires_at = entry
                             .first_seen_ms
@@ -16015,13 +16134,8 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                         if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
                             continue;
                         }
-                        if group_count >= CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
-                            break;
-                        }
-                        if group_bytes + derived_byte_size > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP
-                        {
-                            break;
-                        }
+                        // Finding 4: do NOT break on caps — load all valid
+                        // entries and enforce daemon-wide bounds after.
                         // Finding E: same V2 decode+verify as ordinary load.
                         let (decoded_relay_event, v2_signer, v2_topic) = match decode_and_verify_v2(
                             &entry.envelope_bytes,
@@ -16063,29 +16177,65 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                         if !is_authority {
                             continue;
                         }
+                        // Finding 6: re-derive targets from current active
+                        // non-local witnesses, not just trim unparseable hex.
+                        let active_witnesses: std::collections::HashSet<String> = info
+                            .members_v2
+                            .iter()
+                            .filter(|(id, m)| {
+                                m.state == x0x::groups::GroupMemberState::Active
+                                    && **id != local_agent_hex
+                            })
+                            .map(|(id, _)| id.clone())
+                            .collect();
                         let valid_targets: Vec<String> = entry
                             .relay_targets
                             .iter()
-                            .filter(|t| parse_agent_id_hex(t).is_ok())
+                            .filter(|t| {
+                                parse_agent_id_hex(t).is_ok() && active_witnesses.contains(*t)
+                            })
                             .cloned()
                             .collect();
                         if valid_targets.len() != entry.relay_targets.len() {
                             continue;
                         }
-                        group_count += 1;
-                        group_bytes += derived_byte_size;
                         let mut entry = entry.clone();
                         entry.byte_size = derived_byte_size;
                         entry.digest = derived_digest.into();
                         entry.relay_targets = valid_targets;
                         filtered.push(entry);
                     }
+                    // Finding E: act on restore_valid — only install if
+                    // validation produced entries (or the snapshot was
+                    // legitimately empty). Install the filtered entries and
+                    // then enforce daemon-wide combined caps.
                     {
                         let mut outbox = state.predecessor_relay_outbox.write().await;
                         if filtered.is_empty() {
                             outbox.remove(&journal.group_id);
                         } else {
                             outbox.insert(journal.group_id.clone(), filtered);
+                        }
+                        // Finding E: enforce daemon-wide caps after journal
+                        // restore. The journal may install entries that,
+                        // combined with already-live groups, exceed daemon
+                        // count/byte/target budgets. Run the same combined
+                        // budget enforcer as ordinary load.
+                        let mut tombstones = state.completed_relay_tombstones.write().await;
+                        enforce_combined_relay_budget(&mut outbox, &mut tombstones);
+                        // Finding 4: post-restore 4096 target cap (fail closed).
+                        let live_targets: usize = outbox
+                            .values()
+                            .flatten()
+                            .map(|o| o.relay_targets.len())
+                            .sum();
+                        if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+                            tracing::error!(
+                                live_targets,
+                                cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+                                "ADR 0028 B8: journal restore pushes live targets over daemon cap, failing closed"
+                            );
+                            tombstones.clear();
                         }
                     }
                     true
@@ -16097,7 +16247,15 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
                 );
                 false
             };
-            let _ = restore_valid;
+            // Finding E: act on restore_valid — log if the restore was
+            // skipped (group unknown/withdrawn). The validated entries are
+            // already installed above; this is no longer discarded.
+            if !restore_valid {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&journal.group_id),
+                    "ADR 0028 B8: journal restore skipped (group unknown or withdrawn), clearing journal"
+                );
+            }
             *state.pending_b8_compensation.lock().await = None;
         }
         // Persist the recovered state with a CHECKED result.
