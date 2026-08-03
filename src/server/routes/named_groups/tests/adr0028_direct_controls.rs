@@ -50,7 +50,7 @@ fn unix_ms() -> u64 {
 
 /// Identity-only `AppState` rooted at a fresh tempdir, with the local agent
 /// as the group authority. Mirrors the sibling `b_state` helper.
-async fn d_state() -> (Arc<AppState>, tempfile::TempDir) {
+pub(super) async fn d_state() -> (Arc<AppState>, tempfile::TempDir) {
     let (state, dir) = secure_endpoint_test_state().await.expect("secure state");
     (state, dir)
 }
