@@ -17702,37 +17702,70 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             admission.first_seen_ms,
             now_ms,
         )?;
-        // A live marker reconstructs the exact request + obligation below.
-        // An expired marker (Ok(None)) is terminal cleanup: clear the
-        // in-memory pending marker and fall through to the common tail,
-        // preserving every other group's already-validated relay work.
-        // The expired branch must never construct an obligation and must
-        // never return early — an early return would discard the other
-        // groups' maps and leave the on-disk marker uncleared.
+        // Durable request binding validation BEFORE splitting live from
+        // expired. An expired marker with a mismatched requester, digest,
+        // clock, or terminal status must still fail closed with the sidecar
+        // byte-preserved — the earlier if-let-Some wrapper placed these
+        // checks inside the live-only branch, allowing an expired marker to
+        // bypass them and clear silently.
+        let exact_request_status =
+            info.join_requests
+                .get(&admission.request_id)
+                .and_then(|request| {
+                    if request.requester_agent_id == admission.requester_agent_id
+                        && request.predecessor_envelope_digest == Some(admission.digest)
+                        && request.predecessor_first_seen_ms == Some(admission.first_seen_ms)
+                    {
+                        Some(request.status)
+                    } else {
+                        None
+                    }
+                });
+        let request_id_is_occupied = info.join_requests.contains_key(&admission.request_id);
+        // A request_id occupied by a mismatched binding is fatal for both
+        // live and expired markers.
+        if exact_request_status.is_none() && request_id_is_occupied {
+            return Err(
+                "listener admission journal conflicts with the durable request binding".to_string(),
+            );
+        }
+        let exact_obligation_exists = outbox.get(&admission.group_id).is_some_and(|entries| {
+            entries.iter().any(|entry| {
+                entry.group_id == admission.group_id
+                    && entry.request_id == admission.request_id
+                    && entry.requester_agent_id == admission.requester_agent_id
+                    && entry.digest == admission.digest
+            })
+        });
+        let exact_completion_receipt_exists =
+            tombstones.get(&admission.group_id).is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry.group_id == admission.group_id
+                        && entry.request_id == admission.request_id
+                        && entry.requester_agent_id == admission.requester_agent_id
+                        && entry.digest == admission.digest
+                })
+            });
+        // A terminal request without a matching obligation or receipt is
+        // fatal for both live and expired markers.
+        if exact_request_status.is_some_and(|s| s != x0x::groups::JoinRequestStatus::Pending)
+            && !exact_obligation_exists
+            && !exact_completion_receipt_exists
+        {
+            return Err(
+                "listener admission recovery found terminal request without predecessor receipt"
+                    .to_string(),
+            );
+        }
+        // LIVE-ONLY: reconstruct a missing request and create the relay
+        // obligation. An expired marker never constructs a missing request
+        // or obligation, but still falls through to clear the marker after
+        // any exact clock migration/durability confirmation in the common
+        // tail.
         if let Some(validated_obligation) = validated_obligation {
-            let (decoded_event, signer, _) = decode_and_verify_v2(&admission.envelope_bytes)
-                .map_err(|reason| format!("listener journal verification failed: {reason}"))?;
-            let exact_request_status =
-                info.join_requests
-                    .get(&admission.request_id)
-                    .and_then(|request| {
-                        if request.requester_agent_id == admission.requester_agent_id
-                            && request.predecessor_envelope_digest == Some(admission.digest)
-                            && request.predecessor_first_seen_ms == Some(admission.first_seen_ms)
-                        {
-                            Some(request.status)
-                        } else {
-                            None
-                        }
-                    });
-            let recovered_group = if exact_request_status.is_none() {
-                let request_id_is_occupied = info.join_requests.contains_key(&admission.request_id);
-                if request_id_is_occupied {
-                    return Err(
-                        "listener admission journal conflicts with the durable request binding"
-                            .to_string(),
-                    );
-                }
+            let recovered_group = if !request_id_is_occupied {
+                let (decoded_event, signer, _) = decode_and_verify_v2(&admission.envelope_bytes)
+                    .map_err(|reason| format!("listener journal verification failed: {reason}"))?;
                 Some(build_listener_request_candidate_for_restart(
                     info,
                     &decoded_event,
@@ -17743,23 +17776,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
             } else {
                 None
             };
-            let exact_obligation_exists = outbox.get(&admission.group_id).is_some_and(|entries| {
-                entries.iter().any(|entry| {
-                    entry.group_id == admission.group_id
-                        && entry.request_id == admission.request_id
-                        && entry.requester_agent_id == admission.requester_agent_id
-                        && entry.digest == admission.digest
-                })
-            });
-            let exact_completion_receipt_exists =
-                tombstones.get(&admission.group_id).is_some_and(|entries| {
-                    entries.iter().any(|entry| {
-                        entry.group_id == admission.group_id
-                            && entry.request_id == admission.request_id
-                            && entry.requester_agent_id == admission.requester_agent_id
-                            && entry.digest == admission.digest
-                    })
-                });
             let request_candidate = recovered_group.as_ref().unwrap_or(info);
             let request_is_pending = request_candidate
                 .join_requests
@@ -17770,12 +17786,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         && request.predecessor_first_seen_ms == Some(admission.first_seen_ms)
                         && request.is_pending()
                 });
-            if !(request_is_pending || exact_obligation_exists || exact_completion_receipt_exists) {
-                return Err(
-                    "listener admission recovery found terminal request without predecessor receipt"
-                        .to_string(),
-                );
-            }
             if request_is_pending && !exact_obligation_exists && !exact_completion_receipt_exists {
                 outbox
                     .entry(admission.group_id.clone())
@@ -17799,10 +17809,6 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         .to_string(),
                 );
             }
-            // Only after the complete detached request+obligation candidate passes
-            // validation and all governed caps may it update the detached roster
-            // candidate. The candidate is installed and persisted once below,
-            // after every recovery journal has been accepted.
             if let Some(recovered_group) = recovered_group {
                 groups_view.insert(admission.group_id.clone(), recovered_group);
                 roster_candidate_changed = true;
