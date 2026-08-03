@@ -4953,14 +4953,17 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     if entries.is_empty() {
         // Expiry-only drain: persist the (now possibly empty) queue sidecar
         // so expired entries are not rediscovered on restart.
-        if let Err(e) = save_causal_approval_queue_unlocked(state).await {
-            tracing::error!(
-                "ADR 0028: failed to persist causal approval queue after expiry-only drain: {e}"
-            );
-            // Finding 9: restore the pre-drain queue so memory matches the
-            // durable sidecar. On the next retry, the drain re-attempts.
-            let mut queue_lock = state.causal_approval_queue.write().await;
-            queue_lock.insert(group_id.to_string(), queue_snapshot);
+        match save_causal_approval_queue_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+            _ => {
+                tracing::error!(
+                    "ADR 0028: failed to persist causal approval queue after expiry-only drain"
+                );
+                // Finding 9: restore the pre-drain queue so memory matches the
+                // durable sidecar. On the next retry, the drain re-attempts.
+                let mut queue_lock = state.causal_approval_queue.write().await;
+                queue_lock.insert(group_id.to_string(), queue_snapshot);
+            }
         }
         return;
     }
@@ -5165,13 +5168,16 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     // Persist after drain — applied entries are removed, retained entries stay.
     // Persistence lock is already held (P→Q order). Use the unlocked save
     // helper to avoid re-acquiring the persistence mutex.
-    if let Err(e) = save_causal_approval_queue_unlocked(state).await {
-        tracing::error!("ADR 0028: failed to persist causal approval queue after drain: {e}");
-        // Finding 9: restore the pre-drain queue so memory matches the
-        // durable sidecar. Applied entries that were removed from memory
-        // are still in the durable sidecar and will be re-drained on retry.
-        let mut queue_lock = state.causal_approval_queue.write().await;
-        queue_lock.insert(group_id.to_string(), queue_snapshot);
+    match save_causal_approval_queue_unlocked(state).await {
+        Ok(AtomicWriteOutcome::Durable) | Ok(AtomicWriteOutcome::ReplacedNotDurable) => {}
+        _ => {
+            tracing::error!("ADR 0028: failed to persist causal approval queue after drain");
+            // Finding 9: restore the pre-drain queue so memory matches the
+            // durable sidecar. Applied entries that were removed from memory
+            // are still in the durable sidecar and will be re-drained on retry.
+            let mut queue_lock = state.causal_approval_queue.write().await;
+            queue_lock.insert(group_id.to_string(), queue_snapshot);
+        }
     }
 }
 
@@ -16062,7 +16068,8 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
         }
     }
     // Watson ruling: reject the WHOLE sidecar if total valid entries exceed
-    // any governed cap. Install zero, leave file unchanged, return Err.
+    // any governed cap — daemon-wide OR per-group. Install zero, leave file
+    // unchanged, return Err. No survivor subset.
     if total_count > CAUSAL_APPROVAL_PER_DAEMON_CAP
         || total_bytes > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP
     {
@@ -16071,13 +16078,45 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) -> R
             total_bytes,
             daemon_count_cap = CAUSAL_APPROVAL_PER_DAEMON_CAP,
             daemon_byte_cap = CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP,
-            "ADR 0028: causal approval queue sidecar rejected — total exceeds governed caps. Installing zero entries."
+            "ADR 0028: causal approval queue sidecar rejected — daemon total exceeds governed caps. Installing zero entries."
         );
         *state.causal_approval_queue.write().await = HashMap::new();
         *state.causal_conflict_tombstones.write().await = HashMap::new();
         return Err(
-            "causal approval queue sidecar rejected: total exceeds governed caps".to_string(),
+            "causal approval queue sidecar rejected: daemon total exceeds governed caps"
+                .to_string(),
         );
+    }
+    // Per-group cap check: if any single group exceeds per-group count or
+    // byte cap, reject the whole sidecar.
+    for (_gid, entries) in &queue {
+        if entries.len() > CAUSAL_APPROVAL_PER_GROUP_CAP {
+            tracing::error!(
+                group_id = %_gid,
+                group_count = entries.len(),
+                cap = CAUSAL_APPROVAL_PER_GROUP_CAP,
+                "ADR 0028: causal approval queue sidecar rejected — per-group count exceeds cap. Installing zero entries."
+            );
+            *state.causal_approval_queue.write().await = HashMap::new();
+            *state.causal_conflict_tombstones.write().await = HashMap::new();
+            return Err(
+                "causal approval queue sidecar rejected: per-group count exceeds cap".to_string(),
+            );
+        }
+        let group_bytes: usize = entries.iter().map(|e| e.byte_size).sum();
+        if group_bytes > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
+            tracing::error!(
+                group_id = %_gid,
+                group_bytes,
+                cap = CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP,
+                "ADR 0028: causal approval queue sidecar rejected — per-group bytes exceed cap. Installing zero entries."
+            );
+            *state.causal_approval_queue.write().await = HashMap::new();
+            *state.causal_conflict_tombstones.write().await = HashMap::new();
+            return Err(
+                "causal approval queue sidecar rejected: per-group bytes exceed cap".to_string(),
+            );
+        }
     }
     *state.causal_approval_queue.write().await = queue;
     // B3: load conflict tombstones from the sidecar.
@@ -16498,44 +16537,33 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
                         entry.relay_targets = valid_targets;
                         filtered.push(entry);
                     }
-                    // Finding E: act on restore_valid — only install if
-                    // validation produced entries (or the snapshot was
-                    // legitimately empty). Install the filtered entries and
-                    // then enforce daemon-wide combined caps.
+                    // Watson ruling: validate BEFORE install. If the
+                    // restored entries, combined with already-live state,
+                    // would exceed any cap, do NOT install — install zero,
+                    // clear the journal, and log the error.
                     {
                         let mut outbox = state.predecessor_relay_outbox.write().await;
+                        let mut tombstones = state.completed_relay_tombstones.write().await;
+                        // Temporarily install to check budget.
                         if filtered.is_empty() {
                             outbox.remove(&journal.group_id);
                         } else {
                             outbox.insert(journal.group_id.clone(), filtered);
                         }
-                        // Watson ruling: enforce daemon-wide caps after journal
-                        // restore. If live exceeds any cap, do NOT install
-                        // the restored state — clear the outbox for this group
-                        // and mark the restore as invalid.
-                        let mut tombstones = state.completed_relay_tombstones.write().await;
                         let within_budget =
                             enforce_combined_relay_budget(&mut outbox, &mut tombstones);
-                        if !within_budget {
-                            tracing::error!(
-                                "ADR 0028 B8: journal restore — live state exceeds governed caps. Rejecting restored entries."
-                            );
-                            outbox.remove(&journal.group_id);
-                            tombstones.remove(&journal.group_id);
-                        }
-                        // Post-restore 4096 target cap.
                         let live_targets: usize = outbox
                             .values()
                             .flatten()
                             .map(|o| o.relay_targets.len())
                             .sum();
-                        if live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
-                            // Watson ruling: never evict live. Reject restored entries.
+                        if !within_budget || live_targets > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
                             tracing::error!(
+                                within_budget,
                                 live_targets,
-                                cap = CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-                                "ADR 0028 B8: journal restore pushes live targets over daemon cap — rejecting restored entries (never evict live)"
+                                "ADR 0028 B8: journal restore — over-cap, rejecting restored entries (never evict live)"
                             );
+                            // Remove the restored entries — install zero.
                             outbox.remove(&journal.group_id);
                             tombstones.remove(&journal.group_id);
                         }
