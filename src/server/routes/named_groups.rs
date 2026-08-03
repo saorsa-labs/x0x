@@ -4791,6 +4791,14 @@ async fn try_queue_causal_approval(
             // bounded. Previously the enlarged map was persisted first, then
             // pruned only in memory with no re-save — saturation/restart could
             // exceed the durable bound.
+            // Finding 3 (Sam 4ea68a9): snapshot the FULL tombstone map before
+            // pruning so a save failure can restore ALL evicted entries, not
+            // just the newly-inserted ones. Pre-existing receipts evicted from
+            // this or other groups must be restored on save failure.
+            let tombstones_snapshot = {
+                let tombstones = state.causal_conflict_tombstones.read().await;
+                tombstones.clone()
+            };
             {
                 let mut tombstones = state.causal_conflict_tombstones.write().await;
                 prune_conflict_tombstones(&mut tombstones);
@@ -4804,9 +4812,14 @@ async fn try_queue_causal_approval(
                 tracing::error!(
                     "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
                 );
-                // Rollback only newly-inserted tombstones (not pre-existing ones).
+                // Finding 3 (Sam 4ea68a9): restore the FULL tombstone map
+                // (pre-prune state) so pre-existing receipts evicted during
+                // pruning are not lost. Then remove only the newly-inserted
+                // entries, which were added by this conflict path.
                 {
                     let mut tombstones = state.causal_conflict_tombstones.write().await;
+                    *tombstones = tombstones_snapshot;
+                    // Now remove newly-inserted entries from the restored map.
                     if let Some(entries) = tombstones.get_mut(group_id) {
                         for d in &newly_inserted {
                             if let Some(pos) = entries.iter().position(|e| e.digest == *d) {
@@ -4814,6 +4827,7 @@ async fn try_queue_causal_approval(
                             }
                         }
                     }
+                    tombstones.retain(|_, list| !list.is_empty());
                 }
                 // Rollback conflicted markings.
                 {
@@ -5007,20 +5021,23 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
             continue;
         }
         state.groups_diagnostics.record_causal_retried(group_id);
-        // B5: snapshot the group before apply so we can roll back the
-        // in-memory state if persistence fails. Without this, the next replay
-        // sees the advanced in-memory state_hash as already_current and drops
-        // the entry while the durable file is still stale.
-        let group_snapshot = {
-            let groups = state.named_groups.read().await;
-            groups.get(group_id).cloned()
-        };
         // Finding 5 (Watson 32c2d3a): hold the membership lock through
         // apply + persist/rollback so a concurrent mutation cannot be
         // included in the write or overwritten by rollback. Post-persist
         // card/log effects happen AFTER the lock is released.
+        // Finding 2 (Sam 4ea68a9): capture group_snapshot AFTER acquiring
+        // the lock, not before. An intervening transition between snapshot
+        // and lock acquisition would be erased by a save-failure rollback.
         let membership_lock = group_membership_lock(state, group_id).await;
         let _replay_membership_guard = membership_lock.lock().await;
+        // B5: snapshot the group AFTER lock acquisition so we can roll back
+        // the in-memory state if persistence fails. Without this, the next
+        // replay sees the advanced in-memory state_hash as already_current
+        // and drops the entry while the durable file is still stale.
+        let group_snapshot = {
+            let groups = state.named_groups.read().await;
+            groups.get(group_id).cloned()
+        };
         // Re-run the full ordinary approval apply with queueing disabled.
         // Boxed to break the async recursion cycle
         // (apply_named_group_metadata_event_inner → replay → apply_inner)
@@ -15711,22 +15728,42 @@ fn enforce_combined_relay_budget(
     // ── Per-group combined count cap (live + completed) ────────────────
     // Finding C/3: a single group can no longer hold 64 live + 64 completed.
     // Protect live obligations: shed only completed receipts oldest-first.
+    // Finding 4 (Sam 4ea68a9): when live alone exceeds the per-group cap,
+    // truncate live oldest-first to the cap — do not install over-budget
+    // live state. This matches the daemon-wide behavior.
     let all_group_ids: std::collections::HashSet<String> =
         outbox.keys().chain(tombstones.keys()).cloned().collect();
     for gid in all_group_ids {
         let live_n = outbox.get(&gid).map(|l| l.len()).unwrap_or(0);
         let completed_n = tombstones.get(&gid).map(|l| l.len()).unwrap_or(0);
         if live_n + completed_n > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
-            let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP.saturating_sub(live_n);
-            if let Some(list) = tombstones.get_mut(&gid) {
-                list.sort_by_key(|t| std::cmp::Reverse(t.first_seen_ms));
-                list.truncate(budget_for_completed);
+            if live_n > CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP {
+                // Live alone exceeds per-group cap — truncate oldest-first.
+                tracing::error!(
+                    group_id = %gid,
+                    live_n,
+                    cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+                    "ADR 0028: per-group live count exceeds cap, truncating oldest-first"
+                );
+                if let Some(list) = outbox.get_mut(&gid) {
+                    list.sort_by_key(|o| o.first_seen_ms);
+                    list.truncate(CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP);
+                }
+                // Also shed all completed for this group.
+                tombstones.remove(&gid);
+            } else {
+                let budget_for_completed = CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP.saturating_sub(live_n);
+                if let Some(list) = tombstones.get_mut(&gid) {
+                    list.sort_by_key(|t| std::cmp::Reverse(t.first_seen_ms));
+                    list.truncate(budget_for_completed);
+                }
             }
             tombstones.retain(|_, list| !list.is_empty());
         }
     }
 
     // ── Per-group combined byte cap (live + completed) ─────────────────
+    // Finding 4: same per-group live truncation for byte cap.
     for gid in outbox
         .keys()
         .chain(tombstones.keys())
@@ -15742,14 +15779,33 @@ fn enforce_combined_relay_budget(
             .map(|l| l.iter().map(|t| t.envelope_bytes.len()).sum())
             .unwrap_or(0);
         if live_bytes + completed_bytes > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
-            let budget_for_completed =
-                CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP.saturating_sub(live_bytes);
-            if let Some(list) = tombstones.get_mut(&gid) {
-                list.sort_by_key(|t| t.first_seen_ms);
-                let mut current = completed_bytes;
-                while current > budget_for_completed && !list.is_empty() {
-                    let removed = list.remove(0);
-                    current = current.saturating_sub(removed.envelope_bytes.len());
+            if live_bytes > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP {
+                // Live alone exceeds per-group byte cap — truncate oldest-first.
+                tracing::error!(
+                    group_id = %gid,
+                    live_bytes,
+                    cap = CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+                    "ADR 0028: per-group live bytes exceed cap, truncating oldest-first"
+                );
+                if let Some(list) = outbox.get_mut(&gid) {
+                    list.sort_by_key(|o| o.first_seen_ms);
+                    let mut current = live_bytes;
+                    while current > CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP && !list.is_empty() {
+                        let removed = list.remove(0);
+                        current = current.saturating_sub(removed.byte_size);
+                    }
+                }
+                tombstones.remove(&gid);
+            } else {
+                let budget_for_completed =
+                    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP.saturating_sub(live_bytes);
+                if let Some(list) = tombstones.get_mut(&gid) {
+                    list.sort_by_key(|t| t.first_seen_ms);
+                    let mut current = completed_bytes;
+                    while current > budget_for_completed && !list.is_empty() {
+                        let removed = list.remove(0);
+                        current = current.saturating_sub(removed.envelope_bytes.len());
+                    }
                 }
             }
             tombstones.retain(|_, list| !list.is_empty());
@@ -15951,19 +16007,22 @@ pub(in crate::server) async fn load_causal_approval_queue(state: &AppState) {
             if derived_byte_size > CAUSAL_ENVELOPE_MAX_BYTES {
                 continue;
             }
-            // Enforce per-group caps (derived).
+            // Finding 4 (Sam 4ea68a9): do NOT break on per-group/per-daemon
+            // caps — break installs a live prefix and silently drops remaining
+            // entries. Use continue so all valid entries are considered;
+            // the caps are enforced after loading via the accounting below.
             if group_count >= CAUSAL_APPROVAL_PER_GROUP_CAP {
-                break;
+                continue;
             }
             if group_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_GROUP_BYTE_CAP {
-                break;
+                continue;
             }
             // Enforce per-daemon caps (derived).
             if total_count >= CAUSAL_APPROVAL_PER_DAEMON_CAP {
-                break;
+                continue;
             }
             if total_bytes + derived_byte_size > CAUSAL_APPROVAL_PER_DAEMON_BYTE_CAP {
-                break;
+                continue;
             }
             // ADR 0028 B7: restart revalidation using the shared exact-envelope
             // validator. Binds: V2 decode + ML-DSA signature, decoded event ==
@@ -16532,6 +16591,17 @@ async fn save_named_groups(state: &AppState) {
 /// when group-state persistence failed (audit 5).
 pub(in crate::server) async fn save_named_groups_checked(state: &AppState) -> std::io::Result<()> {
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    save_named_groups_checked_unlocked(state).await
+}
+
+/// Unlocked variant: caller MUST already hold `named_groups_persistence_lock`.
+/// Finding 1 (Sam 4ea68a9): used by the listener rollback paths that need
+/// to hold the persistence lock across mutation + save + failure-restore
+/// as one transaction, preventing a concurrent cross-group save from
+/// snapshotting the pre-revert state.
+pub(in crate::server) async fn save_named_groups_checked_unlocked(
+    state: &AppState,
+) -> std::io::Result<()> {
     let json = {
         let groups = state.named_groups.read().await;
         serde_json::to_string(&*groups)
@@ -16595,7 +16665,13 @@ async fn write_named_groups_json_atomic(path: &FsPath, json: &str) -> std::io::R
         file.write_all(json.as_bytes()).await?;
         file.sync_all().await?;
         drop(file);
-        tokio::fs::rename(&temp_path, path).await
+        tokio::fs::rename(&temp_path, path).await?;
+        // Finding 5 (Sam 4ea68a9): fsync the parent directory after rename
+        // so the rename is durable before any dependent publication
+        // (B8 approval fan-out) proceeds. Without this, a crash can expose
+        // an approval whose authority roster was never directory-durable.
+        sync_parent_dir_for_path(path)?;
+        Ok::<(), std::io::Error>(())
     }
     .await;
 

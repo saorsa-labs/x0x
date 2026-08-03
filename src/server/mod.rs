@@ -56,7 +56,7 @@ use routes::{
     reject_join_request, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
     run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_named_groups_checked, save_predecessor_relay_outbox_unlocked, seal_group_state,
+    save_named_groups_checked_unlocked, save_predecessor_relay_outbox_unlocked, seal_group_state,
     secure_group_decrypt, secure_group_encrypt, secure_group_reseal,
     secure_open_envelope_adversarial, send_group_public_message, set_group_display_name,
     shutdown_handler, spawn_directory_resubscribe, spawn_global_discovery_listener,
@@ -1602,13 +1602,25 @@ pub async fn serve_with_options(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after obligation admission failure"
                                 );
+                                // Finding 1 (Sam 4ea68a9): hold the named_groups
+                                // persistence lock across mutation + save + failure
+                                // restore so another group's concurrent save cannot
+                                // durably snapshot our pre-revert state. Without this,
+                                // B saves the roster while A has the pre-request
+                                // snapshot in memory, A's save then fails and
+                                // restores the post-apply state — disk has no
+                                // request, memory has it — the opposite of the claim.
+                                let _roster_persistence_guard = relay_state
+                                    .named_groups_persistence_lock
+                                    .lock()
+                                    .await;
                                 store_named_group_info(
                                     &relay_state,
                                     &group_id_str,
                                     snapshot,
                                 )
                                 .await;
-                                if let Err(e) = save_named_groups_checked(&relay_state).await {
+                                if let Err(e) = save_named_groups_checked_unlocked(&relay_state).await {
                                     tracing::error!(
                                         group_id = %group_id_str,
                                         "ADR 0028: rollback save failed after admission failure: {e}"
@@ -1658,13 +1670,19 @@ pub async fn serve_with_options(
                                     group_id = %group_id_str,
                                     "ADR 0028: rolling back JoinRequestCreated after outbox save failure"
                                 );
+                                // Finding 1 (Sam 4ea68a9): same persistence-lock-
+                                // held rollback as the admission-failure path.
+                                let _roster_persistence_guard = relay_state
+                                    .named_groups_persistence_lock
+                                    .lock()
+                                    .await;
                                 store_named_group_info(
                                     &relay_state,
                                     &group_id_str,
                                     snapshot,
                                 )
                                 .await;
-                                if let Err(e) = save_named_groups_checked(&relay_state).await {
+                                if let Err(e) = save_named_groups_checked_unlocked(&relay_state).await {
                                     tracing::error!(
                                         group_id = %group_id_str,
                                         "ADR 0028: rollback save failed after outbox save failure: {e}"

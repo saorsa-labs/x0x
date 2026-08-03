@@ -76,7 +76,7 @@ pub(super) use named_groups::{
     load_treekem_member_key_packages, named_group_metadata_event_group_id,
     named_group_metadata_event_kind, now_millis_u64, publish_group_card_to_discovery,
     recover_treekem_named_journals, reject_join_request, remove_named_group_member,
-    replay_pending_causal_approvals, restore_treekem_groups, save_named_groups_checked,
+    replay_pending_causal_approvals, restore_treekem_groups, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, spawn_directory_resubscribe,
