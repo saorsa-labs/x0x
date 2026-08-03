@@ -55,20 +55,20 @@ use routes::{
     recover_treekem_named_journals, reject_join_request, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
     revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
-    save_predecessor_relay_outbox, seal_group_state, secure_group_decrypt, secure_group_encrypt,
-    secure_group_reseal, secure_open_envelope_adversarial, send_group_public_message,
-    set_group_display_name, shutdown_handler, spawn_directory_resubscribe,
-    spawn_global_discovery_listener, spawn_global_public_message_listener,
-    spawn_listed_to_contacts_listener, status, streams_diagnostics, subscribe, unban_group_member,
-    unpin_machine, unsubscribe, update_contact, update_group_policy, update_member_role,
-    update_named_group, update_task, withdraw_group_state, JoinResultMessage, KvStoreDirectDelta,
-    NamedGroupMetadataEvent, PredecessorRelayObligation, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
+    secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
+    send_group_public_message, set_group_display_name, shutdown_handler,
+    spawn_directory_resubscribe, spawn_global_discovery_listener,
+    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
+    streams_diagnostics, subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact,
+    update_group_policy, update_member_role, update_named_group, update_task, withdraw_group_state,
+    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PredecessorRelayObligation,
+    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 use state::AppState;
@@ -1391,6 +1391,14 @@ pub async fn serve_with_options(
                         relay_targets,
                         completed_at_ms: None,
                     };
+                    // Global lock order P→Q: persistence FIRST, then outbox
+                    // write. Held through mutation and durable save. Prevents
+                    // the dirty-write race where another writer snapshots and
+                    // saves between our mutation and our save.
+                    let _relay_persistence_guard = relay_state
+                        .predecessor_relay_outbox_persistence_lock
+                        .lock()
+                        .await;
                     {
                         let mut outbox = relay_state.predecessor_relay_outbox.write().await;
                         // Compute daemon-wide caps BEFORE borrowing a specific
@@ -1402,6 +1410,18 @@ pub async fn serve_with_options(
                                 .fold((0, 0, 0), |(c, b, t), o| {
                                     (c + 1, b + o.byte_size, t + o.relay_targets.len())
                                 });
+                        // ADR 0028 finding E: enforce a COMBINED live+completed
+                        // budget of CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP (1024) /
+                        // CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP (16 MiB), not
+                        // independent per-store budgets.
+                        let (completed_count, completed_bytes): (usize, usize) = {
+                            let tombstones = relay_state.completed_relay_tombstones.read().await;
+                            tombstones.values().flatten().fold((0, 0), |(c, b), t| {
+                                (c + 1, b + t.envelope_bytes.len())
+                            })
+                        };
+                        let combined_count = daemon_count + completed_count;
+                        let combined_bytes = daemon_bytes + completed_bytes;
                         let group_outbox = outbox.entry(group_id_str.clone()).or_default();
                         // Dedup by digest.
                         if group_outbox.iter().any(|o| o.digest == obligation.digest) {
@@ -1424,22 +1444,24 @@ pub async fn serve_with_options(
                             );
                             continue;
                         }
-                        // ADR 0028: daemon-wide count cap (Kimi blocker 7).
-                        if daemon_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+                        // ADR 0028: COMBINED daemon-wide count cap (live + completed).
+                        if combined_count >= CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
                             tracing::warn!(
-                                "ADR 0028: predecessor relay outbox at daemon count capacity, rejecting"
+                                "ADR 0028: combined relay state at daemon count capacity, rejecting"
                             );
                             continue;
                         }
-                        // ADR 0028: daemon-wide byte cap (Kimi blocker 7).
-                        if daemon_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+                        // ADR 0028: COMBINED daemon-wide byte cap (live + completed).
+                        if combined_bytes + byte_size > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
                             tracing::warn!(
-                                "ADR 0028: predecessor relay outbox at daemon byte capacity, rejecting"
+                                "ADR 0028: combined relay state at daemon byte capacity, rejecting"
                             );
                             continue;
                         }
                         // ADR 0028: 4096 total relay-target cap (Kimi blocker 7).
-                        if total_targets + obligation.relay_targets.len() > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP {
+                        if total_targets + obligation.relay_targets.len()
+                            > CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP
+                        {
                             tracing::warn!(
                                 "ADR 0028: predecessor relay outbox at 4096 total relay-target cap, rejecting"
                             );
@@ -1447,9 +1469,10 @@ pub async fn serve_with_options(
                         }
                         group_outbox.push(obligation);
                     }
-                    // ADR 0028: persist the relay outbox. Roll back on failure
-                    // (Kimi blocker 8).
-                    if let Err(e) = save_predecessor_relay_outbox(&relay_state).await {
+                    // ADR 0028: persist the relay outbox. Persistence lock is
+                    // already held (P→Q) — use the unlocked save. Roll back on
+                    // failure (Kimi blocker 8).
+                    if let Err(e) = save_predecessor_relay_outbox_unlocked(&relay_state).await {
                         tracing::error!(
                             "ADR 0028: relay outbox save failed after admission, rolling back: {e}"
                         );

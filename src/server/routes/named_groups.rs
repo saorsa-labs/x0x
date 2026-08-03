@@ -4569,6 +4569,10 @@ async fn try_queue_causal_approval(
     };
 
     {
+        // Global lock order P→Q: persistence FIRST, then queue write.
+        // Held through all checks, mutation, and durable save. Eliminates
+        // the Qw→P inversion that deadlocked with replay's P→Qw.
+        let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
         let mut queue_lock = state.causal_approval_queue.write().await;
 
         // Pre-check per-daemon count and byte caps.
@@ -4650,15 +4654,13 @@ async fn try_queue_causal_approval(
             // existing entries conflicted AND record the new conflicting digest
             // in the tombstone store so it cannot be re-admitted. Persist
             // atomically; rollback on failure (no diagnostic recorded).
-            // R4: hold the persistence lock from mutation through durable
-            // write so an older snapshot cannot overwrite a newer write.
+            // R4: persistence lock is already held (P→Q order at block entry).
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
                 request_id = %request_id,
                 revision = revision,
                 "ADR 0028 B3: non-identical conflict detected, marking all entries conflicted (reject-both)"
             );
-            let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
             // Snapshot entries for rollback.
             let conflicted_indices: Vec<usize> = queue
                 .iter()
@@ -4702,17 +4704,8 @@ async fn try_queue_causal_approval(
             // B3: persist atomically. If save fails, roll back ALL in-memory
             // mutations (conflicted markings + tombstones) and return without
             // recording a diagnostic — no durable reject-both is acknowledged.
-            // R4: persistence lock is already held — serialize under data read
-            // locks, drop them, then write to disk (no deadlock).
-            let save_result = {
-                let queue = state.causal_approval_queue.read().await;
-                let tombstones = state.causal_conflict_tombstones.read().await;
-                serialize_causal_queue_sidecar(&queue, &tombstones)
-            };
-            let save_result = match save_result {
-                Ok(json) => write_causal_queue_sidecar(state, &json).await,
-                Err(e) => Err(e),
-            };
+            // Persistence lock is already held (P→Q) — use the unlocked save.
+            let save_result = save_causal_approval_queue_unlocked(state).await;
             if let Err(e) = save_result {
                 tracing::error!(
                     "ADR 0028 B3: failed to persist conflict marking, rolling back: {e}"
@@ -4770,28 +4763,16 @@ async fn try_queue_causal_approval(
             return;
         }
 
-        // R4: acquire persistence lock before mutation (same lock order
-        // as B3: queue_lock → persistence_lock). Held through durable save.
-        let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
+        // Persistence lock is already held (P→Q at block entry).
         queue.push_back(approval);
         // Sort by signed revision for ordered drain.
         queue.make_contiguous().sort_by_key(|a| a.revision);
         drop(queue_lock);
 
-        // Persist the queue sidecar after admission. R4: persistence lock
-        // is held from push_back through save. If the save fails, roll back
-        // the in-memory admission so memory and disk stay consistent.
-        // Serialize under data read locks, drop them, then write to disk
-        // (persistence lock already held — no deadlock).
-        let save_result = {
-            let queue = state.causal_approval_queue.read().await;
-            let tombstones = state.causal_conflict_tombstones.read().await;
-            serialize_causal_queue_sidecar(&queue, &tombstones)
-        };
-        let save_result = match save_result {
-            Ok(json) => write_causal_queue_sidecar(state, &json).await,
-            Err(e) => Err(e),
-        };
+        // Persist the queue sidecar after admission. If the save fails, roll
+        // back the in-memory admission so memory and disk stay consistent.
+        // Persistence lock is already held (P→Q) — use the unlocked save.
+        let save_result = save_causal_approval_queue_unlocked(state).await;
         if let Err(e) = save_result {
             tracing::error!(
                 "ADR 0028: causal approval queue save failed after admission, rolling back: {e}"
@@ -4828,14 +4809,17 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     state: &Arc<AppState>,
     group_id: &str,
 ) {
-    let (_persistence_guard, entries) = {
+    // Global lock order P→Q: acquire persistence FIRST, then queue write.
+    // Held through drain, re-insert, and durable save. No writer may hold
+    // a queue lock and wait for persistence — eliminates the deadlock cycle
+    // where replay held P→waited Qw while admission held Qw→waited P.
+    let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
+    let entries = {
         let mut queue_lock = state.causal_approval_queue.write().await;
         let Some(queue) = queue_lock.get_mut(group_id) else {
+            // No queue for this group — nothing to persist.
             return;
         };
-        // R4: acquire persistence lock before mutation (same lock order
-        // as B3: queue_lock → persistence_lock). Held through durable save.
-        let _guard = state.causal_approval_queue_persistence_lock.lock().await;
         let now_ms = now_millis_u64();
         // Drop expired entries and count them for diagnostics.
         let expired_count = queue.iter().filter(|q| q.expires_at_ms <= now_ms).count();
@@ -4845,10 +4829,17 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
         queue.retain(|q| q.expires_at_ms > now_ms);
         // Drain remaining for retry (already sorted by revision).
         let entries: Vec<_> = queue.drain(..).collect();
-        (_guard, entries)
+        entries
     };
 
     if entries.is_empty() {
+        // Expiry-only drain: persist the (now possibly empty) queue sidecar
+        // so expired entries are not rediscovered on restart.
+        if let Err(e) = save_causal_approval_queue_unlocked(state).await {
+            tracing::error!(
+                "ADR 0028: failed to persist causal approval queue after expiry-only drain: {e}"
+            );
+        }
         return;
     }
 
@@ -5002,14 +4993,9 @@ pub(in crate::server) async fn replay_pending_causal_approvals(
     }
 
     // Persist after drain — applied entries are removed, retained entries stay.
-    // Group state was already persisted by the inner apply before we got here;
-    // now persist the queue sidecar. R4/deadlock-fix: drop the persistence
-    // guard before calling the public save wrapper, which acquires its own
-    // persistence lock. This breaks the persistence→queue-read inversion that
-    // deadlocks when admission holds a queue write waiting for the persistence
-    // lock.
-    drop(_persistence_guard);
-    if let Err(e) = save_causal_approval_queue(state).await {
+    // Persistence lock is already held (P→Q order). Use the unlocked save
+    // helper to avoid re-acquiring the persistence mutex.
+    if let Err(e) = save_causal_approval_queue_unlocked(state).await {
         tracing::error!("ADR 0028: failed to persist causal approval queue after drain: {e}");
     }
 }
@@ -7989,8 +7975,18 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         // `first_seen_ms + CAUSAL_APPROVAL_RETENTION_MS` so a one-authority
         // group cannot keep a missing predecessor forever and authorize
         // approval after the frozen five-minute limit (ADR Validation 3).
-        // R4: hold the persistence lock from mutation through durable write.
+        // P→Q: persistence lock held from mutation through durable write.
         let _guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
+        // Full-state snapshot BEFORE pruning so a save failure can roll back
+        // ALL pruned state across every group (not just a narrow subset).
+        let outbox_snapshot: HashMap<String, Vec<PredecessorRelayObligation>> = {
+            let outbox = state.predecessor_relay_outbox.read().await;
+            outbox.clone()
+        };
+        let tombstones_snapshot: HashMap<String, Vec<CompletedRelayTombstone>> = {
+            let tombstones = state.completed_relay_tombstones.read().await;
+            tombstones.clone()
+        };
         let mut pruned = false;
         // Prune expired/completed obligations from the live outbox.
         {
@@ -8008,7 +8004,7 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
             }
             outbox.retain(|_, obligations| !obligations.is_empty());
         }
-        // R2/Fix4: prune completed tombstones daemon-wide and set pruned_any
+        // R2/Fix4: prune completed tombstones daemon-wide and set pruned
         // so tombstone-only pruning is persisted (was: not saved).
         {
             let mut tombstones = state.completed_relay_tombstones.write().await;
@@ -8020,20 +8016,20 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
             }
         }
         if pruned {
-            // Serialize under data read locks, drop them, write to disk
-            // (persistence lock already held — no deadlock).
-            let save_result = {
-                let outbox = state.predecessor_relay_outbox.read().await;
-                let tombstones = state.completed_relay_tombstones.read().await;
-                let pending = state.pending_b8_compensation.lock().await;
-                serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)
-            };
-            let save_result = match save_result {
-                Ok(json) => write_relay_outbox_sidecar(state, &json).await,
-                Err(e) => Err(e),
-            };
-            if let Err(e) = save_result {
-                tracing::error!("ADR 0028 B6: failed to persist pruned outbox (no-due path): {e}");
+            // Persistence lock is already held (P→Q) — use unlocked save.
+            if let Err(e) = save_predecessor_relay_outbox_unlocked(state).await {
+                tracing::error!(
+                    "ADR 0028 B6: failed to persist pruned outbox (no-due path), rolling back: {e}"
+                );
+                // Rollback: restore the full pre-prune state for both stores.
+                {
+                    let mut outbox = state.predecessor_relay_outbox.write().await;
+                    *outbox = outbox_snapshot;
+                }
+                {
+                    let mut tombstones = state.completed_relay_tombstones.write().await;
+                    *tombstones = tombstones_snapshot;
+                }
             }
         }
         return;
@@ -8097,26 +8093,28 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         });
     }
 
-    // B6/R4 (Fix 2): acquire the persistence lock BEFORE mutation so it
-    // spans mutation through durable write with no gap. The relay sends
+    // P→Q: acquire the persistence lock BEFORE mutation so it spans
+    // mutation through durable write with no gap. The relay sends
     // (network I/O) are already complete — no lock was held during I/O.
     let _persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
 
-    // B6: update in-memory obligations with relay results. Snapshot the
-    // affected obligations first so we can roll back on persistence failure.
-    // Fix 4: also snapshot tombstones for groups receiving new entries.
-    let mut snapshots: Vec<(String, Vec<PredecessorRelayObligation>)> = Vec::new();
+    // Full-state snapshot BEFORE any mutation so a save failure can roll
+    // back ALL changes across every group — not just the result groups.
+    // Pruning runs daemon-wide and may evict entries from unrelated groups.
+    let outbox_snapshot: HashMap<String, Vec<PredecessorRelayObligation>> = {
+        let outbox = state.predecessor_relay_outbox.read().await;
+        outbox.clone()
+    };
+    let tombstones_snapshot: HashMap<String, Vec<CompletedRelayTombstone>> = {
+        let tombstones = state.completed_relay_tombstones.read().await;
+        tombstones.clone()
+    };
     let mut completed_tombstones_to_add: Vec<CompletedRelayTombstone> = Vec::new();
-    let mut tombstone_snapshots: HashMap<String, Vec<CompletedRelayTombstone>> = HashMap::new();
 
     {
         let mut outbox = state.predecessor_relay_outbox.write().await;
         for result in &relay_results {
             if let Some(obligations) = outbox.get_mut(&result.group_id) {
-                // Snapshot the group's obligations for rollback.
-                if !snapshots.iter().any(|(gid, _)| gid == &result.group_id) {
-                    snapshots.push((result.group_id.clone(), obligations.clone()));
-                }
                 for obligation in obligations.iter_mut() {
                     if obligation.digest == result.digest {
                         obligation.retry_count = obligation.retry_count.saturating_add(1);
@@ -8142,22 +8140,6 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
                         }
                         break;
                     }
-                }
-            }
-        }
-    }
-
-    // Fix 4: snapshot tombstones for groups that will receive new entries,
-    // so rollback can restore the full pre-mutation state (not just remove
-    // by digest, which could delete a pre-existing deduplicated tombstone).
-    if !completed_tombstones_to_add.is_empty() {
-        let tombstones = state.completed_relay_tombstones.read().await;
-        for t in &completed_tombstones_to_add {
-            if !tombstone_snapshots.contains_key(&t.group_id) {
-                if let Some(list) = tombstones.get(&t.group_id) {
-                    tombstone_snapshots.insert(t.group_id.clone(), list.clone());
-                } else {
-                    tombstone_snapshots.insert(t.group_id.clone(), Vec::new());
                 }
             }
         }
@@ -8204,41 +8186,23 @@ pub(in crate::server) async fn causal_relay_step(state: &Arc<AppState>) {
         outbox.retain(|_, obligations| !obligations.is_empty());
     }
 
-    // Serialize under data read locks, drop them, write to disk
-    // (persistence lock already held — no deadlock).
-    let save_result = {
-        let outbox = state.predecessor_relay_outbox.read().await;
-        let tombstones = state.completed_relay_tombstones.read().await;
-        let pending = state.pending_b8_compensation.lock().await;
-        serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)
-    };
-    let save_result = match save_result {
-        Ok(json) => write_relay_outbox_sidecar(state, &json).await,
-        Err(e) => Err(e),
-    };
+    // Persistence lock is already held (P→Q) — use the unlocked save.
+    let save_result = save_predecessor_relay_outbox_unlocked(state).await;
 
     if let Err(e) = save_result {
         tracing::error!(
             "ADR 0028 B6: failed to persist relay outbox after relay step, rolling back: {e}"
         );
-        // Fix 4: rollback — restore snapshotted obligations.
+        // Full-state rollback: restore ALL groups' obligations and tombstones
+        // from the pre-mutation snapshot. Pruning ran across all groups, so
+        // a narrow restore would lose unrelated pruned state.
         {
             let mut outbox = state.predecessor_relay_outbox.write().await;
-            for (gid, snap) in &snapshots {
-                outbox.insert(gid.clone(), snap.clone());
-            }
+            *outbox = outbox_snapshot;
         }
-        // Fix 4: rollback — restore tombstone snapshots (full restore, not
-        // digest-based removal that could delete pre-existing entries).
-        if !completed_tombstones_to_add.is_empty() {
+        {
             let mut tombstones = state.completed_relay_tombstones.write().await;
-            for (gid, snap) in &tombstone_snapshots {
-                if snap.is_empty() {
-                    tombstones.remove(gid);
-                } else {
-                    tombstones.insert(gid.clone(), snap.clone());
-                }
-            }
+            *tombstones = tombstones_snapshot;
         }
         return;
     }
@@ -12654,6 +12618,11 @@ pub(in crate::server) async fn approve_join_request(
                 request_id: request_id.clone(),
                 outbox_snapshot: outbox_snapshot.clone(),
                 timestamp_ms: now_ms,
+                requester_agent_id: requester_hex.clone(),
+                actor: caller_hex.clone(),
+                predecessor_digest: validated_digest,
+                approved_revision: revision,
+                approved_state_hash: commit.state_hash.clone(),
             });
         }
         {
@@ -12681,17 +12650,8 @@ pub(in crate::server) async fn approve_join_request(
                 }
             }
         }
-        // Serialize + write the outbox (includes the B8 journal).
-        let outbox_save_result = {
-            let outbox = state.predecessor_relay_outbox.read().await;
-            let tombstones = state.completed_relay_tombstones.read().await;
-            let pending = state.pending_b8_compensation.lock().await;
-            serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)
-        };
-        let outbox_save_result = match outbox_save_result {
-            Ok(json) => write_relay_outbox_sidecar(&state, &json).await,
-            Err(e) => Err(e),
-        };
+        // Persistence lock is already held (P→Q) — use the unlocked save.
+        let outbox_save_result = save_predecessor_relay_outbox_unlocked(&state).await;
         if let Err(e) = outbox_save_result {
             // B8 atomicity: roll back BOTH the outbox refresh AND the roster.
             // Clear the journal since the outbox save failed (nothing durable).
@@ -12735,27 +12695,12 @@ pub(in crate::server) async fn approve_join_request(
             // Durably undo the outbox refresh. If this fails, the journal
             // from the first outbox save is still durable and the restart
             // loader will restore the outbox from the journal snapshot.
-            let undo_result = {
-                let outbox = state.predecessor_relay_outbox.read().await;
-                let tombstones = state.completed_relay_tombstones.read().await;
-                let pending = state.pending_b8_compensation.lock().await;
-                serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)
-            };
-            match undo_result {
-                Ok(json) => {
-                    if let Err(undo_e) = write_relay_outbox_sidecar(&state, &json).await {
-                        tracing::error!(
-                            group_id = %LogHexId::group(&id),
-                            "ADR 0028 B8: compensating outbox re-save failed (journal was durable from first save): {undo_e}"
-                        );
-                    }
-                }
-                Err(undo_e) => {
-                    tracing::error!(
-                        group_id = %LogHexId::group(&id),
-                        "ADR 0028 B8: compensating outbox serialize failed: {undo_e}"
-                    );
-                }
+            // Persistence lock is still held (P→Q) — use unlocked save.
+            if let Err(undo_e) = save_predecessor_relay_outbox_unlocked(&state).await {
+                tracing::error!(
+                    group_id = %LogHexId::group(&id),
+                    "ADR 0028 B8: compensating outbox re-save failed (journal was durable from first save): {undo_e}"
+                );
             }
             let mut groups = state.named_groups.write().await;
             if let Some(info) = groups.get_mut(&id) {
@@ -15047,13 +14992,13 @@ pub(in crate::server) struct CompletedRelayTombstone {
     /// cryptographically re-verify the predecessor on restart, not just
     /// trust the copied metadata fields.
     #[serde(default)]
-    envelope_bytes: Vec<u8>,
+    pub(in crate::server) envelope_bytes: Vec<u8>,
     /// ADR 0028 R2: when the original obligation was first seen, for
     /// time-bounded retention. Tombstones expire at
     /// `first_seen_ms + CAUSAL_APPROVAL_RETENTION_MS`, matching the live
     /// obligation expiry window.
     #[serde(default)]
-    first_seen_ms: u64,
+    pub(in crate::server) first_seen_ms: u64,
 }
 
 /// ADR 0028: versioned sidecar for the predecessor relay outbox.
@@ -15090,6 +15035,15 @@ pub(in crate::server) struct PendingB8Compensation {
     /// re-save also fails.
     outbox_snapshot: Vec<PredecessorRelayObligation>,
     timestamp_ms: u64,
+    /// Exact approval binding: recovery must match ALL of these against the
+    /// durable roster, not just `status == Approved` under the request_id.
+    /// A stale or different approval for the same request_id must NOT
+    /// commit the refreshed outbox (finding F).
+    requester_agent_id: String,
+    actor: String,
+    predecessor_digest: [u8; 32],
+    approved_revision: u64,
+    approved_state_hash: String,
 }
 
 /// ADR 0028 R2: prune expired and over-cap completed relay tombstones for a
@@ -15230,6 +15184,125 @@ fn serialize_causal_queue_sidecar(
     })
 }
 
+/// ADR 0028 finding E: enforce the COMBINED daemon-wide relay budget of
+/// `CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP` (1024) entries and
+/// `CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP` (16 MiB) across BOTH the live
+/// outbox and completed tombstones. Eviction is oldest-first (smallest
+/// `first_seen_ms`). Called at restart after loading both stores. The
+/// per-store caps applied during loading are first-pass filters; this
+/// function ensures the combined total never exceeds the accepted budget.
+fn enforce_combined_relay_budget(
+    outbox: &mut HashMap<String, Vec<PredecessorRelayObligation>>,
+    tombstones: &mut HashMap<String, Vec<CompletedRelayTombstone>>,
+) {
+    // Combined count cap.
+    let total_count: usize =
+        outbox.values().flatten().count() + tombstones.values().flatten().count();
+    if total_count > CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP {
+        let mut all: Vec<(String, u64, usize, bool)> = Vec::new();
+        for (gid, list) in outbox.iter() {
+            for (i, o) in list.iter().enumerate() {
+                all.push((gid.clone(), o.first_seen_ms, i, true));
+            }
+        }
+        for (gid, list) in tombstones.iter() {
+            for (i, t) in list.iter().enumerate() {
+                all.push((gid.clone(), t.first_seen_ms, i, false));
+            }
+        }
+        // Sort newest-first (descending first_seen_ms) — keep the newest CAP.
+        all.sort_by_key(|e| std::cmp::Reverse(e.1));
+        let keep: std::collections::HashSet<(String, usize, bool)> = all
+            .iter()
+            .take(CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP)
+            .map(|e| (e.0.clone(), e.2, e.3))
+            .collect();
+        for (gid, list) in outbox.iter_mut() {
+            let mut new_list = Vec::with_capacity(list.len());
+            for (i, o) in list.iter().enumerate() {
+                if keep.contains(&(gid.clone(), i, true)) {
+                    new_list.push(o.clone());
+                }
+            }
+            *list = new_list;
+        }
+        outbox.retain(|_, list| !list.is_empty());
+        for (gid, list) in tombstones.iter_mut() {
+            let mut new_list = Vec::with_capacity(list.len());
+            for (i, t) in list.iter().enumerate() {
+                if keep.contains(&(gid.clone(), i, false)) {
+                    new_list.push(t.clone());
+                }
+            }
+            *list = new_list;
+        }
+        tombstones.retain(|_, list| !list.is_empty());
+    }
+
+    // Combined byte cap.
+    let total_bytes: usize = outbox
+        .values()
+        .flatten()
+        .map(|o| o.byte_size)
+        .sum::<usize>()
+        + tombstones
+            .values()
+            .flatten()
+            .map(|t| t.envelope_bytes.len())
+            .sum::<usize>();
+    if total_bytes > CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+        let mut all: Vec<(String, u64, usize, usize, bool)> = Vec::new();
+        for (gid, list) in outbox.iter() {
+            for (i, o) in list.iter().enumerate() {
+                all.push((gid.clone(), o.first_seen_ms, i, o.byte_size, true));
+            }
+        }
+        for (gid, list) in tombstones.iter() {
+            for (i, t) in list.iter().enumerate() {
+                all.push((
+                    gid.clone(),
+                    t.first_seen_ms,
+                    i,
+                    t.envelope_bytes.len(),
+                    false,
+                ));
+            }
+        }
+        // Sort oldest-first (ascending first_seen_ms) for eviction.
+        all.sort_by_key(|e| e.1);
+        let mut current = total_bytes;
+        let mut evict: std::collections::HashSet<(String, usize, bool)> =
+            std::collections::HashSet::new();
+        for (gid, _, i, sz, is_live) in &all {
+            if current <= CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP {
+                break;
+            }
+            evict.insert((gid.clone(), *i, *is_live));
+            current = current.saturating_sub(*sz);
+        }
+        for (gid, list) in outbox.iter_mut() {
+            let mut new_list = Vec::with_capacity(list.len());
+            for (i, o) in list.iter().enumerate() {
+                if !evict.contains(&(gid.clone(), i, true)) {
+                    new_list.push(o.clone());
+                }
+            }
+            *list = new_list;
+        }
+        outbox.retain(|_, list| !list.is_empty());
+        for (gid, list) in tombstones.iter_mut() {
+            let mut new_list = Vec::with_capacity(list.len());
+            for (i, t) in list.iter().enumerate() {
+                if !evict.contains(&(gid.clone(), i, false)) {
+                    new_list.push(t.clone());
+                }
+            }
+            *list = new_list;
+        }
+        tombstones.retain(|_, list| !list.is_empty());
+    }
+}
+
 /// ADR 0028 R4: Write the causal approval queue sidecar JSON to disk. No data
 /// locks are acquired — caller serializes under data locks, then calls this
 /// while holding only the persistence lock.
@@ -15243,12 +15316,11 @@ async fn write_causal_queue_sidecar(state: &AppState, json: &str) -> std::io::Re
     sync_parent_dir_for_path(&state.causal_approval_queue_path)
 }
 
-/// ADR 0028: persist the causal approval queue to a durable sidecar file.
-/// Acquires the persistence lock, serializes under data read locks, drops
-/// them, then writes to disk — no deadlock (persistence lock never waits
-/// on data locks while another writer holds data locks waiting for it).
-pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> std::io::Result<()> {
-    let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
+/// ADR 0028: Write the causal approval queue sidecar WITHOUT acquiring the
+/// persistence lock. Caller MUST already hold
+/// `causal_approval_queue_persistence_lock`. Global lock order: persistence
+/// (P) → data (Q) — all writers acquire P first, then data locks.
+async fn save_causal_approval_queue_unlocked(state: &AppState) -> std::io::Result<()> {
     let json = {
         let queue = state.causal_approval_queue.read().await;
         let tombstones = state.causal_conflict_tombstones.read().await;
@@ -15257,14 +15329,23 @@ pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> s
     write_causal_queue_sidecar(state, &json).await
 }
 
-/// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
-/// Returns `Err` on write failure so the caller can roll back (Kimi blocker 8).
-/// Acquires the persistence lock, serializes under data read locks (including
-/// the B8 journal), drops them, then writes to disk.
-pub(in crate::server) async fn save_predecessor_relay_outbox(
+/// ADR 0028: persist the causal approval queue to a durable sidecar file.
+/// Acquires the persistence lock first (P), then serializes under data read
+/// locks (Q). Global lock order P→Q. Public wrapper for callers that do not
+/// already hold the persistence lock.
+#[allow(dead_code)]
+pub(in crate::server) async fn save_causal_approval_queue(state: &AppState) -> std::io::Result<()> {
+    let _persistence_guard = state.causal_approval_queue_persistence_lock.lock().await;
+    save_causal_approval_queue_unlocked(state).await
+}
+
+/// ADR 0028: Write the predecessor relay outbox sidecar WITHOUT acquiring
+/// the persistence lock. Caller MUST already hold
+/// `predecessor_relay_outbox_persistence_lock`. Global lock order:
+/// persistence (P) → data (Q) — all writers acquire P first, then data locks.
+pub(in crate::server) async fn save_predecessor_relay_outbox_unlocked(
     state: &AppState,
 ) -> std::io::Result<()> {
-    let _persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
     let json = {
         let outbox = state.predecessor_relay_outbox.read().await;
         let tombstones = state.completed_relay_tombstones.read().await;
@@ -15272,6 +15353,17 @@ pub(in crate::server) async fn save_predecessor_relay_outbox(
         serialize_relay_outbox_sidecar(&outbox, &tombstones, &pending)?
     };
     write_relay_outbox_sidecar(state, &json).await
+}
+
+/// ADR 0028: persist the predecessor relay outbox to a durable sidecar file.
+/// Returns `Err` on write failure so the caller can roll back (Kimi blocker 8).
+/// Acquires the persistence lock first (P), then serializes under data read
+/// locks (Q). Global lock order P→Q.
+pub(in crate::server) async fn save_predecessor_relay_outbox(
+    state: &AppState,
+) -> std::io::Result<()> {
+    let _persistence_guard = state.predecessor_relay_outbox_persistence_lock.lock().await;
+    save_predecessor_relay_outbox_unlocked(state).await
 }
 
 /// ADR 0028 R4: Serialize the relay outbox sidecar to JSON. Caller must hold
@@ -15708,17 +15800,22 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             outbox.insert(group_id, filtered);
         }
     }
-    *state.predecessor_relay_outbox.write().await = outbox;
     // B6/R2/Fix3: load completed relay tombstones from the sidecar, pruning
-    // expired entries and enforcing daemon-wide count/byte caps so the
-    // completed store stays bounded within the relay budget.
-    {
+    // expired entries and enforcing per-store daemon-wide count/byte caps
+    // as a first-pass filter.
+    let mut tombstones = {
         let now_ms = now_millis_u64();
         let mut tombstones = loaded_sidecar.completed_tombstones;
-        // Fix 3: daemon-wide pruning (was: per-group only).
         prune_completed_tombstones_daemon(&mut tombstones, now_ms);
-        *state.completed_relay_tombstones.write().await = tombstones;
-    }
+        tombstones
+    };
+    // ADR 0028 finding E: enforce ONE combined live+completed relay budget
+    // of 1,024 entries / 16 MiB — not two independent per-store budgets.
+    // The per-store caps above are first-pass filters; this ensures the
+    // combined total never exceeds the accepted untrusted-data budget.
+    enforce_combined_relay_budget(&mut outbox, &mut tombstones);
+    *state.predecessor_relay_outbox.write().await = outbox;
+    *state.completed_relay_tombstones.write().await = tombstones;
     // Fix 5: B8 journal recovery. If the sidecar has a pending B8
     // compensation, check whether the roster has the approval:
     // - If yes: the cross-file operation completed (outbox refresh + roster
@@ -15727,19 +15824,29 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
     //   refresh is durable — restore the outbox from the journal snapshot
     //   to undo the refresh.
     if let Some(journal) = loaded_sidecar.pending_compensation {
-        let roster_has_approval = {
+        // Finding F: bind to the EXACT approved tuple — not just any
+        // `Approved` under the same request_id. A stale or different
+        // approval must not commit the refreshed outbox.
+        let roster_has_exact_approval = {
             let groups = state.named_groups.read().await;
             groups.get(&journal.group_id).is_some_and(|info| {
-                info.join_requests
-                    .get(&journal.request_id)
-                    .is_some_and(|jr| jr.status == x0x::groups::JoinRequestStatus::Approved)
+                info.roster_revision == journal.approved_revision
+                    && info.state_hash == journal.approved_state_hash
+                    && info
+                        .join_requests
+                        .get(&journal.request_id)
+                        .is_some_and(|jr| {
+                            jr.status == x0x::groups::JoinRequestStatus::Approved
+                                && jr.requester_agent_id == journal.requester_agent_id
+                                && jr.reviewed_by.as_deref() == Some(journal.actor.as_str())
+                        })
             })
         };
-        if roster_has_approval {
+        if roster_has_exact_approval {
             tracing::info!(
                 group_id = %LogHexId::group(&journal.group_id),
                 request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery — roster has approval, operation completed, clearing journal"
+                "ADR 0028 B8: journal recovery — exact approval match, operation completed, clearing journal"
             );
             // Keep the refreshed outbox (it's correct). Clear the journal.
             *state.pending_b8_compensation.lock().await = None;
@@ -15747,7 +15854,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             tracing::warn!(
                 group_id = %LogHexId::group(&journal.group_id),
                 request_id = %journal.request_id,
-                "ADR 0028 B8: journal recovery — roster lacks approval, restoring outbox from journal snapshot"
+                "ADR 0028 B8: journal recovery — no exact approval match, restoring outbox from journal snapshot"
             );
             // Restore the outbox from the journal snapshot to undo the refresh.
             {
@@ -15760,9 +15867,15 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(state: &AppState) {
             }
             *state.pending_b8_compensation.lock().await = None;
         }
-        // Persist the recovered state (clears the journal durably and/or
-        // persists the restored outbox).
-        let _ = save_predecessor_relay_outbox(state).await;
+        // Finding F: persist the recovered state with a CHECKED result —
+        // a failed recovery write must not be silently ignored.
+        if let Err(e) = save_predecessor_relay_outbox(state).await {
+            tracing::error!(
+                group_id = %LogHexId::group(&journal.group_id),
+                request_id = %journal.request_id,
+                "ADR 0028 B8: journal recovery persist failed: {e}"
+            );
+        }
     }
 }
 
