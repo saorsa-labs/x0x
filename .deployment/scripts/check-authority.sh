@@ -49,7 +49,12 @@
 #   check-authority.sh              # check the real .deployment/ tree
 #   check-authority.sh --root DIR   # check a deployment dir copied to DIR
 #   check-authority.sh --self-test  # exercise every disclosed control against
-#                                   # temp copies (each must flip the check red)
+#                                   # temp copies; runs BOTH the authority
+#                                   # arms (each must flip the check red) and
+#                                   # the installer arms (the real install.sh
+#                                   # behind fake PATH/id/filesystem/systemctl
+#                                   # boundaries). Receipts are reported
+#                                   # separately (authority + installer).
 #
 # Exit: 0 compliant / 1 violation or self-test failure / 2 usage error.
 # =============================================================================
@@ -720,7 +725,7 @@ run_self_test() {
     # disjoint-sole-catcher discipline). Without a tag the arm asserts exit-only
     # and must justify why no tag is assertable.
     expect_fail() {
-        local name="$1" fn="$2" tag="${3:-}" d="$tmp/$1"
+        local name="$1" fn="$2" tag="${3:-}" d="$tmp/$1" rc
         rm -rf "$d"; cp -r "$tmp/base" "$d"
         # A mutator that itself fails (e.g. _rewrite no-op: its pattern matched
         # nothing, so the arm would exercise nothing) is a broken arm, not a
@@ -823,14 +828,396 @@ run_self_test() {
     }
 
     rm -rf "$tmp"
-    echo "[self-test] $pass control(s) fired, $failed failed to fire; C8c arm=$c8c_arm"
+    echo "[self-test] authority: $pass fired, $failed failed; C8c arm=$c8c_arm"
     echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-path, C8-unit-syntax, C9-bin-argv0}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; manifest={C8-manifest-noncanonical}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
     [ "$failed" -eq 0 ]
 }
 
+# === installer self-test: real install.sh behind fakes ======================
+# The §3 authority controls above are check-side: each mutates a temp copy of
+# .deployment/ and runs check-authority.sh on it. The arms below are install-
+# side: each executes the REAL .deployment/install.sh (the entry point declared
+# in authority-inventory.json) against a hermetic surface so the installer's
+# actual behaviour is exercised, not an extracted fragment of it. Counted on a
+# separate installer_pass/installer_failed ledger — the 22/22 authority
+# receipt above is unchanged.
+#
+# Three boundaries are faked so the installer's real code path is observable
+# without platform/privilege dependencies:
+#   1. FILESYSTEM — every absolute destination in the manifest (unit,
+#      config, binary) is rewritten to point into a tempdir under the
+#      stage, AND the prod unit's --config flag is rewritten to the same
+#      remapped config.destination so install.sh's
+#      [unit_config == CONFIG_DST] guard (install.sh:129-138) accepts the
+#      stage. Without the unit rewrite the staged unit still reads the
+#      original /etc/x0x/config.toml and install.sh exits on the
+#      disagreement before reaching systemctl (Watson correction 3).
+#   2. `id` — install.sh's root guard (install.sh:145) reads `id -u`; a
+#      fake `id` returning 0 lets the guard pass on every host without
+#      sudo. The guard itself is still exercised.
+#   3. `systemctl` — install.sh's only contact with the running system is
+#      `daemon-reload` + `enable` (install.sh:165, 168). A stateful fake
+#      `systemctl` on PATH logs every invocation AND its stdout/stderr
+#      (which install.sh's `> /dev/null 2>&1` discards) to a call log,
+#      and returns per-arm-configured exit codes. The stateful behaviour
+#      (counter in a sidecar file) lets ARM 3 exercise the second-call
+#      "already enabled" branch on a re-install — without that, ARM 3
+#      would be a structural duplicate of ARM 2 (Watson correction 4).
+#
+# These arms are NOT the macOS control. The macOS control is the BSD
+# `stat -f '%Lp'` fallback in `_read_mode` (line 616); the 22-arm
+# authority receipt is the platform-bound evidence. These installer
+# arms are platform-independent BY CONSTRUCTION (the only host-specific
+# binary install.sh calls is systemctl, and the fake replaces it
+# deterministically), but they are not a macOS control (Watson
+# correction 2).
+#
+# The 0644 file-mode requirement is preserved: install.sh writes the
+# config and the unit with `install -m 0644` (install.sh:159, 163). The
+# success arms assert the destination files exist with mode 0644 — if
+# either is written with a different mode the arm fails, so the
+# requirement is preserved not relaxed.
+run_installer_test() {
+    local tmp installer_pass=0 installer_failed=0
+    tmp="$(mktemp -d)"
+
+    # rewrite_stage STAGE PREFIX: rewrite every absolute destination in
+    # authority-inventory.json so it sits under PREFIX, AND rewrite the
+    # prod unit's --config flag to the same remapped destination so
+    # install.sh's [unit_config == CONFIG_DST] guard (install.sh:129-138)
+    # accepts the stage. The unit rewrite uses _rewrite (BSD+GNU-safe
+    # in-place sed that preserves the unit's mode); the staged binary's
+    # argv0 is left under the host's /opt because install.sh only writes
+    # it when --binary is passed, which the arms do not pass.
+    rewrite_stage() {
+        local stage="$1" prefix="$2"
+        python3 - "$stage/authority-inventory.json" "$prefix" <<PYEOF
+import sys, json
+path, prefix = sys.argv[1], sys.argv[2]
+m = json.load(open(path))
+for inst in m["instances"]:
+    for k in ("unit", "config", "binary"):
+        if "destination" in inst.get(k, {}):
+            inst[k]["destination"] = prefix + inst[k]["destination"]
+json.dump(m, open(path, "w"), indent=2)
+PYEOF
+        local target="${prefix}/etc/x0x/config.toml"
+        ( cd "$stage" && _rewrite systemd/x0xd.service "s|--config /etc/x0x/config.toml|--config ${target}|" ) || return 1
+    }
+
+    # installer_stage NAME BEHAVIOR: set up a fresh stage with a deployment
+    # copy, fake root, and fake bin (id + stateful systemctl). BEHAVIOR is
+    # one of {fail, ok, already}. The fake systemctl logs every invocation
+    # AND its stdout/stderr (which install.sh's `> /dev/null 2>&1` discards)
+    # to a call log, and returns per-arm-configured exit codes. The state
+    # file persists across runs against the same stage, so the "already"
+    # arm's second install flips the state and the fake's distinct
+    # already-enabled branch fires.
+    installer_stage() {
+        local name="$1" behavior="$2"
+        local stage="$tmp/installer-$name" fakeroot="$tmp/installer-$name/root"
+        local fakebin="$tmp/installer-$name/bin" calllog="$tmp/installer-$name/svc.log"
+        local statefile="$tmp/installer-$name/svc.state"
+        rm -rf "$stage" || return 1
+        mkdir -p "$stage" "$fakeroot" "$fakebin" || return 1
+        cp -r "$DEPLOYMENT_DIR" "$stage/deploy" || return 1
+        rewrite_stage "$stage/deploy" "$fakeroot" || return 1
+        # Fake id: always root. install.sh:145 reads `id -u`; the bare form
+        # (no args) is included so a defensive `id` call also passes.
+        cat > "$fakebin/id" <<'EOSH'
+#!/usr/bin/env bash
+[ "$1" = "-u" ] && { echo 0; exit 0; }
+echo "uid=0(root) gid=0(root) groups=0(root)"
+EOSH
+        # Fake systemctl: stateful (counter file) so the "already" arm's
+        # second enable call logs the distinct "already exists" branch.
+        cat > "$fakebin/systemctl" <<EOSH
+#!/usr/bin/env bash
+LOG="$calllog"
+STATE="$statefile"
+printf '%s\n' "systemctl \$*" >> "\$LOG"
+case "\$1" in
+  daemon-reload) exit 0 ;;
+  enable)
+    n=0
+    [ -f "\$STATE" ] && n="\$(cat "\$STATE" 2>/dev/null || echo 0)"
+    n=\$((n + 1))
+    printf '%s' "\$n" > "\$STATE"
+    case "$behavior" in
+      fail)
+        msg="Failed to enable x0xd.service: Access denied"
+        echo "\$msg" >&2
+        printf '%s\n' "\$msg" >> "\$LOG"
+        exit 1
+        ;;
+      ok|already)
+        if [ "\$n" -eq 1 ]; then
+          msg="Created symlink /etc/systemd/system/multi-user.target.wants/x0xd.service."
+        else
+          msg="alias /etc/systemd/system/x0xd.service already exists in the systemd enablement."
+        fi
+        echo "\$msg" >&2
+        printf '%s\n' "\$msg" >> "\$LOG"
+        exit 0
+        ;;
+    esac
+    ;;
+  is-enabled)
+    # install.sh does not probe is-enabled (enables unconditionally per the
+    # source); return 0 defensively for parity.
+    exit 0
+    ;;
+  *) exit 0 ;;
+esac
+EOSH
+        chmod +x "$fakebin/id" "$fakebin/systemctl" || return 1
+        printf '%s\n' "$stage"
+    }
+
+    # run_installer STAGE: invoke install.sh with fakes on PATH and a clean
+    # environment (env -i). stdout = "rc=N\n<body>" so callers can split
+    # the rc from the body. The fake PATH is prepended so id and systemctl
+    # resolve to the fakes first; host PATH after the fakes keeps python3
+    # (manifest reader) and the standard install/mkdir/basename reachable.
+    run_installer() {
+        local stage="$1" out rc
+        if out="$(env -i HOME="$HOME" PATH="$stage/bin:$PATH" \
+                   bash "$stage/deploy/install.sh" 2>&1)"; then
+            rc=0
+        else
+            rc=$?
+        fi
+        printf 'rc=%s\n%s\n' "$rc" "$out"
+    }
+
+    # get_mode_octal FILE: portable via Python (already a manifest-reader
+    # dependency). os.stat mode includes file-type bits; slicing the last
+    # 3 octal digits yields the permission.
+    get_mode_octal() {
+        python3 -c 'import os,sys; print(oct(os.stat(sys.argv[1]).st_mode)[-3:])' "$1"
+    }
+
+    # --- Assertion functions (named bash functions, not strings) ----------
+    # Each receives rc/out/calllog/fakeroot and returns 0 on pass, 1 on
+    # fail and emits an arm-specific "[installer-test] FAIL:" line. The
+    # common-path checks (call log shows daemon-reload + enable) are
+    # inlined per arm so each arm's failure message is arm-specific.
+
+    _assert_enable_failure() {
+        local rc="$1" out="$2" calllog="$3" fakeroot="$4"
+        if [ "$rc" -ne 1 ]; then
+            echo "[installer-test] FAIL: install-enable-failure — install.sh exit=$rc, expected 1; output:" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if ! grep -q "ERROR: systemctl enable" <<<"$out"; then
+            echo "[installer-test] FAIL: install-enable-failure — install.sh did not emit the documented error" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if grep -q "\[install\] done" <<<"$out"; then
+            echo "[installer-test] FAIL: install-enable-failure — install.sh printed done after enable failure" >&2
+            return 1
+        fi
+        if ! grep -q "systemctl daemon-reload" "$calllog" 2>/dev/null; then
+            echo "[installer-test] FAIL: install-enable-failure — fake was never called with daemon-reload; call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        if ! grep -q "systemctl enable x0xd" "$calllog" 2>/dev/null; then
+            echo "[installer-test] FAIL: install-enable-failure — fake was never called with enable x0xd; call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        local unit_dst="$fakeroot/etc/systemd/system/x0xd.service"
+        local cfg_dst="$fakeroot/etc/x0x/config.toml"
+        if [ ! -f "$unit_dst" ]; then
+            echo "[installer-test] FAIL: install-enable-failure — unit not written to $unit_dst (must precede enable)" >&2
+            return 1
+        fi
+        if [ ! -f "$cfg_dst" ]; then
+            echo "[installer-test] FAIL: install-enable-failure — config not written to $cfg_dst (must precede enable)" >&2
+            return 1
+        fi
+        return 0
+    }
+
+    _assert_enable_success() {
+        local rc="$1" out="$2" calllog="$3" fakeroot="$4"
+        if [ "$rc" -ne 0 ]; then
+            echo "[installer-test] FAIL: install-enable-success — install.sh exit=$rc, expected 0; output:" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if ! grep -q "\[install\] done" <<<"$out"; then
+            echo "[installer-test] FAIL: install-enable-success — install.sh did not print [install] done" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if grep -q "ERROR" <<<"$out"; then
+            echo "[installer-test] FAIL: install-enable-success — install.sh emitted an ERROR" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if ! grep -q "systemctl daemon-reload" "$calllog" 2>/dev/null; then
+            echo "[installer-test] FAIL: install-enable-success — fake was never called with daemon-reload; call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        if ! grep -q "systemctl enable x0xd" "$calllog" 2>/dev/null; then
+            echo "[installer-test] FAIL: install-enable-success — fake was never called with enable x0xd; call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        local unit_dst="$fakeroot/etc/systemd/system/x0xd.service"
+        local cfg_dst="$fakeroot/etc/x0x/config.toml"
+        if [ ! -f "$unit_dst" ]; then
+            echo "[installer-test] FAIL: install-enable-success — unit not written to $unit_dst" >&2
+            return 1
+        fi
+        if [ ! -f "$cfg_dst" ]; then
+            echo "[installer-test] FAIL: install-enable-success — config not written to $cfg_dst" >&2
+            return 1
+        fi
+        local unit_mode; unit_mode="$(get_mode_octal "$unit_dst")"
+        local cfg_mode; cfg_mode="$(get_mode_octal "$cfg_dst")"
+        if [ "$unit_mode" != "644" ]; then
+            echo "[installer-test] FAIL: install-enable-success — unit mode is $unit_mode, expected 644" >&2
+            return 1
+        fi
+        if [ "$cfg_mode" != "644" ]; then
+            echo "[installer-test] FAIL: install-enable-success — config mode is $cfg_mode, expected 644" >&2
+            return 1
+        fi
+        return 0
+    }
+
+    _assert_already_enabled_success() {
+        local rc="$1" out="$2" calllog="$3" fakeroot="$4"
+        if [ "$rc" -ne 0 ]; then
+            echo "[installer-test] FAIL: install-already-enabled-success — second install.sh exit=$rc, expected 0; output:" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if ! grep -q "\[install\] done" <<<"$out"; then
+            echo "[installer-test] FAIL: install-already-enabled-success — second install.sh did not print [install] done" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        if grep -q "ERROR" <<<"$out"; then
+            echo "[installer-test] FAIL: install-already-enabled-success — second install.sh emitted an ERROR" >&2
+            printf '%s\n' "$out" >&2
+            return 1
+        fi
+        # Two enable calls — the stateful fake's distinct already-enabled
+        # branch fires on the second call, NOT a structural duplicate of
+        # the single-call enable-success arm. A missing second call means
+        # the first install never reached enable and the arm is a no-op.
+        local enable_calls
+        enable_calls="$(grep -c "systemctl enable " "$calllog" 2>/dev/null || echo 0)"
+        if [ "${enable_calls:-0}" -lt 2 ]; then
+            echo "[installer-test] FAIL: install-already-enabled-success — expected ≥2 enable calls (stateful), got ${enable_calls:-0}; call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        if ! grep -q "already exists" "$calllog"; then
+            echo "[installer-test] FAIL: install-already-enabled-success — fake's distinct already-enabled branch not taken (no 'already exists' in log); call log:" >&2
+            cat "$calllog" >&2 || true
+            return 1
+        fi
+        local unit_dst="$fakeroot/etc/systemd/system/x0xd.service"
+        local cfg_dst="$fakeroot/etc/x0x/config.toml"
+        if [ ! -f "$unit_dst" ] || [ ! -f "$cfg_dst" ]; then
+            echo "[installer-test] FAIL: install-already-enabled-success — unit or config missing after second install" >&2
+            return 1
+        fi
+        local unit_mode; unit_mode="$(get_mode_octal "$unit_dst")"
+        local cfg_mode; cfg_mode="$(get_mode_octal "$cfg_dst")"
+        if [ "$unit_mode" != "644" ] || [ "$cfg_mode" != "644" ]; then
+            echo "[installer-test] FAIL: install-already-enabled-success — mode regression: unit=$unit_mode cfg=$cfg_mode (expected 644/644)" >&2
+            return 1
+        fi
+        return 0
+    }
+
+    # --- ARM dispatch ------------------------------------------------------
+
+    arm_enable_failure() {
+        local stage calllog fakeroot result rc out
+        stage="$(installer_stage install-enable-failure fail)" || return 1
+        calllog="$stage/svc.log"
+        fakeroot="$stage/root"
+        result="$(run_installer "$stage")"
+        rc="${result%%$'\n'*}"; rc="${rc#rc=}"
+        out="${result#*$'\n'}"
+        _assert_enable_failure "$rc" "$out" "$calllog" "$fakeroot"
+    }
+
+    arm_enable_success() {
+        local stage calllog fakeroot result rc out
+        stage="$(installer_stage install-enable-success ok)" || return 1
+        calllog="$stage/svc.log"
+        fakeroot="$stage/root"
+        result="$(run_installer "$stage")"
+        rc="${result%%$'\n'*}"; rc="${rc#rc=}"
+        out="${result#*$'\n'}"
+        _assert_enable_success "$rc" "$out" "$calllog" "$fakeroot"
+    }
+
+    arm_already_enabled_success() {
+        local stage calllog fakeroot r1 r2 rc1 rc2 out1 out2
+        stage="$(installer_stage install-already-enabled-success already)" || return 1
+        calllog="$stage/svc.log"
+        fakeroot="$stage/root"
+        r1="$(run_installer "$stage")"
+        rc1="${r1%%$'\n'*}"; rc1="${rc1#rc=}"
+        out1="${r1#*$'\n'}"
+        if [ "$rc1" -ne 0 ]; then
+            echo "[installer-test] FAIL: install-already-enabled-success — first install.sh exit=$rc1, expected 0; output:" >&2
+            printf '%s\n' "$out1" >&2
+            return 1
+        fi
+        r2="$(run_installer "$stage")"
+        rc2="${r2%%$'\n'*}"; rc2="${rc2#rc=}"
+        out2="${r2#*$'\n'}"
+        _assert_already_enabled_success "$rc2" "$out2" "$calllog" "$fakeroot"
+    }
+
+    if arm_enable_failure; then
+        echo "[installer-test] ok: install-enable-failure — install.sh exits 1 with the documented error; unit+config written before enable ✓"
+        installer_pass=$((installer_pass + 1))
+    else
+        installer_failed=$((installer_failed + 1))
+    fi
+
+    if arm_enable_success; then
+        echo "[installer-test] ok: install-enable-success — full path through daemon-reload + enable; unit+config mode 0644 ✓"
+        installer_pass=$((installer_pass + 1))
+    else
+        installer_failed=$((installer_failed + 1))
+    fi
+
+    if arm_already_enabled_success; then
+        echo "[installer-test] ok: install-already-enabled-success — stateful fake's already-enabled branch taken on second install; unit+config mode 0644 ✓"
+        installer_pass=$((installer_pass + 1))
+    else
+        installer_failed=$((installer_failed + 1))
+    fi
+
+    rm -rf "$tmp"
+    echo "[installer-test] installer: $installer_pass fired, $installer_failed failed to fire"
+    [ "$installer_failed" -eq 0 ]
+}
+
 if [ "$MODE" = "self-test" ]; then
-    run_self_test
-    exit $?
+    # dispatch_rc (not rc) because `expect_fail` previously leaked `rc` to the
+    # script scope; the leak is now fixed at its source (`local rc` in
+    # expect_fail), but the dispatcher still uses a distinct name so a future
+    # re-introduction of a global `rc` writer cannot regress the script exit.
+    dispatch_rc=0
+    run_self_test || dispatch_rc=$?
+    run_installer_test || dispatch_rc=$?
+    exit "$dispatch_rc"
 else
     run_check
     exit $?
