@@ -2251,14 +2251,17 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                     && *is_pending
                     && !predecessor_receipt_exists
                 {
-                    // Pubsub-first partial state: the metadata
-                    // topic delivered JoinRequestCreated before
-                    // this direct envelope offer. The pubsub path
-                    // stored the byte-identical predecessor digest
-                    // but did not persist the first-seen clock. The
-                    // direct delivery carries the exact envelope;
-                    // admit by backfilling only the clock, not by
-                    // treating the request as inconsistent.
+                    // Compatibility path for intermediate-build
+                    // state: the durable request carries the
+                    // byte-identical predecessor digest but no
+                    // first-seen clock. The live apply path writes
+                    // digest and clock together —
+                    // observed_predecessor_at_ms defaults to now
+                    // whenever an envelope is present — so this
+                    // state survives only in rosters persisted by
+                    // intermediate development/testnet builds, not
+                    // from a transport race. Backfill only the
+                    // clock.
                     AdmissionState::PubsubFirst
                 } else {
                     AdmissionState::Inconsistent
@@ -2413,12 +2416,12 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 is_new_request = false;
             }
             AdmissionState::PubsubFirst => {
-                // The request was applied by the pubsub listener,
-                // which stored the byte-identical predecessor
-                // digest but did not persist the first-seen clock.
-                // This direct delivery carries the exact envelope;
-                // backfill only the clock, then create the
-                // obligation.
+                // Compatibility path: the durable request has the
+                // byte-identical predecessor digest from an
+                // intermediate-build roster but no first-seen
+                // clock. The live apply path always writes both
+                // together, so this is migration-only. Backfill
+                // only the clock, then create the obligation.
                 admission_first_seen_ms = existing_admission
                     .as_ref()
                     .map_or(now_ms, |marker| marker.first_seen_ms);
@@ -2449,7 +2452,8 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                     }
                 }
                 // Backfill only the first-seen clock — the digest
-                // is already byte-identical from the pubsub path.
+                // is already byte-identical from the
+                // intermediate-build roster.
                 // Hold the roster persistence lock across mutation
                 // + save so a concurrent writer cannot snapshot
                 // the pre-backfill state.
