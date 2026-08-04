@@ -1,6 +1,6 @@
 # ADR 0027: Active-Recipient Group-Key Sealing
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-30
 - **Decision owners:** David Irvine
 - **Reviewers:** Sam (author); Dario; Watson. Watson made Kimi's reserved

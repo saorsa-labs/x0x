@@ -7,6 +7,7 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::sync::Mutex as StdMutex;
 use std::time::{Duration, Instant};
@@ -25,9 +26,9 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
 use super::routes::{
-    ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingJoinResult,
-    PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive, RestSubscription,
-    WelcomeFetchWaiter,
+    ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingCausalApproval,
+    PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
+    PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -636,6 +637,10 @@ pub(super) struct AppState {
     /// Serializes snapshot-and-write of `named_groups.json` so an older
     /// snapshot cannot rename over a newer recovered KeyPackage.
     pub(super) named_groups_persistence_lock: Mutex<()>,
+    /// Set when a roster rename is visible but its parent-directory fsync did
+    /// not complete. Metadata applies must re-save the exact visible roster to
+    /// `Durable` before consulting it for another state transition.
+    pub(super) named_groups_requires_durability_confirmation: AtomicBool,
     /// Background metadata listeners for named groups (one per group id).
     pub(super) group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
     /// Cached group cards discovered via gossip or imported from peers.
@@ -686,6 +691,46 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
+    /// arrived before their matching `JoinRequestCreated` predecessor. The
+    /// approval is retained without mutating group state and drained after
+    /// each accepted state advance or restart restoration.
+    pub(super) causal_approval_queue: RwLock<HashMap<String, VecDeque<PendingCausalApproval>>>,
+    /// ADR 0028: per-group relay outbox for requester-signed predecessor
+    /// envelopes. The authority persists the exact V2 bytes and relays them
+    /// to active witnesses on a bounded retry schedule.
+    pub(super) predecessor_relay_outbox: RwLock<HashMap<String, Vec<PredecessorRelayObligation>>>,
+    /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
+    /// Prevents re-admission of a conflicting entry after restart.
+    /// Finding 4: entries carry timestamps for deterministic oldest-first.
+    pub(super) causal_conflict_tombstones:
+        RwLock<HashMap<String, Vec<crate::server::routes::named_groups::ConflictTombstoneEntry>>>,
+    /// ADR 0028 B6: completed relay obligation tombstones, keyed by group_id.
+    /// Pruned from the live retry outbox after all targets delivered; retained
+    /// for the B8 approval precondition check.
+    pub(super) completed_relay_tombstones:
+        RwLock<HashMap<String, Vec<crate::server::routes::named_groups::CompletedRelayTombstone>>>,
+    /// ADR 0028: disk location for the durable causal approval queue sidecar.
+    pub(super) causal_approval_queue_path: PathBuf,
+    /// ADR 0028: disk location for the durable predecessor relay outbox.
+    pub(super) predecessor_relay_outbox_path: PathBuf,
+    /// Serializes snapshot-and-write of the causal approval queue sidecar so
+    /// an older snapshot cannot rename over a newer conflict tombstone.
+    pub(super) causal_approval_queue_persistence_lock: Mutex<()>,
+    /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
+    /// so an older snapshot cannot rename over a newer completed receipt.
+    pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
+    /// ADR 0028 B5: write-ahead journal for the cross-file B8 operation
+    /// (outbox refresh + roster save). Set before the outbox refresh save;
+    /// cleared after both saves succeed. On restart, a pending entry triggers
+    /// compensation (restore outbox if roster lacks the approval).
+    pub(super) pending_b8_compensation:
+        Mutex<Option<crate::server::routes::named_groups::PendingB8Compensation>>,
+    /// Watson item 5: in-memory pending listener admission journal.
+    /// Mirrors the durable sidecar field. Cleared after both request apply
+    /// and obligation save complete.
+    pub(super) pending_listener_admission:
+        Mutex<Option<crate::server::routes::named_groups::PendingListenerAdmission>>,
     /// Bounded per-group log of locally authored/applied TreeKEM membership
     /// events used to satisfy explicit catch-up requests.
     pub(super) treekem_event_log: RwLock<HashMap<String, VecDeque<NamedGroupMetadataEvent>>>,

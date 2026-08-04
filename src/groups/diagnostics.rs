@@ -53,6 +53,37 @@ pub struct GroupCounters {
     /// Number of `MemberJoined` events rejected because the invite secret was
     /// not issued by this local inviter.
     pub member_joined_events_rejected_invite_secret_unknown: u64,
+    // ── ADR 0028 causal predecessor delivery counters ──
+    /// Predecessor envelopes relayed to active witnesses.
+    pub causal_relayed: u64,
+    /// Drain retries attempted.
+    pub causal_retried: u64,
+    /// Approvals admitted to the causal queue.
+    pub causal_queued: u64,
+    /// Exact duplicate digests coalesced.
+    pub causal_deduplicated: u64,
+    /// Queued approvals successfully applied during drain.
+    pub causal_applied: u64,
+    /// Queue entries expired before their predecessor arrived.
+    pub causal_expired: u64,
+    /// Entries rejected for failing admission checks.
+    pub causal_invalid: u64,
+    /// Non-identical conflicts detected (same group/request/requester/revision).
+    pub causal_conflicted: u64,
+    /// Entries rejected due to count or byte caps.
+    pub causal_capacity_rejected: u64,
+}
+
+/// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
+/// route handler from live queue/outbox state and passed to `snapshot`.
+#[derive(Debug, Clone, Default)]
+pub struct CausalGauges {
+    /// Current causal approval queue depth.
+    pub queue_entries: usize,
+    /// Current causal approval queue serialized bytes.
+    pub queue_bytes: usize,
+    /// Current predecessor relay outbox obligations.
+    pub relay_obligations: usize,
 }
 
 /// Public snapshot of all known groups, returned by `GET /diagnostics/groups`.
@@ -79,6 +110,13 @@ pub struct GroupDiagnostic {
     /// Inline counter projection.
     #[serde(flatten)]
     pub counters: GroupCounters,
+    // ── ADR 0028 causal predecessor delivery gauges ──
+    /// Current causal approval queue depth for this group.
+    pub causal_queue_entries: usize,
+    /// Current causal approval queue serialized bytes for this group.
+    pub causal_queue_bytes: usize,
+    /// Current predecessor relay outbox obligations for this group.
+    pub causal_relay_obligations: usize,
 }
 
 /// Process-wide diagnostics table, owned by `AppState`.
@@ -181,6 +219,71 @@ impl GroupsDiagnostics {
         });
     }
 
+    // ── ADR 0028 causal predecessor delivery counter methods ──
+
+    /// Record a predecessor envelope relayed to active witnesses.
+    pub fn record_causal_relayed(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_relayed = c.causal_relayed.saturating_add(1);
+        });
+    }
+
+    /// Record a drain retry attempt.
+    pub fn record_causal_retried(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_retried = c.causal_retried.saturating_add(1);
+        });
+    }
+
+    /// Record an approval admitted to the causal queue.
+    pub fn record_causal_queued(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_queued = c.causal_queued.saturating_add(1);
+        });
+    }
+
+    /// Record a coalesced exact-duplicate digest.
+    pub fn record_causal_deduplicated(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_deduplicated = c.causal_deduplicated.saturating_add(1);
+        });
+    }
+
+    /// Record a queued approval successfully applied during drain.
+    pub fn record_causal_applied(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_applied = c.causal_applied.saturating_add(1);
+        });
+    }
+
+    /// Record a queue entry that expired.
+    pub fn record_causal_expired(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_expired = c.causal_expired.saturating_add(1);
+        });
+    }
+
+    /// Record an entry rejected for failing admission checks.
+    pub fn record_causal_invalid(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_invalid = c.causal_invalid.saturating_add(1);
+        });
+    }
+
+    /// Record a non-identical conflict detected.
+    pub fn record_causal_conflicted(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_conflicted = c.causal_conflicted.saturating_add(1);
+        });
+    }
+
+    /// Record an entry rejected due to count or byte caps.
+    pub fn record_causal_capacity_rejected(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.causal_capacity_rejected = c.causal_capacity_rejected.saturating_add(1);
+        });
+    }
+
     /// Build a snapshot for `GET /diagnostics/groups`. Joins the live
     /// per-group counters with the caller-supplied `members_v2` and
     /// subscription views (the daemon already holds those locks higher up
@@ -191,6 +294,7 @@ impl GroupsDiagnostics {
         groups: &HashMap<String, GroupInfo>,
         metadata_subscribed: &HashSet<String>,
         public_subscribed: &HashSet<String>,
+        causal_gauges: &HashMap<String, CausalGauges>,
     ) -> GroupsDiagnosticsSnapshot {
         let counters_guard = match self.inner.lock() {
             Ok(g) => g,
@@ -223,6 +327,19 @@ impl GroupsDiagnostics {
             dst.member_joined_events_rejected_invite_secret_unknown = dst
                 .member_joined_events_rejected_invite_secret_unknown
                 .saturating_add(src.member_joined_events_rejected_invite_secret_unknown);
+            dst.causal_relayed = dst.causal_relayed.saturating_add(src.causal_relayed);
+            dst.causal_retried = dst.causal_retried.saturating_add(src.causal_retried);
+            dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);
+            dst.causal_deduplicated = dst
+                .causal_deduplicated
+                .saturating_add(src.causal_deduplicated);
+            dst.causal_applied = dst.causal_applied.saturating_add(src.causal_applied);
+            dst.causal_expired = dst.causal_expired.saturating_add(src.causal_expired);
+            dst.causal_invalid = dst.causal_invalid.saturating_add(src.causal_invalid);
+            dst.causal_conflicted = dst.causal_conflicted.saturating_add(src.causal_conflicted);
+            dst.causal_capacity_rejected = dst
+                .causal_capacity_rejected
+                .saturating_add(src.causal_capacity_rejected);
             dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (None, Some(b)) => Some(b),
@@ -256,6 +373,21 @@ impl GroupsDiagnostics {
                     subscribed_public: public_subscribed.contains(&stable_id)
                         || public_subscribed.contains(key),
                     counters: GroupCounters::default(),
+                    causal_queue_entries: causal_gauges
+                        .get(key)
+                        .or_else(|| causal_gauges.get(&stable_id))
+                        .map(|g| g.queue_entries)
+                        .unwrap_or(0),
+                    causal_queue_bytes: causal_gauges
+                        .get(key)
+                        .or_else(|| causal_gauges.get(&stable_id))
+                        .map(|g| g.queue_bytes)
+                        .unwrap_or(0),
+                    causal_relay_obligations: causal_gauges
+                        .get(key)
+                        .or_else(|| causal_gauges.get(&stable_id))
+                        .map(|g| g.relay_obligations)
+                        .unwrap_or(0),
                 });
         }
 
@@ -269,6 +401,9 @@ impl GroupsDiagnostics {
                     subscribed_metadata: metadata_subscribed.contains(key),
                     subscribed_public: public_subscribed.contains(key),
                     counters: GroupCounters::default(),
+                    causal_queue_entries: 0,
+                    causal_queue_bytes: 0,
+                    causal_relay_obligations: 0,
                 });
             merge_counters(&mut row.counters, counters);
         }
@@ -314,7 +449,7 @@ mod tests {
         let mut pub_set = HashSet::new();
         pub_set.insert("g1".to_string());
 
-        let snap = diag.snapshot(&groups, &meta, &pub_set);
+        let snap = diag.snapshot(&groups, &meta, &pub_set, &HashMap::new());
         assert_eq!(snap.groups.len(), 2);
         let g1 = snap.groups.iter().find(|g| g.group_id == "g1").unwrap();
         assert_eq!(g1.counters.messages_received, 2);
@@ -342,7 +477,7 @@ mod tests {
         let diag = GroupsDiagnostics::new();
         diag.record_other_drop("ghost");
         let groups: HashMap<String, GroupInfo> = HashMap::new();
-        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new());
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
         assert_eq!(snap.groups.len(), 1);
         assert_eq!(snap.groups[0].group_id, "ghost");
         assert_eq!(snap.groups[0].members_v2_size, 0);

@@ -63,14 +63,24 @@ impl DaemonFixture {
             .expect("home dir")
             .join(format!(".x0x-{name}"));
 
-        let process = Command::new(&binary)
+        let mut process_cmd = Command::new(&binary);
+        process_cmd
             .arg("--config")
             .arg(&config_path)
             .arg("--skip-update-check")
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("Failed to start x0xd");
+            .stderr(Stdio::null());
+        // `Command` inherits the parent environment by default, so `RUST_LOG`
+        // and `X0X_LOG_DIR` set in the test parent's env reach the daemon
+        // without explicit forwarding. The single non-redundant behavior
+        // here is the `X0X_TEST_LOG_DIR` alias: when set, map it to the
+        // daemon's actual log-dir env var so test scripts don't need to
+        // know the daemon's variable name. When neither is set, the
+        // daemon behaves exactly as before.
+        if let Some(v) = std::env::var_os("X0X_TEST_LOG_DIR") {
+            process_cmd.env("X0X_LOG_DIR", v);
+        }
+        let process = process_cmd.spawn().expect("Failed to start x0xd");
 
         let mut fixture = Self {
             process,

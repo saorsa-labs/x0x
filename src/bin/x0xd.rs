@@ -507,7 +507,18 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read config file: {path}"))?;
-    toml::from_str(&content).with_context(|| format!("failed to parse config file: {path}"))
+    let config: DaemonConfig =
+        toml::from_str(&content).with_context(|| format!("failed to parse config file: {path}"))?;
+    // Warn loudly — but do not reject (0.35.1 cleanup ruling) — about a
+    // top-level key an operator placed under a sub-section, where serde
+    // silently drops it (e.g. `data_dir` under `[history]`, which owns
+    // `db_path`, not `data_dir`). Rejection could brick a drifted live config
+    // on upgrade; it is deferred to a later minor with notice.
+    if let Ok(root) = toml::from_str::<toml::Table>(&content) {
+        let findings = x0x::server::config::diagnose_section_placement(&root);
+        x0x::server::config::warn_section_misplacements(&findings);
+    }
+    Ok(config)
 }
 
 /// Initialize structured logging.

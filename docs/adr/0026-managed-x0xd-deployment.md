@@ -1,6 +1,6 @@
 # ADR 0026: Managed x0xd Deployment Has Distinct Roots and Closed Resolution
 
-- **Status:** Proposed
+- **Status:** Accepted
 - **Date:** 2026-07-30
 - **Decision owners:** David Irvine
 - **Reviewers:** Sam; Dario; Watson. Watson made Kimi's reserved rulings under

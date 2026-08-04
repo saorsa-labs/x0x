@@ -5,7 +5,7 @@
 
 use reqwest::StatusCode;
 use serde_json::Value;
-use std::{sync::OnceLock, time::Duration};
+use std::{future::Future, sync::OnceLock, time::Duration};
 
 #[path = "harness/src/cluster.rs"]
 mod cluster;
@@ -49,6 +49,112 @@ where
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+/// Bounded approval retry uses the two exact transient B8 precondition bodies
+/// observed while a signed predecessor offer is crossing between daemons.
+/// Any other status or body is a hard failure; a permanently missing
+/// obligation cannot be mistaken for a successful approval.
+const D4_APPROVAL_RETRY_TIMEOUT: Duration = Duration::from_secs(30);
+const D4_APPROVAL_RETRY_MAX_ATTEMPTS: u32 = 200;
+const D4_RETRY_NO_CLOCK: &str = "predecessor obligation has no durable first-observation time";
+const D4_RETRY_NOT_RECEIVED: &str =
+    "predecessor obligation not found — JoinRequestCreated not yet received";
+
+#[derive(Debug, Clone, PartialEq)]
+struct ApprovalReply {
+    status: StatusCode,
+    body: Value,
+}
+
+fn is_allowlisted_transient_412(reply: &ApprovalReply) -> bool {
+    reply.status == StatusCode::PRECONDITION_FAILED
+        && reply.body["ok"] == false
+        && matches!(
+            reply.body["error"].as_str(),
+            Some(value) if value == D4_RETRY_NO_CLOCK || value == D4_RETRY_NOT_RECEIVED
+        )
+}
+
+async fn retry_bounded_approval<F, Fut>(
+    timeout: Duration,
+    max_attempts: u32,
+    expected_revision: Option<u64>,
+    mut attempt: F,
+) -> ApprovalReply
+where
+    F: FnMut() -> Fut,
+    Fut: Future<Output = ApprovalReply>,
+{
+    let started = tokio::time::Instant::now();
+    let deadline = started + timeout;
+    let mut attempts = 0;
+    loop {
+        attempts += 1;
+        let reply = attempt().await;
+        if reply.status == StatusCode::OK {
+            assert_eq!(
+                reply.body["ok"], true,
+                "MALFORMED_APPROVAL_BODY: approve body must declare ok=true, got: {:?}",
+                reply.body
+            );
+            let revision = reply.body["revision"].as_u64().unwrap_or_else(|| {
+                panic!(
+                    "MALFORMED_APPROVAL_BODY: approve body must carry revision:u64, got: {:?}",
+                    reply.body
+                )
+            });
+            if let Some(expected_revision) = expected_revision {
+                assert_eq!(
+                    revision, expected_revision,
+                    "approve body revision must equal expected_revision={expected_revision}: {:?}",
+                    reply.body
+                );
+            }
+            return reply;
+        }
+        assert!(
+            is_allowlisted_transient_412(&reply),
+            "UNEXPECTED_APPROVAL_RESPONSE: approve returned non-allowlisted status/body on attempt {attempts}: {:?}",
+            reply
+        );
+        if tokio::time::Instant::now() >= deadline {
+            let elapsed = tokio::time::Instant::now().saturating_duration_since(started);
+            panic!(
+                "DEADLINE_EXPIRED: bounded approval retry deadline elapsed after {elapsed:?} ({attempts} attempts); last response: {:?}",
+                reply
+            );
+        }
+        if attempts >= max_attempts {
+            panic!(
+                "MAX_ATTEMPTS_EXHAUSTED: bounded approval retry exhausted attempt cap {max_attempts} after {attempts} attempts; last response: {:?}",
+                reply
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Extract the panic message from a `tokio::spawn`'d task whose `JoinHandle`
+/// resolved to an error, and assert that the message carries the supplied tag.
+/// `retry_bounded_approval` distinguishes its two terminal branches by emitting
+/// a stable substring at the start of the panic message, so controls can prove
+/// which branch fired (and a single mutation cannot turn one green control
+/// into another green control).
+fn assert_join_panic_tagged(joined: Result<(), tokio::task::JoinError>, tag: &str) {
+    let err = joined.expect_err("spawned retry task must panic");
+    let payload = err.into_panic();
+    let msg = if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else if let Some(s) = payload.downcast_ref::<&'static str>() {
+        (*s).to_string()
+    } else {
+        panic!("retry task panic payload must be String or &'static str");
+    };
+    assert!(
+        msg.contains(tag),
+        "retry task panic must carry {tag:?} evidence; got: {msg}"
+    );
 }
 
 async fn create_group_with_body(d: &AgentInstance, body: Value) -> String {
@@ -282,6 +388,204 @@ async fn wait_request_status(
     );
 }
 
+async fn assert_retry_rejects(reply: ApprovalReply, tag: &str) {
+    let joined = tokio::spawn(async move {
+        retry_bounded_approval(Duration::from_secs(1), 1, Some(1), move || {
+            let reply = reply.clone();
+            async move { reply }
+        })
+        .await;
+    })
+    .await;
+    assert_join_panic_tagged(joined, tag);
+}
+
+#[tokio::test]
+async fn d4_retry_allows_missing_clock_412_then_consumes_200() {
+    let mut calls = 0;
+    let reply = retry_bounded_approval(Duration::from_secs(1), 3, Some(7), || {
+        calls += 1;
+        let reply = if calls == 1 {
+            ApprovalReply {
+                status: StatusCode::PRECONDITION_FAILED,
+                body: serde_json::json!({ "ok": false, "error": D4_RETRY_NO_CLOCK }),
+            }
+        } else {
+            ApprovalReply {
+                status: StatusCode::OK,
+                body: serde_json::json!({ "ok": true, "revision": 7 }),
+            }
+        };
+        async move { reply }
+    })
+    .await;
+    assert_eq!(calls, 2);
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn d4_retry_allows_missing_obligation_412_then_consumes_200() {
+    let mut calls = 0;
+    let reply = retry_bounded_approval(Duration::from_secs(1), 3, Some(9), || {
+        calls += 1;
+        let reply = if calls == 1 {
+            ApprovalReply {
+                status: StatusCode::PRECONDITION_FAILED,
+                body: serde_json::json!({ "ok": false, "error": D4_RETRY_NOT_RECEIVED }),
+            }
+        } else {
+            ApprovalReply {
+                status: StatusCode::OK,
+                body: serde_json::json!({ "ok": true, "revision": 9 }),
+            }
+        };
+        async move { reply }
+    })
+    .await;
+    assert_eq!(calls, 2);
+    assert_eq!(reply.status, StatusCode::OK);
+}
+
+#[tokio::test]
+async fn d4_retry_rejects_unexpected_status_and_body() {
+    // 404 — wrong HTTP status.
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::NOT_FOUND,
+            body: serde_json::json!({ "ok": false, "error": "request not found" }),
+        },
+        "UNEXPECTED_APPROVAL_RESPONSE",
+    )
+    .await;
+    // 412 with a non-allowlisted error string.
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::PRECONDITION_FAILED,
+            body: serde_json::json!({ "ok": false, "error": "predecessor obligation expired before approval authorization" }),
+        },
+        "UNEXPECTED_APPROVAL_RESPONSE",
+    )
+    .await;
+    // 412 with an allowlisted error string but ok:true (not false).
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::PRECONDITION_FAILED,
+            body: serde_json::json!({ "ok": true, "error": D4_RETRY_NOT_RECEIVED }),
+        },
+        "UNEXPECTED_APPROVAL_RESPONSE",
+    )
+    .await;
+    // 500 with an allowlisted error string — isolates the status conjunct.
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            body: serde_json::json!({ "ok": false, "error": D4_RETRY_NOT_RECEIVED }),
+        },
+        "UNEXPECTED_APPROVAL_RESPONSE",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn d4_retry_rejects_malformed_success_body() {
+    // ok:false with a revision — the ok==true predicate must reject this.
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::OK,
+            body: serde_json::json!({ "ok": false, "revision": 1 }),
+        },
+        "MALFORMED_APPROVAL_BODY",
+    )
+    .await;
+    // ok:true but no revision — the revision predicate must reject this.
+    assert_retry_rejects(
+        ApprovalReply {
+            status: StatusCode::OK,
+            body: serde_json::json!({ "ok": true }),
+        },
+        "MALFORMED_APPROVAL_BODY",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn d4_retry_permanently_missing_obligation_expires_bound() {
+    let joined = tokio::spawn(async {
+        retry_bounded_approval(Duration::from_secs(1), 1, Some(1), move || async {
+            ApprovalReply {
+                status: StatusCode::PRECONDITION_FAILED,
+                body: serde_json::json!({ "ok": false, "error": D4_RETRY_NOT_RECEIVED }),
+            }
+        })
+        .await;
+    })
+    .await;
+    assert_join_panic_tagged(joined, "MAX_ATTEMPTS_EXHAUSTED");
+}
+
+#[tokio::test]
+async fn d4_retry_deadline_zero_expires_before_attempt_cap() {
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter_clone = counter.clone();
+    let joined = tokio::spawn(async move {
+        retry_bounded_approval(Duration::ZERO, 2, Some(1), move || {
+            counter_clone.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            async move {
+                ApprovalReply {
+                    status: StatusCode::PRECONDITION_FAILED,
+                    body: serde_json::json!({ "ok": false, "error": D4_RETRY_NOT_RECEIVED }),
+                }
+            }
+        })
+        .await;
+    })
+    .await;
+    assert_join_panic_tagged(joined, "DEADLINE_EXPIRED");
+    assert_eq!(
+        counter.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "deadline predicate must fire after one attempt, not the attempt cap"
+    );
+}
+
+/// Expected outcome for the body-scoped `POST /groups/:id/requests/:rid/approve`
+/// call. The D4 row consumes the genuine 200 (the body must declare
+/// `ok: true` and carry a numeric `revision`). Transient B8 races are retried
+/// only for the two exact allowlisted 412 bodies; every other response is fatal.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ApproveExpectation {
+    Ok,
+}
+
+/// Body-scoped D4 approval with a bounded retry for the two transient B8
+/// precondition responses. The bound is authoritative: an obligation that
+/// never arrives fails rather than being converted into a false green.
+async fn body_scoped_approve(
+    admin: &AgentInstance,
+    group_id: &str,
+    request_id: &str,
+    expectation: ApproveExpectation,
+) -> (StatusCode, Value) {
+    let ApproveExpectation::Ok = expectation;
+    let reply = retry_bounded_approval(
+        D4_APPROVAL_RETRY_TIMEOUT,
+        D4_APPROVAL_RETRY_MAX_ATTEMPTS,
+        None,
+        || async {
+            let resp = authed_client(admin)
+                .post(admin.url(&format!("/groups/{group_id}/requests/{request_id}/approve")))
+                .send()
+                .await
+                .expect("approve request");
+            let status = resp.status();
+            let body: Value = resp.json().await.expect("approve body must be JSON");
+            ApprovalReply { status, body }
+        },
+    )
+    .await;
+    (reply.status, reply.body)
+}
+
 fn member_state(members: &Value, agent_id: &str) -> Option<String> {
     members["members"].as_array().and_then(|arr| {
         arr.iter()
@@ -502,14 +806,22 @@ async fn d4_join_request_events_converge_via_signed_commits_once() {
     let (_pending_hash, pending_rev) =
         wait_state_match_keys(alice, &alice_group_id, bob, &bob_group_id).await;
 
-    let approve = authed_client(alice)
-        .post(alice.url(&format!(
-            "/groups/{alice_group_id}/requests/{req3_id}/approve"
-        )))
-        .send()
-        .await
-        .expect("approve request3");
-    assert_eq!(approve.status(), StatusCode::OK);
+    // Body-scoped approval: the body must declare `ok: true` and carry a
+    // numeric `revision`. The previous D4 row
+    // asserted only the status code, so an empty `{ok: true}` body without
+    // a revision was treated as a pass. The body-scoped helper consumes
+    // a genuine 200 — the helper's own shape assertions fail loudly if the
+    // handler ever drops the `revision` field.
+    let (_approve_status, approve_body) =
+        body_scoped_approve(alice, &alice_group_id, &req3_id, ApproveExpectation::Ok).await;
+    assert_eq!(
+        approve_body["ok"], true,
+        "approve body must declare ok=true: {approve_body:?}"
+    );
+    assert!(
+        approve_body["revision"].is_number(),
+        "approve body must carry a numeric revision: {approve_body:?}"
+    );
     let (approved_hash, approved_rev) =
         wait_state_match_keys(alice, &alice_group_id, bob, &bob_group_id).await;
     assert!(

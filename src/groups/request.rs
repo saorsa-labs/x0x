@@ -43,6 +43,18 @@ pub struct JoinRequest {
     #[serde(default)]
     pub reviewed_by: Option<String>,
     pub status: JoinRequestStatus,
+    /// ADR 0028: blake3 digest of the predecessor relay envelope that
+    /// created this request. Stored at apply time so the relay listener's
+    /// repair path can verify an exact replay matches the durable
+    /// transition, not just request-ID presence.
+    #[serde(default)]
+    pub predecessor_envelope_digest: Option<[u8; 32]>,
+    /// ADR 0028: local first-observation time for the authenticated
+    /// predecessor envelope. This is persisted with the request so exact
+    /// duplicate deliveries cannot recreate an expired relay obligation with
+    /// a fresh retention window.
+    #[serde(default)]
+    pub predecessor_first_seen_ms: Option<u64>,
 }
 
 impl JoinRequest {
@@ -66,6 +78,8 @@ impl JoinRequest {
             reviewed_at: None,
             reviewed_by: None,
             status: JoinRequestStatus::Pending,
+            predecessor_envelope_digest: None,
+            predecessor_first_seen_ms: None,
         }
     }
 

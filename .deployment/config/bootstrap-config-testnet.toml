@@ -1,0 +1,40 @@
+# Tracked configuration source for the x0x testnet instance (x0xd-testnet).
+#
+# Distinct from the production config by port (ADR 0026 Decision 1): QUIC/gossip
+# on 6483 and the local REST API on 127.0.0.1:13600, so the testnet never clashes
+# with the production listener (5483 / 12600) when both run on the same host.
+#
+# `data_dir` is intentionally left at its default: the unit runs with
+# `--name testnet`, which derives an instance-scoped effective data root of
+# $XDG_DATA_HOME/x0x-testnet, keeping the testnet root distinct from production
+# without a second, hand-maintained data_dir algorithm (design chapter §2).
+
+bind_address = "0.0.0.0:6483"
+api_address = "127.0.0.1:13600"
+log_level = "info"
+bootstrap_peers = [
+    "142.93.199.50:6483",
+    "147.182.234.192:6483",
+    "65.21.157.229:6483",
+    "116.203.101.172:6483",
+    "152.42.210.67:6483",
+    "170.64.176.102:6483",
+    "[2604:a880:400:d1:0:3:7db3:f001]:6483",
+    "[2604:a880:4:1d0:0:1:6ba1:f000]:6483",
+    "[2a01:4f9:c012:684b::1]:6483",
+    "[2a01:4f8:1c1a:31e6::1]:6483",
+    "[2400:6180:0:d2:0:2:d30b:d000]:6483",
+    "[2400:6180:10:200::ba69:b000]:6483",
+]
+
+[update]
+enabled = true
+stop_on_upgrade = true
+gossip_updates = true
+fallback_check_interval_minutes = 360
+rollout_window_minutes = 60
+
+# Gossip overlay tunables. See docs/adr/0009-recv-pump-overload-policy.md for
+# the recv-pump overload + parallel-dispatch policy.
+[gossip]
+dispatch_workers = 1
