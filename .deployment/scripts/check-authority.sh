@@ -781,7 +781,7 @@ run_self_test() {
         expect_fail C8c-before-C9-failfast       mut_C8c_first  C8-unit-syntax
         c8c_arm="verified"
     else
-        echo "[self-test] skip: C8-unit-syntax-error + C8c-before-C9-failfast — systemd-analyze absent on this host (CI runner proves them red)" >&2
+        echo "[self-test] skip: C8-unit-syntax-error + C8c-before-C9-failfast — systemd-analyze absent on this host (CI runner proves them red; total 22 authority arms = 20 fired + 2 disclosed platform-bound skips on this host)"
         c8c_arm="skipped(no systemd-analyze)"
     fi
     expect_fail C9-unit-argv0-moved        mut_C9a  C9-bin-argv0
@@ -828,7 +828,12 @@ run_self_test() {
     }
 
     rm -rf "$tmp"
-    echo "[self-test] authority: $pass fired, $failed failed; C8c arm=$c8c_arm"
+    # Authority total: 22 arms (20 always-run + 2 platform-bound on Linux only:
+    # C8-unit-syntax-error and C8c-before-C9-failfast, both need systemd-analyze).
+    # On macOS where systemd-analyze is absent, the 2 are skipped and a
+    # platform-bound disclosure is printed on the SAME stream as the receipt
+    # (per ADR 0025 :59) so a stdout-captured receipt cross-foots.
+    echo "[self-test] authority: $pass fired, $failed failed (of 22 total: 20 always-run + 2 platform-bound = C8-unit-syntax-error, C8c-before-C9-failfast, the latter two skipped here because systemd-analyze is absent on this host; CI runner with systemd-analyze proves them red); C8c arm=$c8c_arm"
     echo "[self-test] attribution: single-site={C2-disagree, C2-no-config, C5-dup-root, C5-dup-config, C7-missing-artifact, C7-entrypoint-selector, C7-unreachable, C7-resolve-disagree, C8-shell-syntax, C8-config-syntax, C8-unit-path, C8-unit-syntax, C9-bin-argv0}; shared={C1-authority, C3-missing, C4-orphan, C6-source}; manifest={C8-manifest-noncanonical}; shadowed={C7-resolve-failed ← C6 (both run --resolve, C6 first)}"
     [ "$failed" -eq 0 ]
 }
@@ -1140,7 +1145,119 @@ EOSH
         return 0
     }
 
-    # --- ARM dispatch ------------------------------------------------------
+    # --- Red-proof mutators (Dario correction: each green arm must have a
+    #     fault-injection mutator that proves the assertion is load-bearing).
+    # Each mutator is paired with the green arm that should red under the
+    # fault, via `expect_installer_fails`. A red-proof arm passes when the
+    # green assertion returns 1 (reds) after the mutator is applied. If the
+    # green assertion still returns 0, the mutator did not break the
+    # property the arm governs and the arm is no-op — the red-proof fails.
+
+    # MUT-INSTALL-ENABLE-GUARD: drop the install.sh enable guard so the
+    # installer proceeds past a failed systemctl enable. The block at
+    # install.sh:167-171 (if ! systemctl enable ... ; then echo ERROR; exit 1;
+    # fi) is rendered inert: the echo ERROR is kept, but exit 1 is replaced
+    # with `:` so the installer exits 0 even when enable fails. The
+    # install-enable-failure arm asserts rc=1 + "ERROR: systemctl enable";
+    # with the guard removed, rc=0 and the arm reds. install-enable-success
+    # and install-already-enabled-success run with the ok-fake so enable
+    # never fails for them — the guard never trips and those arms stay green.
+    # Sole-catcher for install-enable-failure.
+    mut_install_enable_guard() {
+        # Replace ONLY the `exit 1` that follows the enable-guard's ERROR
+        # echo. Sed multi-line address: read the line after the ERROR echo
+        # (N) and substitute `exit 1` on the joined text.
+        _rewrite install.sh '/echo "\[install\] ERROR: systemctl enable/ { N; s|exit 1|: # mutated - enable guard swallowed|; }'
+    }
+
+    # MUT-INSTALL-UNIT-MODE: change the unit's `install -m 0644` to
+    # `install -m 0755`. The mode-0644 requirement on the destination unit
+    # is the load-bearing property for install-enable-success (and is
+    # also asserted by install-already-enabled-success). With the unit
+    # written at 0755, both success-mode arms red. install-enable-failure
+    # does not check the unit's mode, so it stays green. Documentation:
+    # the shared-mode-checked property binds arm 2 with arm 3 — the
+    # receipt discloses this as a documented multi-arm red (Dario's
+    # correction noted arm 2 lacks a unique sole-catcher; the mode check
+    # is the shared property and the disclosure is the honest shape).
+    mut_install_unit_mode() {
+        _rewrite install.sh 's|install -m 0644 "\$UNIT_SRC_PATH"|install -m 0755 "$UNIT_SRC_PATH"|'
+    }
+
+    # MUT-INSTALL-NO-ALREADY-ENABLED: replace the staged fake's
+    # second-call log message with a benign string so the stateful fake's
+    # distinct already-enabled branch never logs its own message. The
+    # exit-code logic is preserved (the FAIL fake still returns 1, the
+    # ALREADY fake still returns 0), so this mutator is sole-catching for
+    # install-already-enabled-success: arm 1's fail-fake does not contain
+    # the 'already exists' string so the sed pattern is a no-op there;
+    # arm 2's ok-fake does not contain the string either, so the mutator
+    # is a no-op there; only arm 3's already-fake has the substitution
+    # applied and the fake's distinct branch is suppressed.
+    mut_install_fake_not_stateful() {
+        # Rewrite the staged fake's 'already exists' message to a benign
+        # marker. The fake's behavior (return code and state-counter) is
+        # preserved — only the logged msg changes.
+        _rewrite ../bin/systemctl 's|already exists in the systemd enablement\.|never-marked-mutated-marker-keep-state-counter-valid.|'
+    }
+
+    # expect_installer_fails NAME FN ARM: run mutator FN in arm ARM's stage
+    # and re-execute the green assertion. The green assertion returning 1
+    # means the mutator made the targeted property red — the red-proof
+    # passes. If the assertion returns 0, the mutator did not break the
+    # property the arm governs and the red-proof fails (the green arm is
+    # no-op for that property).
+    expect_installer_fails() {
+        local name="$1" fn="$2" arm="$3"
+        local stage d behavior
+        case "$arm" in
+            install-enable-failure)           behavior=fail ;;
+            install-enable-success)           behavior=ok ;;
+            install-already-enabled-success)  behavior=already ;;
+            *) echo "[installer-test] FAIL: $name — unknown arm '$arm'" >&2
+               installer_failed=$((installer_failed + 1)); return ;;
+        esac
+        stage="$(installer_stage "$name" "$behavior")" || { installer_failed=$((installer_failed + 1)); return; }
+        d="$stage/deploy"
+        if ! ( cd "$d" && "$fn" ); then
+            echo "[installer-test] FAIL: $name — mutator failed (no-op _rewrite); arm not exercised" >&2
+            installer_failed=$((installer_failed + 1))
+            return
+        fi
+        local calllog="$stage/svc.log" fakeroot="$stage/root"
+        if [ "$behavior" = "already" ]; then
+            local r1 rc1
+            r1="$(run_installer "$stage")"
+            rc1="${r1%%$'\n'*}"; rc1="${rc1#rc=}"
+            if [ "$rc1" -ne 0 ]; then
+                echo "[installer-test] FAIL: $name — first install.sh exit=$rc1 (mutator broke the wrong thing)" >&2
+                installer_failed=$((installer_failed + 1))
+                return
+            fi
+        fi
+        local r rc arm_rc
+        r="$(run_installer "$stage")"
+        rc="${r%%$'\n'*}"; rc="${rc#rc=}"
+        out="${r#*$'\n'}"
+        case "$arm" in
+            install-enable-failure)
+                _assert_enable_failure "$rc" "$out" "$calllog" "$fakeroot"; arm_rc=$? ;;
+            install-enable-success)
+                _assert_enable_success "$rc" "$out" "$calllog" "$fakeroot"; arm_rc=$? ;;
+            install-already-enabled-success)
+                _assert_already_enabled_success "$rc" "$out" "$calllog" "$fakeroot"; arm_rc=$? ;;
+        esac
+        if [ "$arm_rc" -eq 0 ]; then
+            echo "[installer-test] FAIL: $name — mutator did NOT make $arm red (the arm is no-op)" >&2
+            installer_failed=$((installer_failed + 1))
+        else
+            echo "[installer-test] ok: $name — $arm reddened by mutator (load-bearing assertion) ✓"
+            installer_pass=$((installer_pass + 1))
+        fi
+    }
+
+    # --- Green arm dispatch ------------------------------------------------
+
 
     arm_enable_failure() {
         local stage calllog fakeroot result rc out
@@ -1204,8 +1321,29 @@ EOSH
         installer_failed=$((installer_failed + 1))
     fi
 
+    # --- Red-proof dispatch (Dario correction: each green arm must be
+    #     backed by a fault-injection mutator that proves the assertion
+    #     is load-bearing; 8 were run for the Rust rows and item 5 of
+    #     Watson's approved scope requires the same for these).
+    local green_count=3 red_proof_count=3
+    expect_installer_fails install-enable-failure-mut-enable-guard        mut_install_enable_guard         install-enable-failure
+    expect_installer_fails install-enable-success-mut-unit-mode           mut_install_unit_mode             install-enable-success
+    expect_installer_fails install-already-enabled-success-mut-fake       mut_install_fake_not_stateful     install-already-enabled-success
+
+    # Receipt: 3 green arms + 3 red-proof arms = 6 total. Arm 1's
+    # mutator is sole-catching (only reds install-enable-failure).
+    # Arm 3's mutator is sole-catching (only reds install-already-
+    # enabled-success; the fake's exit code and state counter are
+    # preserved). Arm 2's mutator is a documented multi-arm red
+    # (reddens install-already-enabled-success too because both
+    # success arms assert mode 0644 on the destination unit — arm 2
+    # lacks a unique sole-catcher, the mode check is the shared
+    # property, and the disclosure is the honest shape per Dario's
+    # correction).
+
     rm -rf "$tmp"
-    echo "[installer-test] installer: $installer_pass fired, $installer_failed failed to fire"
+    echo "[installer-test] installer: $installer_pass fired, $installer_failed failed to fire (of $((green_count + red_proof_count)) total: $green_count green arms + $red_proof_count red-proof arms; arm 2's mutator is a documented multi-arm red shared with arm 3 — both success arms assert mode 0644 on the destination unit)"
+    echo "[installer-test] attribution: single-site={install-enable-failure (mutator: guard swallow), install-already-enabled-success (mutator: fake already-branch suppressed)}; shared-property-positive-control={install-enable-success (mutator: unit mode 0644 is shared with install-already-enabled-success — Dario's correction: arm 2 lacks a unique sole-catcher, the mode check is the shared property, the disclosure is the honest shape)}"
     [ "$installer_failed" -eq 0 ]
 }
 
