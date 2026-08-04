@@ -1803,14 +1803,14 @@ async fn assert_classification_preconditions(
 /// tombstone) are asserted before the handler call, not just arranged.
 ///
 /// Mutation evidence (MUT-NEW-APPLY): remove the
-/// `apply_named_group_metadata_event_inner_serialized` call in the New
-/// arm (mod.rs:2489) → New classifies correctly but the JoinRequestCreated
-/// is never durably stored, so the "request now exists" assertion fails.
-/// MUT-NEW-OBLIGATION: drop the obligation push at :2637 → no obligation
-/// is created and the test fails. MUT-NEW-CLOCK: change
-/// `admission_first_seen_ms` at :2496 to `now_ms.wrapping_add(1)` — the
-/// stored request clock diverges from the obligation clock, failing the
-/// "exact same clock" assertion.
+/// `apply_named_group_metadata_event_inner_serialized` call in the New arm
+/// (src/server/mod.rs:2492-2503) → New classifies correctly but the
+/// JoinRequestCreated is never durably stored, so the "request now exists"
+/// assertion fails. MUT-NEW-OBLIGATION: drop the obligation push at
+/// src/server/mod.rs:2637 → no obligation is created and the test fails.
+/// MUT-NEW-CLOCK: change `admission_first_seen_ms` at src/server/mod.rs:2337-2339
+/// to `now_ms.wrapping_add(1)` — the stored request clock diverges from the
+/// obligation clock, failing the "exact same clock" assertion.
 #[tokio::test]
 async fn pr291_new_direct_relay_journals_applies_creates_obligation() {
     let (state, _dir) = s_state().await;
@@ -1925,26 +1925,23 @@ async fn pr291_new_direct_relay_journals_applies_creates_obligation() {
     );
 }
 
-/// Watson v4: live Repair. The gossip has already durably stored the
-/// pending request with the exact envelope digest and a still-live
-/// original first-observation clock. The marker is None (Dario's third
-/// precondition) and no obligation or completion tombstone matches. The
+/// Watson v4: live Repair. A pre-existing durable pending request carries the
+/// exact envelope digest and a still-live original first-observation clock.
 /// exact direct relay must select Repair, leave the request clock
 /// unchanged, create the obligation with that same clock, and permit B8
 /// approval.
 ///
 /// Mutation evidence (MUT-REPAIR-CLOCK): change
-/// `admission_first_seen_ms = stored_first_seen_ms` (mod.rs:2371) to
+/// `admission_first_seen_ms = stored_first_seen_ms` (src/server/mod.rs:2371) to
 /// `= now_ms` → the Repair arm refreshes the obligation clock instead of
-/// preserving the gossip-stored clock, and the "stored clock equals
-/// gossip-stored clock" exact-match assertion reddens. (Forcing
-/// `first_seen_is_live = true` at the classifier is inert for this row —
-/// the live clock already satisfies the predicate — and produces the same
+/// preserving the persisted clock, and the exact-match assertion reddens.
+/// (Forcing `first_seen_is_live = true` at the classifier is inert for this
+/// row — the live clock already satisfies the predicate, and produces the same
 /// RED as MUT-REFRESH.) MUT-REPAIR-OBLIGATION drops the obligation push at
-/// :2641. MUT-REPAIR-APPLY: force `is_new_request = true` in the Repair
-/// arm → the apply runs on a request that already exists, returns
-/// ACCEPTED_REJECTED (mod.rs:6821-6822), the handler breaks out with the
-/// marker left set, and the obligation is not created.
+/// `src/server/mod.rs:2641`. MUT-REPAIR-APPLY: force `is_new_request = true`
+/// in the Repair arm → the apply runs on an existing request, returns
+/// ACCEPTED_REJECTED (src/server/routes/named_groups.rs:6821-6822), the
+/// handler breaks out with the marker left set, and no obligation is created.
 #[tokio::test]
 async fn pr291_live_repair_direct_relay_creates_obligation_without_apply() {
     let (state, _dir) = s_state().await;
@@ -1966,7 +1963,7 @@ async fn pr291_live_repair_direct_relay_creates_obligation_without_apply() {
         stored_clock,
     );
 
-    // Install the gossip-stored pending request with the exact digest
+    // Install the pre-existing durable pending request with the exact digest
     // and a still-live original first-seen clock.
     {
         let mut groups = state.named_groups.write().await;
@@ -2012,11 +2009,11 @@ async fn pr291_live_repair_direct_relay_creates_obligation_without_apply() {
         .get(&gk)
         .and_then(|info| info.join_requests.get(&entry.request_id))
         .cloned()
-        .expect("Repair must preserve the gossip-stored request");
+        .expect("Repair must preserve the pre-existing durable request");
     assert_eq!(
         stored.predecessor_first_seen_ms,
         Some(stored_clock),
-        "Repair must not refresh the gossip-stored clock"
+        "Repair must not refresh the persisted clock"
     );
     assert_eq!(
         stored.predecessor_envelope_digest,
@@ -2051,19 +2048,20 @@ async fn pr291_live_repair_direct_relay_creates_obligation_without_apply() {
     );
 }
 
-/// Watson v4: PubsubFirst. The gossip has already durably stored the
-/// pending request with the byte-identical predecessor digest but no
-/// first-seen clock (pubsub-first partial state). The marker is None
-/// (Dario's third precondition) and no obligation or completion tombstone
-/// matches. The exact direct relay must backfill the clock at :2467,
-/// create the obligation at :2540, and permit B8 approval.
+/// Watson v4: PubsubFirst. A pre-existing durable pending request carries the
+/// byte-identical predecessor digest but no first-seen clock (the
+/// intermediate-build compatibility state). The marker is None (Dario's third
+/// precondition) and no obligation or completion tombstone matches. The exact
+/// direct relay must backfill the clock at `src/server/mod.rs:2471`, create
+/// the obligation at `src/server/mod.rs:2544-2556`, and permit B8 approval.
 ///
 /// Mutation evidence (MUT-PUBSUB-BACKFILL): remove the clock backfill at
-/// :2467 → the stored request stays at `predecessor_first_seen_ms = None`,
-/// and the "stored clock equals obligation clock" assertion fails. The
-/// `created_at == 0` independence check guards the request-preservation
-/// invariant: if the classifier is forced to New, the apply path runs,
-/// sees an existing request (mod.rs:6821-6822), returns rejected, and the
+/// `src/server/mod.rs:2471` → the stored request stays at
+/// `predecessor_first_seen_ms = None`, and the stored-clock/obligation-clock
+/// assertion fails. The `created_at == 0` independence check guards the
+/// request-preservation invariant: if the classifier is forced to New, the
+/// apply path runs, sees an existing request
+/// (src/server/routes/named_groups.rs:6821-6822), returns rejected, and the
 /// handler breaks out without creating the obligation.
 #[tokio::test]
 async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation() {
@@ -2084,8 +2082,8 @@ async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation(
         0, // first_seen_ms is resolved to now_ms inside the handler
     );
 
-    // Install the gossip-stored pending request with the byte-identical
-    // predecessor digest but no first-seen clock (pubsub-first state).
+    // Install the pre-existing durable pending request with the byte-identical
+    // predecessor digest but no first-seen clock (intermediate-build state).
     {
         let mut groups = state.named_groups.write().await;
         let info = groups.get_mut(&gk).expect("group");
@@ -2137,7 +2135,7 @@ async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation(
         .get(&gk)
         .and_then(|info| info.join_requests.get(&entry.request_id))
         .cloned()
-        .expect("PubsubFirst must preserve the gossip-stored request");
+        .expect("PubsubFirst must preserve the pre-existing durable request");
     assert_eq!(
         stored.predecessor_envelope_digest,
         Some(entry.digest),
@@ -2158,7 +2156,7 @@ async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation(
     // predecessor_event timestamp.
     assert_eq!(
         stored.created_at, 0,
-        "PubsubFirst must preserve the gossip-stored request (not apply a new one)"
+        "PubsubFirst must preserve the pre-existing durable request (not apply a new one)"
     );
 
     // The obligation carries the exact same clock.
@@ -2184,5 +2182,389 @@ async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation(
         approve_status(&state, &gk, &entry.request_id).await,
         StatusCode::OK,
         "PubsubFirst arm must permit B8 approval with 200"
+    );
+}
+
+/// PubsubFirst arm driven through a real load cycle, not an in-memory
+/// fixture. The intermediate-build roster shape
+/// (`predecessor_envelope_digest = Some(digest)`,
+/// `predecessor_first_seen_ms = None`) is written to disk via
+/// `save_named_groups_checked`, then re-read via `load_named_groups` so
+/// the in-memory state is behaviourally equivalent to what an intermediate-build
+/// daemon would surface at startup. The handler then classifies
+/// re-offer as PubsubFirst and backfills the clock from `now_ms` —
+/// the exact branch PR #291 documents for the migration path.
+///
+/// This is the disk-persisted counterpart to
+/// `pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation`,
+/// which only mutates the in-memory map. A passing green here proves
+/// `predecessor_first_seen_ms = None` survives the round-trip through
+/// `serde_json` (the `Option<u64>` is preserved, not coerced to
+/// `Some(0)`), and that the handler still selects PubsubFirst (not
+/// New) when the durable state was loaded from disk.
+///
+/// MUT-DISK-LOAD-DIGEST: replace `predecessor_envelope_digest: Some(digest)`
+/// with `None` on load (mutate the loaded map, then offer). The PubsubFirst
+/// arm requires the byte-identical predecessor digest match; without it
+/// the handler falls into the `New` arm and backfill is skipped. The missing
+/// digest assertion is the sole catcher under this mutation.
+#[tokio::test]
+async fn pr291_loaded_intermediate_build_pubsub_first_classifies_on_reload() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x3005u32);
+    install_group(&state, &gk, 2).await;
+    let topic = group_topic(&state, &gk).await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let lh = local_hex(&state);
+
+    let entry = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-pubsub-first-loaded",
+        &requester_hex,
+        0, // first_seen_ms is resolved to now_ms inside the handler
+    );
+
+    // persist and reload so the in-memory state is behaviourally equivalent to
+    // what an intermediate-build daemon would surface at startup.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&gk).expect("group");
+        info.join_requests.insert(
+            entry.request_id.clone(),
+            join_request_with(
+                &entry,
+                &gk,
+                &requester_hex,
+                None,
+                x0x::groups::JoinRequestStatus::Pending,
+            ),
+        );
+        info.recompute_state_hash();
+    }
+    let save_outcome = save_roster(&state).await.expect("save_roster");
+    assert_eq!(
+        save_outcome,
+        AtomicWriteOutcome::Durable,
+        "intermediate-build roster must persist durably before reload"
+    );
+    reload_roster(&state).await;
+
+    // The loaded state must preserve `predecessor_first_seen_ms = None`
+    // and the byte-identical `predecessor_envelope_digest = Some(digest)`.
+    // (An Option<u64> serde round-trip is the load-bearing property the
+    // PubsubFirst arm depends on.)
+    {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&gk).expect("group");
+        let stored = info
+            .join_requests
+            .get(&entry.request_id)
+            .expect("loaded request");
+        assert_eq!(
+            stored.predecessor_envelope_digest,
+            Some(entry.digest),
+            "intermediate-build round-trip must preserve predecessor digest"
+        );
+        assert_eq!(
+            stored.predecessor_first_seen_ms, None,
+            "intermediate-build round-trip must preserve None clock"
+        );
+    }
+
+    // Marker is None and no obligation/tombstone matches this tuple —
+    // same jointly-selecting preconditions as the in-memory row.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "precondition: pending_listener_admission must be None after reload"
+    );
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        0,
+        "precondition: no obligation after reload"
+    );
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "precondition: no completion tombstone after reload"
+    );
+
+    // Drive the offer through the handler against the loaded state.
+    let now_before = unix_ms();
+    offer_via_handler(&state, &lh, &entry, &requester_kp, now_before).await;
+    let now_after = unix_ms();
+
+    // PubsubFirst arm: marker cleared, clock backfilled from now_ms,
+    // obligation created with the same clock.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "PubsubFirst arm cleared the marker on success (loaded state)"
+    );
+
+    let stored = state
+        .named_groups
+        .read()
+        .await
+        .get(&gk)
+        .and_then(|info| info.join_requests.get(&entry.request_id))
+        .cloned()
+        .expect("PubsubFirst must preserve the pre-existing durable request (loaded)");
+    assert_eq!(
+        stored.predecessor_envelope_digest,
+        Some(entry.digest),
+        "loaded PubsubFirst: stored request has exact predecessor digest"
+    );
+    let backfilled_clock = stored
+        .predecessor_first_seen_ms
+        .expect("PubsubFirst must backfill the clock (loaded)");
+    assert!(
+        backfilled_clock >= now_before && backfilled_clock <= now_after,
+        "loaded PubsubFirst: backfilled clock ({backfilled_clock}) must resolve to now_ms (window {now_before}..={now_after})"
+    );
+    assert!(
+        stored.is_pending(),
+        "loaded PubsubFirst: stored request must be Pending"
+    );
+
+    // The obligation carries the exact same clock.
+    assert_obligation_exists(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+        backfilled_clock,
+    )
+    .await;
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "no completion tombstone for loaded PubsubFirst arm"
+    );
+
+    // B8 outcome: the loaded PubsubFirst arm's obligation must be
+    // consumable by the real `approve_join_request` handler with HTTP 200.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK,
+        "loaded PubsubFirst arm must permit B8 approval with 200"
+    );
+}
+
+/// Live Repair arm driven through the real metadata apply path, not an
+/// in-memory `join_requests.insert`. The JoinRequestCreated is applied
+/// through `apply_named_group_metadata_event` (the same path a witness
+/// daemon uses when a metadata event arrives via pubsub), the roster
+/// is persisted and reloaded, and only then is the predecessor-relay
+/// re-offer driven through the handler. The handler must select
+/// Repair — the durable request is byte-identical to the envelope
+/// and the original first-seen clock is still live.
+///
+/// This is the "real metadata-first" counterpart to
+/// `pr291_live_repair_direct_relay_creates_obligation_without_apply`,
+/// which hand-rolls the durable state via `info.join_requests.insert`.
+/// The new row proves the durable state populated by the production
+/// apply path (with a real signed commit, prev_state_hash chain, and
+/// roster hash) is correctly recognised by the Repair arm after a
+/// restart. The existing row's hand-rolled fixture could pass with
+/// the apply arm broken; this one cannot.
+///
+/// `src/server/routes/named_groups.rs:6842` leaves the field as `None` after
+/// apply. After reload, the handler's `request_matches` predicate fails on the
+/// digest equality check and the request falls into the `New` arm (or
+/// `Inconsistent` if other preconditions fail). The Repair-clock assertion
+/// reddens under this mutation.
+#[tokio::test]
+async fn pr291_metadata_first_repair_re_offers_after_real_apply() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x3006u32);
+    // The apply arm requires `RequestAccess` admission
+    // (src/server/routes/named_groups.rs:6805) and the event must carry a
+    // valid commit (src/server/routes/named_groups.rs:6799), so the group uses
+    // the same `PublicRequestSecure` policy as the New row.
+    install_group_with_policy(
+        &state,
+        &gk,
+        2,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    let topic = group_topic(&state, &gk).await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let lh = local_hex(&state);
+    let now = unix_ms();
+    let original_clock = now - 1000; // well within 5-min retention → live
+
+    // Build a real requester-signed V2 envelope with a properly-signed
+    // GroupStateCommit so the apply's `verify_structure` and the
+    // `validate_apply` NonMemberRequest authority both pass.
+    let commit = {
+        let groups = state.named_groups.read().await;
+        let group = groups.get(&gk).expect("group");
+        signed_request_join_commit(group, &requester_kp)
+    };
+    let entry = build_relay_entry_with_commit(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-repair-metadata-first",
+        &requester_hex,
+        original_clock,
+        commit.clone(),
+    );
+
+    // Apply the JoinRequestCreated through the production metadata
+    // apply path — the same path a witness daemon uses when the
+    // event arrives via pubsub. This populates the durable state
+    // (`info.join_requests[request_id]`) with the byte-identical
+    // predecessor digest and a live first-seen clock, and persists
+    // the roster to disk.
+    let apply_outcome = apply_named_group_metadata_event(
+        &state,
+        NamedGroupMetadataEvent::JoinRequestCreated {
+            group_id: gk.clone(),
+            request_id: entry.request_id.clone(),
+            requester_agent_id: requester_hex.clone(),
+            message: None,
+            ts: original_clock,
+            requester_kem_public_key_b64: None,
+            treekem_key_package_b64: None,
+            commit: Some(commit.clone()),
+        },
+        requester_kp.agent_id(),
+        true,
+        Some(&entry.envelope),
+    )
+    .await;
+    assert!(
+        apply_outcome.accepted,
+        "metadata-first apply must accept the JoinRequestCreated"
+    );
+
+    // Persist + reload so the in-memory state is byte-faithful to
+    // what a witness daemon would surface after a restart.
+    let save_outcome = save_roster(&state).await.expect("save_roster");
+    assert_eq!(
+        save_outcome,
+        AtomicWriteOutcome::Durable,
+        "metadata-first roster must persist durably before reload"
+    );
+    reload_roster(&state).await;
+
+    // The loaded state must carry the exact predecessor digest and
+    // a live first-seen clock — the load-bearing Repair predicates.
+    // The production `apply_named_group_metadata_event` populates
+    // `predecessor_first_seen_ms` from `now_millis_u64()` (the public
+    // wrapper passes `predecessor_first_seen_ms: None` to the inner
+    // function, so the apply resolves the observed-clock via
+    // `None.unwrap_or_else(now_millis_u64)`), not from the event's
+    // `ts`. The clock is therefore a fresh live value — exactly the
+    // shape a witness daemon would surface after restart.
+    let apply_clock = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&gk).expect("group");
+        let stored = info
+            .join_requests
+            .get(&entry.request_id)
+            .expect("loaded apply-populated request");
+        assert_eq!(
+            stored.predecessor_envelope_digest,
+            Some(entry.digest),
+            "metadata-first apply must persist the byte-identical predecessor digest"
+        );
+        let clock = stored
+            .predecessor_first_seen_ms
+            .expect("metadata-first apply must populate predecessor_first_seen_ms");
+        assert!(
+            stored.is_pending(),
+            "metadata-first apply must leave the request Pending"
+        );
+        clock
+    };
+    // Live range: 5 min retention (CAUSAL_APPROVAL_RETENTION_MS).
+    assert!(
+        apply_clock + 5 * 60 * 1000 > unix_ms(),
+        "apply_clock ({apply_clock}) must be live (within 5-min retention of now {})",
+        unix_ms()
+    );
+
+    // Marker is None and no obligation/tombstone matches this tuple.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "precondition: pending_listener_admission must be None after apply+reload"
+    );
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        0,
+        "precondition: no obligation after apply+reload"
+    );
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "precondition: no completion tombstone after apply+reload"
+    );
+
+    // Drive the re-offer through the handler against the apply-populated
+    // durable state. The clock argument here is `unix_ms()` — distinct
+    // from `original_clock` — to prove the handler leaves the durable
+    // clock unchanged (Repair must not refresh it).
+    offer_via_handler(&state, &lh, &entry, &requester_kp, unix_ms()).await;
+
+    // Repair arm: marker cleared, original clock preserved, obligation
+    // created with the exact same clock.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "Repair arm cleared the marker on success (metadata-first apply)"
+    );
+    let stored = state
+        .named_groups
+        .read()
+        .await
+        .get(&gk)
+        .and_then(|info| info.join_requests.get(&entry.request_id))
+        .cloned()
+        .expect("Repair must preserve the apply-populated request");
+    assert_eq!(
+        stored.predecessor_envelope_digest,
+        Some(entry.digest),
+        "Repair: stored request has exact predecessor digest"
+    );
+    assert_eq!(
+        stored.predecessor_first_seen_ms,
+        Some(apply_clock),
+        "Repair: apply-populated clock must be preserved across the re-offer"
+    );
+    assert!(
+        stored.is_pending(),
+        "Repair: stored request must remain Pending"
+    );
+
+    // The obligation carries the apply-populated clock — distinct from
+    // both `original_clock` (the event's `ts`) and the re-offer's
+    // `unix_ms()` argument.
+    assert_obligation_exists(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+        apply_clock,
+    )
+    .await;
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "no completion tombstone for Repair arm"
+    );
+
+    // B8 outcome: the Repair arm's obligation must be consumable by
+    // the real `approve_join_request` handler with HTTP 200.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK,
+        "Repair arm must permit B8 approval with 200 (metadata-first apply)"
     );
 }
