@@ -63,6 +63,25 @@ fn local_hex(state: &AppState) -> String {
     hex::encode(state.agent.agent_id().as_bytes())
 }
 
+/// Drive the real `approve_join_request` handler and return the HTTP status.
+/// Mirrors `adr0028_direct_controls.rs:369-382` so each row binds the
+/// (group_key, request_id) of the obligation it creates (or, for the
+/// expired sibling, refuses to create) to a concrete B8 outcome rather
+/// than to obligation-existence prose.
+async fn approve_status(state: &Arc<AppState>, group_key: &str, request_id: &str) -> StatusCode {
+    let (status, _body) = response_json(
+        approve_join_request(
+            State(Arc::clone(state)),
+            Path((group_key.to_string(), request_id.to_string())),
+        )
+        .await
+        .into_response(),
+    )
+    .await
+    .expect("response");
+    status
+}
+
 /// Real requester-signed V2 pub/sub envelope (same construction as
 /// `pubsub::encode_v2` using only public ML-DSA-65 primitives).
 fn sign_v2_envelope(kp: &AgentKeypair, topic: &str, event: &NamedGroupMetadataEvent) -> Vec<u8> {
@@ -129,6 +148,39 @@ fn build_relay_entry(
     first_seen_ms: u64,
 ) -> RelayEntry {
     let event = predecessor_event(group_key, request_id, requester_hex, first_seen_ms);
+    let envelope = sign_v2_envelope(requester_kp, topic, &event);
+    let digest: [u8; 32] = blake3::hash(&envelope).into();
+    RelayEntry {
+        byte_size: envelope.len(),
+        envelope,
+        digest,
+        request_id: request_id.to_string(),
+    }
+}
+/// Same as `build_relay_entry` but with a `commit: Some(...)` on the
+/// `JoinRequestCreated` event. The apply path (mod.rs:6799) rejects events
+/// whose commit is `None`, so the handler-driven New row needs a commit to
+/// exercise the apply code path. The other restart-driven fixtures short-
+/// circuit before apply and keep `commit: None`.
+fn build_relay_entry_with_commit(
+    requester_kp: &AgentKeypair,
+    topic: &str,
+    group_key: &str,
+    request_id: &str,
+    requester_hex: &str,
+    first_seen_ms: u64,
+    commit: x0x::groups::GroupStateCommit,
+) -> RelayEntry {
+    let event = NamedGroupMetadataEvent::JoinRequestCreated {
+        group_id: group_key.to_string(),
+        request_id: request_id.to_string(),
+        requester_agent_id: requester_hex.to_string(),
+        message: None,
+        ts: first_seen_ms,
+        requester_kem_public_key_b64: None,
+        treekem_key_package_b64: None,
+        commit: Some(commit),
+    };
     let envelope = sign_v2_envelope(requester_kp, topic, &event);
     let digest: [u8; 32] = blake3::hash(&envelope).into();
     RelayEntry {
@@ -210,6 +262,72 @@ async fn install_group(state: &AppState, group_key: &str, witness_count: usize) 
         .write()
         .await
         .insert(group_key.to_string(), info);
+}
+
+/// Install a group with the local agent as authority + witness_count witnesses
+/// under the given policy preset. The default `install_group` uses
+/// `PrivateSecure` (InviteOnly), which the apply rejects for JoinRequestCreated
+/// (mod.rs:6805). The handler-driven New row exercises the apply path, so it
+/// installs a group with `PublicRequestSecure` admission.
+async fn install_group_with_policy(
+    state: &AppState,
+    group_key: &str,
+    witness_count: usize,
+    preset: x0x::groups::GroupPolicyPreset,
+) {
+    let admin_id = state.agent.agent_id();
+    let mut info = GroupInfo::with_policy(
+        "pr291-restart".to_string(),
+        String::new(),
+        admin_id,
+        group_key.to_string(),
+        preset.to_policy(),
+    );
+    let lh = local_hex(state);
+    for i in 1..=witness_count {
+        let whex = format!("{:064x}", 0x2000u64 + i as u64);
+        if whex != lh {
+            info.add_member(whex, x0x::groups::GroupRole::Member, Some(lh.clone()), None);
+        }
+    }
+    info.recompute_state_hash();
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_key.to_string(), info);
+}
+/// Build a properly-signed `GroupStateCommit` for a non-member
+/// `JoinRequestCreated` event. The commit's `prev_state_hash` and revision
+/// are taken from the group's current state; `state_hash` and the signature
+/// are computed by the production `sign` path so the apply's
+/// `verify_structure` (commit signature/state_hash) and `validate_apply`
+/// (prev_state_hash chain, revision monotonicity, signer authority) all pass
+/// against the pre-mutation group.
+fn signed_request_join_commit(
+    group: &x0x::groups::GroupInfo,
+    requester_kp: &AgentKeypair,
+) -> x0x::groups::GroupStateCommit {
+    let prev_state_hash = group.state_hash.clone();
+    let new_revision = group.state_revision + 1;
+    let roster_root = x0x::groups::state_commit::compute_roster_root(&group.members_v2);
+    let policy_hash = x0x::groups::state_commit::compute_policy_hash(&group.policy);
+    let public_meta_hash =
+        x0x::groups::state_commit::compute_public_meta_hash(&group.public_meta());
+    let security_binding = group.security_binding.clone();
+    x0x::groups::GroupStateCommit::sign(
+        group.stable_group_id().to_string(),
+        new_revision,
+        Some(prev_state_hash),
+        roster_root,
+        policy_hash,
+        public_meta_hash,
+        security_binding,
+        false,
+        new_revision,
+        requester_kp,
+    )
+    .expect("sign JoinRequestCreated commit")
 }
 
 async fn group_topic(state: &AppState, group_key: &str) -> String {
@@ -1500,6 +1618,31 @@ async fn pr291_expired_reoffer_exact_envelope_does_not_refresh_clock() {
         Some(old_marker_time),
         "migrated clock survived roster reload"
     );
+    // Explicit pre-relay fixture assertions (Dario's third precondition +
+    // tuple-keyed controls). The migration pass already cleared the marker
+    // and persisted the expired clock; assert that state is in place
+    // before driving the direct re-offer. The :2141-2148 abort and the
+    // :2127-2132 expiry gate are otherwise invisible to any outcome-shaped
+    // assertion, so this is the only row that catches a leftover marker.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "pre-relay: pending_listener_admission must be None"
+    );
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        0,
+        "pre-relay: no obligation for this (group, request, requester, digest) tuple"
+    );
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "pre-relay: no completion tombstone for this tuple"
+    );
+    assert_eq!(
+        persisted_clock,
+        Some(old_marker_time),
+        "pre-relay: stored clock must still be the expired migrated value"
+    );
 
     // Now pass the EXACT original envelope through the handler. The handler
     // must classify this as Inconsistent (expired request, matching binding,
@@ -1551,4 +1694,495 @@ async fn pr291_expired_reoffer_exact_envelope_does_not_refresh_clock() {
     assert!(listener_admission_is_none(&state).await);
     assert_eq!(relay_outbox_for_group(&state, &gk).await.len(), 0);
     assert_eq!(tombstone_count_for_group(&state, &gk).await, 0);
+
+    // B8 outcome: the expired re-offer created no obligation, so the real
+    // `approve_join_request` handler cannot consume one and must refuse
+    // with 412. Drives the executable B8 path, not obligation prose.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::PRECONDITION_FAILED,
+        "expired re-offer must refuse B8 approval with 412 (no obligation exists)"
+    );
+}
+
+// ===========================================================================
+// Direct-relay admission classification (handler-driven, not restart-driven)
+// ===========================================================================
+// These rows drive the EXACT direct re-offer through the extracted handler
+// (handle_predecessor_relay_typed_payload) and prove the AdmissionState
+// classification resolves to the right arm with the right named properties.
+// The rows are the same logical matrix as the restart-driven rows above, but
+// exercise the live handler path instead of the on-restart loader.
+
+/// Drive the requester-signed offer through the extracted handler using
+/// the production path. The handler is the same function the typed-DM
+/// receiver loop calls per incoming payload.
+async fn offer_via_handler(
+    state: &Arc<AppState>,
+    local_hex: &str,
+    entry: &RelayEntry,
+    requester_kp: &AgentKeypair,
+    received_at_unix_ms: u64,
+) {
+    let mut dm_payload =
+        Vec::with_capacity(GROUP_PREDECESSOR_RELAY_DM_PREFIX.len() + entry.envelope.len());
+    dm_payload.extend_from_slice(GROUP_PREDECESSOR_RELAY_DM_PREFIX);
+    dm_payload.extend_from_slice(&entry.envelope);
+    let dm = DmTypedPayload {
+        sender: requester_kp.agent_id(),
+        machine_id: MachineId([0u8; 32]),
+        payload: dm_payload,
+        verified: true,
+        trust_decision: None,
+        received_at_unix_ms,
+    };
+    handle_predecessor_relay_typed_payload(state, local_hex, dm).await;
+}
+
+/// Assert Dario's third precondition (no leftover admission marker) plus
+/// the two tuple-keyed controls (no durable join request, no matching
+/// obligation or completion tombstone). These are the jointly-selecting
+/// preconditions for the New / Repair / PubsubFirst classifications.
+async fn assert_classification_preconditions(
+    state: &AppState,
+    group_key: &str,
+    request_id: &str,
+    requester_hex: &str,
+    digest: &[u8; 32],
+) {
+    // Dario's third precondition: pending_listener_admission is None.
+    assert!(
+        listener_admission_is_none(state).await,
+        "precondition: pending_listener_admission must be None"
+    );
+    // No durable join request for this request_id.
+    let request_present = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .and_then(|info| info.join_requests.get(request_id))
+        .is_some();
+    assert!(
+        !request_present,
+        "precondition: no durable join request must exist for {request_id}"
+    );
+    // No matching obligation.
+    let obligations = relay_outbox_for_group(state, group_key).await;
+    let matching_obligation = obligations.iter().any(|o| {
+        o.request_id == request_id && o.requester_agent_id == requester_hex && o.digest == *digest
+    });
+    assert!(
+        !matching_obligation,
+        "precondition: no obligation must match ({group_key}, {request_id}, {requester_hex})"
+    );
+    // No matching completion tombstone.
+    let tombstones = state.completed_relay_tombstones.read().await;
+    let matching_tombstone = tombstones
+        .get(group_key)
+        .map(|l| {
+            l.iter().any(|t| {
+                t.request_id == request_id
+                    && t.requester_agent_id == requester_hex
+                    && t.digest == *digest
+            })
+        })
+        .unwrap_or(false);
+    assert!(
+        !matching_tombstone,
+        "precondition: no completion tombstone must match ({group_key}, {request_id}, {requester_hex})"
+    );
+}
+
+/// Watson v4: New regression control. The exact direct re-offer is first
+/// contact for the authority. The handler must classify New, durably store
+/// the request with the exact predecessor digest and first-seen clock,
+/// create the matching obligation with that same clock, and permit B8
+/// approval. The third precondition (no leftover admission marker) and
+/// the two tuple-keyed controls (no durable request, no obligation/
+/// tombstone) are asserted before the handler call, not just arranged.
+///
+/// Mutation evidence (MUT-NEW-APPLY): remove the
+/// `apply_named_group_metadata_event_inner_serialized` call in the New
+/// arm (mod.rs:2489) → New classifies correctly but the JoinRequestCreated
+/// is never durably stored, so the "request now exists" assertion fails.
+/// MUT-NEW-OBLIGATION: drop the obligation push at :2637 → no obligation
+/// is created and the test fails. MUT-NEW-CLOCK: change
+/// `admission_first_seen_ms` at :2496 to `now_ms.wrapping_add(1)` — the
+/// stored request clock diverges from the obligation clock, failing the
+/// "exact same clock" assertion.
+#[tokio::test]
+async fn pr291_new_direct_relay_journals_applies_creates_obligation() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x3002u32);
+    // New arm applies the request, so the group must have `RequestAccess`
+    // admission (mod.rs:6805) and the event must carry a commit (mod.rs:6799).
+    install_group_with_policy(
+        &state,
+        &gk,
+        2,
+        x0x::groups::GroupPolicyPreset::PublicRequestSecure,
+    )
+    .await;
+    let topic = group_topic(&state, &gk).await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let lh = local_hex(&state);
+
+    // The commit must chain from the group's pre-mutation state and be
+    // signed by the requester (a non-member), so the apply's
+    // `verify_structure` (signature + state_hash) and `validate_apply`
+    // (prev_state_hash chain, revision monotonicity, NonMemberRequest
+    // authority) all pass. `signed_request_join_commit` reads the group's
+    // current state_revision + state_hash, recomputes the component
+    // hashes from the current roster/policy/meta, and signs with the
+    // requester's key — the same path the production signer uses, so
+    // the post-mutation roster's recomputed state_hash matches the
+    // commit's claimed state_hash.
+    let commit = {
+        let groups = state.named_groups.read().await;
+        let group = groups.get(&gk).expect("group exists");
+        signed_request_join_commit(group, &requester_kp)
+    };
+
+    let entry = build_relay_entry_with_commit(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-new-direct",
+        &requester_hex,
+        0, // first_seen_ms is resolved to now_ms inside the handler
+        commit,
+    );
+
+    // Three jointly-selecting preconditions asserted before the relay.
+    assert_classification_preconditions(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+    )
+    .await;
+
+    // Drive the requester offer through the handler.
+    let now_before = unix_ms();
+    offer_via_handler(&state, &lh, &entry, &requester_kp, now_before).await;
+    let now_after = unix_ms();
+
+    // New arm: marker cleared, request applied, obligation created.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "New arm cleared the marker on success"
+    );
+
+    // The durable request is now stored with the exact digest and clock.
+    let stored = state
+        .named_groups
+        .read()
+        .await
+        .get(&gk)
+        .and_then(|info| info.join_requests.get(&entry.request_id))
+        .cloned()
+        .expect("New arm must durably store the request");
+    assert_eq!(
+        stored.predecessor_envelope_digest,
+        Some(entry.digest),
+        "stored request has exact predecessor digest"
+    );
+    let stored_clock = stored
+        .predecessor_first_seen_ms
+        .expect("New arm must record the first-seen clock");
+    assert!(
+        stored_clock >= now_before && stored_clock <= now_after,
+        "stored clock ({stored_clock}) must resolve to now_ms (window {now_before}..={now_after})"
+    );
+    assert!(stored.is_pending(), "stored request must be Pending");
+
+    // The obligation carries the exact same clock.
+    assert_obligation_exists(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+        stored_clock,
+    )
+    .await;
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "no completion tombstone for New arm"
+    );
+
+    // B8 outcome: the New arm's obligation must be consumable by the real
+    // `approve_join_request` handler with HTTP 200. Drives the executable
+    // B8 path, not obligation-existence prose.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK,
+        "New arm must permit B8 approval with 200"
+    );
+}
+
+/// Watson v4: live Repair. The gossip has already durably stored the
+/// pending request with the exact envelope digest and a still-live
+/// original first-observation clock. The marker is None (Dario's third
+/// precondition) and no obligation or completion tombstone matches. The
+/// exact direct relay must select Repair, leave the request clock
+/// unchanged, create the obligation with that same clock, and permit B8
+/// approval.
+///
+/// Mutation evidence (MUT-REPAIR-CLOCK): change
+/// `admission_first_seen_ms = stored_first_seen_ms` (mod.rs:2371) to
+/// `= now_ms` → the Repair arm refreshes the obligation clock instead of
+/// preserving the gossip-stored clock, and the "stored clock equals
+/// gossip-stored clock" exact-match assertion reddens. (Forcing
+/// `first_seen_is_live = true` at the classifier is inert for this row —
+/// the live clock already satisfies the predicate — and produces the same
+/// RED as MUT-REFRESH.) MUT-REPAIR-OBLIGATION drops the obligation push at
+/// :2641. MUT-REPAIR-APPLY: force `is_new_request = true` in the Repair
+/// arm → the apply runs on a request that already exists, returns
+/// ACCEPTED_REJECTED (mod.rs:6821-6822), the handler breaks out with the
+/// marker left set, and the obligation is not created.
+#[tokio::test]
+async fn pr291_live_repair_direct_relay_creates_obligation_without_apply() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x3003u32);
+    install_group(&state, &gk, 2).await;
+    let topic = group_topic(&state, &gk).await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let lh = local_hex(&state);
+    let now = unix_ms();
+    let stored_clock = now - 1000; // well within 5-min retention → live
+
+    let entry = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-repair-live",
+        &requester_hex,
+        stored_clock,
+    );
+
+    // Install the gossip-stored pending request with the exact digest
+    // and a still-live original first-seen clock.
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&gk).expect("group");
+        info.join_requests.insert(
+            entry.request_id.clone(),
+            bound_join_request(&entry, &gk, &requester_hex, stored_clock),
+        );
+        info.recompute_state_hash();
+    }
+
+    // Marker is None (Dario's third precondition) and no obligation/
+    // tombstone matches this tuple.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "precondition: pending_listener_admission must be None"
+    );
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        0,
+        "precondition: no obligation"
+    );
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "precondition: no completion tombstone"
+    );
+
+    // Drive the offer through the handler.
+    offer_via_handler(&state, &lh, &entry, &requester_kp, unix_ms()).await;
+
+    // Repair arm: marker cleared, request clock unchanged, obligation
+    // created with the same clock.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "Repair arm cleared the marker on success"
+    );
+
+    let stored = state
+        .named_groups
+        .read()
+        .await
+        .get(&gk)
+        .and_then(|info| info.join_requests.get(&entry.request_id))
+        .cloned()
+        .expect("Repair must preserve the gossip-stored request");
+    assert_eq!(
+        stored.predecessor_first_seen_ms,
+        Some(stored_clock),
+        "Repair must not refresh the gossip-stored clock"
+    );
+    assert_eq!(
+        stored.predecessor_envelope_digest,
+        Some(entry.digest),
+        "stored request has exact predecessor digest"
+    );
+    assert!(stored.is_pending(), "stored request must be Pending");
+
+    // The obligation carries the exact same clock.
+    assert_obligation_exists(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+        stored_clock,
+    )
+    .await;
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "no completion tombstone for Repair arm"
+    );
+
+    // B8 outcome: the live Repair arm's obligation must be consumable by
+    // the real `approve_join_request` handler with HTTP 200. Drives the
+    // executable B8 path, not obligation-existence prose.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK,
+        "live Repair arm must permit B8 approval with 200"
+    );
+}
+
+/// Watson v4: PubsubFirst. The gossip has already durably stored the
+/// pending request with the byte-identical predecessor digest but no
+/// first-seen clock (pubsub-first partial state). The marker is None
+/// (Dario's third precondition) and no obligation or completion tombstone
+/// matches. The exact direct relay must backfill the clock at :2467,
+/// create the obligation at :2540, and permit B8 approval.
+///
+/// Mutation evidence (MUT-PUBSUB-BACKFILL): remove the clock backfill at
+/// :2467 → the stored request stays at `predecessor_first_seen_ms = None`,
+/// and the "stored clock equals obligation clock" assertion fails. The
+/// `created_at == 0` independence check guards the request-preservation
+/// invariant: if the classifier is forced to New, the apply path runs,
+/// sees an existing request (mod.rs:6821-6822), returns rejected, and the
+/// handler breaks out without creating the obligation.
+#[tokio::test]
+async fn pr291_pubsub_first_direct_relay_backfills_clock_and_creates_obligation() {
+    let (state, _dir) = s_state().await;
+    let gk = format!("{:032x}", 0x3004u32);
+    install_group(&state, &gk, 2).await;
+    let topic = group_topic(&state, &gk).await;
+    let requester_kp = fresh_kp();
+    let requester_hex = hex::encode(requester_kp.agent_id().as_bytes());
+    let lh = local_hex(&state);
+
+    let entry = build_relay_entry(
+        &requester_kp,
+        &topic,
+        &gk,
+        "req-pubsub-first",
+        &requester_hex,
+        0, // first_seen_ms is resolved to now_ms inside the handler
+    );
+
+    // Install the gossip-stored pending request with the byte-identical
+    // predecessor digest but no first-seen clock (pubsub-first state).
+    {
+        let mut groups = state.named_groups.write().await;
+        let info = groups.get_mut(&gk).expect("group");
+        info.join_requests.insert(
+            entry.request_id.clone(),
+            join_request_with(
+                &entry,
+                &gk,
+                &requester_hex,
+                None,
+                x0x::groups::JoinRequestStatus::Pending,
+            ),
+        );
+        info.recompute_state_hash();
+    }
+
+    // Marker is None and no obligation/tombstone matches this tuple.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "precondition: pending_listener_admission must be None"
+    );
+    assert_eq!(
+        relay_outbox_for_group(&state, &gk).await.len(),
+        0,
+        "precondition: no obligation"
+    );
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "precondition: no completion tombstone"
+    );
+
+    // Drive the offer through the handler.
+    let now_before = unix_ms();
+    offer_via_handler(&state, &lh, &entry, &requester_kp, now_before).await;
+    let now_after = unix_ms();
+
+    // PubsubFirst arm: marker cleared, clock backfilled, obligation
+    // created with the same clock.
+    assert!(
+        listener_admission_is_none(&state).await,
+        "PubsubFirst arm cleared the marker on success"
+    );
+
+    let stored = state
+        .named_groups
+        .read()
+        .await
+        .get(&gk)
+        .and_then(|info| info.join_requests.get(&entry.request_id))
+        .cloned()
+        .expect("PubsubFirst must preserve the gossip-stored request");
+    assert_eq!(
+        stored.predecessor_envelope_digest,
+        Some(entry.digest),
+        "stored request has exact predecessor digest"
+    );
+    let backfilled_clock = stored
+        .predecessor_first_seen_ms
+        .expect("PubsubFirst must backfill the clock");
+    assert!(
+        backfilled_clock >= now_before && backfilled_clock <= now_after,
+        "backfilled clock ({backfilled_clock}) must resolve to now_ms (window {now_before}..={now_after})"
+    );
+    assert!(stored.is_pending(), "stored request must be Pending");
+    // The request must be preserved (not overwritten by an apply).
+    // `join_request_with(..., None, ...)` sets `created_at = 0` via
+    // `unwrap_or(0)`; an apply-driven rewrite would set `created_at`
+    // from the event's `ts`, which is built from the now-stale
+    // predecessor_event timestamp.
+    assert_eq!(
+        stored.created_at, 0,
+        "PubsubFirst must preserve the gossip-stored request (not apply a new one)"
+    );
+
+    // The obligation carries the exact same clock.
+    assert_obligation_exists(
+        &state,
+        &gk,
+        &entry.request_id,
+        &requester_hex,
+        &entry.digest,
+        backfilled_clock,
+    )
+    .await;
+    assert_eq!(
+        tombstone_count_for_group(&state, &gk).await,
+        0,
+        "no completion tombstone for PubsubFirst arm"
+    );
+
+    // B8 outcome: the PubsubFirst arm's obligation must be consumable by
+    // the real `approve_join_request` handler with HTTP 200. Drives the
+    // executable B8 path, not obligation-existence prose.
+    assert_eq!(
+        approve_status(&state, &gk, &entry.request_id).await,
+        StatusCode::OK,
+        "PubsubFirst arm must permit B8 approval with 200"
+    );
 }
