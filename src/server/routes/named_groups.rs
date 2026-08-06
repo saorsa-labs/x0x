@@ -9139,11 +9139,13 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
     let payload = msg.body.as_bytes().to_vec();
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
     history.record(x0x::history::HistoryRecord {
-        // Use BLAKE3(signable_bytes()) so the history dedup key matches the
-        // thread API's msg_id (ADR-0029). Unlike compute_msg_id which hashes
-        // the JSON artifact (includes signature bytes), this is canonical-
-        // content-based: re-signed identical content now dedupes — intended.
-        msg_id: *blake3::hash(&msg.signable_bytes()).as_bytes(),
+        // HistoryRecord.msg_id is the store-internal dedup key governed by
+        // HistoryRecord::validate(): it must equal compute_msg_id(artifact,
+        // payload), i.e. BLAKE3 of the signed JSON artifact when present.
+        // This is NOT the ADR-0029 thread msg_id (BLAKE3 of signable_bytes).
+        // The canonical thread msg_id is exposed at the REST layer and is
+        // recomputable from the stored artifact via GroupPublicMessage::msg_id().
+        msg_id: x0x::history::HistoryRecord::compute_msg_id(Some(&artifact), &payload),
         scope: x0x::history::Scope::Group(msg.group_id.clone()),
         author_agent: Some(msg.author_agent_id.clone()),
         author_machine: None,
@@ -25108,6 +25110,83 @@ mod tests {
             serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
                 .expect("payload JSON should decode");
         assert_eq!(decoded, msg);
+    }
+
+    /// Regression test: the HistoryRecord constructed by record_group_public_history
+    /// must pass HistoryRecord::validate(). Fix 1 of the ADR-0029 review broke this
+    /// by using BLAKE3(signable_bytes) instead of compute_msg_id(artifact, payload),
+    /// violating the store invariant and silently dropping every group-public message
+    /// from durable history. This test catches any future drift between the msg_id
+    /// computation and the validate() invariant.
+    #[test]
+    fn group_public_history_record_passes_validate() {
+        use x0x::history::{Direction, HistoryRecord, Provenance, Scope};
+
+        // Build a non-threaded message (v1 domain).
+        let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let msg_v1 = x0x::groups::GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash".into(),
+            1,
+            &kp,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "non-threaded body".into(),
+            1_000,
+            None,
+            None,
+        )
+        .expect("sign v1");
+
+        // Build a threaded message (v2 domain).
+        let fake_root = "a".repeat(64);
+        let msg_v2 = x0x::groups::GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash".into(),
+            1,
+            &kp,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "threaded reply".into(),
+            2_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .expect("sign v2");
+
+        for msg in [&msg_v1, &msg_v2] {
+            let artifact = serde_json::to_vec(msg).expect("serialize");
+            let payload = msg.body.as_bytes().to_vec();
+            let record = HistoryRecord {
+                // Must use compute_msg_id, not BLAKE3(signable_bytes) — validate()
+                // enforces this invariant and rejects rows that violate it.
+                msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+                scope: Scope::Group(msg.group_id.clone()),
+                author_agent: Some(msg.author_agent_id.clone()),
+                author_machine: None,
+                author_pubkey: hex::decode(&msg.author_public_key).ok(),
+                sent_at_ms: i64::try_from(msg.timestamp).unwrap_or(i64::MAX),
+                seen_at_ms: 0,
+                direction: Direction::Outbound,
+                content_type: "text/plain".to_string(),
+                payload,
+                signed_artifact: Some(artifact),
+                signature: hex::decode(&msg.signature).ok(),
+                sig_context: Some(
+                    if msg.thread_root.is_some() || msg.thread_parent.is_some() {
+                        "x0x.group.public-message.v2"
+                    } else {
+                        "x0x.group.public-message.v1"
+                    }
+                    .to_string(),
+                ),
+                provenance: Provenance::VerifiedEnvelope,
+                replace_key: None,
+            };
+            record.validate().expect(
+                "HistoryRecord produced by record_group_public_history must pass validate()",
+            );
+        }
     }
 
     /// Issue #205: minting a `private_secure` invite must strip per-member
