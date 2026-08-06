@@ -327,11 +327,9 @@ pub fn validate_public_message(
         });
     }
 
-    // 4. signature + author binding
-    msg.verify_signature()
-        .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
-
-    // 4b. threading field validation (ADR-0029)
+    // 4. threading field structural checks (cheap, no crypto — run before
+    //    signature verification so malformed gossip messages are rejected
+    //    without paying ML-DSA-65 verify cost). ADR-0029.
     if let Some(root) = &msg.thread_root {
         validate_thread_hex("thread_root", root)?;
     }
@@ -342,7 +340,11 @@ pub fn validate_public_message(
             return Err(IngestError::ThreadParentWithoutRoot);
         }
     }
-    // self-reference check (structurally impossible to construct but cheap)
+    // Self-reference: thread_root/thread_parent must not equal the message's
+    // own msg_id. Constructing a genuinely self-referential signed message
+    // requires a BLAKE3 hash fixed-point, so this check is reachable only
+    // for tampered messages whose signature would fail anyway — but it serves
+    // as a cheap early reject before the expensive ML-DSA-65 verify.
     let own_id = msg.msg_id();
     if msg.thread_root.as_deref() == Some(own_id.as_str()) {
         return Err(IngestError::ThreadSelfReference {
@@ -355,14 +357,18 @@ pub fn validate_public_message(
         });
     }
 
-    // 5. banned authors rejected
+    // 5. signature + author binding
+    msg.verify_signature()
+        .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
+
+    // 7. banned authors rejected
     if let Some(member) = ctx.members_v2.get(&msg.author_agent_id) {
         if member.state == GroupMemberState::Banned {
             return Err(IngestError::AuthorBanned);
         }
     }
 
-    // 6. write-access policy enforcement
+    // 8. write-access policy enforcement
     let author_role = ctx
         .members_v2
         .get(&msg.author_agent_id)
@@ -904,11 +910,10 @@ mod tests {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
         // Build a valid v1 message then manually inject a bad thread_root.
+        // Thread structural checks now run BEFORE signature verification, so
+        // InvalidThreadField fires first (cheap reject, no crypto cost).
         let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
-        // Re-sign with thread_root set to a bad value (too short).
-        // We can't produce a valid signed message with a bad thread_root (sign
-        // doesn't validate), so instead directly test the ingest validator:
-        msg.thread_root = Some("not-hex".to_string());
+        msg.thread_root = Some("not-hex".to_string()); // too short and not hex
         let policy = open_policy();
         let mut members = BTreeMap::new();
         members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
@@ -919,14 +924,11 @@ mod tests {
         };
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
-            // Signature fails first since thread_root changes signable bytes —
-            // both InvalidSignature and InvalidThreadField are acceptable
-            // failure modes here. The key property is that the message is rejected.
-            IngestError::InvalidSignature(_) | IngestError::InvalidThreadField { .. }
+            IngestError::InvalidThreadField { .. }
         ));
     }
 
-    /// Ingest: parent-without-root rejected (validator path, not sign path).
+    /// Ingest: parent-without-root rejected (pre-signature structural check).
     #[test]
     fn ingest_rejects_parent_without_root() {
         let kp = make_kp();
@@ -956,10 +958,13 @@ mod tests {
             policy: &policy,
             members_v2: &members,
         };
-        // Signature fails first (stripping root changes bytes), which is
-        // also a valid rejection. Both InvalidSignature and
-        // ThreadParentWithoutRoot are acceptable here.
-        assert!(validate_public_message(&ctx, &msg).is_err());
+        // Thread structural checks run BEFORE signature verification.
+        // ThreadParentWithoutRoot fires as a cheap early reject; the
+        // tampered signature is never computed.
+        assert!(matches!(
+            validate_public_message(&ctx, &msg).unwrap_err(),
+            IngestError::ThreadParentWithoutRoot
+        ));
     }
 
     /// Ingest: orphan parent accepted (parent not known locally is fine).
@@ -994,20 +999,23 @@ mod tests {
         validate_public_message(&ctx, &msg).unwrap();
     }
 
-    /// Ingest: self-reference is checked by the validator.
-    /// Because sign() doesn't validate and self-reference is
-    /// structurally impossible to construct, we test the validator
-    /// path by manually constructing the condition after signing.
+    /// Ingest: self-reference check is live pre-signature (after fix 2) and
+    /// serves as a cheap early reject. Because `msg_id()` = BLAKE3(signable_bytes)
+    /// and `signable_bytes` INCLUDES `thread_root`, a genuinely self-referential
+    /// message requires a BLAKE3 fixed point (x = BLAKE3(f(x))) — computationally
+    /// infeasible. When we set `thread_root = own_id` after signing, `msg_id()`
+    /// changes (different input bytes), so the self-reference check does NOT fire;
+    /// the tampered signature is what the validator rejects. This test verifies the
+    /// end-to-end rejection and documents the hash-circularity property.
     #[test]
     fn ingest_rejects_self_reference() {
         let kp = make_kp();
         let hex_id = hex::encode(kp.agent_id().as_bytes());
-        // Sign a non-threaded message first to get a msg_id.
+        // Sign a non-threaded message first to get a stable msg_id.
         let base = build_signed_msg(&kp, "g1", "base", GroupPublicMessageKind::Chat);
         let base_id = base.msg_id();
-        // Now sign with root = base_id, then tamper root to be the
-        // threaded message's own msg_id. The signature will be invalid, but
-        // the validator should hit self-reference (or InvalidSignature) — both are correct.
+        // Sign a threaded message with root = base_id. Its own msg_id is the
+        // BLAKE3 of v2 signable bytes with thread_root=base_id.
         let mut msg = GroupPublicMessage::sign(
             "g1".into(),
             "state-hash-1".into(),
@@ -1021,8 +1029,10 @@ mod tests {
             None,
         )
         .unwrap();
+        // Capture own_id BEFORE tampering. After we set thread_root = own_id,
+        // msg_id() will recompute from the new (tampered) signable_bytes and
+        // produce a DIFFERENT value — the self-reference check passes; sig fails.
         let own_id = msg.msg_id();
-        // Tamper: set thread_root to own msg_id.
         msg.thread_root = Some(own_id);
         let policy = open_policy();
         let mut members = BTreeMap::new();
@@ -1032,7 +1042,13 @@ mod tests {
             policy: &policy,
             members_v2: &members,
         };
-        // Must fail (InvalidSignature or ThreadSelfReference).
-        assert!(validate_public_message(&ctx, &msg).is_err());
+        // Self-reference check is reachable only for messages whose signature
+        // would fail anyway (BLAKE3 fixed-point property). Tampering thread_root
+        // changes signable_bytes, so msg_id() ≠ old own_id and the self-reference
+        // check does not fire; InvalidSignature is the actual early reject here.
+        assert!(matches!(
+            validate_public_message(&ctx, &msg).unwrap_err(),
+            IngestError::InvalidSignature(_)
+        ));
     }
 }

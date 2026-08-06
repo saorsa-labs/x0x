@@ -9075,6 +9075,19 @@ pub(in crate::server) async fn get_group_public_messages(
         None => cached,
     };
 
+    // Validate thread_root query param format before doing any work: 64
+    // lowercase hex chars only. Garbage input would otherwise trigger O(N)
+    // BLAKE3 computations and always return an empty result set.
+    if let Some(filter_root) = &query.thread_root {
+        if filter_root.len() != 64
+            || !filter_root
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_root query param must be exactly 64 lowercase hex chars");
+        }
+    }
+
     // Apply thread_root filter (ADR-0029): keep messages whose thread_root
     // matches, plus the root message itself (identified by its own msg_id).
     let msgs: Vec<_> = if let Some(filter_root) = &query.thread_root {
@@ -9126,7 +9139,11 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
     let payload = msg.body.as_bytes().to_vec();
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
     history.record(x0x::history::HistoryRecord {
-        msg_id: x0x::history::HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+        // Use BLAKE3(signable_bytes()) so the history dedup key matches the
+        // thread API's msg_id (ADR-0029). Unlike compute_msg_id which hashes
+        // the JSON artifact (includes signature bytes), this is canonical-
+        // content-based: re-signed identical content now dedupes — intended.
+        msg_id: *blake3::hash(&msg.signable_bytes()).as_bytes(),
         scope: x0x::history::Scope::Group(msg.group_id.clone()),
         author_agent: Some(msg.author_agent_id.clone()),
         author_machine: None,
