@@ -77,8 +77,10 @@ content, independent of JSON re-serialization. It is the direct analogue
 of Nostr's `event.id`, making bridge translation a table lookup. Hash
 references make thread cycles impossible without a hash collision. The
 ID is exposed (additively) everywhere messages appear: the
-`GET /groups/:id/messages` items, the SSE message event, and the
-`POST /groups/:id/send` response.
+`GET /groups/:id/messages` items and the `POST /groups/:id/send`
+response. (No SSE event exists for group public messages today —
+delivery is gossip-topic plus DM push; if one is added later it must
+carry `msg_id` too.)
 
 **Thread fields.** Two new optional fields on `GroupPublicMessage`:
 
