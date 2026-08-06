@@ -1080,6 +1080,13 @@ enum GroupSub {
         /// Message kind: chat (default) | announcement.
         #[arg(long)]
         kind: Option<String>,
+        /// msg_id of the thread root (64 lowercase hex). ADR-0029.
+        #[arg(long)]
+        thread_root: Option<String>,
+        /// msg_id of the direct parent reply target (64 lowercase hex). ADR-0029.
+        /// Requires --thread-root to also be set.
+        #[arg(long)]
+        reply_to: Option<String>,
     },
     /// Retrieve cached SignedPublic messages for a group.
     Messages {
@@ -1805,7 +1812,22 @@ async fn run(
                 group_id,
                 body,
                 kind,
-            }) => commands::group::send(&client, &group_id, &body, kind.as_deref()).await,
+                thread_root,
+                reply_to,
+            }) => {
+                if reply_to.is_some() && thread_root.is_none() {
+                    anyhow::bail!("--reply-to requires --thread-root to also be set");
+                }
+                commands::group::send(
+                    &client,
+                    &group_id,
+                    &body,
+                    kind.as_deref(),
+                    thread_root.as_deref(),
+                    reply_to.as_deref(),
+                )
+                .await
+            }
             Some(GroupSub::Messages { group_id }) => {
                 commands::group::messages(&client, &group_id).await
             }

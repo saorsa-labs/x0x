@@ -8780,6 +8780,13 @@ pub(in crate::server) struct SendGroupMessageRequest {
     /// Message kind — `"chat"` (default) or `"announcement"`.
     #[serde(default)]
     kind: Option<String>,
+    /// `msg_id` of the thread root (64 lowercase hex chars). ADR-0029.
+    #[serde(default)]
+    thread_root: Option<String>,
+    /// `msg_id` of the direct parent in the thread (64 lowercase hex chars). ADR-0029.
+    /// Requires `thread_root` to also be present.
+    #[serde(default)]
+    thread_parent: Option<String>,
 }
 
 /// POST /groups/:id/send — publish a message to the group.
@@ -8812,6 +8819,29 @@ pub(in crate::server) async fn send_group_public_message(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body exceeds MAX_PUBLIC_MESSAGE_BYTES",
         );
+    }
+
+    // Validate thread fields (ADR-0029): 64 lowercase hex chars, parent ⇒ root.
+    if let Some(root) = &req.thread_root {
+        if root.len() != 64
+            || !root
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_root must be exactly 64 lowercase hex chars");
+        }
+    }
+    if let Some(parent) = &req.thread_parent {
+        if parent.len() != 64
+            || !parent
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_parent must be exactly 64 lowercase hex chars");
+        }
+        if req.thread_root.is_none() {
+            return bad_request("thread_parent requires thread_root to also be set");
+        }
     }
 
     let signing_kp = state.agent.identity().agent_keypair();
@@ -8871,6 +8901,8 @@ pub(in crate::server) async fn send_group_public_message(
             kind,
             req.body,
             now_ms,
+            req.thread_root,
+            req.thread_parent,
         ) {
             Ok(m) => (m, direct_recipients),
             Err(e) => {
@@ -8920,6 +8952,7 @@ pub(in crate::server) async fn send_group_public_message(
     cache_public_message(&state, msg.clone()).await;
     spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
 
+    let msg_id = msg.msg_id();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -8928,8 +8961,17 @@ pub(in crate::server) async fn send_group_public_message(
             "topic": topic,
             "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
             "timestamp": msg.timestamp,
+            "msg_id": msg_id,
         })),
     )
+}
+
+/// Query parameters for [`get_group_public_messages`].
+#[derive(Debug, serde::Deserialize, Default)]
+pub(in crate::server) struct GetMessagesQuery {
+    /// Filter to a specific thread (64 lowercase hex chars). ADR-0029.
+    #[serde(default)]
+    thread_root: Option<String>,
 }
 
 /// GET /groups/:id/messages — retrieve cached public messages.
@@ -8938,9 +8980,13 @@ pub(in crate::server) async fn send_group_public_message(
 /// token receives the history. If `MembersOnly`, only active members
 /// receive it. For `MlsEncrypted` groups, returns 400 — encrypted
 /// history belongs in a different surface.
+///
+/// Optional query parameter: `thread_root=<msg_id>` — filters to messages
+/// in that thread (root included when present). ADR-0029.
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<GetMessagesQuery>,
 ) -> impl IntoResponse {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Resolve the stable_group_id — the public-message cache and topic
@@ -9029,9 +9075,46 @@ pub(in crate::server) async fn get_group_public_messages(
         None => cached,
     };
 
+    // Validate thread_root query param format before doing any work: 64
+    // lowercase hex chars only. Garbage input would otherwise trigger O(N)
+    // BLAKE3 computations and always return an empty result set.
+    if let Some(filter_root) = &query.thread_root {
+        if filter_root.len() != 64
+            || !filter_root
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_root query param must be exactly 64 lowercase hex chars");
+        }
+    }
+
+    // Apply thread_root filter (ADR-0029): keep messages whose thread_root
+    // matches, plus the root message itself (identified by its own msg_id).
+    let msgs: Vec<_> = if let Some(filter_root) = &query.thread_root {
+        msgs.into_iter()
+            .filter(|m| {
+                m.thread_root.as_deref() == Some(filter_root.as_str()) || &m.msg_id() == filter_root
+            })
+            .collect()
+    } else {
+        msgs
+    };
+
+    // Augment each message with its computed msg_id (ADR-0029).
+    let messages_with_id: Vec<serde_json::Value> = msgs
+        .iter()
+        .filter_map(|m| {
+            let mut v = serde_json::to_value(m).ok()?;
+            if let serde_json::Value::Object(ref mut map) = v {
+                map.insert("msg_id".to_string(), serde_json::Value::String(m.msg_id()));
+            }
+            Some(v)
+        })
+        .collect();
+
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "messages": msgs })),
+        Json(serde_json::json!({ "ok": true, "messages": messages_with_id })),
     )
 }
 
@@ -9056,6 +9139,12 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
     let payload = msg.body.as_bytes().to_vec();
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
     history.record(x0x::history::HistoryRecord {
+        // HistoryRecord.msg_id is the store-internal dedup key governed by
+        // HistoryRecord::validate(): it must equal compute_msg_id(artifact,
+        // payload), i.e. BLAKE3 of the signed JSON artifact when present.
+        // This is NOT the ADR-0029 thread msg_id (BLAKE3 of signable_bytes).
+        // The canonical thread msg_id is exposed at the REST layer and is
+        // recomputable from the stored artifact via GroupPublicMessage::msg_id().
         msg_id: x0x::history::HistoryRecord::compute_msg_id(Some(&artifact), &payload),
         scope: x0x::history::Scope::Group(msg.group_id.clone()),
         author_agent: Some(msg.author_agent_id.clone()),
@@ -9072,8 +9161,15 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
         payload,
         signed_artifact: Some(artifact),
         signature: hex::decode(&msg.signature).ok(),
-        // Mirrors `groups::public_message::PUBLIC_MESSAGE_DOMAIN`.
-        sig_context: Some("x0x.group.public-message.v1".to_string()),
+        // Mirrors the signing domain used for this message (ADR-0029).
+        sig_context: Some(
+            if msg.thread_root.is_some() || msg.thread_parent.is_some() {
+                "x0x.group.public-message.v2"
+            } else {
+                "x0x.group.public-message.v1"
+            }
+            .to_string(),
+        ),
         provenance: if outbound {
             x0x::history::Provenance::LocalSend
         } else {
@@ -25001,6 +25097,8 @@ mod tests {
             kind: x0x::groups::GroupPublicMessageKind::Chat,
             body: "hello".to_string(),
             timestamp: 123,
+            thread_root: None,
+            thread_parent: None,
             signature: "cc".repeat(64),
         };
 
@@ -25012,6 +25110,83 @@ mod tests {
             serde_json::from_slice(&payload[GROUP_PUBLIC_MESSAGE_DM_PREFIX.len()..])
                 .expect("payload JSON should decode");
         assert_eq!(decoded, msg);
+    }
+
+    /// Regression test: the HistoryRecord constructed by record_group_public_history
+    /// must pass HistoryRecord::validate(). Fix 1 of the ADR-0029 review broke this
+    /// by using BLAKE3(signable_bytes) instead of compute_msg_id(artifact, payload),
+    /// violating the store invariant and silently dropping every group-public message
+    /// from durable history. This test catches any future drift between the msg_id
+    /// computation and the validate() invariant.
+    #[test]
+    fn group_public_history_record_passes_validate() {
+        use x0x::history::{Direction, HistoryRecord, Provenance, Scope};
+
+        // Build a non-threaded message (v1 domain).
+        let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+        let msg_v1 = x0x::groups::GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash".into(),
+            1,
+            &kp,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "non-threaded body".into(),
+            1_000,
+            None,
+            None,
+        )
+        .expect("sign v1");
+
+        // Build a threaded message (v2 domain).
+        let fake_root = "a".repeat(64);
+        let msg_v2 = x0x::groups::GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash".into(),
+            1,
+            &kp,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "threaded reply".into(),
+            2_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .expect("sign v2");
+
+        for msg in [&msg_v1, &msg_v2] {
+            let artifact = serde_json::to_vec(msg).expect("serialize");
+            let payload = msg.body.as_bytes().to_vec();
+            let record = HistoryRecord {
+                // Must use compute_msg_id, not BLAKE3(signable_bytes) — validate()
+                // enforces this invariant and rejects rows that violate it.
+                msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+                scope: Scope::Group(msg.group_id.clone()),
+                author_agent: Some(msg.author_agent_id.clone()),
+                author_machine: None,
+                author_pubkey: hex::decode(&msg.author_public_key).ok(),
+                sent_at_ms: i64::try_from(msg.timestamp).unwrap_or(i64::MAX),
+                seen_at_ms: 0,
+                direction: Direction::Outbound,
+                content_type: "text/plain".to_string(),
+                payload,
+                signed_artifact: Some(artifact),
+                signature: hex::decode(&msg.signature).ok(),
+                sig_context: Some(
+                    if msg.thread_root.is_some() || msg.thread_parent.is_some() {
+                        "x0x.group.public-message.v2"
+                    } else {
+                        "x0x.group.public-message.v1"
+                    }
+                    .to_string(),
+                ),
+                provenance: Provenance::VerifiedEnvelope,
+                replace_key: None,
+            };
+            record.validate().expect(
+                "HistoryRecord produced by record_group_public_history must pass validate()",
+            );
+        }
     }
 
     /// Issue #205: minting a `private_secure` invite must strip per-member

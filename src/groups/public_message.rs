@@ -42,8 +42,14 @@ use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 
-/// Domain-separation tag for public-message signatures.
+/// Domain-separation tag for public-message signatures (v1 — no thread fields).
 pub const PUBLIC_MESSAGE_DOMAIN: &[u8] = b"x0x.group.public-message.v1";
+
+/// Domain-separation tag for threaded public-message signatures (v2).
+///
+/// Used when `thread_root` or `thread_parent` is set. Messages without thread
+/// fields sign under `PUBLIC_MESSAGE_DOMAIN` and are byte-identical to v1.
+pub const PUBLIC_MESSAGE_DOMAIN_V2: &[u8] = b"x0x.group.public-message.v2";
 
 /// Topic-string prefix for public-group chat.
 pub const PUBLIC_GROUP_TOPIC_PREFIX: &str = "x0x.groups.public";
@@ -91,6 +97,13 @@ pub struct GroupPublicMessage {
     pub body: String,
     /// Unix milliseconds at send time.
     pub timestamp: u64,
+    /// `msg_id` of the thread's first message (hex, 64 chars). ADR-0029.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_root: Option<String>,
+    /// `msg_id` of the direct parent in the thread (hex, 64 chars). ADR-0029.
+    /// When present, `thread_root` must also be present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_parent: Option<String>,
     /// Hex ML-DSA-65 signature over `signable_bytes()`.
     pub signature: String,
 }
@@ -99,10 +112,22 @@ impl GroupPublicMessage {
     /// Canonical bytes signed by the author to produce `signature`.
     ///
     /// Includes every field except `signature` itself.
+    ///
+    /// **Compatibility rule (ADR-0029):** when both `thread_root` and
+    /// `thread_parent` are `None`, the output is byte-identical to the
+    /// pre-threading v1 encoding (same domain, no thread suffix). When
+    /// either field is `Some`, the v2 domain is used and both thread
+    /// fields are appended length-prefixed after `timestamp` (absent ⇒
+    /// empty string).
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
+        let threaded = self.thread_root.is_some() || self.thread_parent.is_some();
         let mut buf = Vec::with_capacity(512 + self.body.len());
-        buf.extend_from_slice(PUBLIC_MESSAGE_DOMAIN);
+        buf.extend_from_slice(if threaded {
+            PUBLIC_MESSAGE_DOMAIN_V2
+        } else {
+            PUBLIC_MESSAGE_DOMAIN
+        });
         push_len_prefixed(&mut buf, self.group_id.as_bytes());
         push_len_prefixed(&mut buf, self.state_hash_at_send.as_bytes());
         buf.extend_from_slice(&self.revision_at_send.to_le_bytes());
@@ -117,10 +142,32 @@ impl GroupPublicMessage {
         push_len_prefixed(&mut buf, &kind_bytes);
         push_len_prefixed(&mut buf, self.body.as_bytes());
         buf.extend_from_slice(&self.timestamp.to_le_bytes());
+        if threaded {
+            push_len_prefixed(
+                &mut buf,
+                self.thread_root.as_deref().unwrap_or("").as_bytes(),
+            );
+            push_len_prefixed(
+                &mut buf,
+                self.thread_parent.as_deref().unwrap_or("").as_bytes(),
+            );
+        }
         buf
     }
 
+    /// Stable message identity: lowercase hex of `BLAKE3(signable_bytes())`.
+    ///
+    /// 64 hex characters. Deterministic and recomputable by any verifier.
+    /// Analogous to Nostr's `event.id`. ADR-0029.
+    #[must_use]
+    pub fn msg_id(&self) -> String {
+        hex::encode(blake3::hash(&self.signable_bytes()).as_bytes())
+    }
+
     /// Build and sign a new public message.
+    ///
+    /// Pass `thread_root` / `thread_parent` to produce a v2-domain threaded
+    /// message (ADR-0029). Both `None` produces a v1-compatible message.
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         group_id: String,
@@ -131,6 +178,8 @@ impl GroupPublicMessage {
         kind: GroupPublicMessageKind,
         body: String,
         timestamp: u64,
+        thread_root: Option<String>,
+        thread_parent: Option<String>,
     ) -> Result<Self, ApplyError> {
         let author_agent_id = hex::encode(keypair.agent_id().as_bytes());
         let author_public_key = hex::encode(keypair.public_key().as_bytes());
@@ -144,6 +193,8 @@ impl GroupPublicMessage {
             kind,
             body,
             timestamp,
+            thread_root,
+            thread_parent,
             signature: String::new(),
         };
         let sig = sign_with_ml_dsa(keypair.secret_key(), &msg.signable_bytes())
@@ -185,6 +236,22 @@ fn push_len_prefixed(buf: &mut Vec<u8>, bytes: &[u8]) {
     buf.extend_from_slice(bytes);
 }
 
+/// Validate that a thread field value is exactly 64 lowercase hex characters.
+fn validate_thread_hex(field: &'static str, value: &str) -> Result<(), IngestError> {
+    if value.len() == 64
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        Ok(())
+    } else {
+        Err(IngestError::InvalidThreadField {
+            field,
+            value: value.to_string(),
+        })
+    }
+}
+
 // ────────────────────────── Ingest validator ────────────────────────────
 
 /// Errors from public-message ingest validation.
@@ -207,6 +274,18 @@ pub enum IngestError {
 
     #[error("write-policy violation under {policy:?}: author lacks required role")]
     WritePolicyViolation { policy: GroupWriteAccess },
+
+    /// A thread field value is not exactly 64 lowercase hex characters.
+    #[error("invalid thread field '{field}': must be 64 lowercase hex chars, got '{value}'")]
+    InvalidThreadField { field: &'static str, value: String },
+
+    /// `thread_parent` is set but `thread_root` is absent.
+    #[error("thread_parent requires thread_root to also be set")]
+    ThreadParentWithoutRoot,
+
+    /// A thread field references the message's own `msg_id`.
+    #[error("thread field '{field}' must not equal the message's own msg_id")]
+    ThreadSelfReference { field: &'static str },
 }
 
 /// Context passed to the ingest validator. Receivers build this from
@@ -248,18 +327,48 @@ pub fn validate_public_message(
         });
     }
 
-    // 4. signature + author binding
+    // 4. threading field structural checks (cheap, no crypto — run before
+    //    signature verification so malformed gossip messages are rejected
+    //    without paying ML-DSA-65 verify cost). ADR-0029.
+    if let Some(root) = &msg.thread_root {
+        validate_thread_hex("thread_root", root)?;
+    }
+    if let Some(parent) = &msg.thread_parent {
+        validate_thread_hex("thread_parent", parent)?;
+        // parent requires root
+        if msg.thread_root.is_none() {
+            return Err(IngestError::ThreadParentWithoutRoot);
+        }
+    }
+    // Self-reference: thread_root/thread_parent must not equal the message's
+    // own msg_id. Constructing a genuinely self-referential signed message
+    // requires a BLAKE3 hash fixed-point, so this check is reachable only
+    // for tampered messages whose signature would fail anyway — but it serves
+    // as a cheap early reject before the expensive ML-DSA-65 verify.
+    let own_id = msg.msg_id();
+    if msg.thread_root.as_deref() == Some(own_id.as_str()) {
+        return Err(IngestError::ThreadSelfReference {
+            field: "thread_root",
+        });
+    }
+    if msg.thread_parent.as_deref() == Some(own_id.as_str()) {
+        return Err(IngestError::ThreadSelfReference {
+            field: "thread_parent",
+        });
+    }
+
+    // 5. signature + author binding
     msg.verify_signature()
         .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
 
-    // 5. banned authors rejected
+    // 7. banned authors rejected
     if let Some(member) = ctx.members_v2.get(&msg.author_agent_id) {
         if member.state == GroupMemberState::Banned {
             return Err(IngestError::AuthorBanned);
         }
     }
 
-    // 6. write-access policy enforcement
+    // 8. write-access policy enforcement
     let author_role = ctx
         .members_v2
         .get(&msg.author_agent_id)
@@ -350,6 +459,8 @@ mod tests {
             kind,
             body.to_string(),
             1_000,
+            None,
+            None,
         )
         .unwrap()
     }
@@ -435,6 +546,8 @@ mod tests {
             GroupPublicMessageKind::Chat,
             "x".into(),
             1_000,
+            None,
+            None,
         )
         .unwrap();
         msg.author_user_id = Some("cafebabe".into());
@@ -645,5 +758,297 @@ mod tests {
         let p = GroupPolicyPreset::PublicAnnounce.to_policy();
         assert_eq!(p.write_access, GroupWriteAccess::AdminOnly);
         assert_eq!(p.read_access, GroupReadAccess::Public);
+    }
+
+    // ── ADR-0029 threading tests ─────────────────────────────────────────
+
+    /// v1 byte-identity: a message without thread fields must produce
+    /// signable_bytes starting with the v1 domain — no v2 suffix.
+    #[test]
+    fn v1_byte_identity_no_thread_fields() {
+        let kp = make_kp();
+        let msg = build_signed_msg(&kp, "g1", "hello", GroupPublicMessageKind::Chat);
+        assert!(msg.thread_root.is_none());
+        assert!(msg.thread_parent.is_none());
+        let bytes = msg.signable_bytes();
+        assert!(
+            bytes.starts_with(PUBLIC_MESSAGE_DOMAIN),
+            "non-threaded message must use v1 domain"
+        );
+        // Must NOT contain the v2 domain bytes anywhere in the prefix position
+        assert!(!bytes.starts_with(PUBLIC_MESSAGE_DOMAIN_V2));
+    }
+
+    /// v2 domain: a threaded message uses the v2 domain.
+    #[test]
+    fn threaded_message_uses_v2_domain() {
+        let kp = make_kp();
+        let fake_root = "a".repeat(64);
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "reply".into(),
+            2_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .unwrap();
+        let bytes = msg.signable_bytes();
+        assert!(
+            bytes.starts_with(PUBLIC_MESSAGE_DOMAIN_V2),
+            "threaded message must use v2 domain"
+        );
+        assert!(!bytes.starts_with(PUBLIC_MESSAGE_DOMAIN));
+    }
+
+    /// Fail-closed: a threaded message verified with manually constructed
+    /// v1-style bytes must fail (old-node simulation).
+    #[test]
+    fn threaded_message_fails_v1_verification() {
+        let kp = make_kp();
+        let fake_root = "b".repeat(64);
+        let mut msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "reply".into(),
+            3_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .unwrap();
+        // Simulate an old node by stripping thread fields AFTER signing —
+        // the signature was computed over v2 bytes but we now present v1 bytes.
+        msg.thread_root = None;
+        msg.thread_parent = None;
+        // verify_signature recomputes v1 bytes (both None) — should fail.
+        assert!(
+            msg.verify_signature().is_err(),
+            "stripping thread fields from a v2-signed message must fail"
+        );
+    }
+
+    /// Tamper — adding thread fields to a v1-signed message fails.
+    #[test]
+    fn adding_thread_to_v1_message_fails() {
+        let kp = make_kp();
+        let mut msg = build_signed_msg(&kp, "g1", "original", GroupPublicMessageKind::Chat);
+        msg.verify_signature().unwrap(); // baseline passes
+        msg.thread_root = Some("c".repeat(64));
+        assert!(
+            msg.verify_signature().is_err(),
+            "injecting thread_root into v1-signed message must fail"
+        );
+    }
+
+    /// Tamper — clearing thread fields from a v2-signed message fails.
+    #[test]
+    fn clearing_thread_from_v2_message_fails() {
+        let kp = make_kp();
+        let fake_root = "d".repeat(64);
+        let mut msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "post".into(),
+            4_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .unwrap();
+        msg.verify_signature().unwrap(); // baseline passes
+        msg.thread_root = None;
+        msg.thread_parent = None;
+        assert!(
+            msg.verify_signature().is_err(),
+            "stripping thread fields from v2-signed message must fail"
+        );
+    }
+
+    /// msg_id determinism: same inputs → same id.
+    #[test]
+    fn msg_id_is_deterministic() {
+        let kp = make_kp();
+        let msg = build_signed_msg(&kp, "g1", "hello", GroupPublicMessageKind::Chat);
+        assert_eq!(msg.msg_id(), msg.msg_id(), "msg_id must be deterministic");
+    }
+
+    /// msg_id differs when body differs.
+    #[test]
+    fn msg_id_differs_on_different_body() {
+        let kp = make_kp();
+        let msg1 = build_signed_msg(&kp, "g1", "hello", GroupPublicMessageKind::Chat);
+        let msg2 = build_signed_msg(&kp, "g1", "world", GroupPublicMessageKind::Chat);
+        assert_ne!(msg1.msg_id(), msg2.msg_id());
+    }
+
+    /// msg_id is exactly 64 lowercase hex chars.
+    #[test]
+    fn msg_id_format() {
+        let kp = make_kp();
+        let msg = build_signed_msg(&kp, "g1", "test", GroupPublicMessageKind::Chat);
+        let id = msg.msg_id();
+        assert_eq!(id.len(), 64);
+        assert!(id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase()));
+    }
+
+    /// Ingest: bad hex rejected.
+    #[test]
+    fn ingest_rejects_bad_thread_hex() {
+        let kp = make_kp();
+        let hex_id = hex::encode(kp.agent_id().as_bytes());
+        // Build a valid v1 message then manually inject a bad thread_root.
+        // Thread structural checks now run BEFORE signature verification, so
+        // InvalidThreadField fires first (cheap reject, no crypto cost).
+        let mut msg = build_signed_msg(&kp, "g1", "x", GroupPublicMessageKind::Chat);
+        msg.thread_root = Some("not-hex".to_string()); // too short and not hex
+        let policy = open_policy();
+        let mut members = BTreeMap::new();
+        members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg).unwrap_err(),
+            IngestError::InvalidThreadField { .. }
+        ));
+    }
+
+    /// Ingest: parent-without-root rejected (pre-signature structural check).
+    #[test]
+    fn ingest_rejects_parent_without_root() {
+        let kp = make_kp();
+        let hex_id = hex::encode(kp.agent_id().as_bytes());
+        // Sign with root+parent, then strip root after signing.
+        let fake_root = "e".repeat(64);
+        let mut msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "reply".into(),
+            5_000,
+            Some(fake_root.clone()),
+            Some(fake_root),
+        )
+        .unwrap();
+        // Strip root — now parent is present without root.
+        msg.thread_root = None;
+        let policy = open_policy();
+        let mut members = BTreeMap::new();
+        members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        // Thread structural checks run BEFORE signature verification.
+        // ThreadParentWithoutRoot fires as a cheap early reject; the
+        // tampered signature is never computed.
+        assert!(matches!(
+            validate_public_message(&ctx, &msg).unwrap_err(),
+            IngestError::ThreadParentWithoutRoot
+        ));
+    }
+
+    /// Ingest: orphan parent accepted (parent not known locally is fine).
+    #[test]
+    fn ingest_accepts_orphan_parent() {
+        let kp = make_kp();
+        let hex_id = hex::encode(kp.agent_id().as_bytes());
+        let fake_root = "f".repeat(64);
+        let fake_parent = "1".repeat(64);
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "orphaned reply".into(),
+            6_000,
+            Some(fake_root),
+            Some(fake_parent),
+        )
+        .unwrap();
+        let policy = open_policy();
+        let mut members = BTreeMap::new();
+        members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        // Must succeed — the parent not being locally known is fine (ADR-0028).
+        validate_public_message(&ctx, &msg).unwrap();
+    }
+
+    /// Ingest: self-reference check is live pre-signature (after fix 2) and
+    /// serves as a cheap early reject. Because `msg_id()` = BLAKE3(signable_bytes)
+    /// and `signable_bytes` INCLUDES `thread_root`, a genuinely self-referential
+    /// message requires a BLAKE3 fixed point (x = BLAKE3(f(x))) — computationally
+    /// infeasible. When we set `thread_root = own_id` after signing, `msg_id()`
+    /// changes (different input bytes), so the self-reference check does NOT fire;
+    /// the tampered signature is what the validator rejects. This test verifies the
+    /// end-to-end rejection and documents the hash-circularity property.
+    #[test]
+    fn ingest_rejects_self_reference() {
+        let kp = make_kp();
+        let hex_id = hex::encode(kp.agent_id().as_bytes());
+        // Sign a non-threaded message first to get a stable msg_id.
+        let base = build_signed_msg(&kp, "g1", "base", GroupPublicMessageKind::Chat);
+        let base_id = base.msg_id();
+        // Sign a threaded message with root = base_id. Its own msg_id is the
+        // BLAKE3 of v2 signable bytes with thread_root=base_id.
+        let mut msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "self ref".into(),
+            7_000,
+            Some(base_id.clone()),
+            None,
+        )
+        .unwrap();
+        // Capture own_id BEFORE tampering. After we set thread_root = own_id,
+        // msg_id() will recompute from the new (tampered) signable_bytes and
+        // produce a DIFFERENT value — the self-reference check passes; sig fails.
+        let own_id = msg.msg_id();
+        msg.thread_root = Some(own_id);
+        let policy = open_policy();
+        let mut members = BTreeMap::new();
+        members.insert(hex_id.clone(), active_member(&hex_id, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        // Self-reference check is reachable only for messages whose signature
+        // would fail anyway (BLAKE3 fixed-point property). Tampering thread_root
+        // changes signable_bytes, so msg_id() ≠ old own_id and the self-reference
+        // check does not fire; InvalidSignature is the actual early reject here.
+        assert!(matches!(
+            validate_public_message(&ctx, &msg).unwrap_err(),
+            IngestError::InvalidSignature(_)
+        ));
     }
 }
