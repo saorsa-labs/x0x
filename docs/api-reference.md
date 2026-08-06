@@ -552,6 +552,48 @@ cached history:
 - `MlsEncrypted` — returns 400 (encrypted history belongs elsewhere).
 - Withdrawn groups return 409 and do not restart public-message listeners.
 
+#### Threading (ADR-0029)
+
+`POST /groups/:id/send` accepts two optional threading fields:
+
+```json
+{
+  "body": "text",
+  "thread_root":   "<64-char lowercase hex msg_id>",
+  "thread_parent": "<64-char lowercase hex msg_id>"
+}
+```
+
+- `thread_root` — `msg_id` of the first message in the thread.
+- `thread_parent` — `msg_id` of the direct parent reply target. Requires
+  `thread_root` to also be set. A direct reply to the root sets both fields
+  to the root's `msg_id` (NIP-10 semantics).
+- Both fields must be exactly 64 lowercase hex characters; 400 is returned
+  otherwise.
+
+The response includes `"msg_id"` — the stable BLAKE3 identity of the message:
+
+```json
+{ "ok": true, "msg_id": "<64-char hex>", "group_id": "...", "timestamp": ... }
+```
+
+Every message item returned by `GET /groups/:id/messages` also includes
+`"msg_id"`. The endpoint accepts an optional `thread_root=<msg_id>` query
+parameter that filters the result set to messages in that thread (the root
+message itself is included when present):
+
+```
+GET /groups/:id/messages?thread_root=<64-char hex>
+```
+
+**Compatibility:** messages without thread fields sign under the v1 domain
+(`x0x.group.public-message.v1`) and are byte-identical to the pre-ADR-0029
+wire format — old nodes accept them unchanged. Threaded messages sign under
+`x0x.group.public-message.v2`; old nodes reject them at signature
+verification (fail-closed, never mis-attributed). The referenced parent is
+not required to exist locally (partial gossip history is normal per
+ADR-0028).
+
 ### Phase D.3 — state-commit chain
 
 Each named group maintains a signed commit chain:

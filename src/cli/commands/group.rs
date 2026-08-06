@@ -392,11 +392,19 @@ pub async fn send(
     group_id: &str,
     body_text: &str,
     kind: Option<&str>,
+    thread_root: Option<&str>,
+    reply_to: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut req = json!({ "body": body_text });
     if let Some(k) = kind {
         req["kind"] = Value::String(k.to_string());
+    }
+    if let Some(root) = thread_root {
+        req["thread_root"] = Value::String(root.to_string());
+    }
+    if let Some(parent) = reply_to {
+        req["thread_parent"] = Value::String(parent.to_string());
     }
     let resp = client
         .post(&format!("/groups/{group_id}/send"), &req)

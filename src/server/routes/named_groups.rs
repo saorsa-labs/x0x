@@ -8780,6 +8780,13 @@ pub(in crate::server) struct SendGroupMessageRequest {
     /// Message kind — `"chat"` (default) or `"announcement"`.
     #[serde(default)]
     kind: Option<String>,
+    /// `msg_id` of the thread root (64 lowercase hex chars). ADR-0029.
+    #[serde(default)]
+    thread_root: Option<String>,
+    /// `msg_id` of the direct parent in the thread (64 lowercase hex chars). ADR-0029.
+    /// Requires `thread_root` to also be present.
+    #[serde(default)]
+    thread_parent: Option<String>,
 }
 
 /// POST /groups/:id/send — publish a message to the group.
@@ -8812,6 +8819,29 @@ pub(in crate::server) async fn send_group_public_message(
             StatusCode::PAYLOAD_TOO_LARGE,
             "body exceeds MAX_PUBLIC_MESSAGE_BYTES",
         );
+    }
+
+    // Validate thread fields (ADR-0029): 64 lowercase hex chars, parent ⇒ root.
+    if let Some(root) = &req.thread_root {
+        if root.len() != 64
+            || !root
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_root must be exactly 64 lowercase hex chars");
+        }
+    }
+    if let Some(parent) = &req.thread_parent {
+        if parent.len() != 64
+            || !parent
+                .bytes()
+                .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+        {
+            return bad_request("thread_parent must be exactly 64 lowercase hex chars");
+        }
+        if req.thread_root.is_none() {
+            return bad_request("thread_parent requires thread_root to also be set");
+        }
     }
 
     let signing_kp = state.agent.identity().agent_keypair();
@@ -8871,6 +8901,8 @@ pub(in crate::server) async fn send_group_public_message(
             kind,
             req.body,
             now_ms,
+            req.thread_root,
+            req.thread_parent,
         ) {
             Ok(m) => (m, direct_recipients),
             Err(e) => {
@@ -8920,6 +8952,7 @@ pub(in crate::server) async fn send_group_public_message(
     cache_public_message(&state, msg.clone()).await;
     spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
 
+    let msg_id = msg.msg_id();
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -8928,8 +8961,17 @@ pub(in crate::server) async fn send_group_public_message(
             "topic": topic,
             "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
             "timestamp": msg.timestamp,
+            "msg_id": msg_id,
         })),
     )
+}
+
+/// Query parameters for [`get_group_public_messages`].
+#[derive(Debug, serde::Deserialize, Default)]
+pub(in crate::server) struct GetMessagesQuery {
+    /// Filter to a specific thread (64 lowercase hex chars). ADR-0029.
+    #[serde(default)]
+    thread_root: Option<String>,
 }
 
 /// GET /groups/:id/messages — retrieve cached public messages.
@@ -8938,9 +8980,13 @@ pub(in crate::server) async fn send_group_public_message(
 /// token receives the history. If `MembersOnly`, only active members
 /// receive it. For `MlsEncrypted` groups, returns 400 — encrypted
 /// history belongs in a different surface.
+///
+/// Optional query parameter: `thread_root=<msg_id>` — filters to messages
+/// in that thread (root included when present). ADR-0029.
 pub(in crate::server) async fn get_group_public_messages(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    Query(query): Query<GetMessagesQuery>,
 ) -> impl IntoResponse {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Resolve the stable_group_id — the public-message cache and topic
@@ -9029,9 +9075,33 @@ pub(in crate::server) async fn get_group_public_messages(
         None => cached,
     };
 
+    // Apply thread_root filter (ADR-0029): keep messages whose thread_root
+    // matches, plus the root message itself (identified by its own msg_id).
+    let msgs: Vec<_> = if let Some(filter_root) = &query.thread_root {
+        msgs.into_iter()
+            .filter(|m| {
+                m.thread_root.as_deref() == Some(filter_root.as_str()) || &m.msg_id() == filter_root
+            })
+            .collect()
+    } else {
+        msgs
+    };
+
+    // Augment each message with its computed msg_id (ADR-0029).
+    let messages_with_id: Vec<serde_json::Value> = msgs
+        .iter()
+        .filter_map(|m| {
+            let mut v = serde_json::to_value(m).ok()?;
+            if let serde_json::Value::Object(ref mut map) = v {
+                map.insert("msg_id".to_string(), serde_json::Value::String(m.msg_id()));
+            }
+            Some(v)
+        })
+        .collect();
+
     (
         StatusCode::OK,
-        Json(serde_json::json!({ "ok": true, "messages": msgs })),
+        Json(serde_json::json!({ "ok": true, "messages": messages_with_id })),
     )
 }
 
@@ -9072,8 +9142,15 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
         payload,
         signed_artifact: Some(artifact),
         signature: hex::decode(&msg.signature).ok(),
-        // Mirrors `groups::public_message::PUBLIC_MESSAGE_DOMAIN`.
-        sig_context: Some("x0x.group.public-message.v1".to_string()),
+        // Mirrors the signing domain used for this message (ADR-0029).
+        sig_context: Some(
+            if msg.thread_root.is_some() || msg.thread_parent.is_some() {
+                "x0x.group.public-message.v2"
+            } else {
+                "x0x.group.public-message.v1"
+            }
+            .to_string(),
+        ),
         provenance: if outbound {
             x0x::history::Provenance::LocalSend
         } else {
@@ -25001,6 +25078,8 @@ mod tests {
             kind: x0x::groups::GroupPublicMessageKind::Chat,
             body: "hello".to_string(),
             timestamp: 123,
+            thread_root: None,
+            thread_parent: None,
             signature: "cc".repeat(64),
         };
 

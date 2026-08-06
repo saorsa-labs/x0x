@@ -52,6 +52,8 @@ fn sign_msg(
         kind,
         body.into(),
         1_000,
+        None,
+        None,
     )
     .unwrap()
 }
