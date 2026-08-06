@@ -2,6 +2,48 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.36.0] - 2026-08-06
+
+### Added
+
+- **First-class threading on signed public group messages (ADR-0029, PR #293).**
+  `GroupPublicMessage` gains optional `thread_root` / `thread_parent` fields and
+  a spec-defined identity `msg_id = BLAKE3(signable_bytes())` — deterministic,
+  recomputable by any verifier, and the direct analogue of Nostr's `event.id`
+  for NIP-10 bridge mapping. `POST /groups/:id/send` accepts the thread fields
+  and returns `msg_id`; `GET /groups/:id/messages` items carry `msg_id` and the
+  endpoint accepts a `?thread_root=` filter (400 on malformed input). CLI:
+  `x0x group send --thread-root/--reply-to`.
+
+  Wire compatibility: messages without thread fields remain **byte-identical
+  to the v1 signing encoding** under the v1 domain — full interop with
+  pre-0.36 nodes. Threaded messages sign under a new
+  `x0x.group.public-message.v2` domain and fail closed (signature reject) on
+  older nodes until they upgrade. Ingest validates thread-field format
+  (64-lowercase-hex, parent-implies-root) with cheap structural checks ordered
+  before ML-DSA-65 verification; orphan replies are accepted per ADR-0028's
+  delivery-order principle.
+
+  Verified by adversarial review (domain ambiguity, byte-identity, and
+  malleability explicitly cleared), frozen-vector compat tests, four
+  daemon-backed integration tests, and two 2-hour multi-daemon soaks — the
+  first soak caught a history-store regression (see Fixed), the second ran
+  clean (945/945 delivery, 0 history errors).
+
+### Fixed
+
+- **Group-public history writes were briefly rejected on the feature branch**
+  (never released): writing the ADR-0029 thread `msg_id` into
+  `HistoryRecord.msg_id` violated the store's `validate()` invariant and every
+  group-public history write was silently dropped. Reverted to the canonical
+  store key plus a regression test asserting the exact record the writer
+  builds passes validation (`group_public_history_record_passes_validate`).
+
+### Testing
+
+- `threading_integration` daemon tests enrolled in the serialized
+  `quic-localhost` nextest group (loopback QUIC startup contention flake).
+
 ## [v0.35.0] - 2026-07-29
 
 ### Security
