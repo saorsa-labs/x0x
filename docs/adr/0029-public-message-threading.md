@@ -152,7 +152,14 @@ migrate to the first-class fields, then be removed.
 
 ### Neutral / Operational
 
-- History store, dedup keys, and retention are unchanged.
+- History store, dedup keys, and retention are unchanged. Explicitly:
+  `HistoryRecord.msg_id` remains the store-internal dedup key bound by
+  `HistoryRecord::validate()` (BLAKE3 over artifact/payload) and is NOT
+  the ADR-0029 thread `msg_id` — the thread ID is exposed at the REST
+  layer and recomputable from any stored artifact via
+  `GroupPublicMessage::msg_id()`. Writing the thread ID into
+  `HistoryRecord.msg_id` violates the validate() invariant and silently
+  rejects every write (found by soak, 2026-08-06).
 - The GUI migration is follow-up work; both schemes coexist briefly.
 
 ## Validation
