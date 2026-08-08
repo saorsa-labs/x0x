@@ -9620,6 +9620,10 @@ type ReconnectTracker = std::sync::Arc<
 ///   LAN/loopback) from every successful connect/accept, so Phase 2 covers
 ///   the default global-bootstrap config where `allow_local_scope=FALSE`
 ///   filters loopback out of the discovery cache (CR-HOST-1).
+/// - Dials every candidate with the **known PeerId** (`connect_peer_with_
+///   addrs`), never address-only: ant-quic's HolePunch strategy refuses to
+///   coordinate without the target's PeerId, so an address-only dial always
+///   fails when direct paths time out (issue #295).
 /// - Self-cancels when the peer reconnects (checked via `is_connected` on each
 ///   attempt) or when the shutdown token fires.
 /// - Is **single-flight** per peer: only one reconnect task runs at a time,
@@ -9750,11 +9754,11 @@ fn schedule_reconnect(
                 }
                 match tokio::time::timeout(
                     std::time::Duration::from_secs(5),
-                    network.connect_addr(*addr),
+                    network.connect_peer_with_addrs(peer_id, vec![*addr]),
                 )
                 .await
                 {
-                    Ok(Ok(connected_peer)) if connected_peer == peer_id => {
+                    Ok(Ok((_, connected_peer))) if connected_peer == peer_id => {
                         tracing::info!(
                             target: "x0x::connect",
                             peer_id_prefix = %prefix,
@@ -9765,7 +9769,7 @@ fn schedule_reconnect(
                         connected = true;
                         break;
                     }
-                    Ok(Ok(other)) => {
+                    Ok(Ok((_, other))) => {
                         tracing::warn!(
                             target: "x0x::connect",
                             peer_id_prefix = %prefix,
@@ -14014,6 +14018,60 @@ mod tests {
             .await
             .expect("DM should succeed over the recovered connection");
         assert_eq!(receipt.path, dm::DmPath::RawQuic);
+    }
+
+    /// Regression (issue #295): `connect_cached_peer` now dials with the known
+    /// PeerId (`connect_peer_with_addrs`) instead of an address-only
+    /// `connect_addr`, so ant-quic's HolePunch strategy can coordinate. The
+    /// switch must preserve the identity invariant: a stale cache entry whose
+    /// address now serves a DIFFERENT authenticated peer must not resolve as
+    /// the requested peer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connect_cached_peer_rejects_address_serving_a_different_peer() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("carol-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+
+        let alice_network = alice.network().expect("alice network");
+        let carol_network = carol.network().expect("carol network");
+        let carol_addr =
+            normalize_loopback_addr(carol_network.bound_addr().await.expect("carol bound"));
+
+        // Poison alice's bootstrap cache: claim a victim peer lives at carol's
+        // address. The cached dial authenticates the responder and must reject
+        // it as the victim instead of reporting success for the wrong peer.
+        // ([0x42; 32] is a non-synthetic PeerId, so ant-quic retains and dials
+        // the entry normally.)
+        let victim_peer = ant_quic::PeerId([0x42; 32]);
+        alice_network
+            .bootstrap_cache()
+            .expect("alice bootstrap cache")
+            .add_from_connection(victim_peer, vec![carol_addr], None)
+            .await;
+
+        let result = alice_network.connect_cached_peer(victim_peer).await;
+        assert!(
+            result.is_err(),
+            "stale cache entry serving a different peer must not resolve \
+             as the requested peer (got {result:?})"
+        );
     }
     // ─── Reconnect-policy suppression regression tests ─────────────────────
     //

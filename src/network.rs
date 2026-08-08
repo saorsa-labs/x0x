@@ -2288,6 +2288,11 @@ impl NetworkNode {
     /// same authenticated peer. Stale cache entries that now point at a
     /// different peer are rejected.
     ///
+    /// Each dial is **peer-authenticated** (`connect_peer_with_addrs`), never
+    /// address-only: the HolePunch strategy refuses to coordinate without the
+    /// target's PeerId, so an address-only dial cannot traverse NAT even when
+    /// the PeerId is known (issue #295).
+    ///
     /// # Errors
     ///
     /// Returns `NetworkError` if the peer is not cached or none of its cached
@@ -2323,9 +2328,11 @@ impl NetworkNode {
 
         let candidate_addrs = cached_peer.preferred_addresses();
         for addr in &candidate_addrs {
-            match self.connect_addr(*addr).await {
-                Ok(connected_peer) if connected_peer == peer_id => return Ok(*addr),
-                Ok(connected_peer) => {
+            match self.connect_peer_with_addrs(peer_id, vec![*addr]).await {
+                Ok((selected_addr, connected_peer)) if connected_peer == peer_id => {
+                    return Ok(selected_addr)
+                }
+                Ok((_, connected_peer)) => {
                     warn!(
                         "Cached address {} for peer {:?} resolved to unexpected peer {:?}",
                         addr, peer_id, connected_peer
