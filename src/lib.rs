@@ -1756,6 +1756,17 @@ async fn upsert_discovered_machine(
     }
 }
 
+/// Whether a transport-observed remote address is worth keeping as a redial
+/// candidate.
+///
+/// The accept loop substitutes `0.0.0.0:0` when `remote_addr` is not a UDP
+/// socket (relayed or non-UDP transports). Neither an unspecified host nor a
+/// zero port can ever be dialed back, so caching either would only produce
+/// failing reconnect attempts.
+fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
+    !address.ip().is_unspecified() && address.port() != 0
+}
+
 async fn upsert_discovered_machine_from_agent(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
@@ -8358,18 +8369,26 @@ impl Agent {
                         // candidate set. Without this, a peer known only via an
                         // inbound connection has candidate_addrs=0 and the LAN
                         // dial that would succeed is never attempted (issue #304).
-                        // Skip the 0.0.0.0:0 placeholder the accept loop
+                        // Skip addresses that can never be dialed back --
+                        // notably the 0.0.0.0:0 placeholder the accept loop
                         // substitutes when remote_addr is not a UDP socket.
-                        if address.ip() != std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-                            || address.port() != 0
-                        {
+                        if observed_address_is_dialable(&address) {
                             let now_s = dm::now_unix_ms() / 1000;
                             upsert_discovered_machine(
                                 &machine_cache,
                                 DiscoveredMachine {
                                     machine_id,
                                     addresses: vec![address],
-                                    announced_at: now_s,
+                                    // A connection observation is NOT an
+                                    // announcement. `upsert_discovered_machine`
+                                    // treats a newer `announced_at` as authority
+                                    // to last-write-wins `reachable_via` and
+                                    // `relay_candidates`; passing `now` here
+                                    // would erase a NAT-restricted peer's
+                                    // coordinator/relay hints on every connect.
+                                    // 0 keeps the merge to what we actually
+                                    // observed: the address and `last_seen`.
+                                    announced_at: 0,
                                     last_seen: now_s,
                                     machine_public_key: Vec::new(),
                                     nat_type: None,
@@ -16790,13 +16809,10 @@ mod candidate_address_retention_tests {
         let machine_id = MachineId([0x01u8; 32]);
         let zero_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
 
-        // The PeerConnected handler skips insertion when address is 0.0.0.0:0.
-        // Simulate what the guard in the handler checks.
-        let is_placeholder = zero_addr.ip()
-            == std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
-            && zero_addr.port() == 0;
-
-        if !is_placeholder {
+        // Call the SAME predicate the PeerConnected handler gates on, rather
+        // than duplicating its expression here -- a copy would keep passing if
+        // the production guard were broken.
+        if super::observed_address_is_dialable(&zero_addr) {
             let now_s = crate::dm::now_unix_ms() / 1000;
             upsert_discovered_machine(
                 &cache,
