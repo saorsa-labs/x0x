@@ -18173,6 +18173,14 @@ const NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT: Duration = PENDING_JOIN_RESULT_TTL;
 /// Retention for recorded expected join-result inviters. Must cover the
 /// longest join-result poll window so late roster-repair responses are still
 /// accepted instead of rejected as `missing_expected_inviter`.
+///
+/// This is a single retention for ALL planes, so pinning it to the non-TreeKEM
+/// window also widens TreeKEM pins from 120s to 600s. That is deliberate and
+/// harmless: a TreeKEM poll clears its own pin at `JOIN_RESULT_POLL_TIMEOUT`,
+/// so the longer retention only affects entries whose poll task died without
+/// clearing. A pin authorizes nothing on its own — it names the one inviter
+/// whose `MemberAdded` this joiner will consider, and the event still goes
+/// through `apply_named_group_metadata_event`.
 const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT;
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
