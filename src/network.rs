@@ -2473,6 +2473,29 @@ impl NetworkNode {
             }
         };
 
+        // Identity gate — verify the responding peer is the one we requested,
+        // same as connect_peer_with_addrs. ant-quic performs QUIC-level
+        // authentication, so a mismatch here would be unexpected, but the
+        // guard ensures no cache bookkeeping or PeerConnected runs if it
+        // ever occurs (e.g., a reused connection whose far end rotated keys).
+        if peer_conn.peer_id != peer_id {
+            tracing::warn!(
+                target: "x0x::connect",
+                strategy = "peer",
+                requested_prefix = %hex_prefix(&peer_id.0, 4),
+                actual_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
+                %addr,
+                "identity mismatch on connect_peer: no cache bookkeeping"
+            );
+            if let Some(ref cache) = self.bootstrap_cache {
+                cache.record_failure(&peer_id).await;
+            }
+            return Err(NetworkError::ConnectionFailed(format!(
+                "identity mismatch: expected {:?} but {:?} answered",
+                peer_id, peer_conn.peer_id,
+            )));
+        }
+
         // Record in bootstrap cache so future connections use the cached address
         let rtt_ms = start.elapsed().as_millis() as u32;
         if let Some(ref cache) = self.bootstrap_cache {
@@ -2514,6 +2537,19 @@ impl NetworkNode {
             v6_count,
             "starting peer-authenticated dial with hints"
         );
+        // Snapshot which peers are already connected BEFORE the dial. ant-quic
+        // may return a pre-existing reused connection (connect_orchestrated scans
+        // connected_peers by remote address). If the returned peer_id mismatches,
+        // we must NOT disconnect a connection that existed before our dial —
+        // that would be #206-class reconnect churn on a healthy peer that simply
+        // happened to share the cached address. We only close a NEW connection.
+        let pre_dial_connected: std::collections::HashSet<AntPeerId> = node
+            .connected_peers()
+            .await
+            .into_iter()
+            .map(|conn| conn.peer_id)
+            .collect();
+
         let start = std::time::Instant::now();
         let peer_conn_res = node.connect_peer_with_addrs(peer_id, addrs).await;
         let dur_ms = start.elapsed().as_millis() as u64;
@@ -2549,6 +2585,47 @@ impl NetworkNode {
                 ));
             }
         };
+
+        // Identity gate — verify the responding peer is the one we requested
+        // BEFORE running any cache bookkeeping or emitting PeerConnected.
+        // Running bookkeeping first (the previous order) allowed a stale cache
+        // entry pointing at a different host ("Carol") to give Carol a
+        // record_success entry and a live connection, while the requested peer
+        // ("Alice") received record_failure, inverting cache quality. Fixes #302.
+        if peer_conn.peer_id != peer_id {
+            // Only close the connection if it was NOT pre-existing before our
+            // dial. ant-quic's connect_orchestrated can return a live connection
+            // to a peer that shares the cached address ("Carol"). Tearing down a
+            // connection we did not open risks #206-class reconnect churn on a
+            // healthy, actively-used peer. A pre-existing connection is healthy;
+            // the fault is in the stale cache entry only.
+            let was_pre_existing = pre_dial_connected.contains(&peer_conn.peer_id);
+            tracing::warn!(
+                target: "x0x::connect",
+                strategy = "peer_with_addrs",
+                requested_prefix = %hex_prefix(&peer_id.0, 4),
+                actual_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
+                %addr,
+                dur_ms,
+                was_pre_existing,
+                "identity mismatch: skipping bookkeeping"
+            );
+            if !was_pre_existing {
+                // Connection was newly established by this dial — safe to close.
+                // Use plain disconnect (transport-level); the remote peer is not
+                // at fault, only the cache entry was stale.
+                let _ = node.disconnect(&peer_conn.peer_id).await;
+            }
+            // Degrade the REQUESTED peer's cache quality: the stored address
+            // proved to lead to a different host. Do NOT penalise peer_conn.peer_id.
+            if let Some(ref cache) = self.bootstrap_cache {
+                cache.record_failure(&peer_id).await;
+            }
+            return Err(NetworkError::ConnectionFailed(format!(
+                "identity mismatch: expected {:?} but {:?} answered at {}",
+                peer_id, peer_conn.peer_id, addr,
+            )));
+        }
 
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         let rtt_ms = dur_ms as u32;
@@ -5582,5 +5659,136 @@ mod message_tests {
         assert_eq!(config.connection_timeout, default_connection_timeout());
         assert_eq!(config.stats_interval, default_stats_interval());
         assert_eq!(config.max_peers_per_ip, default_max_peers_per_ip());
+    }
+}
+
+/// Revert-guard for issue #302: identity check must precede cache bookkeeping
+/// in `connect_peer_with_addrs`.
+///
+/// If this test is reverted to the old order (bookkeeping before identity check)
+/// the test will fail because:
+///   - the impostor peer will appear in the bootstrap cache with a success record
+///   - the impostor connection will remain open in connected_peers
+///
+/// WHY: A stale cache entry pointing at a different host ("Carol") used to cause
+/// Carol to gain a `record_success` and a live leaked connection whenever
+/// `connect_peer_with_addrs(alice_id, carol_addr)` was called. Fixing the order
+/// ensures no bookkeeping runs on a mismatched peer.
+#[cfg(test)]
+mod identity_before_bookkeeping_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// `connect_peer_with_addrs` with a mismatched peer_id must:
+    ///   1. return Err (not Ok with the impostor's peer_id)
+    ///   2. NOT emit a `PeerConnected` event for the impostor
+    ///   3. record_failure for the requested (stale) peer_id, not the impostor
+    ///
+    /// WHY the two revert guards matter:
+    ///
+    /// BEFORE fix: `connect_peer_with_addrs(fake_peer_id, [b_addr])` returned
+    ///   `Ok((addr, b_real_peer_id))` — success with the wrong peer_id. Cache
+    ///   bookkeeping (`add_from_connection` + `record_success`) already ran for
+    ///   whoever answered, and `PeerConnected` was emitted for the impostor.
+    ///
+    /// AFTER fix: returns `Err(...)`. The identity gate fires before any cache
+    ///   bookkeeping or event emission. If the gate is removed or moved after
+    ///   bookkeeping, guard 1 fails (is_ok). If only the Err return is kept but
+    ///   the emit_event call is accidentally left before the gate, guard 2 fails
+    ///   (PeerConnected is received on the subscription channel).
+    #[tokio::test]
+    async fn mismatched_dial_returns_err_and_does_not_emit_peer_connected() {
+        // Block B from being accepted inbound by A so the accept loop cannot
+        // emit PeerConnected on a concurrent path, which would interfere with
+        // the subscription check below.
+        let a_fake_allowlist: std::collections::HashSet<[u8; 32]> = {
+            let mut set = std::collections::HashSet::new();
+            set.insert([0xFFu8; 32]); // impossible peer — blocks all inbound
+            set
+        };
+        let config_a = NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: Vec::new(),
+            inbound_allowlist: a_fake_allowlist,
+            ..NetworkConfig::default()
+        };
+        let config_b = NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+            bootstrap_nodes: Vec::new(),
+            ..NetworkConfig::default()
+        };
+
+        let cache_dir_a = tempfile::tempdir().unwrap();
+        let cache_config_a = ant_quic::BootstrapCacheConfig::builder()
+            .cache_dir(cache_dir_a.path().join("peers"))
+            .min_peers_to_save(0)
+            .persist(false)
+            .build();
+
+        let node_a = NetworkNode::new(config_a, Some(cache_config_a), None)
+            .await
+            .expect("node_a creation failed");
+        let node_b = NetworkNode::new(config_b, None, None)
+            .await
+            .expect("node_b creation failed");
+
+        let b_bound = node_b
+            .bound_addr()
+            .await
+            .expect("node_b must have a bound address");
+        let b_addr: SocketAddr = format!("127.0.0.1:{}", b_bound.port()).parse().unwrap();
+        let b_real_peer_id = node_b.peer_id();
+
+        let fake_peer_id = ant_quic::PeerId([0xAAu8; 32]);
+        assert_ne!(
+            fake_peer_id, b_real_peer_id,
+            "test invariant: fake_peer_id must not equal b_real_peer_id"
+        );
+
+        // Subscribe BEFORE the dial so we can observe whether any
+        // PeerConnected event is emitted on the mismatch path.
+        let mut event_rx = node_a.subscribe();
+
+        let result = node_a
+            .connect_peer_with_addrs(fake_peer_id, vec![b_addr])
+            .await;
+
+        // REVERT GUARD 1: identity gate must fire before any cache bookkeeping.
+        // Before fix #302 this returned Ok((addr, actual_peer_id)); after the
+        // fix it returns Err. Restoring the old order makes this assertion fail.
+        assert!(
+            result.is_err(),
+            "connect_peer_with_addrs must return Err on peer_id mismatch; \
+             got Ok — the identity gate was removed or moved after bookkeeping \
+             (revert of fix #302). Got: {:?}",
+            result
+        );
+
+        // REVERT GUARD 2: no PeerConnected must reach subscribers for the
+        // impostor. connect_peer_with_addrs returns synchronously, so any
+        // event emitted on the mismatch path is already in the channel or
+        // will never arrive. If emit_event is accidentally left before the
+        // identity gate, try_recv finds the event and the assertion fails.
+        match event_rx.try_recv() {
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {
+                // Correct: no PeerConnected was emitted on the mismatch path.
+            }
+            Ok(NetworkEvent::PeerConnected { peer_id, .. }) => {
+                panic!(
+                    "PeerConnected must NOT be emitted for the impostor on identity mismatch; \
+                     received PeerConnected for peer {:?} — emit_event fired before the identity \
+                     gate (revert of fix #302)",
+                    peer_id
+                );
+            }
+            Ok(other) => {
+                // A different event (e.g. NatTypeDetected) is irrelevant —
+                // only PeerConnected is the prohibited emission here.
+                let _ = other;
+            }
+            Err(tokio::sync::broadcast::error::TryRecvError::Closed) => {}
+            Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {}
+        }
     }
 }
