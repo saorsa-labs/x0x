@@ -9902,13 +9902,15 @@ pub(in crate::server) async fn join_group_via_invite(
                 BASE64.encode(signing_kp.public_key().as_bytes())
             };
             let stable_id_for_event = info.stable_group_id().to_string();
-            if invite_is_treekem {
-                record_expected_join_result_inviter(
-                    state.as_ref(),
-                    join_result_key(&stable_id_for_event, &joiner_hex),
-                    invite.inviter.clone(),
-                );
-            }
+            // Both planes record the expected join-result inviter: TreeKEM
+            // joins poll for the Welcome-bearing commit, non-TreeKEM joins
+            // poll for the authoritative MemberAdded roster commit so a
+            // missed commit is repairable after the join window (#297).
+            record_expected_join_result_inviter(
+                state.as_ref(),
+                join_result_key(&stable_id_for_event, &joiner_hex),
+                invite.inviter.clone(),
+            );
             let display_name_for_event = req.display_name.clone();
             let canonical = canonical_member_joined_bytes(
                 &info.mls_group_id,
@@ -9997,22 +9999,26 @@ pub(in crate::server) async fn join_group_via_invite(
                     );
                 }
             }
-            if invite_is_treekem {
-                let state_for_poll = Arc::clone(&state);
-                let group_id_for_poll = group_id_hex.clone();
-                let event_group_id_for_poll = info.stable_group_id().to_string();
-                let member_for_poll = joiner_hex.clone();
-                tokio::spawn(async move {
-                    poll_join_result_until_treekem_ready(
-                        state_for_poll,
-                        group_id_for_poll,
-                        event_group_id_for_poll,
-                        inviter,
-                        member_for_poll,
-                    )
-                    .await;
-                });
-            }
+            // Poll the join authority for the authoritative join result.
+            // TreeKEM joins converge when the TreeKEM group is installed;
+            // non-TreeKEM joins converge once the local roster lists the
+            // joiner as an active member, repairing a MemberAdded commit
+            // missed during the join window (#297).
+            let state_for_poll = Arc::clone(&state);
+            let group_id_for_poll = group_id_hex.clone();
+            let event_group_id_for_poll = info.stable_group_id().to_string();
+            let member_for_poll = joiner_hex.clone();
+            tokio::spawn(async move {
+                poll_join_result_until_membership_confirmed(
+                    state_for_poll,
+                    group_id_for_poll,
+                    event_group_id_for_poll,
+                    inviter,
+                    member_for_poll,
+                    invite_is_treekem,
+                )
+                .await;
+            });
 
             // Announce join on the chat topic so the inviter sees us —
             // fire-and-forget. The result was already discarded pre-fix,
@@ -18158,6 +18164,25 @@ const PENDING_JOIN_RESULT_TTL: Duration = Duration::from_secs(10 * 60);
 
 const JOIN_RESULT_POLL_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// Non-TreeKEM joins have no TreeKEM Welcome to converge on, so their repair
+/// poll runs for as long as the authority keeps the staged `MemberAdded`
+/// commit (`PENDING_JOIN_RESULT_TTL`): a commit missed during the join window
+/// stays pullable for the whole staging lifetime (#297).
+const NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT: Duration = PENDING_JOIN_RESULT_TTL;
+
+/// Retention for recorded expected join-result inviters. Must cover the
+/// longest join-result poll window so late roster-repair responses are still
+/// accepted instead of rejected as `missing_expected_inviter`.
+///
+/// This is a single retention for ALL planes, so pinning it to the non-TreeKEM
+/// window also widens TreeKEM pins from 120s to 600s. That is deliberate and
+/// harmless: a TreeKEM poll clears its own pin at `JOIN_RESULT_POLL_TIMEOUT`,
+/// so the longer retention only affects entries whose poll task died without
+/// clearing. A pin authorizes nothing on its own — it names the one inviter
+/// whose `MemberAdded` this joiner will consider, and the event still goes
+/// through `apply_named_group_metadata_event`.
+const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT;
+
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
@@ -18203,7 +18228,7 @@ fn record_expected_join_result_inviter(state: &AppState, key: String, inviter_ag
         );
         return;
     };
-    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected.retain(|_, pending| pending.created_at.elapsed() < EXPECTED_JOIN_RESULT_INVITER_TTL);
     expected.insert(
         key,
         ExpectedJoinResultInviter {
@@ -18220,7 +18245,7 @@ fn expected_join_result_inviter(state: &AppState, key: &str) -> Option<String> {
         );
         return None;
     };
-    expected.retain(|_, pending| pending.created_at.elapsed() < JOIN_RESULT_POLL_TIMEOUT);
+    expected.retain(|_, pending| pending.created_at.elapsed() < EXPECTED_JOIN_RESULT_INVITER_TTL);
     expected
         .get(key)
         .map(|pending| pending.inviter_agent_id.clone())
@@ -18445,18 +18470,47 @@ pub(in crate::server) async fn handle_join_result_message(
     }
 }
 
-async fn poll_join_result_until_treekem_ready(
+/// Poll the join authority for the authoritative join result until the join
+/// is locally confirmed, re-requesting the staged `MemberAdded` commit every
+/// `JOIN_RESULT_POLL_INTERVAL`.
+///
+/// Confirmation depends on the secure plane: TreeKEM joins (`await_treekem`)
+/// converge once the TreeKEM group is installed, i.e. the Welcome carried by
+/// the join result has been processed. Non-TreeKEM joins have no key schedule
+/// to converge; they converge once the local roster lists the joiner as an
+/// active member, and poll for the longer
+/// `NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT` so a `MemberAdded` commit missed
+/// during the join window (e.g. a gossip connection dropping right after the
+/// join was accepted) is repaired instead of leaving the joiner permanently
+/// absent from its own roster and write-locked with a 403 (#297).
+async fn poll_join_result_until_membership_confirmed(
     state: Arc<AppState>,
     group_id: String,
     event_group_id: String,
     inviter: AgentId,
     member_agent_id: String,
+    await_treekem: bool,
 ) {
-    let deadline = tokio::time::Instant::now() + JOIN_RESULT_POLL_TIMEOUT;
+    let timeout = if await_treekem {
+        JOIN_RESULT_POLL_TIMEOUT
+    } else {
+        NON_TREEKEM_JOIN_RESULT_POLL_TIMEOUT
+    };
+    let deadline = tokio::time::Instant::now() + timeout;
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
     let mut timed_out = true;
     while tokio::time::Instant::now() < deadline {
-        if state.treekem_groups.read().await.contains_key(&group_id) {
+        let confirmed = if await_treekem {
+            state.treekem_groups.read().await.contains_key(&group_id)
+        } else {
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|info| info.has_member(&member_agent_id))
+        };
+        if confirmed {
             timed_out = false;
             break;
         }
@@ -18513,7 +18567,7 @@ async fn poll_join_result_until_treekem_ready(
     }
     clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     if timed_out {
-        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), "timed out polling anchor for TreeKEM join result");
+        tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; membership remains unconfirmed");
     }
 }
 
@@ -19778,6 +19832,84 @@ mod tests {
             .context("read response body")?;
         let body = serde_json::from_slice(&bytes).context("decode response body")?;
         Ok((status, body))
+    }
+
+    /// Why: #297 — a non-TreeKEM joiner that missed the authority's
+    /// `MemberAdded` commit during the join window had no repair path and
+    /// stayed absent from its own roster permanently (silent 403 on every
+    /// send). The roster-repair poll must keep pulling the staged join result
+    /// from the inviter while the local roster lacks the joiner, and must
+    /// stop — dropping the expected-inviter pin — as soon as the roster lists
+    /// the joiner as active, with no TreeKEM group ever being installed.
+    #[tokio::test]
+    async fn non_treekem_join_result_poll_repairs_roster_then_stops() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let (info, owner_hex) = sole_owner_group();
+        let group_id = info.mls_group_id.clone();
+        let event_group_id = info.stable_group_id().to_string();
+        let joiner_hex = "bb".repeat(32);
+        let inviter = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let expected_key = join_result_key(&event_group_id, &joiner_hex);
+        record_expected_join_result_inviter(
+            state.as_ref(),
+            expected_key.clone(),
+            hex::encode(inviter.as_bytes()),
+        );
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let poll_state = Arc::clone(&state);
+        let poll_group_id = group_id.clone();
+        let poll_member = joiner_hex.clone();
+        let poll = tokio::spawn(async move {
+            poll_join_result_until_membership_confirmed(
+                poll_state,
+                poll_group_id,
+                event_group_id,
+                inviter,
+                poll_member,
+                false,
+            )
+            .await;
+        });
+
+        // The roster does not list the joiner yet, so the repair poll must
+        // still be running (it re-requests the staged commit every interval).
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !poll.is_finished(),
+            "non-TreeKEM repair poll exited before roster membership was confirmed"
+        );
+
+        // The missed commit finally lands (gossip redelivery or a fetch
+        // response): the roster now lists the joiner as an active member.
+        {
+            let mut groups = state.named_groups.write().await;
+            let info = groups
+                .get_mut(&group_id)
+                .context("group must exist in test state")?;
+            info.add_member(
+                joiner_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(owner_hex),
+                None,
+            );
+        }
+
+        // A poll iteration can be parked inside a failing send attempt for
+        // multiple per-attempt timeouts; the confirmation check runs at the
+        // top of the next iteration, so allow ample slack.
+        tokio::time::timeout(Duration::from_secs(90), poll)
+            .await
+            .context("repair poll must stop once the roster lists the joiner")??;
+        assert!(
+            expected_join_result_inviter(state.as_ref(), &expected_key).is_none(),
+            "expected-inviter pin must be dropped when the repair poll stops"
+        );
+        Ok(())
     }
 
     #[tokio::test]
