@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.36.1] - 2026-08-08
+
+Hardening-only release. **It does not fix the asymmetric group-message delivery
+bug** that is currently under investigation (x0x #296, #302): Stage-1 acceptance
+for a candidate fix failed, and the investigation remains open. What ships here
+is transport and join-path hardening that was verified on its own terms — see
+*Known issues* below for what is still broken.
+
+### Fixed
+
+- **ant-quic 0.27.35 → 0.27.36 — silent permanent send-stall (ant-quic #230).**
+  When a path was abandoned, its in-flight packets were debited from the
+  surviving paths, underflowing the `InFlight` counter. The congestion
+  controller then believed the window was permanently full and never sent
+  again — a connection that looked healthy but could no longer transmit. The
+  underflow wraps silently in every prior release build, so this affects all
+  x0x versions up to and including v0.36.0. The same bump brings endpoint-driver
+  supervision and respawn instead of a terminal latched `driver_lost`
+  (ant-quic #220), a synthetic peer-ID leak fix (ant-quic #221), and session-cap
+  hardening (ant-quic #215).
+
+- **mDNS plane isolation.** `x0xd` now sets ant-quic's `mdns_namespace` from the
+  resolved gossip plane id. Previously, co-located daemons on different planes
+  (prod / testnet / test) still found each other over the shared ant-quic mDNS
+  service and auto-connected on the LAN, so the plane gate only rejected the
+  peer *after* the connection already existed. Prod (`x0x.prod`) and testnet now
+  occupy distinct namespaces; the explicit open-plane opt-out
+  (`network_id = ""`) still maps to ant-quic's default of no namespace.
+  Verified in live testing.
+
+- **Proactive reconnect keeps the peer's identity (#295, PR #298).** The
+  proactive redial path knew the target `PeerId` but dialled bare addresses.
+  ant-quic's hole-punch strategy refuses address-only dialling, so every
+  reconnect silently degraded to direct-only and failed whenever the stale
+  connection blocked direct dials. Proactive reconnect and bootstrap-cache
+  fallback now both use peer-authenticated `connect_peer_with_addrs`, and a
+  stale cached address that authenticates as a *different* peer is rejected.
+  Verified in live testing; recovery in degraded topologies is still limited —
+  tracked in the open investigation below.
+
+- **Non-TreeKEM group joins repair their own roster (#297, PR #299).** Only
+  TreeKEM joins entered the post-join result polling path. A non-TreeKEM joiner
+  that missed the authoritative `MemberAdded` commit had no retry mechanism and
+  stayed absent from its own roster indefinitely, so every send failed with 403.
+  Non-TreeKEM joins now poll the authority until roster membership is confirmed
+  or the 10-minute staged-result retention window expires; TreeKEM joins keep
+  their existing 120-second Welcome convergence path. This is groundwork — its
+  full effectiveness depends on transport fixes still in progress.
+
+### Known issues
+
+- The asymmetric group-delivery investigation is **still open**: x0x #296 and
+  #302, ant-quic #234, #235 and #238, and saorsa-gossip #32. Nothing in this
+  release should be read as closing them.
+
 ## [v0.36.0] - 2026-08-06
 
 ### Added
