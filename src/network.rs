@@ -1611,6 +1611,11 @@ impl NetworkNode {
         // isolation.
         if let Some(id) = &config.network_id {
             validate_plane_id(id).map_err(NetworkError::NodeCreation)?;
+            // Isolate LAN discovery by plane as well. Without a namespace,
+            // co-located daemons on different planes still find each other via
+            // the shared `ant-quic` mDNS service and auto-connect, so the plane
+            // gate only ever rejects them after the connection exists.
+            builder = builder.mdns_namespace(id.clone());
         }
 
         let node = Node::with_config(builder.build()).await.map_err(|e| {
