@@ -346,7 +346,19 @@ impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
             (Some(s), Some(pk)) if msg.verified => (s, pk.to_vec()),
-            _ => return,
+            _ => {
+                // Real unverified-drop site (issue #296): count here before
+                // discarding so the server-layer typed-payload handler never
+                // sees these messages and does not need its own copy of this
+                // check.
+                self.dm.record_incoming_signature_failed();
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "inbound_unverified_drop",
+                    "dropped unverified pubsub message before envelope decode"
+                );
+                return;
+            }
         };
 
         if msg.payload.len() > MAX_ENVELOPE_BYTES {
@@ -424,6 +436,11 @@ impl InboxPipeline {
 
         if envelope.sender_agent_id != *pubsub_sender.as_bytes() {
             self.dm.record_incoming_signature_failed();
+            tracing::debug!(
+                target: "dm.trace",
+                stage = "inbound_sender_id_mismatch",
+                "dropped DM: envelope sender_agent_id does not match gossip-layer sender"
+            );
             return;
         }
 
@@ -1918,5 +1935,42 @@ mod tests {
         let debug = format!("{:?}", config);
         assert!(debug.contains("silent_reject"));
         assert!(debug.contains("typed_payload_routes"));
+    }
+
+    // ── Unverified drop path instrumentation (issue #296) ─────────────
+
+    /// The REAL drop site for unverified pubsub messages is dm_inbox.rs, NOT
+    /// server/mod.rs. The typed-payload handler in server/mod.rs only fires
+    /// after the inbox pipeline has already verified and dispatched the message
+    /// — typed.verified is hardcoded to true there, so any !typed.verified
+    /// check in server/mod.rs is unreachable dead code. This test is the
+    /// revert-guard: if the counter call is removed from handle_incoming the
+    /// test fails even though the dead server-layer check is still in place.
+    #[tokio::test]
+    async fn unverified_pubsub_message_increments_signature_failed_counter() {
+        let sender = test_keypair();
+        let harness = make_inbox_harness(&sender, None, None).await;
+        let dm = Arc::clone(&harness.pipeline.dm);
+
+        let msg = PubSubMessage {
+            topic: "test-inbox-topic".to_string(),
+            payload: bytes::Bytes::new(),
+            sender: None,
+            sender_public_key: None,
+            verified: false,
+            trust_level: None,
+            raw_envelope: None,
+        };
+
+        let before = dm.diagnostics_snapshot().stats.incoming_signature_failed;
+        harness.pipeline.handle_incoming(msg, false).await;
+        let after = dm.diagnostics_snapshot().stats.incoming_signature_failed;
+
+        assert_eq!(
+            after - before,
+            1,
+            "unverified PubSubMessage must increment incoming_signature_failed \
+             at the real drop site in dm_inbox (issue #296)"
+        );
     }
 }

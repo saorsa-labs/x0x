@@ -1186,13 +1186,11 @@ pub async fn serve_with_options(
         let public_dm_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = group_public_dm_rx.recv().await {
-                if !typed.verified {
-                    continue;
-                }
                 let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
                 else {
                     continue;
                 };
+
                 let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
                 else {
                     tracing::debug!(

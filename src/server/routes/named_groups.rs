@@ -8873,6 +8873,14 @@ pub(in crate::server) async fn send_group_public_message(
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
+                    state
+                        .groups_diagnostics
+                        .record_sender_write_policy_rejection(info.stable_group_id());
+                    tracing::warn!(
+                        group_id = %info.stable_group_id(),
+                        author = %local_hex,
+                        "rejected public group send: members-only write policy"
+                    );
                     return forbidden("members-only write policy");
                 }
             }

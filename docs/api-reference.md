@@ -1027,6 +1027,17 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 
+### `GET /diagnostics/groups`
+
+Per-group counters for the public-message ingest pipeline and the sender-side write-policy gate. Each row in `groups` corresponds to a locally-known group.
+
+Key counter fields (flattened into each group row):
+
+| Field | Side | Meaning |
+|---|---|---|
+| `messages_dropped_write_policy_violation` | Receiver | Inbound public messages rejected by the ingest pipeline for write-policy reasons (e.g. `MembersOnly` author not in `members_v2`). The canary for the join-roster-propagation regression: a spike here on the owner side after a joiner posts means `members_v2` is stale. |
+| `sends_rejected_write_policy` | Sender | Outgoing sends from this daemon rejected locally by a members-only write-access policy. A non-zero value means this daemon is absent from its own roster copy. Tracked separately so operators can distinguish "I cannot see joiners" from "I am missing from my own roster". |
+
 ### `GET /diagnostics/connect`
 
 Connect-ACL policy summary and allow/deny counters. Counters read `0` until the T4 forwarder (issue #132) is wired.
