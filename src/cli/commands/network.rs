@@ -117,11 +117,15 @@ pub async fn diagnostics_dm(client: &DaemonClient) -> Result<()> {
 /// Prints per-group ingest counters: `members_v2_size`, metadata/public
 /// listener state, accepted message count, last-message-at, and per-reason
 /// drop buckets (`decode_failed`, `author_banned`,
-/// `write_policy_violation`, `signature_failed`, `other`). The
-/// `write_policy_violation` bucket is the canary for the
-/// join-roster-propagation regression — non-zero on the owner side means
-/// joiners' messages reached the listener but the owner's `members_v2`
-/// view is missing them.
+/// `write_policy_violation`, `signature_failed`, `other`).
+///
+/// `write_policy_violation` counts two distinct events, so read it together
+/// with the WARN that accompanies each increment. On the owner side it is the
+/// canary for the join-roster-propagation regression — joiners' messages
+/// reached the listener but the owner's `members_v2` view is missing them. On
+/// the sender side it also counts this daemon's OWN outgoing sends rejected
+/// locally by a members-only policy, which instead means this daemon is
+/// absent from its own roster copy.
 pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/groups").await
 }
