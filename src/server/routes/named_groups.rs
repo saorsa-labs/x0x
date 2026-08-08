@@ -8875,7 +8875,7 @@ pub(in crate::server) async fn send_group_public_message(
                 if caller_role.is_none() {
                     state
                         .groups_diagnostics
-                        .record_write_policy_violation(info.stable_group_id());
+                        .record_sender_write_policy_rejection(info.stable_group_id());
                     tracing::warn!(
                         group_id = %info.stable_group_id(),
                         author = %local_hex,

@@ -606,14 +606,14 @@ pub(in crate::server) async fn gossip_diagnostics(
 /// `members_v2_size`, listener-state booleans, and the per-reason
 /// drop buckets used by the public-message ingest pipeline.
 ///
-/// `messages_dropped_write_policy_violation` aggregates two distinct
-/// events; the WARN emitted alongside each increment distinguishes them.
-/// Receiver side, it is the canary for the join-roster-propagation
-/// regression: a non-zero value on the owner side means joiners'
-/// messages are reaching the listener but `members_v2` is stale.
-/// Sender side, it also counts this daemon's own outgoing sends
-/// rejected locally by a members-only policy, which instead means this
-/// daemon is missing from its own roster copy.
+/// `messages_dropped_write_policy_violation` is the receiver-side canary
+/// for the join-roster-propagation regression: a non-zero value on the
+/// owner side means joiners' messages are reaching the listener but
+/// `members_v2` is stale.
+///
+/// `sends_rejected_write_policy` is tracked separately and counts this
+/// daemon's own outgoing sends rejected locally by a members-only policy;
+/// a non-zero value means this daemon is absent from its own roster copy.
 pub(in crate::server) async fn groups_diagnostics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {

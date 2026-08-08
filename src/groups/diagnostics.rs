@@ -36,7 +36,17 @@ pub struct GroupCounters {
     pub messages_dropped_author_banned: u64,
     /// Public messages rejected by `validate_public_message` for write-access
     /// policy reasons (e.g. `MembersOnly` author not in `members_v2`).
+    /// This is the ingest (receiver-side) canary for the join-roster-propagation
+    /// regression: a non-zero value means joiners' messages are reaching this
+    /// node's listener but `members_v2` is stale. See also
+    /// `sends_rejected_write_policy` for the sender-side count.
     pub messages_dropped_write_policy_violation: u64,
+    /// Outgoing public group sends that were rejected locally by a members-only
+    /// write-access policy. A non-zero value means THIS daemon is not present in
+    /// its own local roster copy. Tracked separately from
+    /// `messages_dropped_write_policy_violation` (the receiver-side ingest
+    /// canary) so that operators can distinguish the two failure modes.
+    pub sends_rejected_write_policy: u64,
     /// Public messages whose author signature failed to verify, or whose
     /// `author_agent_id` did not match the derived AgentId.
     pub messages_dropped_signature_failed: u64,
@@ -167,14 +177,31 @@ impl GroupsDiagnostics {
         });
     }
 
-    /// Record a `WritePolicyViolation` rejection — the headline counter for
-    /// the join-roster-propagation regression: a sudden jump on the owner
-    /// side immediately after a joiner posts means the owner's
+    /// Record a receiver-side `WritePolicyViolation` rejection — the headline
+    /// counter for the join-roster-propagation regression: a sudden jump on
+    /// the owner side immediately after a joiner posts means the owner's
     /// `members_v2` has not converged yet.
+    ///
+    /// Call this on the INGEST path only. For outgoing sends rejected locally
+    /// by a members-only policy, use `record_sender_write_policy_rejection`.
     pub fn record_write_policy_violation(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.messages_dropped_write_policy_violation =
                 c.messages_dropped_write_policy_violation.saturating_add(1);
+        });
+    }
+
+    /// Record a sender-side write-policy rejection: this daemon attempted to
+    /// send a public group message but was refused because it is not in the
+    /// local `members_v2` roster for a members-only group.
+    ///
+    /// Tracked in a separate field (`sends_rejected_write_policy`) from the
+    /// receiver-side ingest counter (`messages_dropped_write_policy_violation`)
+    /// so operators can distinguish "I cannot see joiners" from "I am missing
+    /// from my own roster".
+    pub fn record_sender_write_policy_rejection(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.sends_rejected_write_policy = c.sends_rejected_write_policy.saturating_add(1);
         });
     }
 
@@ -312,6 +339,9 @@ impl GroupsDiagnostics {
             dst.messages_dropped_write_policy_violation = dst
                 .messages_dropped_write_policy_violation
                 .saturating_add(src.messages_dropped_write_policy_violation);
+            dst.sends_rejected_write_policy = dst
+                .sends_rejected_write_policy
+                .saturating_add(src.sends_rejected_write_policy);
             dst.messages_dropped_signature_failed = dst
                 .messages_dropped_signature_failed
                 .saturating_add(src.messages_dropped_signature_failed);
@@ -468,6 +498,46 @@ mod tests {
         );
         assert!(!g2.subscribed_metadata);
         assert!(!g2.subscribed_public);
+    }
+
+    /// Verify that the receiver-side ingest counter and the sender-side
+    /// rejection counter move independently.
+    ///
+    /// Before the fix the sender-side rejection incremented
+    /// `messages_dropped_write_policy_violation` (the same field as the
+    /// receiver-side ingest counter), destroying its meaning as the
+    /// join-roster-propagation canary. After the fix the two fields are
+    /// distinct: an ingest drop bumps `messages_dropped_write_policy_violation`
+    /// while a local send rejection bumps `sends_rejected_write_policy`.
+    ///
+    /// If the sender-side call is changed back to
+    /// `record_write_policy_violation`, the `sends_rejected_write_policy`
+    /// assertion fails (stays 0) and the `messages_dropped_write_policy_violation`
+    /// assertion also fails (becomes 2 instead of 1).
+    #[test]
+    fn sender_and_receiver_write_policy_counters_are_independent() {
+        let diag = GroupsDiagnostics::new();
+
+        // Receiver-side: ingest path dropped an incoming message.
+        diag.record_write_policy_violation("grp");
+        // Sender-side: this daemon's own outgoing send was rejected locally.
+        diag.record_sender_write_policy_rejection("grp");
+
+        let mut groups: HashMap<String, GroupInfo> = HashMap::new();
+        groups.insert("grp".into(), group("Grp", "grp"));
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+
+        let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
+        assert_eq!(
+            g.counters.messages_dropped_write_policy_violation,
+            1,
+            "receiver-side ingest drop must be in messages_dropped_write_policy_violation only"
+        );
+        assert_eq!(
+            g.counters.sends_rejected_write_policy,
+            1,
+            "sender-side local rejection must be in sends_rejected_write_policy only"
+        );
     }
 
     #[test]
