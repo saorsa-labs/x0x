@@ -1756,6 +1756,17 @@ async fn upsert_discovered_machine(
     }
 }
 
+/// Whether a transport-observed remote address is worth keeping as a redial
+/// candidate.
+///
+/// The accept loop substitutes `0.0.0.0:0` when `remote_addr` is not a UDP
+/// socket (relayed or non-UDP transports). Neither an unspecified host nor a
+/// zero port can ever be dialed back, so caching either would only produce
+/// failing reconnect attempts.
+fn observed_address_is_dialable(address: &std::net::SocketAddr) -> bool {
+    !address.ip().is_unspecified() && address.port() != 0
+}
+
 async fn upsert_discovered_machine_from_agent(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
@@ -8329,7 +8340,7 @@ impl Agent {
                 };
 
                 match event {
-                    network::NetworkEvent::PeerConnected { peer_id, .. } => {
+                    network::NetworkEvent::PeerConnected { peer_id, address } => {
                         let machine_id = identity::MachineId(peer_id);
                         let cached_agent_id = {
                             let cache = cache.read().await;
@@ -8351,6 +8362,46 @@ impl Agent {
                             if let Some(handle) = tracker.remove(&peer_id) {
                                 handle.abort();
                             }
+                        }
+                        // Record the peer's observed remote address into the
+                        // machine discovery cache so the proactive-reconnect
+                        // path (lib.rs candidate_addrs loop) finds a non-empty
+                        // candidate set. Without this, a peer known only via an
+                        // inbound connection has candidate_addrs=0 and the LAN
+                        // dial that would succeed is never attempted (issue #304).
+                        // Skip addresses that can never be dialed back --
+                        // notably the 0.0.0.0:0 placeholder the accept loop
+                        // substitutes when remote_addr is not a UDP socket.
+                        if observed_address_is_dialable(&address) {
+                            let now_s = dm::now_unix_ms() / 1000;
+                            upsert_discovered_machine(
+                                &machine_cache,
+                                DiscoveredMachine {
+                                    machine_id,
+                                    addresses: vec![address],
+                                    // A connection observation is NOT an
+                                    // announcement. `upsert_discovered_machine`
+                                    // treats a newer `announced_at` as authority
+                                    // to last-write-wins `reachable_via` and
+                                    // `relay_candidates`; passing `now` here
+                                    // would erase a NAT-restricted peer's
+                                    // coordinator/relay hints on every connect.
+                                    // 0 keeps the merge to what we actually
+                                    // observed: the address and `last_seen`.
+                                    announced_at: 0,
+                                    last_seen: now_s,
+                                    machine_public_key: Vec::new(),
+                                    nat_type: None,
+                                    can_receive_direct: None,
+                                    is_relay: None,
+                                    is_coordinator: None,
+                                    reachable_via: Vec::new(),
+                                    relay_candidates: Vec::new(),
+                                    agent_ids: Vec::new(),
+                                    user_ids: Vec::new(),
+                                },
+                            )
+                            .await;
                         }
                     }
                     network::NetworkEvent::PeerDisconnected { peer_id, reason } => {
@@ -16672,5 +16723,289 @@ mod fence_token_tests {
             revision: 4,
         };
         assert_ne!(stale, current, "revision moved ⇒ token is stale");
+    }
+}
+
+/// Tests for issue #304: inbound peer address must appear in machine_discovery_cache
+/// so the proactive-reconnect candidate loop finds a non-empty candidate set.
+#[cfg(test)]
+mod candidate_address_retention_tests {
+    use super::{upsert_discovered_machine, DiscoveredMachine};
+    use crate::identity::MachineId;
+    use std::sync::Arc;
+    use tokio::sync::RwLock;
+
+    /// Verify that upsert_discovered_machine with a connection-derived record
+    /// correctly populates the cache so the reconnect path reads candidate_addrs > 0.
+    ///
+    /// This encodes WHY: before fix #304 the PeerConnected handler did NOT call
+    /// upsert_discovered_machine, so a peer known only via an inbound connection
+    /// had candidate_addrs=0 on redial and the LAN dial was skipped entirely.
+    #[tokio::test]
+    async fn peer_connected_address_appears_in_machine_discovery_cache() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let peer_id = [0x42u8; 32];
+        let machine_id = MachineId(peer_id);
+        let address: std::net::SocketAddr = "192.168.1.108:5493".parse().unwrap();
+
+        // Cache starts empty — candidate_addrs would be 0 before the fix.
+        assert!(
+            cache.read().await.is_empty(),
+            "cache must start empty for this test to prove anything"
+        );
+
+        // Simulate what the PeerConnected handler now does (fix #304).
+        let now_s = crate::dm::now_unix_ms() / 1000;
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![address],
+                announced_at: now_s,
+                last_seen: now_s,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        // The reconnect path reads: cache.get(&machine_id).map(|m| m.addresses.clone())
+        let candidate_addrs = {
+            let guard = cache.read().await;
+            guard
+                .get(&machine_id)
+                .map(|m| m.addresses.clone())
+                .unwrap_or_default()
+        };
+
+        assert_eq!(
+            candidate_addrs.len(),
+            1,
+            "reconnect candidate set must be non-empty after a connection is established"
+        );
+        assert_eq!(
+            candidate_addrs[0], address,
+            "candidate address must be the peer's observed remote address"
+        );
+    }
+
+    /// Verify that the 0.0.0.0:0 placeholder from the accept loop (when remote_addr
+    /// is not a UDP socket) is NOT inserted into the cache. Inserting it would cause
+    /// all reconnect dials to attempt 0.0.0.0:0 and fail, producing noise.
+    #[tokio::test]
+    async fn zero_placeholder_address_is_not_recorded() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x01u8; 32]);
+        let zero_addr: std::net::SocketAddr = "0.0.0.0:0".parse().unwrap();
+
+        // Call the SAME predicate the PeerConnected handler gates on, rather
+        // than duplicating its expression here -- a copy would keep passing if
+        // the production guard were broken.
+        if super::observed_address_is_dialable(&zero_addr) {
+            let now_s = crate::dm::now_unix_ms() / 1000;
+            upsert_discovered_machine(
+                &cache,
+                DiscoveredMachine {
+                    machine_id,
+                    addresses: vec![zero_addr],
+                    announced_at: now_s,
+                    last_seen: now_s,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    agent_ids: Vec::new(),
+                    user_ids: Vec::new(),
+                },
+            )
+            .await;
+        }
+
+        assert!(
+            cache.read().await.is_empty(),
+            "0.0.0.0:0 placeholder must not be inserted into machine_discovery_cache"
+        );
+    }
+
+    /// Verify address deduplication: calling upsert twice for the same machine
+    /// at the same address does not duplicate the address entry.
+    #[tokio::test]
+    async fn repeated_connection_does_not_duplicate_addresses() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x33u8; 32]);
+        let address: std::net::SocketAddr = "10.0.0.1:5483".parse().unwrap();
+        let now_s = crate::dm::now_unix_ms() / 1000;
+
+        // Upsert twice — simulates two consecutive connections.
+        for _ in 0..2 {
+            upsert_discovered_machine(
+                &cache,
+                DiscoveredMachine {
+                    machine_id,
+                    addresses: vec![address],
+                    announced_at: now_s,
+                    last_seen: now_s,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    agent_ids: Vec::new(),
+                    user_ids: Vec::new(),
+                },
+            )
+            .await;
+        }
+
+        let guard = cache.read().await;
+        let entry = guard.get(&machine_id).expect("entry must exist");
+        assert_eq!(
+            entry.addresses.len(),
+            1,
+            "upsert must deduplicate: same address inserted twice must produce one entry"
+        );
+    }
+}
+
+/// Handler-level test for issue #304: the actual PeerConnected event-handler
+/// path (not just the underlying upsert function) must record the inbound
+/// peer's observed address in `machine_discovery_cache`.
+///
+/// The three tests in `candidate_address_retention_tests` verify the upsert
+/// function in isolation but never exercise the handler arm that calls it.
+/// If that arm is deleted from the handler, those three tests still pass.
+/// This test fails instead: it drives a real PeerConnected event through the
+/// production handler and asserts the cache is populated.
+#[cfg(test)]
+mod peer_connected_handler_integration_tests {
+    use super::*;
+    use crate::identity::MachineId;
+
+    /// A real PeerConnected event — generated by bob's actual network dial
+    /// arriving at alice's accept loop — must cause alice's
+    /// `machine_discovery_cache` to contain bob's machine_id with a
+    /// non-empty address list.
+    ///
+    /// REVERT GUARD: delete the `upsert_discovered_machine` call from the
+    /// `PeerConnected` arm of `start_network_event_listener` and this test
+    /// fails with "machine_discovery_cache entry not found for bob". The
+    /// three tests in `candidate_address_retention_tests` continue passing
+    /// because they call the upsert function directly and never reach the
+    /// handler.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn peer_connected_handler_populates_machine_discovery_cache() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_peer_cache_disabled()
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: Vec::new(),
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("alice");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_peer_cache_disabled()
+            .with_network_config(network::NetworkConfig {
+                bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                bootstrap_nodes: Vec::new(),
+                ..network::NetworkConfig::default()
+            })
+            .build()
+            .await
+            .expect("bob");
+
+        let alice_net = alice.network().expect("alice network");
+        let bob_net = bob.network().expect("bob network");
+        // bound_addr() may return [::]:port (unspecified) — convert to
+        // 127.0.0.1:port so bob can dial a concrete loopback address.
+        // This mirrors normalize_loopback_addr from the reconnect tests.
+        let alice_addr = {
+            let raw = alice_net.bound_addr().await.expect("alice bound addr");
+            if raw.ip().is_unspecified() {
+                std::net::SocketAddr::new(
+                    std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                    raw.port(),
+                )
+            } else {
+                raw
+            }
+        };
+        let bob_machine_id = MachineId(bob.machine_id().0);
+
+        // Start alice's event handler AFTER we have the network references but
+        // BEFORE the dial, so the handler is subscribed when the accept loop
+        // fires PeerConnected. The spawned task must have called
+        // `network.subscribe()` before we dial — yield here to let it run.
+        // Same pattern used by the reconnect-recovery tests (line ~13769).
+        alice.start_network_event_listener();
+        tokio::task::yield_now().await;
+
+        // Bob dials alice. Alice's accept loop fires NetworkEvent::PeerConnected
+        // with bob's observed address. Alice's handler calls
+        // upsert_discovered_machine, inserting bob into machine_discovery_cache.
+        // If that upsert call is deleted from the handler, the cache stays
+        // empty and the polling assertion below fails.
+        bob_net
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob must connect to alice");
+
+        // Poll for the handler to populate the cache. A fixed sleep is fragile
+        // under load; polling with a deadline is the pattern used throughout
+        // the reconnect tests.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            {
+                let guard = alice.machine_discovery_cache.read().await;
+                if guard.contains_key(&bob_machine_id) {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                let guard = alice.machine_discovery_cache.read().await;
+                assert!(
+                    guard.contains_key(&bob_machine_id),
+                    "PeerConnected handler must insert bob's machine_id into alice's \
+                     machine_discovery_cache within 3 s; if this assertion fails, the \
+                     upsert_discovered_machine call was removed from the PeerConnected \
+                     handler (revert of fix #304)"
+                );
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let guard = alice.machine_discovery_cache.read().await;
+        let bob_entry = &guard[&bob_machine_id];
+        assert!(
+            !bob_entry.addresses.is_empty(),
+            "machine_discovery_cache entry for bob must carry at least one address \
+             so the proactive-reconnect candidate loop finds a non-empty dial set"
+        );
     }
 }
