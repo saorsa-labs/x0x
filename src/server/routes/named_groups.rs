@@ -343,6 +343,7 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // authority on apply, so dropping the raw fallback can strand members after
     // their metadata listener exits.
     let mut config = direct_message_send_config();
+    config.prefer_raw_quic_if_connected = false;
     config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
     config.require_gossip_ack = true;
     config
@@ -622,6 +623,16 @@ pub(in crate::server) struct TreeKemCatchupResponse {
     group_id: String,
     events: Vec<NamedGroupMetadataEvent>,
     truncated: bool,
+}
+
+/// Authenticated direct-channel bootstrap for a newly-added member of a
+/// signed-public group. The snapshot carries the complete public roster and
+/// the authority's retained head commit, allowing a recipient with no local
+/// group/card state to validate and install the exact committed frontier.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct PublicGroupBootstrap {
+    message_type: String,
+    group: Box<x0x::groups::GroupInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2251,6 +2262,215 @@ fn spawn_named_group_event_delivery_to_active_members(
             event,
             GROUP_BACKGROUND_PUBLISH_DELAY,
         );
+    }
+}
+
+fn signed_public_bootstrap_snapshot(
+    mut group: x0x::groups::GroupInfo,
+) -> Option<x0x::groups::GroupInfo> {
+    if group.withdrawn
+        || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || group.shared_secret.is_some()
+        || group.security_binding.is_some()
+    {
+        return None;
+    }
+
+    // A bootstrap is a public roster/state snapshot, never an authority
+    // backup. Strip local-only admission and key material before it leaves the
+    // daemon. These fields do not contribute to the signed public state hash.
+    group.issued_invite_secrets.clear();
+    group.issued_invites.clear();
+    group.join_requests.clear();
+    group.shared_secret = None;
+    group.secret_epoch = 0;
+    for member in group.members_v2.values_mut() {
+        member.kem_public_key_b64 = None;
+        member.treekem_key_package_b64 = None;
+        member.treekem_key_package_hash = None;
+    }
+    let head = group.commit_log.last()?.clone();
+    group.commit_log.clear();
+    group.commit_log.push(head);
+    Some(group)
+}
+
+/// Direct-deliver a committed signed-public snapshot to a newly-added member.
+/// The receiver independently verifies the retained head commit before it
+/// installs anything, so this is a bootstrap transport rather than an
+/// authorization bypass.
+fn spawn_public_group_bootstrap_delivery(
+    state: &AppState,
+    recipient_hex: &str,
+    group: x0x::groups::GroupInfo,
+) {
+    let recipient = match parse_agent_id_hex(recipient_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(&recipient_hex),
+                "cannot direct-deliver public-group bootstrap: {e}"
+            );
+            return;
+        }
+    };
+    let Some(group) = signed_public_bootstrap_snapshot(group) else {
+        tracing::warn!(
+            recipient = %LogHexId::agent(&recipient_hex),
+            "refusing to direct-deliver a non-public or unverifiable group bootstrap"
+        );
+        return;
+    };
+    let group_id = group.stable_group_id().to_string();
+    let payload = match serde_json::to_vec(&PublicGroupBootstrap {
+        message_type: "public_group_bootstrap".to_string(),
+        group: Box::new(group),
+    }) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize public-group bootstrap: {e}");
+            return;
+        }
+    };
+    let agent = Arc::clone(&state.agent);
+    tokio::spawn(async move {
+        if let Err(e) = agent
+            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+            .await
+        {
+            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to direct-deliver public-group bootstrap: {e}");
+        }
+    });
+}
+
+fn validate_public_group_bootstrap(
+    group: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+    local_agent_hex: &str,
+) -> bool {
+    if group.withdrawn
+        || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+        || group.shared_secret.is_some()
+        || group.security_binding.is_some()
+        || !group.has_active_member(local_agent_hex)
+        || !group
+            .caller_role(sender_hex)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+    {
+        return false;
+    }
+    let Some(genesis) = group.genesis.as_ref() else {
+        return false;
+    };
+    if genesis.group_id != group.stable_group_id()
+        || genesis.creator_agent_id != hex::encode(group.creator.as_bytes())
+        || genesis.created_at != group.created_at
+    {
+        return false;
+    }
+    let Some(retained) = group.commit_log.last() else {
+        return false;
+    };
+    let commit = &retained.commit;
+    if group.commit_log.len() != 1
+        || !retained.roster_root_consistent()
+        || retained.roster != x0x::groups::roster_projection(&group.members_v2)
+        || commit.verify_structure().is_err()
+        || commit.committed_by != sender_hex
+        || commit.group_id != group.stable_group_id()
+        || commit.revision != group.state_revision
+        || commit.state_hash != group.state_hash
+        || commit.prev_state_hash != group.prev_state_hash
+        || commit.withdrawn != group.withdrawn
+        || commit.roster_root != x0x::groups::compute_roster_root(&group.members_v2)
+        || commit.policy_hash != x0x::groups::compute_policy_hash(&group.policy)
+        || commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&group.public_meta())
+        || commit.security_binding != group.security_binding
+    {
+        return false;
+    }
+    x0x::groups::enforce_last_admin_invariant(&group.members_v2, group.withdrawn).is_ok()
+}
+
+/// Hard cap on named groups installable via the remote bootstrap path;
+/// bounds attacker-driven state growth and listener-task spawn.
+const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
+
+/// Validate and install a signed-public bootstrap received over the
+/// authenticated direct channel. Existing local state is never overwritten;
+/// normal metadata commits remain the only update path after bootstrap.
+pub(in crate::server) async fn handle_public_group_bootstrap(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    bootstrap: PublicGroupBootstrap,
+) {
+    if bootstrap.message_type != "public_group_bootstrap" {
+        return;
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    {
+        let revoked = state.agent.revocation_set();
+        if revoked.read().await.is_agent_revoked(sender) {
+            return;
+        }
+    }
+    // Consent gate: a bootstrap persists a group and spawns listener tasks,
+    // so an unsolicited one from a stranger is a spam/resource vector. The
+    // roster inside the bootstrap is sender-controlled and cannot carry the
+    // consent decision; only senders the local agent already knows may seed
+    // groups (mirrors the pending-welcome convention for encrypted groups).
+    {
+        let contacts = state.contacts.read().await;
+        if contacts.trust_level(sender).rank() < crate::contacts::TrustLevel::Known.rank() {
+            tracing::debug!(
+                sender = %LogHexId::agent(&sender_hex),
+                "ignoring public-group bootstrap from unknown or blocked sender"
+            );
+            return;
+        }
+    }
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group = *bootstrap.group;
+    if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
+        tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
+        return;
+    }
+    let group_id = group.stable_group_id().to_string();
+    {
+        let groups = state.named_groups.read().await;
+        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
+            tracing::warn!(
+                sender = %LogHexId::agent(&sender_hex),
+                "refusing public-group bootstrap: named-group capacity reached"
+            );
+            return;
+        }
+        if groups.contains_key(&group_id)
+            || groups
+                .values()
+                .any(|existing| existing.stable_group_id() == group_id)
+        {
+            return;
+        }
+    }
+    let outcome = persist_named_groups_mutation(state, |groups| {
+        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS
+            || groups.contains_key(&group_id)
+            || groups
+                .values()
+                .any(|existing| existing.stable_group_id() == group_id)
+        {
+            return false;
+        }
+        groups.insert(group_id.clone(), group);
+        true
+    })
+    .await;
+    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        ensure_named_group_listeners(Arc::clone(state), &group_id).await;
+        tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
+    } else {
+        tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap was not durably installed");
     }
 }
 
@@ -9262,7 +9482,12 @@ fn encode_group_public_message_direct_payload(
 
 fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
-    config.require_gossip = true;
+    // User-visible community posts should use the receive-ACKed raw path when
+    // the member already has a live direct binding. Keep gossip-inbox as the
+    // fallback for startup/convergence, but do not force it: a saturated
+    // gossip overlay must not strand a post when the direct path is healthy.
+    config.prefer_raw_quic_if_connected = true;
+    config.require_gossip = false;
     config.require_gossip_ack = true;
     config
 }
@@ -10141,7 +10366,7 @@ pub(in crate::server) async fn add_named_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
 
-    let (metadata_topic, event, members, epoch) = {
+    let (metadata_topic, event, members, epoch, bootstrap_group, added_agent_hex) = {
         let named_groups = state.named_groups.read().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -10185,6 +10410,7 @@ pub(in crate::server) async fn add_named_group_member(
         let metadata_topic = next.metadata_topic.clone();
         let event_group_id = next.stable_group_id().to_string();
         let members = named_group_member_values(&next);
+        let bootstrap_group = next.clone();
         drop(named_groups);
 
         if !matches!(
@@ -10217,7 +10443,7 @@ pub(in crate::server) async fn add_named_group_member(
             group_id: event_group_id,
             revision,
             actor: actor_hex,
-            agent_id: agent_hex,
+            agent_id: agent_hex.clone(),
             display_name: req.display_name,
             treekem_commit_b64: None,
             treekem_welcome_b64: None,
@@ -10228,10 +10454,21 @@ pub(in crate::server) async fn add_named_group_member(
             member_recovery_history: Vec::new(),
             commit: Some(commit),
         };
-        (metadata_topic, event, members, epoch)
+        (
+            metadata_topic,
+            event,
+            members,
+            epoch,
+            bootstrap_group,
+            agent_hex,
+        )
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if bootstrap_group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
+        spawn_public_group_bootstrap_delivery(&state, &added_agent_hex, bootstrap_group.clone());
+    }
+    spawn_named_group_event_delivery_to_active_members(&state, &bootstrap_group, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
     (
         StatusCode::OK,
@@ -18610,7 +18847,14 @@ fn welcome_blob_send_config(msg: &WelcomeBlobMessage) -> x0x::dm::DmSendConfig {
         WelcomeBlobMessage::FetchRequest { .. }
         | WelcomeBlobMessage::Offer { .. }
         | WelcomeBlobMessage::ChunkAck { .. }
-        | WelcomeBlobMessage::Complete { .. } => direct_message_send_config(),
+        | WelcomeBlobMessage::Complete { .. } => x0x::dm::DmSendConfig {
+            // Welcome-blob control messages must keep the gossip-inbox path
+            // preferred: the raw-preferred default for user DMs does not
+            // apply here, because a welcome fetch races the very connection
+            // establishment that raw delivery depends on.
+            prefer_raw_quic_if_connected: false,
+            ..direct_message_send_config()
+        },
     }
 }
 
@@ -19840,6 +20084,53 @@ mod tests {
             .context("read response body")?;
         let body = serde_json::from_slice(&bytes).context("decode response body")?;
         Ok((status, body))
+    }
+
+    #[test]
+    fn signed_public_bootstrap_is_secret_free_and_commit_bound() -> Result<()> {
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let recipient = x0x::identity::AgentKeypair::generate()?;
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
+        let recipient_hex = hex::encode(recipient.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Acceptance".to_string(),
+            String::new(),
+            authority.agent_id(),
+            "ab".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            Some("Studio".to_string()),
+        );
+        group.seal_commit(&authority, now_millis_u64())?;
+
+        let snapshot = signed_public_bootstrap_snapshot(group).context("public snapshot")?;
+        assert!(snapshot.shared_secret.is_none());
+        assert!(snapshot.issued_invites.is_empty());
+        assert!(snapshot.issued_invite_secrets.is_empty());
+        assert_eq!(snapshot.commit_log.len(), 1);
+        assert!(validate_public_group_bootstrap(
+            &snapshot,
+            &authority_hex,
+            &recipient_hex
+        ));
+
+        let mut tampered = snapshot;
+        tampered
+            .members_v2
+            .get_mut(&recipient_hex)
+            .context("recipient member")?
+            .role = x0x::groups::GroupRole::Admin;
+        assert!(!validate_public_group_bootstrap(
+            &tampered,
+            &authority_hex,
+            &recipient_hex
+        ));
+        Ok(())
     }
 
     /// Why: #297 — a non-TreeKEM joiner that missed the authority's
@@ -24826,6 +25117,20 @@ mod tests {
     }
 
     #[test]
+    fn public_group_messages_prefer_receive_acked_raw_quic_with_gossip_fallback() {
+        let config = group_public_message_direct_delivery_config();
+
+        assert!(config.prefer_raw_quic_if_connected);
+        assert!(!config.require_gossip);
+        assert!(!config.stop_fallback_on_raw_error);
+        assert!(config.require_gossip_ack);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    #[test]
     fn treekem_welcome_ref_is_content_addressed_and_serialized() {
         let bytes = b"large treekem welcome blob";
         let welcome_id = welcome_id_for_bytes(bytes);
@@ -27054,7 +27359,7 @@ mod tests {
         DirectSendRequest {
             agent_id,
             payload,
-            prefer_raw_quic_if_connected: false,
+            prefer_raw_quic_if_connected: Some(false),
             raw_quic_receive_ack_ms: None,
             stop_fallback_on_raw_error: false,
             require_gossip: false,

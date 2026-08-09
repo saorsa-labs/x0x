@@ -2416,6 +2416,49 @@ impl HeartbeatContext {
     }
 }
 
+fn raw_dm_history_record(
+    sender: identity::AgentId,
+    machine_id: identity::MachineId,
+    payload: &[u8],
+    verified: bool,
+    trust_decision: Option<trust::TrustDecision>,
+    now_ms: i64,
+) -> Option<history::HistoryRecord> {
+    if !verified
+        || matches!(
+            trust_decision,
+            Some(trust::TrustDecision::RejectBlocked | trust::TrustDecision::RejectMachineMismatch)
+        )
+    {
+        return None;
+    }
+    let history::classify::DmPayloadClass::Durable(content_type) =
+        history::classify::classify_dm_payload(payload)
+    else {
+        return None;
+    };
+    Some(history::HistoryRecord {
+        msg_id: history::HistoryRecord::compute_msg_id(None, payload),
+        scope: history::Scope::Dm(hex::encode(sender.as_bytes())),
+        author_agent: Some(hex::encode(sender.as_bytes())),
+        author_machine: Some(hex::encode(machine_id.as_bytes())),
+        author_pubkey: None,
+        sent_at_ms: now_ms,
+        seen_at_ms: now_ms,
+        direction: history::Direction::Inbound,
+        content_type: content_type.to_string(),
+        payload: payload.to_vec(),
+        signed_artifact: None,
+        signature: None,
+        sig_context: None,
+        // The raw stream is authenticated by the verified AgentId->MachineId
+        // transport binding, but exposes no re-serializable wire signature at
+        // this layer. This matches artifact-less verified pub/sub history.
+        provenance: history::Provenance::VerifiedEnvelope,
+        replace_key: None,
+    })
+}
+
 impl Agent {
     /// Create a new offline agent with default identity configuration.
     ///
@@ -8540,6 +8583,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let history_handle = self.history_handle.clone();
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
 
@@ -8698,6 +8742,27 @@ impl Agent {
                 } else {
                     None
                 };
+
+                // ADR-0023: the gossip-inbox path records after its envelope
+                // verification gates, but the receive-ACK raw-QUIC path joins
+                // the same application stream here. Persist an artifact-less
+                // row only when the transport AgentId->MachineId binding was
+                // verified and trust did not reject the sender. Buzz message
+                // envelopes carry a per-send clientId in their payload, so
+                // payload-derived ids remain distinct for repeated user text.
+                if let (Some(history), Some(record)) = (
+                    history_handle.as_ref(),
+                    raw_dm_history_record(
+                        sender,
+                        machine_id,
+                        &data,
+                        verified,
+                        trust_decision,
+                        i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+                    ),
+                ) {
+                    history.record(record);
+                }
 
                 // Fan out to all subscribe_direct() receivers with verification info.
                 let delivered = dm
@@ -12268,6 +12333,56 @@ mod tests {
 
     fn sa(s: &str) -> std::net::SocketAddr {
         s.parse().expect("valid SocketAddr literal in test")
+    }
+
+    #[test]
+    fn verified_raw_dm_builds_durable_inbound_history() {
+        let sender = identity::AgentId([7; 32]);
+        let machine = identity::MachineId([9; 32]);
+        let payload = br#"{"text":"hello","clientId":"raw-history"}"#;
+        let record = raw_dm_history_record(
+            sender,
+            machine,
+            payload,
+            true,
+            Some(trust::TrustDecision::Accept),
+            123,
+        )
+        .expect("verified user DM should produce history");
+
+        assert_eq!(record.scope, history::Scope::Dm(hex::encode([7; 32])));
+        assert_eq!(record.direction, history::Direction::Inbound);
+        assert_eq!(record.content_type, "application/json");
+        assert_eq!(record.payload, payload);
+        assert_eq!(record.provenance, history::Provenance::VerifiedEnvelope);
+        record.validate().expect("raw DM history record is valid");
+    }
+
+    #[test]
+    fn raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads() {
+        let sender = identity::AgentId([7; 32]);
+        let machine = identity::MachineId([9; 32]);
+        let payload = br#"{"text":"hello","clientId":"raw-history"}"#;
+
+        assert!(raw_dm_history_record(sender, machine, payload, false, None, 1).is_none());
+        assert!(raw_dm_history_record(
+            sender,
+            machine,
+            payload,
+            true,
+            Some(trust::TrustDecision::RejectBlocked),
+            1,
+        )
+        .is_none());
+        assert!(raw_dm_history_record(
+            sender,
+            machine,
+            history::classify::GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+            true,
+            Some(trust::TrustDecision::Accept),
+            1,
+        )
+        .is_none());
     }
 
     #[test]
