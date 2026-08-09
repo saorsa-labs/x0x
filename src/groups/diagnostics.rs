@@ -529,13 +529,11 @@ mod tests {
 
         let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
         assert_eq!(
-            g.counters.messages_dropped_write_policy_violation,
-            1,
+            g.counters.messages_dropped_write_policy_violation, 1,
             "receiver-side ingest drop must be in messages_dropped_write_policy_violation only"
         );
         assert_eq!(
-            g.counters.sends_rejected_write_policy,
-            1,
+            g.counters.sends_rejected_write_policy, 1,
             "sender-side local rejection must be in sends_rejected_write_policy only"
         );
     }
