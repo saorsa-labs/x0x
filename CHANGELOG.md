@@ -2,6 +2,78 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.36.2] - 2026-08-09
+
+**This release fixes the asymmetric group-message delivery bug that v0.36.1
+could not.** The root cause was in the transport, one layer below everything
+previously investigated, and the fix is live-verified rather than inferred.
+
+### Fixed
+
+- **ant-quic 0.27.36 → 0.27.37 — a transient UDP send error permanently killed
+  the connection driver.** In `State::drive_transmit`, a `Poll::Ready(Err(e))`
+  from `udp_sender.poll_send` was propagated as fatal, ending the per-connection
+  driver task. Once that task was gone the connection state machine was never
+  driven again: no ACKs, no PTO probes, no idle timeout and therefore no
+  `CONNECTION_CLOSE`. `Connection::is_closed()` stayed `false`, so the daemon
+  kept reporting `connected_peers=1, direct_connections=1` while transmitting
+  nothing at all — a silent, permanent, one-way black-hole that looked healthy
+  from every API surface.
+
+  The trigger in the field is `EHOSTUNREACH` (os error 65), raised synchronously
+  by `sendto`. ant-quic already had an `is_transient_socket_error` classifier
+  listing errno 65, added by x0x#262 — but it guarded only the endpoint *receive*
+  path, and the helper was private to `endpoint.rs`. The transmit path in the
+  connection driver was never covered. 0.27.37 makes the classifier
+  `pub(crate)` and applies it in `drive_transmit`: transient errors now drop the
+  single datagram, log at debug, and let QUIC loss recovery retransmit over a
+  working path. Non-transient errors keep the previous fatal behaviour.
+
+  This is the root cause of the asymmetric delivery reported in #296 and #302.
+  Root-cause writeup and packet-level correlation:
+  `.planning/investigations/20260807-120832/wedge-rootcause-20260808.md`.
+
+- **saorsa-gossip 0.5.67 → 0.5.68** — zero-fanout diagnostics and cooling-floor
+  rescue.
+
+- **Machine-discovery cache and connection bookkeeping (#296, PR #300;
+  #302, PR #305; #304, PR #307)** — identity is now established before
+  bookkeeping, disconnect is guarded on a pre-existing connection, and
+  candidate retention no longer discards addresses still needed for redial.
+
+### Verified
+
+Live two-node acceptance run on 2026-08-09 (laptop ↔ Mac Studio over LAN,
+isolated gossip plane, release-profile binaries with default features):
+
+- Roster converged to 2 Active members on both nodes within 60 s.
+- All four messages — top-level and threaded, in both directions — were
+  delivered, with identical `msg_id`s present in both nodes' `history.db` and
+  correct direction flags. Every ingest drop counter stayed at 0.
+- The joining node logged **87** `ignoring transient socket send error` events.
+  Under v0.36.1 the *first* such error terminated its connection driver; here
+  the driver absorbed all 87 and the fatal `background I/O path ended` line
+  appears zero times.
+- A genuine environmental UDP black-hole opened mid-run (an independent probe
+  recorded a 100 %-loss window). Delivery completed through it.
+- Zero panics, zero `ERROR` lines on either node.
+
+### Known issues
+
+- **Group message delivery is correct but slow (~44 s end-to-end).** The
+  direct-unicast delivery path fails before gossip carries the message — the
+  sender burns a ~24 s direct-delivery timeout plus a retry, and the receiver
+  reports `recipient key material unavailable`. Messages arrive intact and in
+  order, but latency is far higher than it should be. This is a distinct defect
+  from the driver wedge and was previously masked, because before this release
+  the affected pair delivered nothing at all. Newly observed; no healthy
+  baseline exists to compare against.
+
+- **The studio1 `EHOSTUNREACH` window itself is unexplained and remains an open
+  ops item.** This release stops that condition from being fatal; it does not
+  stop it from occurring. The leading (unproven) hypothesis is a dual-stack
+  socket selecting an `IPV6_V6ONLY` socket for an IPv4-mapped destination.
+
 ## [v0.36.1] - 2026-08-08
 
 Hardening-only release. **It does not fix the asymmetric group-message delivery
