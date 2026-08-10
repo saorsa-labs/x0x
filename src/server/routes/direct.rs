@@ -31,6 +31,7 @@ pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     // group_join / hop-DM 25s-timeout black hole).
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
+        prefer_raw_quic_if_connected: true,
         raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
         ..x0x::dm::DmSendConfig::default()
     }
@@ -59,7 +60,7 @@ pub(in crate::server) struct DirectSendRequest {
     pub(in crate::server) payload: String,
     /// Prefer the raw-QUIC path when a live direct connection exists.
     #[serde(default)]
-    pub(in crate::server) prefer_raw_quic_if_connected: bool,
+    pub(in crate::server) prefer_raw_quic_if_connected: Option<bool>,
     /// Optional raw-QUIC receive-pipeline ACK timeout for the message itself.
     #[serde(default)]
     pub(in crate::server) raw_quic_receive_ack_ms: Option<u64>,
@@ -81,6 +82,24 @@ pub(in crate::server) struct DirectSendRequest {
     /// This does not force the message itself onto raw-QUIC receive-ACK.
     #[serde(default)]
     pub(in crate::server) require_ack_ms: Option<u64>,
+}
+
+fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendConfig {
+    let mut config = direct_message_send_config();
+    if let Some(prefer_raw_quic_if_connected) = req.prefer_raw_quic_if_connected {
+        config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
+    }
+    config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
+    config.require_gossip = req.require_gossip;
+    if let Some(require_gossip_ack) = req.require_gossip_ack {
+        config.require_gossip_ack = require_gossip_ack;
+    }
+    if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
+        config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
+            raw_ack_ms.clamp(100, 30_000),
+        ));
+    }
+    config
 }
 
 /// POST /agents/connect — connect to a discovered agent.
@@ -240,18 +259,7 @@ pub(in crate::server) async fn direct_send(
         Err(resp) => return resp,
     };
 
-    let mut send_config = direct_message_send_config();
-    send_config.prefer_raw_quic_if_connected = req.prefer_raw_quic_if_connected;
-    send_config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
-    send_config.require_gossip = req.require_gossip;
-    if let Some(require_gossip_ack) = req.require_gossip_ack {
-        send_config.require_gossip_ack = require_gossip_ack;
-    }
-    if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
-        send_config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
-            raw_ack_ms.clamp(100, 30_000),
-        ));
-    }
+    let send_config = direct_send_config_for_request(&req);
 
     match state
         .agent
@@ -431,16 +439,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_message_send_config_requires_gossip_ack_by_default() {
+    fn direct_message_send_config_prefers_receive_acked_raw_quic() {
         let config = direct_message_send_config();
         assert!(config.require_gossip_ack);
-        // Raw-QUIC fallback must be loss-detecting (receive-pipeline ACK), or
+        assert!(config.prefer_raw_quic_if_connected);
+        // Raw-QUIC preference must be loss-detecting (receive-pipeline ACK), or
         // a send into a superseded connection reports Ok, the retry never
         // fires, and the recipient's app never sees the message.
         assert_eq!(
             config.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
         );
+    }
+
+    #[test]
+    fn direct_send_request_preserves_raw_quic_default_unless_explicitly_overridden() {
+        let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": ""
+        }))
+        .expect("minimal direct-send request should deserialize");
+        assert!(direct_send_config_for_request(&omitted).prefer_raw_quic_if_connected);
+
+        let disabled: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "prefer_raw_quic_if_connected": false
+        }))
+        .expect("direct-send request with explicit override should deserialize");
+        assert!(!direct_send_config_for_request(&disabled).prefer_raw_quic_if_connected);
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

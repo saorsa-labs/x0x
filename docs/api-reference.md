@@ -349,6 +349,12 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 }
 ```
 
+Optional field `prefer_raw_quic_if_connected` (bool): when a live transport
+connection to the recipient exists, deliver over raw QUIC instead of the
+gossip inbox. **Defaults to `true` since v0.37.0** (previously `false`);
+omitting the field selects the daemon default, so clients that relied on the
+old default must now send `"prefer_raw_quic_if_connected": false` explicitly.
+
 ### `/direct/events` SSE message shape
 
 Direct messages arrive flat — no `data` envelope:

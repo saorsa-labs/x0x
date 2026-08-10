@@ -55,9 +55,20 @@ fn query_from(params: &HistoryListParams, scope: Scope) -> HistoryQuery {
 /// indicates whether one exists for offline re-verification.
 fn row_json(row: &StoredRecord) -> serde_json::Value {
     let r = &row.record;
+    let group_message = group_history_message(r);
+    let msg_id = group_message
+        .as_ref()
+        .map(x0x::groups::GroupPublicMessage::msg_id)
+        .unwrap_or_else(|| hex::encode(r.msg_id));
+    let thread_root = group_message
+        .as_ref()
+        .and_then(|message| message.thread_root.as_deref());
+    let thread_parent = group_message
+        .as_ref()
+        .and_then(|message| message.thread_parent.as_deref());
     serde_json::json!({
         "id": row.id,
-        "msg_id": hex::encode(r.msg_id),
+        "msg_id": msg_id,
         "scope": r.scope.canonical(),
         "author_agent": r.author_agent,
         "author_machine": r.author_machine,
@@ -69,7 +80,27 @@ fn row_json(row: &StoredRecord) -> serde_json::Value {
         "signed": r.signature.is_some(),
         "provenance": r.provenance,
         "replace_key": r.replace_key,
+        "thread_root": thread_root,
+        "thread_parent": thread_parent,
     })
+}
+
+/// Recover the rendering identity and ADR-0029 ancestry from the verified
+/// group-public artifact. The history store's `msg_id` remains its dedupe key
+/// (`BLAKE3(signed_artifact)`), while the desktop contract uses the message's
+/// canonical signing-domain id (`GroupPublicMessage::msg_id()`).
+fn group_history_message(
+    record: &x0x::history::HistoryRecord,
+) -> Option<x0x::groups::GroupPublicMessage> {
+    let Scope::Group(scope_group_id) = &record.scope else {
+        return None;
+    };
+    let artifact = record.signed_artifact.as_deref()?;
+    let message = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact).ok()?;
+    if message.group_id != *scope_group_id || message.body.as_bytes() != record.payload {
+        return None;
+    }
+    Some(message)
 }
 
 /// GET /history — scoped durable-history listing (newest first, keyset
@@ -219,4 +250,57 @@ pub(in crate::server) async fn history_diagnostics(
             "reaper_evicted_total": c.reaper_evicted_total.load(Ordering::Relaxed),
         })),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use x0x::groups::{GroupPublicMessage, GroupPublicMessageKind};
+    use x0x::history::{Direction, HistoryRecord, Provenance};
+
+    #[test]
+    fn group_history_json_uses_canonical_message_id_and_thread_ancestry() {
+        let root = "a".repeat(64);
+        let message = GroupPublicMessage {
+            group_id: "group-1".to_string(),
+            state_hash_at_send: "state-1".to_string(),
+            revision_at_send: 1,
+            author_agent_id: "author-1".to_string(),
+            author_public_key: "public-key-1".to_string(),
+            author_user_id: None,
+            kind: GroupPublicMessageKind::Chat,
+            body: "thread reply".to_string(),
+            timestamp: 42,
+            thread_root: Some(root.clone()),
+            thread_parent: Some(root.clone()),
+            signature: "signature-1".to_string(),
+        };
+        let artifact = serde_json::to_vec(&message).expect("serialize message");
+        let payload = message.body.as_bytes().to_vec();
+        let stored = StoredRecord {
+            id: 7,
+            record: HistoryRecord {
+                msg_id: HistoryRecord::compute_msg_id(Some(&artifact), &payload),
+                scope: Scope::Group(message.group_id.clone()),
+                author_agent: Some(message.author_agent_id.clone()),
+                author_machine: None,
+                author_pubkey: None,
+                sent_at_ms: 42,
+                seen_at_ms: 43,
+                direction: Direction::Inbound,
+                content_type: "text/plain".to_string(),
+                payload,
+                signed_artifact: Some(artifact),
+                signature: Some(vec![1]),
+                sig_context: Some("x0x.group.public-message.v2".to_string()),
+                provenance: Provenance::VerifiedEnvelope,
+                replace_key: None,
+            },
+        };
+
+        let json = row_json(&stored);
+        assert_eq!(json["msg_id"], message.msg_id());
+        assert_eq!(json["thread_root"], root);
+        assert_eq!(json["thread_parent"], root);
+    }
 }
