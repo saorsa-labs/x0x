@@ -27,6 +27,11 @@ Manifest-based decentralized self-update with symmetric gossip propagation.
 
 Both apply paths back off versions that fail to apply: a failed version is recorded and skipped for 30 minutes before retrying (a newer release supersedes the skip immediately). This prevents a release that can never apply in a given environment from re-downloading and re-extracting on every gossip receipt.
 
+`x0xd --skip-update-check` disables self-update for that process invocation. It
+suppresses the startup GitHub check, gossip-delivered apply, manifest broadcast,
+fallback polling, and manual `/upgrade/apply`. The setting is not persisted;
+launching the daemon normally later restores the configured updater behavior.
+
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
 
 ## CI Integration
