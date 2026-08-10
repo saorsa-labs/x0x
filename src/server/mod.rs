@@ -61,14 +61,14 @@ use routes::{
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
-    spawn_directory_resubscribe, spawn_global_discovery_listener,
-    spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
-    unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
-    update_task, withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
-    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
-    PublicGroupBootstrap, SelfPublishedReleaseManifests, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    spawn_direct_public_message_listener, spawn_directory_resubscribe,
+    spawn_global_discovery_listener, spawn_global_public_message_listener,
+    spawn_listed_to_contacts_listener, status, store_named_group_info, streams_diagnostics,
+    subscribe, unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
+    update_member_role, update_named_group, update_task, withdraw_group_state, AtomicWriteOutcome,
+    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
+    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
@@ -1235,6 +1235,12 @@ pub async fn serve_with_options(
             }
         }));
     }
+
+    // Receive-ACKed raw QUIC group posts enter the generic direct-message
+    // fan-out, not the gossip-inbox typed route above. Register the matching
+    // prefix consumer explicitly so an ACKed post reaches application ingest
+    // and durable history instead of disappearing after transport receipt.
+    bg_tasks.push(spawn_direct_public_message_listener(Arc::clone(&state)));
 
     // ADR 0028: predecessor relay listener. When a requester offers their signed
     // V2 JoinRequestCreated envelope to the authority via typed DM, the

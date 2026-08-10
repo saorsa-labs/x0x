@@ -4897,7 +4897,7 @@ impl Agent {
         // Send via network layer. Prefer receive-pipeline ACK when configured:
         // success then means the remote ant-quic reader drained the direct
         // message bytes, not merely that the local socket accepted them.
-        let send_result = if let Some(timeout) = receive_ack_timeout {
+        let mut send_result = if let Some(timeout) = receive_ack_timeout {
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
             tracing::debug!(
                 target: "dm.trace",
@@ -4940,6 +4940,70 @@ impl Agent {
                 .await
                 .map(|()| dm::DmPath::RawQuic)
         };
+
+        // A receive-ACK failure while ant-quic still reports the cached
+        // connection as live is the zombie-connection shape observed in the
+        // two-machine v0.37.0 acceptance run. The old path disconnected the
+        // zombie only after deciding the HTTP request had failed, so recovery
+        // helped a later request but the current DM still returned 504. Repair
+        // and reissue once inside this logical send. Signed group payloads and
+        // durable raw-DM history are idempotent across the ambiguous
+        // "receiver drained bytes but ACK was lost" case.
+        if let (Some(timeout), Err(first_error)) = (receive_ack_timeout, &send_result) {
+            if Self::raw_quic_ack_error_is_retryable(first_error) {
+                let first_error = first_error.to_string();
+                if network.is_connected(&ant_peer_id).await {
+                    if let Err(error) = network.disconnect(&ant_peer_id).await {
+                        tracing::debug!(
+                            target: "x0x::direct",
+                            stage = "send",
+                            to = %agent_prefix,
+                            %machine_prefix,
+                            error = %error,
+                            "failed to tear down stale connection before receive-ACK retry"
+                        );
+                    }
+                }
+
+                const ACK_REPAIR_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+                let repaired = matches!(
+                    tokio::time::timeout(
+                        ACK_REPAIR_TIMEOUT,
+                        network.ensure_peer_send_ready(&ant_peer_id),
+                    )
+                    .await,
+                    Ok(Ok(()))
+                ) && network.is_connected(&ant_peer_id).await;
+
+                if repaired {
+                    if let Some(hook) = self.direct_messaging.raw_quic_ack_race_test_hook() {
+                        hook.notify_repair_retry_started();
+                    }
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "send",
+                        to = %agent_prefix,
+                        %machine_prefix,
+                        first_error,
+                        "receive-ACK send failed on cached connection; repaired and reissuing once"
+                    );
+                    send_result = self
+                        .send_ack_racing_replaced(
+                            network.as_ref(),
+                            ant_peer_id,
+                            machine_id,
+                            &direct::DirectMessaging::encode_message(
+                                &self.identity.agent_id(),
+                                payload,
+                            )?,
+                            timeout,
+                            prefer_newest_grace,
+                            agent_id,
+                        )
+                        .await;
+                }
+            }
+        }
 
         match send_result {
             Ok(path) => {
@@ -5060,9 +5124,18 @@ impl Agent {
             if let Some(hook) = ack_race_test_hook.as_ref() {
                 hook.notify_first_attempt_started();
             }
-            let result = network
-                .send_with_receive_ack(ant_peer_id, wire, timeout)
-                .await;
+            let result = if ack_race_test_hook
+                .as_ref()
+                .is_some_and(|hook| hook.take_fail_first_attempt_before_send())
+            {
+                Some(Err(ant_quic::NodeError::Connection(
+                    "forced stale cached connection for retry regression".to_string(),
+                )))
+            } else {
+                network
+                    .send_with_receive_ack(ant_peer_id, wire, timeout)
+                    .await
+            };
             if let Some(hook) = ack_race_test_hook.as_ref() {
                 hook.hold_first_attempt_result().await;
             }
@@ -5259,6 +5332,15 @@ impl Agent {
             | error::NetworkError::NotConnected(_) => !gossip_available,
             _ => false,
         }
+    }
+
+    fn raw_quic_ack_error_is_retryable(err: &error::NetworkError) -> bool {
+        !matches!(
+            err,
+            error::NetworkError::PayloadTooLarge { .. }
+                | error::NetworkError::NodeCreation(_)
+                | error::NetworkError::RemoteReceiveBackpressured(_)
+        )
     }
 
     fn raw_quic_ack_receive_backpressured(reason: &str) -> bool {

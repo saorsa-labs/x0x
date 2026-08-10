@@ -134,6 +134,9 @@ pub struct RawQuicAckRaceTestHook {
     first_attempt_started: Notify,
     first_attempt_result_release: Notify,
     replaced_short_circuit: Notify,
+    repair_retry_started: Notify,
+    hold_first_attempt_result: AtomicBool,
+    fail_first_attempt_before_send: AtomicBool,
 }
 
 impl std::fmt::Debug for RawQuicAckRaceTestHook {
@@ -149,6 +152,9 @@ impl Default for RawQuicAckRaceTestHook {
             first_attempt_started: Notify::new(),
             first_attempt_result_release: Notify::new(),
             replaced_short_circuit: Notify::new(),
+            repair_retry_started: Notify::new(),
+            hold_first_attempt_result: AtomicBool::new(true),
+            fail_first_attempt_before_send: AtomicBool::new(false),
         }
     }
 }
@@ -157,6 +163,17 @@ impl RawQuicAckRaceTestHook {
     #[must_use]
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Build a deterministic hook that fails the first ACKed raw attempt
+    /// before transport I/O, then observes the stale-connection repair retry.
+    #[must_use]
+    pub fn new_forced_first_failure() -> Self {
+        Self {
+            hold_first_attempt_result: AtomicBool::new(false),
+            fail_first_attempt_before_send: AtomicBool::new(true),
+            ..Self::default()
+        }
     }
 
     pub async fn wait_first_attempt_started(&self) {
@@ -171,16 +188,31 @@ impl RawQuicAckRaceTestHook {
         self.replaced_short_circuit.notified().await;
     }
 
+    pub async fn wait_repair_retry_started(&self) {
+        self.repair_retry_started.notified().await;
+    }
+
     pub(crate) fn notify_first_attempt_started(&self) {
         self.first_attempt_started.notify_one();
     }
 
     pub(crate) async fn hold_first_attempt_result(&self) {
-        self.first_attempt_result_release.notified().await;
+        if self.hold_first_attempt_result.load(Ordering::Relaxed) {
+            self.first_attempt_result_release.notified().await;
+        }
     }
 
     pub(crate) fn notify_replaced_short_circuit(&self) {
         self.replaced_short_circuit.notify_one();
+    }
+
+    pub(crate) fn take_fail_first_attempt_before_send(&self) -> bool {
+        self.fail_first_attempt_before_send
+            .swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn notify_repair_retry_started(&self) {
+        self.repair_retry_started.notify_one();
     }
 }
 

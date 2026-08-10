@@ -349,6 +349,18 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     config
 }
 
+fn public_group_bootstrap_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    // A bootstrap carries its own signed state-commit chain and is therefore
+    // safe to send on the receive-ACKed raw path. Prefer that path when a
+    // contact already has a live direct binding: the gossip-inbox ACK can be
+    // lost after the receiver has installed the snapshot, which made the
+    // authority log a 24-second timeout despite successful installation.
+    config.prefer_raw_quic_if_connected = true;
+    config.require_gossip = false;
+    config
+}
+
 /// Request body for POST /groups.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateGroupRequest {
@@ -2335,7 +2347,11 @@ fn spawn_public_group_bootstrap_delivery(
     let agent = Arc::clone(&state.agent);
     tokio::spawn(async move {
         if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
+            .send_direct_with_config(
+                &recipient,
+                payload,
+                public_group_bootstrap_delivery_config(),
+            )
             .await
         {
             tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to direct-deliver public-group bootstrap: {e}");
@@ -9480,6 +9496,48 @@ fn encode_group_public_message_direct_payload(
     Ok(payload)
 }
 
+async fn ingest_group_public_message_direct_payload(
+    state: &AppState,
+    sender: &AgentId,
+    payload: &[u8],
+) -> bool {
+    let Some(json) = payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX) else {
+        return false;
+    };
+    let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(json) else {
+        tracing::debug!(
+            sender = %hex::encode(sender.as_bytes()),
+            "direct group-public payload was not a GroupPublicMessage"
+        );
+        return true;
+    };
+    let group_id = msg.group_id.clone();
+    tracing::debug!(
+        group_id = %group_id,
+        sender = %hex::encode(sender.as_bytes()),
+        "direct-delivered public group message received"
+    );
+    ingest_public_message(state, msg, &group_id).await;
+    true
+}
+
+/// Subscribe to the generic direct-message fan-out for receive-ACKed raw QUIC
+/// group posts. Gossip-inbox typed routes bypass that fan-out and continue to
+/// use their dedicated channel; this listener closes the raw-only ingress gap.
+pub(in crate::server) fn spawn_direct_public_message_listener(
+    state: Arc<AppState>,
+) -> tokio::task::JoinHandle<()> {
+    // Subscribe synchronously before spawning so a raw group post cannot race
+    // server startup and arrive before this consumer is registered.
+    let mut rx = state.agent.subscribe_direct();
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            let _ =
+                ingest_group_public_message_direct_payload(&state, &msg.sender, &msg.payload).await;
+        }
+    })
+}
+
 fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     // User-visible community posts should use the receive-ACKed raw path when
@@ -12148,7 +12206,15 @@ pub(in crate::server) async fn leave_group(
         return resp;
     }
     if let Some(error) = x0x::groups::last_admin_self_leave_precheck_error(info, &local_agent_hex) {
-        return api_error(StatusCode::CONFLICT, error);
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": error,
+                "delete_endpoint": format!("POST /groups/{id}/state/withdraw"),
+                "delete_command": format!("x0x group delete {id}"),
+            })),
+        );
     }
     let mut next = info.clone();
     next.roster_revision = next.roster_revision.saturating_add(1);
@@ -19968,6 +20034,29 @@ mod tests {
         Ok((state, dir))
     }
 
+    async fn public_message_history_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let history = x0x::history::HistoryConfig {
+            enabled: true,
+            db_path: Some(data_dir.join("history.db")),
+            ..x0x::history::HistoryConfig::default()
+        };
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_history(history)
+                .build()
+                .await?,
+        );
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
     async fn secure_endpoint_test_state_at(
         data_dir: &FsPath,
         agent: Arc<Agent>,
@@ -20130,6 +20219,281 @@ mod tests {
             &authority_hex,
             &recipient_hex
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn public_group_bootstrap_prefers_receive_acked_raw_delivery() {
+        let config = public_group_bootstrap_delivery_config();
+        assert!(config.prefer_raw_quic_if_connected);
+        assert!(!config.require_gossip);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+    }
+
+    /// A stranger bootstrap must install nothing. Once the recipient removes
+    /// and re-adds the authority as a known contact, and the authority removes
+    /// then re-adds the recipient in a newer signed roster, installation must
+    /// resume deterministically from that fresh snapshot.
+    #[tokio::test]
+    async fn public_bootstrap_refuses_stranger_then_contact_and_member_readd_installs() -> Result<()>
+    {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let authority_id = authority.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Consent recovery".to_string(),
+            String::new(),
+            authority_id,
+            "bd".repeat(32),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        group.seal_commit(&authority, now_millis_u64())?;
+
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: authority_id,
+            trust_level: x0x::contacts::TrustLevel::Unknown,
+            label: Some("stranger".to_string()),
+            added_at: 0,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Anonymous,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+        handle_public_group_bootstrap(
+            &state,
+            &authority_id,
+            PublicGroupBootstrap {
+                message_type: "public_group_bootstrap".to_string(),
+                group: Box::new(
+                    signed_public_bootstrap_snapshot(group.clone())
+                        .context("first bootstrap snapshot")?,
+                ),
+            },
+        )
+        .await;
+        assert!(
+            state.named_groups.read().await.is_empty(),
+            "unknown authority must not install persistent group state"
+        );
+
+        state.contacts.write().await.remove(&authority_id);
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: authority_id,
+            trust_level: x0x::contacts::TrustLevel::Known,
+            label: Some("re-added authority".to_string()),
+            added_at: 1,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Anonymous,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.remove_member(&local_hex, Some(authority_hex.clone()));
+        group.seal_commit(&authority, now_millis_u64())?;
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            Some("restored member".to_string()),
+        );
+        group.seal_commit(&authority, now_millis_u64())?;
+        let stable_id = group.stable_group_id().to_string();
+        handle_public_group_bootstrap(
+            &state,
+            &authority_id,
+            PublicGroupBootstrap {
+                message_type: "public_group_bootstrap".to_string(),
+                group: Box::new(
+                    signed_public_bootstrap_snapshot(group)
+                        .context("restored bootstrap snapshot")?,
+                ),
+            },
+        )
+        .await;
+
+        let groups = state.named_groups.read().await;
+        let installed = groups
+            .get(&stable_id)
+            .context("trusted fresh bootstrap installed")?;
+        assert!(installed.has_active_member(&local_hex));
+        assert_eq!(installed.state_revision, 3);
+        Ok(())
+    }
+
+    /// Sole-catching raw ingress regression: no gossip listener participates.
+    /// The test injects a prefixed message into generic direct fan-out and
+    /// requires the server's raw listener to validate/cache it and write the
+    /// received threaded reply to durable history with ancestry intact.
+    #[tokio::test]
+    async fn receive_acked_raw_group_reply_reaches_history_with_thread_metadata() -> Result<()> {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let remote = x0x::identity::AgentKeypair::generate()?;
+        let remote_hex = hex::encode(remote.agent_id().as_bytes());
+        let group_id = "raw-public-ingress".to_string();
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Raw ingress".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            remote_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex),
+            None,
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        let stable_id = group.stable_group_id().to_string();
+        let state_hash = group.state_hash.clone();
+        let state_revision = group.state_revision;
+        state.named_groups.write().await.insert(group_id, group);
+
+        let root = "a1".repeat(32);
+        let reply = x0x::groups::GroupPublicMessage::sign(
+            stable_id.clone(),
+            state_hash,
+            state_revision,
+            &remote,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "raw threaded reply".to_string(),
+            now_millis_u64(),
+            Some(root.clone()),
+            Some(root.clone()),
+        )?;
+        let payload = encode_group_public_message_direct_payload(&reply)?;
+        let listener = spawn_direct_public_message_listener(Arc::clone(&state));
+        state
+            .agent
+            .direct_messaging()
+            .handle_incoming(
+                x0x::identity::MachineId([0x44; 32]),
+                remote.agent_id(),
+                payload,
+                true,
+                Some(x0x::trust::TrustDecision::Accept),
+                None,
+            )
+            .await;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            let cached = state.public_messages.read().await;
+            if cached
+                .get(&stable_id)
+                .is_some_and(|messages| messages.iter().any(|msg| msg.signature == reply.signature))
+            {
+                break;
+            }
+            drop(cached);
+            if Instant::now() >= deadline {
+                anyhow::bail!("raw direct listener did not cache the community reply");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        let history = state.agent.history().context("history enabled")?;
+        let history_deadline = Instant::now() + Duration::from_secs(2);
+        let record = loop {
+            let rows = history.store().query(&x0x::history::HistoryQuery {
+                scope: Some(x0x::history::Scope::Group(stable_id.clone())),
+                ..x0x::history::HistoryQuery::default()
+            })?;
+            if let Some(row) = rows.into_iter().next() {
+                break row.record;
+            }
+            if Instant::now() >= history_deadline {
+                anyhow::bail!("raw community reply was not recorded in history");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        assert_eq!(record.direction, x0x::history::Direction::Inbound);
+        assert_eq!(
+            record.provenance,
+            x0x::history::Provenance::VerifiedEnvelope
+        );
+        let artifact = record.signed_artifact.context("signed artifact retained")?;
+        let restored: x0x::groups::GroupPublicMessage = serde_json::from_slice(&artifact)?;
+        assert_eq!(restored.thread_root.as_deref(), Some(root.as_str()));
+        assert_eq!(restored.thread_parent.as_deref(), Some(root.as_str()));
+        assert_eq!(restored.author_agent_id, remote_hex);
+        listener.abort();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn sole_admin_leave_points_to_explicit_delete_and_withdrawal_succeeds() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "gate-8-owner-cleanup".to_string();
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Gate 8 cleanup".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), group);
+
+        let leave_response = leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
+            .await
+            .into_response();
+        let (leave_status, leave_body) = response_json(leave_response).await?;
+        assert_eq!(leave_status, StatusCode::CONFLICT);
+        assert_eq!(
+            leave_body["delete_endpoint"].as_str(),
+            Some("POST /groups/gate-8-owner-cleanup/state/withdraw"),
+            "last-admin refusal must expose the explicit cleanup contract: {leave_body}"
+        );
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .is_some_and(|stored| {
+                    !stored.withdrawn
+                        && stored
+                            .active_members()
+                            .any(|member| member.role.at_least(x0x::groups::GroupRole::Admin))
+                }),
+            "ordinary leave must preserve the live-group admin invariant"
+        );
+
+        let delete_response =
+            withdraw_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+                .await
+                .into_response();
+        let (delete_status, delete_body) = response_json(delete_response).await?;
+        assert_eq!(delete_status, StatusCode::OK, "delete: {delete_body}");
+        let groups = state.named_groups.read().await;
+        let tombstone = groups
+            .get(&group_id)
+            .context("withdrawn tombstone retained")?;
+        assert!(tombstone.withdrawn);
+        assert!(tombstone.shared_secret.is_none());
+        assert!(tombstone.security_binding.is_none());
         Ok(())
     }
 

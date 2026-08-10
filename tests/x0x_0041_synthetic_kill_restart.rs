@@ -433,3 +433,122 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         "alice should have advanced bob's lifecycle generation past {pre_kill_generation}; got {final_gen:?}"
     );
 }
+
+/// Regression for the v0.37.0 two-Mac failure: an ACKed raw DM that hits a
+/// stale cached connection must repair and reissue within the SAME logical
+/// send. Before the fix the stale connection was torn down only while
+/// returning the first error, so only a later HTTP request could recover.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_connection_ack_failure_repairs_and_retries_same_send() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_agent(&dir, "retry-alice").await);
+    let bob = Arc::new(build_agent(&dir, "retry-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let discovered = |agent: &Agent, addr| x0x::DiscoveredAgent {
+        agent_id: agent.agent_id(),
+        machine_id: agent.machine_id(),
+        user_id: None,
+        addresses: vec![addr],
+        announced_at: now_secs,
+        last_seen: now_secs,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: Vec::new(),
+    };
+    alice
+        .insert_discovered_agent_for_testing(discovered(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered(&alice, alice_addr))
+        .await;
+
+    let connected_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connected_deadline {
+        if alice_network.is_connected(&bob_peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        alice_network.is_connected(&bob_peer).await,
+        "precondition: cached direct connection is live"
+    );
+
+    let hook = Arc::new(RawQuicAckRaceTestHook::new_forced_first_failure());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&hook)));
+    let mut bob_rx = bob.subscribe_direct();
+    let payload = b"same-request-repair-after-stale-cached-connection".to_vec();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(5),
+        alice.send_direct_with_config(
+            &bob.agent_id(),
+            payload.clone(),
+            DmSendConfig {
+                prefer_raw_quic_if_connected: true,
+                raw_quic_receive_ack_timeout: Some(Duration::from_secs(1)),
+                stop_fallback_on_raw_error: true,
+                max_retries: 0,
+                ..DmSendConfig::default()
+            },
+        ),
+    )
+    .await
+    .expect("same logical send repairs inside five seconds")
+    .expect("repair retry returns success");
+
+    tokio::time::timeout(Duration::from_secs(1), hook.wait_repair_retry_started())
+        .await
+        .expect("receive-ACK failure must take the repair retry path");
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+
+    assert_eq!(receipt.path, DmPath::RawQuicAcked);
+    let received = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("bob receives retry payload")
+        .expect("bob subscriber remains open");
+    assert_eq!(received.payload, payload);
+    assert!(
+        bob_rx.try_recv().is_none(),
+        "forced pre-send failure must not duplicate the application payload"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
