@@ -233,11 +233,9 @@ class Node:
             # --no-hard-coded-bootstrap would now be redundant (it preserves
             # config peers), so it is not passed.
             f'bootstrap_peers = [{peers}]\n'
-            # Fully disable self-update. --skip-update-check (passed at
-            # start) only suppresses the startup GitHub check — it does NOT
-            # stop gossip-delivered auto-apply, which replaced a v0.30.1
-            # legacy participant with the latest release mid-run and
-            # invalidated the mixed-version skew gate (v0.31.1 retest).
+            # Keep the config-level disable as defense in depth for legacy
+            # x0xd binaries whose --skip-update-check only suppressed startup.
+            # Current binaries use that flag to stop every update path.
             '[update]\n'
             'enabled = false\n'
         )

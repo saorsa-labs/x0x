@@ -76,11 +76,11 @@ use routes::{
     GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
-use state::AppState;
 pub use state::{
     default_api_address, default_bind_address, default_data_dir, validate_instance_name,
     DaemonConfig, InstanceName, ServeOptions, ServerHandle, DEFAULT_QUIC_PORT,
 };
+use state::{effective_self_update_enabled, AppState};
 use ws::{serve_gui, ws_diagnostics, ws_direct_handler, ws_handler, ws_sessions, WsOutboundStats};
 
 use std::collections::HashMap;
@@ -206,6 +206,12 @@ pub async fn serve_with_options(
         connect_policy,
         self_update_enabled,
     } = options;
+    // `--skip-update-check` is process-scoped updater suppression. Compute one
+    // effective capability before any updater path is considered, then use it
+    // for startup checks, background gossip/poll workers, and `/upgrade/apply`.
+    // The config itself stays unchanged, so a later ordinary launch still
+    // participates in the normal release train.
+    let self_update_enabled = effective_self_update_enabled(self_update_enabled, skip_update_check);
     // Ensure data directory exists early so self-update has a working directory.
     tokio::fs::create_dir_all(&config.data_dir)
         .await
@@ -226,7 +232,7 @@ pub async fn serve_with_options(
     // Startup GitHub check (fallback mechanism — gossip is primary).
     // Gated on `self_update_enabled` so embedders never download/install a new
     // binary in-process; the daemon binary sets it to `config.update.enabled`.
-    if self_update_enabled && config.update.enabled && !skip_update_check {
+    if self_update_enabled && config.update.enabled {
         if let Err(e) = run_startup_update_check(&config, None).await {
             tracing::warn!(error = %e, "Startup update check failed: {e}");
         }
@@ -925,7 +931,7 @@ pub async fn serve_with_options(
     // Fix D (Issue #110 Phase 2): gated on `self_update_enabled` — this fetches a
     // GitHub release manifest and writes SKILL.md, both updater side-effects an
     // embedder with self-update off must not perform. The daemon keeps it on
-    // (self_update_enabled = config.update_enabled()), so behaviour is unchanged.
+    // Ordinary daemon launches keep it on; process-scoped skip launches do not.
     if self_update_enabled && config.update.enabled {
         let agent_for_broadcast = Arc::clone(&state.agent);
         let update_config = config.update.clone();
