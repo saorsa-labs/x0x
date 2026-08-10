@@ -135,6 +135,41 @@ fn fts_hit_miss_and_injection_literal() {
 }
 
 #[test]
+fn native_channel_message_json_searches_only_its_text_projection() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    let scope = Scope::Dm("peer-agent".into());
+    let payload = br#"{"text":"e2e-ui-dm-search-marker","createdAt":1786379111246,"clientId":"metadata-must-not-be-indexed","mentions":["peer-agent"]}"#;
+    let mut channel_message = record(payload, scope.clone(), 1);
+    channel_message.content_type = "application/json".into();
+
+    assert_eq!(
+        store.insert(&channel_message).unwrap(),
+        InsertOutcome::Inserted
+    );
+
+    let hits = store
+        .search(
+            "e2e-ui-dm-search-marker",
+            &HistoryQuery {
+                scope: Some(scope),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(hits.len(), 1);
+    assert_eq!(hits[0].record.content_type, "application/json");
+    assert_eq!(hits[0].record.payload, payload);
+    assert!(
+        store
+            .search("metadata-must-not-be-indexed", &HistoryQuery::default())
+            .unwrap()
+            .is_empty(),
+        "FTS must index the human text field, not the full JSON envelope"
+    );
+}
+
+#[test]
 fn retention_evicts_oldest_and_respects_scope_limits() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(&dir.path().join("history.db")).unwrap();
