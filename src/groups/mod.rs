@@ -642,6 +642,197 @@ impl GroupInfo {
         self.finalize_applied_commit(commit)
     }
 
+    /// Atomically catch up a signed-public group from a contiguous sequence of
+    /// retained, admin-authored state commits.
+    ///
+    /// Each retained entry carries the access-bearing roster projection that
+    /// produced its signed `roster_root`. The projection is installed on a
+    /// clone, then the ordinary apply validator and finalizer verify signature,
+    /// predecessor, authority, component hashes, withdrawal terminality, and
+    /// the last-admin invariant. `self` changes only after the complete batch
+    /// succeeds.
+    /// `target_roster_revision` must come from the authority's group snapshot
+    /// at the final supplied commit. It is checked for monotonicity, bounded to
+    /// at most one increment per commit, and required to cover every observed
+    /// roster projection change; it is never derived from `state_revision`.
+    ///
+    /// Policy, public-metadata, and security-binding values are intentionally
+    /// not accepted from this recovery path: retained entries carry only their
+    /// hashes. A commit that changed one of those values therefore fails the
+    /// normal final state-hash check unless the receiver already has the exact
+    /// concrete value. Terminal withdrawal likewise remains exclusive to the
+    /// explicit `GroupDeleted` apply path, where key wiping is atomic.
+    pub fn apply_retained_commits(
+        &mut self,
+        retained: &[state_commit::RetainedCommit],
+        target_roster_revision: u64,
+    ) -> Result<usize, state_commit::ApplyError> {
+        if retained.is_empty() {
+            return Err(state_commit::ApplyError::Invariant(
+                "retained catch-up requires at least one commit".to_string(),
+            ));
+        }
+        if self.policy.confidentiality != GroupConfidentiality::SignedPublic {
+            return Err(state_commit::ApplyError::Invariant(
+                "retained catch-up is limited to signed-public groups".to_string(),
+            ));
+        }
+        if self.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+        if target_roster_revision < self.roster_revision {
+            return Err(state_commit::ApplyError::Invariant(format!(
+                "retained catch-up roster revision regressed: have {}, got {target_roster_revision}",
+                self.roster_revision
+            )));
+        }
+        let batch_len = u64::try_from(retained.len()).map_err(|_| {
+            state_commit::ApplyError::Invariant(
+                "retained catch-up batch length does not fit u64".to_string(),
+            )
+        })?;
+        let maximum_roster_revision = self.roster_revision.saturating_add(batch_len);
+        if target_roster_revision > maximum_roster_revision {
+            return Err(state_commit::ApplyError::Invariant(format!(
+                "retained catch-up roster revision gap: maximum {maximum_roster_revision}, got {target_roster_revision}"
+            )));
+        }
+
+        let mut candidate = self.clone();
+        let mut roster_changes = 0_u64;
+        for entry in retained {
+            if candidate.apply_one_retained_commit(entry)? {
+                roster_changes = roster_changes.saturating_add(1);
+            }
+        }
+        let minimum_roster_revision = self.roster_revision.saturating_add(roster_changes);
+        if target_roster_revision < minimum_roster_revision {
+            return Err(state_commit::ApplyError::Invariant(format!(
+                "retained catch-up roster revision omitted a committed roster change: minimum {minimum_roster_revision}, got {target_roster_revision}"
+            )));
+        }
+        candidate.roster_revision = target_roster_revision;
+        *self = candidate;
+        Ok(retained.len())
+    }
+
+    fn apply_one_retained_commit(
+        &mut self,
+        retained: &state_commit::RetainedCommit,
+    ) -> Result<bool, state_commit::ApplyError> {
+        let commit = &retained.commit;
+        if commit.revision <= self.state_revision {
+            return Err(state_commit::ApplyError::StaleRevision {
+                got: commit.revision,
+                have: self.state_revision,
+            });
+        }
+        let expected_revision = self.state_revision.checked_add(1).ok_or_else(|| {
+            state_commit::ApplyError::Invariant(
+                "state revision overflow prevents retained catch-up".to_string(),
+            )
+        })?;
+        if commit.revision != expected_revision {
+            return Err(state_commit::ApplyError::Invariant(format!(
+                "retained catch-up revision gap: expected {expected_revision}, got {}",
+                commit.revision
+            )));
+        }
+        if commit.withdrawn {
+            return Err(state_commit::ApplyError::Invariant(
+                "retained catch-up cannot apply a withdrawal commit".to_string(),
+            ));
+        }
+
+        let actual_roster_root = state_commit::roster_root_of_projection(&retained.roster);
+        if actual_roster_root != commit.roster_root {
+            return Err(state_commit::ApplyError::StateHashMismatch {
+                expected: commit.roster_root.clone(),
+                got: actual_roster_root,
+            });
+        }
+        for (agent_id, snapshot) in &retained.roster {
+            if !is_canonical_agent_id_hex(agent_id) {
+                return Err(state_commit::ApplyError::Invariant(format!(
+                    "retained roster contains invalid agent id {agent_id}"
+                )));
+            }
+            if !matches!(
+                snapshot.state,
+                GroupMemberState::Active | GroupMemberState::Banned
+            ) {
+                return Err(state_commit::ApplyError::Invariant(
+                    "retained roster projection may contain only active or banned members"
+                        .to_string(),
+                ));
+            }
+        }
+
+        let ctx = state_commit::ApplyContext {
+            current_state_hash: &self.state_hash,
+            current_revision: self.state_revision,
+            current_withdrawn: self.withdrawn,
+            members_v2: &self.members_v2,
+            group_id: self.stable_group_id(),
+        };
+        state_commit::validate_apply(&ctx, commit, state_commit::ActionKind::AdminOrHigher)?;
+
+        // Only `(agent_id, role, state)` is covered by the signed roster root.
+        // `treekem_key_package_hash` is retained as advisory audit metadata but
+        // must not be installed by this signature-driven recovery path.
+        let roster_changed =
+            state_commit::compute_roster_root(&self.members_v2) != commit.roster_root;
+        self.install_retained_roster(&retained.roster, commit);
+        self.updated_at = commit.committed_at;
+        self.finalize_applied_commit(commit)?;
+        Ok(roster_changed)
+    }
+
+    fn install_retained_roster(
+        &mut self,
+        roster: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
+        commit: &state_commit::GroupStateCommit,
+    ) {
+        for (agent_id, member) in &mut self.members_v2 {
+            if matches!(
+                member.state,
+                GroupMemberState::Active | GroupMemberState::Banned
+            ) && !roster.contains_key(agent_id)
+            {
+                member.state = GroupMemberState::Removed;
+                member.updated_at = commit.committed_at;
+                member.removed_by = Some(commit.committed_by.clone());
+            }
+        }
+
+        for (agent_id, snapshot) in roster {
+            self.members_v2
+                .entry(agent_id.clone())
+                .and_modify(|member| {
+                    member.role = snapshot.role;
+                    member.state = snapshot.state;
+                    member.updated_at = commit.committed_at;
+                    member.removed_by = (snapshot.state == GroupMemberState::Banned)
+                        .then(|| commit.committed_by.clone());
+                })
+                .or_insert_with(|| GroupMember {
+                    agent_id: agent_id.clone(),
+                    user_id: None,
+                    role: snapshot.role,
+                    state: snapshot.state,
+                    display_name: None,
+                    joined_at: commit.committed_at,
+                    updated_at: commit.committed_at,
+                    added_by: Some(commit.committed_by.clone()),
+                    removed_by: (snapshot.state == GroupMemberState::Banned)
+                        .then(|| commit.committed_by.clone()),
+                    kem_public_key_b64: None,
+                    treekem_key_package_b64: None,
+                    treekem_key_package_hash: None,
+                });
+        }
+    }
+
     fn finalize_applied_commit_with_terminal_mode(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -1176,6 +1367,13 @@ impl GroupInfo {
     }
 }
 
+fn is_canonical_agent_id_hex(candidate: &str) -> bool {
+    candidate.len() == 64
+        && candidate
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1240,6 +1438,253 @@ mod tests {
                 .roster
                 .contains_key(&hex::encode([2u8; 32])),
             "newly added member must appear in the latest retained projection"
+        );
+    }
+
+    fn retained_catchup_fixture() -> (
+        AgentKeypair,
+        GroupInfo,
+        GroupInfo,
+        Vec<state_commit::RetainedCommit>,
+        String,
+    ) {
+        let admin = AgentKeypair::generate().expect("admin keypair");
+        let child_id = hex::encode([2_u8; 32]);
+        let mut authority = GroupInfo::with_policy(
+            "Catch-up".into(),
+            String::new(),
+            admin.agent_id(),
+            "ab".repeat(16),
+            GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        authority.roster_revision = authority.roster_revision.saturating_add(1);
+        authority.add_member(
+            child_id.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            Some("child".into()),
+        );
+        authority.seal_commit(&admin, 1_000).expect("ancestor");
+        let ancestor = authority.clone();
+
+        // State-only reseal: the counters must remain independent through
+        // catch-up (`state_revision` advances, `roster_revision` does not).
+        authority
+            .seal_commit(&admin, 1_500)
+            .expect("state-only reseal");
+        authority.roster_revision = authority.roster_revision.saturating_add(1);
+        authority.remove_member(&child_id, Some(hex::encode(admin.agent_id().as_bytes())));
+        authority.seal_commit(&admin, 2_000).expect("remove");
+        authority.roster_revision = authority.roster_revision.saturating_add(1);
+        authority.add_member(
+            child_id.clone(),
+            GroupRole::Member,
+            Some(hex::encode(admin.agent_id().as_bytes())),
+            Some("child".into()),
+        );
+        authority.seal_commit(&admin, 3_000).expect("re-add");
+        let retained = authority.commit_log[1..].to_vec();
+        (admin, ancestor, authority, retained, child_id)
+    }
+
+    #[test]
+    fn retained_catchup_applies_contiguous_remove_readd_batch() {
+        let (_admin, mut child, authority, retained, child_id) = retained_catchup_fixture();
+
+        let applied = child
+            .apply_retained_commits(&retained, authority.roster_revision)
+            .expect("contiguous retained history applies");
+
+        assert_eq!(applied, 3);
+        assert_eq!(child.state_revision, authority.state_revision);
+        assert_eq!(child.roster_revision, authority.roster_revision);
+        assert_ne!(
+            child.state_revision, child.roster_revision,
+            "state-only commits must not inflate the recovered roster counter"
+        );
+        assert_eq!(child.state_hash, authority.state_hash);
+        assert_eq!(
+            state_commit::roster_projection(&child.members_v2),
+            state_commit::roster_projection(&authority.members_v2)
+        );
+        assert!(child.has_active_member(&child_id));
+        assert_eq!(child.commit_log, authority.commit_log);
+    }
+
+    #[test]
+    fn retained_catchup_does_not_install_unsigned_treekem_hashes() {
+        let (_admin, mut child, _authority, retained, _child_id) = retained_catchup_fixture();
+        let mut advisory_tampered = retained[0].clone();
+        for snapshot in advisory_tampered.roster.values_mut() {
+            snapshot.treekem_key_package_hash = Some("unsigned-advisory-value".to_string());
+        }
+        let target_roster_revision = child.roster_revision;
+
+        child
+            .apply_retained_commits(&[advisory_tampered], target_roster_revision)
+            .expect("signed roster fields remain applicable");
+
+        assert!(child
+            .members_v2
+            .values()
+            .all(|member| member.treekem_key_package_hash.is_none()));
+    }
+
+    #[test]
+    fn retained_catchup_rejects_wrong_group_signature_gap_fork_and_authority() {
+        let (admin, ancestor, _authority, retained, _child_id) = retained_catchup_fixture();
+
+        let mut wrong_group = retained[0].clone();
+        wrong_group.commit.group_id = "wrong-group".to_string();
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(&[wrong_group], ancestor.roster_revision)
+            .expect_err("wrong group rejected");
+        assert!(matches!(
+            err,
+            state_commit::ApplyError::GroupIdMismatch { .. }
+        ));
+
+        let mut bad_signature = retained[0].clone();
+        bad_signature.commit.signature = "00".repeat(3_309);
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(&[bad_signature], ancestor.roster_revision)
+            .expect_err("bad signature rejected");
+        assert!(matches!(err, state_commit::ApplyError::InvalidSignature(_)));
+
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(
+                &[retained[1].clone()],
+                ancestor.roster_revision.saturating_add(1),
+            )
+            .expect_err("revision gap rejected");
+        assert!(matches!(
+            err,
+            state_commit::ApplyError::Invariant(ref message)
+                if message.contains("revision gap")
+        ));
+
+        let template = &retained[0];
+        let fork_commit = state_commit::GroupStateCommit::sign(
+            template.commit.group_id.clone(),
+            template.commit.revision,
+            Some("forked-predecessor".to_string()),
+            template.commit.roster_root.clone(),
+            template.commit.policy_hash.clone(),
+            template.commit.public_meta_hash.clone(),
+            template.commit.security_binding.clone(),
+            false,
+            template.commit.committed_at,
+            &admin,
+        )
+        .expect("signed fork fixture");
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(
+                &[state_commit::RetainedCommit {
+                    commit: fork_commit,
+                    roster: template.roster.clone(),
+                }],
+                ancestor.roster_revision,
+            )
+            .expect_err("fork rejected");
+        assert!(matches!(
+            err,
+            state_commit::ApplyError::PrevHashMismatch { .. }
+        ));
+
+        let outsider = AgentKeypair::generate().expect("outsider keypair");
+        let unauthorized_commit = state_commit::GroupStateCommit::sign(
+            template.commit.group_id.clone(),
+            template.commit.revision,
+            template.commit.prev_state_hash.clone(),
+            template.commit.roster_root.clone(),
+            template.commit.policy_hash.clone(),
+            template.commit.public_meta_hash.clone(),
+            template.commit.security_binding.clone(),
+            false,
+            template.commit.committed_at,
+            &outsider,
+        )
+        .expect("signed unauthorized fixture");
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(
+                &[state_commit::RetainedCommit {
+                    commit: unauthorized_commit,
+                    roster: template.roster.clone(),
+                }],
+                ancestor.roster_revision,
+            )
+            .expect_err("unauthorized transition rejected");
+        assert!(matches!(err, state_commit::ApplyError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn retained_catchup_rejects_withdrawal_bad_roster_and_is_atomic() {
+        let (admin, ancestor, _authority, retained, _child_id) = retained_catchup_fixture();
+        let template = &retained[0];
+        let withdrawn_commit = state_commit::GroupStateCommit::sign(
+            template.commit.group_id.clone(),
+            template.commit.revision,
+            template.commit.prev_state_hash.clone(),
+            template.commit.roster_root.clone(),
+            template.commit.policy_hash.clone(),
+            template.commit.public_meta_hash.clone(),
+            template.commit.security_binding.clone(),
+            true,
+            template.commit.committed_at,
+            &admin,
+        )
+        .expect("signed withdrawal fixture");
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(
+                &[state_commit::RetainedCommit {
+                    commit: withdrawn_commit,
+                    roster: template.roster.clone(),
+                }],
+                ancestor.roster_revision,
+            )
+            .expect_err("withdrawal rejected");
+        assert!(matches!(err, state_commit::ApplyError::Invariant(_)));
+
+        let mut bad_roster = template.clone();
+        bad_roster
+            .roster
+            .remove(&hex::encode(admin.agent_id().as_bytes()));
+        let err = ancestor
+            .clone()
+            .apply_retained_commits(&[bad_roster], ancestor.roster_revision)
+            .expect_err("roster root mismatch rejected");
+        assert!(matches!(
+            err,
+            state_commit::ApplyError::StateHashMismatch { .. }
+        ));
+
+        let mut bad_second = retained[1].clone();
+        bad_second.commit.signature = "00".repeat(3_309);
+        let mut child = ancestor;
+        let before = serde_json::to_vec(&child).expect("snapshot child");
+        let before_roster_revision = child.roster_revision;
+        let rejected_target_roster_revision = child.roster_revision.saturating_add(1);
+        let err = child
+            .apply_retained_commits(
+                &[retained[0].clone(), bad_second],
+                rejected_target_roster_revision,
+            )
+            .expect_err("bad second commit rejects batch");
+        assert!(matches!(err, state_commit::ApplyError::InvalidSignature(_)));
+        assert_eq!(
+            serde_json::to_vec(&child).expect("snapshot rejected child"),
+            before,
+            "a failed batch must not expose its valid prefix"
+        );
+        assert_eq!(
+            child.roster_revision, before_roster_revision,
+            "a rejected batch must not mutate the independent roster counter"
         );
     }
 

@@ -732,6 +732,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/state/commits/apply",
+        cli_name: "group state-commits-apply",
+        description: "Apply a contiguous retained signed-public state-commit batch",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/:id/state/seal",
         cli_name: "group state-seal",
         description: "Advance the state-commit chain and republish signed card",

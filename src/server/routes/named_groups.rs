@@ -152,6 +152,53 @@ static B8_BEFORE_FINAL_AUTHORIZATION_NOW_NOTIFY: StdMutex<
 > = StdMutex::new(None);
 
 #[cfg(test)]
+#[derive(Clone)]
+struct GroupPublicPrimaryPublishHookControl {
+    entered: Arc<tokio::sync::Notify>,
+    release: Option<Arc<tokio::sync::Notify>>,
+    force_failure: bool,
+}
+
+#[cfg(test)]
+static GROUP_PUBLIC_PRIMARY_PUBLISH_HOOKS: std::sync::LazyLock<
+    StdMutex<HashMap<String, GroupPublicPrimaryPublishHookControl>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+#[cfg(test)]
+static GROUP_PUBLIC_HISTORY_INSERT_FAILURES: std::sync::LazyLock<StdMutex<HashSet<String>>> =
+    std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
+
+#[cfg(test)]
+static GROUP_PUBLIC_BACKGROUND_ATTEMPTS: StdMutex<Vec<(String, &'static str)>> =
+    StdMutex::new(Vec::new());
+
+#[cfg(test)]
+fn take_group_public_primary_publish_hook(
+    group_id: &str,
+) -> Option<GroupPublicPrimaryPublishHookControl> {
+    GROUP_PUBLIC_PRIMARY_PUBLISH_HOOKS
+        .lock()
+        .expect("group public publish hook poisoned")
+        .remove(group_id)
+}
+
+#[cfg(test)]
+fn take_group_public_history_insert_failure(group_id: &str) -> bool {
+    GROUP_PUBLIC_HISTORY_INSERT_FAILURES
+        .lock()
+        .expect("group public history failure hook poisoned")
+        .remove(group_id)
+}
+
+#[cfg(test)]
+fn record_group_public_background_attempt(group_id: &str, path: &'static str) {
+    GROUP_PUBLIC_BACKGROUND_ATTEMPTS
+        .lock()
+        .expect("group public background attempt recorder poisoned")
+        .push((group_id.to_string(), path));
+}
+
+#[cfg(test)]
 pub(in crate::server) struct TreeKemCacheWriterHookControl {
     // Signalled with a stored permit once the writer has entered the hook, so a
     // test can deterministically observe that the write is in flight regardless
@@ -9056,6 +9103,9 @@ pub(in crate::server) async fn send_group_public_message(
             "body exceeds MAX_PUBLIC_MESSAGE_BYTES",
         );
     }
+    if req.body.is_empty() {
+        return bad_request("body must not be empty");
+    }
 
     // Validate thread fields (ADR-0029): 64 lowercase hex chars, parent ⇒ root.
     if let Some(root) = &req.thread_root {
@@ -9158,11 +9208,6 @@ pub(in crate::server) async fn send_group_public_message(
         }
     };
 
-    // Subscribe locally before publishing so the sender's pubsub runtime has
-    // the topic fully initialised before the first outbound message. This makes
-    // reverse-direction cross-daemon receive far more reliable on fresh topics.
-    spawn_public_message_listener(Arc::clone(&state), msg.group_id.clone()).await;
-
     let topic = x0x::groups::public_topic_for(&msg.group_id);
     let bytes = match serde_json::to_vec(&msg) {
         Ok(b) => b,
@@ -9173,39 +9218,55 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
-    if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("publish failed: {e}"),
-        );
-    }
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
-        .await
+
+    // Local acceptance is the response boundary. With history enabled, do an
+    // acknowledged SQLite insert on the blocking pool before exposing the
+    // message in memory or scheduling any network work. A failed insert is a
+    // real failed send: no cache entry and no delivery attempt. History-disabled
+    // deployments intentionally retain the legacy memory-only acceptance mode.
+    let history_enabled = state.agent.history().is_some();
+    let history_persisted = match persist_outbound_group_public_history(&state, &msg, &bytes).await
     {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            group_id = %msg.group_id,
-            "E: global public-send fallback publish failed: {e}"
-        );
-    }
-    // Publish succeeded, so cache locally. The listener was started before the
-    // publish above to avoid first-message topic races.
-    cache_public_message(&state, msg.clone()).await;
-    spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
+        Ok(persisted) => persisted,
+        Err(e) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("local history commit failed: {e}"),
+            );
+        }
+    };
+    cache_public_message_in_memory(&state, msg.clone()).await;
+
+    // Delivery is best-effort after local acceptance. Each path is spawned
+    // independently: a slow listener or failed/blocked primary topic cannot
+    // suppress the global fallback or direct-member fanout, and no background
+    // failure can roll back the accepted local message.
+    spawn_group_public_message_background_delivery(
+        &state,
+        topic.clone(),
+        bytes,
+        direct_recipients,
+        msg.clone(),
+    );
 
     let msg_id = msg.msg_id();
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            "accepted": true,
             "group_id": msg.group_id,
             "topic": topic,
             "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
             "timestamp": msg.timestamp,
             "msg_id": msg_id,
+            "history_enabled": history_enabled,
+            "history_persisted": history_persisted,
+            "local_acceptance": if history_persisted {
+                "durable_history"
+            } else {
+                "memory_only_history_disabled"
+            },
         })),
     )
 }
@@ -9362,27 +9423,16 @@ pub(in crate::server) async fn get_group_public_messages(
     )
 }
 
-/// Record a validated group public message durably (ADR-0023 §4).
-///
-/// Called from the single convergence point every delivery path funnels
-/// through (`cache_public_message`), so per-group topic, global fallback,
-/// and DM direct-push all record exactly once — the store dedupes on
-/// `msg_id = BLAKE3(signed JSON)`.
-fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicMessage) {
-    let Some(history) = state.agent.history() else {
-        return;
-    };
-    if msg.body.is_empty() {
-        return;
-    }
-    let Ok(artifact) = serde_json::to_vec(msg) else {
-        return;
-    };
+fn group_public_history_record(
+    state: &AppState,
+    msg: &x0x::groups::GroupPublicMessage,
+    artifact: Vec<u8>,
+) -> x0x::history::HistoryRecord {
     let self_hex = hex::encode(state.agent.agent_id().as_bytes());
     let outbound = msg.author_agent_id == self_hex;
     let payload = msg.body.as_bytes().to_vec();
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
-    history.record(x0x::history::HistoryRecord {
+    x0x::history::HistoryRecord {
         // HistoryRecord.msg_id is the store-internal dedup key governed by
         // HistoryRecord::validate(): it must equal compute_msg_id(artifact,
         // payload), i.e. BLAKE3 of the signed JSON artifact when present.
@@ -9420,7 +9470,67 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
             x0x::history::Provenance::VerifiedEnvelope
         },
         replace_key: None,
-    });
+    }
+}
+
+/// Commit a locally-authored public group message to SQLite before the REST
+/// call reports acceptance. Returns `false` only when history is intentionally
+/// disabled. Any enabled-history insert or blocking-task failure is fatal to
+/// this send and happens before cache/network side effects.
+async fn persist_outbound_group_public_history(
+    state: &AppState,
+    msg: &x0x::groups::GroupPublicMessage,
+    artifact: &[u8],
+) -> std::result::Result<bool, String> {
+    let Some(history) = state.agent.history() else {
+        return Ok(false);
+    };
+    let record = group_public_history_record(state, msg, artifact.to_vec());
+    let store = Arc::clone(history.store());
+    let counters = history.counters();
+
+    #[cfg(test)]
+    if take_group_public_history_insert_failure(&msg.group_id) {
+        counters.write_errors.fetch_add(1, Ordering::Relaxed);
+        return Err("injected history insert failure".to_string());
+    }
+
+    let outcome = match tokio::task::spawn_blocking(move || store.insert(&record)).await {
+        Ok(Ok(outcome)) => outcome,
+        Ok(Err(e)) => {
+            counters.write_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(e.to_string());
+        }
+        Err(e) => {
+            counters.write_errors.fetch_add(1, Ordering::Relaxed);
+            return Err(format!("history insert task failed: {e}"));
+        }
+    };
+    match outcome {
+        x0x::history::InsertOutcome::Inserted | x0x::history::InsertOutcome::Replaced => {
+            counters.written_total.fetch_add(1, Ordering::Relaxed);
+        }
+        x0x::history::InsertOutcome::Duplicate | x0x::history::InsertOutcome::StaleRejected => {
+            counters.dedup_hits.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    Ok(true)
+}
+
+/// Record a validated inbound/replayed group public message durably
+/// (ADR-0023 §4). Redundant delivery paths may enqueue the same artifact; the
+/// store dedupes it by `BLAKE3(signed JSON)`.
+fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicMessage) {
+    let Some(history) = state.agent.history() else {
+        return;
+    };
+    if msg.body.is_empty() {
+        return;
+    }
+    let Ok(artifact) = serde_json::to_vec(msg) else {
+        return;
+    };
+    history.record(group_public_history_record(state, msg, artifact));
 }
 
 /// Record MLS-group plaintext obtained via a local secure-surface call
@@ -9472,6 +9582,13 @@ fn record_mls_history(
 /// Append a validated message to the per-group ring buffer (capped).
 async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
     record_group_public_history(state, &msg);
+    cache_public_message_in_memory(state, msg).await;
+}
+
+/// Append to the in-memory hot tail without enqueueing history. Local sends
+/// use this only after their acknowledged direct `Store::insert`, preventing a
+/// second asynchronous history write while retaining normal signature dedupe.
+async fn cache_public_message_in_memory(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
     let mut all = state.public_messages.write().await;
     let slot = all.entry(msg.group_id.clone()).or_default();
     // Deduplicate by the stable message identity (`signature`) rather
@@ -9566,6 +9683,15 @@ fn spawn_group_public_message_delivery(
             return;
         }
     };
+    #[cfg(test)]
+    record_group_public_background_attempt(
+        &msg.group_id,
+        if delay.is_some() {
+            "direct_delayed"
+        } else {
+            "direct"
+        },
+    );
     let payload = match encode_group_public_message_direct_payload(msg) {
         Ok(payload) => payload,
         Err(e) => {
@@ -9611,6 +9737,73 @@ fn spawn_group_public_message_delivery_to_active_members(
             Some(GROUP_BACKGROUND_PUBLISH_DELAY),
         );
     }
+}
+
+fn spawn_group_public_message_background_delivery(
+    state: &Arc<AppState>,
+    topic: String,
+    bytes: Vec<u8>,
+    direct_recipients: Vec<String>,
+    msg: x0x::groups::GroupPublicMessage,
+) {
+    // Listener establishment can involve network startup, so it receives its
+    // own task and cannot delay either publish path.
+    let listener_state = Arc::clone(state);
+    let listener_group_id = msg.group_id.clone();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        record_group_public_background_attempt(&listener_group_id, "listener");
+        spawn_public_message_listener(listener_state, listener_group_id).await;
+    });
+
+    let primary_agent = Arc::clone(&state.agent);
+    let primary_topic = topic.clone();
+    let primary_bytes = bytes.clone();
+    let primary_group_id = msg.group_id.clone();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        record_group_public_background_attempt(&primary_group_id, "primary");
+        #[cfg(test)]
+        if let Some(control) = take_group_public_primary_publish_hook(&primary_group_id) {
+            control.entered.notify_one();
+            if let Some(release) = control.release {
+                release.notified().await;
+            }
+            if control.force_failure {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&primary_group_id),
+                    "E: injected public-send primary publish failure"
+                );
+                return;
+            }
+        }
+        if let Err(e) = primary_agent.publish(&primary_topic, primary_bytes).await {
+            tracing::warn!(
+                topic = %LogHexId::topic(&primary_topic),
+                group_id = %LogHexId::group(&primary_group_id),
+                "E: public-send primary publish failed after local acceptance: {e}"
+            );
+        }
+    });
+
+    let fallback_agent = Arc::clone(&state.agent);
+    let fallback_group_id = msg.group_id.clone();
+    tokio::spawn(async move {
+        #[cfg(test)]
+        record_group_public_background_attempt(&fallback_group_id, "global");
+        if let Err(e) = fallback_agent
+            .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
+            .await
+        {
+            tracing::warn!(
+                topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                group_id = %LogHexId::group(&fallback_group_id),
+                "E: global public-send fallback publish failed after local acceptance: {e}"
+            );
+        }
+    });
+
+    spawn_group_public_message_delivery_to_active_members(state, direct_recipients, &msg);
 }
 
 pub(in crate::server) async fn ingest_public_message(
@@ -12027,6 +12220,125 @@ pub(in crate::server) async fn get_group_state_commits(
             "has_more": has_more,
             "next_from_revision": next_from_revision,
             "commits": entries,
+        })),
+    )
+}
+
+const STATE_COMMITS_APPLY_MAX: usize = 500;
+
+/// Authenticated local catch-up payload. Entries are the `{ commit, roster }`
+/// objects returned by `GET /groups/:id/state/commits`; the read endpoint's
+/// additional `roster_root_verified` field is ignored by serde.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct ApplyStateCommitsRequest {
+    commits: Vec<x0x::groups::RetainedCommit>,
+    /// Final `roster_revision` from the same owner `GET /groups/:id`
+    /// snapshot whose retained history supplied `commits`.
+    target_roster_revision: u64,
+}
+
+fn state_commit_apply_error(
+    error: x0x::groups::ApplyError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let status = match error {
+        x0x::groups::ApplyError::Unauthorized { .. } => StatusCode::FORBIDDEN,
+        x0x::groups::ApplyError::StaleRevision { .. }
+        | x0x::groups::ApplyError::PrevHashMismatch { .. }
+        | x0x::groups::ApplyError::Withdrawn => StatusCode::CONFLICT,
+        x0x::groups::ApplyError::InvalidSignature(_)
+        | x0x::groups::ApplyError::Invariant(_)
+        | x0x::groups::ApplyError::MissingTarget(_)
+        | x0x::groups::ApplyError::StateHashMismatch { .. }
+        | x0x::groups::ApplyError::GroupIdMismatch { .. } => StatusCode::BAD_REQUEST,
+    };
+    api_error(status, format!("retained state catch-up rejected: {error}"))
+}
+
+/// POST /groups/:id/state/commits/apply — atomically apply an authenticated
+/// local batch of retained, already-signed state commits.
+///
+/// This endpoint performs no peer fetch and publishes no network event. It is
+/// a local repair bridge for a signed-public member that has obtained the
+/// owner's retained history through an independently authenticated channel.
+/// The library apply path requires an exact contiguous chain, verifies every
+/// signature and roster snapshot, evaluates signer authority against the
+/// pre-transition roster, rejects terminal withdrawal, and commits the batch
+/// durably only after every entry succeeds.
+pub(in crate::server) async fn apply_group_state_commits(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(request): Json<ApplyStateCommitsRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    if request.commits.is_empty() {
+        return bad_request("commits must contain at least one retained state commit");
+    }
+    if request.commits.len() > STATE_COMMITS_APPLY_MAX {
+        return api_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!("commits exceeds the maximum batch size of {STATE_COMMITS_APPLY_MAX}"),
+        );
+    }
+
+    let membership_lock = group_membership_lock(&state, &id).await;
+    let _membership_guard = membership_lock.lock().await;
+    if !confirm_named_groups_durability(&state).await {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "named-groups roster remains unavailable pending directory-durability confirmation",
+        );
+    }
+
+    let mut next = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id).cloned() else {
+            return not_found("group not found");
+        };
+        info
+    };
+    let before_revision = next.state_revision;
+    let before_hash = next.state_hash.clone();
+    let applied =
+        match next.apply_retained_commits(&request.commits, request.target_roster_revision) {
+            Ok(applied) => applied,
+            Err(error) => return state_commit_apply_error(error),
+        };
+    let state_revision = next.state_revision;
+    let state_hash = next.state_hash.clone();
+    let roster_revision = next.roster_revision;
+    let roster_root = x0x::groups::compute_roster_root(&next.members_v2);
+    let stable_group_id = next.stable_group_id().to_string();
+
+    if !matches!(
+        persist_named_group_info(&state, &id, next).await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "retained state catch-up was not durably installed",
+        );
+    }
+
+    tracing::info!(
+        group_id = %LogHexId::group(&stable_group_id),
+        applied,
+        from_revision = before_revision,
+        to_revision = state_revision,
+        from_state_hash = %before_hash,
+        to_state_hash = %state_hash,
+        "applied authenticated local retained state catch-up"
+    );
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": stable_group_id,
+            "applied": applied,
+            "from_revision": before_revision,
+            "state_revision": state_revision,
+            "roster_revision": roster_revision,
+            "state_hash": state_hash,
+            "roster_root": roster_root,
+            "withdrawn": false,
         })),
     )
 }
@@ -19556,6 +19868,113 @@ mod tests {
         .is_none());
     }
 
+    #[tokio::test]
+    async fn retained_state_catchup_route_durably_applies_remove_readd() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group_id = "cd".repeat(16);
+        let mut source = x0x::groups::GroupInfo::with_policy(
+            "Catch-up route".to_string(),
+            String::new(),
+            authority.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        source.roster_revision = source.roster_revision.saturating_add(1);
+        source.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            Some("local child".to_string()),
+        );
+        source.seal_commit(&authority, 1_000)?;
+        let ancestor = source.clone();
+        source.seal_commit(&authority, 1_500)?;
+        source.roster_revision = source.roster_revision.saturating_add(1);
+        source.remove_member(&local_hex, Some(authority_hex.clone()));
+        source.seal_commit(&authority, 2_000)?;
+        source.roster_revision = source.roster_revision.saturating_add(1);
+        source.add_member(
+            local_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            Some("local child".to_string()),
+        );
+        source.seal_commit(&authority, 3_000)?;
+        let commits = source.commit_log[1..].to_vec();
+        let target_roster_revision = source.roster_revision;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), ancestor.clone());
+        assert!(matches!(
+            save_named_groups_checked(&state).await,
+            Ok(AtomicWriteOutcome::Durable)
+        ));
+
+        let before_rejected_memory = serde_json::to_vec(&ancestor)?;
+        let before_rejected_disk = tokio::fs::read(&state.named_groups_path).await?;
+        let mut bad_commits = commits.clone();
+        bad_commits[1].commit.signature = "00".repeat(3_309);
+        let (status, Json(body)) = apply_group_state_commits(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(ApplyStateCommitsRequest {
+                commits: bad_commits,
+                target_roster_revision,
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "response: {body}");
+        {
+            let stored = state.named_groups.read().await;
+            let unchanged = stored.get(&group_id).context("unchanged group")?;
+            assert_eq!(
+                serde_json::to_vec(unchanged)?,
+                before_rejected_memory,
+                "a rejected batch must not mutate the in-memory group"
+            );
+        }
+        assert_eq!(
+            tokio::fs::read(&state.named_groups_path).await?,
+            before_rejected_disk,
+            "a rejected batch must not rewrite persisted group state"
+        );
+
+        let (status, Json(body)) = apply_group_state_commits(
+            State(Arc::clone(&state)),
+            Path(group_id.clone()),
+            Json(ApplyStateCommitsRequest {
+                commits,
+                target_roster_revision,
+            }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        assert_eq!(body["applied"], 3);
+        let stored = state.named_groups.read().await;
+        let recovered = stored.get(&group_id).context("recovered group")?;
+        assert_eq!(recovered.state_revision, source.state_revision);
+        assert_eq!(recovered.roster_revision, source.roster_revision);
+        assert_ne!(recovered.state_revision, recovered.roster_revision);
+        assert_eq!(recovered.state_hash, source.state_hash);
+        assert!(recovered.has_active_member(&local_hex));
+        assert_eq!(
+            x0x::groups::roster_projection(&recovered.members_v2),
+            x0x::groups::roster_projection(&source.members_v2)
+        );
+        let persisted = tokio::fs::read(&state.named_groups_path).await?;
+        assert!(
+            String::from_utf8_lossy(&persisted).contains(&source.state_hash),
+            "durable roster must contain the recovered signed head"
+        );
+        Ok(())
+    }
+
     #[test]
     fn group_card_cache_prunes_expired_cards() {
         let mut cache = HashMap::new();
@@ -20179,6 +20598,74 @@ mod tests {
         Ok((status, body))
     }
 
+    async fn install_public_send_test_group(
+        state: &Arc<AppState>,
+        group_id: &str,
+        include_remote_member: bool,
+    ) -> Result<Option<String>> {
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Send acceptance".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let remote_hex = if include_remote_member {
+            let remote = x0x::identity::AgentKeypair::generate()?;
+            let remote_hex = hex::encode(remote.agent_id().as_bytes());
+            group.roster_revision = group.roster_revision.saturating_add(1);
+            group.add_member(
+                remote_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+                Some("remote member".to_string()),
+            );
+            Some(remote_hex)
+        } else {
+            None
+        };
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group);
+        Ok(remote_hex)
+    }
+
+    async fn public_send_history_rows(
+        state: &AppState,
+        group_id: &str,
+    ) -> Result<Vec<x0x::history::StoredRecord>> {
+        let history = state.agent.history().context("history enabled")?;
+        let store = Arc::clone(history.store());
+        let scope = x0x::history::Scope::Group(group_id.to_string());
+        Ok(tokio::task::spawn_blocking(move || {
+            store.query(&x0x::history::HistoryQuery {
+                scope: Some(scope),
+                limit: 10,
+                ..Default::default()
+            })
+        })
+        .await??)
+    }
+
+    fn clear_public_send_background_attempts(group_id: &str) {
+        GROUP_PUBLIC_BACKGROUND_ATTEMPTS
+            .lock()
+            .expect("group public attempt recorder poisoned")
+            .retain(|(attempt_group, _)| attempt_group != group_id);
+    }
+
+    fn public_send_background_paths(group_id: &str) -> HashSet<&'static str> {
+        GROUP_PUBLIC_BACKGROUND_ATTEMPTS
+            .lock()
+            .expect("group public attempt recorder poisoned")
+            .iter()
+            .filter_map(|(attempt_group, path)| (attempt_group == group_id).then_some(*path))
+            .collect()
+    }
+
     #[test]
     fn signed_public_bootstrap_is_secret_free_and_commit_bound() -> Result<()> {
         let authority = x0x::identity::AgentKeypair::generate()?;
@@ -20335,6 +20822,190 @@ mod tests {
             .context("trusted fresh bootstrap installed")?;
         assert!(installed.has_active_member(&local_hex));
         assert_eq!(installed.state_revision, 3);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_send_accepts_promptly_while_primary_publish_is_blocked_and_writes_one_row(
+    ) -> Result<()> {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let group_id = "public-send-blocked-primary";
+        install_public_send_test_group(&state, group_id, true).await?;
+        clear_public_send_background_attempts(group_id);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        GROUP_PUBLIC_PRIMARY_PUBLISH_HOOKS
+            .lock()
+            .expect("group public publish hook poisoned")
+            .insert(
+                group_id.to_string(),
+                GroupPublicPrimaryPublishHookControl {
+                    entered: Arc::clone(&entered),
+                    release: Some(Arc::clone(&release)),
+                    force_failure: false,
+                },
+            );
+
+        let response = tokio::time::timeout(
+            Duration::from_secs(2),
+            send_group_public_message(
+                State(Arc::clone(&state)),
+                Path(group_id.to_string()),
+                Json(SendGroupMessageRequest {
+                    body: "accepted before gossip".to_string(),
+                    kind: None,
+                    thread_root: None,
+                    thread_parent: None,
+                }),
+            ),
+        )
+        .await
+        .context("send response waited for blocked primary publish")?
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["history_enabled"], true);
+        assert_eq!(body["history_persisted"], true);
+        assert_eq!(body["local_acceptance"], "durable_history");
+        assert_eq!(body["msg_id"].as_str().map(str::len), Some(64));
+
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .context("blocked primary publish task never started")?;
+        let rows = public_send_history_rows(&state, group_id).await?;
+        assert_eq!(rows.len(), 1, "local acceptance writes exactly one row");
+        let cached = state.public_messages.read().await;
+        assert_eq!(cached.get(group_id).map(Vec::len), Some(1));
+        drop(cached);
+        release.notify_one();
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_send_primary_failure_does_not_suppress_global_or_direct_fanout() -> Result<()> {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let group_id = "public-send-primary-failure";
+        install_public_send_test_group(&state, group_id, true).await?;
+        clear_public_send_background_attempts(group_id);
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        GROUP_PUBLIC_PRIMARY_PUBLISH_HOOKS
+            .lock()
+            .expect("group public publish hook poisoned")
+            .insert(
+                group_id.to_string(),
+                GroupPublicPrimaryPublishHookControl {
+                    entered: Arc::clone(&entered),
+                    release: None,
+                    force_failure: true,
+                },
+            );
+
+        let response = send_group_public_message(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SendGroupMessageRequest {
+                body: "primary may fail".to_string(),
+                kind: None,
+                thread_root: None,
+                thread_parent: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .context("forced primary failure task never started")?;
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let paths = loop {
+            let paths = public_send_background_paths(group_id);
+            if paths.contains("primary")
+                && paths.contains("global")
+                && paths.contains("direct")
+                && paths.contains("direct_delayed")
+            {
+                break paths;
+            }
+            if Instant::now() >= deadline {
+                anyhow::bail!("background paths did not start independently: {paths:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert!(paths.contains("global"));
+        assert!(paths.contains("direct"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_send_history_failure_is_precommit_and_schedules_no_network() -> Result<()> {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let group_id = "public-send-history-failure";
+        install_public_send_test_group(&state, group_id, true).await?;
+        clear_public_send_background_attempts(group_id);
+        GROUP_PUBLIC_HISTORY_INSERT_FAILURES
+            .lock()
+            .expect("group public history failure hook poisoned")
+            .insert(group_id.to_string());
+
+        let response = send_group_public_message(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SendGroupMessageRequest {
+                body: "must not escape".to_string(),
+                kind: None,
+                thread_root: None,
+                thread_parent: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "response: {body}");
+        assert!(state.public_messages.read().await.get(group_id).is_none());
+        assert!(public_send_background_paths(group_id).is_empty());
+        assert!(public_send_history_rows(&state, group_id).await?.is_empty());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_send_history_disabled_reports_memory_only_acceptance() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = "public-send-history-disabled";
+        install_public_send_test_group(&state, group_id, false).await?;
+
+        let response = send_group_public_message(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            Json(SendGroupMessageRequest {
+                body: "memory-only acceptance".to_string(),
+                kind: None,
+                thread_root: None,
+                thread_parent: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        assert_eq!(body["accepted"], true);
+        assert_eq!(body["history_enabled"], false);
+        assert_eq!(body["history_persisted"], false);
+        assert_eq!(body["local_acceptance"], "memory_only_history_disabled");
+        assert_eq!(
+            state
+                .public_messages
+                .read()
+                .await
+                .get(group_id)
+                .map(Vec::len),
+            Some(1)
+        );
         Ok(())
     }
 
