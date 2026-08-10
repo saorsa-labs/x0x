@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.37.0] - 2026-08-10
+
+Delivery-path follow-up to the v0.36.2 transport wedge fix: raw-QUIC direct
+delivery becomes the preferred path, gains durable history, and signed-public
+groups get a consent-gated cold-start bootstrap.
+
+### Added
+
+- **SignedPublic group bootstrap over the direct channel.** When an admin adds
+  a member to a SignedPublic group, the authority direct-sends a
+  secret-stripped, commit-bound roster snapshot so a cold-start member can
+  install the group without waiting for gossip anti-entropy. The receiver
+  validates genesis, roster root, policy hash, and the sealed head commit
+  (ML-DSA) before installing; existing local state is never overwritten.
+- **Consent gate + capacity cap on bootstrap install.** Bootstraps are only
+  accepted from senders the local agent already knows (contact trust ≥ Known),
+  and `MAX_BOOTSTRAP_INSTALLED_GROUPS = 256` bounds remote-triggered group
+  state and listener-task growth. The roster inside a bootstrap is
+  sender-controlled and cannot carry the consent decision.
+- **Durable ADR-0023 history for raw-QUIC DMs.** Direct messages arriving on
+  the raw-QUIC receive-ACK path previously bypassed the gossip-inbox recorder
+  and left no history row; they are now recorded (gated on transport
+  verification, trust decision, and payload classification).
+- **ADR-0029 thread metadata in `GET /history`.** Group rows now expose the
+  canonical `msg_id` and recovered `thread_root`/`thread_parent`.
+
+### Changed
+
+- **`prefer_raw_quic_if_connected` now defaults ON** for direct sends and
+  group public messages. The REST field is now `Option<bool>`: omitting it
+  selects the daemon default (previously `false`). Clients that relied on the
+  old default must send `"prefer_raw_quic_if_connected": false` explicitly.
+  Welcome-blob control messages explicitly keep gossip preference — a welcome
+  fetch races the very connection raw delivery depends on.
+- Named-group metadata events from `add_named_group_member` are now also
+  direct-delivered to active members, matching the existing convention on
+  remove/update/join.
+
 ## [v0.36.2] - 2026-08-09
 
 **This release fixes the asymmetric group-message delivery bug that v0.36.1
