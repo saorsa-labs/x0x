@@ -723,23 +723,56 @@ async fn handle_ws_command(
                         let mut subscribers = HashSet::new();
                         subscribers.insert(session_id.to_string());
 
-                        let forwarder =
-                            if let Ok(mut gossip_sub) = state.agent.subscribe(topic).await {
-                                let btx = broadcast_tx.clone();
-                                let topic_clone = topic.clone();
-                                tokio::spawn(async move {
-                                    while let Some(msg) = gossip_sub.recv().await {
-                                        let out = WsOutbound::Message {
-                                            topic: topic_clone.clone(),
-                                            payload: BASE64.encode(&msg.payload),
-                                            origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
-                                        };
-                                        let _ = btx.send(out);
+                        let forwarder = if topic
+                            .starts_with(&format!("{}.", crate::groups::PUBLIC_GROUP_TOPIC_PREFIX))
+                        {
+                            // Public-group traffic has three ingress paths:
+                            // group gossip, the global fallback, and receive-ACKed
+                            // raw QUIC. Consume the daemon's post-validation bus
+                            // so every path has identical live semantics and a
+                            // transport race cannot produce duplicate frames.
+                            let mut live_rx = state.public_message_live_tx.subscribe();
+                            let btx = broadcast_tx.clone();
+                            let topic_clone = topic.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match live_rx.recv().await {
+                                        Ok(message) if message.topic == topic_clone => {
+                                            let out = WsOutbound::Message {
+                                                topic: topic_clone.clone(),
+                                                payload: BASE64.encode(&message.payload),
+                                                origin: Some(message.origin),
+                                            };
+                                            let _ = btx.send(out);
+                                        }
+                                        Ok(_) => {}
+                                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                                            tracing::warn!(
+                                                skipped,
+                                                topic = %topic_clone,
+                                                "validated public-message live bus lagged"
+                                            );
+                                        }
+                                        Err(broadcast::error::RecvError::Closed) => break,
                                     }
-                                })
-                            } else {
-                                tokio::spawn(async {}) // no-op if subscribe failed
-                            };
+                                }
+                            })
+                        } else if let Ok(mut gossip_sub) = state.agent.subscribe(topic).await {
+                            let btx = broadcast_tx.clone();
+                            let topic_clone = topic.clone();
+                            tokio::spawn(async move {
+                                while let Some(msg) = gossip_sub.recv().await {
+                                    let out = WsOutbound::Message {
+                                        topic: topic_clone.clone(),
+                                        payload: BASE64.encode(&msg.payload),
+                                        origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                                    };
+                                    let _ = btx.send(out);
+                                }
+                            })
+                        } else {
+                            tokio::spawn(async {}) // no-op if subscribe failed
+                        };
 
                         ws_topics.insert(
                             topic.clone(),

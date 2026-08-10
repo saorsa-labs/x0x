@@ -9580,27 +9580,32 @@ fn record_mls_history(
 }
 
 /// Append a validated message to the per-group ring buffer (capped).
-async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
+async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) -> bool {
     record_group_public_history(state, &msg);
-    cache_public_message_in_memory(state, msg).await;
+    cache_public_message_in_memory(state, msg).await
 }
 
 /// Append to the in-memory hot tail without enqueueing history. Local sends
 /// use this only after their acknowledged direct `Store::insert`, preventing a
 /// second asynchronous history write while retaining normal signature dedupe.
-async fn cache_public_message_in_memory(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
+async fn cache_public_message_in_memory(
+    state: &AppState,
+    msg: x0x::groups::GroupPublicMessage,
+) -> bool {
     let mut all = state.public_messages.write().await;
     let slot = all.entry(msg.group_id.clone()).or_default();
     // Deduplicate by the stable message identity (`signature`) rather
     // than a lossy (author,timestamp,body) tuple so legitimate repeated
     // bodies sent in the same millisecond are still preserved.
     let dup = slot.iter().any(|m| m.signature == msg.signature);
-    if !dup {
-        slot.push(msg);
-        while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
-            slot.remove(0);
-        }
+    if dup {
+        return false;
     }
+    slot.push(msg);
+    while slot.len() > PUBLIC_MESSAGE_HISTORY_CAP {
+        slot.remove(0);
+    }
+    true
 }
 
 fn encode_group_public_message_direct_payload(
@@ -9855,7 +9860,28 @@ pub(in crate::server) async fn ingest_public_message(
             state
                 .groups_diagnostics
                 .record_message_received(&stable_id, now_millis_u64());
-            cache_public_message(state, msg).await;
+            let topic = x0x::groups::public_topic_for(&stable_id);
+            let origin = msg.author_agent_id.clone();
+            let payload = serde_json::to_vec(&msg);
+            if cache_public_message(state, msg).await {
+                match payload {
+                    Ok(payload) => {
+                        let _ = state.public_message_live_tx.send(
+                            super::super::state::ValidatedPublicMessage {
+                                topic,
+                                payload,
+                                origin,
+                            },
+                        );
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(&stable_id),
+                            "validated public message could not enter live stream: {error}"
+                        );
+                    }
+                }
+            }
         }
         Err(e) => {
             // Map ingest errors to diagnostics buckets so /diagnostics/groups
@@ -20508,6 +20534,7 @@ mod tests {
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
+        let (public_message_live_tx, _) = broadcast::channel(16);
         Ok(Arc::new(AppState {
             agent,
             history_record_topics: Vec::new(),
@@ -20538,6 +20565,7 @@ mod tests {
             directory_resubscribe_jitter_ms: DIRECTORY_RESUBSCRIBE_JITTER_MS,
             public_messages: RwLock::new(HashMap::new()),
             public_message_tasks: RwLock::new(HashMap::new()),
+            public_message_live_tx,
             agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),
             contacts,
             mls_groups: RwLock::new(HashMap::new()),
@@ -21055,6 +21083,7 @@ mod tests {
         )?;
         let payload = encode_group_public_message_direct_payload(&reply)?;
         let listener = spawn_direct_public_message_listener(Arc::clone(&state));
+        let mut live_rx = state.public_message_live_tx.subscribe();
         state
             .agent
             .direct_messaging()
@@ -21067,6 +21096,20 @@ mod tests {
                 None,
             )
             .await;
+
+        let live = tokio::time::timeout(Duration::from_secs(2), live_rx.recv())
+            .await
+            .context("raw community reply did not enter the validated live bus")??;
+        assert_eq!(
+            live.topic,
+            x0x::groups::public_topic_for(&stable_id),
+            "raw and gossip delivery must converge on the same live topic"
+        );
+        assert_eq!(live.origin, remote_hex);
+        let live_message: x0x::groups::GroupPublicMessage = serde_json::from_slice(&live.payload)?;
+        assert_eq!(live_message.signature, reply.signature);
+        assert_eq!(live_message.thread_root.as_deref(), Some(root.as_str()));
+        assert_eq!(live_message.thread_parent.as_deref(), Some(root.as_str()));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

@@ -677,6 +677,13 @@ pub(super) struct AppState {
     pub(super) public_messages: RwLock<HashMap<String, Vec<x0x::groups::GroupPublicMessage>>>,
     /// Phase E: background listener tasks on public-chat topics.
     pub(super) public_message_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// Validated public-group messages fanned into local live subscribers.
+    ///
+    /// All network ingress paths publish here only after signature/policy
+    /// validation and cache deduplication. Public-group WebSocket subscriptions
+    /// consume this bus instead of tapping gossip directly, so raw QUIC and the
+    /// global fallback have the same live-delivery semantics as group gossip.
+    pub(super) public_message_live_tx: broadcast::Sender<ValidatedPublicMessage>,
     /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
     /// envelopes addressed to this agent. Public half is published in the
     /// `/agent` response and in `JoinRequestCreated` so other daemons can
@@ -832,6 +839,14 @@ pub(super) struct AppState {
     /// consumer + outbound local-port listeners. `None` when connect is
     /// disabled (no policy) so the daemon runs zero forwarder tasks.
     pub(super) forward_service: Option<Arc<x0x::forward::ForwardService>>,
+}
+
+/// A validated public-group message ready for local live delivery.
+#[derive(Debug, Clone)]
+pub(super) struct ValidatedPublicMessage {
+    pub(super) topic: String,
+    pub(super) payload: Vec<u8>,
+    pub(super) origin: String,
 }
 
 #[derive(Clone)]

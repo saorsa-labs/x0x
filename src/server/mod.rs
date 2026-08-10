@@ -457,6 +457,7 @@ pub async fn serve_with_options(
     }
 
     let (broadcast_tx, _) = broadcast::channel::<SseEvent>(256);
+    let (public_message_live_tx, _) = broadcast::channel(256);
     // Load or generate the per-daemon ML-KEM-768 keypair. Persisted under
     // `<data_dir>/agent_kem.key` with mode 0600. This keypair is the root of
     // trust for `SecureShareDelivered` — only the holder of the secret half
@@ -613,6 +614,7 @@ pub async fn serve_with_options(
             .unwrap_or(DIRECTORY_RESUBSCRIBE_JITTER_MS),
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
+        public_message_live_tx,
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),
