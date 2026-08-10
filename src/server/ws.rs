@@ -86,6 +86,12 @@ enum WsOutbound {
         topic: String,
         payload: String,
         origin: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_root: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_parent: Option<String>,
     },
     #[serde(rename = "direct_message")]
     DirectMessage {
@@ -115,6 +121,17 @@ enum WsOutbound {
     Live { topic: String },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+fn validated_public_message_frame(message: super::state::ValidatedPublicMessage) -> WsOutbound {
+    WsOutbound::Message {
+        topic: message.topic,
+        payload: BASE64.encode(message.payload),
+        origin: Some(message.origin),
+        msg_id: Some(message.msg_id),
+        thread_root: message.thread_root,
+        thread_parent: message.thread_parent,
+    }
 }
 
 /// Client → Server WebSocket command.
@@ -738,11 +755,7 @@ async fn handle_ws_command(
                                 loop {
                                     match live_rx.recv().await {
                                         Ok(message) if message.topic == topic_clone => {
-                                            let out = WsOutbound::Message {
-                                                topic: topic_clone.clone(),
-                                                payload: BASE64.encode(&message.payload),
-                                                origin: Some(message.origin),
-                                            };
+                                            let out = validated_public_message_frame(message);
                                             let _ = btx.send(out);
                                         }
                                         Ok(_) => {}
@@ -766,6 +779,9 @@ async fn handle_ws_command(
                                         topic: topic_clone.clone(),
                                         payload: BASE64.encode(&msg.payload),
                                         origin: msg.sender.map(|s| hex::encode(s.as_bytes())),
+                                        msg_id: None,
+                                        thread_root: None,
+                                        thread_parent: None,
                                     };
                                     let _ = btx.send(out);
                                 }
@@ -812,6 +828,9 @@ async fn handle_ws_command(
                                         topic: topic.clone(),
                                         payload: BASE64.encode(&r.payload),
                                         origin: r.author_agent.clone(),
+                                        msg_id: Some(hex::encode(r.msg_id)),
+                                        thread_root: None,
+                                        thread_parent: None,
                                     };
                                     if !feed_droppable(tx, out, stats) {
                                         break;
@@ -1045,6 +1064,30 @@ fn render_gui_html() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn validated_public_group_frame_uses_application_payload_and_metadata() {
+        let root = "ab".repeat(32);
+        let parent = "cd".repeat(32);
+        let frame = validated_public_message_frame(super::super::state::ValidatedPublicMessage {
+            topic: "x0x.groups.public.test".to_string(),
+            payload: br#"{"text":"hello","clientId":"test-client"}"#.to_vec(),
+            origin: "ef".repeat(32),
+            msg_id: "12".repeat(32),
+            thread_root: Some(root.clone()),
+            thread_parent: Some(parent.clone()),
+        });
+        let value = serde_json::to_value(frame).expect("serialize public group frame");
+        assert_eq!(value["type"], "message");
+        assert_eq!(
+            BASE64.decode(value["payload"].as_str().expect("payload string")),
+            Ok(br#"{"text":"hello","clientId":"test-client"}"#.to_vec())
+        );
+        assert_eq!(value["origin"], "ef".repeat(32));
+        assert_eq!(value["msg_id"], "12".repeat(32));
+        assert_eq!(value["thread_root"], root);
+        assert_eq!(value["thread_parent"], parent);
+    }
 
     // ========================================================================
     // #122 / WS1.1 — WS outbound queue feeder-policy unit tests.

@@ -9862,25 +9862,21 @@ pub(in crate::server) async fn ingest_public_message(
                 .record_message_received(&stable_id, now_millis_u64());
             let topic = x0x::groups::public_topic_for(&stable_id);
             let origin = msg.author_agent_id.clone();
-            let payload = serde_json::to_vec(&msg);
+            let payload = msg.body.as_bytes().to_vec();
+            let msg_id = msg.msg_id();
+            let thread_root = msg.thread_root.clone();
+            let thread_parent = msg.thread_parent.clone();
             if cache_public_message(state, msg).await {
-                match payload {
-                    Ok(payload) => {
-                        let _ = state.public_message_live_tx.send(
-                            super::super::state::ValidatedPublicMessage {
-                                topic,
-                                payload,
-                                origin,
-                            },
-                        );
-                    }
-                    Err(error) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&stable_id),
-                            "validated public message could not enter live stream: {error}"
-                        );
-                    }
-                }
+                let _ = state.public_message_live_tx.send(
+                    super::super::state::ValidatedPublicMessage {
+                        topic,
+                        payload,
+                        origin,
+                        msg_id,
+                        thread_root,
+                        thread_parent,
+                    },
+                );
             }
         }
         Err(e) => {
@@ -21106,10 +21102,10 @@ mod tests {
             "raw and gossip delivery must converge on the same live topic"
         );
         assert_eq!(live.origin, remote_hex);
-        let live_message: x0x::groups::GroupPublicMessage = serde_json::from_slice(&live.payload)?;
-        assert_eq!(live_message.signature, reply.signature);
-        assert_eq!(live_message.thread_root.as_deref(), Some(root.as_str()));
-        assert_eq!(live_message.thread_parent.as_deref(), Some(root.as_str()));
+        assert_eq!(live.payload, reply.body.as_bytes());
+        assert_eq!(live.msg_id, reply.msg_id());
+        assert_eq!(live.thread_root.as_deref(), Some(root.as_str()));
+        assert_eq!(live.thread_parent.as_deref(), Some(root.as_str()));
 
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {

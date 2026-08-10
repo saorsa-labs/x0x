@@ -845,8 +845,15 @@ pub(super) struct AppState {
 #[derive(Debug, Clone)]
 pub(super) struct ValidatedPublicMessage {
     pub(super) topic: String,
+    /// Application payload carried by the signed group envelope. The outer
+    /// envelope has already been validated and remains in durable history as
+    /// the signed artifact; live consumers receive the same inner bytes as
+    /// `/history` so both paths share one application contract.
     pub(super) payload: Vec<u8>,
     pub(super) origin: String,
+    pub(super) msg_id: String,
+    pub(super) thread_root: Option<String>,
+    pub(super) thread_parent: Option<String>,
 }
 
 #[derive(Clone)]
