@@ -18,7 +18,7 @@ use crate::error::{HistoryError, HistoryResult};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_LIMIT: usize = 500;
@@ -247,8 +247,9 @@ impl Store {
         collect_rows(&guard, &sql, params)
     }
 
-    /// Full-text search over text payloads. Tokens are quoted so user input
-    /// is literal terms, never FTS operators (donor `fts_match_expr`).
+    /// Full-text search over searchable payload text. Tokens are quoted so
+    /// user input is literal terms, never FTS operators (donor
+    /// `fts_match_expr`).
     pub fn search(&self, needle: &str, q: &HistoryQuery) -> HistoryResult<Vec<StoredRecord>> {
         let fts = fts_match_expr(needle);
         if fts.is_empty() {
@@ -528,11 +529,7 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
 }
 
 fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> HistoryResult<()> {
-    let payload_text: Option<String> = if record.is_text() {
-        Some(String::from_utf8_lossy(&record.payload).into_owned())
-    } else {
-        None
-    };
+    let payload_text = searchable_payload_text(&record.content_type, &record.payload);
     let msg_id: &[u8] = &record.msg_id;
     tx.execute(
         "INSERT INTO history (msg_id, scope_kind, scope_id, author_agent, author_machine, \
@@ -581,6 +578,7 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
             Ok(())
         }
         Some(v) if v == SCHEMA_VERSION => Ok(()),
+        Some(1) => migrate_v1_to_v2(conn),
         Some(v) if v < SCHEMA_VERSION => {
             // Future migrations chain here, bumping stored version each step.
             Err(HistoryError::Database(format!(
@@ -591,6 +589,82 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
             "history.db schema v{v} is newer than this binary (v{SCHEMA_VERSION})"
         ))),
     }
+}
+
+/// Schema v2 adds no columns: it backfills the existing FTS projection for
+/// native channel-message JSON that schema v1 intentionally left empty. The
+/// `history_fts_au` trigger refreshes each corresponding FTS row atomically.
+fn migrate_v1_to_v2(conn: &Connection) -> HistoryResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    let mut after_id = 0_i64;
+    loop {
+        let candidates = {
+            let mut stmt = tx.prepare(
+                "SELECT id, payload FROM history \
+                 WHERE content_type = 'application/json' AND payload_text IS NULL AND id > ?1 \
+                 ORDER BY id LIMIT 256",
+            )?;
+            let rows = stmt.query_map(rusqlite::params![after_id], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })?;
+            let mut candidates = Vec::new();
+            for row in rows {
+                candidates.push(row?);
+            }
+            candidates
+        };
+        let Some((last_id, _)) = candidates.last() else {
+            break;
+        };
+        after_id = *last_id;
+        for (id, payload) in candidates {
+            if let Some(text) = searchable_payload_text("application/json", &payload) {
+                tx.execute(
+                    "UPDATE history SET payload_text = ?1 WHERE id = ?2",
+                    rusqlite::params![text, id],
+                )?;
+            }
+        }
+    }
+    tx.execute(
+        "UPDATE schema_version SET version = ?1",
+        rusqlite::params![SCHEMA_VERSION],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Derive the text stored in the external-content FTS table without changing
+/// the original payload or its MIME type.
+///
+/// Besides ordinary `text/*`, recognize the native channel-message JSON used
+/// by current clients. Requiring its correlation fields avoids indexing
+/// unrelated JSON plumbing or metadata merely because it contains a `text`
+/// property. Only the human-authored body is indexed; `clientId`, timestamps,
+/// mentions, and any future metadata remain outside the search projection.
+fn searchable_payload_text(content_type: &str, payload: &[u8]) -> Option<String> {
+    if content_type.starts_with("text/") {
+        return Some(String::from_utf8_lossy(payload).into_owned());
+    }
+    if content_type != "application/json" {
+        return None;
+    }
+
+    let value: serde_json::Value = serde_json::from_slice(payload).ok()?;
+    let object = value.as_object()?;
+    let text = object.get("text")?.as_str()?;
+    let client_id = object.get("clientId")?.as_str()?;
+    object.get("createdAt")?.as_i64()?;
+    if client_id.is_empty() {
+        return None;
+    }
+    if let Some(mentions) = object.get("mentions") {
+        let mentions = mentions.as_array()?;
+        if !mentions.iter().all(serde_json::Value::is_string) {
+            return None;
+        }
+    }
+    Some(text.to_owned())
 }
 
 const SCHEMA_V1: &str = r#"
@@ -660,6 +734,58 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("history.db")).unwrap();
         (store, dir)
+    }
+
+    #[test]
+    fn v1_migration_backfills_native_channel_message_search_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let payload = br#"{"text":"persisted-before-upgrade","createdAt":1786379111246,"clientId":"legacy-client-id"}"#;
+        let scope = Scope::Dm("legacy-peer".into());
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL); \
+                 INSERT INTO schema_version (version) VALUES (1);",
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            let msg_id = HistoryRecord::compute_msg_id(None, payload);
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, sent_at_ms, seen_at_ms, \
+                 direction, content_type, payload, payload_text, provenance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?9)",
+                rusqlite::params![
+                    &msg_id[..],
+                    scope.kind(),
+                    scope.id(),
+                    1_i64,
+                    1_i64,
+                    Direction::Inbound.as_i64(),
+                    "application/json",
+                    payload,
+                    Provenance::LocalAppDecrypt.as_i64(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        let hits = store
+            .search(
+                "persisted-before-upgrade",
+                &HistoryQuery {
+                    scope: Some(scope),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(hits.len(), 1, "v1 JSON row must be searchable after open");
+        let guard = lock_conn(&store.conn).unwrap();
+        let version: i64 = guard
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, SCHEMA_VERSION);
     }
 
     fn rec(payload: &[u8], scope: Scope) -> HistoryRecord {

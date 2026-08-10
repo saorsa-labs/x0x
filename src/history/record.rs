@@ -187,7 +187,8 @@ pub struct HistoryRecord {
     pub seen_at_ms: i64,
     /// Direction relative to this node.
     pub direction: Direction,
-    /// MIME content type of `payload`; only `text/*` rows are FTS-indexed.
+    /// MIME content type of `payload`; `text/*` rows and recognized native
+    /// channel-message JSON bodies are FTS-indexed.
     pub content_type: String,
     /// Decrypted application payload — what a UI renders and search indexes.
     pub payload: Vec<u8>,
@@ -273,7 +274,7 @@ impl HistoryRecord {
         Ok(())
     }
 
-    /// True when the payload should be FTS-indexed.
+    /// True when the complete payload should be FTS-indexed as text.
     #[must_use]
     pub fn is_text(&self) -> bool {
         self.content_type.starts_with("text/")
