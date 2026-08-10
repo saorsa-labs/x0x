@@ -4679,6 +4679,66 @@ impl Agent {
         self.relay_candidates.read().await.clone()
     }
 
+    /// Resolve the target's currently-live machine after a dial or transport
+    /// repair. Discovery can lag the direct-messaging registry during a
+    /// machine transition, so prefer whichever mapping ant-quic reports as
+    /// connected and reconcile the discovery entry when the registry wins.
+    async fn connected_direct_machine(
+        &self,
+        agent_id: &identity::AgentId,
+        network: &network::NetworkNode,
+    ) -> Option<identity::MachineId> {
+        let cached_machine_id = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .get(agent_id)
+                .map(|entry| entry.machine_id)
+                .filter(|machine_id| machine_id.0 != [0_u8; 32])
+        };
+        if let Some(machine_id) = cached_machine_id {
+            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+                return Some(machine_id);
+            }
+        }
+
+        let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
+        if let Some(machine_id) = registry_machine_id {
+            if network.is_connected(&ant_quic::PeerId(machine_id.0)).await {
+                if cached_machine_id != Some(machine_id) {
+                    let mut cache = self.identity_discovery_cache.write().await;
+                    if let Some(entry) = cache.get_mut(agent_id) {
+                        entry.machine_id = machine_id;
+                    }
+                }
+                return Some(machine_id);
+            }
+        }
+
+        None
+    }
+
+    /// Re-run the complete identity-discovery dial after the narrow
+    /// bootstrap-cache repair path fails. A fresh presence card can contain
+    /// usable addresses even when no cached transport route exists.
+    async fn redial_direct_machine_from_discovery(
+        &self,
+        agent_id: &identity::AgentId,
+        network: &network::NetworkNode,
+    ) -> Option<identity::MachineId> {
+        if let Err(error) = self.connect_to_agent(agent_id).await {
+            tracing::debug!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %network::hex_prefix(&agent_id.0, 4),
+                error = %error,
+                "identity-discovery redial failed"
+            );
+            return None;
+        }
+
+        self.connected_direct_machine(agent_id, network).await
+    }
+
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
     ///
     /// X0X-0053: `prefer_newest_grace` is the bounded post-Replaced reissue
@@ -4738,7 +4798,7 @@ impl Agent {
         };
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
 
-        let (machine_id, resolution) = match (cached_machine_id, registry_machine_id) {
+        let (mut machine_id, mut resolution) = match (cached_machine_id, registry_machine_id) {
             (Some(id), _) if network.is_connected(&ant_quic::PeerId(id.0)).await => {
                 (id, "cached_connected")
             }
@@ -4788,8 +4848,8 @@ impl Agent {
         // sends best-effort clear stale lifecycle blocks when ant-quic is live;
         // capability-first gossip sends may leave cosmetic stale diagnostics
         // until a raw probe/send path observes the live connection.
-        let ant_peer_id = ant_quic::PeerId(machine_id.0);
-        let machine_prefix = network::hex_prefix(&machine_id.0, 4);
+        let mut ant_peer_id = ant_quic::PeerId(machine_id.0);
+        let mut machine_prefix = network::hex_prefix(&machine_id.0, 4);
         let mut connected = network.is_connected(&ant_peer_id).await;
 
         // X0X-0033: when machine_id is known (resolved from cache or registry)
@@ -4824,6 +4884,23 @@ impl Agent {
                 "send-readiness repair on disconnected peer"
             );
             connected = network.is_connected(&ant_peer_id).await;
+
+            // Presence/discovery and transport readiness are deliberately
+            // separate. If the fast bootstrap-cache repair cannot recover a
+            // known machine, use the discovery card's current addresses in
+            // the same logical send instead of returning AgentNotConnected.
+            if !connected {
+                if let Some(redialed_machine_id) = self
+                    .redial_direct_machine_from_discovery(agent_id, network)
+                    .await
+                {
+                    machine_id = redialed_machine_id;
+                    ant_peer_id = ant_quic::PeerId(machine_id.0);
+                    machine_prefix = network::hex_prefix(&machine_id.0, 4);
+                    connected = true;
+                    resolution = "discovery_redial";
+                }
+            }
         }
 
         // X0X-0051 / X0X-0053: the X0X-0041 prefer-newest-grace block was

@@ -433,3 +433,101 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         "alice should have advanced bob's lifecycle generation past {pre_kill_generation}; got {final_gen:?}"
     );
 }
+
+/// Regression for the second v0.37.0 two-Mac failure shape: presence and
+/// identity discovery can be fresh while no transport connection currently
+/// exists. A raw send must use the discovered addresses to establish that
+/// connection instead of limiting repair to a bootstrap-cache lookup.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn discovered_but_disconnected_peer_is_dialed_by_same_send() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_agent(&dir, "discovery-alice").await);
+    let bob = Arc::new(build_agent(&dir, "discovery-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    let discovered = |agent: &Agent, addr| x0x::DiscoveredAgent {
+        agent_id: agent.agent_id(),
+        machine_id: agent.machine_id(),
+        user_id: None,
+        addresses: vec![addr],
+        announced_at: now_secs,
+        last_seen: now_secs,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: Vec::new(),
+    };
+    alice
+        .insert_discovered_agent_for_testing(discovered(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered(&alice, alice_addr))
+        .await;
+
+    assert!(
+        !alice_network.is_connected(&bob_peer).await,
+        "precondition: discovery is fresh but no direct transport exists"
+    );
+
+    let mut bob_rx = bob.subscribe_direct();
+    let payload = b"same-request-connect-from-fresh-discovery".to_vec();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(8),
+        alice.send_direct_with_config(
+            &bob.agent_id(),
+            payload.clone(),
+            DmSendConfig {
+                prefer_raw_quic_if_connected: true,
+                raw_quic_receive_ack_timeout: Some(Duration::from_secs(1)),
+                stop_fallback_on_raw_error: true,
+                max_retries: 0,
+                ..DmSendConfig::default()
+            },
+        ),
+    )
+    .await
+    .expect("same logical send should dial from discovery inside eight seconds")
+    .expect("discovery redial should make the raw send succeed");
+
+    assert_eq!(receipt.path, DmPath::RawQuicAcked);
+    assert!(
+        alice_network.is_connected(&bob_peer).await,
+        "send should establish the discovered peer connection"
+    );
+    let received = tokio::time::timeout(Duration::from_secs(2), bob_rx.recv())
+        .await
+        .expect("bob receives payload")
+        .expect("bob subscriber remains open");
+    assert_eq!(received.payload, payload);
+    assert_eq!(received.sender, alice.agent_id());
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
