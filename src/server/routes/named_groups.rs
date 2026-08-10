@@ -11643,6 +11643,7 @@ async fn leave_treekem_group(
         return api_error(StatusCode::CONFLICT, error);
     }
 
+    let delivery_roster = next.clone();
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
     next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
@@ -11689,6 +11690,7 @@ async fn leave_treekem_group(
     };
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     remember_treekem_membership_event(&state, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
 
     (
         StatusCode::OK,
@@ -12216,6 +12218,7 @@ pub(in crate::server) async fn leave_group(
             })),
         );
     }
+    let delivery_roster = info.clone();
     let mut next = info.clone();
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
@@ -12251,6 +12254,7 @@ pub(in crate::server) async fn leave_group(
         );
     }
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     let cache_aliases = treekem_cache_group_aliases(&state, &id).await;
@@ -22710,6 +22714,85 @@ mod tests {
         );
         Ok(())
     }
+
+    /// A successful self-leave must deliver its signed `MemberRemoved` commit
+    /// to the members who retain the group, even when metadata gossip has no
+    /// remote fan-out. This is the exact two-daemon failure observed on the
+    /// v0.37.0 candidate: the leaver durably removed its local GSS group while
+    /// the owner remained at the pre-leave roster revision.
+    ///
+    /// Sole-catching mutation: remove the
+    /// `spawn_named_group_event_delivery_to_active_members` call from
+    /// `leave_group`. The HTTP/local-deletion assertions still pass, while the
+    /// owner disappears from both recorded delivery paths and this test fails.
+    #[tokio::test]
+    async fn non_treekem_self_leave_directly_delivers_member_removed_to_retained_owner(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let retained_owner = crate::identity::AgentKeypair::generate()?;
+        let retained_owner_hex = hex::encode(retained_owner.agent_id().as_bytes());
+        let group_id = "self-leave-delivery-gss".to_string();
+
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "self-leave direct delivery".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member(
+            retained_owner_hex.clone(),
+            x0x::groups::GroupRole::Admin,
+            Some(local_hex),
+            None,
+        );
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("delivery recorder poisoned")
+            .clear();
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "self-leave failed: {body}");
+        assert!(
+            !state.named_groups.read().await.contains_key(&group_id),
+            "successful self-leave must still remove the group locally"
+        );
+
+        let recipients_for = |kind: &str| -> Vec<String> {
+            NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+                .lock()
+                .expect("delivery recorder poisoned")
+                .iter()
+                .filter(|(_, gid, event_kind, path_kind)| {
+                    gid == &group_id && *event_kind == "member_removed" && *path_kind == kind
+                })
+                .map(|(recipient, _, _, _)| recipient.clone())
+                .collect()
+        };
+        let direct = recipients_for("direct");
+        let delayed = recipients_for("delayed");
+        assert!(
+            direct.contains(&retained_owner_hex) && delayed.contains(&retained_owner_hex),
+            "the retained owner must receive the signed self-leave on both direct paths; \
+             direct={direct:?} delayed={delayed:?}"
+        );
+        Ok(())
+    }
+
     // ── Non-TreeKEM JoinRequestApproved fan-out: the approval handler must
     // deliver the signed JoinRequestApproved to EVERY non-local active member
     // (the already-present witnesses) AND the new requester, on BOTH the direct
