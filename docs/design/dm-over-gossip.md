@@ -30,8 +30,8 @@ release timing.
 
 ## Non-goals
 
-- Durable local storage of DMs (no inbox persistence in v1 — DMs are
-  still ephemeral unless the caller persists them).
+- Durable local storage of DMs in v1. Protocol v2 adds an opt-in durable
+  application ACK after exact-envelope history commit and local dispatch.
 - User-level read receipts. "Human read" is not a receipt level v1
   implements.
 - Forward secrecy at session level. v1 uses per-message ML-KEM-768;
@@ -129,8 +129,10 @@ pub struct DmAckBody {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum DmAckOutcome {
-    /// Successfully decrypted, signature verified, trust-policy
-    /// passed, enqueued to the recipient's DM handler/inbox.
+    /// Successfully decrypted, signature verified, and trust-policy passed.
+    /// For v1, enqueued to the recipient handler. For durable v2, the exact
+    /// signed envelope was committed to history and local dispatch completed.
+    /// This is not a globally exactly-once receipt across daemon restarts.
     Accepted,
     /// Envelope valid but trust policy (block list, machine
     /// mismatch, etc.) rejected it at the recipient.
@@ -190,15 +192,25 @@ can't swap identifiers around.
 
 Documented explicitly so we don't overclaim:
 
-| Level | Name | v1? | What Ok means |
-|---|---|---|---|
-| 1 | Transport accepted | — | Gossip `publish()` returned Ok. We don't expose this as a receipt. |
-| 2 | **Recipient agent accepted** | **YES** | Recipient's process decrypted, verified, passed policy, enqueued to the DM handler. This is what `send_direct` returns on success. |
-| 3 | Durable locally stored | future | Recipient wrote the DM to a persistent inbox. Not in v1. |
-| 4 | User read | future/never | Human read the DM in a UI. Out of scope. |
+| Level | Name | v1? | v2? | What Ok means |
+|---|---|---|---|---|
+| 1 | Transport accepted | — | — | Gossip `publish()` returned Ok. We don't expose this as a receipt. |
+| 2 | **Recipient agent accepted** | **YES** | prerequisite | Recipient decrypted, verified, passed policy, and enqueued to the DM handler. |
+| 3 | **Durable application accepted** | — | **YES** | Recipient committed the exact signed envelope to local history and completed local application dispatch before ACK construction. |
+| 4 | User read | never | never | Human read the DM in a UI. Out of scope. |
 
-`DmReceipt::delivered_at` corresponds to **level 2**. Docs and API
-names use "accepted" rather than "delivered" to avoid confusion.
+The ACK outcome is interpreted using the envelope protocol version.
+`DmReceipt::delivered_at` corresponds to level 2 for v1 and level 3 for
+durable v2. Neither level is a user-read receipt.
+
+Durable v2 is intentionally **at least once**, not globally exactly once.
+The exact signed envelope is idempotent in SQLite, but the completed-delivery
+replay cache is memory-only. A retry in the same daemon process is re-ACKed
+without another history row or application dispatch. After a daemon restart,
+the same still-valid envelope can produce SQLite `Duplicate` (one durable row)
+and then be dispatched to the application again before the fresh replay cache
+is completed. Applications that require restart-spanning exactly-once effects
+must dedupe by the signed envelope/request identity themselves.
 
 ## Capability negotiation
 
@@ -255,7 +267,8 @@ source of truth for path selection.
 
 `(sender_agent_id, request_id)` — 48 bytes.
 
-Any envelope whose key is already in the recent-deliveries cache is:
+Any envelope whose key is already in the current process's
+recent-deliveries cache is:
 
 - Not re-dispatched to the DM handler (no duplicate user-visible
   delivery).
@@ -285,6 +298,27 @@ struct CachedOutcome {
   high-traffic node receiving >10K distinct DMs in <5 min would start
   losing dedupe, which is an acceptable degradation mode (duplicates
   re-delivered).
+- The cache is not persisted. On daemon restart it is empty. Durable v2's
+  history insert remains idempotent, but an exact replay can be dispatched
+  again after the store reports `Duplicate`; this is the documented
+  at-least-once boundary rather than an exactly-once guarantee.
+
+### Durable v2 ACK publication
+
+After durable commit and local dispatch, v2 constructs one authenticated ACK
+and schedules two concurrent publication routes: the sender's derived inbox
+topic and the compatibility bus. A bounded background worker owns these
+futures so pubsub FIFO-gate or fan-out backpressure cannot head-of-line block
+the serial inbox subscription loop. Each route retains the full pinned
+Critical-priority budget (10 s FIFO gate + 10 s send) plus slack before it is
+cancelled. The worker has bounded queue and concurrency limits; graceful
+channel closure drains accepted jobs, while service abort drops the worker's
+tracked task set and aborts all children. V1 publication remains synchronous
+and unchanged (target first, then compatibility bus only when received there).
+
+A publish returning `Ok` can still mean zero remote fan-out. The route-failure
+counter therefore reports explicit errors/timeouts only and must not be read
+as proof that an ACK reached its sender.
 
 ### Timestamp-acceptance window
 

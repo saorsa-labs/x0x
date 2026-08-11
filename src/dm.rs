@@ -249,12 +249,16 @@ pub struct DmAckBody {
     pub outcome: DmAckOutcome,
 }
 
-/// Per-design-doc ACK semantics — "recipient agent accepted" or policy
-/// rejection. Never implies durable storage or user read.
+/// Protocol-versioned recipient outcome. `Accepted` is level-2 enqueue under
+/// v1 and level-3 history commit plus completed local dispatch under durable
+/// v2. It never implies user read or globally exactly-once application
+/// delivery; the replay cache is memory-only across daemon restarts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DmAckOutcome {
-    /// Envelope decrypted, signature verified, trust-policy passed, and
-    /// enqueued to the recipient's DM handler / inbox.
+    /// Envelope decrypted, signature verified, and trust-policy passed. Under
+    /// v1 it was enqueued to the recipient handler. Under durable v2 its exact
+    /// signed envelope was committed to history and local dispatch completed.
+    /// A post-restart replay can be history-deduped yet dispatched again.
     Accepted,
     /// Envelope was valid but the recipient's trust policy rejected it.
     /// The sender learns *why* they were rejected via `reason`. Deployments

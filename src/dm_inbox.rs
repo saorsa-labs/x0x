@@ -16,16 +16,20 @@ use crate::identity::{AgentId, MachineId, MachineKeypair};
 use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
-use std::{sync::Arc, time::Duration};
+use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
-/// Upper bound for one ACK publication route. PubSub's per-peer fan-out is
-/// itself bounded at four seconds; the extra second lets normal completion
-/// accounting settle without allowing one wedged route to pin the serial DM
-/// inbox loop indefinitely.
-const ACK_PUBLISH_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
+/// The pinned pubsub Critical-priority contract permits ten seconds waiting
+/// at its FIFO gate plus ten seconds for the send itself. Keep each durable
+/// ACK route alive for that complete healthy-congestion budget plus slack.
+const DURABLE_ACK_ROUTE_TIMEOUT: Duration = Duration::from_secs(22);
+/// ACK envelopes are small, but the queue is bounded so a disconnected mesh
+/// cannot turn sender retries into unbounded retained work.
+const DURABLE_ACK_QUEUE_CAPACITY: usize = 256;
+/// Bound the number of ACK jobs simultaneously holding pubsub fan-out work.
+const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
 
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
@@ -216,6 +220,31 @@ pub struct DmInboxService {
     topic: String,
 }
 
+struct AckPublishJob {
+    recipient: AgentId,
+    acked_request_id: [u8; 16],
+    protocol_version: u16,
+    encoded: Bytes,
+}
+
+#[derive(Clone)]
+struct AckPublisherHandle {
+    sender: mpsc::Sender<AckPublishJob>,
+}
+
+impl AckPublisherHandle {
+    fn try_publish(&self, job: AckPublishJob) -> NetworkResult<()> {
+        self.sender.try_send(job).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => NetworkError::RemoteReceiveBackpressured(
+                "durable ACK publisher queue is full".to_string(),
+            ),
+            mpsc::error::TrySendError::Closed(_) => {
+                NetworkError::ChannelClosed("durable ACK publisher stopped".to_string())
+            }
+        })
+    }
+}
+
 /// Legacy shared DM transport topic. New sends use per-recipient inbox
 /// topics; this listener remains so rolling upgrades can still receive
 /// envelopes from older daemons.
@@ -254,6 +283,8 @@ impl DmInboxService {
             .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
             .await;
         let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
+        let (ack_publisher, ack_worker) =
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
@@ -271,6 +302,7 @@ impl DmInboxService {
             revocation_set,
             authenticated_machine_bindings,
             history,
+            ack_publisher,
         };
 
         let primary_handle =
@@ -283,7 +315,9 @@ impl DmInboxService {
         );
 
         Ok(Self {
-            handles: vec![primary_handle, legacy_handle],
+            // Aborting the worker drops its JoinSet, which aborts all owned
+            // route publications. A graceful channel close drains them.
+            handles: vec![primary_handle, legacy_handle, ack_worker],
             topic,
         })
     }
@@ -321,6 +355,105 @@ fn spawn_subscription_loop(
     })
 }
 
+fn spawn_durable_ack_publisher(
+    pubsub: Arc<PubSubManager>,
+    dm: Arc<DirectMessaging>,
+) -> (AckPublisherHandle, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+    let worker = spawn_ack_publish_worker(receiver, move |job| {
+        let pubsub = Arc::clone(&pubsub);
+        let dm = Arc::clone(&dm);
+        async move {
+            publish_durable_ack_job(pubsub, dm, job).await;
+        }
+    });
+    (AckPublisherHandle { sender }, worker)
+}
+
+fn spawn_ack_publish_worker<Publish, PublishFuture>(
+    mut receiver: mpsc::Receiver<AckPublishJob>,
+    publish: Publish,
+) -> JoinHandle<()>
+where
+    Publish: Fn(AckPublishJob) -> PublishFuture + Send + Sync + 'static,
+    PublishFuture: Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let publish = Arc::new(publish);
+        let mut in_flight = JoinSet::new();
+
+        loop {
+            if in_flight.len() >= DURABLE_ACK_MAX_CONCURRENT {
+                if let Some(result) = in_flight.join_next().await {
+                    log_ack_publish_join_result(result);
+                }
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                Some(result) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    log_ack_publish_join_result(result);
+                }
+                job = receiver.recv() => {
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let publish = Arc::clone(&publish);
+                    in_flight.spawn(async move {
+                        publish(job).await;
+                    });
+                }
+            }
+        }
+
+        // Graceful closure drains accepted jobs. DmInboxService::abort aborts
+        // this owner task; dropping JoinSet then aborts every child promptly.
+        while let Some(result) = in_flight.join_next().await {
+            log_ack_publish_join_result(result);
+        }
+    })
+}
+
+fn log_ack_publish_join_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "dm.trace",
+            stage = "ack_publish_worker_failed",
+            %error,
+            "durable ACK publisher task failed"
+        );
+    }
+}
+
+async fn publish_durable_ack_job(
+    pubsub: Arc<PubSubManager>,
+    dm: Arc<DirectMessaging>,
+    job: AckPublishJob,
+) {
+    let topic = DmInboxService::inbox_topic_name(&job.recipient);
+    let primary = pubsub.publish_topic_id(
+        topic,
+        dm_inbox_topic(&job.recipient),
+        Bytes::clone(&job.encoded),
+    );
+    let legacy = pubsub.publish(DM_BUS_TOPIC.to_string(), job.encoded);
+    let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+    if let Err(error) = result {
+        dm.record_ack_publish_route_failed();
+        tracing::warn!(
+            target: "dm.trace",
+            stage = "ack_publish_route_failed",
+            acked_request_id = %hex::encode(job.acked_request_id),
+            recipient = %hex::encode(job.recipient.as_bytes()),
+            protocol_version = job.protocol_version,
+            hedged = true,
+            %error,
+            "one or more durable ACK routes failed; another hedge may still have delivered"
+        );
+    }
+}
+
 #[derive(Clone)]
 struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
@@ -345,6 +478,9 @@ struct InboxPipeline {
     /// ADR-0023 history handle. Recording is `try_send`-only — this loop
     /// must never block (see the typed-route comment below).
     history: Option<crate::history::HistoryHandle>,
+    /// Bounded background owner for durable v2 ACK route publications. V1
+    /// remains synchronous for exact legacy behavior.
+    ack_publisher: AckPublisherHandle,
 }
 
 fn cached_ack_for_protocol(
@@ -370,12 +506,7 @@ fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool
     )
 }
 
-fn ack_requires_legacy_bus_hedge(protocol_version: u16, received_on_legacy_bus: bool) -> bool {
-    received_on_legacy_bus || protocol_version >= DM_PROTOCOL_DURABLE_ACK
-}
-
-async fn publish_ack_routes<Primary, Legacy>(
-    hedge_on_legacy_bus: bool,
+async fn publish_durable_ack_routes<Primary, Legacy>(
     route_timeout: Duration,
     primary: Primary,
     legacy: Legacy,
@@ -384,10 +515,6 @@ where
     Primary: std::future::Future<Output = NetworkResult<()>>,
     Legacy: std::future::Future<Output = NetworkResult<()>>,
 {
-    if !hedge_on_legacy_bus {
-        return publish_ack_route_with_timeout("targeted", route_timeout, primary).await;
-    }
-
     // A targeted inbox publish can deliver remotely yet remain pending under
     // per-topic fan-out backpressure. Poll the compatibility-bus hedge at the
     // same time so a durable recipient does not commit and dispatch the DM
@@ -395,7 +522,9 @@ where
     // targeted topic. Each independently-polled route has an explicit
     // deadline: the successful hedge can reach the sender immediately, while
     // a wedged sibling is cancelled at the deadline instead of pinning this
-    // serial inbox loop and blocking later DMs/ACKs forever.
+    // serial inbox loop and blocking later DMs/ACKs forever. These futures
+    // are owned by a bounded background worker, so neither healthy congestion
+    // nor the full route deadline blocks subscription processing.
     let (primary, legacy) = tokio::join!(
         publish_ack_route_with_timeout("targeted", route_timeout, primary),
         publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
@@ -1032,15 +1161,35 @@ impl InboxPipeline {
         let encoded = envelope
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
-        let topic = DmInboxService::inbox_topic_name(&to);
-        let primary =
-            self.pubsub
-                .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()));
-        let legacy = self
-            .pubsub
-            .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded));
-        let hedged = ack_requires_legacy_bus_hedge(protocol_version, ack_legacy_bus);
-        let result = publish_ack_routes(hedged, ACK_PUBLISH_ROUTE_TIMEOUT, primary, legacy).await;
+        let result = if protocol_version >= DM_PROTOCOL_DURABLE_ACK {
+            // Durable v2 owns both publications in the bounded background
+            // worker. The inbox loop can immediately process a subsequent DM
+            // while the target and compatibility-bus routes retain their full
+            // healthy-congestion budgets.
+            self.ack_publisher.try_publish(AckPublishJob {
+                recipient: to,
+                acked_request_id: acks_request_id,
+                protocol_version,
+                encoded: Bytes::from(encoded),
+            })
+        } else {
+            // Preserve v1 exactly: target first, and only publish back on the
+            // compatibility bus when this payload itself arrived there. No
+            // new deadline or background ownership changes legacy behavior.
+            let topic = DmInboxService::inbox_topic_name(&to);
+            let primary = self
+                .pubsub
+                .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
+                .await;
+            let legacy = if ack_legacy_bus {
+                self.pubsub
+                    .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
+                    .await
+            } else {
+                Ok(())
+            };
+            primary.and(legacy)
+        };
         if let Err(error) = &result {
             self.dm.record_ack_publish_route_failed();
             tracing::warn!(
@@ -1049,9 +1198,9 @@ impl InboxPipeline {
                 acked_request_id = %hex::encode(acks_request_id),
                 recipient = %hex::encode(to.as_bytes()),
                 protocol_version,
-                hedged,
+                hedged = protocol_version >= DM_PROTOCOL_DURABLE_ACK,
                 %error,
-                "one or more required ACK publish routes returned an error; another hedge may still have delivered"
+                "ACK publication could not be scheduled or completed"
             );
         }
         result
@@ -1118,7 +1267,7 @@ mod tests {
     use crate::history::{HistoryConfig, HistoryQuery, HistoryService};
     use crate::identity::{AgentKeypair, MachineKeypair};
     use crate::network::{NetworkConfig, NetworkNode};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     fn test_keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keygen")
@@ -1159,6 +1308,7 @@ mod tests {
         recipient_kem: Arc<AgentKemKeypair>,
         receiver: crate::direct::DirectMessageReceiver,
         history_service: Option<HistoryService>,
+        ack_worker: JoinHandle<()>,
         _tempdir: tempfile::TempDir,
     }
 
@@ -1210,6 +1360,8 @@ mod tests {
                 .expect("insert machine revocation");
         }
 
+        let (ack_publisher, ack_worker) =
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
         let pipeline = InboxPipeline {
             pubsub,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
@@ -1228,6 +1380,7 @@ mod tests {
             revocation_set: Arc::new(RwLock::new(revocation_set)),
             authenticated_machine_bindings,
             history: None,
+            ack_publisher,
         };
 
         InboxHarness {
@@ -1236,6 +1389,7 @@ mod tests {
             recipient_kem,
             receiver,
             history_service: None,
+            ack_worker,
             _tempdir: tempdir,
         }
     }
@@ -1417,6 +1571,48 @@ mod tests {
 
         harness.pipeline.handle_incoming(duplicate, false).await;
         assert_no_delivery(&mut harness.receiver).await;
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_v2_restart_replay_keeps_one_history_row_but_may_redispatch() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xA5);
+        let replay_after_restart = message.clone();
+
+        harness.pipeline.handle_incoming(message, false).await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial v2 dispatch timeout")
+            .expect("initial v2 delivery stream closed");
+
+        // Model daemon restart: durable SQLite history survives, while the
+        // RecentDeliveryCache is deliberately memory-only and starts empty.
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        harness
+            .pipeline
+            .handle_incoming(replay_after_restart, false)
+            .await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("post-restart replay dispatch timeout")
+            .expect("post-restart delivery stream closed");
+
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query post-restart history")
+                .len(),
+            1,
+            "SQLite dedupes the exact signed envelope even though the app can see a replay after restart"
+        );
 
         if let Some(service) = harness.history_service.take() {
             service.shutdown().await;
@@ -1715,36 +1911,46 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_ack_bus_hedge_is_bounded_and_does_not_block_followup_dm() {
-        assert!(!ack_requires_legacy_bus_hedge(
-            crate::dm::DM_PROTOCOL_V1,
-            false
-        ));
-        assert!(ack_requires_legacy_bus_hedge(
-            crate::dm::DM_PROTOCOL_V1,
-            true
-        ));
-        assert!(ack_requires_legacy_bus_hedge(
-            DM_PROTOCOL_DURABLE_ACK,
-            false
-        ));
+    async fn durable_ack_route_deadline_cancels_stalled_sibling() {
+        struct DropFlag(Arc<AtomicBool>);
 
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let targeted_dropped = Arc::new(AtomicBool::new(false));
+        let dropped = Arc::clone(&targeted_dropped);
+        let targeted = async move {
+            let _drop_flag = DropFlag(dropped);
+            std::future::pending::<NetworkResult<()>>().await
+        };
+        let result =
+            publish_durable_ack_routes(Duration::from_millis(20), targeted, async { Ok(()) }).await;
+
+        assert!(result.is_err());
+        assert!(
+            targeted_dropped.load(Ordering::SeqCst),
+            "the stalled route future must be cancelled at its deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_ack_background_hedge_does_not_block_subscription_loop() {
         let sender = test_keypair();
         let sender_machine = MachineKeypair::generate().expect("sender machine");
         let mut harness = make_inbox_harness(&sender, None, None).await;
         let history = enable_durable_history(&mut harness).await;
         let message = durable_attested_payload_message(&harness, &sender, &sender_machine, 0xC1);
         let replay = message.clone();
+        let followup = durable_attested_payload_message(&harness, &sender, &sender_machine, 0xC2);
         let request_id = DmEnvelope::from_wire_bytes(&message.payload)
             .expect("decode production-shaped payload")
             .request_id;
-
-        harness.pipeline.handle_incoming(message, false).await;
-        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
-            .await
-            .expect("initial durable app dispatch timed out")
-            .expect("direct-message receiver closed");
-        assert_eq!(delivered.payload, b"security regression payload");
+        let followup_request_id = DmEnvelope::from_wire_bytes(&followup.payload)
+            .expect("decode follow-up payload")
+            .request_id;
 
         let inflight = Arc::new(InFlightAcks::new());
         let recipient = harness.pipeline.self_agent_id;
@@ -1755,58 +1961,112 @@ mod tests {
             recipient,
             Some(machine),
         );
-        struct DropFlag(Arc<AtomicBool>);
+        let release_targeted = Arc::new(tokio::sync::Notify::new());
+        let first_started = Arc::new(tokio::sync::Notify::new());
+        let first_completed = Arc::new(tokio::sync::Notify::new());
+        let replay_ack_seen = Arc::new(tokio::sync::Notify::new());
+        let followup_ack_seen = Arc::new(tokio::sync::Notify::new());
+        let first_job_count = Arc::new(AtomicUsize::new(0));
+        let active_jobs = Arc::new(AtomicUsize::new(0));
+        let first_is_complete = Arc::new(AtomicBool::new(false));
 
-        impl Drop for DropFlag {
-            fn drop(&mut self) {
-                self.0.store(true, Ordering::SeqCst);
+        harness.ack_worker.abort();
+        let (ack_sender, ack_receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+        harness.pipeline.ack_publisher = AckPublisherHandle { sender: ack_sender };
+        let worker_inflight = Arc::clone(&inflight);
+        let worker_release = Arc::clone(&release_targeted);
+        let worker_started = Arc::clone(&first_started);
+        let worker_completed = Arc::clone(&first_completed);
+        let worker_replay_seen = Arc::clone(&replay_ack_seen);
+        let worker_followup_seen = Arc::clone(&followup_ack_seen);
+        let worker_first_job_count = Arc::clone(&first_job_count);
+        let worker_active_jobs = Arc::clone(&active_jobs);
+        let worker_first_is_complete = Arc::clone(&first_is_complete);
+        harness.ack_worker = spawn_ack_publish_worker(ack_receiver, move |job| {
+            let inflight = Arc::clone(&worker_inflight);
+            let release = Arc::clone(&worker_release);
+            let started = Arc::clone(&worker_started);
+            let completed = Arc::clone(&worker_completed);
+            let replay_seen = Arc::clone(&worker_replay_seen);
+            let followup_seen = Arc::clone(&worker_followup_seen);
+            let first_job_count = Arc::clone(&worker_first_job_count);
+            let active_jobs = Arc::clone(&worker_active_jobs);
+            let first_is_complete = Arc::clone(&worker_first_is_complete);
+            async move {
+                active_jobs.fetch_add(1, Ordering::SeqCst);
+                if job.acked_request_id == request_id
+                    && first_job_count.fetch_add(1, Ordering::SeqCst) == 0
+                {
+                    let targeted = async move {
+                        release.notified().await;
+                        Ok(())
+                    };
+                    let legacy = async move {
+                        assert!(inflight.resolve_for_protocol(
+                            &request_id,
+                            DM_PROTOCOL_DURABLE_ACK,
+                            recipient,
+                            machine,
+                            DmAckOutcome::Accepted,
+                        ));
+                        started.notify_one();
+                        Ok(())
+                    };
+                    let result =
+                        publish_durable_ack_routes(Duration::from_secs(2), targeted, legacy).await;
+                    assert!(result.is_ok(), "released durable ACK routes: {result:?}");
+                    first_is_complete.store(true, Ordering::SeqCst);
+                    completed.notify_one();
+                } else if job.acked_request_id == request_id {
+                    replay_seen.notify_one();
+                } else if job.acked_request_id == followup_request_id {
+                    followup_seen.notify_one();
+                }
+                active_jobs.fetch_sub(1, Ordering::SeqCst);
             }
-        }
+        });
 
-        let targeted_started = Arc::new(AtomicBool::new(false));
-        let targeted_dropped = Arc::new(AtomicBool::new(false));
-        let targeted_started_tx = Arc::clone(&targeted_started);
-        let targeted_dropped_tx = Arc::clone(&targeted_dropped);
-        let legacy_inflight = Arc::clone(&inflight);
-
-        let targeted = async move {
-            let _drop_flag = DropFlag(targeted_dropped_tx);
-            targeted_started_tx.store(true, Ordering::SeqCst);
-            std::future::pending::<NetworkResult<()>>().await
-        };
-        let legacy = async move {
-            assert!(legacy_inflight.resolve_for_protocol(
-                &request_id,
-                DM_PROTOCOL_DURABLE_ACK,
-                recipient,
-                machine,
-                DmAckOutcome::Accepted,
-            ));
-            Ok(())
-        };
-        let publish_result = tokio::time::timeout(Duration::from_secs(1), async move {
-            publish_ack_routes(
-                ack_requires_legacy_bus_hedge(DM_PROTOCOL_DURABLE_ACK, false),
-                Duration::from_millis(50),
-                targeted,
-                legacy,
+        // Exercise the real Subscription -> serial loop -> handle_incoming
+        // path. This publisher signs the outer gossip envelope as `sender`.
+        let sender_node = Arc::new(
+            NetworkNode::new(
+                NetworkConfig::default(),
+                None,
+                Some((sender.public_key().clone(), sender.secret_key().clone())),
             )
             .await
-        })
-        .await
-        .expect("hedged ACK publisher remained head-of-line blocked");
-        assert!(
-            publish_result.is_err(),
-            "the stalled targeted route must report its bounded timeout"
+            .expect("sender network node"),
         );
-        assert!(
-            targeted_started.load(Ordering::SeqCst),
-            "targeted ACK publish was not polled concurrently"
+        let sender_pubsub = Arc::new(
+            PubSubManager::new(
+                sender_node,
+                Some(Arc::new(SigningContext::from_keypair(&sender))),
+            )
+            .expect("sender pubsub"),
         );
-        assert!(
-            targeted_dropped.load(Ordering::SeqCst),
-            "timed-out targeted ACK publish was not cancelled"
-        );
+        let topic = DmInboxService::inbox_topic_name(&harness.recipient_agent_id);
+        let subscription = sender_pubsub
+            .subscribe_topic_id(topic.clone(), dm_inbox_topic(&harness.recipient_agent_id))
+            .await;
+        let subscription_handle =
+            spawn_subscription_loop(topic.clone(), false, subscription, harness.pipeline.clone());
+
+        sender_pubsub
+            .publish_topic_id(
+                topic.clone(),
+                dm_inbox_topic(&harness.recipient_agent_id),
+                message.payload,
+            )
+            .await
+            .expect("publish initial DM through subscription");
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial durable app dispatch timed out")
+            .expect("direct-message receiver closed");
+        assert_eq!(delivered.payload, b"security regression payload");
+        tokio::time::timeout(Duration::from_secs(2), first_started.notified())
+            .await
+            .expect("legacy ACK hedge was not started");
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), receipt)
                 .await
@@ -1815,11 +2075,22 @@ mod tests {
             DmAckOutcome::Accepted
         );
         assert_eq!(inflight.outstanding(), 0);
+        assert!(!first_is_complete.load(Ordering::SeqCst));
 
         // The sender can retry the same logical envelope before observing the
         // hedge. Stable request_id replay must re-ACK from the completion cache
         // without a second durable row or second application dispatch.
-        harness.pipeline.handle_incoming(replay, true).await;
+        sender_pubsub
+            .publish_topic_id(
+                topic.clone(),
+                dm_inbox_topic(&harness.recipient_agent_id),
+                replay.payload,
+            )
+            .await
+            .expect("publish stable-request replay through subscription");
+        tokio::time::timeout(Duration::from_secs(2), replay_ack_seen.notified())
+            .await
+            .expect("replay ACK job was not scheduled");
         assert_no_delivery(&mut harness.receiver).await;
         let rows = history
             .store()
@@ -1841,23 +2112,30 @@ mod tests {
             1
         );
 
-        // This is the same serial processing order as the subscription loop:
-        // the next distinct envelope cannot enter `handle_incoming` until the
-        // previous ACK publication returns. Its delivery proves the bounded
-        // cancellation above prevents a stalled route from causing HoL.
-        let followup = durable_attested_payload_message(&harness, &sender, &sender_machine, 0xC2);
-        tokio::time::timeout(
-            Duration::from_secs(2),
-            harness.pipeline.handle_incoming(followup, false),
-        )
-        .await
-        .expect("follow-up DM remained head-of-line blocked");
+        // The first targeted route is still pending. A distinct envelope on
+        // the same Subscription must nevertheless traverse the serial inbox
+        // loop, commit, dispatch, and schedule its own ACK.
+        sender_pubsub
+            .publish_topic_id(
+                topic,
+                dm_inbox_topic(&harness.recipient_agent_id),
+                followup.payload,
+            )
+            .await
+            .expect("publish follow-up DM through subscription");
         let followup_delivered =
             tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
                 .await
                 .expect("follow-up durable app dispatch timed out")
                 .expect("direct-message receiver closed");
         assert_eq!(followup_delivered.payload, b"security regression payload");
+        tokio::time::timeout(Duration::from_secs(2), followup_ack_seen.notified())
+            .await
+            .expect("follow-up ACK job was not scheduled");
+        assert!(
+            !first_is_complete.load(Ordering::SeqCst),
+            "stalled first target unexpectedly completed before release"
+        );
         assert_eq!(
             history
                 .store()
@@ -1875,6 +2153,20 @@ mod tests {
             2
         );
 
+        release_targeted.notify_one();
+        tokio::time::timeout(Duration::from_secs(2), first_completed.notified())
+            .await
+            .expect("released ACK job did not complete");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while active_jobs.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ACK worker did not clean completed jobs");
+
+        subscription_handle.abort();
+        harness.ack_worker.abort();
         if let Some(service) = harness.history_service.take() {
             service.shutdown().await;
         }

@@ -699,8 +699,9 @@ pub struct DmDiagnosticsStats {
     /// the primary per-group/store pubsub path still delivers.
     #[serde(default)]
     pub incoming_typed_route_dropped: u64,
-    /// ACK publish operations where at least one required route returned an
-    /// explicit error. Zero-fanout `Ok` results are not counted here.
+    /// ACK publication operations that could not be scheduled or whose
+    /// required route returned an explicit error/timeout. Zero-fanout `Ok`
+    /// results are not counted here.
     #[serde(default)]
     pub ack_publish_route_failed: u64,
     /// Authenticated ACKs that did not match a current request/protocol/agent/
@@ -1173,7 +1174,7 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record an explicit error from one or more ACK publication routes.
+    /// Record an ACK scheduling failure or explicit route error/timeout.
     pub(crate) fn record_ack_publish_route_failed(&self) {
         self.diagnostics
             .ack_publish_route_failed
