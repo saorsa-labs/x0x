@@ -261,6 +261,9 @@ pub enum DmAckOutcome {
     /// that prefer silent rejection can set `trust.silent_reject = true`
     /// and skip emitting this ACK entirely.
     RejectedByPolicy { reason: String },
+    /// The logical request was already completed under weaker protocol
+    /// semantics, so it cannot be upgraded in-place to a durable receipt.
+    AckSemanticsUnavailable { reason: String },
 }
 
 // ─── Origin-machine attestation (issue #213) ──────────────────────────────
@@ -782,25 +785,14 @@ pub fn dm_inbox_topic(agent_id: &AgentId) -> TopicId {
 pub struct DedupeKey {
     pub sender_agent_id: [u8; 32],
     pub request_id: [u8; 16],
-    pub protocol_version: u16,
 }
 
 impl DedupeKey {
     #[must_use]
     pub fn new(sender_agent_id: [u8; 32], request_id: [u8; 16]) -> Self {
-        Self::for_protocol(sender_agent_id, request_id, DM_PROTOCOL_V1)
-    }
-
-    #[must_use]
-    pub fn for_protocol(
-        sender_agent_id: [u8; 32],
-        request_id: [u8; 16],
-        protocol_version: u16,
-    ) -> Self {
         Self {
             sender_agent_id,
             request_id,
-            protocol_version,
         }
     }
 }
@@ -831,7 +823,20 @@ struct RecentDeliveryCacheInner {
 #[derive(Debug, Clone)]
 pub struct CachedOutcome {
     pub outcome: DmAckOutcome,
+    /// Semantics under which the outcome completed. This is metadata, not
+    /// part of the logical dedupe key: changing protocol versions must never
+    /// make one request dispatch twice.
+    pub protocol_version: u16,
     pub first_seen: Instant,
+}
+
+/// Failure to durably publish a completed v2 outcome into the replay cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCacheError {
+    /// The cache mutex was poisoned; callers must withhold the ACK.
+    Poisoned,
+    /// A completion already exists for this logical request.
+    AlreadyCompleted,
 }
 
 impl RecentDeliveryCache {
@@ -903,6 +908,16 @@ impl RecentDeliveryCache {
     /// (proceed) so a poisoned cache degrades to possible double-delivery
     /// rather than silent message loss.
     pub fn insert(&self, key: DedupeKey, outcome: DmAckOutcome) -> bool {
+        self.insert_for_protocol(key, outcome, DM_PROTOCOL_V1)
+    }
+
+    /// Insert a legacy outcome and record which protocol semantics produced it.
+    pub fn insert_for_protocol(
+        &self,
+        key: DedupeKey,
+        outcome: DmAckOutcome,
+        protocol_version: u16,
+    ) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
             return true;
         };
@@ -913,6 +928,7 @@ impl RecentDeliveryCache {
             key,
             CachedOutcome {
                 outcome,
+                protocol_version,
                 first_seen: Instant::now(),
             },
         );
@@ -926,6 +942,39 @@ impl RecentDeliveryCache {
             inner.entries.remove(&oldest);
         }
         true
+    }
+
+    /// Publish a completed v2 delivery into the replay cache.
+    ///
+    /// Unlike the legacy insertion path, mutex poisoning and a competing
+    /// completion are explicit failures. The receiver must withhold its ACK
+    /// unless this succeeds, so it can never acknowledge a completion that
+    /// was not made replay-safe.
+    pub fn complete_durable(
+        &self,
+        key: DedupeKey,
+        outcome: DmAckOutcome,
+    ) -> std::result::Result<(), DurableCacheError> {
+        let mut inner = self.inner.lock().map_err(|_| DurableCacheError::Poisoned)?;
+        if inner.entries.contains_key(&key) {
+            return Err(DurableCacheError::AlreadyCompleted);
+        }
+        inner.entries.insert(
+            key,
+            CachedOutcome {
+                outcome,
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                first_seen: Instant::now(),
+            },
+        );
+        inner.order.push_back(key);
+        while inner.entries.len() > inner.max_size {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        Ok(())
     }
 
     /// Return the shared per-request lock used by the durable v2 pipeline.
@@ -1210,7 +1259,7 @@ impl DmEnvelope {
     /// Dedupe key for this envelope.
     #[must_use]
     pub fn dedupe_key(&self) -> DedupeKey {
-        DedupeKey::for_protocol(self.sender_agent_id, self.request_id, self.protocol_version)
+        DedupeKey::new(self.sender_agent_id, self.request_id)
     }
 
     /// Verify the origin-machine attestation (issue #213).
@@ -1626,6 +1675,46 @@ mod tests {
         // A different key is independently claimable.
         let k2 = DedupeKey::new(dummy_agent_id(2), [9; 16]);
         assert!(cache.insert(k2, DmAckOutcome::Accepted));
+    }
+
+    #[test]
+    fn dedupe_identity_does_not_change_across_protocol_versions() {
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_V1,
+            request_id: [0x44; 16],
+            sender_agent_id: dummy_agent_id(4),
+            sender_machine_id: dummy_agent_id(5),
+            recipient_agent_id: dummy_agent_id(6),
+            created_at_unix_ms: 1,
+            expires_at_unix_ms: 2,
+            body: EnvelopeBuilder::build_ack_body([0x44; 16], DmAckOutcome::Accepted),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        let v1_key = envelope.dedupe_key();
+        envelope.protocol_version = DM_PROTOCOL_DURABLE_ACK;
+        assert_eq!(
+            envelope.dedupe_key(),
+            v1_key,
+            "one sender/request pair is one logical delivery across upgrades"
+        );
+    }
+
+    #[test]
+    fn durable_completion_fails_closed_when_cache_is_poisoned() {
+        let cache = RecentDeliveryCache::with_defaults();
+        let key = DedupeKey::new(dummy_agent_id(7), [0x77; 16]);
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = cache.inner.lock().expect("initial cache lock");
+            panic!("poison cache for durable completion test");
+        }));
+        assert!(poisoned.is_err());
+        assert_eq!(
+            cache.complete_durable(key, DmAckOutcome::Accepted),
+            Err(DurableCacheError::Poisoned)
+        );
+        assert!(cache.lookup(&key).is_none());
+        assert!(cache.delivery_lock(key).is_none());
     }
 
     #[test]

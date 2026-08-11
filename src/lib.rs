@@ -4371,7 +4371,7 @@ impl Agent {
                     )
                 })?;
                 let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
-                history
+                let outcome = history
                     .record_committed(history::HistoryRecord {
                         msg_id: history::HistoryRecord::compute_local_send_msg_id(
                             &request_id,
@@ -4394,6 +4394,14 @@ impl Agent {
                     })
                     .await
                     .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?;
+                if !matches!(
+                    outcome,
+                    history::InsertOutcome::Inserted | history::InsertOutcome::Duplicate
+                ) {
+                    return Err(dm::DmError::HistoryCommitFailed(format!(
+                        "history write did not establish the exact loopback row: {outcome:?}"
+                    )));
+                }
             }
 
             let delivered = self
@@ -15697,6 +15705,38 @@ mod tests {
             0,
             "loopback path must not register with the relay engine"
         );
+    }
+
+    #[tokio::test]
+    async fn strict_send_to_v1_recipient_fails_before_raw_transport() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let recipient = identity::AgentId([0x51; 32]);
+        let kem = groups::kem_envelope::AgentKemKeypair::generate().expect("recipient KEM");
+        agent.capability_store().insert(
+            recipient,
+            identity::MachineId([0x52; 32]),
+            dm::DmCapabilities::v1_gossip_ready(kem.public_bytes),
+            dm::now_unix_ms(),
+        );
+        let config = dm::DmSendConfig {
+            require_durable_app_ack: true,
+            prefer_raw_quic_if_connected: true,
+            stop_fallback_on_raw_error: false,
+            ..dm::DmSendConfig::default()
+        };
+
+        let error = agent
+            .send_direct_with_config_inner(&recipient, b"strict v2".to_vec(), config)
+            .await
+            .expect_err("v1-only recipient cannot satisfy durable application ACK");
+        assert!(matches!(error, dm::DmError::AckSemanticsUnavailable(_)));
     }
 
     #[tokio::test]

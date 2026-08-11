@@ -18,6 +18,18 @@ use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
+    // Internal daemon protocols retain their existing v1-compatible transport
+    // policy. The product `/direct/send` route applies the stricter durable
+    // application-ACK contract in `direct_product_send_config` below.
+    x0x::dm::DmSendConfig {
+        timeout_per_attempt: Duration::from_secs(8),
+        prefer_raw_quic_if_connected: true,
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        ..x0x::dm::DmSendConfig::default()
+    }
+}
+
+fn direct_product_send_config() -> x0x::dm::DmSendConfig {
     // Product/UI success is strict: only a v2 recipient ACK emitted after
     // authenticated history commit and local application dispatch qualifies.
     x0x::dm::DmSendConfig {
@@ -81,7 +93,7 @@ pub(in crate::server) struct DirectSendRequest {
 }
 
 fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendConfig {
-    let mut config = direct_message_send_config();
+    let mut config = direct_product_send_config();
     let _legacy_transport_request = (
         req.prefer_raw_quic_if_connected,
         req.stop_fallback_on_raw_error,
@@ -433,8 +445,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_message_send_config_requires_durable_v2_gossip_ack() {
-        let config = direct_message_send_config();
+    fn direct_product_send_config_requires_durable_v2_gossip_ack() {
+        let config = direct_product_send_config();
         assert!(config.require_gossip_ack);
         assert!(config.require_gossip);
         assert!(config.require_durable_app_ack);

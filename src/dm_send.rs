@@ -476,6 +476,9 @@ fn ack_outcome_to_receipt(
             path: DmPath::GossipInbox,
         }),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
+        DmAckOutcome::AckSemanticsUnavailable { reason } => {
+            Err(DmError::AckSemanticsUnavailable(reason))
+        }
     }
 }
 
@@ -853,6 +856,16 @@ mod tests {
             format!("{:?}", err).contains("not trusted"),
             "error should contain reason"
         );
+    }
+
+    #[test]
+    fn ack_semantics_unavailable_outcome_is_explicit_sender_error() {
+        let outcome = DmAckOutcome::AckSemanticsUnavailable {
+            reason: "logical request already completed under v1 semantics".to_string(),
+        };
+        let error = ack_outcome_to_receipt(outcome, [4u8; 16], 0)
+            .expect_err("weaker cached semantics cannot become a v2 receipt");
+        assert!(matches!(error, DmError::AckSemanticsUnavailable(_)));
     }
 
     // ── send_via_gossip early validation ──────────────────────────────

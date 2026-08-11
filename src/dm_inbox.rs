@@ -342,6 +342,22 @@ struct InboxPipeline {
     history: Option<crate::history::HistoryHandle>,
 }
 
+fn cached_ack_for_protocol(
+    cached: &crate::dm::CachedOutcome,
+    requested_protocol: u16,
+) -> DmAckOutcome {
+    if cached.protocol_version >= requested_protocol {
+        cached.outcome.clone()
+    } else {
+        DmAckOutcome::AckSemanticsUnavailable {
+            reason: format!(
+                "logical request already completed under v{} semantics",
+                cached.protocol_version
+            ),
+        }
+    }
+}
+
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
@@ -404,17 +420,25 @@ impl InboxPipeline {
         let dedupe = envelope.dedupe_key();
         if let Some(cached) = self.cache.lookup(&dedupe) {
             if matches!(envelope.body, DmBody::Payload(_)) {
-                let _ = self
-                    .publish_ack(
-                        AgentId(envelope.sender_agent_id),
-                        envelope.request_id,
-                        cached.outcome,
-                        envelope.protocol_version,
-                        ack_legacy_bus,
-                    )
-                    .await;
+                if cached.protocol_version >= envelope.protocol_version {
+                    let _ = self
+                        .publish_ack(
+                            AgentId(envelope.sender_agent_id),
+                            envelope.request_id,
+                            cached_ack_for_protocol(&cached, envelope.protocol_version),
+                            envelope.protocol_version,
+                            ack_legacy_bus,
+                        )
+                        .await;
+                    return;
+                }
+                // A v1 completion cannot satisfy a v2 receipt. Continue
+                // through signature, attestation, and decrypt verification;
+                // the serialized branch below returns an explicit semantics
+                // error without dispatching the logical request again.
+            } else {
+                return;
             }
-            return;
         }
 
         if !verify_envelope_signature(&envelope, &sender_pubkey) {
@@ -612,7 +636,11 @@ impl InboxPipeline {
                 let outcome = DmAckOutcome::RejectedByPolicy {
                     reason: decision.to_string(),
                 };
-                self.cache.insert(envelope.dedupe_key(), outcome.clone());
+                self.cache.insert_for_protocol(
+                    envelope.dedupe_key(),
+                    outcome.clone(),
+                    protocol_version,
+                );
                 if !self.silent_reject {
                     let _ = self
                         .publish_ack(
@@ -642,34 +670,31 @@ impl InboxPipeline {
             return;
         }
 
-        // V2 serializes the two subscription paths without inserting a
-        // provisional Accepted outcome. A failed/cancelled owner releases the
-        // lock and the next exact retry can safely attempt the commit again.
-        let _durable_delivery_guard = if durable_ack {
-            let Some(lock) = self.cache.delivery_lock(envelope.dedupe_key()) else {
-                tracing::warn!(
-                    request_id = %hex::encode(envelope.request_id),
-                    "v2 durable delivery claim cache is saturated; withholding ACK"
-                );
-                return;
-            };
-            let guard = lock.lock_owned().await;
-            if let Some(cached) = self.cache.lookup(&envelope.dedupe_key()) {
-                let _ = self
-                    .publish_ack(
-                        sender_agent_id,
-                        envelope.request_id,
-                        cached.outcome,
-                        protocol_version,
-                        ack_legacy_bus,
-                    )
-                    .await;
-                return;
-            }
-            Some(guard)
-        } else {
-            None
+        // Serialize every protocol generation for one logical request. This
+        // prevents simultaneous v1/v2 or primary/legacy copies from each
+        // dispatching after observing a cache miss. V2 still avoids inserting
+        // a provisional Accepted outcome: a failed owner releases the lock so
+        // an exact retry can safely attempt the commit again.
+        let Some(lock) = self.cache.delivery_lock(envelope.dedupe_key()) else {
+            tracing::warn!(
+                request_id = %hex::encode(envelope.request_id),
+                "DM delivery claim cache is saturated or unavailable; withholding ACK"
+            );
+            return;
         };
+        let _delivery_guard = lock.lock_owned().await;
+        if let Some(cached) = self.cache.lookup(&envelope.dedupe_key()) {
+            let _ = self
+                .publish_ack(
+                    sender_agent_id,
+                    envelope.request_id,
+                    cached_ack_for_protocol(&cached, protocol_version),
+                    protocol_version,
+                    ack_legacy_bus,
+                )
+                .await;
+            return;
+        }
 
         // Atomic dedupe claim BEFORE delivery. The same envelope can arrive
         // twice — once on the primary per-recipient inbox and once on the
@@ -682,9 +707,11 @@ impl InboxPipeline {
         // The claim happens only after a successful decrypt, so a decrypt
         // failure above still leaves the slot unclaimed for a genuine retry.
         if !durable_ack
-            && !self
-                .cache
-                .insert(envelope.dedupe_key(), DmAckOutcome::Accepted)
+            && !self.cache.insert_for_protocol(
+                envelope.dedupe_key(),
+                DmAckOutcome::Accepted,
+                protocol_version,
+            )
         {
             let _ = self
                 .publish_ack(
@@ -767,13 +794,27 @@ impl InboxPipeline {
                     );
                     return;
                 };
-                if let Err(error) = history.record_committed(record).await {
-                    tracing::warn!(
-                        request_id = %hex::encode(envelope.request_id),
-                        %error,
-                        "v2 durable history commit failed; withholding ACK and app dispatch"
-                    );
-                    return;
+                match history.record_committed(record).await {
+                    Ok(
+                        crate::history::InsertOutcome::Inserted
+                        | crate::history::InsertOutcome::Duplicate,
+                    ) => {}
+                    Ok(outcome) => {
+                        tracing::warn!(
+                            request_id = %hex::encode(envelope.request_id),
+                            ?outcome,
+                            "v2 durable history write did not establish this exact row; withholding ACK and app dispatch"
+                        );
+                        return;
+                    }
+                    Err(error) => {
+                        tracing::warn!(
+                            request_id = %hex::encode(envelope.request_id),
+                            %error,
+                            "v2 durable history commit failed; withholding ACK and app dispatch"
+                        );
+                        return;
+                    }
                 }
             } else if let (Some(history), Some(record)) = (self.history.as_ref(), history_record) {
                 // Legacy v1 keeps the ADR-0023 non-blocking, shed-on-full path.
@@ -801,8 +842,17 @@ impl InboxPipeline {
         }
 
         if durable_ack {
-            self.cache
-                .insert(envelope.dedupe_key(), DmAckOutcome::Accepted);
+            if let Err(error) = self
+                .cache
+                .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
+            {
+                tracing::error!(
+                    request_id = %hex::encode(envelope.request_id),
+                    ?error,
+                    "v2 dispatch completed but replay-safe completion failed; withholding ACK"
+                );
+                return;
+            }
         }
 
         let _ = self
@@ -1258,6 +1308,155 @@ mod tests {
         if let Some(service) = harness.history_service.take() {
             service.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn durable_v2_commit_failure_withholds_completion_and_retry_succeeds() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let _closed_handle = enable_durable_history(&mut harness).await;
+        let stopped = harness
+            .history_service
+            .take()
+            .expect("history service started");
+        stopped.shutdown().await;
+
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xA4);
+        harness
+            .pipeline
+            .handle_incoming(message.clone(), false)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness
+                .pipeline
+                .cache
+                .lookup(
+                    &DmEnvelope::from_wire_bytes(&message.payload)
+                        .expect("envelope")
+                        .dedupe_key()
+                )
+                .is_none(),
+            "failed commit must not publish an Accepted completion"
+        );
+
+        let retry_db = harness._tempdir.path().join("retry-history.db");
+        let retry_config = HistoryConfig {
+            enabled: true,
+            db_path: Some(retry_db),
+            ..HistoryConfig::default()
+        };
+        let retry_service = HistoryService::start(&retry_config, harness._tempdir.path())
+            .expect("restart history writer");
+        let retry_history = retry_service.handle();
+        harness.pipeline.history = Some(retry_history.clone());
+        harness.history_service = Some(retry_service);
+
+        harness.pipeline.handle_incoming(message, false).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("retry dispatch timeout")
+            .expect("retry delivery stream closed");
+        assert_eq!(delivered.payload, b"security regression payload");
+        assert_eq!(
+            retry_history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query retry history")
+                .len(),
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_v2_simultaneous_primary_and_legacy_commit_and_dispatch_once() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xA5);
+
+        tokio::join!(
+            harness.pipeline.handle_incoming(message.clone(), false),
+            harness.pipeline.handle_incoming(message, true)
+        );
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("simultaneous dispatch timeout")
+            .expect("delivery stream closed");
+        assert_eq!(delivered.payload, b"security regression payload");
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query history")
+                .len(),
+            1
+        );
+        assert_eq!(
+            history
+                .counters()
+                .written_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            history
+                .counters()
+                .dedup_hits
+                .load(std::sync::atomic::Ordering::Relaxed),
+            0
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn v1_then_v2_same_logical_request_is_not_redispatched() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let v1 = attested_payload_message(&harness, &sender, &machine, 0xA6);
+        let mut v2_envelope = DmEnvelope::from_wire_bytes(&v1.payload).expect("decode v1");
+        v2_envelope.protocol_version = DM_PROTOCOL_DURABLE_ACK;
+        v2_envelope.signature.clear();
+        v2_envelope.origin_attestation = None;
+        sign_envelope_with_agent(&mut v2_envelope, &sender);
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &v2_envelope,
+            machine.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(&machine).expect("v2 attestation");
+        v2_envelope.origin_attestation = Some(attestation);
+        let v2 = wrap_in_pubsub(&harness, &sender, &v2_envelope);
+
+        harness.pipeline.handle_incoming(v1, false).await;
+        let _first = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("v1 dispatch timeout")
+            .expect("delivery stream closed");
+        harness.pipeline.handle_incoming(v2, false).await;
+        assert_no_delivery(&mut harness.receiver).await;
+
+        let cached = harness
+            .pipeline
+            .cache
+            .lookup(&v2_envelope.dedupe_key())
+            .expect("v1 completion remains cached");
+        assert_eq!(cached.protocol_version, crate::dm::DM_PROTOCOL_V1);
+        assert!(matches!(
+            cached_ack_for_protocol(&cached, DM_PROTOCOL_DURABLE_ACK),
+            DmAckOutcome::AckSemanticsUnavailable { .. }
+        ));
     }
 
     #[tokio::test]

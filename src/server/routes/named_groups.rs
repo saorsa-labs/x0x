@@ -28580,7 +28580,7 @@ mod tests {
         state.agent.capability_store().insert(
             recipient,
             x0x::identity::MachineId([9u8; 32]),
-            x0x::dm::DmCapabilities::v1_gossip_ready(vec![0xAAu8; 32]),
+            x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![0xAAu8; 32]),
             x0x::dm::now_unix_ms(),
         );
         let response = direct_send(
@@ -28613,7 +28613,7 @@ mod tests {
         state.agent.capability_store().insert(
             recipient,
             x0x::identity::MachineId([9u8; 32]),
-            x0x::dm::DmCapabilities::v1_gossip_ready(kem.public_bytes.clone()),
+            x0x::dm::DmCapabilities::v2_durable_gossip_ready(kem.public_bytes.clone()),
             x0x::dm::now_unix_ms(),
         );
         let response = direct_send(
@@ -28632,6 +28632,39 @@ mod tests {
             "not-ready gossip runtime must be a retryable 503, body: {body}"
         );
         assert_eq!(body["error"], "local_gossip_unavailable");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn direct_send_200_implies_history_query_and_restart_visibility() -> Result<()> {
+        let (state, dir) = public_message_history_test_state().await?;
+        let recipient = state.agent.agent_id();
+        let response = direct_send(
+            State(Arc::clone(&state)),
+            Json(direct_send_test_request(
+                hex::encode(recipient.as_bytes()),
+                BASE64.encode(b"durable REST loopback"),
+            )),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "strict loopback failed: {body}");
+
+        let history = state.agent.history().expect("history enabled");
+        let visible = history
+            .store()
+            .query(&x0x::history::HistoryQuery::default())?;
+        assert_eq!(visible.len(), 1, "HTTP 200 must follow committed history");
+        assert_eq!(visible[0].record.payload, b"durable REST loopback");
+
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        drop(state);
+        let reopened = x0x::history::Store::open(&dir.path().join("history.db"))?;
+        let after_restart = reopened.query(&x0x::history::HistoryQuery::default())?;
+        assert_eq!(after_restart.len(), 1);
+        assert_eq!(after_restart[0].record.payload, b"durable REST loopback");
         Ok(())
     }
 
