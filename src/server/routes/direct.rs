@@ -18,21 +18,16 @@ use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Generic daemon/UI DMs should only return success after the inbox path
-    // observes the recipient ACK. Callers that intentionally want
-    // fire-and-forget gossip can pass `require_gossip_ack: false`.
-    //
-    // The raw-QUIC fallback (taken whenever the recipient's gossip-inbox
-    // capability advert has not converged yet — always the case in the first
-    // seconds after boot) must use ant-quic's receive-pipeline ACK. A
-    // fire-and-forget raw send into a connection that is being superseded
-    // reports Ok while the bytes are lost, the retry machinery never fires,
-    // and the recipient's app never sees the message (the dogfood
-    // group_join / hop-DM 25s-timeout black hole).
+    // Product/UI success is strict: only a v2 recipient ACK emitted after
+    // authenticated history commit and local application dispatch qualifies.
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
-        prefer_raw_quic_if_connected: true,
-        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        require_gossip: true,
+        require_gossip_ack: true,
+        require_durable_app_ack: true,
+        prefer_raw_quic_if_connected: false,
+        raw_quic_receive_ack_timeout: None,
+        stop_fallback_on_raw_error: true,
         ..x0x::dm::DmSendConfig::default()
     }
 }
@@ -87,18 +82,18 @@ pub(in crate::server) struct DirectSendRequest {
 
 fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendConfig {
     let mut config = direct_message_send_config();
-    if let Some(prefer_raw_quic_if_connected) = req.prefer_raw_quic_if_connected {
-        config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
-    }
-    config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
-    config.require_gossip = req.require_gossip;
-    if let Some(require_gossip_ack) = req.require_gossip_ack {
-        config.require_gossip_ack = require_gossip_ack;
-    }
+    let _legacy_transport_request = (
+        req.prefer_raw_quic_if_connected,
+        req.stop_fallback_on_raw_error,
+        req.require_gossip,
+        req.require_gossip_ack,
+    );
+    // Preserve the historical timeout input as a caller-controlled strict
+    // per-attempt budget, but never let legacy transport knobs weaken the
+    // product endpoint's receipt contract.
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
-        config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
-            raw_ack_ms.clamp(100, 30_000),
-        ));
+        config.timeout_per_attempt =
+            std::time::Duration::from_millis(raw_ack_ms.clamp(100, 30_000));
     }
     config
 }
@@ -112,6 +107,12 @@ fn direct_send_error_status(error: &x0x::dm::DmError) -> (StatusCode, &'static s
         // Issue #188: the cached capability advert / contact card is not
         // converged (or is corrupt). This is transient and safe to retry.
         x0x::dm::DmError::RecipientKeyInvalid(_) => (StatusCode::CONFLICT, "recipient_key_invalid"),
+        x0x::dm::DmError::AckSemanticsUnavailable(_) => {
+            (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
+        }
+        x0x::dm::DmError::HistoryCommitFailed(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "history_commit_failed")
+        }
         x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
         x0x::dm::DmError::PeerLikelyOffline { .. } => {
             (StatusCode::BAD_GATEWAY, "peer_likely_offline")
@@ -432,35 +433,39 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_message_send_config_prefers_receive_acked_raw_quic() {
+    fn direct_message_send_config_requires_durable_v2_gossip_ack() {
         let config = direct_message_send_config();
         assert!(config.require_gossip_ack);
-        assert!(config.prefer_raw_quic_if_connected);
-        // Raw-QUIC preference must be loss-detecting (receive-pipeline ACK), or
-        // a send into a superseded connection reports Ok, the retry never
-        // fires, and the recipient's app never sees the message.
-        assert_eq!(
-            config.raw_quic_receive_ack_timeout,
-            Some(Duration::from_secs(8))
-        );
+        assert!(config.require_gossip);
+        assert!(config.require_durable_app_ack);
+        assert!(!config.prefer_raw_quic_if_connected);
+        assert_eq!(config.raw_quic_receive_ack_timeout, None);
     }
 
     #[test]
-    fn direct_send_request_preserves_raw_quic_default_unless_explicitly_overridden() {
+    fn direct_send_request_cannot_weaken_durable_ack_contract() {
         let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "00".repeat(32),
             "payload": ""
         }))
         .expect("minimal direct-send request should deserialize");
-        assert!(direct_send_config_for_request(&omitted).prefer_raw_quic_if_connected);
+        let omitted_config = direct_send_config_for_request(&omitted);
+        assert!(omitted_config.require_durable_app_ack);
+        assert!(!omitted_config.prefer_raw_quic_if_connected);
 
-        let disabled: DirectSendRequest = serde_json::from_value(serde_json::json!({
+        let legacy_requested: DirectSendRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "00".repeat(32),
             "payload": "",
-            "prefer_raw_quic_if_connected": false
+            "prefer_raw_quic_if_connected": true,
+            "require_gossip": false,
+            "require_gossip_ack": false
         }))
-        .expect("direct-send request with explicit override should deserialize");
-        assert!(!direct_send_config_for_request(&disabled).prefer_raw_quic_if_connected);
+        .expect("legacy direct-send knobs should still deserialize");
+        let config = direct_send_config_for_request(&legacy_requested);
+        assert!(config.require_durable_app_ack);
+        assert!(config.require_gossip);
+        assert!(config.require_gossip_ack);
+        assert!(!config.prefer_raw_quic_if_connected);
     }
 
     #[test]

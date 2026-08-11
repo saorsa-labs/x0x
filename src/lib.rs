@@ -4337,14 +4337,63 @@ impl Agent {
         &self,
         to: &identity::AgentId,
         payload: Vec<u8>,
-        config: dm::DmSendConfig,
+        mut config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        if config.require_durable_app_ack {
+            // A strict receipt is never satisfied by transport acceptance,
+            // publish-only gossip, or relay forwarding.
+            config.require_gossip = true;
+            config.require_gossip_ack = true;
+            config.prefer_raw_quic_if_connected = false;
+            config.stop_fallback_on_raw_error = true;
+        }
         if *to == self.identity.agent_id() {
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
                 return Err(dm::DmError::PayloadTooLarge {
                     len: payload.len(),
                     max: direct::MAX_DIRECT_PAYLOAD_SIZE,
                 });
+            }
+
+            let request_id = dm_send::fresh_request_id();
+            if config.require_durable_app_ack {
+                let history::classify::DmPayloadClass::Durable(content_type) =
+                    history::classify::classify_dm_payload(&payload)
+                else {
+                    return Err(dm::DmError::AckSemanticsUnavailable(
+                        "strict application ACK is only available for durable DM payloads"
+                            .to_string(),
+                    ));
+                };
+                let history = self.history_handle.as_ref().ok_or_else(|| {
+                    dm::DmError::AckSemanticsUnavailable(
+                        "local durable history is disabled".to_string(),
+                    )
+                })?;
+                let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
+                history
+                    .record_committed(history::HistoryRecord {
+                        msg_id: history::HistoryRecord::compute_local_send_msg_id(
+                            &request_id,
+                            &payload,
+                        ),
+                        scope: history::Scope::Dm(hex::encode(to.as_bytes())),
+                        author_agent: Some(hex::encode(self.identity.agent_id().as_bytes())),
+                        author_machine: Some(hex::encode(self.identity.machine_id().as_bytes())),
+                        author_pubkey: None,
+                        sent_at_ms: now,
+                        seen_at_ms: now,
+                        direction: history::Direction::Inbound,
+                        content_type: content_type.to_string(),
+                        payload: payload.clone(),
+                        signed_artifact: None,
+                        signature: None,
+                        sig_context: None,
+                        provenance: history::Provenance::LocalSend,
+                        replace_key: None,
+                    })
+                    .await
+                    .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?;
             }
 
             let delivered = self
@@ -4355,7 +4404,7 @@ impl Agent {
                     payload,
                 )
                 .await;
-            let receipt = dm_send::loopback_receipt();
+            let receipt = dm_send::loopback_receipt_with_request_id(request_id);
             tracing::debug!(
                 target: "dm.trace",
                 stage = "outbound_send_returned_ok",
@@ -4374,6 +4423,11 @@ impl Agent {
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
         let (cap, cap_source) = if advert_gossip_ready {
             (advert_cap, "advert_cache")
+        } else if config.require_durable_app_ack {
+            // Static contact cards are not proof that the recipient currently
+            // has a functioning history writer. Strict semantics require the
+            // signed, TTL-bounded runtime advert.
+            (advert_cap, "advert_cache_unusable_for_durable_ack")
         } else {
             let contact_cap = {
                 let contacts = self.contact_store.read().await;
@@ -4408,20 +4462,31 @@ impl Agent {
             capability_store_entries = self.capability_store.len(),
         );
 
+        if config.require_durable_app_ack
+            && !cap
+                .as_ref()
+                .is_some_and(dm::DmCapabilities::supports_durable_app_ack)
+        {
+            return Err(dm::DmError::AckSemanticsUnavailable(format!(
+                "recipient {} has no current v2 durable-ACK capability advert",
+                hex::encode(to.as_bytes())
+            )));
+        }
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
         // closure never runs - the happy path pays nothing.
-        let relay_seed: Option<(Vec<u8>, Vec<u8>)> = if self.peer_relay.policy().enabled {
-            cap.as_ref()
-                .filter(|c| !c.kem_public_key.is_empty())
-                .map(|c| (payload.clone(), c.kem_public_key.clone()))
-        } else {
-            None
-        };
+        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
+            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
+                cap.as_ref()
+                    .filter(|c| !c.kem_public_key.is_empty())
+                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
+            } else {
+                None
+            };
 
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
-        let mut config = config;
         // Direct transport RTT is a valid hint for raw-QUIC work, but it is
         // not a reliable bound for the gossip-inbox ACK path. Keep the
         // conservative default for PubSub-backed DMs unless the caller passed
@@ -7689,8 +7754,11 @@ impl Agent {
         // Upgrade our advertised capabilities so peers stop falling back
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
-        let upgraded =
-            dm::DmCapabilities::pending().with_kem_public_key(kem_keypair.public_bytes.clone());
+        let upgraded = if self.history_handle.is_some() {
+            dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
+        } else {
+            dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
+        };
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on

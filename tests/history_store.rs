@@ -345,6 +345,32 @@ async fn writer_service_writes_and_sheds() {
     );
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn commit_receipt_makes_row_immediately_queryable() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = HistoryConfig {
+        enabled: true,
+        ..HistoryConfig::default()
+    };
+    let service = HistoryService::start(&config, dir.path()).unwrap();
+    let handle = service.handle();
+    let committed = record(b"receipt row", Scope::Dm("peer".into()), 42);
+
+    assert_eq!(
+        handle.record_committed(committed.clone()).await.unwrap(),
+        InsertOutcome::Inserted
+    );
+    let rows = handle.store().query(&HistoryQuery::default()).unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].record.payload, committed.payload);
+    assert_eq!(
+        handle.record_committed(committed).await.unwrap(),
+        InsertOutcome::Duplicate
+    );
+
+    service.shutdown().await;
+}
+
 /// Library default is off: `HistoryConfig::default().enabled == false`,
 /// daemon default is on.
 #[test]

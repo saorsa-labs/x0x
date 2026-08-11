@@ -13,7 +13,16 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use super::record::HistoryRecord;
-use super::store::Store;
+use super::store::{InsertOutcome, Store};
+use crate::error::{HistoryError, HistoryResult};
+
+enum WriteCommand {
+    BestEffort(HistoryRecord),
+    Commit {
+        record: HistoryRecord,
+        reply: tokio::sync::oneshot::Sender<HistoryResult<InsertOutcome>>,
+    },
+}
 
 /// Channel capacity (records) between producers and the writer thread.
 pub const WRITER_QUEUE_CAPACITY: usize = 4096;
@@ -47,7 +56,7 @@ pub struct HistoryCounters {
 /// Producer-side handle: cheap to clone, never blocks.
 #[derive(Clone, Debug)]
 pub struct WriterHandle {
-    tx: mpsc::SyncSender<HistoryRecord>,
+    tx: mpsc::SyncSender<WriteCommand>,
     counters: Arc<HistoryCounters>,
 }
 
@@ -55,11 +64,29 @@ impl WriterHandle {
     /// Enqueue a record; drops (and counts) when the queue is full or the
     /// writer has shut down. Never blocks.
     pub fn record(&self, record: HistoryRecord) {
-        match self.tx.try_send(record) {
+        match self.tx.try_send(WriteCommand::BestEffort(record)) {
             Ok(()) => {}
             Err(mpsc::TrySendError::Full(_)) | Err(mpsc::TrySendError::Disconnected(_)) => {
                 self.counters.dropped_full.fetch_add(1, Ordering::Relaxed);
             }
+        }
+    }
+
+    /// Enqueue a record and wait until its SQLite transaction has committed.
+    ///
+    /// Unlike [`Self::record`], this never sheds silently: a full or closed
+    /// writer queue is returned to the caller so an application-level ACK
+    /// cannot get ahead of durable history.
+    pub async fn record_committed(&self, record: HistoryRecord) -> HistoryResult<InsertOutcome> {
+        let (reply, receipt) = tokio::sync::oneshot::channel();
+        match self.tx.try_send(WriteCommand::Commit { record, reply }) {
+            Ok(()) => {}
+            Err(mpsc::TrySendError::Full(_)) => return Err(HistoryError::WriterBackpressured),
+            Err(mpsc::TrySendError::Disconnected(_)) => return Err(HistoryError::WriterClosed),
+        }
+        match receipt.await {
+            Ok(result) => result,
+            Err(_) => Err(HistoryError::WriterClosed),
         }
     }
 
@@ -87,7 +114,7 @@ impl Writer {
     /// Spawn the writer thread over `store`.
     #[must_use]
     pub fn spawn(store: Arc<Store>) -> Self {
-        let (tx, rx) = mpsc::sync_channel::<HistoryRecord>(WRITER_QUEUE_CAPACITY);
+        let (tx, rx) = mpsc::sync_channel::<WriteCommand>(WRITER_QUEUE_CAPACITY);
         let (shutdown_tx, shutdown_rx) = mpsc::channel::<()>();
         let counters = Arc::new(HistoryCounters::default());
         let thread_counters = Arc::clone(&counters);
@@ -126,7 +153,7 @@ impl Writer {
 
 fn writer_loop(
     store: &Store,
-    rx: &mpsc::Receiver<HistoryRecord>,
+    rx: &mpsc::Receiver<WriteCommand>,
     shutdown_rx: &mpsc::Receiver<()>,
     counters: &HistoryCounters,
 ) {
@@ -137,11 +164,15 @@ fn writer_loop(
         // Fill a batch: block briefly for the first record, then drain
         // whatever is immediately available up to BATCH_MAX.
         match rx.recv_timeout(BATCH_WINDOW) {
-            Ok(rec) => {
-                batch.push(rec);
-                while batch.len() < BATCH_MAX {
+            Ok(command) => {
+                process_command(store, command, &mut batch, counters);
+                let mut commands_processed = 1;
+                while commands_processed < BATCH_MAX {
                     match rx.try_recv() {
-                        Ok(r) => batch.push(r),
+                        Ok(command) => {
+                            process_command(store, command, &mut batch, counters);
+                            commands_processed += 1;
+                        }
                         Err(_) => break,
                     }
                 }
@@ -162,18 +193,15 @@ fn writer_loop(
     }
 }
 
-fn drain_at_shutdown(
-    store: &Store,
-    rx: &mpsc::Receiver<HistoryRecord>,
-    counters: &HistoryCounters,
-) {
+fn drain_at_shutdown(store: &Store, rx: &mpsc::Receiver<WriteCommand>, counters: &HistoryCounters) {
     let deadline = std::time::Instant::now() + SHUTDOWN_DRAIN_GRACE;
     let mut batch: Vec<HistoryRecord> = Vec::with_capacity(BATCH_MAX);
     loop {
         if std::time::Instant::now() >= deadline {
             // Count what we are abandoning, then stop.
             let mut abandoned = 0u64;
-            while rx.try_recv().is_ok() {
+            while let Ok(command) = rx.try_recv() {
+                abandon_command(command);
                 abandoned += 1;
             }
             if abandoned > 0 {
@@ -188,17 +216,55 @@ fn drain_at_shutdown(
             return;
         }
         match rx.try_recv() {
-            Ok(rec) => {
-                batch.push(rec);
-                if batch.len() >= BATCH_MAX {
-                    flush(store, &mut batch, counters);
-                }
+            Ok(command) => {
+                process_command(store, command, &mut batch, counters);
             }
             Err(_) => {
                 flush(store, &mut batch, counters);
                 return;
             }
         }
+    }
+}
+
+fn process_command(
+    store: &Store,
+    command: WriteCommand,
+    batch: &mut Vec<HistoryRecord>,
+    counters: &HistoryCounters,
+) {
+    match command {
+        WriteCommand::BestEffort(record) => {
+            batch.push(record);
+            if batch.len() >= BATCH_MAX {
+                flush(store, batch, counters);
+            }
+        }
+        WriteCommand::Commit { record, reply } => {
+            // Preserve producer order: everything queued before this receipt
+            // is committed before the receipt-bearing record.
+            flush(store, batch, counters);
+            let result = store.insert(&record);
+            match &result {
+                Ok(InsertOutcome::Inserted | InsertOutcome::Replaced) => {
+                    counters.written_total.fetch_add(1, Ordering::Relaxed);
+                }
+                Ok(InsertOutcome::Duplicate | InsertOutcome::StaleRejected) => {
+                    counters.dedup_hits.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(error) => {
+                    counters.write_errors.fetch_add(1, Ordering::Relaxed);
+                    tracing::error!(%error, "[history] receipt-bearing write failed");
+                }
+            }
+            let _ = reply.send(result);
+        }
+    }
+}
+
+fn abandon_command(command: WriteCommand) {
+    if let WriteCommand::Commit { reply, .. } = command {
+        let _ = reply.send(Err(HistoryError::WriterClosed));
     }
 }
 

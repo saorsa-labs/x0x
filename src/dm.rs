@@ -22,8 +22,15 @@ use std::time::{Duration, Instant};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-/// DM protocol version. Bumped on any backward-incompatible wire change.
-pub const DM_PROTOCOL_VERSION: u16 = 1;
+/// Legacy DM semantics: `Accepted` means verified and locally enqueued.
+pub const DM_PROTOCOL_V1: u16 = 1;
+
+/// Durable application-ACK semantics: `Accepted` is emitted only after a
+/// verified payload commits to history and local dispatch completes.
+pub const DM_PROTOCOL_DURABLE_ACK: u16 = 2;
+
+/// Highest DM protocol version understood by this build.
+pub const DM_PROTOCOL_VERSION: u16 = DM_PROTOCOL_DURABLE_ACK;
 
 /// Maximum envelope bytes (postcard-serialised). Soft cap: receivers drop
 /// envelopes over this size without processing or ACKing.
@@ -83,6 +90,14 @@ pub struct DmCapabilities {
 }
 
 impl DmCapabilities {
+    /// Whether this live advert can satisfy a strict product send.
+    #[must_use]
+    pub fn supports_durable_app_ack(&self) -> bool {
+        self.gossip_inbox
+            && !self.kem_public_key.is_empty()
+            && self.max_protocol_version >= DM_PROTOCOL_DURABLE_ACK
+    }
+
     /// Placeholder capability advert for agents that have not yet wired
     /// their KEM keypair. `gossip_inbox` is `false` and `kem_public_key`
     /// is empty — senders will fall back to the raw-QUIC path.
@@ -102,7 +117,20 @@ impl DmCapabilities {
     #[must_use]
     pub fn v1_gossip_ready(kem_public_key: Vec<u8>) -> Self {
         Self {
-            max_protocol_version: DM_PROTOCOL_VERSION,
+            max_protocol_version: DM_PROTOCOL_V1,
+            gossip_inbox: true,
+            kem_algorithm: "ML-KEM-768".to_string(),
+            max_envelope_bytes: MAX_ENVELOPE_BYTES,
+            kem_public_key,
+        }
+    }
+
+    /// Fully-wired gossip DM advert whose v2 ACKs certify a committed local
+    /// history row plus completed local application dispatch.
+    #[must_use]
+    pub fn v2_durable_gossip_ready(kem_public_key: Vec<u8>) -> Self {
+        Self {
+            max_protocol_version: DM_PROTOCOL_DURABLE_ACK,
             gossip_inbox: true,
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
@@ -472,6 +500,16 @@ pub enum DmError {
     #[error("recipient key material invalid: {0}")]
     RecipientKeyInvalid(String),
 
+    /// The recipient supports gossip DMs but not the durable application-ACK
+    /// semantics required by this call.
+    #[error("recipient does not advertise durable application ACK support: {0}")]
+    AckSemanticsUnavailable(String),
+
+    /// The local durable history transaction required for a truthful success
+    /// receipt could not be completed.
+    #[error("durable history commit failed: {0}")]
+    HistoryCommitFailed(String),
+
     /// No application-layer ACK received within the retry budget. The DM
     /// MAY or may not have been delivered; the sender cannot distinguish.
     /// Safe to retry (recipient dedupes on `request_id`).
@@ -656,6 +694,9 @@ pub struct DmSendConfig {
     /// ACK before returning success. If false, a successful gossip publish is
     /// reported as accepted-for-delivery and any later ACK is ignored.
     pub require_gossip_ack: bool,
+    /// Require v2 semantics: authenticated origin, committed recipient
+    /// history, and completed local application dispatch before success.
+    pub require_durable_app_ack: bool,
     /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
     /// just observed a `Replaced` event but the new `Established` has not yet
     /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
@@ -682,6 +723,7 @@ impl Default for DmSendConfig {
             raw_quic_receive_ack_timeout: None,
             stop_fallback_on_raw_error: false,
             require_gossip_ack: true,
+            require_durable_app_ack: false,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }
@@ -740,14 +782,25 @@ pub fn dm_inbox_topic(agent_id: &AgentId) -> TopicId {
 pub struct DedupeKey {
     pub sender_agent_id: [u8; 32],
     pub request_id: [u8; 16],
+    pub protocol_version: u16,
 }
 
 impl DedupeKey {
     #[must_use]
     pub fn new(sender_agent_id: [u8; 32], request_id: [u8; 16]) -> Self {
+        Self::for_protocol(sender_agent_id, request_id, DM_PROTOCOL_V1)
+    }
+
+    #[must_use]
+    pub fn for_protocol(
+        sender_agent_id: [u8; 32],
+        request_id: [u8; 16],
+        protocol_version: u16,
+    ) -> Self {
         Self {
             sender_agent_id,
             request_id,
+            protocol_version,
         }
     }
 }
@@ -768,6 +821,10 @@ struct RecentDeliveryCacheInner {
     entries: HashMap<DedupeKey, CachedOutcome>,
     ttl: Duration,
     max_size: usize,
+    /// Per-logical-message serialization used by v2 so concurrent primary
+    /// inbox and legacy-bus copies cannot observe a provisional success.
+    delivery_locks: HashMap<DedupeKey, Arc<tokio::sync::Mutex<()>>>,
+    delivery_lock_order: VecDeque<DedupeKey>,
 }
 
 /// A cached per-DM outcome.
@@ -808,6 +865,8 @@ impl RecentDeliveryCache {
                 entries: HashMap::new(),
                 ttl,
                 max_size,
+                delivery_locks: HashMap::new(),
+                delivery_lock_order: VecDeque::new(),
             }),
         }
     }
@@ -867,6 +926,38 @@ impl RecentDeliveryCache {
             inner.entries.remove(&oldest);
         }
         true
+    }
+
+    /// Return the shared per-request lock used by the durable v2 pipeline.
+    /// Locks are bounded by the same capacity as cached outcomes.
+    pub fn delivery_lock(&self, key: DedupeKey) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return None;
+        };
+        if let Some(lock) = inner.delivery_locks.get(&key) {
+            return Some(Arc::clone(lock));
+        }
+        while inner.delivery_locks.len() >= inner.max_size {
+            let removable = inner.delivery_lock_order.iter().position(|candidate| {
+                inner
+                    .delivery_locks
+                    .get(candidate)
+                    .is_some_and(|lock| Arc::strong_count(lock) == 1)
+            });
+            let Some(position) = removable else {
+                // Every slot has a live owner or waiter. Fail closed rather
+                // than evicting an in-flight lock and permitting duplicate
+                // durable dispatch.
+                return None;
+            };
+            if let Some(oldest_idle) = inner.delivery_lock_order.remove(position) {
+                inner.delivery_locks.remove(&oldest_idle);
+            }
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        inner.delivery_locks.insert(key, Arc::clone(&lock));
+        inner.delivery_lock_order.push_back(key);
+        Some(lock)
     }
 
     /// Current cache size (diagnostic).
@@ -1119,7 +1210,7 @@ impl DmEnvelope {
     /// Dedupe key for this envelope.
     #[must_use]
     pub fn dedupe_key(&self) -> DedupeKey {
-        DedupeKey::new(self.sender_agent_id, self.request_id)
+        DedupeKey::for_protocol(self.sender_agent_id, self.request_id, self.protocol_version)
     }
 
     /// Verify the origin-machine attestation (issue #213).
@@ -1238,6 +1329,46 @@ impl EnvelopeBuilder {
     where
         F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
     {
+        Self::build_payload_envelope_with_version(
+            DM_PROTOCOL_V1,
+            request_id,
+            self_agent_id,
+            self_machine_id,
+            machine_keypair,
+            recipient_agent_id,
+            recipient_kem_public_key,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            payload,
+            sign,
+        )
+    }
+
+    /// Build a payload envelope using an explicitly negotiated protocol
+    /// version. The layout is unchanged between v1 and v2; only ACK semantics
+    /// differ.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_payload_envelope_with_version<F>(
+        protocol_version: u16,
+        request_id: [u8; 16],
+        self_agent_id: &AgentId,
+        self_machine_id: &MachineId,
+        machine_keypair: &crate::identity::MachineKeypair,
+        recipient_agent_id: &AgentId,
+        recipient_kem_public_key: &[u8],
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        payload: Vec<u8>,
+        sign: F,
+    ) -> std::result::Result<DmEnvelope, DmError>
+    where
+        F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
+    {
+        if !(DM_PROTOCOL_V1..=DM_PROTOCOL_VERSION).contains(&protocol_version) {
+            return Err(DmError::EnvelopeConstruction(format!(
+                "unsupported DM protocol version {protocol_version}"
+            )));
+        }
         // Classify the size cap with its dedicated variant so API layers can
         // answer 413 instead of the opaque `envelope_construction` 400
         // (issue #188). Covers the relay-fallback path, which has no earlier
@@ -1264,7 +1395,7 @@ impl EnvelopeBuilder {
         )
         .map_err(|e| DmError::EnvelopeConstruction(e.to_string()))?;
         let mut envelope = DmEnvelope {
-            protocol_version: DM_PROTOCOL_VERSION,
+            protocol_version,
             request_id,
             sender_agent_id: *self_agent_id.as_bytes(),
             sender_machine_id: *self_machine_id.as_bytes(),
@@ -1298,7 +1429,12 @@ impl EnvelopeBuilder {
 /// the sender task when an ACK arrives.
 #[derive(Default)]
 pub struct InFlightAcks {
-    inner: Arc<dashmap::DashMap<[u8; 16], tokio::sync::oneshot::Sender<DmAckOutcome>>>,
+    inner: Arc<dashmap::DashMap<[u8; 16], InFlightAck>>,
+}
+
+struct InFlightAck {
+    protocol_version: u16,
+    reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
 }
 
 impl Clone for InFlightAcks {
@@ -1323,8 +1459,24 @@ impl InFlightAcks {
     /// replaced. This matches sender-retry semantics where only the most
     /// recent attempt's waiter is of interest.
     pub fn register(&self, request_id: [u8; 16]) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
+        self.register_for_protocol(request_id, DM_PROTOCOL_V1)
+    }
+
+    /// Register a waiter that accepts only an ACK using the negotiated
+    /// protocol version.
+    pub fn register_for_protocol(
+        &self,
+        request_id: [u8; 16],
+        protocol_version: u16,
+    ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner.insert(request_id, tx);
+        self.inner.insert(
+            request_id,
+            InFlightAck {
+                protocol_version,
+                reply: tx,
+            },
+        );
         rx
     }
 
@@ -1332,10 +1484,27 @@ impl InFlightAcks {
     /// present, false otherwise (e.g. late ACK arriving after sender gave
     /// up).
     pub fn resolve(&self, request_id: &[u8; 16], outcome: DmAckOutcome) -> bool {
-        if let Some((_, tx)) = self.inner.remove(request_id) {
+        self.resolve_for_protocol(request_id, DM_PROTOCOL_V1, outcome)
+    }
+
+    /// Resolve a waiter only when the ACK matches its negotiated semantics.
+    pub fn resolve_for_protocol(
+        &self,
+        request_id: &[u8; 16],
+        protocol_version: u16,
+        outcome: DmAckOutcome,
+    ) -> bool {
+        let matches = self
+            .inner
+            .get(request_id)
+            .is_some_and(|pending| pending.protocol_version == protocol_version);
+        if !matches {
+            return false;
+        }
+        if let Some((_, pending)) = self.inner.remove(request_id) {
             // If the receiver was dropped we silently swallow the send
             // error — caller already moved on.
-            let _ = tx.send(outcome);
+            let _ = pending.reply.send(outcome);
             true
         } else {
             false
@@ -1713,6 +1882,19 @@ mod tests {
         ));
         assert_eq!(cfg.raw_quic_receive_ack_timeout, None);
         assert!(!cfg.stop_fallback_on_raw_error);
+        assert!(!cfg.require_durable_app_ack);
+    }
+
+    #[test]
+    fn durable_ack_capability_is_explicit_and_v1_stays_legacy() {
+        let kem_key = vec![7u8; 1184];
+        let v1 = DmCapabilities::v1_gossip_ready(kem_key.clone());
+        let v2 = DmCapabilities::v2_durable_gossip_ready(kem_key);
+
+        assert_eq!(v1.max_protocol_version, DM_PROTOCOL_V1);
+        assert!(!v1.supports_durable_app_ack());
+        assert_eq!(v2.max_protocol_version, DM_PROTOCOL_DURABLE_ACK);
+        assert!(v2.supports_durable_app_ack());
     }
 
     #[test]
@@ -1731,6 +1913,21 @@ mod tests {
         let _rx2 = acks.register(rid2);
         acks.cancel(&rid2);
         assert_eq!(acks.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_waiter_rejects_legacy_ack_version() {
+        let acks = InFlightAcks::new();
+        let rid = [3u8; 16];
+        let mut rx = acks.register_for_protocol(rid, DM_PROTOCOL_DURABLE_ACK);
+
+        assert!(!acks.resolve_for_protocol(&rid, DM_PROTOCOL_V1, DmAckOutcome::Accepted));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(acks.resolve_for_protocol(&rid, DM_PROTOCOL_DURABLE_ACK, DmAckOutcome::Accepted));
+        assert_eq!(rx.await.expect("v2 ACK"), DmAckOutcome::Accepted);
     }
 
     // ── Issue #213: origin-machine attestation ────────────────────────

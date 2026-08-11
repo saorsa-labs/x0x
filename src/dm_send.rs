@@ -2,7 +2,7 @@
 
 use crate::dm::{
     dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, MAX_PAYLOAD_BYTES,
+    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -92,7 +92,13 @@ pub async fn send_via_gossip(
 
     let created = now_unix_ms();
     let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
-    let envelope = EnvelopeBuilder::build_payload_envelope(
+    let protocol_version = if config.require_durable_app_ack {
+        DM_PROTOCOL_DURABLE_ACK
+    } else {
+        DM_PROTOCOL_V1
+    };
+    let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
+        protocol_version,
         request_id,
         &self_agent_id,
         &self_machine_id,
@@ -124,7 +130,7 @@ pub async fn send_via_gossip(
         bytes = wire.len(),
     );
 
-    let mut rx = inflight.register(request_id);
+    let mut rx = inflight.register_for_protocol(request_id, protocol_version);
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
     // X0X-0041: split the lifecycle hint into the per-peer match key and the
@@ -509,6 +515,16 @@ pub fn raw_quic_receipt() -> DmReceipt {
 #[must_use]
 pub fn loopback_receipt() -> DmReceipt {
     receipt_for_path(DmPath::Loopback)
+}
+
+#[must_use]
+pub fn loopback_receipt_with_request_id(request_id: [u8; 16]) -> DmReceipt {
+    DmReceipt {
+        request_id,
+        accepted_at: Instant::now(),
+        retries_used: 0,
+        path: DmPath::Loopback,
+    }
 }
 
 #[must_use]
