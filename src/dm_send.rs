@@ -92,13 +92,13 @@ impl DmAckWaiter {
         recipient_agent_id: AgentId,
         recipient_machine_id: Option<MachineId>,
     ) -> Self {
-        let rx = inflight.register_for_protocol(
+        let (rx, waiter_id) = inflight.register_owned_for_protocol(
             prepared.request_id,
             prepared.protocol_version,
             recipient_agent_id,
             recipient_machine_id,
         );
-        let guard = InFlightGuard::new(inflight, prepared.request_id);
+        let guard = InFlightGuard::new(inflight, prepared.request_id, waiter_id);
         Self { rx, guard }
     }
 
@@ -476,14 +476,16 @@ pub(crate) async fn send_prepared_via_gossip(
 struct InFlightGuard {
     inflight: Arc<InFlightAcks>,
     request_id: [u8; 16],
+    waiter_id: u64,
     resolved: bool,
 }
 
 impl InFlightGuard {
-    fn new(inflight: Arc<InFlightAcks>, request_id: [u8; 16]) -> Self {
+    fn new(inflight: Arc<InFlightAcks>, request_id: [u8; 16], waiter_id: u64) -> Self {
         Self {
             inflight,
             request_id,
+            waiter_id,
             resolved: false,
         }
     }
@@ -644,7 +646,8 @@ fn gossip_publish_receipt(request_id: [u8; 16], retries_used: u8) -> DmReceipt {
 impl Drop for InFlightGuard {
     fn drop(&mut self) {
         if !self.resolved {
-            self.inflight.cancel(&self.request_id);
+            self.inflight
+                .cancel_waiter(&self.request_id, self.waiter_id);
         }
     }
 }
@@ -984,10 +987,15 @@ mod tests {
     fn inflight_guard_drop_cancels_unresolved_waiter() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x88; 16];
-        let _rx = inflight.register(request_id, AgentId([0x81; 32]), Some(MachineId([0x82; 32])));
+        let (_rx, waiter_id) = inflight.register_owned_for_protocol(
+            request_id,
+            DM_PROTOCOL_V1,
+            AgentId([0x81; 32]),
+            Some(MachineId([0x82; 32])),
+        );
         assert_eq!(inflight.outstanding(), 1);
         {
-            let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+            let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id, waiter_id);
         }
         assert_eq!(inflight.outstanding(), 0);
     }
@@ -996,8 +1004,13 @@ mod tests {
     fn inflight_guard_mark_resolved_preserves_waiter_on_drop() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x89; 16];
-        let _rx = inflight.register(request_id, AgentId([0x83; 32]), Some(MachineId([0x84; 32])));
-        let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+        let (_rx, waiter_id) = inflight.register_owned_for_protocol(
+            request_id,
+            DM_PROTOCOL_V1,
+            AgentId([0x83; 32]),
+            Some(MachineId([0x84; 32])),
+        );
+        let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id, waiter_id);
         guard.mark_resolved();
         drop(guard);
         assert_eq!(inflight.outstanding(), 1);

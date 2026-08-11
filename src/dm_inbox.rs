@@ -1220,10 +1220,11 @@ impl InboxPipeline {
             .await
             {
                 Ok(true) => {
-                    if let Err(error) = self
-                        .cache
-                        .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
-                    {
+                    if let Err(error) = self.cache.complete_durable(
+                        envelope.dedupe_key(),
+                        DmAckOutcome::Accepted,
+                        protocol_version,
+                    ) {
                         tracing::error!(
                             request_id = %hex::encode(envelope.request_id),
                             ?error,
@@ -1303,10 +1304,11 @@ impl InboxPipeline {
                     return;
                 }
             }
-            if let Err(error) = self
-                .cache
-                .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
-            {
+            if let Err(error) = self.cache.complete_durable(
+                envelope.dedupe_key(),
+                DmAckOutcome::Accepted,
+                protocol_version,
+            ) {
                 tracing::error!(
                     request_id = %hex::encode(envelope.request_id),
                     ?error,
@@ -1381,6 +1383,7 @@ impl InboxPipeline {
                     }
                     crate::history::classify::DmPayloadClass::Ephemeral => None,
                 };
+            let message_id = history_record.as_ref().map(|record| record.msg_id);
 
             if durable_ack {
                 let (Some(history), Some(record)) = (self.history.as_ref(), history_record) else {
@@ -1425,6 +1428,7 @@ impl InboxPipeline {
                         // transport observation (issue #120).
                         observed_origin: None,
                         thread_meta,
+                        message_id,
                     },
                 )
                 .await;
@@ -1438,10 +1442,11 @@ impl InboxPipeline {
         }
 
         if durable_ack {
-            if let Err(error) = self
-                .cache
-                .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
-            {
+            if let Err(error) = self.cache.complete_durable(
+                envelope.dedupe_key(),
+                DmAckOutcome::Accepted,
+                protocol_version,
+            ) {
                 tracing::error!(
                     request_id = %hex::encode(envelope.request_id),
                     ?error,
@@ -2212,6 +2217,37 @@ mod tests {
             row.record.thread_root.as_deref() == Some(root_id.as_str())
                 && row.record.thread_parent.as_deref() == Some(parent_id.as_str())
         }));
+
+        // Simulate a lost v3 ACK by replaying the exact raw frame while the
+        // completion cache is still live. The receiver must retain v3 (not
+        // downgrade the cached outcome to v2), re-ACK, and avoid a second
+        // history row or live dispatch.
+        assert!(
+            ingress
+                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &reply_frame)
+                .await
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        let reply_envelope =
+            DmEnvelope::from_wire_bytes(reply.payload.as_ref()).expect("decode v3 reply");
+        let cached = harness
+            .pipeline
+            .cache
+            .lookup(&reply_envelope.dedupe_key())
+            .expect("v3 completion cached");
+        assert_eq!(cached.protocol_version, crate::dm::DM_PROTOCOL_THREADED);
+        assert_eq!(
+            cached_ack_for_protocol(&cached, crate::dm::DM_PROTOCOL_THREADED),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query history after exact v3 replay")
+                .len(),
+            2
+        );
 
         harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
         let restart_ingress = DmInboxIngress {

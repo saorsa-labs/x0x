@@ -362,6 +362,10 @@ pub struct DirectMessage {
     /// When present, reflects the full trust evaluation including contact
     /// store trust level and machine pinning.
     pub trust_decision: Option<TrustDecision>,
+    /// Canonical durable-history identity for this exact accepted message.
+    /// Present for envelope and durable loopback deliveries; legacy raw
+    /// messages that have no stable application identity leave this absent.
+    pub message_id: Option<[u8; 32]>,
     /// Issue #120: opt-in coarsened origin token — the transport-observed
     /// peer address masked to a fixed prefix, with directness and CGNAT
     /// markers.
@@ -407,6 +411,7 @@ impl DirectMessage {
             received_at,
             verified,
             trust_decision,
+            message_id: None,
             observed_origin: None,
             thread_root: None,
             thread_parent: None,
@@ -843,6 +848,7 @@ pub struct DirectMessaging {
 pub(crate) struct DirectInboundMetadata {
     pub(crate) observed_origin: Option<ObservedOrigin>,
     pub(crate) thread_meta: Option<DmThreadMeta>,
+    pub(crate) message_id: Option<[u8; 32]>,
 }
 
 impl DirectMessaging {
@@ -1330,6 +1336,7 @@ impl DirectMessaging {
         agent_id: AgentId,
         payload: Vec<u8>,
         thread_meta: Option<DmThreadMeta>,
+        message_id: Option<[u8; 32]>,
     ) -> u64 {
         self.handle_incoming_with_thread(
             machine_id,
@@ -1340,6 +1347,7 @@ impl DirectMessaging {
             DirectInboundMetadata {
                 observed_origin: None,
                 thread_meta,
+                message_id,
             },
         )
         .await
@@ -1379,6 +1387,7 @@ impl DirectMessaging {
             DirectInboundMetadata {
                 observed_origin,
                 thread_meta: None,
+                message_id: None,
             },
         )
         .await
@@ -1397,6 +1406,7 @@ impl DirectMessaging {
         let DirectInboundMetadata {
             observed_origin,
             thread_meta,
+            message_id,
         } = metadata;
         self.diagnostics
             .incoming_envelopes_total
@@ -1418,6 +1428,7 @@ impl DirectMessaging {
             trust_decision,
         );
         msg.observed_origin = observed_origin;
+        msg.message_id = message_id;
         msg.thread_root = thread_meta.as_ref().map(DmThreadMeta::thread_root_hex);
         msg.thread_parent = thread_meta.and_then(|meta| meta.thread_parent_hex());
 

@@ -154,12 +154,32 @@ fn direct_message_event_data(msg: &crate::direct::DirectMessage) -> serde_json::
             obj.insert("observed_origin".to_string(), value);
         }
     }
+    if let (Some(object), Some(message_id)) = (data.as_object_mut(), msg.message_id) {
+        object.insert(
+            "msg_id".to_string(),
+            serde_json::Value::String(hex::encode(message_id)),
+        );
+    }
     insert_thread_fields(
         &mut data,
         msg.thread_root.as_ref(),
         msg.thread_parent.as_ref(),
     );
     data
+}
+
+type DmBackfillIdentity = (String, [u8; 32]);
+
+fn history_dm_identity(record: &crate::history::HistoryRecord) -> Option<DmBackfillIdentity> {
+    match &record.scope {
+        crate::history::Scope::Dm(peer) => Some((peer.clone(), record.msg_id)),
+        crate::history::Scope::Group(_) | crate::history::Scope::Topic(_) => None,
+    }
+}
+
+fn live_dm_identity(msg: &crate::direct::DirectMessage) -> Option<DmBackfillIdentity> {
+    msg.message_id
+        .map(|message_id| (hex::encode(msg.sender.as_bytes()), message_id))
 }
 
 fn insert_thread_fields(
@@ -206,7 +226,7 @@ pub(super) async fn direct_events_sse(
     // live tap above is already established, so nothing is missed while the
     // (blocking) store query runs.
     let mut backfill_rows: Vec<serde_json::Value> = Vec::new();
-    let mut backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+    let mut backfill_identities: Option<std::collections::HashSet<DmBackfillIdentity>> = None;
     if let Some(limit) = params.backfill {
         if let Some(history) = state.agent.history() {
             let store = std::sync::Arc::clone(history.store());
@@ -218,10 +238,12 @@ pub(super) async fn direct_events_sse(
             match tokio::task::spawn_blocking(move || store.query(&q)).await {
                 Ok(Ok(mut rows)) => {
                     rows.reverse(); // oldest-first replay
-                    let mut hashes = std::collections::HashSet::new();
+                    let mut identities = std::collections::HashSet::new();
                     for row in &rows {
                         let r = &row.record;
-                        hashes.insert(*blake3::hash(&r.payload).as_bytes());
+                        if let Some(identity) = history_dm_identity(r) {
+                            identities.insert(identity);
+                        }
                         let mut data = serde_json::json!({
                             "sender": r.author_agent,
                             "machine_id": r.author_machine,
@@ -231,6 +253,7 @@ pub(super) async fn direct_events_sse(
                                 r.provenance,
                                 crate::history::Provenance::VerifiedEnvelope
                             ),
+                            "msg_id": hex::encode(r.msg_id),
                         });
                         insert_thread_fields(
                             &mut data,
@@ -239,7 +262,7 @@ pub(super) async fn direct_events_sse(
                         );
                         backfill_rows.push(data);
                     }
-                    backfill_hashes = Some(hashes);
+                    backfill_identities = Some(identities);
                 }
                 Ok(Err(e)) => {
                     tracing::warn!("direct SSE backfill query failed: {e}");
@@ -261,7 +284,7 @@ pub(super) async fn direct_events_sse(
         if emit_marker {
             yield Ok(Event::default().event("live").data("{}"));
         }
-        let mut dedupe = backfill_hashes;
+        let mut dedupe = backfill_identities;
         loop {
             tokio::select! {
                 _ = shutdown_rx.changed() => {
@@ -273,17 +296,15 @@ pub(super) async fn direct_events_sse(
                         break;
                     };
                     // Drop live frames already replayed by backfill (each at
-                    // most once); stop checking on first miss — the stream
-                    // has passed the backfill horizon.
+                    // most once). Identity includes authenticated DM scope and
+                    // the canonical stored message id, never payload bytes.
                     if let Some(set) = dedupe.as_mut() {
-                        let h = *blake3::hash(&msg.payload).as_bytes();
-                        if set.remove(&h) {
+                        if live_dm_identity(&msg).is_some_and(|identity| set.remove(&identity)) {
                             if set.is_empty() {
                                 dedupe = None;
                             }
                             continue;
                         }
-                        dedupe = None;
                     }
                     tracing::debug!(
                         target: "dm.trace",
@@ -419,5 +440,30 @@ mod tests {
         assert_eq!(data["verified"], true);
         assert_eq!(data["received_at"], 1_774_860_000);
         assert!(data["trust_decision"].is_null());
+    }
+
+    #[test]
+    fn dm_backfill_seam_uses_message_identity_not_payload_or_thread_text() {
+        let mut root = dm_with_origin(None);
+        root.message_id = Some([0x11; 32]);
+        root.thread_root = Some("aa".repeat(32));
+        let mut reply = root.clone();
+        reply.message_id = Some([0x22; 32]);
+        reply.thread_parent = Some("bb".repeat(32));
+
+        let root_identity = live_dm_identity(&root).expect("root identity");
+        let reply_identity = live_dm_identity(&reply).expect("reply identity");
+        assert_ne!(
+            root_identity, reply_identity,
+            "identical payload text in different messages must not collapse"
+        );
+        let mut seam =
+            std::collections::HashSet::from([root_identity.clone(), reply_identity.clone()]);
+        assert!(seam.remove(&root_identity));
+        assert!(!seam.remove(&root_identity), "exact replay is removed once");
+        assert!(
+            seam.remove(&reply_identity),
+            "distinct reply remains visible"
+        );
     }
 }

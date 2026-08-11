@@ -16,6 +16,7 @@ use saorsa_gossip_types::TopicId;
 use saorsa_pqc::api::kem::{MlKem, MlKemPublicKey};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -633,6 +634,11 @@ pub enum DmError {
     #[error("durable history commit failed: {0}")]
     HistoryCommitFailed(String),
 
+    /// An explicit logical id was already committed with different message
+    /// content or metadata.
+    #[error("logical direct-message id conflicts with its committed message")]
+    IdempotencyConflict,
+
     /// No application-layer ACK received within the retry budget. The DM
     /// MAY or may not have been delivered; the sender cannot distinguish.
     /// Safe to retry (recipient dedupes on `request_id`).
@@ -1064,7 +1070,7 @@ impl RecentDeliveryCache {
         true
     }
 
-    /// Publish a completed v2 delivery into the replay cache.
+    /// Publish a completed durable delivery into the replay cache.
     ///
     /// Unlike the legacy insertion path, mutex poisoning and a competing
     /// completion are explicit failures. The receiver must withhold its ACK
@@ -1074,6 +1080,7 @@ impl RecentDeliveryCache {
         &self,
         key: DedupeKey,
         outcome: DmAckOutcome,
+        protocol_version: u16,
     ) -> std::result::Result<(), DurableCacheError> {
         let mut inner = self.inner.lock().map_err(|_| DurableCacheError::Poisoned)?;
         if inner.entries.contains_key(&key) {
@@ -1083,7 +1090,7 @@ impl RecentDeliveryCache {
             key,
             CachedOutcome {
                 outcome,
-                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                protocol_version,
                 first_seen: Instant::now(),
             },
         );
@@ -1603,24 +1610,34 @@ impl EnvelopeBuilder {
 
 // ─── In-flight ACK tracking ────────────────────────────────────────────────
 
-/// Map of request_id → oneshot::Sender that the inbox handler uses to wake
-/// the sender task when an ACK arrives.
-#[derive(Default)]
+/// Map of request_id → coalesced waiters that the inbox handler wakes when
+/// one authenticated ACK arrives.
 pub struct InFlightAcks {
     inner: Arc<dashmap::DashMap<[u8; 16], InFlightAck>>,
+    next_waiter_id: Arc<AtomicU64>,
 }
 
 struct InFlightAck {
     expected_recipient: AgentId,
     expected_machine: Option<MachineId>,
     protocol_version: u16,
-    reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
+    replies: HashMap<u64, tokio::sync::oneshot::Sender<DmAckOutcome>>,
+}
+
+impl Default for InFlightAcks {
+    fn default() -> Self {
+        Self {
+            inner: Arc::new(dashmap::DashMap::new()),
+            next_waiter_id: Arc::new(AtomicU64::new(1)),
+        }
+    }
 }
 
 impl Clone for InFlightAcks {
     fn clone(&self) -> Self {
         Self {
             inner: Arc::clone(&self.inner),
+            next_waiter_id: Arc::clone(&self.next_waiter_id),
         }
     }
 }
@@ -1634,10 +1651,8 @@ impl InFlightAcks {
     /// Register a waiter for `request_id`. Returns the receiver side of the
     /// oneshot; caller awaits it with their timeout.
     ///
-    /// If a prior waiter exists for the same id (e.g. from an earlier
-    /// retry that was already resolved), the existing waiter is silently
-    /// replaced. This matches sender-retry semantics where only the most
-    /// recent attempt's waiter is of interest.
+    /// A prior waiter with the same authenticated binding is coalesced so
+    /// concurrent calls all observe the same ACK.
     pub fn register(
         &self,
         request_id: [u8; 16],
@@ -1662,17 +1677,89 @@ impl InFlightAcks {
         expected_recipient: AgentId,
         expected_machine: Option<MachineId>,
     ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner.insert(
+        self.register_owned_for_protocol(
             request_id,
-            InFlightAck {
-                expected_recipient,
-                expected_machine,
-                protocol_version,
-                reply: tx,
-            },
-        );
-        rx
+            protocol_version,
+            expected_recipient,
+            expected_machine,
+        )
+        .0
+    }
+
+    /// Register one independently cancellable subscriber for a logical send.
+    /// Concurrent retries with identical authenticated ACK expectations share
+    /// the registry entry and all receive the same eventual outcome.
+    pub(crate) fn register_owned_for_protocol(
+        &self,
+        request_id: [u8; 16],
+        protocol_version: u16,
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
+    ) -> (tokio::sync::oneshot::Receiver<DmAckOutcome>, u64) {
+        use dashmap::mapref::entry::Entry;
+
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let waiter_id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+        match self.inner.entry(request_id) {
+            Entry::Vacant(entry) => {
+                let mut replies = HashMap::new();
+                replies.insert(waiter_id, tx);
+                entry.insert(InFlightAck {
+                    expected_recipient,
+                    expected_machine,
+                    protocol_version,
+                    replies,
+                });
+            }
+            Entry::Occupied(mut entry) => {
+                let pending = entry.get_mut();
+                if pending.protocol_version == protocol_version
+                    && pending.expected_recipient == expected_recipient
+                    && pending.expected_machine == expected_machine
+                {
+                    pending.replies.insert(waiter_id, tx);
+                } else {
+                    // A request id cannot safely represent two different ACK
+                    // bindings. Dropping this sender closes only the conflicting
+                    // registration and preserves the original logical send.
+                    drop(tx);
+                }
+            }
+        }
+        (rx, waiter_id)
+    }
+
+    /// Cancel only the caller-owned subscription. Other overlapping retries
+    /// for the same logical request remain registered.
+    pub(crate) fn cancel_waiter(&self, request_id: &[u8; 16], waiter_id: u64) {
+        use dashmap::mapref::entry::Entry;
+
+        if let Entry::Occupied(mut entry) = self.inner.entry(*request_id) {
+            entry.get_mut().replies.remove(&waiter_id);
+            if entry.get().replies.is_empty() {
+                entry.remove();
+            }
+        }
+    }
+
+    fn ack_binding_matches(
+        pending: &InFlightAck,
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+    ) -> bool {
+        pending.protocol_version == protocol_version
+            && pending.expected_recipient == ack_sender
+            && pending
+                .expected_machine
+                .is_none_or(|expected| expected == ack_machine)
+    }
+
+    #[cfg(test)]
+    fn waiter_count_for(&self, request_id: &[u8; 16]) -> usize {
+        self.inner
+            .get(request_id)
+            .map_or(0, |pending| pending.replies.len())
     }
 
     /// Resolve a waiter for `request_id`. Returns true if a waiter was
@@ -1699,23 +1786,25 @@ impl InFlightAcks {
         ack_machine: MachineId,
         outcome: DmAckOutcome,
     ) -> bool {
-        let matches = self.inner.get(request_id).is_some_and(|pending| {
-            pending.protocol_version == protocol_version
-                && pending.expected_recipient == ack_sender
-                && pending
-                    .expected_machine
-                    .is_none_or(|expected| expected == ack_machine)
-        });
-        if !matches {
-            return false;
-        }
-        if let Some((_, pending)) = self.inner.remove(request_id) {
-            // If the receiver was dropped we silently swallow the send
-            // error — caller already moved on.
-            let _ = pending.reply.send(outcome);
-            true
-        } else {
-            false
+        use dashmap::mapref::entry::Entry;
+
+        match self.inner.entry(*request_id) {
+            Entry::Occupied(entry)
+                if Self::ack_binding_matches(
+                    entry.get(),
+                    protocol_version,
+                    ack_sender,
+                    ack_machine,
+                ) =>
+            {
+                let pending = entry.remove();
+                for reply in pending.replies.into_values() {
+                    // A caller may independently time out or be cancelled.
+                    let _ = reply.send(outcome.clone());
+                }
+                true
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => false,
         }
     }
 
@@ -1726,7 +1815,7 @@ impl InFlightAcks {
 
     /// Diagnostic count of outstanding waiters.
     pub fn outstanding(&self) -> usize {
-        self.inner.len()
+        self.inner.iter().map(|pending| pending.replies.len()).sum()
     }
 }
 
@@ -1865,7 +1954,7 @@ mod tests {
         let key = DedupeKey::new(dummy_agent_id(7), [0x77; 16]);
         cache.poison_for_testing();
         assert_eq!(
-            cache.complete_durable(key, DmAckOutcome::Accepted),
+            cache.complete_durable(key, DmAckOutcome::Accepted, DM_PROTOCOL_DURABLE_ACK,),
             Err(DurableCacheError::Poisoned)
         );
         assert!(cache.lookup(&key).is_none());
@@ -2261,6 +2350,65 @@ mod tests {
             DmAckOutcome::Accepted
         );
         assert_eq!(acks.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn concurrent_logical_waiters_share_one_authenticated_ack() {
+        let acks = InFlightAcks::new();
+        let request_id = [0x45; 16];
+        let recipient = AgentId([0x46; 32]);
+        let machine = MachineId([0x47; 32]);
+        let first =
+            acks.register_for_protocol(request_id, DM_PROTOCOL_THREADED, recipient, Some(machine));
+        let second =
+            acks.register_for_protocol(request_id, DM_PROTOCOL_THREADED, recipient, Some(machine));
+
+        assert_eq!(acks.waiter_count_for(&request_id), 2);
+        assert!(acks.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(first.await.expect("first ACK"), DmAckOutcome::Accepted);
+        assert_eq!(second.await.expect("second ACK"), DmAckOutcome::Accepted);
+        assert_eq!(acks.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancelling_one_logical_waiter_preserves_the_other() {
+        let acks = InFlightAcks::new();
+        let request_id = [0x48; 16];
+        let recipient = AgentId([0x49; 32]);
+        let machine = MachineId([0x4a; 32]);
+        let (cancelled, cancelled_id) = acks.register_owned_for_protocol(
+            request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            Some(machine),
+        );
+        let (remaining, _) = acks.register_owned_for_protocol(
+            request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            Some(machine),
+        );
+
+        acks.cancel_waiter(&request_id, cancelled_id);
+        assert!(cancelled.await.is_err());
+        assert_eq!(acks.waiter_count_for(&request_id), 1);
+        assert!(acks.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(
+            remaining.await.expect("remaining ACK"),
+            DmAckOutcome::Accepted
+        );
     }
 
     // ── Issue #213: origin-machine attestation ────────────────────────

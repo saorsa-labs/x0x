@@ -154,6 +154,7 @@ fn direct_send_error_status(error: &x0x::dm::DmError) -> (StatusCode, &'static s
         x0x::dm::DmError::HistoryCommitFailed(_) => {
             (StatusCode::SERVICE_UNAVAILABLE, "history_commit_failed")
         }
+        x0x::dm::DmError::IdempotencyConflict => (StatusCode::CONFLICT, "idempotency_conflict"),
         x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
         x0x::dm::DmError::PeerLikelyOffline { .. } => {
             (StatusCode::BAD_GATEWAY, "peer_likely_offline")

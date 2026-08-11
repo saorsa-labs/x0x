@@ -230,11 +230,10 @@ impl HistoryRecord {
     /// each logical send distinct while retries of the *same* logical send
     /// (which reuse the nonce) still dedupe.
     #[must_use]
-    pub fn compute_local_send_msg_id(nonce: &[u8; 16], payload: &[u8]) -> [u8; 32] {
+    pub fn compute_local_send_msg_id(nonce: &[u8; 16]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"x0x-history-local-send-v1");
         hasher.update(nonce);
-        hasher.update(payload);
         *hasher.finalize().as_bytes()
     }
 

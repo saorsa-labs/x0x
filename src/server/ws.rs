@@ -102,6 +102,8 @@ enum WsOutbound {
         verified: bool,
         trust_decision: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        msg_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
         thread_root: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         thread_parent: Option<String>,
@@ -125,6 +127,20 @@ enum WsOutbound {
     Live { topic: String },
     #[serde(rename = "error")]
     Error { message: String },
+}
+
+type DmBackfillIdentity = (String, [u8; 32]);
+
+fn history_dm_identity(record: &crate::history::HistoryRecord) -> Option<DmBackfillIdentity> {
+    match &record.scope {
+        crate::history::Scope::Dm(peer) => Some((peer.clone(), record.msg_id)),
+        crate::history::Scope::Group(_) | crate::history::Scope::Topic(_) => None,
+    }
+}
+
+fn live_dm_identity(msg: &crate::direct::DirectMessage) -> Option<DmBackfillIdentity> {
+    msg.message_id
+        .map(|message_id| (hex::encode(msg.sender.as_bytes()), message_id))
 }
 
 fn validated_public_message_frame(message: super::state::ValidatedPublicMessage) -> WsOutbound {
@@ -472,7 +488,8 @@ async fn handle_ws_connection(
         // Live tap FIRST (ADR-0023 seam rule), then the optional stored
         // backfill, then the `live` marker, then the live forwarder.
         let mut direct_rx = state.agent.subscribe_direct();
-        let mut dm_backfill_hashes: Option<std::collections::HashSet<[u8; 32]>> = None;
+        let mut dm_backfill_identities: Option<std::collections::HashSet<DmBackfillIdentity>> =
+            None;
         if let Some(limit) = direct_backfill {
             if let Some(history) = state.agent.history() {
                 let store = Arc::clone(history.store());
@@ -484,10 +501,12 @@ async fn handle_ws_connection(
                 match tokio::task::spawn_blocking(move || store.query(&q)).await {
                     Ok(Ok(mut rows)) => {
                         rows.reverse(); // newest-first → oldest-first replay
-                        let mut hashes = std::collections::HashSet::new();
+                        let mut identities = std::collections::HashSet::new();
                         for row in &rows {
                             let r = &row.record;
-                            hashes.insert(*blake3::hash(&r.payload).as_bytes());
+                            if let Some(identity) = history_dm_identity(r) {
+                                identities.insert(identity);
+                            }
                             let out = WsOutbound::DirectMessage {
                                 sender: r.author_agent.clone().unwrap_or_default(),
                                 machine_id: r.author_machine.clone().unwrap_or_default(),
@@ -498,6 +517,7 @@ async fn handle_ws_connection(
                                     crate::history::Provenance::VerifiedEnvelope
                                 ),
                                 trust_decision: None,
+                                msg_id: Some(hex::encode(r.msg_id)),
                                 observed_origin: None,
                                 thread_root: r.thread_root.clone(),
                                 thread_parent: r.thread_parent.clone(),
@@ -508,7 +528,7 @@ async fn handle_ws_connection(
                                 break;
                             }
                         }
-                        dm_backfill_hashes = Some(hashes);
+                        dm_backfill_identities = Some(identities);
                     }
                     Ok(Err(e)) => {
                         tracing::warn!(session_id = %session_id, "direct WS backfill query failed: {e}");
@@ -533,17 +553,15 @@ async fn handle_ws_connection(
         let dm_slow_close = slow_close.clone();
         let dm_counted = Arc::clone(&slow_close_counted);
         Some(tokio::spawn(async move {
-            let mut dedupe = dm_backfill_hashes;
+            let mut dedupe = dm_backfill_identities;
             while let Some(msg) = direct_rx.recv().await {
                 if let Some(set) = dedupe.as_mut() {
-                    let h = *blake3::hash(&msg.payload).as_bytes();
-                    if set.remove(&h) {
+                    if live_dm_identity(&msg).is_some_and(|identity| set.remove(&identity)) {
                         if set.is_empty() {
                             dedupe = None;
                         }
                         continue;
                     }
-                    dedupe = None;
                 }
                 let out = WsOutbound::DirectMessage {
                     sender: hex::encode(msg.sender.as_bytes()),
@@ -552,6 +570,7 @@ async fn handle_ws_connection(
                     received_at: msg.received_at,
                     verified: msg.verified,
                     trust_decision: msg.trust_decision.map(|d| d.to_string()),
+                    msg_id: msg.message_id.map(hex::encode),
                     observed_origin: msg.observed_origin,
                     thread_root: msg.thread_root,
                     thread_parent: msg.thread_parent,
@@ -1151,6 +1170,7 @@ mod tests {
             received_at: 1_774_860_000,
             verified: true,
             trust_decision: None,
+            msg_id: None,
             observed_origin,
             thread_root: None,
             thread_parent: None,
@@ -1197,6 +1217,31 @@ mod tests {
         );
         assert_eq!(v["type"], "direct_message");
         assert_eq!(v["payload"], "aGVsbG8=");
+    }
+
+    #[test]
+    fn ws_dm_backfill_seam_keeps_identical_payloads_with_distinct_ids() {
+        let mut first = crate::direct::DirectMessage::new(
+            crate::identity::AgentId([0x31; 32]),
+            crate::identity::MachineId([0x32; 32]),
+            b"same text".to_vec(),
+        );
+        first.message_id = Some([0x33; 32]);
+        let mut second = first.clone();
+        second.message_id = Some([0x34; 32]);
+        second.thread_root = Some("cd".repeat(32));
+
+        let first_identity = live_dm_identity(&first).expect("first identity");
+        let second_identity = live_dm_identity(&second).expect("second identity");
+        assert_ne!(first_identity, second_identity);
+        let mut seam =
+            std::collections::HashSet::from([first_identity.clone(), second_identity.clone()]);
+        assert!(seam.remove(&first_identity));
+        assert!(
+            !seam.remove(&first_identity),
+            "exact replay is removed once"
+        );
+        assert!(seam.remove(&second_identity));
     }
 
     #[tokio::test]

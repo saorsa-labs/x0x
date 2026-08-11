@@ -248,6 +248,21 @@ impl Store {
         collect_rows(&guard, &sql, params)
     }
 
+    /// Fetch one exact canonical message identity.
+    pub fn get_by_msg_id(&self, msg_id: &[u8; 32]) -> HistoryResult<Option<StoredRecord>> {
+        let sql = "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
+                   author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
+                   signed_artifact, signature, sig_context, provenance, replace_key, \
+                   thread_root, thread_parent FROM history WHERE msg_id = ?1 LIMIT 1";
+        let guard = lock_conn(&self.conn)?;
+        let mut rows = collect_rows(
+            &guard,
+            sql,
+            vec![rusqlite::types::Value::Blob(msg_id.to_vec())],
+        )?;
+        Ok(rows.pop())
+    }
+
     /// Full-text search over searchable payload text. Tokens are quoted so
     /// user input is literal terms, never FTS operators (donor
     /// `fts_match_expr`).

@@ -4896,7 +4896,7 @@ impl Agent {
         };
         let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
         history_handle.record(history::HistoryRecord {
-            msg_id: history::HistoryRecord::compute_local_send_msg_id(&request_id, payload),
+            msg_id: history::HistoryRecord::compute_local_send_msg_id(&request_id),
             scope: history::Scope::Dm(hex::encode(to.as_bytes())),
             author_agent: Some(hex::encode(self.identity.agent_id().as_bytes())),
             author_machine: Some(hex::encode(self.identity.machine_id().as_bytes())),
@@ -4949,29 +4949,51 @@ impl Agent {
 
             let request_id =
                 dm_send::request_id_for_logical(self.identity.agent_id(), *to, logical_id.as_ref());
-            if config.require_durable_app_ack {
-                let history::classify::DmPayloadClass::Durable(content_type) =
-                    history::classify::classify_dm_payload(&payload)
-                else {
-                    return Err(dm::DmError::AckSemanticsUnavailable(
-                        "strict application ACK is only available for durable DM payloads"
-                            .to_string(),
-                    ));
+            let payload_class = history::classify::classify_dm_payload(&payload);
+            let durable_loopback =
+                matches!(payload_class, history::classify::DmPayloadClass::Durable(_));
+            let needs_persistent_identity = config.require_durable_app_ack || logical_id.is_some();
+            if needs_persistent_identity && !durable_loopback {
+                return Err(dm::DmError::AckSemanticsUnavailable(
+                    "logical or strict loopback delivery requires a durable DM payload".to_string(),
+                ));
+            }
+            if logical_id.is_some() && self.history_handle.is_none() {
+                return Err(dm::DmError::AckSemanticsUnavailable(
+                    "logical loopback idempotency requires local durable history".to_string(),
+                ));
+            }
+
+            let mut message_id = None;
+            let mut deliver_live = true;
+            if durable_loopback && self.history_handle.is_some() {
+                let content_type = match payload_class {
+                    history::classify::DmPayloadClass::Durable(content_type) => content_type,
+                    history::classify::DmPayloadClass::Ephemeral => {
+                        return Err(dm::DmError::AckSemanticsUnavailable(
+                            "loopback history requires a durable DM payload".to_string(),
+                        ));
+                    }
                 };
                 let history = self.history_handle.as_ref().ok_or_else(|| {
                     dm::DmError::AckSemanticsUnavailable(
                         "local durable history is disabled".to_string(),
                     )
                 })?;
+                let canonical_msg_id =
+                    history::HistoryRecord::compute_local_send_msg_id(&request_id);
+                let scope = history::Scope::Dm(hex::encode(to.as_bytes()));
+                let author_agent = hex::encode(self.identity.agent_id().as_bytes());
+                let thread_root = thread_meta.as_ref().map(dm::DmThreadMeta::thread_root_hex);
+                let thread_parent = thread_meta
+                    .as_ref()
+                    .and_then(dm::DmThreadMeta::thread_parent_hex);
                 let now = i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX);
                 let outcome = history
                     .record_committed(history::HistoryRecord {
-                        msg_id: history::HistoryRecord::compute_local_send_msg_id(
-                            &request_id,
-                            &payload,
-                        ),
-                        scope: history::Scope::Dm(hex::encode(to.as_bytes())),
-                        author_agent: Some(hex::encode(self.identity.agent_id().as_bytes())),
+                        msg_id: canonical_msg_id,
+                        scope: scope.clone(),
+                        author_agent: Some(author_agent.clone()),
                         author_machine: Some(hex::encode(self.identity.machine_id().as_bytes())),
                         author_pubkey: None,
                         sent_at_ms: now,
@@ -4984,32 +5006,78 @@ impl Agent {
                         sig_context: None,
                         provenance: history::Provenance::LocalSend,
                         replace_key: None,
-                        thread_root: thread_meta.as_ref().map(dm::DmThreadMeta::thread_root_hex),
-                        thread_parent: thread_meta
-                            .as_ref()
-                            .and_then(dm::DmThreadMeta::thread_parent_hex),
+                        thread_root: thread_root.clone(),
+                        thread_parent: thread_parent.clone(),
                     })
                     .await
                     .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?;
-                if !matches!(
-                    outcome,
-                    history::InsertOutcome::Inserted | history::InsertOutcome::Duplicate
-                ) {
-                    return Err(dm::DmError::HistoryCommitFailed(format!(
-                        "history write did not establish the exact loopback row: {outcome:?}"
-                    )));
+                match outcome {
+                    history::InsertOutcome::Inserted => {}
+                    history::InsertOutcome::Duplicate => {
+                        let store = std::sync::Arc::clone(history.store());
+                        let existing = tokio::task::spawn_blocking(move || {
+                            store.get_by_msg_id(&canonical_msg_id)
+                        })
+                        .await
+                        .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?
+                        .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?
+                        .ok_or_else(|| {
+                            dm::DmError::HistoryCommitFailed(
+                                "duplicate loopback identity disappeared from history".to_string(),
+                            )
+                        })?;
+                        let exact_retry = existing.record.scope == scope
+                            && existing.record.author_agent.as_deref() == Some(&author_agent)
+                            && existing.record.content_type == content_type
+                            && existing.record.payload == payload
+                            && existing.record.thread_root == thread_root
+                            && existing.record.thread_parent == thread_parent;
+                        if !exact_retry {
+                            return Err(dm::DmError::IdempotencyConflict);
+                        }
+                        deliver_live = false;
+                    }
+                    history::InsertOutcome::Replaced | history::InsertOutcome::StaleRejected => {
+                        return Err(dm::DmError::HistoryCommitFailed(format!(
+                            "history write did not establish the exact loopback row: {outcome:?}"
+                        )));
+                    }
                 }
+                message_id = Some(canonical_msg_id);
+            } else if config.require_durable_app_ack {
+                if !durable_loopback {
+                    return Err(dm::DmError::AckSemanticsUnavailable(
+                        "strict application ACK is only available for durable DM payloads"
+                            .to_string(),
+                    ));
+                }
+                return Err(dm::DmError::AckSemanticsUnavailable(
+                    "local durable history is disabled".to_string(),
+                ));
+            } else if logical_id.is_some() {
+                return Err(dm::DmError::AckSemanticsUnavailable(
+                    if !durable_loopback {
+                        "logical loopback idempotency requires a durable DM payload"
+                    } else {
+                        "logical loopback idempotency requires local durable history"
+                    }
+                    .to_string(),
+                ));
             }
 
-            let delivered = self
-                .direct_messaging
-                .handle_loopback_with_thread(
-                    self.identity.machine_id(),
-                    self.identity.agent_id(),
-                    payload,
-                    thread_meta.clone(),
-                )
-                .await;
+            let delivered = if deliver_live {
+                self.direct_messaging
+                    .handle_loopback_with_thread(
+                        self.identity.machine_id(),
+                        self.identity.agent_id(),
+                        payload,
+                        thread_meta.clone(),
+                        message_id,
+                    )
+                    .await
+            } else {
+                0
+            };
             let receipt = dm_send::loopback_receipt_with_request_id(request_id);
             tracing::debug!(
                 target: "dm.trace",
@@ -14247,6 +14315,145 @@ mod tests {
         assert_eq!(diagnostics.stats.outgoing_path_loopback, 1);
         assert_eq!(diagnostics.stats.incoming_envelopes_total, 1);
         assert_eq!(diagnostics.stats.incoming_delivered_to_subscribe, 1);
+    }
+
+    #[tokio::test]
+    async fn logical_loopback_is_idempotent_and_conflict_safe_across_restart() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let machine_key = dir.path().join("machine.key");
+        let agent_key = dir.path().join("agent.key");
+        let contacts = dir.path().join("contacts.json");
+        let history_db = dir.path().join("history.db");
+        let history_config = history::HistoryConfig {
+            enabled: true,
+            db_path: Some(history_db),
+            ..history::HistoryConfig::default()
+        };
+        let logical_id = dm::DmLogicalId::parse("loopback-restart-key").expect("logical id");
+        let thread_a = dm::DmThreadMeta::from_hex(Some(&"a1".repeat(32)), None)
+            .expect("thread metadata")
+            .expect("thread root");
+        let thread_b = dm::DmThreadMeta::from_hex(Some(&"b2".repeat(32)), None)
+            .expect("thread metadata")
+            .expect("thread root");
+        let strict = dm::DmSendConfig {
+            require_durable_app_ack: true,
+            ..dm::DmSendConfig::default()
+        };
+
+        let agent = Agent::builder()
+            .with_machine_key(&machine_key)
+            .with_agent_key_path(&agent_key)
+            .with_contact_store_path(&contacts)
+            .with_history(history_config.clone())
+            .build()
+            .await
+            .expect("first agent");
+        let self_id = agent.agent_id();
+        let mut rx = agent.subscribe_direct();
+        let payload = b"one durable logical loopback".to_vec();
+
+        let first = agent
+            .send_direct_with_config_and_thread(
+                &self_id,
+                payload.clone(),
+                strict.clone(),
+                Some(thread_a.clone()),
+                Some(logical_id.clone()),
+            )
+            .await
+            .expect("first logical send");
+        let live = rx.recv().await.expect("first live delivery");
+        assert_eq!(
+            live.message_id,
+            Some(history::HistoryRecord::compute_local_send_msg_id(
+                &first.request_id,
+            ))
+        );
+
+        let retry = agent
+            .send_direct_with_config_and_thread(
+                &self_id,
+                payload.clone(),
+                strict.clone(),
+                Some(thread_a.clone()),
+                Some(logical_id.clone()),
+            )
+            .await
+            .expect("exact retry");
+        assert_eq!(retry.request_id, first.request_id);
+        assert!(
+            rx.try_recv().is_none(),
+            "exact retry must not re-deliver live"
+        );
+
+        let payload_conflict = agent
+            .send_direct_with_config_and_thread(
+                &self_id,
+                b"different payload".to_vec(),
+                strict.clone(),
+                Some(thread_a.clone()),
+                Some(logical_id.clone()),
+            )
+            .await
+            .expect_err("same logical id with another payload must conflict");
+        assert!(matches!(payload_conflict, dm::DmError::IdempotencyConflict));
+        let metadata_conflict = agent
+            .send_direct_with_config_and_thread(
+                &self_id,
+                payload.clone(),
+                strict.clone(),
+                Some(thread_b),
+                Some(logical_id.clone()),
+            )
+            .await
+            .expect_err("same logical id with other metadata must conflict");
+        assert!(matches!(
+            metadata_conflict,
+            dm::DmError::IdempotencyConflict
+        ));
+
+        drop(rx);
+        agent.shutdown().await;
+        drop(agent);
+
+        let restarted = Agent::builder()
+            .with_machine_key(machine_key)
+            .with_agent_key_path(agent_key)
+            .with_contact_store_path(contacts)
+            .with_history(history_config)
+            .build()
+            .await
+            .expect("restarted agent");
+        let mut restarted_rx = restarted.subscribe_direct();
+        let after_restart = restarted
+            .send_direct_with_config_and_thread(
+                &restarted.agent_id(),
+                payload,
+                strict,
+                Some(thread_a),
+                Some(logical_id),
+            )
+            .await
+            .expect("exact retry after restart");
+        assert_eq!(after_restart.request_id, first.request_id);
+        assert!(
+            restarted_rx.try_recv().is_none(),
+            "restart retry must not create a second live delivery"
+        );
+        let rows = restarted
+            .history()
+            .expect("history")
+            .store()
+            .query(&history::HistoryQuery {
+                scope: Some(history::Scope::Dm(hex::encode(
+                    restarted.agent_id().as_bytes(),
+                ))),
+                ..history::HistoryQuery::default()
+            })
+            .expect("history query");
+        assert_eq!(rows.len(), 1, "one logical id must retain one row");
+        restarted.shutdown().await;
     }
 
     fn loopback_network_config() -> network::NetworkConfig {
