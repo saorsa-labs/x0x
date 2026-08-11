@@ -23,8 +23,14 @@ const FIRST_PUBLISH_DELAY_MS: u64 = 250;
 /// A verified requester can make the fleet republish public data, but it must
 /// not be able to amplify traffic without bound. Long-running responders
 /// therefore publish at most once per window in response to requests. A peer
-/// that has not published recently still responds immediately.
+/// that has not answered a fleet request recently still responds immediately.
 const MIN_REQUEST_RESPONSE_INTERVAL_SECS: u64 = 30;
+
+/// A targeted refresh is emitted only by a strict send whose recipient cache
+/// entry is missing. Unlike the fleet-wide startup hint, exactly one daemon
+/// responds, so a short global coalescing window is sufficient to prevent a
+/// burst of concurrent sends from producing unbounded advert traffic.
+const MIN_TARGETED_RESPONSE_INTERVAL_SECS: u64 = 1;
 
 /// Startup-burst schedule so late-joining peers catch our advert quickly.
 const STARTUP_BURST_INTERVALS_MS: &[u64] = &[5_000, 10_000, 20_000, 45_000];
@@ -32,6 +38,63 @@ const STARTUP_BURST_INTERVALS_MS: &[u64] = &[5_000, 10_000, 20_000, 45_000];
 #[derive(Debug, Serialize, Deserialize)]
 struct CapabilityAdvertRequest {
     protocol_version: u16,
+    /// `None` is the fleet-wide startup convergence hint. A strict send uses
+    /// `Some(agent_id)` so every non-target daemon can discard the request
+    /// without producing a response.
+    requested_agent_id: Option<[u8; 32]>,
+    /// Makes every request attempt distinct independently of the outer
+    /// signature implementation and gives operators a stable trace token.
+    request_id: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ReannounceRequest {
+    Fleet,
+    Targeted,
+}
+
+#[derive(Debug, Default)]
+struct PendingResponses {
+    fleet: bool,
+    targeted: bool,
+}
+
+impl PendingResponses {
+    fn record(&mut self, request: ReannounceRequest) {
+        match request {
+            ReannounceRequest::Fleet => self.fleet = true,
+            ReannounceRequest::Targeted => self.targeted = true,
+        }
+    }
+
+    fn clear(&mut self) {
+        self.fleet = false;
+        self.targeted = false;
+    }
+}
+
+/// Publish an authenticated request for fresh capability state.
+///
+/// `requested_agent_id = None` is reserved for the bounded startup burst.
+/// Strict sends pass their exact recipient so only that daemon responds.
+pub(crate) async fn publish_capability_advert_request(
+    pubsub: &PubSubManager,
+    requested_agent_id: Option<AgentId>,
+) -> NetworkResult<()> {
+    let request = CapabilityAdvertRequest {
+        protocol_version: ADVERT_PROTOCOL_VERSION,
+        requested_agent_id: requested_agent_id.map(|agent_id| *agent_id.as_bytes()),
+        request_id: crate::dm_send::fresh_request_id(),
+    };
+    let request_bytes = postcard::to_stdvec(&request).map_err(|error| {
+        NetworkError::SerializationError(format!("capability advert request encode: {error}"))
+    })?;
+    pubsub
+        .publish(
+            DM_CAPABILITY_REQUEST_TOPIC.to_string(),
+            Bytes::from(request_bytes),
+        )
+        .await
 }
 
 pub struct CapabilityAdvertService {
@@ -86,7 +149,8 @@ impl CapabilityAdvertService {
             .await;
         let store_sub = Arc::clone(&store);
         let self_agent_for_sub = self_agent_id;
-        let (reannounce_tx, mut reannounce_rx) = tokio::sync::mpsc::channel::<()>(1);
+        let (reannounce_tx, mut reannounce_rx) =
+            tokio::sync::mpsc::channel::<ReannounceRequest>(16);
 
         let subscriber = tokio::spawn(async move {
             while let Some(message) = subscription.recv().await {
@@ -141,9 +205,15 @@ impl CapabilityAdvertService {
                 if request.protocol_version != ADVERT_PROTOCOL_VERSION {
                     continue;
                 }
-                // Capacity one deliberately coalesces concurrent requests.
-                // The publisher applies an additional global rate limit.
-                let _ = reannounce_tx.try_send(());
+                let request_kind = match request.requested_agent_id {
+                    Some(requested) if requested != *self_agent_id.as_bytes() => continue,
+                    Some(_) => ReannounceRequest::Targeted,
+                    None => ReannounceRequest::Fleet,
+                };
+                // The bounded channel absorbs a mixed fleet/targeted burst;
+                // the publisher coalesces every queued request into one
+                // signed advert and applies the per-kind rate limits.
+                let _ = reannounce_tx.try_send(request_kind);
             }
             tracing::debug!("capability advert request responder exited");
         });
@@ -156,17 +226,6 @@ impl CapabilityAdvertService {
             }
 
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
-            let request = CapabilityAdvertRequest {
-                protocol_version: ADVERT_PROTOCOL_VERSION,
-            };
-            let request_bytes = match postcard::to_stdvec(&request) {
-                Ok(bytes) => bytes,
-                Err(error) => {
-                    tracing::warn!("capability advert request encode failed: {error}");
-                    return;
-                }
-            };
-
             // Repeat across the same mesh-formation envelope as the advert
             // startup burst. A request missed before peer discovery is retried
             // without changing the five-minute steady-state advert cadence.
@@ -176,12 +235,7 @@ impl CapabilityAdvertService {
                 .map(Some)
                 .chain(std::iter::once(None))
             {
-                if let Err(error) = requester_pubsub
-                    .publish(
-                        DM_CAPABILITY_REQUEST_TOPIC.to_string(),
-                        Bytes::copy_from_slice(&request_bytes),
-                    )
-                    .await
+                if let Err(error) = publish_capability_advert_request(&requester_pubsub, None).await
                 {
                     tracing::warn!("capability advert request publish failed: {error}");
                 }
@@ -198,9 +252,14 @@ impl CapabilityAdvertService {
         let publisher = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
             let mut burst_idx: usize = 0;
-            let mut last_publish_at: Option<tokio::time::Instant> = None;
+            let mut last_fleet_response_at: Option<tokio::time::Instant> = None;
+            let mut last_targeted_response_at: Option<tokio::time::Instant> = None;
+            let mut pending_responses = PendingResponses::default();
             let mut requests_open = true;
             loop {
+                while let Ok(request) = reannounce_rx.try_recv() {
+                    pending_responses.record(request);
+                }
                 let caps_snapshot = publisher_caps_rx.borrow().clone();
                 // Never broadcast a not-yet-usable (pending) advert: absence
                 // already tells senders to use the raw fallback, while a
@@ -242,10 +301,14 @@ impl CapabilityAdvertService {
                         {
                             tracing::warn!("capability advert publish failed: {e}");
                         } else {
-                            last_publish_at = Some(tokio::time::Instant::now());
-                            // This advert also satisfies requests that queued
-                            // while signing/publishing it.
-                            while reannounce_rx.try_recv().is_ok() {}
+                            let published_at = tokio::time::Instant::now();
+                            if pending_responses.fleet {
+                                last_fleet_response_at = Some(published_at);
+                            }
+                            if pending_responses.targeted {
+                                last_targeted_response_at = Some(published_at);
+                            }
+                            pending_responses.clear();
                             tracing::debug!("capability advert published");
                         }
                     }
@@ -258,26 +321,49 @@ impl CapabilityAdvertService {
                 } else {
                     publish_interval
                 };
-                tokio::select! {
-                    _ = tokio::time::sleep(next_delay) => {}
-                    res = publisher_caps_rx.changed() => {
-                        if res.is_ok() {
-                            tracing::debug!("capability advert upgraded; republishing");
-                            burst_idx = 0;
-                        }
-                    }
-                    request = reannounce_rx.recv(), if requests_open => {
-                        if request.is_none() {
-                            requests_open = false;
-                        } else {
-                            if let Some(last_publish) = last_publish_at {
-                                let earliest = last_publish + request_response_min_interval;
-                                tokio::time::sleep_until(earliest).await;
+                let publish_delay = tokio::time::sleep(next_delay);
+                tokio::pin!(publish_delay);
+                loop {
+                    tokio::select! {
+                        _ = &mut publish_delay => break,
+                        res = publisher_caps_rx.changed() => {
+                            if res.is_ok() {
+                                tracing::debug!("capability advert upgraded; republishing");
+                                burst_idx = 0;
                             }
-                            // One response satisfies all requests observed in
-                            // the rate-limit window.
-                            while reannounce_rx.try_recv().is_ok() {}
-                            tracing::debug!("verified capability request received; republishing");
+                            break;
+                        }
+                        request = reannounce_rx.recv(), if requests_open => {
+                            match request {
+                                None => requests_open = false,
+                                Some(kind) => {
+                                    pending_responses.record(kind);
+                                    let (last_response, min_interval) = match kind {
+                                        ReannounceRequest::Fleet => (
+                                            last_fleet_response_at,
+                                            request_response_min_interval,
+                                        ),
+                                        ReannounceRequest::Targeted => (
+                                            last_targeted_response_at,
+                                            Duration::from_secs(MIN_TARGETED_RESPONSE_INTERVAL_SECS),
+                                        ),
+                                    };
+                                    let now = tokio::time::Instant::now();
+                                    let earliest = last_response
+                                        .map_or(now, |last| last + min_interval);
+                                    if earliest <= now {
+                                        tracing::debug!(?kind, "verified capability request received; republishing");
+                                        break;
+                                    }
+                                    if earliest < publish_delay.deadline() {
+                                        publish_delay.as_mut().reset(earliest);
+                                    }
+                                    tracing::debug!(
+                                        ?kind,
+                                        "verified capability request coalesced until next eligible publish"
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -734,6 +820,8 @@ mod tests {
 
         let request = CapabilityAdvertRequest {
             protocol_version: ADVERT_PROTOCOL_VERSION,
+            requested_agent_id: None,
+            request_id: [0xA1; 16],
         };
         let request_bytes = postcard::to_stdvec(&request).expect("encode request");
         pubsub
@@ -762,6 +850,117 @@ mod tests {
             verify_advert_signature(&reannounced, &signing.public_key_bytes),
             "requested advert must retain the exact signed AgentId + MachineId binding"
         );
+
+        service.abort();
+    }
+
+    /// A rate-limited fleet request must not park the publisher and suppress
+    /// an already-scheduled startup advert. The live installed-binary failure
+    /// showed this matters: each daemon also receives its own startup request,
+    /// so sleeping inside the request branch can serialize the complete burst
+    /// behind the 30-second response window.
+    #[tokio::test]
+    async fn rate_limited_request_does_not_block_scheduled_startup_publish() {
+        const SHORT_BURST: &[u64] = &[100, 100];
+
+        let kp = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
+        let mut subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v1_gossip_ready(vec![0x5C; 1184]));
+        let service = CapabilityAdvertService::spawn_with_timing(
+            Arc::clone(&pubsub),
+            signing,
+            kp.agent_id(),
+            MachineId([0x5D; 32]),
+            caps_rx,
+            Arc::new(CapabilityStore::new()),
+            Duration::from_secs(3_600),
+            Duration::from_secs(2),
+            SHORT_BURST,
+            false,
+        )
+        .await
+        .expect("spawn service");
+
+        tokio::time::timeout(Duration::from_secs(3), subscriber.recv())
+            .await
+            .expect("initial advert timeout")
+            .expect("subscriber closed");
+
+        publish_capability_advert_request(&pubsub, None)
+            .await
+            .expect("first fleet request");
+        tokio::time::timeout(Duration::from_millis(500), subscriber.recv())
+            .await
+            .expect("first request response timeout")
+            .expect("subscriber closed");
+
+        publish_capability_advert_request(&pubsub, None)
+            .await
+            .expect("second fleet request");
+        tokio::time::timeout(Duration::from_millis(500), subscriber.recv())
+            .await
+            .expect("scheduled startup advert was blocked by response rate limit")
+            .expect("subscriber closed");
+
+        service.abort();
+    }
+
+    /// On-demand strict-send refreshes are addressed. Non-target daemons must
+    /// stay silent; the exact target may respond immediately without making
+    /// every mesh member amplify one UI send.
+    #[tokio::test]
+    async fn targeted_request_only_reannounces_from_exact_agent() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&kp));
+        let self_agent = kp.agent_id();
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
+        let mut subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v1_gossip_ready(vec![0x6A; 1184]));
+        let service = CapabilityAdvertService::spawn_with_timing(
+            Arc::clone(&pubsub),
+            signing,
+            self_agent,
+            MachineId([0x6B; 32]),
+            caps_rx,
+            Arc::new(CapabilityStore::new()),
+            Duration::from_secs(3_600),
+            Duration::from_millis(25),
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn service");
+
+        tokio::time::timeout(Duration::from_secs(3), subscriber.recv())
+            .await
+            .expect("initial advert timeout")
+            .expect("subscriber closed");
+
+        publish_capability_advert_request(&pubsub, Some(AgentId([0xEE; 32])))
+            .await
+            .expect("foreign targeted request");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), subscriber.recv())
+                .await
+                .is_err(),
+            "a non-target daemon must not reannounce"
+        );
+
+        publish_capability_advert_request(&pubsub, Some(self_agent))
+            .await
+            .expect("self targeted request");
+        tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+            .await
+            .expect("exact target did not reannounce")
+            .expect("subscriber closed");
 
         service.abort();
     }
@@ -802,6 +1001,8 @@ mod tests {
 
         let request = CapabilityAdvertRequest {
             protocol_version: ADVERT_PROTOCOL_VERSION,
+            requested_agent_id: None,
+            request_id: [0xB2; 16],
         };
         pubsub
             .publish(

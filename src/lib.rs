@@ -318,6 +318,11 @@ pub struct Agent {
     /// Handle for the running capability advert service.
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
+    /// Last strict-send capability solicitation per recipient. Concurrent UI
+    /// actions targeting one agent coalesce, while independent agent sends do
+    /// not suppress one another.
+    last_capability_refresh_requests:
+        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], tokio::time::Instant>>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
@@ -4193,6 +4198,63 @@ impl Agent {
             .await
     }
 
+    /// Ask one recipient to republish its signed runtime capability and give
+    /// the local subscriber a short window to ingest it. This is used only by
+    /// strict product sends after a TTL-bounded cache miss: success semantics
+    /// remain unchanged, while a daemon whose startup-only solicitation was
+    /// lost no longer stays wedged until the five-minute advert cadence.
+    async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
+        const LOCAL_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
+        const CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        let should_publish = {
+            let now = tokio::time::Instant::now();
+            let mut last_requests = self.last_capability_refresh_requests.lock().await;
+            last_requests.retain(|_, last| now.duration_since(*last) < LOCAL_REQUEST_MIN_INTERVAL);
+            let recipient_key = *recipient.as_bytes();
+            let allowed = !last_requests.contains_key(&recipient_key);
+            if allowed {
+                last_requests.insert(recipient_key, now);
+            }
+            allowed
+        };
+
+        if should_publish {
+            if let Err(error) = dm_capability_service::publish_capability_advert_request(
+                runtime.pubsub(),
+                Some(recipient),
+            )
+            .await
+            {
+                tracing::warn!(
+                    target: "dm.trace",
+                    recipient = %hex::encode(recipient.as_bytes()),
+                    %error,
+                    "targeted capability refresh publish failed"
+                );
+            }
+        }
+
+        let deadline = tokio::time::Instant::now() + CONVERGENCE_WAIT;
+        loop {
+            let converged = self
+                .capability_store
+                .lookup_binding(&recipient)
+                .is_some_and(|binding| {
+                    binding.machine_id.0 != [0_u8; 32]
+                        && binding.capabilities.supports_durable_app_ack()
+                });
+            if converged || tokio::time::Instant::now() >= deadline {
+                return;
+            }
+            tokio::time::sleep(POLL_INTERVAL).await;
+        }
+    }
+
     async fn dm_peer_rtt_ms(&self, agent_id: &identity::AgentId) -> Option<u32> {
         let registry_machine_id = self.direct_messaging.get_machine_id(agent_id).await;
         let cached_machine_id = {
@@ -4425,7 +4487,16 @@ impl Agent {
             return Ok(receipt);
         }
 
-        let advert_binding = self.capability_store.lookup_binding(to);
+        let mut advert_binding = self.capability_store.lookup_binding(to);
+        if config.require_durable_app_ack
+            && !advert_binding.as_ref().is_some_and(|binding| {
+                binding.machine_id.0 != [0_u8; 32]
+                    && binding.capabilities.supports_durable_app_ack()
+            })
+        {
+            self.refresh_strict_dm_capability(*to).await;
+            advert_binding = self.capability_store.lookup_binding(to);
+        }
         let advert_cap = advert_binding
             .as_ref()
             .map(|binding| binding.capabilities.clone());
@@ -11062,6 +11133,9 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
+            last_capability_refresh_requests: tokio::sync::Mutex::new(
+                std::collections::HashMap::new(),
+            ),
             dm_inbox_service: tokio::sync::Mutex::new(None),
             revocation_set,
             identity_dir: self.identity_dir,
@@ -17372,6 +17446,53 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
         "upgraded capabilities must carry the KEM public key"
     );
     agent.stop_dm_inbox().await;
+}
+
+#[tokio::test]
+async fn strict_capability_miss_publishes_targeted_refresh_and_waits_for_cache() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let agent = std::sync::Arc::new(
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .expect("agent"),
+    );
+    let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
+    let mut request_sub = runtime
+        .pubsub()
+        .subscribe(dm_capability::DM_CAPABILITY_REQUEST_TOPIC.to_string())
+        .await;
+    let recipient = identity::AgentId([0xD1; 32]);
+
+    let refresh_agent = std::sync::Arc::clone(&agent);
+    let refresh = tokio::spawn(async move {
+        refresh_agent.refresh_strict_dm_capability(recipient).await;
+    });
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), request_sub.recv())
+        .await
+        .expect("targeted refresh request timeout")
+        .expect("request subscription closed");
+    assert_eq!(request.topic, dm_capability::DM_CAPABILITY_REQUEST_TOPIC);
+    assert!(request.verified, "refresh request must be authenticated");
+    assert_eq!(request.sender, Some(agent.identity.agent_id()));
+
+    agent.capability_store.insert(
+        recipient,
+        identity::MachineId([0xD2; 32]),
+        dm::DmCapabilities::v2_durable_gossip_ready(vec![0xD3; 1184]),
+        dm_capability::now_unix_ms(),
+    );
+    tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+        .await
+        .expect("refresh did not observe converged cache")
+        .expect("refresh task failed");
+
+    agent.shutdown().await;
 }
 
 #[test]
