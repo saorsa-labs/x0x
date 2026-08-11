@@ -365,6 +365,33 @@ fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool
     )
 }
 
+fn ack_requires_legacy_bus_hedge(protocol_version: u16, received_on_legacy_bus: bool) -> bool {
+    received_on_legacy_bus || protocol_version >= DM_PROTOCOL_DURABLE_ACK
+}
+
+async fn publish_ack_routes<Primary, Legacy>(
+    hedge_on_legacy_bus: bool,
+    primary: Primary,
+    legacy: Legacy,
+) -> NetworkResult<()>
+where
+    Primary: std::future::Future<Output = NetworkResult<()>>,
+    Legacy: std::future::Future<Output = NetworkResult<()>>,
+{
+    if !hedge_on_legacy_bus {
+        return primary.await;
+    }
+
+    // A targeted inbox publish can deliver remotely yet remain pending under
+    // per-topic fan-out backpressure. Poll the compatibility-bus hedge at the
+    // same time so a durable recipient does not commit and dispatch the DM
+    // while the sender exhausts its complete ACK budget waiting on the reverse
+    // targeted topic. Await both rather than dropping the slower future as
+    // soon as one route finishes, preserving ownership of both PubSub calls.
+    let (primary, legacy) = tokio::join!(primary, legacy);
+    primary.and(legacy)
+}
+
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
@@ -967,18 +994,18 @@ impl InboxPipeline {
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
         let topic = DmInboxService::inbox_topic_name(&to);
-        let primary = self
-            .pubsub
-            .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
-            .await;
-        let legacy = if ack_legacy_bus {
+        let primary =
             self.pubsub
-                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
-                .await
-        } else {
-            Ok(())
-        };
-        primary.and(legacy)
+                .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()));
+        let legacy = self
+            .pubsub
+            .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded));
+        publish_ack_routes(
+            ack_requires_legacy_bus_hedge(protocol_version, ack_legacy_bus),
+            primary,
+            legacy,
+        )
+        .await
     }
 }
 
@@ -1617,6 +1644,77 @@ mod tests {
             DmAckOutcome::Accepted
         );
         assert_eq!(harness.pipeline.inflight.outstanding(), 0);
+    }
+
+    #[tokio::test]
+    async fn durable_ack_bus_hedge_resolves_exact_waiter_while_targeted_publish_stalls() {
+        assert!(!ack_requires_legacy_bus_hedge(
+            crate::dm::DM_PROTOCOL_V1,
+            false
+        ));
+        assert!(ack_requires_legacy_bus_hedge(
+            crate::dm::DM_PROTOCOL_V1,
+            true
+        ));
+        assert!(ack_requires_legacy_bus_hedge(
+            DM_PROTOCOL_DURABLE_ACK,
+            false
+        ));
+
+        let inflight = Arc::new(InFlightAcks::new());
+        let request_id = [0xC1; 16];
+        let recipient = AgentId([0xC2; 32]);
+        let machine = MachineId([0xC3; 32]);
+        let receipt = inflight.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            Some(machine),
+        );
+        let targeted_started = Arc::new(tokio::sync::Notify::new());
+        let targeted_started_tx = Arc::clone(&targeted_started);
+        let legacy_inflight = Arc::clone(&inflight);
+
+        let targeted = async move {
+            targeted_started_tx.notify_one();
+            std::future::pending::<NetworkResult<()>>().await
+        };
+        let legacy = async move {
+            assert!(legacy_inflight.resolve_for_protocol(
+                &request_id,
+                DM_PROTOCOL_DURABLE_ACK,
+                recipient,
+                machine,
+                DmAckOutcome::Accepted,
+            ));
+            Ok(())
+        };
+        let publish_task = tokio::spawn(async move {
+            publish_ack_routes(
+                ack_requires_legacy_bus_hedge(DM_PROTOCOL_DURABLE_ACK, false),
+                targeted,
+                legacy,
+            )
+            .await
+        });
+
+        tokio::time::timeout(Duration::from_secs(1), targeted_started.notified())
+            .await
+            .expect("targeted ACK publish was not polled");
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), receipt)
+                .await
+                .expect("legacy ACK hedge did not reach the sender waiter")
+                .expect("sender waiter was cancelled"),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(inflight.outstanding(), 0);
+        assert!(
+            !publish_task.is_finished(),
+            "stalled targeted publish should remain owned while the hedge resolves the sender"
+        );
+        publish_task.abort();
+        let _ = publish_task.await;
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {
