@@ -363,8 +363,9 @@ pub struct DirectMessage {
     /// store trust level and machine pinning.
     pub trust_decision: Option<TrustDecision>,
     /// Canonical durable-history identity for this exact accepted message.
-    /// Present for envelope and durable loopback deliveries; legacy raw
-    /// messages that have no stable application identity leave this absent.
+    /// Present for envelope, durable loopback, and history-eligible verified
+    /// legacy-raw deliveries. Ephemeral or untrusted raw messages leave this
+    /// absent because no matching durable row can enter a backfill seam.
     pub message_id: Option<[u8; 32]>,
     /// Issue #120: opt-in coarsened origin token — the transport-observed
     /// peer address masked to a fixed prefix, with directness and CGNAT

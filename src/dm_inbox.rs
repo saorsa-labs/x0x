@@ -703,14 +703,46 @@ fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool
     )
 }
 
-async fn durable_history_contains_logical_request(
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DurableLogicalRequestBinding {
+    protocol_version: u16,
+    application_payload: Vec<u8>,
+    thread_root: Option<String>,
+    thread_parent: Option<String>,
+}
+
+impl DurableLogicalRequestBinding {
+    fn accepted(
+        protocol_version: u16,
+        application_payload: &[u8],
+        thread_meta: Option<&DmThreadMeta>,
+    ) -> Self {
+        Self {
+            protocol_version,
+            application_payload: application_payload.to_vec(),
+            thread_root: thread_meta.map(DmThreadMeta::thread_root_hex),
+            thread_parent: thread_meta.and_then(DmThreadMeta::thread_parent_hex),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableLogicalRequestLookup {
+    Missing,
+    Exact,
+    Conflict,
+}
+
+async fn durable_history_logical_request(
     history: &crate::history::HistoryHandle,
     sender: AgentId,
     request_id: [u8; 16],
-) -> crate::error::HistoryResult<bool> {
+    accepted: DurableLogicalRequestBinding,
+) -> crate::error::HistoryResult<DurableLogicalRequestLookup> {
     let store = Arc::clone(history.store());
     tokio::task::spawn_blocking(move || {
         let mut before_id = None;
+        let mut found_exact = false;
         loop {
             let rows = store.query(&crate::history::HistoryQuery {
                 scope: Some(crate::history::Scope::Dm(hex::encode(sender.as_bytes()))),
@@ -728,11 +760,24 @@ async fn durable_history_contains_logical_request(
                 if envelope.sender_agent_id == *sender.as_bytes()
                     && envelope.request_id == request_id
                 {
-                    return Ok(true);
+                    let stored = DurableLogicalRequestBinding {
+                        protocol_version: envelope.protocol_version,
+                        application_payload: row.record.payload.clone(),
+                        thread_root: row.record.thread_root.clone(),
+                        thread_parent: row.record.thread_parent.clone(),
+                    };
+                    if stored != accepted {
+                        return Ok(DurableLogicalRequestLookup::Conflict);
+                    }
+                    found_exact = true;
                 }
             }
             if rows.len() < crate::history::MAX_QUERY_LIMIT {
-                return Ok(false);
+                return Ok(if found_exact {
+                    DurableLogicalRequestLookup::Exact
+                } else {
+                    DurableLogicalRequestLookup::Missing
+                });
             }
             before_id = rows.last().map(|row| row.id);
         }
@@ -852,7 +897,9 @@ impl InboxPipeline {
         let dedupe = envelope.dedupe_key();
         if let Some(cached) = self.cache.lookup(&dedupe) {
             if matches!(envelope.body, DmBody::Payload(_)) {
-                if cached.protocol_version >= envelope.protocol_version {
+                if envelope.protocol_version < DM_PROTOCOL_DURABLE_ACK
+                    || cached.protocol_version < DM_PROTOCOL_DURABLE_ACK
+                {
                     let _ = self
                         .publish_ack(
                             AgentId(envelope.sender_agent_id),
@@ -864,10 +911,11 @@ impl InboxPipeline {
                         .await;
                     return;
                 }
-                // A v1 completion cannot satisfy a v2 receipt. Continue
-                // through signature, attestation, and decrypt verification;
-                // the serialized branch below returns an explicit semantics
-                // error without dispatching the logical request again.
+                // Durable retries must cross signature, attestation, and
+                // decrypt verification before the accepted protocol, payload,
+                // and thread binding can be compared with durable history.
+                // The cache is only an outcome hint and cannot authenticate
+                // those logical-content fields.
             } else {
                 return;
             }
@@ -1158,16 +1206,21 @@ impl InboxPipeline {
         };
         let _delivery_guard = lock.lock_owned().await;
         if let Some(cached) = self.cache.lookup(&envelope.dedupe_key()) {
-            let _ = self
-                .publish_ack(
-                    sender_agent_id,
-                    envelope.request_id,
-                    cached_ack_for_protocol(&cached, protocol_version),
-                    protocol_version,
-                    ack_route,
-                )
-                .await;
-            return;
+            if !durable_ack || cached.protocol_version < DM_PROTOCOL_DURABLE_ACK {
+                let _ = self
+                    .publish_ack(
+                        sender_agent_id,
+                        envelope.request_id,
+                        cached_ack_for_protocol(&cached, protocol_version),
+                        protocol_version,
+                        ack_route,
+                    )
+                    .await;
+                return;
+            }
+            // A durable cache hit still requires the exact durable binding
+            // comparison below. It may be a same-request mutation rather than
+            // an exact retransmission.
         }
 
         // Atomic dedupe claim BEFORE delivery. The same envelope can arrive
@@ -1212,15 +1265,33 @@ impl InboxPipeline {
                 );
                 return;
             };
-            match durable_history_contains_logical_request(
+            let accepted = DurableLogicalRequestBinding::accepted(
+                protocol_version,
+                &application_payload,
+                thread_meta.as_ref(),
+            );
+            match durable_history_logical_request(
                 history,
                 sender_agent_id,
                 envelope.request_id,
+                accepted,
             )
             .await
             {
-                Ok(true) => {
-                    if let Err(error) = self.cache.complete_durable(
+                Ok(DurableLogicalRequestLookup::Exact) => {
+                    if let Some(cached) = self.cache.lookup(&envelope.dedupe_key()) {
+                        if cached.protocol_version != protocol_version
+                            || cached.outcome != DmAckOutcome::Accepted
+                        {
+                            tracing::error!(
+                                request_id = %hex::encode(envelope.request_id),
+                                cached_protocol_version = cached.protocol_version,
+                                protocol_version,
+                                "exact durable history binding conflicts with replay-cache completion; withholding ACK"
+                            );
+                            return;
+                        }
+                    } else if let Err(error) = self.cache.complete_durable(
                         envelope.dedupe_key(),
                         DmAckOutcome::Accepted,
                         protocol_version,
@@ -1243,7 +1314,16 @@ impl InboxPipeline {
                         .await;
                     return;
                 }
-                Ok(false) => {}
+                Ok(DurableLogicalRequestLookup::Conflict) => {
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        sender = %hex::encode(sender_agent_id.as_bytes()),
+                        protocol_version,
+                        "durable logical request conflicts with the accepted protocol, payload, or thread binding; withholding ACK and app dispatch"
+                    );
+                    return;
+                }
+                Ok(DurableLogicalRequestLookup::Missing) => {}
                 Err(error) => {
                     tracing::warn!(
                         request_id = %hex::encode(envelope.request_id),
@@ -1837,6 +1917,43 @@ mod tests {
         handle
     }
 
+    fn capture_ack_jobs(harness: &mut InboxHarness) -> mpsc::Receiver<AckPublishJob> {
+        harness.ack_worker.abort();
+        let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+        harness.pipeline.ack_publisher = AckPublisherHandle { sender };
+        receiver
+    }
+
+    async fn expect_accepted_ack(
+        receiver: &mut mpsc::Receiver<AckPublishJob>,
+        request_id: [u8; 16],
+        protocol_version: u16,
+    ) {
+        let job = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("durable ACK job timeout")
+            .expect("durable ACK capture closed");
+        assert_eq!(job.acked_request_id, request_id);
+        assert_eq!(job.protocol_version, protocol_version);
+        let envelope = DmEnvelope::from_wire_bytes(&job.encoded).expect("decode captured ACK");
+        assert!(matches!(
+            envelope.body,
+            DmBody::Ack(crate::dm::DmAckBody {
+                acks_request_id,
+                outcome: DmAckOutcome::Accepted,
+            }) if acks_request_id == request_id
+        ));
+    }
+
+    async fn assert_no_ack(receiver: &mut mpsc::Receiver<AckPublishJob>) {
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), receiver.recv())
+                .await
+                .is_err(),
+            "conflicting logical request unexpectedly produced an ACK"
+        );
+    }
+
     /// Build a signed-but-unattested payload envelope, simulating a
     /// pre-#213 (legacy) sender: agent signature only, no origin attestation.
     fn craft_unsigned_payload_envelope(
@@ -1931,46 +2048,46 @@ mod tests {
         machine: &MachineKeypair,
         request_byte: u8,
     ) -> PubSubMessage {
-        let legacy = attested_payload_message(harness, sender, machine, request_byte);
-        let mut envelope =
-            DmEnvelope::from_wire_bytes(&legacy.payload).expect("decode attested envelope");
-        envelope.protocol_version = DM_PROTOCOL_DURABLE_ACK;
-        envelope.signature.clear();
-        envelope.origin_attestation = None;
-        sign_envelope_with_agent(&mut envelope, sender);
-        let mut attestation =
-            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
-        attestation.sign(machine).expect("machine attest v2");
-        envelope.origin_attestation = Some(attestation);
-        wrap_in_pubsub(harness, sender, &envelope)
+        durable_attested_payload_message_with_binding(
+            harness,
+            sender,
+            machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"security regression payload",
+            None,
+        )
     }
 
-    fn threaded_attested_payload_message(
+    #[allow(clippy::too_many_arguments)]
+    fn durable_attested_payload_message_with_binding(
         harness: &InboxHarness,
         sender: &AgentKeypair,
         machine: &MachineKeypair,
         request_byte: u8,
-        thread_meta: &DmThreadMeta,
+        protocol_version: u16,
+        application_payload: &[u8],
+        thread_meta: Option<&DmThreadMeta>,
     ) -> PubSubMessage {
         let created_at = now_unix_ms();
-        let application_payload = crate::dm_send::encode_application_payload(
-            b"security regression payload".to_vec(),
-            crate::dm::DM_PROTOCOL_THREADED,
-            Some(thread_meta),
+        let encoded_payload = crate::dm_send::encode_application_payload(
+            application_payload.to_vec(),
+            protocol_version,
+            thread_meta,
         )
-        .expect("encode threaded application payload");
+        .expect("encode application payload");
         let body = EnvelopeBuilder::build_payload_body(
             &[request_byte; 16],
             sender.agent_id().as_bytes(),
             harness.recipient_agent_id.as_bytes(),
             created_at,
-            application_payload,
+            encoded_payload,
             None,
             &harness.recipient_kem.public_bytes,
         )
-        .expect("build threaded payload body");
+        .expect("build durable payload body");
         let mut envelope = DmEnvelope {
-            protocol_version: crate::dm::DM_PROTOCOL_THREADED,
+            protocol_version,
             request_id: [request_byte; 16],
             sender_agent_id: *sender.agent_id().as_bytes(),
             sender_machine_id: *machine.machine_id().as_bytes(),
@@ -1984,9 +2101,29 @@ mod tests {
         sign_envelope_with_agent(&mut envelope, sender);
         let mut attestation =
             DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
-        attestation.sign(machine).expect("machine attest v3");
+        attestation
+            .sign(machine)
+            .expect("durable machine attestation");
         envelope.origin_attestation = Some(attestation);
         wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    fn threaded_attested_payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+        thread_meta: &DmThreadMeta,
+    ) -> PubSubMessage {
+        durable_attested_payload_message_with_binding(
+            harness,
+            sender,
+            machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"security regression payload",
+            Some(thread_meta),
+        )
     }
 
     fn durable_attested_ack_message(
@@ -2276,6 +2413,245 @@ mod tests {
                 .len(),
             2,
             "restart retry must not duplicate either the row or live dispatch"
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_restart_protocol_upgrade_conflicts_without_ack_history_or_live() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let request_byte = 0xD1;
+        let initial = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"stable application payload",
+            None,
+        );
+        let thread = DmThreadMeta::from_hex(Some(&"11".repeat(32)), None)
+            .expect("thread metadata")
+            .expect("thread root");
+        let upgraded = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"stable application payload",
+            Some(&thread),
+        );
+
+        harness.pipeline.handle_incoming(initial, false).await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial delivery timeout")
+            .expect("initial delivery stream closed");
+        expect_accepted_ack(&mut ack_jobs, [request_byte; 16], DM_PROTOCOL_DURABLE_ACK).await;
+
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        harness.pipeline.handle_incoming(upgraded, false).await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_no_ack(&mut ack_jobs).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query protocol-conflict history")
+                .len(),
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_restart_payload_mutation_conflicts_without_ack_history_or_live() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let request_byte = 0xD2;
+        let initial = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"accepted payload",
+            None,
+        );
+        let mutated = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"mutated payload",
+            None,
+        );
+
+        harness.pipeline.handle_incoming(initial, false).await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial delivery timeout")
+            .expect("initial delivery stream closed");
+        expect_accepted_ack(&mut ack_jobs, [request_byte; 16], DM_PROTOCOL_DURABLE_ACK).await;
+
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        harness.pipeline.handle_incoming(mutated, false).await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_no_ack(&mut ack_jobs).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query payload-conflict history")
+                .len(),
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_restart_thread_mutation_conflicts_without_ack_history_or_live() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let request_byte = 0xD3;
+        let first_thread = DmThreadMeta::from_hex(Some(&"21".repeat(32)), Some(&"22".repeat(32)))
+            .expect("first thread metadata")
+            .expect("first thread");
+        let changed_thread = DmThreadMeta::from_hex(Some(&"21".repeat(32)), Some(&"23".repeat(32)))
+            .expect("changed thread metadata")
+            .expect("changed thread");
+        let initial = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"stable threaded payload",
+            Some(&first_thread),
+        );
+        let mutated = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"stable threaded payload",
+            Some(&changed_thread),
+        );
+
+        harness.pipeline.handle_incoming(initial, false).await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial threaded delivery timeout")
+            .expect("initial threaded delivery stream closed");
+        expect_accepted_ack(
+            &mut ack_jobs,
+            [request_byte; 16],
+            crate::dm::DM_PROTOCOL_THREADED,
+        )
+        .await;
+
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        harness.pipeline.handle_incoming(mutated, false).await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_no_ack(&mut ack_jobs).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query thread-conflict history")
+                .len(),
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn exact_v3_restart_retry_reacks_without_history_or_live_duplicate() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let request_byte = 0xD4;
+        let thread = DmThreadMeta::from_hex(Some(&"31".repeat(32)), Some(&"32".repeat(32)))
+            .expect("thread metadata")
+            .expect("thread");
+        let initial = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"exact v3 payload",
+            Some(&thread),
+        );
+        let exact_retry = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            request_byte,
+            crate::dm::DM_PROTOCOL_THREADED,
+            b"exact v3 payload",
+            Some(&thread),
+        );
+        assert_ne!(
+            initial.payload, exact_retry.payload,
+            "restart retry must carry fresh ciphertext"
+        );
+
+        harness.pipeline.handle_incoming(initial, false).await;
+        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial v3 delivery timeout")
+            .expect("initial v3 delivery stream closed");
+        expect_accepted_ack(
+            &mut ack_jobs,
+            [request_byte; 16],
+            crate::dm::DM_PROTOCOL_THREADED,
+        )
+        .await;
+
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        harness.pipeline.handle_incoming(exact_retry, false).await;
+        expect_accepted_ack(
+            &mut ack_jobs,
+            [request_byte; 16],
+            crate::dm::DM_PROTOCOL_THREADED,
+        )
+        .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query exact v3 retry history")
+                .len(),
+            1
         );
 
         if let Some(service) = harness.history_service.take() {

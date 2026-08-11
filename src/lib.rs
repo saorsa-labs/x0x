@@ -2501,6 +2501,58 @@ fn raw_dm_history_record(
     })
 }
 
+struct LegacyRawDmAdmission {
+    sender: identity::AgentId,
+    machine_id: identity::MachineId,
+    payload: Vec<u8>,
+    verified: bool,
+    trust_decision: Option<trust::TrustDecision>,
+    observed_origin: Option<connectivity::ObservedOrigin>,
+    now_ms: i64,
+}
+
+async fn persist_and_deliver_legacy_raw_dm(
+    history_handle: Option<&history::HistoryHandle>,
+    dm: &direct::DirectMessaging,
+    admission: LegacyRawDmAdmission,
+) -> u64 {
+    let LegacyRawDmAdmission {
+        sender,
+        machine_id,
+        payload,
+        verified,
+        trust_decision,
+        observed_origin,
+        now_ms,
+    } = admission;
+    let history_record = raw_dm_history_record(
+        sender,
+        machine_id,
+        &payload,
+        verified,
+        trust_decision,
+        now_ms,
+    );
+    let message_id = history_record.as_ref().map(|record| record.msg_id);
+    if let (Some(history), Some(record)) = (history_handle, history_record) {
+        history.record(record);
+    }
+
+    dm.handle_incoming_with_thread(
+        machine_id,
+        sender,
+        payload,
+        verified,
+        trust_decision,
+        direct::DirectInboundMetadata {
+            observed_origin,
+            thread_meta: None,
+            message_id,
+        },
+    )
+    .await
+}
+
 const MAX_INFLIGHT_CAPABILITY_REFRESHES: usize = 256;
 const CAPABILITY_REFRESH_TARGETED_ONLY_WAIT: std::time::Duration =
     std::time::Duration::from_secs(1);
@@ -10002,31 +10054,21 @@ impl Agent {
                 // verified and trust did not reject the sender. Buzz message
                 // envelopes carry a per-send clientId in their payload, so
                 // payload-derived ids remain distinct for repeated user text.
-                if let (Some(history), Some(record)) = (
-                    history_handle.as_ref(),
-                    raw_dm_history_record(
-                        sender,
-                        machine_id,
-                        &data,
-                        verified,
-                        trust_decision,
-                        i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
-                    ),
-                ) {
-                    history.record(record);
-                }
-
                 // Fan out to all subscribe_direct() receivers with verification info.
-                let delivered = dm
-                    .handle_incoming(
-                        machine_id,
+                let delivered = persist_and_deliver_legacy_raw_dm(
+                    history_handle.as_ref(),
+                    &dm,
+                    LegacyRawDmAdmission {
                         sender,
-                        data,
+                        machine_id,
+                        payload: data,
                         verified,
                         trust_decision,
                         observed_origin,
-                    )
-                    .await;
+                        now_ms: i64::try_from(dm::now_unix_ms()).unwrap_or(i64::MAX),
+                    },
+                )
+                .await;
 
                 tracing::debug!(
                     target: "dm.trace",
@@ -13740,6 +13782,86 @@ mod tests {
             1,
         )
         .is_none());
+    }
+
+    #[tokio::test]
+    async fn mixed_version_legacy_raw_seam_suppresses_only_its_exact_live_id() {
+        let directory = tempfile::tempdir().expect("history tempdir");
+        let history_config = history::HistoryConfig {
+            enabled: true,
+            ..history::HistoryConfig::default()
+        };
+        let history_service = history::HistoryService::start(&history_config, directory.path())
+            .expect("start history service");
+        let history = history_service.handle();
+        let dm = direct::DirectMessaging::new();
+        let mut receiver = dm.subscribe();
+        let sender = identity::AgentId([0x41; 32]);
+        let machine_id = identity::MachineId([0x42; 32]);
+        let payload = br#"{"text":"same rendered text","clientId":"legacy-raw"}"#.to_vec();
+        let canonical_raw_id = history::HistoryRecord::compute_msg_id(None, payload.as_slice());
+
+        let delivered = persist_and_deliver_legacy_raw_dm(
+            Some(&history),
+            &dm,
+            LegacyRawDmAdmission {
+                sender,
+                machine_id,
+                payload: payload.clone(),
+                verified: true,
+                trust_decision: Some(trust::TrustDecision::Accept),
+                observed_origin: None,
+                now_ms: 123,
+            },
+        )
+        .await;
+        assert_eq!(delivered, 1);
+        let live = tokio::time::timeout(std::time::Duration::from_secs(1), receiver.recv())
+            .await
+            .expect("legacy raw live delivery timeout")
+            .expect("legacy raw live stream closed");
+        assert_eq!(live.message_id, Some(canonical_raw_id));
+
+        let rows = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let rows = history
+                    .store()
+                    .query(&history::HistoryQuery::default())
+                    .expect("query legacy raw history");
+                if !rows.is_empty() {
+                    break rows;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("legacy raw history commit timeout");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.msg_id, canonical_raw_id);
+
+        // Model a mixed-version backfill: a modern signed-envelope row can
+        // render identical application bytes while retaining a distinct
+        // canonical artifact-derived id. The seam must remove only the exact
+        // legacy-raw live duplicate and leave the modern row visible.
+        let modern_id =
+            history::HistoryRecord::compute_msg_id(Some(b"v3-signed-artifact"), &payload);
+        assert_ne!(modern_id, canonical_raw_id);
+        let scope = hex::encode(sender.as_bytes());
+        let mut seam = std::collections::HashSet::from([
+            (scope.clone(), canonical_raw_id),
+            (scope.clone(), modern_id),
+        ]);
+        let live_identity = (
+            scope,
+            live.message_id.expect("legacy raw canonical live id"),
+        );
+        assert!(seam.remove(&live_identity));
+        assert!(
+            seam.contains(&(hex::encode(sender.as_bytes()), modern_id)),
+            "a distinct modern row with identical payload must remain visible"
+        );
+
+        history_service.shutdown().await;
     }
 
     #[test]
