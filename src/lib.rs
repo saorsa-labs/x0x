@@ -4263,7 +4263,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
-        self.direct_messaging.record_outgoing_started(*to, None);
+        let mut outgoing = self.direct_messaging.outgoing_send_guard(*to);
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -4282,13 +4282,10 @@ impl Agent {
         let result = if let Some(deadline) = total_deadline {
             match tokio::time::timeout(deadline, send).await {
                 Ok(result) => result,
-                Err(_) => {
-                    self.direct_messaging.record_outgoing_failed(*to);
-                    Err(dm::DmError::Timeout {
-                        retries: 0,
-                        elapsed: deadline,
-                    })
-                }
+                Err(_) => Err(dm::DmError::Timeout {
+                    retries: 0,
+                    elapsed: deadline,
+                }),
             }
         } else {
             send.await
@@ -4296,6 +4293,7 @@ impl Agent {
         if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
         }
+        outgoing.finish(result.as_ref().ok().map(|receipt| receipt.path));
         result
     }
 
@@ -4343,7 +4341,6 @@ impl Agent {
     ) -> Result<dm::DmReceipt, dm::DmError> {
         if *to == self.identity.agent_id() {
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
-                self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::PayloadTooLarge {
                     len: payload.len(),
                     max: direct::MAX_DIRECT_PAYLOAD_SIZE,
@@ -4359,8 +4356,6 @@ impl Agent {
                 )
                 .await;
             let receipt = dm_send::loopback_receipt();
-            self.direct_messaging
-                .record_outgoing_succeeded(*to, receipt.path);
             tracing::debug!(
                 target: "dm.trace",
                 stage = "outbound_send_returned_ok",
@@ -4437,7 +4432,6 @@ impl Agent {
         self.direct_messaging
             .record_outgoing_rtt_hint(*to, rtt_hint_ms);
         if let Some((phi, last_seen_ms_ago)) = self.dm_peer_likely_offline(to).await {
-            self.direct_messaging.record_outgoing_failed(*to);
             return Err(dm::DmError::PeerLikelyOffline {
                 phi,
                 last_seen_ms_ago,
@@ -4452,7 +4446,6 @@ impl Agent {
         if gossip_ok {
             if let Some(caps) = &cap {
                 if let Err(reason) = dm::validate_recipient_kem_key(&caps.kem_public_key) {
-                    self.direct_messaging.record_outgoing_failed(*to);
                     return Err(dm::DmError::RecipientKeyInvalid(reason));
                 }
             }
@@ -4557,8 +4550,6 @@ impl Agent {
 
         match result {
             Ok(receipt) => {
-                self.direct_messaging
-                    .record_outgoing_succeeded(*to, receipt.path);
                 // X0X-0070b: every direct-DM success clears the relay engine's
                 // per-peer failure history. A peer that had crossed
                 // `needs_relay` and now recovers a direct path increments
@@ -4568,7 +4559,6 @@ impl Agent {
                 Ok(receipt)
             }
             Err(direct_err) => {
-                self.direct_messaging.record_outgoing_failed(*to);
                 // X0X-0070b: count this direct-DM failure on the relay engine.
                 // With the default disabled policy `needs_relay` always
                 // returns `false` and the fallback below is skipped. With
@@ -4585,8 +4575,6 @@ impl Agent {
                     if self.peer_relay.needs_relay(to) {
                         match self.try_relay_fallback(to, saved_payload, &kem_pub).await {
                             Ok(relay_receipt) => {
-                                self.direct_messaging
-                                    .record_outgoing_succeeded(*to, relay_receipt.path);
                                 return Ok(relay_receipt);
                             }
                             Err(relay_err) => {
@@ -4807,6 +4795,18 @@ impl Agent {
                 peer_id: agent_id.0,
                 timeout: deadline,
             }),
+        }
+    }
+
+    fn newer_direct_generation(
+        &self,
+        machine_id: &identity::MachineId,
+        previous: Option<u64>,
+    ) -> Option<u64> {
+        let current = self.direct_messaging.current_generation(machine_id)?;
+        match previous {
+            Some(previous) if current <= previous => None,
+            _ => Some(current),
         }
     }
 
@@ -5312,6 +5312,14 @@ impl Agent {
                     .await
             };
             if let Some(hook) = ack_race_test_hook.as_ref() {
+                hook.notify_first_attempt_result_ready();
+                if result.as_ref().is_some_and(Result::is_ok)
+                    && hook.take_queue_replaced_after_first_result()
+                {
+                    let next_generation = pre_send_generation.unwrap_or(0).saturating_add(1);
+                    self.direct_messaging
+                        .record_lifecycle_replaced(machine_id, next_generation);
+                }
                 hook.hold_first_attempt_result().await;
             }
             result
@@ -5349,7 +5357,9 @@ impl Agent {
                             | Err(BroadcastTryRecvError::Lagged(_)) => break,
                         }
                     }
-                    if let Some(gen) = queued_supersede {
+                    if let Some(gen) = queued_supersede.or_else(|| {
+                        self.newer_direct_generation(&machine_id, pre_send_generation)
+                    }) {
                         superseded_to = gen;
                         break;
                     }
@@ -5392,6 +5402,16 @@ impl Agent {
                                 }
                             }
                             if let Some(gen) = found {
+                                superseded_to = gen;
+                                break;
+                            }
+                            // The target event may be among the entries the
+                            // broadcast receiver skipped. Reconcile against
+                            // the authoritative lifecycle table before
+                            // accepting an old-generation send result.
+                            if let Some(gen) = self
+                                .newer_direct_generation(&machine_id, pre_send_generation)
+                            {
                                 superseded_to = gen;
                                 break;
                             }

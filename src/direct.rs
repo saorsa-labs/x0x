@@ -132,6 +132,7 @@ pub(crate) fn inbound_peer_revoked(
 #[doc(hidden)]
 pub struct RawQuicAckRaceTestHook {
     first_attempt_started: Notify,
+    first_attempt_result_ready: Notify,
     first_attempt_result_release: Notify,
     replaced_short_circuit: Notify,
     repair_retry_started: Notify,
@@ -139,6 +140,7 @@ pub struct RawQuicAckRaceTestHook {
     hold_first_attempt_result: AtomicBool,
     fail_first_attempt_before_send: AtomicBool,
     fail_first_attempt_backpressured: AtomicBool,
+    queue_replaced_after_first_result: AtomicBool,
     hold_repair_retry_before_send: AtomicBool,
 }
 
@@ -153,6 +155,7 @@ impl Default for RawQuicAckRaceTestHook {
     fn default() -> Self {
         Self {
             first_attempt_started: Notify::new(),
+            first_attempt_result_ready: Notify::new(),
             first_attempt_result_release: Notify::new(),
             replaced_short_circuit: Notify::new(),
             repair_retry_started: Notify::new(),
@@ -160,6 +163,7 @@ impl Default for RawQuicAckRaceTestHook {
             hold_first_attempt_result: AtomicBool::new(true),
             fail_first_attempt_before_send: AtomicBool::new(false),
             fail_first_attempt_backpressured: AtomicBool::new(false),
+            queue_replaced_after_first_result: AtomicBool::new(false),
             hold_repair_retry_before_send: AtomicBool::new(false),
         }
     }
@@ -207,8 +211,24 @@ impl RawQuicAckRaceTestHook {
         }
     }
 
+    /// Build a deterministic both-ready race: after the first receive-ACK
+    /// succeeds, queue a same-peer `Replaced` before returning the result to
+    /// the biased select.
+    #[must_use]
+    pub fn new_queued_replaced_after_success() -> Self {
+        Self {
+            hold_first_attempt_result: AtomicBool::new(false),
+            queue_replaced_after_first_result: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
     pub async fn wait_first_attempt_started(&self) {
         self.first_attempt_started.notified().await;
+    }
+
+    pub async fn wait_first_attempt_result_ready(&self) {
+        self.first_attempt_result_ready.notified().await;
     }
 
     pub fn release_first_attempt_result(&self) {
@@ -231,6 +251,10 @@ impl RawQuicAckRaceTestHook {
         self.first_attempt_started.notify_one();
     }
 
+    pub(crate) fn notify_first_attempt_result_ready(&self) {
+        self.first_attempt_result_ready.notify_one();
+    }
+
     pub(crate) async fn hold_first_attempt_result(&self) {
         if self.hold_first_attempt_result.load(Ordering::Relaxed) {
             self.first_attempt_result_release.notified().await;
@@ -248,6 +272,11 @@ impl RawQuicAckRaceTestHook {
 
     pub(crate) fn take_fail_first_attempt_backpressured(&self) -> bool {
         self.fail_first_attempt_backpressured
+            .swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_queue_replaced_after_first_result(&self) -> bool {
+        self.queue_replaced_after_first_result
             .swap(false, Ordering::Relaxed)
     }
 
@@ -648,6 +677,48 @@ pub struct DmDiagnosticsStats {
     pub subscriber_channel_closed: u64,
 }
 
+/// RAII accounting for one public logical DM send. Completion records exactly
+/// one success or failure; dropping the caller future records cancellation as
+/// failure so `started == succeeded + failed` remains true.
+pub(crate) struct OutgoingSendGuard<'a> {
+    messaging: &'a DirectMessaging,
+    agent_id: AgentId,
+    completed: bool,
+}
+
+impl<'a> OutgoingSendGuard<'a> {
+    fn new(messaging: &'a DirectMessaging, agent_id: AgentId) -> Self {
+        messaging.record_outgoing_started(agent_id, None);
+        Self {
+            messaging,
+            agent_id,
+            completed: false,
+        }
+    }
+
+    pub(crate) fn finish(&mut self, path: Option<DmPath>) {
+        if self.completed {
+            return;
+        }
+        match path {
+            Some(path) => self
+                .messaging
+                .record_outgoing_succeeded(self.agent_id, path),
+            None => self.messaging.record_outgoing_failed(self.agent_id),
+        }
+        self.completed = true;
+    }
+}
+
+impl Drop for OutgoingSendGuard<'_> {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.messaging.record_outgoing_failed(self.agent_id);
+            self.completed = true;
+        }
+    }
+}
+
 /// Per-peer direct-message diagnostics exposed by `/diagnostics/dm`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct DmPeerDiagnostics {
@@ -958,6 +1029,10 @@ impl DirectMessaging {
                 peer.avg_rtt_ms = Some(rtt);
             }
         });
+    }
+
+    pub(crate) fn outgoing_send_guard(&self, agent_id: AgentId) -> OutgoingSendGuard<'_> {
+        OutgoingSendGuard::new(self, agent_id)
     }
 
     pub(crate) fn record_outgoing_rtt_hint(&self, agent_id: AgentId, avg_rtt_ms: Option<u32>) {
@@ -1724,6 +1799,29 @@ mod tests {
         assert_eq!(dm.current_generation(&machine_id), Some(7));
         dm.record_lifecycle_replaced(machine_id, 9);
         assert_eq!(dm.current_generation(&machine_id), Some(9));
+    }
+
+    #[test]
+    fn outgoing_send_guard_records_one_terminal_on_finish_or_cancellation() {
+        let dm = DirectMessaging::new();
+        let success_peer = AgentId([0x31; 32]);
+        {
+            let mut send = dm.outgoing_send_guard(success_peer);
+            send.finish(Some(DmPath::RawQuicAcked));
+        }
+        let cancelled_peer = AgentId([0x32; 32]);
+        {
+            let _cancelled = dm.outgoing_send_guard(cancelled_peer);
+        }
+
+        let stats = dm.diagnostics_snapshot().stats;
+        assert_eq!(stats.outgoing_send_total, 2);
+        assert_eq!(stats.outgoing_send_succeeded, 1);
+        assert_eq!(stats.outgoing_send_failed, 1);
+        assert_eq!(
+            stats.outgoing_send_total,
+            stats.outgoing_send_succeeded + stats.outgoing_send_failed
+        );
     }
 
     #[tokio::test]

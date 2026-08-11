@@ -261,12 +261,19 @@ async fn sender_uses_relay_when_direct_path_fails() {
         post_diag.outgoing_path_relayed, 1,
         "DirectMessaging diagnostics must agree (outgoing_path_relayed counter)"
     );
-    // The pre-attempt direct failure also increments outgoing_send_failed
-    // - that is the contract: the relay receipt is recorded as Succeeded,
-    // but the prior direct attempt is recorded as Failed.
-    assert!(
-        post_diag.outgoing_send_failed >= 1,
-        "the pre-relay direct attempt must surface as a failed send"
+    assert_eq!(
+        post_diag.outgoing_send_total,
+        pre_diag.outgoing_send_total + 1,
+        "relay fallback is one logical public send"
+    );
+    assert_eq!(
+        post_diag.outgoing_send_succeeded,
+        pre_diag.outgoing_send_succeeded + 1,
+        "successful relay fallback has one success terminal"
+    );
+    assert_eq!(
+        post_diag.outgoing_send_failed, pre_diag.outgoing_send_failed,
+        "the recovered direct attempt is peer-relay accounting, not a failed logical send"
     );
 }
 

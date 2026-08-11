@@ -596,6 +596,162 @@ async fn cached_connection_ack_failure_repairs_and_retries_same_send() {
     bob.shutdown().await;
 }
 
+/// Deterministic coverage for two lifecycle races around a successful old-
+/// generation ACK: (1) both the ACK result and Replaced are ready in the
+/// biased select, and (2) the target Replaced event is skipped by broadcast
+/// lag. Both must reissue with the original ant request id, so Bob admits each
+/// logical payload exactly once.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn successful_ack_replaced_races_reissue_duplicate_safe() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_agent(&dir, "race-alice").await);
+    let bob = Arc::new(build_agent(&dir, "race-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr))
+        .await;
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+    alice
+        .direct_messaging()
+        .mark_connected(bob.agent_id(), bob.machine_id())
+        .await;
+
+    let mut bob_rx = bob.subscribe_direct();
+    let send_config = || DmSendConfig {
+        prefer_raw_quic_if_connected: true,
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(2)),
+        stop_fallback_on_raw_error: true,
+        max_retries: 0,
+        ..DmSendConfig::default()
+    };
+
+    // Both-ready branch: the hook queues Replaced after transport ACK success
+    // but before the send future returns to the biased select.
+    let both_ready = Arc::new(RawQuicAckRaceTestHook::new_queued_replaced_after_success());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&both_ready)));
+    let first_payload = b"both-ready-old-generation-ack".to_vec();
+    let first_send = {
+        let alice = Arc::clone(&alice);
+        let bob_agent_id = bob.agent_id();
+        let payload = first_payload.clone();
+        tokio::spawn(async move {
+            alice
+                .send_direct_with_config(&bob_agent_id, payload, send_config())
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        both_ready.wait_replaced_short_circuit(),
+    )
+    .await
+    .expect("queued Replaced must beat the simultaneously ready old ACK");
+    let first_receipt = first_send
+        .await
+        .expect("first send task completes")
+        .expect("both-ready reissue succeeds");
+    assert_eq!(first_receipt.path, DmPath::RawQuicAcked);
+    let first_received = tokio::time::timeout(Duration::from_secs(1), bob_rx.recv())
+        .await
+        .expect("bob receives both-ready payload")
+        .expect("bob subscriber remains open");
+    assert_eq!(first_received.payload, first_payload);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bob_rx.recv())
+            .await
+            .is_err(),
+        "same request id must dedupe the both-ready reissue"
+    );
+
+    // Lag branch: hold a successful result, advance the target generation,
+    // then overflow the receiver with unrelated lifecycle events so the
+    // target event itself is skipped. The lifecycle table must recover it.
+    let lagged = Arc::new(RawQuicAckRaceTestHook::new());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&lagged)));
+    let second_payload = b"lagged-replaced-old-generation-ack".to_vec();
+    let second_send = {
+        let alice = Arc::clone(&alice);
+        let bob_agent_id = bob.agent_id();
+        let payload = second_payload.clone();
+        tokio::spawn(async move {
+            alice
+                .send_direct_with_config(&bob_agent_id, payload, send_config())
+                .await
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        lagged.wait_first_attempt_result_ready(),
+    )
+    .await
+    .expect("old-generation ACK result is ready before lifecycle flood");
+    let previous = alice
+        .direct_messaging()
+        .current_generation(&bob.machine_id())
+        .unwrap_or(0);
+    alice
+        .direct_messaging()
+        .record_lifecycle_replaced(bob.machine_id(), previous.saturating_add(1));
+    for marker in 0_u16..300 {
+        let mut bytes = [0_u8; 32];
+        bytes[..2].copy_from_slice(&marker.to_be_bytes());
+        alice
+            .direct_messaging()
+            .record_lifecycle_replaced(x0x::identity::MachineId(bytes), u64::from(marker));
+    }
+    lagged.release_first_attempt_result();
+    tokio::time::timeout(Duration::from_secs(1), lagged.wait_replaced_short_circuit())
+        .await
+        .expect("lag reconciliation must recover the skipped target generation");
+    let second_receipt = second_send
+        .await
+        .expect("second send task completes")
+        .expect("lag-reconciled reissue succeeds");
+    assert_eq!(second_receipt.path, DmPath::RawQuicAcked);
+    let second_received = tokio::time::timeout(Duration::from_secs(1), bob_rx.recv())
+        .await
+        .expect("bob receives lag-race payload")
+        .expect("bob subscriber remains open");
+    assert_eq!(second_received.payload, second_payload);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bob_rx.recv())
+            .await
+            .is_err(),
+        "same request id must dedupe the lag-reconciled reissue"
+    );
+
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
 /// `raw_quic_receive_ack_timeout` is the deadline for the complete logical
 /// raw send, not one ant-quic ACK exchange. If the receiver admits the bytes
 /// but the ACK result remains stuck, the sender returns a typed timeout once,
