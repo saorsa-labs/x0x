@@ -970,25 +970,25 @@ async fn decode_for_delivery(
 const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
     "x0x/dm/v1/", // DM bus + DM inbox (slash style — x0x/dm/v1/bus, x0x/dm/v1/inbox/...)
     "x0x.dm.",    // Reserved for any future dot-style DM topics
-    "x0x.identity.announce.v2", // Identity announce — control-plane
     "x0x.test.discover.v1", // Test orchestrator discover (X0X-0076 harness)
     "x0x.test.control.v1", // Test orchestrator control commands
 ];
 
 const BULK_TOPIC_PREFIXES: &[&str] = &[
-    "x0x.identity.shard.v2.",  // Identity anti-entropy shards
-    "x0x.machine.shard.v2.",   // Machine anti-entropy shards
-    "x0x.user.shard.v2.",      // User anti-entropy shards
-    "x0x.machine.announce.v2", // Machine announce — bulk
-    "x0x.user.announce.v2",    // User announce — bulk
-    "x0x.discovery.groups",    // Global group discovery anti-entropy
-    "x0x.directory.",          // Group directory tag/name/id shards (src/groups/discovery.rs)
-    "x0x.rendezvous.shard",    // Rendezvous shard discovery
-    "x0x/release",             // Release manifests (slash style — x0x/release)
-    "x0x.release.",            // Reserved for any future dot-style release topics
-    "x0x/caps/v1",             // Mesh-wide DM capability advert (5-min republish)
-    "x0x.group.cards",         // Group card anti-entropy
-    "x0x.group.share.v2",      // Group share anti-entropy
+    "x0x.identity.shard.v2.",   // Identity anti-entropy shards
+    "x0x.identity.announce.v2", // Legacy identity announce — recoverable anti-entropy
+    "x0x.machine.shard.v2.",    // Machine anti-entropy shards
+    "x0x.user.shard.v2.",       // User anti-entropy shards
+    "x0x.machine.announce.v2",  // Machine announce — bulk
+    "x0x.user.announce.v2",     // User announce — bulk
+    "x0x.discovery.groups",     // Global group discovery anti-entropy
+    "x0x.directory.",           // Group directory tag/name/id shards (src/groups/discovery.rs)
+    "x0x.rendezvous.shard",     // Rendezvous shard discovery
+    "x0x/release",              // Release manifests (slash style — x0x/release)
+    "x0x.release.",             // Reserved for any future dot-style release topics
+    "x0x/caps/v1",              // Mesh-wide DM capability advert (5-min republish)
+    "x0x.group.cards",          // Group card anti-entropy
+    "x0x.group.share.v2",       // Group share anti-entropy
 ];
 
 /// Returns the X0X-0074 admission priority for an x0x topic name.
@@ -1027,13 +1027,9 @@ fn register_x0x_topic_priorities(
 ) {
     use saorsa_gossip_types::TopicId;
 
-    // Critical — DM bus + control plane + test orchestrator
+    // Critical — DM bus + test orchestrator
     registry.register(
         TopicId::from_entity("x0x/dm/v1/bus".as_bytes()),
-        TopicPriority::Critical,
-    );
-    registry.register(
-        TopicId::from_entity("x0x.identity.announce.v2".as_bytes()),
         TopicPriority::Critical,
     );
     registry.register(
@@ -1049,7 +1045,14 @@ fn register_x0x_topic_priorities(
     // when the runtime subscribes to its own inbox. The prefix
     // `x0x/dm/v1/` in CRITICAL_TOPIC_PREFIXES catches them.
 
-    // Bulk — fleet-wide anti-entropy + manifests + capability adverts
+    // Bulk — fleet-wide anti-entropy + manifests + capability adverts. The
+    // legacy identity announcement is recoverable from the identity shards and
+    // periodic heartbeat. Keeping it out of the per-peer Critical FIFO prevents
+    // mixed-version receiver-republish amplification from starving DM traffic.
+    registry.register(
+        TopicId::from_entity("x0x.identity.announce.v2".as_bytes()),
+        TopicPriority::Bulk,
+    );
     registry.register(
         TopicId::from_entity("x0x.machine.announce.v2".as_bytes()),
         TopicPriority::Bulk,
@@ -1362,10 +1365,23 @@ mod tests {
     }
 
     #[test]
-    fn classify_x0x_topic_routes_identity_announce_to_critical() {
+    fn classify_x0x_topic_routes_identity_announce_to_bulk() {
         assert_eq!(
             classify_x0x_topic("x0x.identity.announce.v2"),
-            TopicPriority::Critical
+            TopicPriority::Bulk,
+            "legacy identity amplification must not share the Critical DM FIFO"
+        );
+    }
+
+    #[test]
+    fn static_registry_routes_identity_announce_to_bulk() {
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::new();
+        register_x0x_topic_priorities(&registry);
+
+        assert_eq!(
+            registry.priority_for(&TopicId::from_entity("x0x.identity.announce.v2")),
+            TopicPriority::Bulk,
+            "the seeded priority must match the dynamic classifier before first publish"
         );
     }
 

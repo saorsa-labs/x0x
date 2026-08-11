@@ -21560,6 +21560,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn card_import_refreshes_contact_without_downgrading_live_v2_capability() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+        let machine_id = crate::identity::MachineId([0x21; 32]);
+        let runtime_key = vec![0x22; 1184];
+        state.agent.capability_store().insert(
+            target_id,
+            machine_id,
+            x0x::dm::DmCapabilities::v2_durable_gossip_ready(runtime_key.clone()),
+            x0x::dm_capability::now_unix_ms(),
+        );
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&target_id, x0x::contacts::TrustLevel::Trusted);
+
+        let card_key = vec![0x23; 1184];
+        let mut card = x0x::groups::card::AgentCard::new(
+            "Refreshed Alice".to_string(),
+            &target_id,
+            &hex::encode(machine_id.as_bytes()),
+        );
+        card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(card_key.clone()));
+        card.sign(&target_kp)?;
+        let req: ImportCardRequest = serde_json::from_value(serde_json::json!({
+            "card": card.to_link(),
+            "trust_level": "known"
+        }))
+        .context("deserialize ImportCardRequest")?;
+        let response = import_agent_card(State(Arc::clone(&state)), Json(req))
+            .await
+            .into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["trust_level"], "Trusted");
+        assert_eq!(body["trust_change_ignored"], true);
+
+        let contact = state
+            .contacts
+            .read()
+            .await
+            .get(&target_id)
+            .cloned()
+            .context("refreshed contact")?;
+        assert_eq!(contact.label.as_deref(), Some("Refreshed Alice"));
+        let contact_caps = contact.dm_capabilities.context("card capabilities")?;
+        assert_eq!(contact_caps.max_protocol_version, 1);
+        assert_eq!(contact_caps.kem_public_key, card_key);
+
+        let binding = state
+            .agent
+            .capability_store()
+            .lookup_binding(&target_id)
+            .context("live runtime binding")?;
+        assert_eq!(binding.machine_id, machine_id);
+        assert!(binding.capabilities.supports_durable_app_ack());
+        assert_eq!(binding.capabilities.kem_public_key, runtime_key);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn card_import_sets_requested_trust_for_new_contact() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
         let target_kp = crate::identity::AgentKeypair::generate()?;

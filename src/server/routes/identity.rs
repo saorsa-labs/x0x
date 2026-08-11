@@ -675,13 +675,12 @@ pub(in crate::server) async fn import_agent_card(
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                capability_store.insert(
+                inserted_dm_capability = capability_store.insert_from_card(
                     agent_id,
                     x0x::identity::MachineId(machine_id_bytes),
                     caps,
                     x0x::dm_capability::now_unix_ms(),
                 );
-                inserted_dm_capability = true;
             }
         }
     }

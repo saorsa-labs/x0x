@@ -264,6 +264,46 @@ impl CapabilityStore {
         );
     }
 
+    /// Insert capability material imported from an agent card unless it would
+    /// lower the protocol version of a live runtime advert.
+    ///
+    /// Agent cards remain useful for first contact and refresh same-version
+    /// KEM/machine material, but current cards advertise v1 even when the live
+    /// daemon has published a signed v2 durable-ACK advert. Treating card import
+    /// time as a fresher advert timestamp would otherwise replace that v2
+    /// binding and make strict product sends fail until the next mesh refresh.
+    /// Returns `true` when the card material was inserted.
+    pub fn insert_from_card(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        capabilities: DmCapabilities,
+        imported_at_unix_ms: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if let Some(existing) = inner.get(agent_id.as_bytes()) {
+            let existing_is_live = now.duration_since(existing.seen_at) <= self.ttl;
+            if existing_is_live
+                && existing.capabilities.max_protocol_version > capabilities.max_protocol_version
+            {
+                return false;
+            }
+        }
+        inner.insert(
+            *agent_id.as_bytes(),
+            CachedAdvert {
+                capabilities,
+                machine_id: *machine_id.as_bytes(),
+                seen_at: now,
+                created_at_unix_ms: imported_at_unix_ms,
+            },
+        );
+        true
+    }
+
     /// Arm one deterministic cache miss for an authenticated daemon test.
     ///
     /// The next lookup for `agent_id` removes any cached advert and returns
@@ -383,6 +423,59 @@ mod tests {
             !got.gossip_inbox,
             "fresher advert must win regardless of content"
         );
+    }
+
+    #[test]
+    fn v1_card_cannot_downgrade_live_v2_runtime_binding() {
+        let store = CapabilityStore::new();
+        let agent_id = AgentId([0x71; 32]);
+        let runtime_machine = MachineId([0x72; 32]);
+        let runtime_key = vec![0x73; 1184];
+        store.insert(
+            agent_id,
+            runtime_machine,
+            DmCapabilities::v2_durable_gossip_ready(runtime_key.clone()),
+            1_000,
+        );
+
+        assert!(!store.insert_from_card(
+            agent_id,
+            MachineId([0x74; 32]),
+            DmCapabilities::v1_gossip_ready(vec![0x75; 1184]),
+            2_000,
+        ));
+
+        let binding = store.lookup_binding(&agent_id).expect("runtime binding");
+        assert_eq!(binding.machine_id, runtime_machine);
+        assert!(binding.capabilities.supports_durable_app_ack());
+        assert_eq!(binding.capabilities.kem_public_key, runtime_key);
+    }
+
+    #[test]
+    fn repeated_v1_card_refreshes_card_capability_binding() {
+        let store = CapabilityStore::new();
+        let agent_id = AgentId([0x81; 32]);
+        let first_machine = MachineId([0x82; 32]);
+        let refreshed_machine = MachineId([0x83; 32]);
+        assert!(store.insert_from_card(
+            agent_id,
+            first_machine,
+            DmCapabilities::v1_gossip_ready(vec![0x84; 1184]),
+            1_000,
+        ));
+        assert!(store.insert_from_card(
+            agent_id,
+            refreshed_machine,
+            DmCapabilities::v1_gossip_ready(vec![0x85; 1184]),
+            2_000,
+        ));
+
+        let binding = store
+            .lookup_binding(&agent_id)
+            .expect("refreshed card binding");
+        assert_eq!(binding.machine_id, refreshed_machine);
+        assert_eq!(binding.capabilities.max_protocol_version, 1);
+        assert_eq!(binding.capabilities.kem_public_key, vec![0x85; 1184]);
     }
 
     #[test]
