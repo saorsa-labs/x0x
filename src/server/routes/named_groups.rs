@@ -21085,6 +21085,85 @@ mod tests {
         Ok((state, dir))
     }
 
+    fn group_redelivery_loopback_network_config() -> x0x::network::NetworkConfig {
+        x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback address literal")),
+            bootstrap_nodes: Vec::new(),
+            port_mapping_enabled: false,
+            ..x0x::network::NetworkConfig::default()
+        }
+    }
+
+    fn normalize_group_redelivery_loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        if addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                addr.port(),
+            )
+        } else {
+            addr
+        }
+    }
+
+    fn group_redelivery_discovered_agent(
+        agent: &Agent,
+        addr: std::net::SocketAddr,
+    ) -> x0x::DiscoveredAgent {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time after Unix epoch")
+            .as_secs();
+        x0x::DiscoveredAgent {
+            agent_id: agent.agent_id(),
+            machine_id: agent.machine_id(),
+            user_id: None,
+            addresses: vec![addr],
+            announced_at: now_secs,
+            last_seen: now_secs,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+        }
+    }
+
+    async fn networked_public_message_history_test_state(
+        root: &FsPath,
+        name: &str,
+    ) -> Result<(
+        Arc<AppState>,
+        Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
+    )> {
+        let data_dir = root.join(name);
+        tokio::fs::create_dir_all(&data_dir).await?;
+        let history = x0x::history::HistoryConfig {
+            enabled: true,
+            db_path: Some(data_dir.join("history.db")),
+            ..x0x::history::HistoryConfig::default()
+        };
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(group_redelivery_loopback_network_config())
+                .with_history(history)
+                .build()
+                .await?,
+        );
+        let kem = Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?);
+        let state = secure_endpoint_test_state_at(&data_dir, agent).await?;
+        Ok((state, kem))
+    }
+
     async fn secure_endpoint_test_state_at(
         data_dir: &FsPath,
         agent: Arc<Agent>,
@@ -21833,6 +21912,219 @@ mod tests {
         )?;
         assert_eq!(retained.signature, original_signature);
         assert_eq!(retained, msg);
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn redelivery_endpoint_waits_for_remote_durable_group_commit_over_raw_transport(
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (sender, sender_kem) =
+            networked_public_message_history_test_state(dir.path(), "redelivery-sender").await?;
+        let (recipient, recipient_kem) =
+            networked_public_message_history_test_state(dir.path(), "redelivery-recipient").await?;
+
+        sender.agent.join_network().await?;
+        recipient.agent.join_network().await?;
+
+        let (recipient_typed_tx, mut recipient_typed_rx) =
+            mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(16);
+        sender
+            .agent
+            .start_dm_inbox(sender_kem, x0x::dm_inbox::DmInboxConfig::default())
+            .await?;
+        recipient
+            .agent
+            .start_dm_inbox(
+                Arc::clone(&recipient_kem),
+                x0x::dm_inbox::DmInboxConfig::default()
+                    .with_typed_payload_route(GROUP_PUBLIC_MESSAGE_DM_PREFIX, recipient_typed_tx),
+            )
+            .await?;
+        let recipient_for_typed = Arc::clone(&recipient);
+        let recipient_typed_task = tokio::spawn(async move {
+            while let Some(typed) = recipient_typed_rx.recv().await {
+                handle_group_public_typed_payload(&recipient_for_typed, typed).await;
+            }
+        });
+
+        let sender_network = sender.agent.network().context("sender network")?.clone();
+        let recipient_network = recipient
+            .agent
+            .network()
+            .context("recipient network")?
+            .clone();
+        let sender_addr = normalize_group_redelivery_loopback(
+            sender_network
+                .bound_addr()
+                .await
+                .context("sender bound address")?,
+        );
+        let recipient_addr = normalize_group_redelivery_loopback(
+            recipient_network
+                .bound_addr()
+                .await
+                .context("recipient bound address")?,
+        );
+        let sender_peer = ant_quic::PeerId(sender.agent.machine_id().0);
+        let recipient_peer = ant_quic::PeerId(recipient.agent.machine_id().0);
+        let connected = sender_network.connect_addr(recipient_addr).await?;
+        assert_eq!(connected.0, recipient.agent.machine_id().0);
+        let connected_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < connected_deadline {
+            if sender_network.is_connected(&recipient_peer).await
+                && recipient_network.is_connected(&sender_peer).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(sender_network.is_connected(&recipient_peer).await);
+        assert!(recipient_network.is_connected(&sender_peer).await);
+
+        sender
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &recipient.agent,
+                recipient_addr,
+            ))
+            .await;
+        recipient
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &sender.agent,
+                sender_addr,
+            ))
+            .await;
+        sender.agent.insert_capability_for_testing(
+            recipient.agent.agent_id(),
+            recipient.agent.machine_id(),
+            x0x::dm::DmCapabilities::v3_threaded_durable_gossip_ready(
+                recipient_kem.public_bytes.clone(),
+            ),
+        );
+
+        let group_id = "transport-durable-redelivery";
+        let sender_hex = hex::encode(sender.agent.agent_id().as_bytes());
+        let recipient_hex = hex::encode(recipient.agent.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Transport durable redelivery".to_string(),
+            String::new(),
+            sender.agent.agent_id(),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(sender_hex),
+            Some("recipient".to_string()),
+        );
+        group.seal_commit(sender.agent.identity().agent_keypair(), now_millis_u64())?;
+        sender
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group.clone());
+        recipient
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group.clone());
+
+        let thread_root = "33".repeat(32);
+        let message = x0x::groups::GroupPublicMessage::sign(
+            group_id.to_string(),
+            group.state_hash,
+            group.state_revision,
+            sender.agent.identity().agent_keypair(),
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "wake @X through the authenticated application ACK".to_string(),
+            now_millis_u64(),
+            Some(thread_root.clone()),
+            Some(thread_root),
+        )?;
+        let msg_id = message.msg_id();
+        let artifact = serde_json::to_vec(&message)?;
+        assert!(
+            persist_outbound_group_public_history(&sender, &message, &artifact)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            "sender must retain the exact signed artifact before redelivery"
+        );
+        let mut recipient_live = recipient.public_message_live_tx.subscribe();
+
+        let (status, body) = tokio::time::timeout(
+            Duration::from_secs(15),
+            redeliver_response(
+                Arc::clone(&sender),
+                group_id,
+                &msg_id,
+                recipient_hex.clone(),
+            ),
+        )
+        .await
+        .context("first redelivery endpoint deadline")??;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "endpoint body: {body}; sender DM: {:?}; recipient DM: {:?}",
+            sender.agent.direct_messaging().diagnostics_snapshot(),
+            recipient.agent.direct_messaging().diagnostics_snapshot(),
+        );
+        assert_eq!(body["ok"], true);
+        assert_eq!(body["group_id"], group_id);
+        assert_eq!(body["msg_id"], msg_id);
+        assert_eq!(body["agent_id"], recipient_hex);
+        assert_eq!(body["outcome"], "committed");
+        assert_eq!(body["path"], "raw_quic_acked");
+
+        let live_message = tokio::time::timeout(Duration::from_secs(1), recipient_live.recv())
+            .await
+            .context("recipient live delivery after strict ACK")??;
+        assert_eq!(live_message.msg_id, message.msg_id());
+        assert_eq!(live_message.origin, message.author_agent_id);
+        assert_eq!(live_message.payload, message.body.as_bytes());
+        assert_eq!(live_message.thread_root, message.thread_root);
+        assert_eq!(live_message.thread_parent, message.thread_parent);
+        let rows = public_send_history_rows(&recipient, group_id).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].record.signed_artifact.as_deref(),
+            Some(artifact.as_slice())
+        );
+
+        let (duplicate_status, duplicate_body) = tokio::time::timeout(
+            Duration::from_secs(15),
+            redeliver_response(sender.clone(), group_id, &msg_id, recipient_hex),
+        )
+        .await
+        .context("duplicate redelivery endpoint deadline")??;
+        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(duplicate_body["outcome"], "committed");
+        assert_eq!(duplicate_body["path"], "raw_quic_acked");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), recipient_live.recv())
+                .await
+                .is_err(),
+            "exact duplicate must not emit a second live event"
+        );
+        let duplicate_rows = public_send_history_rows(&recipient, group_id).await?;
+        assert_eq!(duplicate_rows.len(), 1);
+        assert_eq!(
+            duplicate_rows[0].record.signed_artifact.as_deref(),
+            Some(artifact.as_slice())
+        );
+        let diagnostics = sender.agent.direct_messaging().diagnostics_snapshot();
+        assert_eq!(diagnostics.stats.outgoing_path_raw_quic, 2);
+        assert_eq!(diagnostics.stats.outgoing_send_succeeded, 2);
+        assert_eq!(diagnostics.stats.outgoing_send_failed, 0);
+
+        recipient_typed_task.abort();
+        sender.agent.shutdown().await;
+        recipient.agent.shutdown().await;
         Ok(())
     }
 
