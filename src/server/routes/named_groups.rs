@@ -9556,14 +9556,26 @@ pub(in crate::server) async fn redeliver_group_public_message(
         .into_response();
     }
 
+    let logical_id = match group_public_message_logical_id(&msg) {
+        Ok(logical_id) => logical_id,
+        Err(error) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to derive group redelivery identity: {error}"),
+            )
+            .into_response();
+        }
+    };
     let payload = encode_group_public_message_direct_artifact(&artifact);
     let raw_started = Instant::now();
     let receipt = match state
         .agent
-        .send_direct_with_config(
+        .send_direct_with_config_and_thread(
             &target,
             payload.clone(),
             group_public_message_raw_delivery_config(),
+            None,
+            Some(logical_id.clone()),
         )
         .await
     {
@@ -9579,10 +9591,12 @@ pub(in crate::server) async fn redeliver_group_public_message(
                 error = %raw_error,
                 "durable group redelivery raw attempt failed; starting bounded gossip repair"
             );
-            let gossip = state.agent.send_direct_with_config(
+            let gossip = state.agent.send_direct_with_config_and_thread(
                 &target,
                 payload,
                 group_public_message_redelivery_gossip_config(),
+                None,
+                Some(logical_id),
             );
             match tokio::time::timeout(GROUP_PUBLIC_REDELIVERY_GOSSIP_DEADLINE, gossip).await {
                 Ok(Ok(receipt)) => receipt,
@@ -9676,6 +9690,8 @@ fn group_public_history_record(
             x0x::history::Provenance::VerifiedEnvelope
         },
         replace_key: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     }
 }
 
@@ -9838,6 +9854,8 @@ fn record_mls_history(
         sig_context: None,
         provenance: x0x::history::Provenance::LocalAppDecrypt,
         replace_key: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     });
 }
 
@@ -9882,6 +9900,12 @@ fn encode_group_public_message_direct_artifact(artifact: &[u8]) -> Vec<u8> {
     payload.extend_from_slice(GROUP_PUBLIC_MESSAGE_DM_PREFIX);
     payload.extend_from_slice(artifact);
     payload
+}
+
+fn group_public_message_logical_id(
+    msg: &x0x::groups::GroupPublicMessage,
+) -> std::result::Result<x0x::dm::DmLogicalId, String> {
+    x0x::dm::DmLogicalId::parse(&format!("group-public:{}", msg.msg_id()))
 }
 
 async fn ingest_group_public_message_direct_payload(
@@ -9948,6 +9972,85 @@ async fn retained_exact_group_public_artifact(
     .map_err(|error| format!("exact group artifact lookup task failed: {error}"))?
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableGroupRequestLookup {
+    Missing,
+    Exact,
+    Conflict,
+}
+
+/// Resolve one authenticated DM request against every durable group scope.
+///
+/// The DM replay cache is intentionally in-memory, so a daemon restart loses
+/// it. The accepted group row therefore retains the authenticated transport
+/// sender and outer request id separately from the signed message author. A
+/// reused request id is an exact duplicate only when the verbatim signed
+/// artifact and its group/thread/application bindings are all unchanged.
+async fn durable_group_logical_request(
+    history: &x0x::history::HistoryHandle,
+    outer_sender: AgentId,
+    request_id: [u8; 16],
+    stable_group_id: &str,
+    msg: &x0x::groups::GroupPublicMessage,
+    artifact: &[u8],
+) -> std::result::Result<DurableGroupRequestLookup, String> {
+    let store = Arc::clone(history.store());
+    let outer_sender = hex::encode(outer_sender.as_bytes());
+    let stable_group_id = stable_group_id.to_string();
+    let msg = msg.clone();
+    let artifact = artifact.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut before_id = None;
+        let mut found_exact = false;
+        loop {
+            let rows = store
+                .query(&x0x::history::HistoryQuery {
+                    scope_kind: Some(x0x::history::Scope::Group(String::new()).kind()),
+                    limit: x0x::history::MAX_QUERY_LIMIT,
+                    before_id,
+                    ..Default::default()
+                })
+                .map_err(|error| error.to_string())?;
+            for row in &rows {
+                if row.record.ingress_sender_agent.as_deref() != Some(outer_sender.as_str())
+                    || row.record.logical_request_id != Some(request_id)
+                {
+                    continue;
+                }
+                let stored_group_id = match &row.record.scope {
+                    x0x::history::Scope::Group(group_id) => group_id,
+                    _ => return Ok(DurableGroupRequestLookup::Conflict),
+                };
+                let exact = row.record.validate().is_ok()
+                    && row.record.provenance == x0x::history::Provenance::VerifiedEnvelope
+                    && row.record.direction == x0x::history::Direction::Inbound
+                    && stored_group_id == &stable_group_id
+                    && row.record.author_agent.as_deref() == Some(msg.author_agent_id.as_str())
+                    && row.record.payload == msg.body.as_bytes()
+                    && row.record.signed_artifact.as_deref() == Some(artifact.as_slice())
+                    && row.record.thread_root == msg.thread_root
+                    && row.record.thread_parent == msg.thread_parent
+                    && serde_json::from_slice::<x0x::groups::GroupPublicMessage>(&artifact)
+                        .is_ok_and(|decoded| decoded == msg);
+                if !exact {
+                    return Ok(DurableGroupRequestLookup::Conflict);
+                }
+                found_exact = true;
+            }
+            if rows.len() < x0x::history::MAX_QUERY_LIMIT {
+                return Ok(if found_exact {
+                    DurableGroupRequestLookup::Exact
+                } else {
+                    DurableGroupRequestLookup::Missing
+                });
+            }
+            before_id = rows.last().map(|row| row.id);
+        }
+    })
+    .await
+    .map_err(|error| format!("durable group request lookup task failed: {error}"))?
+}
+
 /// Strict typed-DM admission for a signed group artifact. This is the
 /// application completion boundary consumed by the durable DM inbox: success
 /// means the exact group row is durably Inserted or already exists byte-for-
@@ -9956,6 +10059,7 @@ async fn retained_exact_group_public_artifact(
 async fn ingest_group_public_message_durable(
     state: &AppState,
     outer_sender: AgentId,
+    request_id: [u8; 16],
     msg: x0x::groups::GroupPublicMessage,
     artifact: &[u8],
 ) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
@@ -10037,7 +10141,31 @@ async fn ingest_group_public_message_durable(
         .agent
         .history()
         .ok_or_else(|| "durable group history is disabled".to_string())?;
-    let record = group_public_history_record(state, &msg, artifact.to_vec());
+    match durable_group_logical_request(
+        history,
+        outer_sender,
+        request_id,
+        &stable_id,
+        &msg,
+        artifact,
+    )
+    .await?
+    {
+        DurableGroupRequestLookup::Exact => {
+            return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+        }
+        DurableGroupRequestLookup::Conflict => {
+            return Err(
+                "authenticated group request id conflicts with its durable artifact binding"
+                    .to_string(),
+            );
+        }
+        DurableGroupRequestLookup::Missing => {}
+    }
+
+    let mut record = group_public_history_record(state, &msg, artifact.to_vec());
+    record.ingress_sender_agent = Some(outer_sender_hex);
+    record.logical_request_id = Some(request_id);
     let outcome = history
         .record_committed(record)
         .await
@@ -10058,6 +10186,21 @@ async fn ingest_group_public_message_durable(
             ));
         }
     };
+    if durable_group_logical_request(
+        history,
+        outer_sender,
+        request_id,
+        &stable_id,
+        &msg,
+        artifact,
+    )
+    .await?
+        != DurableGroupRequestLookup::Exact
+    {
+        return Err(
+            "durable group row did not retain the authenticated request binding".to_string(),
+        );
+    }
 
     state
         .groups_diagnostics
@@ -10116,7 +10259,14 @@ pub(in crate::server) async fn handle_group_public_typed_payload(
     );
     if let Some(completion) = completion {
         let result = if typed.verified {
-            ingest_group_public_message_durable(state, typed.sender, msg, artifact).await
+            ingest_group_public_message_durable(
+                state,
+                typed.sender,
+                typed.request_id,
+                msg,
+                artifact,
+            )
+            .await
         } else {
             Err("typed group payload is not verified".to_string())
         };
@@ -10212,6 +10362,17 @@ fn spawn_group_public_message_delivery(
             return;
         }
     };
+    let logical_id = match group_public_message_logical_id(msg) {
+        Ok(logical_id) => logical_id,
+        Err(error) => {
+            tracing::error!(
+                group_id = %LogHexId::group(&msg.group_id),
+                %error,
+                "failed to derive public group direct-delivery identity"
+            );
+            return;
+        }
+    };
     let agent = Arc::clone(&state.agent);
     let recipient_label = recipient_hex.to_string();
     let group_id = msg.group_id.clone();
@@ -10232,10 +10393,12 @@ fn spawn_group_public_message_delivery(
         );
         let raw_started = Instant::now();
         match agent
-            .send_direct_with_config(
+            .send_direct_with_config_and_thread(
                 &recipient,
                 payload.clone(),
                 group_public_message_raw_delivery_config(),
+                None,
+                Some(logical_id.clone()),
             )
             .await
         {
@@ -10277,10 +10440,12 @@ fn spawn_group_public_message_delivery(
         );
         let repair_started = Instant::now();
         match agent
-            .send_direct_with_config(
+            .send_direct_with_config_and_thread(
                 &recipient,
                 payload,
                 group_public_message_gossip_repair_config(),
+                None,
+                Some(logical_id),
             )
             .await
         {
@@ -15771,6 +15936,8 @@ pub(in crate::server) async fn import_group_card(
                 sig_context: None,
                 provenance: x0x::history::Provenance::VerifiedEnvelope,
                 replace_key: Some(format!("group-card:{group_id}")),
+                ingress_sender_agent: None,
+                logical_request_id: None,
             });
         }
     }
@@ -21085,6 +21252,63 @@ mod tests {
         Ok((state, dir))
     }
 
+    async fn restartable_public_message_history_test_state(
+        data_dir: &FsPath,
+    ) -> Result<Arc<AppState>> {
+        tokio::fs::create_dir_all(data_dir).await?;
+        let history = x0x::history::HistoryConfig {
+            enabled: true,
+            db_path: Some(data_dir.join("history.db")),
+            ..x0x::history::HistoryConfig::default()
+        };
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_history(history)
+                .build()
+                .await?,
+        );
+        secure_endpoint_test_state_at(data_dir, agent).await
+    }
+
+    fn durable_group_request_test_group(
+        state: &AppState,
+        group_id: &str,
+        courier: AgentId,
+        author: AgentId,
+    ) -> Result<x0x::groups::GroupInfo> {
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let courier_hex = hex::encode(courier.as_bytes());
+        let author_hex = hex::encode(author.as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Durable group request".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            courier_hex,
+            x0x::groups::GroupRole::Member,
+            Some(local_hex.clone()),
+            Some("courier".to_string()),
+        );
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            author_hex,
+            x0x::groups::GroupRole::Member,
+            Some(local_hex),
+            Some("author".to_string()),
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        Ok(group)
+    }
+
     fn group_redelivery_loopback_network_config() -> x0x::network::NetworkConfig {
         x0x::network::NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback address literal")),
@@ -21353,6 +21577,30 @@ mod tests {
             .into_response(),
         )
         .await
+    }
+
+    async fn strict_group_typed_result(
+        state: &Arc<AppState>,
+        sender: AgentId,
+        request_id: [u8; 16],
+        artifact: &[u8],
+    ) -> Result<x0x::dm_inbox::DmTypedPayloadCompletionResult> {
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        handle_group_public_typed_payload(
+            state,
+            x0x::dm_inbox::DmTypedPayload {
+                sender,
+                machine_id: x0x::identity::MachineId([0x71_u8; 32]),
+                request_id,
+                payload: encode_group_public_message_direct_artifact(artifact),
+                verified: true,
+                trust_decision: Some(x0x::trust::TrustDecision::Accept),
+                received_at_unix_ms: now_millis_u64(),
+                completion: Some(completion_tx),
+            },
+        )
+        .await;
+        Ok(completion_rx.await?)
     }
 
     fn clear_public_send_background_attempts(group_id: &str) {
@@ -21857,6 +22105,7 @@ mod tests {
             x0x::dm_inbox::DmTypedPayload {
                 sender: author.agent_id(),
                 machine_id: x0x::identity::MachineId([7_u8; 32]),
+                request_id: [0x51_u8; 16],
                 payload: payload.clone(),
                 verified: true,
                 trust_decision: None,
@@ -21878,6 +22127,7 @@ mod tests {
             x0x::dm_inbox::DmTypedPayload {
                 sender: author.agent_id(),
                 machine_id: x0x::identity::MachineId([7_u8; 32]),
+                request_id: [0x51_u8; 16],
                 payload,
                 verified: true,
                 trust_decision: None,
@@ -21912,6 +22162,196 @@ mod tests {
         )?;
         assert_eq!(retained.signature, original_signature);
         assert_eq!(retained, msg);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn same_authenticated_group_request_is_exact_duplicate_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("exact-request-restart");
+        let first = restartable_public_message_history_test_state(&data_dir).await?;
+        let first_local_id = first.agent.agent_id();
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        let author = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "exact-request-restart";
+        let group = durable_group_request_test_group(
+            &first,
+            group_id,
+            courier.agent_id(),
+            author.agent_id(),
+        )?;
+        first
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group.clone());
+        let thread_root = "81".repeat(32);
+        let message = x0x::groups::GroupPublicMessage::sign(
+            group_id.to_string(),
+            group.state_hash.clone(),
+            group.state_revision,
+            &author,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "persist this exact authenticated request".to_string(),
+            now_millis_u64(),
+            Some(thread_root.clone()),
+            Some(thread_root),
+        )?;
+        let artifact = serde_json::to_vec(&message)?;
+        let request_id = [0x82_u8; 16];
+        let mut first_live = first.public_message_live_tx.subscribe();
+        assert_eq!(
+            strict_group_typed_result(&first, courier.agent_id(), request_id, &artifact)
+                .await?
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Inserted
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), first_live.recv()).await??;
+        let first_rows = public_send_history_rows(&first, group_id).await?;
+        assert_eq!(first_rows.len(), 1);
+        assert_eq!(
+            first_rows[0].record.ingress_sender_agent.as_deref(),
+            Some(hex::encode(courier.agent_id().as_bytes()).as_str())
+        );
+        assert_eq!(first_rows[0].record.logical_request_id, Some(request_id));
+
+        drop(first_live);
+        first.exec_service.shutdown().await;
+        first.agent.shutdown().await;
+        drop(first);
+
+        let restarted = restartable_public_message_history_test_state(&data_dir).await?;
+        assert_eq!(restarted.agent.agent_id(), first_local_id);
+        restarted
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group);
+        let mut restarted_live = restarted.public_message_live_tx.subscribe();
+        assert_eq!(
+            strict_group_typed_result(&restarted, courier.agent_id(), request_id, &artifact)
+                .await?
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), restarted_live.recv())
+                .await
+                .is_err(),
+            "cold exact retry must not publish another live event"
+        );
+        assert!(
+            restarted.public_messages.read().await.is_empty(),
+            "cold exact retry must not repopulate the volatile message cache"
+        );
+        let restarted_rows = public_send_history_rows(&restarted, group_id).await?;
+        assert_eq!(restarted_rows.len(), 1);
+        assert_eq!(
+            restarted_rows[0].record.signed_artifact.as_deref(),
+            Some(artifact.as_slice())
+        );
+        restarted.exec_service.shutdown().await;
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn mutated_authenticated_group_request_is_rejected_after_restart() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("mutated-request-restart");
+        let first = restartable_public_message_history_test_state(&data_dir).await?;
+        let courier = x0x::identity::AgentKeypair::generate()?;
+        let author = x0x::identity::AgentKeypair::generate()?;
+        let group_id = "mutated-request-restart";
+        let group = durable_group_request_test_group(
+            &first,
+            group_id,
+            courier.agent_id(),
+            author.agent_id(),
+        )?;
+        first
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group.clone());
+        let thread_root = "91".repeat(32);
+        let accepted = x0x::groups::GroupPublicMessage::sign(
+            group_id.to_string(),
+            group.state_hash.clone(),
+            group.state_revision,
+            &author,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "accepted artifact".to_string(),
+            now_millis_u64(),
+            Some(thread_root.clone()),
+            Some(thread_root.clone()),
+        )?;
+        let accepted_artifact = serde_json::to_vec(&accepted)?;
+        let request_id = [0x92_u8; 16];
+        let mut first_live = first.public_message_live_tx.subscribe();
+        assert_eq!(
+            strict_group_typed_result(&first, courier.agent_id(), request_id, &accepted_artifact,)
+                .await?
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Inserted
+        );
+        let _ = tokio::time::timeout(Duration::from_secs(1), first_live.recv()).await??;
+        drop(first_live);
+        first.exec_service.shutdown().await;
+        first.agent.shutdown().await;
+        drop(first);
+
+        let restarted = restartable_public_message_history_test_state(&data_dir).await?;
+        restarted
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group.clone());
+        let mutated_thread_root = "93".repeat(32);
+        let mutated = x0x::groups::GroupPublicMessage::sign(
+            group_id.to_string(),
+            group.state_hash,
+            group.state_revision,
+            &author,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "mutated artifact under the same outer request".to_string(),
+            now_millis_u64().saturating_add(1),
+            Some(mutated_thread_root.clone()),
+            Some(mutated_thread_root),
+        )?;
+        let mutated_artifact = serde_json::to_vec(&mutated)?;
+        let mut restarted_live = restarted.public_message_live_tx.subscribe();
+        let error = strict_group_typed_result(
+            &restarted,
+            courier.agent_id(),
+            request_id,
+            &mutated_artifact,
+        )
+        .await?
+        .expect_err("same authenticated request id must reject a changed artifact");
+        assert!(error.contains("conflicts with its durable artifact binding"));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), restarted_live.recv())
+                .await
+                .is_err(),
+            "conflicting cold retry must not publish a live event"
+        );
+        assert!(restarted.public_messages.read().await.is_empty());
+        let rows = public_send_history_rows(&restarted, group_id).await?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].record.signed_artifact.as_deref(),
+            Some(accepted_artifact.as_slice())
+        );
+        assert_ne!(
+            rows[0].record.signed_artifact.as_deref(),
+            Some(mutated_artifact.as_slice())
+        );
+        restarted.exec_service.shutdown().await;
+        restarted.agent.shutdown().await;
         Ok(())
     }
 
@@ -22102,7 +22542,13 @@ mod tests {
         )
         .await
         .context("duplicate redelivery endpoint deadline")??;
-        assert_eq!(duplicate_status, StatusCode::OK);
+        assert_eq!(
+            duplicate_status,
+            StatusCode::OK,
+            "duplicate endpoint body: {duplicate_body}; sender DM: {:?}; recipient DM: {:?}",
+            sender.agent.direct_messaging().diagnostics_snapshot(),
+            recipient.agent.direct_messaging().diagnostics_snapshot(),
+        );
         assert_eq!(duplicate_body["outcome"], "committed");
         assert_eq!(duplicate_body["path"], "raw_quic_acked");
         assert!(
@@ -27961,6 +28407,8 @@ mod tests {
                 ),
                 provenance: Provenance::VerifiedEnvelope,
                 replace_key: None,
+                ingress_sender_agent: None,
+                logical_request_id: None,
             };
             record.validate().expect(
                 "HistoryRecord produced by record_group_public_history must pass validate()",

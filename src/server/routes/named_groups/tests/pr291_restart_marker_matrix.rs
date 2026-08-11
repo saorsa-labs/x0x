@@ -1655,6 +1655,7 @@ async fn pr291_expired_reoffer_exact_envelope_does_not_refresh_clock() {
     let dm = DmTypedPayload {
         sender: requester_kp.agent_id(),
         machine_id: MachineId([0u8; 32]),
+        request_id: [0u8; 16],
         payload: dm_payload,
         verified: true,
         trust_decision: None,
@@ -1732,6 +1733,7 @@ async fn offer_via_handler(
     let dm = DmTypedPayload {
         sender: requester_kp.agent_id(),
         machine_id: MachineId([0u8; 32]),
+        request_id: [0u8; 16],
         payload: dm_payload,
         verified: true,
         trust_decision: None,
