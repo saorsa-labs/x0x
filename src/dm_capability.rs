@@ -168,6 +168,16 @@ impl CapabilityStore {
         self.lookup_binding_at(agent_id, Instant::now())
     }
 
+    /// Strict-send lookup plus proof that the disabled-by-default deterministic
+    /// test control forced this exact miss. Production lookups always return
+    /// `false`, preserving the refresh worker's early-cache optimization.
+    pub(crate) fn lookup_binding_with_refresh_proof(
+        &self,
+        agent_id: &AgentId,
+    ) -> (Option<CapabilityBinding>, bool) {
+        self.lookup_binding_at_with_refresh_proof(agent_id, Instant::now())
+    }
+
     /// Look up a peer's capability as of `now`.
     ///
     /// Test seam over [`lookup`](Self::lookup): production callers always go
@@ -182,26 +192,39 @@ impl CapabilityStore {
 
     /// Testable clock seam for [`Self::lookup_binding`].
     pub fn lookup_binding_at(&self, agent_id: &AgentId, now: Instant) -> Option<CapabilityBinding> {
+        self.lookup_binding_at_with_refresh_proof(agent_id, now).0
+    }
+
+    fn lookup_binding_at_with_refresh_proof(
+        &self,
+        agent_id: &AgentId,
+        now: Instant,
+    ) -> (Option<CapabilityBinding>, bool) {
         let forced_miss = self
             .forced_test_misses
             .lock()
             .is_ok_and(|mut forced| forced.remove(agent_id.as_bytes()));
         let Ok(mut inner) = self.inner.lock() else {
-            return None;
+            return (None, forced_miss);
         };
         if forced_miss {
             inner.remove(agent_id.as_bytes());
-            return None;
+            return (None, true);
         }
-        let entry = inner.get(agent_id.as_bytes())?;
+        let Some(entry) = inner.get(agent_id.as_bytes()) else {
+            return (None, false);
+        };
         if now.duration_since(entry.seen_at) > self.ttl {
             inner.remove(agent_id.as_bytes());
-            return None;
+            return (None, false);
         }
-        Some(CapabilityBinding {
-            capabilities: entry.capabilities.clone(),
-            machine_id: MachineId(entry.machine_id),
-        })
+        (
+            Some(CapabilityBinding {
+                capabilities: entry.capabilities.clone(),
+                machine_id: MachineId(entry.machine_id),
+            }),
+            false,
+        )
     }
 
     /// Insert / refresh a cache entry.
@@ -316,12 +339,16 @@ mod tests {
         // A startup-burst advert racing between control arming and strict send
         // cannot defeat the deterministic next-lookup miss.
         store.insert(agent_id, machine_id, caps.clone(), 2_000);
-        assert!(store.lookup_binding(&agent_id).is_none());
+        let (binding, forced_refresh) = store.lookup_binding_with_refresh_proof(&agent_id);
+        assert!(binding.is_none());
+        assert!(forced_refresh);
         store.insert(agent_id, machine_id, caps, 3_000);
+        let (binding, forced_refresh) = store.lookup_binding_with_refresh_proof(&agent_id);
         assert!(
-            store.lookup_binding(&agent_id).is_some(),
+            binding.is_some(),
             "the forced miss must be consumed exactly once"
         );
+        assert!(!forced_refresh);
     }
 
     /// Gossip delivers adverts out of order. A daemon publishes a `pending`

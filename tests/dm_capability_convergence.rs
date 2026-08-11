@@ -28,6 +28,7 @@ async fn strict_send(
     assert!(status.is_success(), "strict send failed ({status}): {body}");
     assert_eq!(body["ok"], true);
     assert_eq!(body["path"], "gossip_inbox");
+    assert_eq!(body["retries_used"], 0);
     body
 }
 

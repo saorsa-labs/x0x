@@ -2689,6 +2689,7 @@ async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    force_refresh: bool,
     fallback_at: tokio::time::Instant,
     deadline: tokio::time::Instant,
     mut publish: impl FnMut(
@@ -2697,7 +2698,10 @@ async fn run_strict_capability_refresh(
         Box<dyn std::future::Future<Output = error::NetworkResult<()>> + Send>,
     >,
 ) {
-    if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
+    if !force_refresh
+        && capability_binding_supports_durable_ack(
+            capability_store.lookup_binding(&recipient).as_ref(),
+        )
     {
         return;
     }
@@ -4486,7 +4490,11 @@ impl Agent {
     /// strict product sends after a TTL-bounded cache miss: success semantics
     /// remain unchanged, while a daemon whose startup-only solicitation was
     /// lost no longer stays wedged until the five-minute advert cadence.
-    async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
+    async fn refresh_strict_dm_capability(
+        &self,
+        recipient: identity::AgentId,
+        force_refresh: bool,
+    ) {
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
@@ -4513,6 +4521,7 @@ impl Agent {
                     recipient,
                     capability_store,
                     shutdown_token,
+                    force_refresh,
                     fallback_at,
                     deadline,
                     publisher,
@@ -4789,11 +4798,12 @@ impl Agent {
             return Ok(receipt);
         }
 
-        let mut advert_binding = self.capability_store.lookup_binding(to);
+        let (mut advert_binding, force_refresh) =
+            self.capability_store.lookup_binding_with_refresh_proof(to);
         if config.require_durable_app_ack
             && !capability_binding_supports_durable_ack(advert_binding.as_ref())
         {
-            self.refresh_strict_dm_capability(*to).await;
+            self.refresh_strict_dm_capability(*to, force_refresh).await;
             advert_binding = self.capability_store.lookup_binding(to);
         }
         let advert_cap = advert_binding
@@ -17793,11 +17803,15 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
 
     let first_agent = std::sync::Arc::clone(&agent);
     let first_waiter = tokio::spawn(async move {
-        first_agent.refresh_strict_dm_capability(recipient).await;
+        first_agent
+            .refresh_strict_dm_capability(recipient, false)
+            .await;
     });
     let second_agent = std::sync::Arc::clone(&agent);
     let second_waiter = tokio::spawn(async move {
-        second_agent.refresh_strict_dm_capability(recipient).await;
+        second_agent
+            .refresh_strict_dm_capability(recipient, false)
+            .await;
     });
 
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), request_sub.recv())
@@ -17829,7 +17843,7 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
     let replacement_agent = std::sync::Arc::clone(&agent);
     let replacement_waiter = tokio::spawn(async move {
         replacement_agent
-            .refresh_strict_dm_capability(recipient)
+            .refresh_strict_dm_capability(recipient, false)
             .await;
     });
     assert!(
@@ -17926,6 +17940,71 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
 }
 
 #[tokio::test]
+async fn forced_miss_proof_bypasses_worker_cache_race_and_publishes_targeted_refresh() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_network_config(network::NetworkConfig::default())
+        .build()
+        .await
+        .expect("agent");
+    let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
+    let mut request_sub = runtime
+        .pubsub()
+        .subscribe(dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string())
+        .await;
+    let recipient = identity::AgentId([0xE1; 32]);
+    let machine_id = identity::MachineId([0xE2; 32]);
+    let capabilities = dm::DmCapabilities::v2_durable_gossip_ready(vec![0xE3; 1184]);
+    agent
+        .capability_store
+        .insert(recipient, machine_id, capabilities.clone(), 1_000);
+    assert!(agent
+        .capability_store
+        .force_miss_once_for_testing(recipient));
+    let (binding, force_refresh) = agent
+        .capability_store
+        .lookup_binding_with_refresh_proof(&recipient);
+    assert!(binding.is_none());
+    assert!(
+        force_refresh,
+        "the strict-send lookup must carry miss proof"
+    );
+
+    // Reproduce the reviewed race: a valid advert lands after strict send's
+    // lookup but before the single-flight worker reaches its cache check.
+    agent
+        .capability_store
+        .insert(recipient, machine_id, capabilities, 2_000);
+    agent
+        .refresh_strict_dm_capability(recipient, force_refresh)
+        .await;
+
+    let request = tokio::time::timeout(std::time::Duration::from_secs(1), request_sub.recv())
+        .await
+        .expect("forced targeted refresh request timeout")
+        .expect("request subscription closed");
+    assert_eq!(
+        request.topic,
+        dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC
+    );
+    assert!(request.verified, "forced refresh request must authenticate");
+    let decoded =
+        dm_capability_service::decode_capability_advert_request(&request.topic, &request.payload)
+            .expect("decode forced targeted request");
+    assert_eq!(
+        decoded,
+        dm_capability_service::DecodedCapabilityAdvertRequest::Targeted {
+            requested_agent_id: recipient,
+        }
+    );
+    assert_eq!(agent.capability_refreshes.len(), 0);
+    agent.shutdown().await;
+}
+
+#[tokio::test]
 async fn capability_refresh_registry_is_hard_bounded_and_reuses_released_slots() {
     let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
     let release_first = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -17994,6 +18073,7 @@ async fn stalled_capability_publish_obeys_caller_deadline_and_cleans_slot() {
                 recipient,
                 capability_store,
                 shutdown,
+                false,
                 fallback_at,
                 deadline,
                 |_| Box::pin(std::future::pending()),
@@ -18038,6 +18118,7 @@ async fn shutdown_aborts_and_drains_worker_stalled_inside_publish() {
                 recipient,
                 capability_store,
                 worker_shutdown,
+                false,
                 fallback_at,
                 deadline,
                 |_| Box::pin(std::future::pending()),
