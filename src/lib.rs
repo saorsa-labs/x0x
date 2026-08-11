@@ -4263,6 +4263,7 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.direct_messaging.record_outgoing_started(*to, None);
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
         // history wiring point. Classify before the send so the payload is
@@ -4276,9 +4277,22 @@ impl Agent {
         } else {
             None
         };
-        let result = self
-            .send_direct_with_config_inner(to, payload, config)
-            .await;
+        let total_deadline = config.raw_quic_receive_ack_timeout;
+        let send = self.send_direct_with_config_inner(to, payload, config);
+        let result = if let Some(deadline) = total_deadline {
+            match tokio::time::timeout(deadline, send).await {
+                Ok(result) => result,
+                Err(_) => {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    Err(dm::DmError::Timeout {
+                        retries: 0,
+                        elapsed: deadline,
+                    })
+                }
+            }
+        } else {
+            send.await
+        };
         if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
             self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
         }
@@ -4328,7 +4342,6 @@ impl Agent {
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
         if *to == self.identity.agent_id() {
-            self.direct_messaging.record_outgoing_started(*to, None);
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::PayloadTooLarge {
@@ -4422,7 +4435,7 @@ impl Agent {
             config.timeout_per_attempt = dm::dm_attempt_timeout(rtt_hint_ms);
         }
         self.direct_messaging
-            .record_outgoing_started(*to, rtt_hint_ms);
+            .record_outgoing_rtt_hint(*to, rtt_hint_ms);
         if let Some((phi, last_seen_ms_ago)) = self.dm_peer_likely_offline(to).await {
             self.direct_messaging.record_outgoing_failed(*to);
             return Err(dm::DmError::PeerLikelyOffline {
@@ -4450,7 +4463,7 @@ impl Agent {
         let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
         {
             match self
-                .send_direct_raw_quic(
+                .send_direct_raw_quic_with_deadline(
                     to,
                     &payload,
                     config.raw_quic_receive_ack_timeout,
@@ -4530,7 +4543,7 @@ impl Agent {
             match preferred_raw_err {
                 Some(e) => Err(Self::map_raw_quic_dm_error(e)),
                 None => self
-                    .send_direct_raw_quic(
+                    .send_direct_raw_quic_with_deadline(
                         to,
                         &payload,
                         config.raw_quic_receive_ack_timeout,
@@ -4771,6 +4784,32 @@ impl Agent {
         self.connected_direct_machine(agent_id, network).await
     }
 
+    /// Run one complete logical raw-QUIC attempt under the caller's receive-
+    /// ACK budget. The inner operation includes ant-quic's ACK retry and this
+    /// layer's stale-connection repair/reissue, so applying the deadline here
+    /// prevents either retry layer from multiplying the API timeout.
+    async fn send_direct_raw_quic_with_deadline(
+        &self,
+        agent_id: &identity::AgentId,
+        payload: &[u8],
+        receive_ack_timeout: Option<std::time::Duration>,
+        prefer_newest_grace: std::time::Duration,
+    ) -> error::NetworkResult<dm::DmPath> {
+        let send =
+            self.send_direct_raw_quic(agent_id, payload, receive_ack_timeout, prefer_newest_grace);
+        let Some(deadline) = receive_ack_timeout else {
+            return send.await;
+        };
+
+        match tokio::time::timeout(deadline, send).await {
+            Ok(result) => result,
+            Err(_) => Err(error::NetworkError::ConnectionTimeout {
+                peer_id: agent_id.0,
+                timeout: deadline,
+            }),
+        }
+    }
+
     /// Legacy raw-QUIC direct-send path. Internal fallback only.
     ///
     /// X0X-0053: `prefer_newest_grace` is the bounded post-Replaced reissue
@@ -5006,6 +5045,9 @@ impl Agent {
         // Send via network layer. Prefer receive-pipeline ACK when configured:
         // success then means the remote ant-quic reader drained the direct
         // message bytes, not merely that the local socket accepted them.
+        // One request id is reused by every same-send reissue so ant-quic's
+        // receiver dedupe prevents duplicate application admission.
+        let raw_ack_request_id = dm_send::fresh_request_id();
         let mut send_result = if let Some(timeout) = receive_ack_timeout {
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
             tracing::debug!(
@@ -5029,6 +5071,7 @@ impl Agent {
                 ant_peer_id,
                 machine_id,
                 &wire,
+                raw_ack_request_id,
                 timeout,
                 prefer_newest_grace,
                 agent_id,
@@ -5100,6 +5143,7 @@ impl Agent {
                 if repaired {
                     if let Some(hook) = self.direct_messaging.raw_quic_ack_race_test_hook() {
                         hook.notify_repair_retry_started();
+                        hook.hold_repair_retry_before_send().await;
                     }
                     tracing::info!(
                         target: "x0x::direct",
@@ -5118,6 +5162,7 @@ impl Agent {
                                 &self.identity.agent_id(),
                                 payload,
                             )?,
+                            raw_ack_request_id,
                             timeout,
                             prefer_newest_grace,
                             agent_id,
@@ -5223,6 +5268,7 @@ impl Agent {
         ant_peer_id: ant_quic::PeerId,
         machine_id: identity::MachineId,
         wire: &[u8],
+        request_id: [u8; 16],
         timeout: std::time::Duration,
         prefer_newest_grace: std::time::Duration,
         agent_id: &identity::AgentId,
@@ -5248,6 +5294,13 @@ impl Agent {
             }
             let result = if ack_race_test_hook
                 .as_ref()
+                .is_some_and(|hook| hook.take_fail_first_attempt_backpressured())
+            {
+                Some(Err(ant_quic::NodeError::Connection(
+                    "Remote receive pipeline rejected payload: Backpressured".to_string(),
+                )))
+            } else if ack_race_test_hook
+                .as_ref()
                 .is_some_and(|hook| hook.take_fail_first_attempt_before_send())
             {
                 Some(Err(ant_quic::NodeError::Connection(
@@ -5255,7 +5308,7 @@ impl Agent {
                 )))
             } else {
                 network
-                    .send_with_receive_ack(ant_peer_id, wire, timeout)
+                    .send_with_receive_ack_with_request_id(ant_peer_id, request_id, wire, timeout)
                     .await
             };
             if let Some(hook) = ack_race_test_hook.as_ref() {
@@ -5279,26 +5332,30 @@ impl Agent {
                     // exactly the production case where the in-flight ACK
                     // exchange errors out fast on the dying connection
                     // milliseconds before the new connection is registered.
+                    // Drain any queued Replaced for our peer before accepting
+                    // either an Ok or Err from the old generation. With the
+                    // biased select the send future can become ready in the
+                    // same poll as the lifecycle event; the queued replacement
+                    // must win so we do not report obsolete-generation success.
+                    let mut queued_supersede: Option<u64> = None;
+                    loop {
+                        match replaced_rx.try_recv() {
+                            Ok((m, gen)) if m == machine_id => {
+                                queued_supersede = Some(gen);
+                            }
+                            Ok(_) => continue,
+                            Err(BroadcastTryRecvError::Empty)
+                            | Err(BroadcastTryRecvError::Closed)
+                            | Err(BroadcastTryRecvError::Lagged(_)) => break,
+                        }
+                    }
+                    if let Some(gen) = queued_supersede {
+                        superseded_to = gen;
+                        break;
+                    }
                     match send_result {
                         Some(Ok(())) => return Ok(dm::DmPath::RawQuicAcked),
                         Some(Err(e)) => {
-                            // Drain any queued Replaced for our peer.
-                            let mut queued_supersede: Option<u64> = None;
-                            loop {
-                                match replaced_rx.try_recv() {
-                                    Ok((m, gen)) if m == machine_id => {
-                                        queued_supersede = Some(gen);
-                                    }
-                                    Ok(_) => continue,
-                                    Err(BroadcastTryRecvError::Empty)
-                                    | Err(BroadcastTryRecvError::Closed)
-                                    | Err(BroadcastTryRecvError::Lagged(_)) => break,
-                                }
-                            }
-                            if let Some(gen) = queued_supersede {
-                                superseded_to = gen;
-                                break;
-                            }
                             let reason = format!("send_with_receive_ack failed: {e}");
                             return if Self::raw_quic_ack_receive_backpressured(&reason) {
                                 Err(error::NetworkError::RemoteReceiveBackpressured(reason))
@@ -5414,7 +5471,7 @@ impl Agent {
         // Reissue once against the new generation. No further race — a
         // healthy peer should converge in a single supersede cycle.
         match network
-            .send_with_receive_ack(ant_peer_id, wire, timeout)
+            .send_with_receive_ack_with_request_id(ant_peer_id, request_id, wire, timeout)
             .await
         {
             Some(Ok(())) => Ok(dm::DmPath::RawQuicAcked),
@@ -5489,6 +5546,10 @@ impl Agent {
             error::NetworkError::RemoteReceiveBackpressured(reason) => {
                 dm::DmError::ReceiverBackpressured { reason }
             }
+            error::NetworkError::ConnectionTimeout { timeout, .. } => dm::DmError::Timeout {
+                retries: 0,
+                elapsed: timeout,
+            },
             error::NetworkError::PayloadTooLarge { size, max } => {
                 dm::DmError::PayloadTooLarge { len: size, max }
             }
@@ -13078,6 +13139,26 @@ mod tests {
         assert!(matches!(
             Agent::map_raw_quic_dm_error(err),
             dm::DmError::ReceiverBackpressured { .. }
+        ));
+    }
+
+    #[test]
+    fn raw_quic_total_deadline_is_typed_and_allows_configured_gossip_fallback() {
+        let budget = std::time::Duration::from_millis(300);
+        let err = error::NetworkError::ConnectionTimeout {
+            peer_id: [7_u8; 32],
+            timeout: budget,
+        };
+        assert!(
+            !Agent::raw_quic_error_should_stop_fallback(&err, true),
+            "a caller that permits fallback may continue with gossip after the raw deadline"
+        );
+        assert!(matches!(
+            Agent::map_raw_quic_dm_error(err),
+            dm::DmError::Timeout {
+                retries: 0,
+                elapsed,
+            } if elapsed == budget
         ));
     }
 

@@ -1860,6 +1860,29 @@ impl NetworkNode {
         Some(result)
     }
 
+    /// Same receive-pipeline ACK contract as [`Self::send_with_receive_ack`],
+    /// with a caller-owned request id so a logical send reissued across a
+    /// connection replacement remains duplicate-safe at the receiver.
+    pub async fn send_with_receive_ack_with_request_id(
+        &self,
+        peer_id: AntPeerId,
+        request_id: [u8; 16],
+        data: &[u8],
+        timeout: std::time::Duration,
+    ) -> Option<Result<(), ant_quic::NodeError>> {
+        if let Err(e) = self.get_or_connect_pooled_peer(&peer_id).await {
+            return Some(Err(ant_quic::NodeError::Connection(e.to_string())));
+        }
+        let node = self.node.read().await.as_ref().cloned()?;
+        let result = node
+            .send_with_receive_ack_with_request_id(&peer_id, request_id, data, timeout)
+            .await;
+        if result.is_ok() {
+            self.note_connection_pool_activity(peer_id).await;
+        }
+        Some(result)
+    }
+
     /// Subscribe to lifecycle events for all peers (ant-quic 0.27.1 #171).
     pub async fn subscribe_all_peer_events(
         &self,

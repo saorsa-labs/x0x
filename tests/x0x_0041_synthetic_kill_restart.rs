@@ -147,6 +147,31 @@ fn normalize_loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
     }
 }
 
+fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr) -> x0x::DiscoveredAgent {
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    x0x::DiscoveredAgent {
+        agent_id: agent.agent_id(),
+        machine_id: agent.machine_id(),
+        user_id: None,
+        addresses: vec![addr],
+        announced_at: now_secs,
+        last_seen: now_secs,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(),
+        relay_candidates: Vec::new(),
+        cert_not_after: None,
+        agent_certificate: None,
+        agent_public_key: Vec::new(),
+    }
+}
+
 async fn build_agent(dir: &TempDir, name: &str) -> Agent {
     Agent::builder()
         .with_machine_key(dir.path().join(format!("{name}-machine.key")))
@@ -157,6 +182,23 @@ async fn build_agent(dir: &TempDir, name: &str) -> Agent {
         .build()
         .await
         .expect("agent builds")
+}
+
+async fn build_history_agent(dir: &TempDir, name: &str) -> Agent {
+    Agent::builder()
+        .with_machine_key(dir.path().join(format!("{name}-machine.key")))
+        .with_agent_key_path(dir.path().join(format!("{name}-agent.key")))
+        .with_contact_store_path(dir.path().join(format!("{name}-contacts.json")))
+        .with_peer_cache_dir(dir.path().join(format!("{name}-peer-cache")))
+        .with_network_config(loopback_network_config())
+        .with_history(x0x::history::HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.path().join(format!("{name}-history.db"))),
+            ..x0x::history::HistoryConfig::default()
+        })
+        .build()
+        .await
+        .expect("history-enabled agent builds")
 }
 
 /// X0X-0053 acceptance: with the racing-against-Replaced arm in place,
@@ -548,6 +590,357 @@ async fn cached_connection_ack_failure_repairs_and_retries_same_send() {
     assert!(
         unexpected_second_message.is_none(),
         "forced pre-send failure must not duplicate the application payload: {unexpected_second_message:?}"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// `raw_quic_receive_ack_timeout` is the deadline for the complete logical
+/// raw send, not one ant-quic ACK exchange. If the receiver admits the bytes
+/// but the ACK result remains stuck, the sender returns a typed timeout once,
+/// records no outbound LocalSend row, and does not re-admit the payload.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn stalled_ack_result_obeys_total_deadline_without_duplicate_admission() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_history_agent(&dir, "deadline-alice").await);
+    let bob = Arc::new(build_agent(&dir, "deadline-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr))
+        .await;
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+
+    let hook = Arc::new(RawQuicAckRaceTestHook::new());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&hook)));
+    let mut bob_rx = bob.subscribe_direct();
+    let payload = b"stalled-ack-result-total-deadline".to_vec();
+    let budget = Duration::from_millis(300);
+    let started = Instant::now();
+    let error = alice
+        .send_direct_with_config(
+            &bob.agent_id(),
+            payload.clone(),
+            DmSendConfig {
+                prefer_raw_quic_if_connected: true,
+                raw_quic_receive_ack_timeout: Some(budget),
+                stop_fallback_on_raw_error: true,
+                max_retries: 0,
+                ..DmSendConfig::default()
+            },
+        )
+        .await
+        .expect_err("held ACK result must hit the total raw deadline");
+    let elapsed = started.elapsed();
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+
+    assert!(
+        matches!(
+            error,
+            x0x::dm::DmError::Timeout {
+                retries: 0,
+                elapsed: reported,
+            } if reported == budget
+        ),
+        "deadline must surface as typed timeout: {error:?}"
+    );
+    assert!(
+        elapsed >= budget && elapsed <= budget + Duration::from_millis(500),
+        "logical raw send must finish by budget + scheduler epsilon: {elapsed:?}"
+    );
+
+    let received = tokio::time::timeout(Duration::from_secs(1), bob_rx.recv())
+        .await
+        .expect("bob admitted the payload before its ACK result was held")
+        .expect("bob subscriber remains open");
+    assert_eq!(received.payload, payload);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bob_rx.recv())
+            .await
+            .is_err(),
+        "deadline cancellation must not cause duplicate receiver admission"
+    );
+
+    let diagnostics = alice.direct_messaging().diagnostics_snapshot();
+    assert_eq!(diagnostics.stats.outgoing_send_total, 1);
+    assert_eq!(diagnostics.stats.outgoing_send_succeeded, 0);
+    assert_eq!(diagnostics.stats.outgoing_send_failed, 1);
+    let history_rows = alice
+        .history()
+        .expect("alice history enabled")
+        .store()
+        .query(&x0x::history::HistoryQuery {
+            scope: Some(x0x::history::Scope::Dm(hex::encode(
+                bob.agent_id().as_bytes(),
+            ))),
+            ..x0x::history::HistoryQuery::default()
+        })
+        .expect("query alice history");
+    assert!(
+        history_rows.is_empty(),
+        "a timed-out raw send must not create a LocalSend history row: {history_rows:?}"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// A half-dead connected generation can fail the first ACK exchange, repair,
+/// and then wedge before the repaired transport write. The same raw deadline
+/// must cancel that whole sequence; a repair must not start a fresh budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn half_dead_generation_repair_reissue_stays_inside_total_deadline() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_history_agent(&dir, "half-dead-alice").await);
+    let bob = Arc::new(build_agent(&dir, "half-dead-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr))
+        .await;
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+
+    let hook = Arc::new(RawQuicAckRaceTestHook::new_stalled_repair_retry());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&hook)));
+    let mut bob_rx = bob.subscribe_direct();
+    let payload = b"half-dead-generation-total-deadline".to_vec();
+    let budget = Duration::from_secs(1);
+    let started = Instant::now();
+    let error = alice
+        .send_direct_with_config(
+            &bob.agent_id(),
+            payload,
+            DmSendConfig {
+                prefer_raw_quic_if_connected: true,
+                raw_quic_receive_ack_timeout: Some(budget),
+                stop_fallback_on_raw_error: true,
+                max_retries: 0,
+                ..DmSendConfig::default()
+            },
+        )
+        .await
+        .expect_err("stalled repair reissue must hit the total raw deadline");
+    let elapsed = started.elapsed();
+
+    tokio::time::timeout(Duration::from_millis(100), hook.wait_repair_retry_started())
+        .await
+        .expect("the half-dead first generation must enter same-send repair");
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+
+    assert!(
+        matches!(
+            error,
+            x0x::dm::DmError::Timeout {
+                retries: 0,
+                elapsed: reported,
+            } if reported == budget
+        ),
+        "repair deadline must surface as typed timeout: {error:?}"
+    );
+    assert!(
+        elapsed >= budget && elapsed <= budget + Duration::from_millis(500),
+        "repair and reissue must not receive fresh timeout budgets: {elapsed:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bob_rx.recv())
+            .await
+            .is_err(),
+        "stalled pre-write repair must not admit a receiver payload"
+    );
+
+    let diagnostics = alice.direct_messaging().diagnostics_snapshot();
+    assert_eq!(diagnostics.stats.outgoing_send_total, 1);
+    assert_eq!(diagnostics.stats.outgoing_send_succeeded, 0);
+    assert_eq!(diagnostics.stats.outgoing_send_failed, 1);
+    let history_rows = alice
+        .history()
+        .expect("alice history enabled")
+        .store()
+        .query(&x0x::history::HistoryQuery {
+            scope: Some(x0x::history::Scope::Dm(hex::encode(
+                bob.agent_id().as_bytes(),
+            ))),
+            ..x0x::history::HistoryQuery::default()
+        })
+        .expect("query alice history");
+    assert!(
+        history_rows.is_empty(),
+        "a timed-out repair must not create a LocalSend history row: {history_rows:?}"
+    );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// The daemon/default policy permits gossip fallback. Its raw ACK timeout is
+/// nevertheless the total logical-send budget: a fast terminal raw failure
+/// followed by a gossip attempt with no application ACK must return one typed
+/// timeout, rather than starting a fresh gossip retry budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn default_fallback_policy_stays_inside_total_send_deadline() {
+    let dir = TempDir::new().expect("tmpdir");
+    let alice = Arc::new(build_history_agent(&dir, "fallback-alice").await);
+    let bob = Arc::new(build_agent(&dir, "fallback-bob").await);
+
+    alice.join_network().await.expect("alice joins");
+    bob.join_network().await.expect("bob joins");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(
+        alice_network
+            .bound_addr()
+            .await
+            .expect("alice bound to loopback"),
+    );
+    let bob_addr = normalize_loopback(
+        bob_network
+            .bound_addr()
+            .await
+            .expect("bob bound to loopback"),
+    );
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr))
+        .await;
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice connects to bob");
+
+    // Advertise a structurally valid but deliberately unrelated KEM key for
+    // Bob. The raw hook fails before transport I/O, then gossip publishes a
+    // valid envelope that Bob cannot decrypt and therefore never ACKs.
+    let unrelated_kem =
+        x0x::groups::kem_envelope::AgentKemKeypair::generate().expect("generate unrelated KEM key");
+    alice.insert_capability_for_testing(
+        bob.agent_id(),
+        bob.machine_id(),
+        x0x::dm::DmCapabilities::v1_gossip_ready(unrelated_kem.public_bytes),
+    );
+    let hook = Arc::new(RawQuicAckRaceTestHook::new_forced_backpressure());
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(Some(Arc::clone(&hook)));
+    let mut bob_rx = bob.subscribe_direct();
+    let budget = Duration::from_millis(400);
+    let started = Instant::now();
+    let error = alice
+        .send_direct_with_config(
+            &bob.agent_id(),
+            b"raw-then-stalled-gossip-total-deadline".to_vec(),
+            DmSendConfig {
+                prefer_raw_quic_if_connected: true,
+                raw_quic_receive_ack_timeout: Some(budget),
+                // Match the daemon/default policy: fallback remains enabled.
+                stop_fallback_on_raw_error: false,
+                ..DmSendConfig::default()
+            },
+        )
+        .await
+        .expect_err("stalled gossip fallback must share the total send deadline");
+    let elapsed = started.elapsed();
+    tokio::time::timeout(
+        Duration::from_millis(100),
+        hook.wait_first_attempt_started(),
+    )
+    .await
+    .expect("preferred raw path must be attempted before gossip fallback");
+    alice
+        .direct_messaging()
+        .set_raw_quic_ack_race_test_hook_for_testing(None);
+
+    assert!(
+        matches!(
+            error,
+            x0x::dm::DmError::Timeout {
+                retries: 0,
+                elapsed: reported,
+            } if reported == budget
+        ),
+        "total fallback deadline must surface as typed timeout: {error:?}"
+    );
+    assert!(
+        elapsed >= budget && elapsed <= budget + Duration::from_millis(500),
+        "raw plus gossip fallback must finish by one budget + epsilon: {elapsed:?}"
+    );
+    assert!(
+        tokio::time::timeout(Duration::from_millis(150), bob_rx.recv())
+            .await
+            .is_err(),
+        "forced pre-I/O raw failure and undecryptable gossip must not admit a DM"
+    );
+
+    let diagnostics = alice.direct_messaging().diagnostics_snapshot();
+    assert_eq!(diagnostics.stats.outgoing_send_total, 1);
+    assert_eq!(diagnostics.stats.outgoing_send_succeeded, 0);
+    assert_eq!(diagnostics.stats.outgoing_send_failed, 1);
+    let history_rows = alice
+        .history()
+        .expect("alice history enabled")
+        .store()
+        .query(&x0x::history::HistoryQuery {
+            scope: Some(x0x::history::Scope::Dm(hex::encode(
+                bob.agent_id().as_bytes(),
+            ))),
+            ..x0x::history::HistoryQuery::default()
+        })
+        .expect("query alice history");
+    assert!(
+        history_rows.is_empty(),
+        "timed-out fallback must not create a LocalSend row: {history_rows:?}"
     );
 
     alice.shutdown().await;

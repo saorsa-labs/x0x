@@ -61,7 +61,8 @@ pub(in crate::server) struct DirectSendRequest {
     /// Prefer the raw-QUIC path when a live direct connection exists.
     #[serde(default)]
     pub(in crate::server) prefer_raw_quic_if_connected: Option<bool>,
-    /// Optional raw-QUIC receive-pipeline ACK timeout for the message itself.
+    /// Optional total send deadline. This bounds raw receive-pipeline ACK
+    /// retries, connection repair/reissue, and any gossip fallback.
     #[serde(default)]
     pub(in crate::server) raw_quic_receive_ack_ms: Option<u64>,
     /// If true, do not fall back to gossip-inbox after a preferred raw-QUIC
@@ -100,6 +101,45 @@ fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendCon
         ));
     }
     config
+}
+
+fn direct_send_error_status(error: &x0x::dm::DmError) -> (StatusCode, &'static str) {
+    match error {
+        x0x::dm::DmError::RecipientRejected { .. } => (StatusCode::FORBIDDEN, "recipient_rejected"),
+        x0x::dm::DmError::RecipientKeyUnavailable(_) => {
+            (StatusCode::NOT_FOUND, "recipient_key_unavailable")
+        }
+        // Issue #188: the cached capability advert / contact card is not
+        // converged (or is corrupt). This is transient and safe to retry.
+        x0x::dm::DmError::RecipientKeyInvalid(_) => (StatusCode::CONFLICT, "recipient_key_invalid"),
+        x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
+        x0x::dm::DmError::PeerLikelyOffline { .. } => {
+            (StatusCode::BAD_GATEWAY, "peer_likely_offline")
+        }
+        x0x::dm::DmError::PeerDisconnected { .. } => (StatusCode::BAD_GATEWAY, "peer_disconnected"),
+        x0x::dm::DmError::ReceiverBackpressured { .. } => {
+            (StatusCode::SERVICE_UNAVAILABLE, "receiver_backpressured")
+        }
+        x0x::dm::DmError::LocalGossipUnavailable(_) => {
+            (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
+        }
+        // Local envelope build/crypto failure (signing, AEAD, KEM encap,
+        // serialization). A well-formed request cannot cause this.
+        x0x::dm::DmError::EnvelopeConstruction(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
+        }
+        x0x::dm::DmError::PayloadTooLarge { .. } => {
+            (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
+        }
+        x0x::dm::DmError::NoConnectivity(_) => (StatusCode::SERVICE_UNAVAILABLE, "no_connectivity"),
+        x0x::dm::DmError::PublishFailed(_) => (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed"),
+        x0x::dm::DmError::NoRelayCandidate => {
+            (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
+        }
+        x0x::dm::DmError::RelayBuildFailed(_) => {
+            (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
+        }
+    }
 }
 
 /// POST /agents/connect — connect to a discovered agent.
@@ -337,54 +377,7 @@ pub(in crate::server) async fn direct_send(
             )
         }
         Err(e) => {
-            let (status, err_kind) = match &e {
-                x0x::dm::DmError::RecipientRejected { .. } => {
-                    (StatusCode::FORBIDDEN, "recipient_rejected")
-                }
-                x0x::dm::DmError::RecipientKeyUnavailable(_) => {
-                    (StatusCode::NOT_FOUND, "recipient_key_unavailable")
-                }
-                // Issue #188: the cached capability advert / contact card is
-                // not converged (or corrupt) — transient, safe to retry. 409,
-                // NOT 400: the request itself was well-formed.
-                x0x::dm::DmError::RecipientKeyInvalid(_) => {
-                    (StatusCode::CONFLICT, "recipient_key_invalid")
-                }
-                x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
-                x0x::dm::DmError::PeerLikelyOffline { .. } => {
-                    (StatusCode::BAD_GATEWAY, "peer_likely_offline")
-                }
-                x0x::dm::DmError::PeerDisconnected { .. } => {
-                    (StatusCode::BAD_GATEWAY, "peer_disconnected")
-                }
-                x0x::dm::DmError::ReceiverBackpressured { .. } => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "receiver_backpressured")
-                }
-                x0x::dm::DmError::LocalGossipUnavailable(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "local_gossip_unavailable")
-                }
-                // Local envelope build/crypto failure (signing, AEAD, KEM
-                // encap, serialization). A well-formed client request cannot
-                // cause this — it is a server fault, never a 400 (issue #188).
-                x0x::dm::DmError::EnvelopeConstruction(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "envelope_construction")
-                }
-                x0x::dm::DmError::PayloadTooLarge { .. } => {
-                    (StatusCode::PAYLOAD_TOO_LARGE, "payload_too_large")
-                }
-                x0x::dm::DmError::NoConnectivity(_) => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "no_connectivity")
-                }
-                x0x::dm::DmError::PublishFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "publish_failed")
-                }
-                x0x::dm::DmError::NoRelayCandidate => {
-                    (StatusCode::SERVICE_UNAVAILABLE, "no_relay_candidate")
-                }
-                x0x::dm::DmError::RelayBuildFailed(_) => {
-                    (StatusCode::INTERNAL_SERVER_ERROR, "relay_build_failed")
-                }
-            };
+            let (status, err_kind) = direct_send_error_status(&e);
             tracing::error!("direct_send failed ({err_kind}): {e}");
             (
                 status,
@@ -468,6 +461,18 @@ mod tests {
         }))
         .expect("direct-send request with explicit override should deserialize");
         assert!(!direct_send_config_for_request(&disabled).prefer_raw_quic_if_connected);
+    }
+
+    #[test]
+    fn direct_send_timeout_is_http_gateway_timeout() {
+        let error = x0x::dm::DmError::Timeout {
+            retries: 0,
+            elapsed: Duration::from_millis(300),
+        };
+        assert_eq!(
+            direct_send_error_status(&error),
+            (StatusCode::GATEWAY_TIMEOUT, "timeout")
+        );
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

@@ -642,7 +642,10 @@ pub struct DmSendConfig {
     pub prefer_raw_quic_if_connected: bool,
     /// When set, raw-QUIC sends use ant-quic's receive-pipeline ACK surface
     /// and only return success after the remote reader task has drained the
-    /// bytes. `None` keeps the old fire-and-forget raw path.
+    /// bytes. The duration is also the total deadline for the logical send,
+    /// including transport ACK retries, connection repair, a repaired
+    /// reissue, and any configured gossip fallback. `None` keeps the old
+    /// fire-and-forget raw path and does not install a total-send deadline.
     pub raw_quic_receive_ack_timeout: Option<Duration>,
     /// If true, a preferred raw-QUIC failure is terminal and the sender will
     /// not silently fall back to gossip-inbox even when a capability advert is

@@ -135,8 +135,11 @@ pub struct RawQuicAckRaceTestHook {
     first_attempt_result_release: Notify,
     replaced_short_circuit: Notify,
     repair_retry_started: Notify,
+    repair_retry_release: Notify,
     hold_first_attempt_result: AtomicBool,
     fail_first_attempt_before_send: AtomicBool,
+    fail_first_attempt_backpressured: AtomicBool,
+    hold_repair_retry_before_send: AtomicBool,
 }
 
 impl std::fmt::Debug for RawQuicAckRaceTestHook {
@@ -153,8 +156,11 @@ impl Default for RawQuicAckRaceTestHook {
             first_attempt_result_release: Notify::new(),
             replaced_short_circuit: Notify::new(),
             repair_retry_started: Notify::new(),
+            repair_retry_release: Notify::new(),
             hold_first_attempt_result: AtomicBool::new(true),
             fail_first_attempt_before_send: AtomicBool::new(false),
+            fail_first_attempt_backpressured: AtomicBool::new(false),
+            hold_repair_retry_before_send: AtomicBool::new(false),
         }
     }
 }
@@ -176,6 +182,31 @@ impl RawQuicAckRaceTestHook {
         }
     }
 
+    /// Build a deterministic half-dead-generation hook: the first ACKed raw
+    /// attempt fails before transport I/O, then the repaired reissue remains
+    /// pending immediately before transport I/O until released.
+    #[must_use]
+    pub fn new_stalled_repair_retry() -> Self {
+        Self {
+            hold_first_attempt_result: AtomicBool::new(false),
+            fail_first_attempt_before_send: AtomicBool::new(true),
+            hold_repair_retry_before_send: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Build a deterministic hook whose first ACKed raw attempt reports
+    /// receiver backpressure before transport I/O. This terminal raw-path
+    /// outcome allows tests to enter the configured gossip fallback.
+    #[must_use]
+    pub fn new_forced_backpressure() -> Self {
+        Self {
+            hold_first_attempt_result: AtomicBool::new(false),
+            fail_first_attempt_backpressured: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
     pub async fn wait_first_attempt_started(&self) {
         self.first_attempt_started.notified().await;
     }
@@ -190,6 +221,10 @@ impl RawQuicAckRaceTestHook {
 
     pub async fn wait_repair_retry_started(&self) {
         self.repair_retry_started.notified().await;
+    }
+
+    pub fn release_repair_retry(&self) {
+        self.repair_retry_release.notify_one();
     }
 
     pub(crate) fn notify_first_attempt_started(&self) {
@@ -211,8 +246,19 @@ impl RawQuicAckRaceTestHook {
             .swap(false, Ordering::Relaxed)
     }
 
+    pub(crate) fn take_fail_first_attempt_backpressured(&self) -> bool {
+        self.fail_first_attempt_backpressured
+            .swap(false, Ordering::Relaxed)
+    }
+
     pub(crate) fn notify_repair_retry_started(&self) {
         self.repair_retry_started.notify_one();
+    }
+
+    pub(crate) async fn hold_repair_retry_before_send(&self) {
+        if self.hold_repair_retry_before_send.load(Ordering::Relaxed) {
+            self.repair_retry_release.notified().await;
+        }
     }
 }
 
@@ -911,6 +957,15 @@ impl DirectMessaging {
             if let Some(rtt) = avg_rtt_ms.filter(|rtt| *rtt > 0) {
                 peer.avg_rtt_ms = Some(rtt);
             }
+        });
+    }
+
+    pub(crate) fn record_outgoing_rtt_hint(&self, agent_id: AgentId, avg_rtt_ms: Option<u32>) {
+        let Some(rtt) = avg_rtt_ms.filter(|rtt| *rtt > 0) else {
+            return;
+        };
+        self.with_peer_diagnostics(agent_id, |peer| {
+            peer.avg_rtt_ms = Some(rtt);
         });
     }
 
