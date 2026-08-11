@@ -765,9 +765,9 @@ fn local_direct_probe_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net:
 ///
 /// Heartbeats are anti-entropy, not a hot-path delivery mechanism. Keep the
 /// default at five minutes so bootstrap meshes do not spend their PubSub budget
-/// on repeated signed identity/machine announcements. Each fresh announcement
-/// still receives a one-shot receiver-side re-broadcast in
-/// `start_identity_listener` for epidemic convergence.
+/// on repeated signed identity/machine announcements. PlumTree forwards each
+/// locally authored announcement across the topic mesh; receivers must not
+/// re-publish the same payload as a new application message.
 pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 
 /// Default TTL for discovered agent cache entries (seconds).
@@ -778,6 +778,23 @@ pub const IDENTITY_TTL_SECS: u64 = 900;
 
 const DISCOVERY_REBROADCAST_STATE_CAP: usize = 1024;
 const DISCOVERY_REBROADCAST_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum IdentityAnnouncementSource {
+    LocallyAuthored,
+    PlumtreeDelivered,
+}
+
+/// Whether x0x should create a new application-level publish on the legacy
+/// identity topic for this announcement source.
+///
+/// PlumTree already forwards a locally authored publish. Re-publishing a
+/// received payload re-signs it with a fresh message ID, bypasses PlumTree's
+/// message-ID deduplication, and turns one fleet heartbeat epoch into quadratic
+/// application traffic.
+const fn should_publish_identity_on_legacy(source: IdentityAnnouncementSource) -> bool {
+    matches!(source, IdentityAnnouncementSource::LocallyAuthored)
+}
 
 /// Interval (seconds) between runs of the background discovery cache reaper.
 /// The reaper performs TTL-based pruning using the same identity_ttl
@@ -2346,18 +2363,20 @@ impl HeartbeatContext {
                 "heartbeat: failed to serialize announcement: {e}"
             ))
         })?;
-        self.runtime
-            .pubsub()
-            .publish(
-                IDENTITY_ANNOUNCE_TOPIC.to_string(),
-                bytes::Bytes::from(encoded),
-            )
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "heartbeat: publish failed: {e}"
-                )))
-            })?;
+        if should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored) {
+            self.runtime
+                .pubsub()
+                .publish(
+                    IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                    bytes::Bytes::from(encoded),
+                )
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "heartbeat: publish failed: {e}"
+                    )))
+                })?;
+        }
         let now = Agent::unix_timestamp_secs();
         upsert_discovered_machine(
             &self.machine_cache,
@@ -5747,15 +5766,17 @@ impl Agent {
             })?;
 
         // Also publish to legacy broadcast topic for backward compatibility.
-        runtime
-            .pubsub()
-            .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "failed to publish identity announcement: {e}"
-                )))
-            })?;
+        if should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored) {
+            runtime
+                .pubsub()
+                .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to publish identity announcement: {e}"
+                    )))
+                })?;
+        }
 
         let now = Self::unix_timestamp_secs();
         upsert_discovered_machine(
@@ -6229,15 +6250,6 @@ impl Agent {
             let mut auto_connect_attempts =
                 std::collections::HashMap::<identity::AgentId, std::time::Instant>::new();
 
-            // One-shot dedup for re-broadcast: (agent_id, announced_at)
-            // → first-rebroadcast Instant. Bounds each fresh announcement to at
-            // most one receiver-side re-publish per daemon. Repeating the same
-            // payload every few seconds forms a PubSub feedback loop on the
-            // bootstrap mesh and delays latency-sensitive user messages.
-            let mut rebroadcast_state: std::collections::HashMap<
-                (identity::AgentId, u64),
-                std::time::Instant,
-            > = std::collections::HashMap::new();
             let mut machine_rebroadcast_state: std::collections::HashMap<
                 (identity::MachineId, u64),
                 std::time::Instant,
@@ -6778,35 +6790,23 @@ impl Agent {
                     .register_agent(announcement.agent_id, announcement.machine_id)
                     .await;
 
-                // Epidemic re-broadcast — mirrors the release-manifest
-                // re-broadcast pattern. Bootstrap-node meshes have patchy
-                // PlumTree overlap for the identity-announce topic: the
-                // origin's tree only reaches 1–2 hops reliably. Making
-                // every verified recipient re-publish guarantees flood
-                // convergence across the mesh. One-shot dedup on
-                // (agent_id, announced_at) bounds amplification. Pub/Sub
-                // v2 re-signs each publish with a new message ID so
-                // PlumTree's own dedup cannot suppress repeated forwards;
-                // therefore each daemon forwards a given announcement at most
-                // once.
-                if announcement.agent_id != own_agent_id {
-                    let key = (announcement.agent_id, announcement.announced_at);
-                    if should_rebroadcast_discovery_once(
-                        &mut rebroadcast_state,
-                        key,
-                        std::time::Instant::now(),
-                    ) {
-                        let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
-                        let payload = raw_payload.clone();
-                        tokio::spawn(async move {
-                            if let Err(e) = pubsub
-                                .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
-                                .await
-                            {
-                                tracing::debug!("identity announcement re-broadcast failed: {e}");
-                            }
-                        });
-                    }
+                // The message reached this listener through PlumTree, which
+                // already performs eager forwarding and anti-entropy repair.
+                // Do not turn a received announcement into a new application
+                // publish: x0x PubSub would re-sign it with a fresh message ID,
+                // defeating PlumTree deduplication across the fleet.
+                if should_publish_identity_on_legacy(
+                    IdentityAnnouncementSource::PlumtreeDelivered,
+                ) {
+                    let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
+                    tokio::spawn(async move {
+                        if let Err(e) = pubsub
+                            .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), raw_payload)
+                            .await
+                        {
+                            tracing::debug!("identity announcement forwarding failed: {e}");
+                        }
+                    });
                 }
 
                 // Reconcile the agent-level direct-message registry if the transport peer
@@ -12412,6 +12412,95 @@ mod tests {
         s.parse().expect("valid SocketAddr literal in test")
     }
 
+    type IdentityEpochRoute =
+        tokio::sync::mpsc::UnboundedSender<(saorsa_gossip_types::PeerId, bytes::Bytes)>;
+    type IdentityEpochRoutes = std::sync::Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<saorsa_gossip_types::PeerId, IdentityEpochRoute>,
+        >,
+    >;
+
+    struct IdentityEpochMeshTransport {
+        local_peer: saorsa_gossip_types::PeerId,
+        routes: IdentityEpochRoutes,
+    }
+
+    #[async_trait::async_trait]
+    impl saorsa_gossip_transport::GossipTransport for IdentityEpochMeshTransport {
+        async fn dial(
+            &self,
+            _peer: saorsa_gossip_types::PeerId,
+            _addr: std::net::SocketAddr,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn dial_bootstrap(
+            &self,
+            _addr: std::net::SocketAddr,
+        ) -> anyhow::Result<saorsa_gossip_types::PeerId> {
+            Ok(self.local_peer)
+        }
+
+        async fn listen(&self, _bind: std::net::SocketAddr) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn close(&self) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn send_to_peer(
+            &self,
+            peer: saorsa_gossip_types::PeerId,
+            stream_type: saorsa_gossip_transport::GossipStreamType,
+            data: bytes::Bytes,
+        ) -> anyhow::Result<()> {
+            if stream_type != saorsa_gossip_transport::GossipStreamType::PubSub {
+                return Err(anyhow::anyhow!("identity epoch used a non-PubSub stream"));
+            }
+            let route = self
+                .routes
+                .lock()
+                .expect("identity mesh route lock")
+                .get(&peer)
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("missing identity mesh route for {peer}"))?;
+            route
+                .send((self.local_peer, data))
+                .map_err(|_| anyhow::anyhow!("identity mesh receiver closed for {peer}"))
+        }
+
+        async fn receive_message(
+            &self,
+        ) -> anyhow::Result<(
+            saorsa_gossip_types::PeerId,
+            saorsa_gossip_transport::GossipStreamType,
+            bytes::Bytes,
+        )> {
+            Err(anyhow::anyhow!(
+                "identity epoch delivers through explicit test drivers"
+            ))
+        }
+
+        async fn connected_peer_ids(&self) -> Vec<saorsa_gossip_types::PeerId> {
+            let mut peers = self
+                .routes
+                .lock()
+                .expect("identity mesh route lock")
+                .keys()
+                .copied()
+                .filter(|peer| *peer != self.local_peer)
+                .collect::<Vec<_>>();
+            peers.sort_by_key(|peer| *peer.as_bytes());
+            peers
+        }
+
+        fn local_peer_id(&self) -> saorsa_gossip_types::PeerId {
+            self.local_peer
+        }
+    }
+
     #[test]
     fn verified_raw_dm_builds_durable_inbound_history() {
         let sender = identity::AgentId([7; 32]);
@@ -12463,7 +12552,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_rebroadcast_is_one_shot_per_announcement_key() {
+    fn non_identity_discovery_rebroadcast_is_one_shot_per_announcement_key() {
         let now = std::time::Instant::now();
         let mut state = std::collections::HashMap::new();
 
@@ -12482,6 +12571,119 @@ mod tests {
             (7_u8, 43_u64),
             now + std::time::Duration::from_secs(20),
         ));
+    }
+
+    #[test]
+    fn received_identity_announcement_does_not_request_legacy_publish() {
+        assert!(should_publish_identity_on_legacy(
+            IdentityAnnouncementSource::LocallyAuthored
+        ));
+        assert!(!should_publish_identity_on_legacy(
+            IdentityAnnouncementSource::PlumtreeDelivered
+        ));
+    }
+
+    #[tokio::test]
+    async fn identity_epoch_converges_with_linear_application_publishes() {
+        use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+
+        const NODE_COUNT: usize = 4;
+        let routes = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+        let mut peers = Vec::with_capacity(NODE_COUNT);
+        let mut inboxes = Vec::with_capacity(NODE_COUNT);
+
+        for node_index in 0..NODE_COUNT {
+            let mut peer_bytes = [0_u8; 32];
+            peer_bytes[0] = u8::try_from(node_index + 1).expect("small test node index");
+            let peer = saorsa_gossip_types::PeerId::new(peer_bytes);
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            routes
+                .lock()
+                .expect("identity mesh route lock")
+                .insert(peer, tx);
+            peers.push(peer);
+            inboxes.push(rx);
+        }
+
+        let mut nodes = Vec::with_capacity(NODE_COUNT);
+        for peer in &peers {
+            let transport = std::sync::Arc::new(IdentityEpochMeshTransport {
+                local_peer: *peer,
+                routes: std::sync::Arc::clone(&routes),
+            });
+            let signing_key = saorsa_gossip_identity::MlDsaKeyPair::generate()
+                .expect("identity epoch signing key");
+            nodes.push(std::sync::Arc::new(PlumtreePubSub::new(
+                *peer,
+                transport,
+                signing_key,
+            )));
+        }
+
+        let topic = saorsa_gossip_types::TopicId::from_entity(IDENTITY_ANNOUNCE_TOPIC);
+        let mut subscriptions = Vec::with_capacity(NODE_COUNT);
+        for (node_index, node) in nodes.iter().enumerate() {
+            subscriptions.push(node.subscribe(topic));
+            let connected = peers
+                .iter()
+                .copied()
+                .filter(|peer| *peer != peers[node_index])
+                .collect();
+            node.initialize_topic_peers(topic, connected).await;
+        }
+
+        let mut drivers = Vec::with_capacity(NODE_COUNT);
+        for (node, mut inbox) in nodes.iter().cloned().zip(inboxes) {
+            drivers.push(tokio::spawn(async move {
+                while let Some((from, data)) = inbox.recv().await {
+                    node.handle_message(from, data)
+                        .await
+                        .expect("identity epoch PlumTree frame");
+                }
+            }));
+        }
+
+        let mut application_publish_count = 0;
+        for origin_index in 0..NODE_COUNT {
+            for (recipient_index, node) in nodes.iter().enumerate() {
+                let source = if recipient_index == origin_index {
+                    IdentityAnnouncementSource::LocallyAuthored
+                } else {
+                    IdentityAnnouncementSource::PlumtreeDelivered
+                };
+                if should_publish_identity_on_legacy(source) {
+                    application_publish_count += 1;
+                    node.publish(
+                        topic,
+                        bytes::Bytes::from(format!("identity-epoch-{origin_index}")),
+                    )
+                    .await
+                    .expect("policy-selected identity publish");
+                }
+            }
+        }
+
+        for mut subscription in subscriptions {
+            let mut seen = std::collections::HashSet::with_capacity(NODE_COUNT);
+            while seen.len() < NODE_COUNT {
+                let (_sender, payload) =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), subscription.recv())
+                        .await
+                        .expect("identity epoch convergence deadline")
+                        .expect("identity epoch subscription remains open");
+                seen.insert(payload);
+            }
+            assert_eq!(seen.len(), NODE_COUNT);
+        }
+
+        assert_eq!(
+            application_publish_count, NODE_COUNT,
+            "one application publish per origin must converge without receiver re-publish"
+        );
+
+        for driver in drivers {
+            driver.abort();
+        }
     }
 
     #[test]
