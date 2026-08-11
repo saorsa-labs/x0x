@@ -5167,9 +5167,10 @@ impl Agent {
         let (cap, cap_machine, cap_source) = if advert_gossip_ready {
             (advert_cap, advert_machine, "advert_cache")
         } else if config.require_durable_app_ack {
-            // Static contact cards are not proof that the recipient currently
-            // has a functioning history writer. Strict semantics require the
-            // signed, TTL-bounded runtime advert.
+            // Strict semantics require a signed, machine-bound capability in
+            // the TTL-bounded runtime cache. That binding may arrive through
+            // mesh advert ingestion or an authenticated live-card import;
+            // the unbound contact-card fallback below is never sufficient.
             (
                 advert_cap,
                 advert_machine,
@@ -8556,6 +8557,17 @@ impl Agent {
         std::sync::Arc::clone(&self.capability_store)
     }
 
+    /// Snapshot this agent's current receive-side DM capabilities.
+    ///
+    /// The watch value is `pending` until [`Self::start_dm_inbox`] has wired
+    /// the receive path and KEM key. Daemons use this snapshot when minting a
+    /// signed live AgentCard, so a direct card exchange carries the same
+    /// capability state as the mesh advert service.
+    #[must_use]
+    pub fn current_dm_capabilities(&self) -> dm::DmCapabilities {
+        self.dm_capabilities_tx.borrow().clone()
+    }
+
     /// Start or restart the mesh-wide DM capability advert service.
     ///
     /// The service publishes this agent's current DM capability and subscribes
@@ -8724,6 +8736,8 @@ impl Agent {
         if let Some(service) = service {
             service.abort();
         }
+        self.dm_capabilities_tx
+            .send_replace(dm::DmCapabilities::pending());
     }
 
     /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
@@ -18749,6 +18763,7 @@ async fn forced_join_upgrades_paused_ordinary_flight_before_cache_return() {
     let recipient = identity::AgentId([0xE1; 32]);
     let machine_id = identity::MachineId([0xE2; 32]);
     let capabilities = dm::DmCapabilities::v2_durable_gossip_ready(vec![0xE3; 1184]);
+    let capability_issued_at = dm::now_unix_ms();
     let capability_store = std::sync::Arc::clone(&agent.capability_store);
     let shutdown_token = agent.shutdown_token.clone();
     let worker_paused = std::sync::Arc::new(tokio::sync::Notify::new());
@@ -18803,9 +18818,12 @@ async fn forced_join_upgrades_paused_ordinary_flight_before_cache_return() {
     // Exact reviewed interleaving: an ordinary flight exists and is paused
     // before its cache check; an advert arrives, the deterministic forced miss
     // consumes it, then another advert lands before the forced caller joins.
-    agent
-        .capability_store
-        .insert(recipient, machine_id, capabilities.clone(), 1_000);
+    agent.capability_store.insert(
+        recipient,
+        machine_id,
+        capabilities.clone(),
+        capability_issued_at,
+    );
     assert!(agent
         .capability_store
         .force_miss_once_for_testing(recipient));
@@ -18817,9 +18835,12 @@ async fn forced_join_upgrades_paused_ordinary_flight_before_cache_return() {
         force_refresh,
         "the strict-send lookup must carry miss proof"
     );
-    agent
-        .capability_store
-        .insert(recipient, machine_id, capabilities, 2_000);
+    agent.capability_store.insert(
+        recipient,
+        machine_id,
+        capabilities,
+        capability_issued_at + 1,
+    );
 
     let forced_agent = std::sync::Arc::clone(&agent);
     let forced_waiter = tokio::spawn(async move {

@@ -390,22 +390,38 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     invite.base_security_binding = info.security_binding.clone();
 }
 
+/// Build the common live x0x card used by native and A2A discovery routes.
+fn runtime_agent_card(agent: &x0x::Agent, display_name: String) -> x0x::groups::card::AgentCard {
+    let agent_id = agent.agent_id();
+    let machine_id = hex::encode(agent.machine_id().as_bytes());
+    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+    card.dm_capabilities = Some(agent.current_dm_capabilities());
+    card.user_id = agent.user_id().map(|u| hex::encode(u.as_bytes()));
+    card
+}
+
+/// Whether a verified-or-legacy card may seed the TTL-bounded runtime cache.
+///
+/// Unsigned v1 cards remain usable for legacy, non-strict messaging. A v2+
+/// claim can satisfy strict delivery, so it must be covered by the card's
+/// AgentId-bound signature. Callers invoke this only after validating any
+/// signature that is present.
+fn card_capability_may_seed_runtime_store(
+    card: &x0x::groups::card::AgentCard,
+    capabilities: &x0x::dm::DmCapabilities,
+) -> bool {
+    card.signature.is_some() || !capabilities.supports_durable_app_ack()
+}
+
 /// GET /agent/card — generate a shareable identity card.
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(query): axum::extract::Query<CardQuery>,
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
-    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
     let display_name = query.display_name.unwrap_or_default();
 
-    let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
-    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
-        state.agent_kem_keypair.public_bytes.clone(),
-    ));
-
-    // Add user ID if available
-    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+    let mut card = runtime_agent_card(&state.agent, display_name);
 
     // Add external addresses from ant-quic NodeStatus, filtered to
     // globally-advertisable scope only (see discover_local_card_addresses
@@ -506,14 +522,7 @@ pub(in crate::server) async fn get_agent_card(
 pub(in crate::server) async fn get_a2a_agent_card(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    let agent_id = state.agent.agent_id();
-    let machine_id = hex::encode(state.agent.machine_id().as_bytes());
-
-    let mut card = x0x::groups::card::AgentCard::new(String::new(), &agent_id, &machine_id);
-    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
-        state.agent_kem_keypair.public_bytes.clone(),
-    ));
-    card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
+    let mut card = runtime_agent_card(&state.agent, String::new());
 
     // Only globally-advertisable addresses belong in a publicly-served card.
     if let Some(network) = state.agent.network() {
@@ -672,15 +681,21 @@ pub(in crate::server) async fn import_agent_card(
 
     let capability_store = state.agent.capability_store();
     let mut inserted_dm_capability = false;
+    let card_created_at_ms = card.created_at.checked_mul(1_000);
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
-            if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                inserted_dm_capability = capability_store.insert_from_card(
-                    agent_id,
-                    x0x::identity::MachineId(machine_id_bytes),
-                    caps,
-                    x0x::dm_capability::now_unix_ms(),
-                );
+            if caps.gossip_inbox
+                && !caps.kem_public_key.is_empty()
+                && card_capability_may_seed_runtime_store(&card, &caps)
+            {
+                if let Some(created_at_ms) = card_created_at_ms {
+                    inserted_dm_capability = capability_store.insert_from_card(
+                        agent_id,
+                        x0x::identity::MachineId(machine_id_bytes),
+                        caps,
+                        created_at_ms,
+                    );
+                }
             }
         }
     }
@@ -1095,6 +1110,205 @@ pub(in crate::server) struct ServiceEntryData {
     name: String,
     description: String,
     min_trust: String,
+}
+
+#[cfg(test)]
+mod runtime_agent_card_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn signed_runtime_card_transitions_from_pending_to_v3_and_seeds_strict_binding() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let history_config = x0x::history::HistoryConfig {
+            enabled: true,
+            db_path: Some(dir.path().join("history.db")),
+            ..x0x::history::HistoryConfig::default()
+        };
+        let agent = x0x::Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_network_config(x0x::network::NetworkConfig::default())
+            .with_history(history_config)
+            .build()
+            .await
+            .expect("agent");
+
+        let mut pending = runtime_agent_card(&agent, "pending".to_string());
+        assert_eq!(
+            pending.dm_capabilities,
+            Some(x0x::dm::DmCapabilities::pending()),
+            "a card minted before inbox startup must not claim a receive path"
+        );
+        pending
+            .sign(agent.identity().agent_keypair())
+            .expect("sign pending card");
+        pending.verify_signature().expect("verify pending card");
+
+        let kem =
+            Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate().expect("KEM keypair"));
+        agent
+            .start_dm_inbox(Arc::clone(&kem), x0x::dm_inbox::DmInboxConfig::default())
+            .await
+            .expect("start DM inbox");
+
+        let mut ready = runtime_agent_card(&agent, "ready".to_string());
+        let capabilities = ready
+            .dm_capabilities
+            .as_ref()
+            .expect("runtime capabilities");
+        assert!(capabilities.supports_durable_app_ack());
+        assert!(capabilities.supports_thread_metadata());
+        assert_eq!(capabilities.kem_public_key, kem.public_bytes);
+        ready
+            .sign(agent.identity().agent_keypair())
+            .expect("sign ready card");
+        assert!(card_capability_may_seed_runtime_store(
+            &ready,
+            ready
+                .dm_capabilities
+                .as_ref()
+                .expect("signed ready capabilities"),
+        ));
+        let mut unsigned_v3 = ready.clone();
+        unsigned_v3.signature = None;
+        assert!(
+            !card_capability_may_seed_runtime_store(
+                &unsigned_v3,
+                unsigned_v3
+                    .dm_capabilities
+                    .as_ref()
+                    .expect("unsigned v3 capabilities"),
+            ),
+            "an unsigned durable claim must not become a strict runtime binding"
+        );
+
+        // The well-known A2A response embeds this exact signed x0x card in
+        // its `url` extension, so x0x-aware consumers recover the same live
+        // capability state rather than a separately synthesized v1 claim.
+        let a2a = x0x::a2a::a2a_card_from(
+            &ready,
+            &x0x::a2a::A2aContext {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+                exec_enabled: false,
+                certificate_b64: None,
+            },
+        );
+        let a2a_source = x0x::groups::card::AgentCard::from_link(&a2a.url)
+            .expect("decode signed x0x card from well-known A2A URL");
+        a2a_source
+            .verify_signature()
+            .expect("verify well-known source card");
+        assert_eq!(a2a_source.dm_capabilities, ready.dm_capabilities);
+
+        let imported = x0x::groups::card::AgentCard::from_link(&ready.to_link())
+            .expect("decode signed card link");
+        imported.verify_signature().expect("verify ready card");
+        let imported_capabilities = imported
+            .dm_capabilities
+            .clone()
+            .expect("imported runtime capabilities");
+        let machine_id = agent.machine_id();
+        let store = x0x::dm_capability::CapabilityStore::new();
+        assert!(store.insert_from_card(
+            agent.agent_id(),
+            machine_id,
+            imported_capabilities,
+            imported.created_at.saturating_mul(1_000),
+        ));
+        let binding = store
+            .lookup_binding(&agent.agent_id())
+            .expect("strict-capable card binding");
+        assert_eq!(binding.machine_id, machine_id);
+        assert!(binding.capabilities.supports_durable_app_ack());
+        assert!(binding.capabilities.supports_thread_metadata());
+
+        agent.stop_dm_inbox().await;
+        assert_eq!(
+            agent.current_dm_capabilities(),
+            x0x::dm::DmCapabilities::pending()
+        );
+        let stopped_card = runtime_agent_card(&agent, "stopped".to_string());
+        assert_eq!(
+            stopped_card.dm_capabilities,
+            Some(x0x::dm::DmCapabilities::pending())
+        );
+
+        let restarted_kem = Arc::new(
+            x0x::groups::kem_envelope::AgentKemKeypair::generate().expect("restart KEM keypair"),
+        );
+        assert_ne!(restarted_kem.public_bytes, kem.public_bytes);
+        agent
+            .start_dm_inbox(
+                Arc::clone(&restarted_kem),
+                x0x::dm_inbox::DmInboxConfig::default(),
+            )
+            .await
+            .expect("restart DM inbox");
+        let restarted_caps = agent.current_dm_capabilities();
+        assert!(restarted_caps.supports_thread_metadata());
+        assert_eq!(restarted_caps.kem_public_key, restarted_kem.public_bytes);
+
+        // AgentCard v1 carries whole seconds. Force an immediate restart card
+        // into the same signed second as A: conflicting KEM B cannot be
+        // securely ordered against A, so import must quarantine A rather than
+        // retain its dead key or blindly treat B as newer.
+        let mut same_second_restart = runtime_agent_card(&agent, "restarted".to_string());
+        same_second_restart.created_at = imported.created_at;
+        same_second_restart
+            .sign(agent.identity().agent_keypair())
+            .expect("sign same-second restart card");
+        same_second_restart
+            .verify_signature()
+            .expect("verify same-second restart card");
+        let restarted_card_caps = same_second_restart
+            .dm_capabilities
+            .clone()
+            .expect("restart card capabilities");
+        assert!(!store.insert_from_card(
+            agent.agent_id(),
+            machine_id,
+            restarted_card_caps.clone(),
+            same_second_restart.created_at.saturating_mul(1_000),
+        ));
+        assert!(
+            store.lookup_binding(&agent.agent_id()).is_none(),
+            "same-second conflicting card must not leave stale KEM A usable"
+        );
+
+        // The requested runtime advert has millisecond freshness and restores
+        // exact B. Replaying signed card A afterwards cannot roll it back.
+        let restart_advert_created_at = same_second_restart
+            .created_at
+            .saturating_mul(1_000)
+            .saturating_add(1);
+        assert!(store.insert(
+            agent.agent_id(),
+            machine_id,
+            restarted_card_caps,
+            restart_advert_created_at,
+        ));
+        assert!(!store.insert_from_card(
+            agent.agent_id(),
+            machine_id,
+            imported
+                .dm_capabilities
+                .clone()
+                .expect("original card capabilities"),
+            imported.created_at.saturating_mul(1_000),
+        ));
+        let restored_binding = store
+            .lookup_binding(&agent.agent_id())
+            .expect("fresh restarted binding");
+        assert_eq!(restored_binding.machine_id, machine_id);
+        assert_eq!(
+            restored_binding.capabilities.kem_public_key,
+            restarted_kem.public_bytes
+        );
+
+        agent.shutdown().await;
+    }
 }
 
 // ── Key lifecycle — revocation ────────────────────────────────────────────────

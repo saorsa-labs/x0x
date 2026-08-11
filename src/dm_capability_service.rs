@@ -20,6 +20,14 @@ pub const ADVERT_PROTOCOL_VERSION: u16 = 1;
 const FLEET_REQUEST_PROTOCOL_VERSION: u16 = 1;
 const TARGETED_REQUEST_PROTOCOL_VERSION: u16 = 2;
 
+/// Dedicated response topic for an exact-recipient strict refresh.
+///
+/// Steady capability adverts remain Bulk anti-entropy traffic. A strict send
+/// has only a short convergence window, so its authenticated targeted request
+/// and signed response use their own Critical control topics instead of being
+/// cooled behind the fleet-wide advert stream.
+pub(crate) const DM_CAPABILITY_TARGETED_RESPONSE_TOPIC: &str = "x0x/caps/v1/response/targeted-v2";
+
 const FIRST_PUBLISH_DELAY_MS: u64 = 250;
 
 /// A verified requester can make the fleet republish public data, but it must
@@ -107,11 +115,6 @@ impl PendingResponses {
             ReannounceRequest::Targeted => self.targeted = true,
         }
     }
-
-    fn clear(&mut self) {
-        self.fleet = false;
-        self.targeted = false;
-    }
 }
 
 /// Publish an authenticated request for fresh capability state.
@@ -191,13 +194,13 @@ pub(crate) fn ingest_verified_capability_advert(
         MachineId(advert.machine_id),
         advert.capabilities,
         advert.created_at_unix_ms,
-    );
-    true
+    )
 }
 
 pub struct CapabilityAdvertService {
     publisher: JoinHandle<()>,
     subscriber: JoinHandle<()>,
+    targeted_response_subscriber: JoinHandle<()>,
     request_responder: JoinHandle<()>,
     targeted_request_responder: JoinHandle<()>,
     requester: JoinHandle<()>,
@@ -243,6 +246,9 @@ impl CapabilityAdvertService {
         request_startup_burst: bool,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut targeted_response_subscription = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
         let mut request_subscription = pubsub
             .subscribe(DM_CAPABILITY_REQUEST_TOPIC.to_string())
             .await;
@@ -250,7 +256,9 @@ impl CapabilityAdvertService {
             .subscribe(DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string())
             .await;
         let store_sub = Arc::clone(&store);
+        let targeted_store_sub = Arc::clone(&store);
         let self_agent_for_sub = self_agent_id;
+        let self_agent_for_targeted_sub = self_agent_id;
         let (reannounce_tx, mut reannounce_rx) =
             tokio::sync::mpsc::channel::<ReannounceRequest>(16);
         let targeted_reannounce_tx = reannounce_tx.clone();
@@ -267,6 +275,25 @@ impl CapabilityAdvertService {
                 }
             }
             tracing::debug!("capability advert subscriber exited");
+        });
+
+        let targeted_response_subscriber = tokio::spawn(async move {
+            while let Some(message) = targeted_response_subscription.recv().await {
+                let sender = message.sender;
+                if ingest_verified_capability_advert(
+                    &targeted_store_sub,
+                    self_agent_for_targeted_sub,
+                    &message,
+                ) {
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_advert_ingested",
+                        kind = "targeted_v2",
+                        sender = sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
+                    );
+                }
+            }
+            tracing::debug!("targeted capability advert response subscriber exited");
         });
 
         let request_responder = tokio::spawn(async move {
@@ -381,8 +408,9 @@ impl CapabilityAdvertService {
                             // advert. A later watch upgrade publishes
                             // immediately; do not manufacture startup bursts
                             // in response to requests while still pending.
-                            if request.is_none() {
-                                requests_open = false;
+                            match request {
+                                Some(request) => pending_responses.record(request),
+                                None => requests_open = false,
                             }
                         }
                     }
@@ -395,25 +423,59 @@ impl CapabilityAdvertService {
                     caps_snapshot,
                 ) {
                     Ok(bytes) => {
-                        if let Err(e) = publisher_pubsub
-                            .publish(DM_CAPABILITY_TOPIC.to_string(), Bytes::from(bytes))
+                        let bytes = Bytes::from(bytes);
+                        let publish_targeted = pending_responses.targeted;
+                        let mut published_any = false;
+
+                        if publish_targeted {
+                            match publisher_pubsub
+                                .publish(
+                                    DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
+                                    bytes.clone(),
+                                )
+                                .await
+                            {
+                                Ok(()) => {
+                                    published_any = true;
+                                    last_targeted_response_at = Some(tokio::time::Instant::now());
+                                    pending_responses.targeted = false;
+                                    tracing::debug!(
+                                        target: "dm.trace",
+                                        stage = "capability_advert_response_published",
+                                        kind = "targeted_v2",
+                                    );
+                                }
+                                Err(error) => {
+                                    tracing::warn!(
+                                        "capability advert publish failed on targeted response topic: {error}"
+                                    );
+                                }
+                            }
+                        }
+
+                        // Preserve the original advert topic for mixed-patch
+                        // interoperability, but only after the strict Critical
+                        // response has been emitted. Bulk cooling must never
+                        // consume the targeted convergence window.
+                        match publisher_pubsub
+                            .publish(DM_CAPABILITY_TOPIC.to_string(), bytes)
                             .await
                         {
-                            tracing::warn!("capability advert publish failed: {e}");
-                        } else {
-                            let published_at = tokio::time::Instant::now();
-                            if pending_responses.fleet {
-                                last_fleet_response_at = Some(published_at);
+                            Ok(()) => {
+                                published_any = true;
+                                if pending_responses.fleet {
+                                    last_fleet_response_at = Some(tokio::time::Instant::now());
+                                    pending_responses.fleet = false;
+                                }
                             }
-                            if pending_responses.targeted {
-                                last_targeted_response_at = Some(published_at);
-                                tracing::debug!(
-                                    target: "dm.trace",
-                                    stage = "capability_advert_response_published",
-                                    kind = "targeted_v2",
+                            Err(error) => {
+                                tracing::warn!(
+                                    "capability advert publish failed on steady topic: {error}"
                                 );
                             }
-                            pending_responses.clear();
+                        }
+
+                        if published_any {
                             tracing::debug!("capability advert published");
                         }
                     }
@@ -478,6 +540,7 @@ impl CapabilityAdvertService {
         Ok(Self {
             publisher,
             subscriber,
+            targeted_response_subscriber,
             request_responder,
             targeted_request_responder,
             requester,
@@ -507,6 +570,7 @@ impl CapabilityAdvertService {
     pub fn abort(&self) {
         self.publisher.abort();
         self.subscriber.abort();
+        self.targeted_response_subscriber.abort();
         self.request_responder.abort();
         self.targeted_request_responder.abort();
         self.requester.abort();
@@ -845,6 +909,78 @@ mod tests {
         service.abort();
     }
 
+    #[tokio::test]
+    async fn service_ingests_verified_peer_advert_from_targeted_response_topic() {
+        let peer_keypair = AgentKeypair::generate().expect("peer keygen");
+        let peer_signing = Arc::new(SigningContext::from_keypair(&peer_keypair));
+        let peer_agent = peer_keypair.agent_id();
+        let peer_machine = MachineId([0x43; 32]);
+        let peer_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x44; 1184]);
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&peer_signing))).expect("pubsub"),
+        );
+        let store = Arc::new(CapabilityStore::new());
+        let (_caps_tx, caps_rx) = tokio::sync::watch::channel(DmCapabilities::pending());
+        let service = CapabilityAdvertService::spawn_default(
+            Arc::clone(&pubsub),
+            Arc::clone(&peer_signing),
+            AgentId([0x45; 32]),
+            MachineId([0x46; 32]),
+            caps_rx,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("spawn service");
+
+        let encoded =
+            build_signed_advert(&peer_signing, peer_agent, peer_machine, peer_caps.clone())
+                .expect("build targeted peer advert");
+        let mut stale: CapabilityAdvert =
+            postcard::from_bytes(&encoded).expect("decode stale advert template");
+        stale.created_at_unix_ms =
+            now_unix_ms().saturating_sub(crate::dm_capability::ADVERT_CACHE_TTL_SECS * 1_000 + 1);
+        stale.signature = peer_signing
+            .sign(&stale.signed_bytes().expect("stale signed bytes"))
+            .expect("sign stale advert");
+        pubsub
+            .publish(
+                DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
+                Bytes::from(postcard::to_stdvec(&stale).expect("encode stale advert")),
+            )
+            .await
+            .expect("publish stale targeted advert");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            store.lookup_binding(&peer_agent).is_none(),
+            "stale signed targeted response must not satisfy strict refresh"
+        );
+        pubsub
+            .publish(
+                DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string(),
+                Bytes::from(encoded),
+            )
+            .await
+            .expect("publish targeted peer advert");
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store.lookup_binding(&peer_agent).is_some() {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("targeted response subscriber did not ingest peer advert");
+        let binding = store
+            .lookup_binding(&peer_agent)
+            .expect("targeted strict binding");
+        assert_eq!(binding.machine_id, peer_machine);
+        assert_eq!(binding.capabilities, peer_caps);
+
+        service.abort();
+    }
+
     // ------------------------------------------------------------------
     // CapabilityAdvertService: subscriber ingests a peer's verified advert
     // ------------------------------------------------------------------
@@ -1070,7 +1206,10 @@ mod tests {
         let pubsub = Arc::new(
             PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
         );
-        let mut subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut steady_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut targeted_subscriber = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
         let (_caps_tx, caps_rx) =
             tokio::sync::watch::channel(DmCapabilities::v1_gossip_ready(vec![0x6A; 1184]));
         let service = CapabilityAdvertService::spawn_with_timing(
@@ -1088,7 +1227,7 @@ mod tests {
         .await
         .expect("spawn service");
 
-        tokio::time::timeout(Duration::from_secs(3), subscriber.recv())
+        tokio::time::timeout(Duration::from_secs(3), steady_subscriber.recv())
             .await
             .expect("initial advert timeout")
             .expect("subscriber closed");
@@ -1097,7 +1236,7 @@ mod tests {
             .await
             .expect("foreign targeted request");
         assert!(
-            tokio::time::timeout(Duration::from_millis(300), subscriber.recv())
+            tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
                 .await
                 .is_err(),
             "a non-target daemon must not reannounce"
@@ -1106,10 +1245,112 @@ mod tests {
         publish_capability_advert_request(&pubsub, Some(self_agent))
             .await
             .expect("self targeted request");
-        tokio::time::timeout(Duration::from_secs(2), subscriber.recv())
+        let response = tokio::time::timeout(Duration::from_secs(2), targeted_subscriber.recv())
             .await
             .expect("exact target did not reannounce")
             .expect("subscriber closed");
+        assert_eq!(response.topic, DM_CAPABILITY_TARGETED_RESPONSE_TOPIC);
+        let advert: CapabilityAdvert =
+            postcard::from_bytes(&response.payload).expect("decode targeted response advert");
+        assert_eq!(advert.agent_id, *self_agent.as_bytes());
+        assert!(verify_advert_signature(
+            &advert,
+            &response.sender_public_key.expect("response public key"),
+        ));
+        let compatibility_response =
+            tokio::time::timeout(Duration::from_secs(2), steady_subscriber.recv())
+                .await
+                .expect("legacy advert-topic compatibility response timeout")
+                .expect("steady subscriber closed");
+        assert_eq!(compatibility_response.payload, response.payload);
+
+        service.abort();
+    }
+
+    #[tokio::test]
+    async fn pending_targeted_request_survives_upgrade_and_critical_response_leads_bulk() {
+        let keypair = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&keypair));
+        let self_agent = keypair.agent_id();
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
+        let mut targeted_subscriber = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
+        let mut bulk_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let (caps_tx, caps_rx) = tokio::sync::watch::channel(DmCapabilities::pending());
+        let service = CapabilityAdvertService::spawn_with_timing(
+            Arc::clone(&pubsub),
+            signing,
+            self_agent,
+            MachineId([0xB1; 32]),
+            caps_rx,
+            Arc::new(CapabilityStore::new()),
+            Duration::from_secs(3_600),
+            Duration::from_millis(25),
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn service");
+
+        publish_capability_advert_request(&pubsub, Some(self_agent))
+            .await
+            .expect("targeted request while pending");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
+                .await
+                .is_err(),
+            "pending inbox must not claim strict capability"
+        );
+
+        caps_tx.send_replace(DmCapabilities::v3_threaded_durable_gossip_ready(vec![
+            0xB2;
+            1184
+        ]));
+        let targeted = tokio::time::timeout(Duration::from_secs(2), targeted_subscriber.recv())
+            .await
+            .expect("retained targeted request did not respond after upgrade")
+            .expect("targeted subscriber closed");
+        assert_eq!(targeted.topic, DM_CAPABILITY_TARGETED_RESPONSE_TOPIC);
+        let bulk = tokio::time::timeout(Duration::from_secs(2), bulk_subscriber.recv())
+            .await
+            .expect("compatibility advert missing")
+            .expect("bulk subscriber closed");
+        assert_eq!(targeted.payload, bulk.payload);
+
+        // Model stop_dm_inbox's watch transition while retaining the service
+        // so the negative assertion exercises the publisher itself. A
+        // targeted request observed after stop must remain unanswered until a
+        // restarted inbox advertises a new live KEM binding.
+        caps_tx.send_replace(DmCapabilities::pending());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        publish_capability_advert_request(&pubsub, Some(self_agent))
+            .await
+            .expect("targeted request after stop");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
+                .await
+                .is_err(),
+            "stopped inbox must not publish a strict targeted response"
+        );
+
+        caps_tx.send_replace(DmCapabilities::v3_threaded_durable_gossip_ready(vec![
+            0xB3;
+            1184
+        ]));
+        let restarted = tokio::time::timeout(Duration::from_secs(2), targeted_subscriber.recv())
+            .await
+            .expect("retained post-stop request did not respond after restart")
+            .expect("targeted subscriber closed after restart");
+        let restarted_advert: CapabilityAdvert =
+            postcard::from_bytes(&restarted.payload).expect("decode restarted advert");
+        assert!(restarted_advert.capabilities.supports_thread_metadata());
+        assert_eq!(
+            restarted_advert.capabilities.kem_public_key,
+            vec![0xB3; 1184]
+        );
 
         service.abort();
     }
@@ -1196,6 +1437,7 @@ mod tests {
         // is also still inside its startup schedule at this point.
         assert!(!service.publisher.is_finished());
         assert!(!service.subscriber.is_finished());
+        assert!(!service.targeted_response_subscriber.is_finished());
         assert!(!service.request_responder.is_finished());
         assert!(!service.targeted_request_responder.is_finished());
         assert!(!service.requester.is_finished());
@@ -1207,6 +1449,7 @@ mod tests {
             loop {
                 if service.publisher.is_finished()
                     && service.subscriber.is_finished()
+                    && service.targeted_response_subscriber.is_finished()
                     && service.request_responder.is_finished()
                     && service.targeted_request_responder.is_finished()
                     && service.requester.is_finished()

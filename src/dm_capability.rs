@@ -57,6 +57,25 @@ pub const ADVERT_PUBLISH_INTERVAL_SECS: u64 = 300;
 /// Must be > `ADVERT_PUBLISH_INTERVAL_SECS` so that a single missed
 /// publish window doesn't evict the cache entry.
 pub const ADVERT_CACHE_TTL_SECS: u64 = 900;
+/// Maximum tolerated sender clock lead for signed capability state.
+pub const MAX_CAPABILITY_FUTURE_SKEW_SECS: u64 = 300;
+
+/// Whether a signed capability timestamp is inside the acceptance window.
+#[must_use]
+pub fn capability_timestamp_is_fresh(created_at_unix_ms: u64, now_unix_ms: u64) -> bool {
+    timestamp_is_fresh_for_ttl(
+        created_at_unix_ms,
+        now_unix_ms,
+        ADVERT_CACHE_TTL_SECS.saturating_mul(1_000),
+    )
+}
+
+fn timestamp_is_fresh_for_ttl(created_at_unix_ms: u64, now_unix_ms: u64, ttl_ms: u64) -> bool {
+    let skew_ms = MAX_CAPABILITY_FUTURE_SKEW_SECS.saturating_mul(1_000);
+    ttl_ms > 0
+        && created_at_unix_ms <= now_unix_ms.saturating_add(skew_ms)
+        && now_unix_ms.saturating_sub(created_at_unix_ms) < ttl_ms
+}
 
 /// Signed capability advertisement broadcast on the mesh-wide capability
 /// topic.
@@ -118,7 +137,7 @@ pub struct CapabilityStore {
 struct CachedAdvert {
     capabilities: DmCapabilities,
     machine_id: [u8; 32],
-    seen_at: Instant,
+    expires_at: Instant,
     created_at_unix_ms: u64,
 }
 
@@ -214,7 +233,7 @@ impl CapabilityStore {
         let Some(entry) = inner.get(agent_id.as_bytes()) else {
             return (None, false);
         };
-        if now.duration_since(entry.seen_at) > self.ttl {
+        if now > entry.expires_at {
             inner.remove(agent_id.as_bytes());
             return (None, false);
         }
@@ -231,64 +250,31 @@ impl CapabilityStore {
     ///
     /// `created_at_unix_ms` is the advert's signed sender-side timestamp and
     /// orders adverts from the same sender: an advert strictly older than the
-    /// cached one is ignored. Gossip (epidemic broadcast) does not guarantee
+    /// cached one is ignored. Equal timestamps are replays and cannot extend
+    /// the original expiry. Gossip (epidemic broadcast) does not guarantee
     /// in-order delivery, so without this a daemon's startup `pending`
     /// (gossip_inbox=false) advert can arrive *after* its upgraded
     /// gossip-ready advert and clobber it — leaving every sender on the
     /// silent raw-QUIC fallback (`advert_cache_unusable`) until the next
-    /// republish window. An equal timestamp refreshes the TTL (duplicate
-    /// delivery of the same advert).
+    /// republish window.
+    ///
+    /// Returns `true` only when fresh signed state was inserted.
     pub fn insert(
         &self,
         agent_id: AgentId,
         machine_id: MachineId,
         capabilities: DmCapabilities,
         created_at_unix_ms: u64,
-    ) {
-        let Ok(mut inner) = self.inner.lock() else {
-            return;
-        };
-        if let Some(existing) = inner.get(agent_id.as_bytes()) {
-            if created_at_unix_ms < existing.created_at_unix_ms {
-                return;
-            }
-        }
-        inner.insert(
-            *agent_id.as_bytes(),
-            CachedAdvert {
-                capabilities,
-                machine_id: *machine_id.as_bytes(),
-                seen_at: Instant::now(),
-                created_at_unix_ms,
-            },
-        );
-    }
-
-    /// Insert capability material imported from an agent card unless it would
-    /// lower the protocol version of a live runtime advert.
-    ///
-    /// Agent cards remain useful for first contact and refresh same-version
-    /// KEM/machine material, but current cards advertise v1 even when the live
-    /// daemon has published a signed v2 durable-ACK advert. Treating card import
-    /// time as a fresher advert timestamp would otherwise replace that v2
-    /// binding and make strict product sends fail until the next mesh refresh.
-    /// Returns `true` when the card material was inserted.
-    pub fn insert_from_card(
-        &self,
-        agent_id: AgentId,
-        machine_id: MachineId,
-        capabilities: DmCapabilities,
-        imported_at_unix_ms: u64,
     ) -> bool {
-        let now = Instant::now();
+        let now_ms = now_unix_ms();
+        let Some(expires_at) = self.expiry_for_signed_timestamp(created_at_unix_ms, now_ms) else {
+            return false;
+        };
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
         if let Some(existing) = inner.get(agent_id.as_bytes()) {
-            let existing_is_live = now.duration_since(existing.seen_at) <= self.ttl;
-            if existing_is_live
-                && existing.capabilities.max_protocol_version > capabilities.max_protocol_version
-            {
+            if created_at_unix_ms <= existing.created_at_unix_ms {
                 return false;
             }
         }
@@ -297,11 +283,105 @@ impl CapabilityStore {
             CachedAdvert {
                 capabilities,
                 machine_id: *machine_id.as_bytes(),
-                seen_at: now,
-                created_at_unix_ms: imported_at_unix_ms,
+                expires_at,
+                created_at_unix_ms,
             },
         );
         true
+    }
+
+    /// Insert capability material imported from an agent card unless it would
+    /// lower the protocol version of a live runtime advert.
+    ///
+    /// Agent cards remain useful for first contact and refresh same-version
+    /// KEM/machine material. Live daemon cards now carry the watch-backed
+    /// runtime capability (including v2/v3), while legacy/static cards may
+    /// still carry v1. A lower-version card import must not replace a fresher
+    /// live runtime binding and make strict product sends fail until the next
+    /// mesh refresh.
+    /// Returns `true` when the card material was inserted.
+    pub fn insert_from_card(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        capabilities: DmCapabilities,
+        created_at_unix_ms: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let now_ms = now_unix_ms();
+        let Some(expires_at) = self.expiry_for_signed_timestamp_at(created_at_unix_ms, now_ms, now)
+        else {
+            return false;
+        };
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if let Some(existing) = inner.get(agent_id.as_bytes()) {
+            if created_at_unix_ms < existing.created_at_unix_ms {
+                return false;
+            }
+            let existing_is_live = now <= existing.expires_at;
+            if existing_is_live
+                && existing.capabilities.max_protocol_version > capabilities.max_protocol_version
+            {
+                // Legacy unsigned v1 cards are still accepted for non-strict
+                // compatibility. They must never quarantine a live signed
+                // durable binding, even when an attacker chooses the same
+                // whole-second timestamp.
+                return false;
+            }
+            if created_at_unix_ms == existing.created_at_unix_ms {
+                let material_is_identical = existing.machine_id == *machine_id.as_bytes()
+                    && existing.capabilities == capabilities;
+                if !material_is_identical {
+                    // AgentCard v1 timestamps have second precision. Two
+                    // differently signed cards from the same second cannot be
+                    // securely ordered, so fail closed instead of retaining a
+                    // possibly dead KEM or guessing that the import is newer.
+                    // A targeted runtime advert has millisecond precision and
+                    // can install the unambiguous current binding.
+                    inner.remove(agent_id.as_bytes());
+                }
+                return false;
+            }
+        }
+        inner.insert(
+            *agent_id.as_bytes(),
+            CachedAdvert {
+                capabilities,
+                machine_id: *machine_id.as_bytes(),
+                expires_at,
+                created_at_unix_ms,
+            },
+        );
+        true
+    }
+
+    fn expiry_for_signed_timestamp(
+        &self,
+        created_at_unix_ms: u64,
+        now_unix_ms: u64,
+    ) -> Option<Instant> {
+        self.expiry_for_signed_timestamp_at(created_at_unix_ms, now_unix_ms, Instant::now())
+    }
+
+    fn expiry_for_signed_timestamp_at(
+        &self,
+        created_at_unix_ms: u64,
+        now_unix_ms: u64,
+        now: Instant,
+    ) -> Option<Instant> {
+        let ttl_ms = u64::try_from(self.ttl.as_millis()).unwrap_or(u64::MAX);
+        if !timestamp_is_fresh_for_ttl(created_at_unix_ms, now_unix_ms, ttl_ms) {
+            return None;
+        }
+        let signed_expiry_ms = created_at_unix_ms.saturating_add(ttl_ms);
+        let remaining_ms = signed_expiry_ms
+            .saturating_sub(now_unix_ms)
+            // A tolerated future clock cannot buy TTL + skew. Every accepted
+            // record expires no later than one local TTL from insertion.
+            .min(ttl_ms);
+        now.checked_add(Duration::from_millis(remaining_ms))
     }
 
     /// Arm one deterministic cache miss for an authenticated daemon test.
@@ -354,8 +434,9 @@ mod tests {
         let agent_id = AgentId([1u8; 32]);
         let machine_id = MachineId([2u8; 32]);
         let caps = DmCapabilities::v1_gossip_ready(vec![0u8; 1184]);
+        let issued_at = now_unix_ms();
         assert!(store.lookup(&agent_id).is_none());
-        store.insert(agent_id, machine_id, caps.clone(), 1_000);
+        assert!(store.insert(agent_id, machine_id, caps.clone(), issued_at));
         let got = store.lookup(&agent_id).expect("hit");
         assert_eq!(got.max_protocol_version, caps.max_protocol_version);
         assert_eq!(got.gossip_inbox, caps.gossip_inbox);
@@ -373,16 +454,17 @@ mod tests {
         let agent_id = AgentId([0x31; 32]);
         let machine_id = MachineId([0x42; 32]);
         let caps = DmCapabilities::v2_durable_gossip_ready(vec![0x53; 1184]);
-        store.insert(agent_id, machine_id, caps.clone(), 1_000);
+        let issued_at = now_unix_ms();
+        assert!(store.insert(agent_id, machine_id, caps.clone(), issued_at));
         assert!(store.force_miss_once_for_testing(agent_id));
 
         // A startup-burst advert racing between control arming and strict send
         // cannot defeat the deterministic next-lookup miss.
-        store.insert(agent_id, machine_id, caps.clone(), 2_000);
+        assert!(store.insert(agent_id, machine_id, caps.clone(), issued_at + 1));
         let (binding, forced_refresh) = store.lookup_binding_with_refresh_proof(&agent_id);
         assert!(binding.is_none());
         assert!(forced_refresh);
-        store.insert(agent_id, machine_id, caps, 3_000);
+        assert!(store.insert(agent_id, machine_id, caps, issued_at + 2));
         let (binding, forced_refresh) = store.lookup_binding_with_refresh_proof(&agent_id);
         assert!(
             binding.is_some(),
@@ -402,14 +484,15 @@ mod tests {
         let store = CapabilityStore::new();
         let agent_id = AgentId([5u8; 32]);
         let machine_id = MachineId([6u8; 32]);
-        store.insert(
+        let issued_at = now_unix_ms();
+        assert!(store.insert(
             agent_id,
             machine_id,
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
-            2_000,
-        );
+            issued_at + 1,
+        ));
         // Older pending advert delivered late: ignored.
-        store.insert(agent_id, machine_id, DmCapabilities::pending(), 1_000);
+        assert!(!store.insert(agent_id, machine_id, DmCapabilities::pending(), issued_at));
         let got = store.lookup(&agent_id).expect("hit");
         assert!(
             got.gossip_inbox && !got.kem_public_key.is_empty(),
@@ -417,7 +500,12 @@ mod tests {
         );
         // A genuinely fresher downgrade (e.g. daemon restarted pre-KEM) still
         // applies — ordering, not blanket downgrade protection.
-        store.insert(agent_id, machine_id, DmCapabilities::pending(), 3_000);
+        assert!(store.insert(
+            agent_id,
+            machine_id,
+            DmCapabilities::pending(),
+            issued_at + 2,
+        ));
         let got = store.lookup(&agent_id).expect("hit");
         assert!(
             !got.gossip_inbox,
@@ -431,18 +519,19 @@ mod tests {
         let agent_id = AgentId([0x71; 32]);
         let runtime_machine = MachineId([0x72; 32]);
         let runtime_key = vec![0x73; 1184];
-        store.insert(
+        let issued_at = now_unix_ms();
+        assert!(store.insert(
             agent_id,
             runtime_machine,
             DmCapabilities::v2_durable_gossip_ready(runtime_key.clone()),
-            1_000,
-        );
+            issued_at,
+        ));
 
         assert!(!store.insert_from_card(
             agent_id,
             MachineId([0x74; 32]),
             DmCapabilities::v1_gossip_ready(vec![0x75; 1184]),
-            2_000,
+            issued_at + 1,
         ));
 
         let binding = store.lookup_binding(&agent_id).expect("runtime binding");
@@ -457,17 +546,18 @@ mod tests {
         let agent_id = AgentId([0x81; 32]);
         let first_machine = MachineId([0x82; 32]);
         let refreshed_machine = MachineId([0x83; 32]);
+        let issued_at = now_unix_ms();
         assert!(store.insert_from_card(
             agent_id,
             first_machine,
             DmCapabilities::v1_gossip_ready(vec![0x84; 1184]),
-            1_000,
+            issued_at,
         ));
         assert!(store.insert_from_card(
             agent_id,
             refreshed_machine,
             DmCapabilities::v1_gossip_ready(vec![0x85; 1184]),
-            2_000,
+            issued_at + 1,
         ));
 
         let binding = store
@@ -480,22 +570,23 @@ mod tests {
 
     #[test]
     fn capability_store_expires_on_ttl() {
-        // Deterministic: insert records `seen_at ≈ now`, then the test
-        // queries `lookup_at` at a synthetic future instant past the TTL.
+        // Deterministic: insert derives an `expires_at` instant from the
+        // signed timestamp, then the test queries `lookup_at` at a synthetic
+        // future instant past the TTL.
         // No wall-clock sleep is involved, so CI scheduling jitter can never
         // push the "present" lookup past the TTL boundary — the prior flake.
         let ttl = Duration::from_secs(60);
         let store = CapabilityStore::with_ttl(ttl);
         let agent_id = AgentId([3u8; 32]);
         let machine_id = MachineId([4u8; 32]);
-        store.insert(
+        assert!(store.insert(
             agent_id,
             machine_id,
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
-            1_000,
-        );
-        // `seen_at` was captured inside `insert` just before this point, so a
-        // lookup at "now" is well within the TTL.
+            now_unix_ms(),
+        ));
+        // The signed timestamp was captured immediately before insertion, so
+        // a lookup at "now" is well within the TTL.
         let now = Instant::now();
         assert!(
             store.lookup_at(&agent_id, now).is_some(),
@@ -507,6 +598,178 @@ mod tests {
             store.lookup_at(&agent_id, after_ttl).is_none(),
             "entry must be evicted once the TTL elapses"
         );
+    }
+
+    #[test]
+    fn signed_time_window_rejects_stale_future_and_replay_refresh() {
+        let now_ms = now_unix_ms();
+        let ttl_ms = ADVERT_CACHE_TTL_SECS * 1_000;
+        let skew_ms = MAX_CAPABILITY_FUTURE_SKEW_SECS * 1_000;
+        assert!(!capability_timestamp_is_fresh(
+            now_ms.saturating_sub(ttl_ms + 1),
+            now_ms,
+        ));
+        assert!(!capability_timestamp_is_fresh(
+            now_ms.saturating_add(skew_ms + 1),
+            now_ms,
+        ));
+
+        let store = CapabilityStore::with_ttl(Duration::from_secs(60));
+        let agent = AgentId([0x91; 32]);
+        let first_machine = MachineId([0x92; 32]);
+        let older_machine = MachineId([0x96; 32]);
+        let replay_machine = MachineId([0x93; 32]);
+        let issued_at = now_ms.saturating_sub(59_000);
+        assert!(store.insert(
+            agent,
+            first_machine,
+            DmCapabilities::v2_durable_gossip_ready(vec![0x94; 1184]),
+            issued_at,
+        ));
+        assert!(!store.insert(
+            agent,
+            older_machine,
+            DmCapabilities::v2_durable_gossip_ready(vec![0x97; 1184]),
+            issued_at.saturating_sub(1),
+        ));
+        assert!(!store.insert(
+            agent,
+            replay_machine,
+            DmCapabilities::v2_durable_gossip_ready(vec![0x95; 1184]),
+            issued_at,
+        ));
+        let retained = store
+            .lookup_binding(&agent)
+            .expect("fresh binding retained");
+        assert_eq!(retained.machine_id, first_machine);
+        assert_eq!(retained.capabilities.kem_public_key, vec![0x94; 1184]);
+
+        // A signed card follows the same monotonic ordering rule: importing
+        // older same-version material cannot replace the fresher machine/KEM
+        // binding or renew its original expiry.
+        assert!(!store.insert_from_card(
+            agent,
+            MachineId([0x98; 32]),
+            DmCapabilities::v2_durable_gossip_ready(vec![0x99; 1184]),
+            issued_at.saturating_sub(1),
+        ));
+        let after_original_expiry = Instant::now() + Duration::from_millis(1_100);
+        assert!(store
+            .lookup_binding_at(&agent, after_original_expiry)
+            .is_none());
+    }
+
+    #[test]
+    fn custom_ttl_rejects_expired_and_caps_future_dated_lifetime() {
+        let zero_ttl_store = CapabilityStore::with_ttl(Duration::ZERO);
+        assert!(!zero_ttl_store.insert(
+            AgentId([0xA0; 32]),
+            MachineId([0xAF; 32]),
+            DmCapabilities::v2_durable_gossip_ready(vec![0xAE; 1184]),
+            now_unix_ms(),
+        ));
+
+        let ttl = Duration::from_secs(1);
+        let store = CapabilityStore::with_ttl(ttl);
+        let now_ms = now_unix_ms();
+        let agent = AgentId([0xA1; 32]);
+        let machine = MachineId([0xA2; 32]);
+        let caps = DmCapabilities::v2_durable_gossip_ready(vec![0xA3; 1184]);
+
+        assert!(!store.insert(agent, machine, caps.clone(), now_ms.saturating_sub(1_001),));
+        assert!(store.lookup_binding(&agent).is_none());
+
+        let future_issued_at = now_ms.saturating_add(MAX_CAPABILITY_FUTURE_SKEW_SECS * 1_000);
+        let anchor = Instant::now();
+        let future_expiry = store
+            .expiry_for_signed_timestamp_at(future_issued_at, now_ms, anchor)
+            .expect("max-skew timestamp accepted");
+        assert!(future_expiry <= anchor + ttl);
+        assert!(store.insert(agent, machine, caps, future_issued_at));
+        assert!(
+            store.lookup_binding(&agent).is_some(),
+            "a successful insert must be immediately observable"
+        );
+        let after_local_ttl = Instant::now() + ttl + Duration::from_millis(1);
+        assert!(
+            store.lookup_binding_at(&agent, after_local_ttl).is_none(),
+            "future clock skew must not extend a one-second local TTL"
+        );
+
+        let default_store = CapabilityStore::new();
+        let default_agent = AgentId([0xA4; 32]);
+        assert!(default_store.insert(
+            default_agent,
+            machine,
+            DmCapabilities::v2_durable_gossip_ready(vec![0xA5; 1184]),
+            future_issued_at,
+        ));
+        let after_default_local_ttl =
+            Instant::now() + Duration::from_secs(ADVERT_CACHE_TTL_SECS) + Duration::from_millis(1);
+        assert!(
+            default_store
+                .lookup_binding_at(&default_agent, after_default_local_ttl)
+                .is_none(),
+            "default expiry must be local TTL, never TTL plus future skew"
+        );
+    }
+
+    #[test]
+    fn conflicting_same_timestamp_card_is_quarantined_until_fresh_advert() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0xB1; 32]);
+        let machine_a = MachineId([0xB2; 32]);
+        let machine_b = MachineId([0xB3; 32]);
+        let kem_a = vec![0xB4; 1184];
+        let kem_b = vec![0xB5; 1184];
+        let card_created_at_ms = now_unix_ms();
+
+        assert!(store.insert_from_card(
+            agent,
+            machine_a,
+            DmCapabilities::v3_threaded_durable_gossip_ready(kem_a.clone()),
+            card_created_at_ms,
+        ));
+        assert!(!store.insert_from_card(
+            agent,
+            machine_a,
+            DmCapabilities::v3_threaded_durable_gossip_ready(kem_a.clone()),
+            card_created_at_ms,
+        ));
+        assert_eq!(
+            store
+                .lookup_binding(&agent)
+                .expect("identical replay retains original binding")
+                .machine_id,
+            machine_a
+        );
+        assert!(!store.insert_from_card(
+            agent,
+            machine_b,
+            DmCapabilities::v3_threaded_durable_gossip_ready(kem_b.clone()),
+            card_created_at_ms,
+        ));
+        assert!(
+            store.lookup_binding(&agent).is_none(),
+            "ambiguous same-second restart must not retain the dead A binding"
+        );
+
+        let advert_created_at_ms = card_created_at_ms.saturating_add(1);
+        assert!(store.insert(
+            agent,
+            machine_b,
+            DmCapabilities::v3_threaded_durable_gossip_ready(kem_b.clone()),
+            advert_created_at_ms,
+        ));
+        assert!(!store.insert_from_card(
+            agent,
+            machine_a,
+            DmCapabilities::v3_threaded_durable_gossip_ready(kem_a),
+            card_created_at_ms,
+        ));
+        let binding = store.lookup_binding(&agent).expect("fresh B binding");
+        assert_eq!(binding.machine_id, machine_b);
+        assert_eq!(binding.capabilities.kem_public_key, kem_b);
     }
 
     #[test]

@@ -970,6 +970,8 @@ async fn decode_for_delivery(
 const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
     "x0x/dm/v1/", // DM bus + DM inbox (slash style — x0x/dm/v1/bus, x0x/dm/v1/inbox/...)
     "x0x.dm.",    // Reserved for any future dot-style DM topics
+    "x0x/caps/v1/request/targeted-v2", // Strict-send exact-recipient capability refresh
+    "x0x/caps/v1/response/targeted-v2", // Signed response inside the strict convergence window
     "x0x.test.discover.v1", // Test orchestrator discover (X0X-0076 harness)
     "x0x.test.control.v1", // Test orchestrator control commands
 ];
@@ -1038,6 +1040,14 @@ fn register_x0x_topic_priorities(
     );
     registry.register(
         TopicId::from_entity("x0x.test.control.v1".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/caps/v1/request/targeted-v2".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/caps/v1/response/targeted-v2".as_bytes()),
         TopicPriority::Critical,
     );
     // Per-recipient DM inbox topics (`x0x/dm/v1/inbox/<hash>`) are
@@ -1396,6 +1406,45 @@ mod tests {
         assert_eq!(
             classify_x0x_topic("x0x.test.control.v1"),
             TopicPriority::Critical
+        );
+    }
+
+    #[test]
+    fn targeted_capability_refresh_control_topics_are_critical() {
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v1/request/targeted-v2"),
+            TopicPriority::Critical,
+            "strict-send refresh request must bypass Bulk cooling"
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v1/response/targeted-v2"),
+            TopicPriority::Critical,
+            "signed targeted response must arrive inside the strict-send convergence window"
+        );
+
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::new();
+        register_x0x_topic_priorities(&registry);
+        assert_eq!(
+            registry.priority_for(&TopicId::from_entity(
+                "x0x/caps/v1/request/targeted-v2".as_bytes(),
+            )),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            registry.priority_for(&TopicId::from_entity(
+                "x0x/caps/v1/response/targeted-v2".as_bytes(),
+            )),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v1/request"),
+            TopicPriority::Bulk,
+            "legacy fleet refresh remains recoverable Bulk traffic"
+        );
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v1"),
+            TopicPriority::Bulk,
+            "steady capability adverts remain Bulk"
         );
     }
 
