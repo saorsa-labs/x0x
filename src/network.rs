@@ -2799,14 +2799,28 @@ impl NetworkNode {
         }
     }
 
-    /// Connected peers eligible as gossip carriers under plane isolation
-    /// (issue #206): all connected peers when isolation is off, only
-    /// plane-cleared peers when on. Use this instead of
+    /// Peers for which ant-quic still has a routable transport winner.
+    ///
+    /// The repaired ant-quic connectivity surface filters its outer peer table
+    /// through the transport-aware send predicate: a canonical QUIC winner or
+    /// an active constrained connection. Keep that predicate authoritative
+    /// here instead of rebuilding a QUIC-only approximation from
+    /// `ConnectionHealth`.
+    pub async fn send_ready_peers(&self) -> Vec<AntPeerId> {
+        let Some(node) = self.node.read().await.as_ref().cloned() else {
+            return Vec::new();
+        };
+        send_ready_peer_ids(node.connected_peers().await)
+    }
+
+    /// Send-ready peers eligible as gossip carriers under plane isolation
+    /// (issue #206): all routable transport winners when isolation is off,
+    /// only plane-cleared winners when on. Use this instead of
     /// [`Self::connected_peers`] when seeding gossip peer sets (PlumTree
-    /// eager sets, membership keepalives) so a cross-plane or not-yet-
-    /// verified peer never enters the gossip plane.
+    /// eager sets, membership keepalives) so stale outer-table entries and
+    /// cross-plane or not-yet-verified peers never enter the gossip plane.
     pub(crate) async fn gossip_plane_peers(&self) -> Vec<AntPeerId> {
-        let connected = self.connected_peers().await;
+        let connected = self.send_ready_peers().await;
         if self.config.network_id.is_none() {
             return connected;
         }
@@ -3925,6 +3939,20 @@ fn plane_recently_cleared(
         .is_some_and(|at| at.elapsed() < PLANE_REVERIFY_TTL)
 }
 
+/// Project ant-quic's transport-filtered connection snapshot to peer IDs.
+///
+/// Filtering belongs upstream because ant-quic owns every transport-specific
+/// routability rule. In particular, constrained BLE/LoRa peers need no QUIC
+/// lifecycle winner but remain valid send and gossip carriers.
+fn send_ready_peer_ids(
+    peers: impl IntoIterator<Item = ant_quic::PeerConnection>,
+) -> Vec<AntPeerId> {
+    peers
+        .into_iter()
+        .map(|connection| connection.peer_id)
+        .collect()
+}
+
 async fn plane_note_connected(
     plane_id: &str,
     plane_peers: &Arc<Mutex<HashMap<AntPeerId, PlanePeerState>>>,
@@ -4326,6 +4354,31 @@ mod tests {
 
     fn test_ant_peer(byte: u8) -> AntPeerId {
         ant_quic::PeerId([byte; 32])
+    }
+
+    /// Boundary regression for ant-quic's transport-aware connected snapshot.
+    ///
+    /// The dependency's `constrained_peer_connectivity_surfaces_match_send_routing`
+    /// test owns the actual constrained handshake/send proof. Once that
+    /// predicate returns a BLE peer, x0x must retain it as send-ready so
+    /// `gossip_plane_peers` continues to feed both PlumTree and keepalives.
+    #[test]
+    fn constrained_transport_ready_peer_is_retained_for_gossip() {
+        let constrained = test_ant_peer(2);
+        let connection = ant_quic::PeerConnection {
+            peer_id: constrained,
+            remote_addr: ant_quic::TransportAddr::Ble {
+                device_id: [0x20; 6],
+                service_uuid: None,
+            },
+            traversal_method: ant_quic::TraversalMethod::Direct,
+            side: ant_quic::Side::Client,
+            authenticated: false,
+            connected_at: Instant::now(),
+            last_activity: Instant::now(),
+        };
+
+        assert_eq!(send_ready_peer_ids([connection]), vec![constrained]);
     }
 
     #[tokio::test]
