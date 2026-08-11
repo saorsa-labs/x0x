@@ -633,6 +633,8 @@ struct DirectDiagnosticsCounters {
     incoming_dropped_revoked: AtomicU64,
     incoming_dropped_expired: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
+    ack_publish_route_failed: AtomicU64,
+    ack_unresolved: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -697,6 +699,14 @@ pub struct DmDiagnosticsStats {
     /// the primary per-group/store pubsub path still delivers.
     #[serde(default)]
     pub incoming_typed_route_dropped: u64,
+    /// ACK publish operations where at least one required route returned an
+    /// explicit error. Zero-fanout `Ok` results are not counted here.
+    #[serde(default)]
+    pub ack_publish_route_failed: u64,
+    /// Authenticated ACKs that did not match a current request/protocol/agent/
+    /// machine waiter (including legitimately late ACKs after timeout).
+    #[serde(default)]
+    pub ack_unresolved: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -1163,6 +1173,21 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// Record an explicit error from one or more ACK publication routes.
+    pub(crate) fn record_ack_publish_route_failed(&self) {
+        self.diagnostics
+            .ack_publish_route_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Record an authenticated ACK that did not resolve an active exact
+    /// request/protocol/agent/machine waiter.
+    pub(crate) fn record_ack_unresolved(&self) {
+        self.diagnostics
+            .ack_unresolved
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Snapshot direct-message diagnostics for API surfaces.
     #[must_use]
     pub fn diagnostics_snapshot(&self) -> DmDiagnosticsSnapshot {
@@ -1220,6 +1245,11 @@ impl DirectMessaging {
                 .diagnostics
                 .incoming_typed_route_dropped
                 .load(Ordering::Relaxed),
+            ack_publish_route_failed: self
+                .diagnostics
+                .ack_publish_route_failed
+                .load(Ordering::Relaxed),
+            ack_unresolved: self.diagnostics.ack_unresolved.load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics
                 .incoming_delivered_to_subscribe

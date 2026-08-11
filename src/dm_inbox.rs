@@ -620,6 +620,18 @@ impl InboxPipeline {
                     sender_machine_id,
                     ack.outcome,
                 );
+                if !resolved {
+                    self.dm.record_ack_unresolved();
+                    tracing::warn!(
+                        target: "dm.trace",
+                        stage = "ack_unresolved",
+                        acked_request_id = %hex::encode(ack.acks_request_id),
+                        ack_sender = %hex::encode(sender_agent_id.as_bytes()),
+                        ack_machine = %hex::encode(sender_machine_id.as_bytes()),
+                        protocol_version = envelope.protocol_version,
+                        "authenticated ACK did not match an active exact waiter; it may be late or binding-mismatched"
+                    );
+                }
                 tracing::debug!(
                     acked = %hex::encode(ack.acks_request_id),
                     resolved,
@@ -1000,12 +1012,22 @@ impl InboxPipeline {
         let legacy = self
             .pubsub
             .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded));
-        publish_ack_routes(
-            ack_requires_legacy_bus_hedge(protocol_version, ack_legacy_bus),
-            primary,
-            legacy,
-        )
-        .await
+        let hedged = ack_requires_legacy_bus_hedge(protocol_version, ack_legacy_bus);
+        let result = publish_ack_routes(hedged, primary, legacy).await;
+        if let Err(error) = &result {
+            self.dm.record_ack_publish_route_failed();
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "ack_publish_route_failed",
+                acked_request_id = %hex::encode(acks_request_id),
+                recipient = %hex::encode(to.as_bytes()),
+                protocol_version,
+                hedged,
+                %error,
+                "one or more required ACK publish routes returned an error; another hedge may still have delivered"
+            );
+        }
+        result
     }
 }
 
@@ -1635,6 +1657,15 @@ mod tests {
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
         assert_eq!(harness.pipeline.inflight.outstanding(), 1);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .ack_unresolved,
+            2
+        );
 
         let exact =
             durable_attested_ack_message(&harness, &intended, &intended_machine, request_id, 0xB4);
@@ -1644,6 +1675,16 @@ mod tests {
             DmAckOutcome::Accepted
         );
         assert_eq!(harness.pipeline.inflight.outstanding(), 0);
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .ack_unresolved,
+            2,
+            "the exact ACK must resolve without incrementing mismatch diagnostics"
+        );
     }
 
     #[tokio::test]
@@ -1661,10 +1702,26 @@ mod tests {
             false
         ));
 
+        let sender = test_keypair();
+        let sender_machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &sender_machine, 0xC1);
+        let replay = message.clone();
+        let request_id = DmEnvelope::from_wire_bytes(&message.payload)
+            .expect("decode production-shaped payload")
+            .request_id;
+
+        harness.pipeline.handle_incoming(message, false).await;
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("initial durable app dispatch timed out")
+            .expect("direct-message receiver closed");
+        assert_eq!(delivered.payload, b"security regression payload");
+
         let inflight = Arc::new(InFlightAcks::new());
-        let request_id = [0xC1; 16];
-        let recipient = AgentId([0xC2; 32]);
-        let machine = MachineId([0xC3; 32]);
+        let recipient = harness.pipeline.self_agent_id;
+        let machine = harness.pipeline.self_machine_id;
         let receipt = inflight.register_for_protocol(
             request_id,
             DM_PROTOCOL_DURABLE_ACK,
@@ -1715,6 +1772,35 @@ mod tests {
         );
         publish_task.abort();
         let _ = publish_task.await;
+
+        // The sender can retry the same logical envelope before observing the
+        // hedge. Stable request_id replay must re-ACK from the completion cache
+        // without a second durable row or second application dispatch.
+        harness.pipeline.handle_incoming(replay, true).await;
+        assert_no_delivery(&mut harness.receiver).await;
+        let rows = history
+            .store()
+            .query(&HistoryQuery::default())
+            .expect("query durable replay history");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.payload, b"security regression payload");
+        assert_eq!(
+            rows[0].record.provenance,
+            crate::history::Provenance::VerifiedEnvelope
+        );
+        assert!(rows[0].record.signed_artifact.is_some());
+        assert!(rows[0].record.signature.is_some());
+        assert_eq!(
+            history
+                .counters()
+                .written_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {
