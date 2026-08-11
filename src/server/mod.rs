@@ -42,20 +42,21 @@ use routes::{
     get_agent_card, get_constitution, get_constitution_json, get_group_card,
     get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
     get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
-    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
-    handle_public_group_bootstrap, handle_treekem_catchup_request, handle_treekem_catchup_response,
-    handle_welcome_blob_message, health, history_diagnostics, history_list, history_purge,
-    history_search, history_stats, identity_revocations, identity_revoke, import_agent_card,
-    import_group_card, ingest_public_message, introduction, join_group_via_invite, join_kv_store,
-    leave_group, list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys,
-    list_kv_stores, list_machines, list_mls_groups, list_named_groups, list_revocations,
-    list_task_lists, list_tasks, load_causal_approval_queue, load_named_groups,
-    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
-    named_group_metadata_event_kind, network_status, now_millis_u64, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_treekem_named_journals, reject_join_request, remove_mls_member,
+    group_membership_lock, groups_diagnostics, handle_file_message,
+    handle_group_public_typed_payload, handle_join_result_message, handle_public_group_bootstrap,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
+    health, history_diagnostics, history_list, history_purge, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card, introduction,
+    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
+    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
+    load_named_groups, load_predecessor_relay_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
+    now_millis_u64, peer_health_handler, peers, pin_machine, presence, presence_find,
+    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
+    redeliver_group_public_message, reject_join_request, remove_mls_member,
     remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
     revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
     save_named_groups_checked, save_named_groups_checked_unlocked,
@@ -1226,26 +1227,7 @@ pub async fn serve_with_options(
         let public_dm_state = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
             while let Some(typed) = group_public_dm_rx.recv().await {
-                let Some(payload) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX)
-                else {
-                    continue;
-                };
-
-                let Ok(msg) = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(payload)
-                else {
-                    tracing::debug!(
-                        sender = %hex::encode(typed.sender.as_bytes()),
-                        "typed group-public DM payload was not a GroupPublicMessage"
-                    );
-                    continue;
-                };
-                let group_id = msg.group_id.clone();
-                tracing::debug!(
-                    group_id = %group_id,
-                    sender = %hex::encode(typed.sender.as_bytes()),
-                    "direct-delivered public group message received"
-                );
-                ingest_public_message(&public_dm_state, msg, &group_id).await;
+                handle_group_public_typed_payload(&public_dm_state, typed).await;
             }
         }));
     }
@@ -1459,6 +1441,10 @@ pub async fn serve_with_options(
         // Phase E: public-group messaging.
         .route("/groups/:id/send", post(send_group_public_message))
         .route("/groups/:id/messages", get(get_group_public_messages))
+        .route(
+            "/groups/:id/messages/:msg_id/redeliver",
+            post(redeliver_group_public_message),
+        )
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
         // Phase D.3 — state-commit chain endpoints.

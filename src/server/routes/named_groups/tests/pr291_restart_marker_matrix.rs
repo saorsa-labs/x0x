@@ -1659,6 +1659,7 @@ async fn pr291_expired_reoffer_exact_envelope_does_not_refresh_clock() {
         verified: true,
         trust_decision: None,
         received_at_unix_ms: unix_ms(),
+        completion: None,
     };
     handle_predecessor_relay_typed_payload(&state, &lh, dm).await;
 
@@ -1735,6 +1736,7 @@ async fn offer_via_handler(
         verified: true,
         trust_decision: None,
         received_at_unix_ms,
+        completion: None,
     };
     handle_predecessor_relay_typed_payload(state, local_hex, dm).await;
 }

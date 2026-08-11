@@ -43,6 +43,19 @@ use x0x::Agent;
 
 pub(in crate::server) const GROUP_BACKGROUND_PUBLISH_DELAY: Duration = Duration::from_secs(8);
 
+/// Public-message member delivery gets one prompt exact-recipient retry instead
+/// of waiting for the generic eight-second background republish cadence. Each
+/// raw attempt has this same receive-ACK budget, so the retry starts no later
+/// than the initial probe's deadline while each failure starts its own gossip
+/// repair.
+const GROUP_PUBLIC_DIRECT_RETRY_DELAY: Duration = Duration::from_secs(4);
+
+/// Keep the exact-recipient probe short enough that its explicit gossip repair
+/// still starts inside the user-visible community-delivery latency budget.
+const GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+
+const GROUP_PUBLIC_REDELIVERY_GOSSIP_DEADLINE: Duration = Duration::from_secs(9);
+
 const NAMED_GROUP_METADATA_PUBLISH_TIMEOUT: Duration = Duration::from_secs(5);
 
 const TREEKEM_PENDING_EVENTS_PER_GROUP_CAP: usize = 64;
@@ -9072,6 +9085,12 @@ pub(in crate::server) struct SendGroupMessageRequest {
     thread_parent: Option<String>,
 }
 
+/// Request body for `POST /groups/:id/messages/:msg_id/redeliver`.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct RedeliverGroupMessageRequest {
+    agent_id: String,
+}
+
 /// POST /groups/:id/send — publish a message to the group.
 ///
 /// Branches on `policy.confidentiality`:
@@ -9423,6 +9442,191 @@ pub(in crate::server) async fn get_group_public_messages(
     )
 }
 
+/// POST /groups/:id/messages/:msg_id/redeliver — durably replay one retained
+/// signed group artifact to one active member.
+///
+/// The request contains no message content. The handler loads the exact signed
+/// JSON bytes from local durable history, revalidates them against the current
+/// group view, and returns success only after the target's typed group handler
+/// reports an exact durable Inserted/Duplicate application completion through
+/// the strict DM ACK path.
+pub(in crate::server) async fn redeliver_group_public_message(
+    State(state): State<Arc<AppState>>,
+    Path((id, msg_id)): Path<(String, String)>,
+    Json(req): Json<RedeliverGroupMessageRequest>,
+) -> impl IntoResponse {
+    if msg_id.len() != 64
+        || !msg_id
+            .bytes()
+            .all(|byte| byte.is_ascii_hexdigit() && !byte.is_ascii_uppercase())
+    {
+        return bad_request("msg_id must be exactly 64 lowercase hex chars").into_response();
+    }
+    let target = match parse_agent_id_hex(&req.agent_id) {
+        Ok(target) => target,
+        Err(error) => return bad_request(format!("invalid agent_id: {error}")).into_response(),
+    };
+    let target_hex = hex::encode(target.as_bytes());
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let (stable_id, policy, members) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == id.as_str())
+        }) else {
+            return not_found("group not found").into_response();
+        };
+        if info.withdrawn {
+            return api_error(StatusCode::CONFLICT, "group is withdrawn").into_response();
+        }
+        if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
+            return api_error(
+                StatusCode::CONFLICT,
+                "group does not retain signed public-message artifacts",
+            )
+            .into_response();
+        }
+        if !info.has_active_member(&local_hex) {
+            return forbidden("local caller is not an active group member").into_response();
+        }
+        if !info.has_active_member(&target_hex) {
+            return forbidden("redelivery target is not an active group member").into_response();
+        }
+        (
+            info.stable_group_id().to_string(),
+            info.policy.clone(),
+            info.members_v2.clone(),
+        )
+    };
+    if target_hex == local_hex {
+        return api_error(
+            StatusCode::CONFLICT,
+            "redelivery target is this local agent; no cold handoff is required",
+        )
+        .into_response();
+    }
+
+    let Some(history) = state.agent.history() else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "durable group history is disabled; no retained artifact can be redelivered",
+        )
+        .into_response();
+    };
+    let artifact = match retained_group_public_artifact(history, &stable_id, &msg_id).await {
+        Ok(Some(artifact)) => artifact,
+        Ok(None) => return not_found("retained signed group message not found").into_response(),
+        Err(error) => {
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("retained group artifact lookup failed: {error}"),
+            )
+            .into_response();
+        }
+    };
+    let msg = match serde_json::from_slice::<x0x::groups::GroupPublicMessage>(&artifact) {
+        Ok(msg) => msg,
+        Err(error) => {
+            return api_error(
+                StatusCode::CONFLICT,
+                format!("retained signed artifact is invalid JSON: {error}"),
+            )
+            .into_response();
+        }
+    };
+    if msg.group_id != stable_id || msg.msg_id() != msg_id {
+        return api_error(
+            StatusCode::CONFLICT,
+            "retained signed artifact does not match the requested group/message",
+        )
+        .into_response();
+    }
+    let context = x0x::groups::PublicIngestContext {
+        group_id: &stable_id,
+        policy: &policy,
+        members_v2: &members,
+    };
+    if let Err(error) = x0x::groups::validate_public_message(&context, &msg) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("retained signed artifact is no longer admissible: {error}"),
+        )
+        .into_response();
+    }
+
+    let payload = encode_group_public_message_direct_artifact(&artifact);
+    let raw_started = Instant::now();
+    let receipt = match state
+        .agent
+        .send_direct_with_config(
+            &target,
+            payload.clone(),
+            group_public_message_raw_delivery_config(),
+        )
+        .await
+    {
+        Ok(receipt) => receipt,
+        Err(raw_error) => {
+            tracing::warn!(
+                target: "group.delivery",
+                group_id = %LogHexId::group(&stable_id),
+                msg_id = %LogHexId::new("message", &msg_id),
+                recipient = %LogHexId::agent(&target_hex),
+                route = "raw_quic_redelivery",
+                elapsed_ms = raw_started.elapsed().as_millis() as u64,
+                error = %raw_error,
+                "durable group redelivery raw attempt failed; starting bounded gossip repair"
+            );
+            let gossip = state.agent.send_direct_with_config(
+                &target,
+                payload,
+                group_public_message_redelivery_gossip_config(),
+            );
+            match tokio::time::timeout(GROUP_PUBLIC_REDELIVERY_GOSSIP_DEADLINE, gossip).await {
+                Ok(Ok(receipt)) => receipt,
+                Ok(Err(gossip_error)) => {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        format!(
+                            "durable target receipt unavailable (raw: {raw_error}; gossip: {gossip_error})"
+                        ),
+                    )
+                    .into_response();
+                }
+                Err(_) => {
+                    return api_error(
+                        StatusCode::GATEWAY_TIMEOUT,
+                        "timed out waiting for durable target group receipt",
+                    )
+                    .into_response();
+                }
+            }
+        }
+    };
+    let path = match receipt.path {
+        x0x::dm::DmPath::Loopback => "loopback",
+        x0x::dm::DmPath::GossipInbox => "gossip_inbox",
+        x0x::dm::DmPath::RawQuic => "raw_quic",
+        x0x::dm::DmPath::RawQuicAcked => "raw_quic_acked",
+        x0x::dm::DmPath::Relayed { .. } => "relayed",
+    };
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "group_id": stable_id,
+            "msg_id": msg_id,
+            "agent_id": target_hex,
+            "outcome": "committed",
+            "path": path,
+            "retries": receipt.retries_used,
+        })),
+    )
+        .into_response()
+}
+
 fn group_public_history_record(
     state: &AppState,
     msg: &x0x::groups::GroupPublicMessage,
@@ -9455,6 +9659,8 @@ fn group_public_history_record(
         payload,
         signed_artifact: Some(artifact),
         signature: hex::decode(&msg.signature).ok(),
+        thread_root: msg.thread_root.clone(),
+        thread_parent: msg.thread_parent.clone(),
         // Mirrors the signing domain used for this message (ADR-0029).
         sig_context: Some(
             if msg.thread_root.is_some() || msg.thread_parent.is_some() {
@@ -9471,6 +9677,60 @@ fn group_public_history_record(
         },
         replace_key: None,
     }
+}
+
+/// Find the exact retained signed JSON artifact for one canonical ADR-0029
+/// message id. History rows use a different store-internal id, so this must
+/// recompute `GroupPublicMessage::msg_id()` from each verified artifact rather
+/// than compare the route id to `HistoryRecord::msg_id`.
+async fn retained_group_public_artifact(
+    history: &x0x::history::HistoryHandle,
+    stable_group_id: &str,
+    canonical_msg_id: &str,
+) -> std::result::Result<Option<Vec<u8>>, String> {
+    let store = Arc::clone(history.store());
+    let stable_group_id = stable_group_id.to_string();
+    let canonical_msg_id = canonical_msg_id.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut before_id = None;
+        loop {
+            let rows = store
+                .query(&x0x::history::HistoryQuery {
+                    scope: Some(x0x::history::Scope::Group(stable_group_id.clone())),
+                    limit: x0x::history::MAX_QUERY_LIMIT,
+                    before_id,
+                    ..Default::default()
+                })
+                .map_err(|error| error.to_string())?;
+            for row in &rows {
+                if !matches!(
+                    row.record.provenance,
+                    x0x::history::Provenance::LocalSend
+                        | x0x::history::Provenance::VerifiedEnvelope
+                ) || row.record.validate().is_err()
+                {
+                    continue;
+                }
+                let Some(artifact) = row.record.signed_artifact.as_deref() else {
+                    continue;
+                };
+                let Ok(message) =
+                    serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact)
+                else {
+                    continue;
+                };
+                if message.group_id == stable_group_id && message.msg_id() == canonical_msg_id {
+                    return Ok(Some(artifact.to_vec()));
+                }
+            }
+            if rows.len() < x0x::history::MAX_QUERY_LIMIT {
+                return Ok(None);
+            }
+            before_id = rows.last().map(|row| row.id);
+        }
+    })
+    .await
+    .map_err(|error| format!("retained group artifact lookup task failed: {error}"))?
 }
 
 /// Commit a locally-authored public group message to SQLite before the REST
@@ -9573,6 +9833,8 @@ fn record_mls_history(
         payload: plaintext.to_vec(),
         signed_artifact: None,
         signature: None,
+        thread_root: None,
+        thread_parent: None,
         sig_context: None,
         provenance: x0x::history::Provenance::LocalAppDecrypt,
         replace_key: None,
@@ -9612,10 +9874,14 @@ fn encode_group_public_message_direct_payload(
     msg: &x0x::groups::GroupPublicMessage,
 ) -> serde_json::Result<Vec<u8>> {
     let json = serde_json::to_vec(msg)?;
-    let mut payload = Vec::with_capacity(GROUP_PUBLIC_MESSAGE_DM_PREFIX.len() + json.len());
+    Ok(encode_group_public_message_direct_artifact(&json))
+}
+
+fn encode_group_public_message_direct_artifact(artifact: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(GROUP_PUBLIC_MESSAGE_DM_PREFIX.len() + artifact.len());
     payload.extend_from_slice(GROUP_PUBLIC_MESSAGE_DM_PREFIX);
-    payload.extend_from_slice(&json);
-    Ok(payload)
+    payload.extend_from_slice(artifact);
+    payload
 }
 
 async fn ingest_group_public_message_direct_payload(
@@ -9643,6 +9909,223 @@ async fn ingest_group_public_message_direct_payload(
     true
 }
 
+async fn retained_exact_group_public_artifact(
+    history: &x0x::history::HistoryHandle,
+    stable_group_id: &str,
+    expected_artifact: &[u8],
+) -> std::result::Result<bool, String> {
+    let store = Arc::clone(history.store());
+    let stable_group_id = stable_group_id.to_string();
+    let expected_artifact = expected_artifact.to_vec();
+    tokio::task::spawn_blocking(move || {
+        let mut before_id = None;
+        loop {
+            let rows = store
+                .query(&x0x::history::HistoryQuery {
+                    scope: Some(x0x::history::Scope::Group(stable_group_id.clone())),
+                    limit: x0x::history::MAX_QUERY_LIMIT,
+                    before_id,
+                    ..Default::default()
+                })
+                .map_err(|error| error.to_string())?;
+            if rows.iter().any(|row| {
+                matches!(
+                    row.record.provenance,
+                    x0x::history::Provenance::LocalSend
+                        | x0x::history::Provenance::VerifiedEnvelope
+                ) && row.record.validate().is_ok()
+                    && row.record.signed_artifact.as_deref() == Some(expected_artifact.as_slice())
+            }) {
+                return Ok(true);
+            }
+            if rows.len() < x0x::history::MAX_QUERY_LIMIT {
+                return Ok(false);
+            }
+            before_id = rows.last().map(|row| row.id);
+        }
+    })
+    .await
+    .map_err(|error| format!("exact group artifact lookup task failed: {error}"))?
+}
+
+/// Strict typed-DM admission for a signed group artifact. This is the
+/// application completion boundary consumed by the durable DM inbox: success
+/// means the exact group row is durably Inserted or already exists byte-for-
+/// byte, validation completed against the current roster, and the in-process
+/// cache/live bus admitted it exactly once for this daemon lifetime.
+async fn ingest_group_public_message_durable(
+    state: &AppState,
+    outer_sender: AgentId,
+    msg: x0x::groups::GroupPublicMessage,
+    artifact: &[u8],
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    let decoded = serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact)
+        .map_err(|error| format!("signed group artifact decode failed: {error}"))?;
+    if decoded != msg {
+        return Err("signed group artifact changed after decode".to_string());
+    }
+
+    let message_group_id = msg.group_id.clone();
+    let snapshot = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(&message_group_id)
+            .or_else(|| {
+                groups
+                    .values()
+                    .find(|info| info.stable_group_id() == message_group_id.as_str())
+            })
+            .map(|info| {
+                (
+                    info.policy.clone(),
+                    info.members_v2.clone(),
+                    info.stable_group_id().to_string(),
+                    info.withdrawn,
+                )
+            })
+    };
+    let Some((policy, members, stable_id, withdrawn)) = snapshot else {
+        state
+            .groups_diagnostics
+            .record_other_drop(&message_group_id);
+        return Err("group is not installed locally".to_string());
+    };
+    if withdrawn {
+        state.groups_diagnostics.record_other_drop(&stable_id);
+        return Err("group is withdrawn".to_string());
+    }
+
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let outer_sender_hex = hex::encode(outer_sender.as_bytes());
+    if !members
+        .get(&local_hex)
+        .is_some_and(x0x::groups::GroupMember::is_active)
+    {
+        state.groups_diagnostics.record_other_drop(&stable_id);
+        return Err("local recipient is not an active group member".to_string());
+    }
+    if !members
+        .get(&outer_sender_hex)
+        .is_some_and(x0x::groups::GroupMember::is_active)
+    {
+        state.groups_diagnostics.record_other_drop(&stable_id);
+        return Err("redelivery sender is not an active group member".to_string());
+    }
+
+    let context = x0x::groups::PublicIngestContext {
+        group_id: &stable_id,
+        policy: &policy,
+        members_v2: &members,
+    };
+    if let Err(error) = x0x::groups::validate_public_message(&context, &msg) {
+        match &error {
+            x0x::groups::PublicMessageIngestError::AuthorBanned => {
+                state.groups_diagnostics.record_author_banned(&stable_id)
+            }
+            x0x::groups::PublicMessageIngestError::WritePolicyViolation { .. } => state
+                .groups_diagnostics
+                .record_write_policy_violation(&stable_id),
+            x0x::groups::PublicMessageIngestError::InvalidSignature(_) => {
+                state.groups_diagnostics.record_signature_failed(&stable_id)
+            }
+            _ => state.groups_diagnostics.record_other_drop(&stable_id),
+        }
+        return Err(format!("signed group artifact validation failed: {error}"));
+    }
+
+    let history = state
+        .agent
+        .history()
+        .ok_or_else(|| "durable group history is disabled".to_string())?;
+    let record = group_public_history_record(state, &msg, artifact.to_vec());
+    let outcome = history
+        .record_committed(record)
+        .await
+        .map_err(|error| format!("durable group history commit failed: {error}"))?;
+    let completion = match outcome {
+        x0x::history::InsertOutcome::Inserted => x0x::dm_inbox::DmTypedPayloadCompletion::Inserted,
+        x0x::history::InsertOutcome::Duplicate => {
+            if !retained_exact_group_public_artifact(history, &stable_id, artifact).await? {
+                return Err(
+                    "history duplicate did not retain the exact signed artifact".to_string()
+                );
+            }
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate
+        }
+        x0x::history::InsertOutcome::Replaced | x0x::history::InsertOutcome::StaleRejected => {
+            return Err(format!(
+                "durable group history did not establish an exact row: {outcome:?}"
+            ));
+        }
+    };
+
+    state
+        .groups_diagnostics
+        .record_message_received(&stable_id, now_millis_u64());
+    let topic = x0x::groups::public_topic_for(&stable_id);
+    let origin = msg.author_agent_id.clone();
+    let payload = msg.body.as_bytes().to_vec();
+    let msg_id = msg.msg_id();
+    let thread_root = msg.thread_root.clone();
+    let thread_parent = msg.thread_parent.clone();
+    if cache_public_message_in_memory(state, msg).await {
+        let _ = state
+            .public_message_live_tx
+            .send(super::super::state::ValidatedPublicMessage {
+                topic,
+                payload,
+                origin,
+                msg_id,
+                thread_root,
+                thread_parent,
+            });
+    }
+    Ok(completion)
+}
+
+/// Consume one typed direct group payload and, for strict v2/v3 messages,
+/// resolve the inbox completion only after [`ingest_group_public_message_durable`]
+/// reaches its exact durable application boundary.
+pub(in crate::server) async fn handle_group_public_typed_payload(
+    state: &AppState,
+    mut typed: x0x::dm_inbox::DmTypedPayload,
+) {
+    let completion = typed.completion.take();
+    let Some(artifact) = typed.payload.strip_prefix(GROUP_PUBLIC_MESSAGE_DM_PREFIX) else {
+        if let Some(completion) = completion {
+            let _ = completion.send(Err("typed group payload prefix mismatch".to_string()));
+        }
+        return;
+    };
+    let msg = match serde_json::from_slice::<x0x::groups::GroupPublicMessage>(artifact) {
+        Ok(msg) => msg,
+        Err(error) => {
+            if let Some(completion) = completion {
+                let _ =
+                    completion.send(Err(format!("typed group artifact decode failed: {error}")));
+            }
+            return;
+        }
+    };
+    let group_id = msg.group_id.clone();
+    tracing::debug!(
+        group_id = %group_id,
+        sender = %hex::encode(typed.sender.as_bytes()),
+        durable = completion.is_some(),
+        "direct-delivered public group message received"
+    );
+    if let Some(completion) = completion {
+        let result = if typed.verified {
+            ingest_group_public_message_durable(state, typed.sender, msg, artifact).await
+        } else {
+            Err("typed group payload is not verified".to_string())
+        };
+        let _ = completion.send(result);
+    } else {
+        ingest_public_message(state, msg, &group_id).await;
+    }
+}
+
 /// Subscribe to the generic direct-message fan-out for receive-ACKed raw QUIC
 /// group posts. Gossip-inbox typed routes bypass that fan-out and continue to
 /// use their dedicated channel; this listener closes the raw-only ingress gap.
@@ -9660,15 +10143,40 @@ pub(in crate::server) fn spawn_direct_public_message_listener(
     })
 }
 
-fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
+fn group_public_message_raw_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     // User-visible community posts should use the receive-ACKed raw path when
-    // the member already has a live direct binding. Keep gossip-inbox as the
-    // fallback for startup/convergence, but do not force it: a saturated
-    // gossip overlay must not strand a post when the direct path is healthy.
+    // the member already has a live direct binding. Keep this attempt raw-only
+    // so its exact failure is visible here rather than silently consumed by the
+    // lower-level capability-aware fallback.
     config.prefer_raw_quic_if_connected = true;
     config.require_gossip = false;
-    config.require_gossip_ack = true;
+    config.require_durable_app_ack = true;
+    config.raw_quic_receive_ack_timeout = Some(GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT);
+    config.stop_fallback_on_raw_error = true;
+    config
+}
+
+fn group_public_message_gossip_repair_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    // This is a separate call after the bounded raw probe, so the misnamed raw
+    // timeout can safely bound the complete gossip repair and the signed
+    // envelope's expiry without stealing time from the raw leg.
+    config.require_gossip = true;
+    config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.stop_fallback_on_raw_error = true;
+    config
+}
+
+fn group_public_message_redelivery_gossip_config() -> x0x::dm::DmSendConfig {
+    let mut config = group_public_message_gossip_repair_config();
+    // The endpoint provides its own wall-clock bound. One strict application-
+    // ACK attempt is sufficient after the independent exact-recipient raw
+    // attempt and avoids extending a local cold-start request through the
+    // generic exponential retry schedule.
+    config.max_retries = 0;
     config
 }
 
@@ -9711,19 +10219,92 @@ fn spawn_group_public_message_delivery(
         if let Some(delay) = delay {
             tokio::time::sleep(delay).await;
         }
-        if let Err(e) = agent
+
+        let attempt = if delay.is_some() { "retry" } else { "initial" };
+        #[cfg(test)]
+        record_group_public_background_attempt(
+            &group_id,
+            if delay.is_some() {
+                "direct_delayed_raw"
+            } else {
+                "direct_raw"
+            },
+        );
+        let raw_started = Instant::now();
+        match agent
             .send_direct_with_config(
                 &recipient,
-                payload,
-                group_public_message_direct_delivery_config(),
+                payload.clone(),
+                group_public_message_raw_delivery_config(),
             )
             .await
         {
-            tracing::warn!(
+            Ok(receipt) => {
+                tracing::debug!(
+                    target: "group.delivery",
+                    group_id = %LogHexId::group(&group_id),
+                    recipient = %LogHexId::agent(&recipient_label),
+                    attempt,
+                    route = "raw_quic",
+                    path = ?receipt.path,
+                    retries = receipt.retries_used,
+                    elapsed_ms = raw_started.elapsed().as_millis() as u64,
+                    "exact-member public group delivery succeeded"
+                );
+                return;
+            }
+            Err(error) => tracing::warn!(
+                target: "group.delivery",
                 group_id = %LogHexId::group(&group_id),
                 recipient = %LogHexId::agent(&recipient_label),
-                "failed to direct-deliver public group message: {e}"
-            );
+                attempt,
+                route = "raw_quic",
+                repair_route = "gossip_inbox",
+                elapsed_ms = raw_started.elapsed().as_millis() as u64,
+                %error,
+                "exact-member raw public group delivery failed; starting explicit gossip repair"
+            ),
+        }
+
+        #[cfg(test)]
+        record_group_public_background_attempt(
+            &group_id,
+            if delay.is_some() {
+                "direct_delayed_gossip_repair"
+            } else {
+                "direct_gossip_repair"
+            },
+        );
+        let repair_started = Instant::now();
+        match agent
+            .send_direct_with_config(
+                &recipient,
+                payload,
+                group_public_message_gossip_repair_config(),
+            )
+            .await
+        {
+            Ok(receipt) => tracing::debug!(
+                target: "group.delivery",
+                group_id = %LogHexId::group(&group_id),
+                recipient = %LogHexId::agent(&recipient_label),
+                attempt,
+                route = "gossip_inbox_repair",
+                path = ?receipt.path,
+                retries = receipt.retries_used,
+                elapsed_ms = repair_started.elapsed().as_millis() as u64,
+                "public group exact-member gossip repair succeeded"
+            ),
+            Err(error) => tracing::warn!(
+                target: "group.delivery",
+                group_id = %LogHexId::group(&group_id),
+                recipient = %LogHexId::agent(&recipient_label),
+                attempt,
+                route = "gossip_inbox_repair",
+                elapsed_ms = repair_started.elapsed().as_millis() as u64,
+                %error,
+                "public group exact-member gossip repair failed"
+            ),
         }
     });
 }
@@ -9739,7 +10320,7 @@ fn spawn_group_public_message_delivery_to_active_members(
             state,
             &recipient,
             msg,
-            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
+            Some(GROUP_PUBLIC_DIRECT_RETRY_DELAY),
         );
     }
 }
@@ -15185,6 +15766,8 @@ pub(in crate::server) async fn import_group_card(
                 payload: card_json,
                 signed_artifact: None,
                 signature: None,
+                thread_root: None,
+                thread_parent: None,
                 sig_context: None,
                 provenance: x0x::history::Provenance::VerifiedEnvelope,
                 replace_key: Some(format!("group-card:{group_id}")),
@@ -20675,6 +21258,24 @@ mod tests {
         .await??)
     }
 
+    async fn redeliver_response(
+        state: Arc<AppState>,
+        group_id: &str,
+        msg_id: &str,
+        agent_id: String,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        response_json(
+            redeliver_group_public_message(
+                State(state),
+                Path((group_id.to_string(), msg_id.to_string())),
+                Json(RedeliverGroupMessageRequest { agent_id }),
+            )
+            .await
+            .into_response(),
+        )
+        .await
+    }
+
     fn clear_public_send_background_attempts(group_id: &str) {
         GROUP_PUBLIC_BACKGROUND_ATTEMPTS
             .lock()
@@ -20954,6 +21555,8 @@ mod tests {
                 && paths.contains("global")
                 && paths.contains("direct")
                 && paths.contains("direct_delayed")
+                && paths.contains("direct_raw")
+                && paths.contains("direct_gossip_repair")
             {
                 break paths;
             }
@@ -21031,6 +21634,205 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn redelivery_rejects_wrong_group_message_nonmember_removed_and_withdrawn() -> Result<()>
+    {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let group_id = "redelivery-authz";
+        let remote_hex = install_public_send_test_group(&state, group_id, true)
+            .await?
+            .context("remote member")?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let missing_msg = "00".repeat(32);
+
+        let (status, _) = redeliver_response(
+            Arc::clone(&state),
+            "missing-group",
+            &missing_msg,
+            remote_hex.clone(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let (status, _) = redeliver_response(
+            Arc::clone(&state),
+            group_id,
+            &missing_msg,
+            remote_hex.clone(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+
+        let stranger = x0x::identity::AgentKeypair::generate()?;
+        let (status, _) = redeliver_response(
+            Arc::clone(&state),
+            group_id,
+            &missing_msg,
+            hex::encode(stranger.agent_id().as_bytes()),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let group = groups.get_mut(group_id).context("installed group")?;
+            group
+                .members_v2
+                .get_mut(&local_hex)
+                .context("local member")?
+                .state = x0x::groups::GroupMemberState::Removed;
+        }
+        let (status, _) = redeliver_response(
+            Arc::clone(&state),
+            group_id,
+            &missing_msg,
+            remote_hex.clone(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        {
+            let mut groups = state.named_groups.write().await;
+            let group = groups.get_mut(group_id).context("installed group")?;
+            group
+                .members_v2
+                .get_mut(&local_hex)
+                .context("local member")?
+                .state = x0x::groups::GroupMemberState::Active;
+            group.remove_member(
+                &remote_hex,
+                Some(hex::encode(state.agent.agent_id().as_bytes())),
+            );
+        }
+        let (status, _) =
+            redeliver_response(Arc::clone(&state), group_id, &missing_msg, remote_hex).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN);
+
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(group_id)
+            .context("installed group")?
+            .withdrawn = true;
+        let (status, _) = redeliver_response(state, group_id, &missing_msg, local_hex).await?;
+        assert_eq!(status, StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn durable_typed_redelivery_preserves_artifact_and_dedupes_history_and_live() -> Result<()>
+    {
+        let (state, _dir) = public_message_history_test_state().await?;
+        let author = x0x::identity::AgentKeypair::generate()?;
+        let author_hex = hex::encode(author.agent_id().as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group_id = "durable-redelivery";
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Durable redelivery".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            author_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(local_hex),
+            Some("author".to_string()),
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        let state_hash = group.state_hash.clone();
+        let state_revision = group.state_revision;
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.to_string(), group);
+
+        let thread_root = "11".repeat(32);
+        let msg = x0x::groups::GroupPublicMessage::sign(
+            group_id.to_string(),
+            state_hash,
+            state_revision,
+            &author,
+            None,
+            x0x::groups::GroupPublicMessageKind::Chat,
+            "wake @X without changing this artifact".to_string(),
+            now_millis_u64(),
+            Some(thread_root.clone()),
+            Some(thread_root),
+        )?;
+        let artifact = serde_json::to_vec(&msg)?;
+        let payload = encode_group_public_message_direct_artifact(&artifact);
+        let original_signature = msg.signature.clone();
+        let mut live = state.public_message_live_tx.subscribe();
+
+        let (first_tx, first_rx) = tokio::sync::oneshot::channel();
+        handle_group_public_typed_payload(
+            &state,
+            x0x::dm_inbox::DmTypedPayload {
+                sender: author.agent_id(),
+                machine_id: x0x::identity::MachineId([7_u8; 32]),
+                payload: payload.clone(),
+                verified: true,
+                trust_decision: None,
+                received_at_unix_ms: now_millis_u64(),
+                completion: Some(first_tx),
+            },
+        )
+        .await;
+        assert_eq!(
+            first_rx.await?.map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Inserted
+        );
+        let live_message = tokio::time::timeout(Duration::from_secs(1), live.recv()).await??;
+        assert_eq!(live_message.msg_id, msg.msg_id());
+
+        let (duplicate_tx, duplicate_rx) = tokio::sync::oneshot::channel();
+        handle_group_public_typed_payload(
+            &state,
+            x0x::dm_inbox::DmTypedPayload {
+                sender: author.agent_id(),
+                machine_id: x0x::identity::MachineId([7_u8; 32]),
+                payload,
+                verified: true,
+                trust_decision: None,
+                received_at_unix_ms: now_millis_u64(),
+                completion: Some(duplicate_tx),
+            },
+        )
+        .await;
+        assert_eq!(
+            duplicate_rx.await?.map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), live.recv())
+                .await
+                .is_err(),
+            "exact duplicate must not emit a second live event"
+        );
+
+        let rows = public_send_history_rows(&state, group_id).await?;
+        assert_eq!(rows.len(), 1, "exact redelivery retains one durable row");
+        assert_eq!(
+            rows[0].record.signed_artifact.as_deref(),
+            Some(artifact.as_slice())
+        );
+        let retained: x0x::groups::GroupPublicMessage = serde_json::from_slice(
+            rows[0]
+                .record
+                .signed_artifact
+                .as_deref()
+                .context("retained signed artifact")?,
+        )?;
+        assert_eq!(retained.signature, original_signature);
+        assert_eq!(retained, msg);
         Ok(())
     }
 
@@ -26338,17 +27140,34 @@ mod tests {
     }
 
     #[test]
-    fn public_group_messages_prefer_receive_acked_raw_quic_with_gossip_fallback() {
-        let config = group_public_message_direct_delivery_config();
+    fn public_group_messages_probe_raw_then_repair_over_authenticated_gossip() {
+        let raw = group_public_message_raw_delivery_config();
 
-        assert!(config.prefer_raw_quic_if_connected);
-        assert!(!config.require_gossip);
-        assert!(!config.stop_fallback_on_raw_error);
-        assert!(config.require_gossip_ack);
+        assert!(raw.prefer_raw_quic_if_connected);
+        assert!(!raw.require_gossip);
+        assert!(raw.stop_fallback_on_raw_error);
+        assert!(raw.require_gossip_ack);
+        assert!(raw.require_durable_app_ack);
         assert_eq!(
-            config.raw_quic_receive_ack_timeout,
+            raw.raw_quic_receive_ack_timeout,
+            Some(GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT)
+        );
+
+        let repair = group_public_message_gossip_repair_config();
+        assert!(!repair.prefer_raw_quic_if_connected);
+        assert!(repair.require_gossip);
+        assert!(repair.stop_fallback_on_raw_error);
+        assert!(repair.require_gossip_ack);
+        assert!(repair.require_durable_app_ack);
+        assert_eq!(
+            repair.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
         );
+        assert!(GROUP_PUBLIC_DIRECT_RETRY_DELAY <= GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT);
+
+        let redelivery_repair = group_public_message_redelivery_gossip_config();
+        assert_eq!(redelivery_repair.max_retries, 0);
+        assert!(redelivery_repair.require_durable_app_ack);
     }
 
     #[test]
@@ -26838,6 +27657,8 @@ mod tests {
                 payload,
                 signed_artifact: Some(artifact),
                 signature: hex::decode(&msg.signature).ok(),
+                thread_root: msg.thread_root.clone(),
+                thread_parent: msg.thread_parent.clone(),
                 sig_context: Some(
                     if msg.thread_root.is_some() || msg.thread_parent.is_some() {
                         "x0x.group.public-message.v2"
@@ -28586,6 +29407,9 @@ mod tests {
             require_gossip: false,
             require_gossip_ack: None,
             require_ack_ms: None,
+            thread_root: None,
+            thread_parent: None,
+            logical_id: None,
         }
     }
 
