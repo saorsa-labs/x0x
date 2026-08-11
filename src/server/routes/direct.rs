@@ -17,6 +17,12 @@ use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
+const PRODUCT_DM_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(8);
+// One raw/attempt budget plus dm_inbox's documented 22-second Critical ACK
+// route budget. Keeping these distinct prevents the outer HTTP deadline from
+// dropping the exact waiter just as a healthy-congested ACK arrives.
+const PRODUCT_DM_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
     // Internal daemon protocols retain their existing v1-compatible raw
     // transport policy. Product DMs additionally require the v2 application
@@ -34,14 +40,15 @@ fn direct_product_send_config() -> x0x::dm::DmSendConfig {
     // v2 envelope over raw QUIC, but only the recipient's authenticated ACK
     // after history commit and app dispatch qualifies. The same envelope is
     // the bounded gossip fallback, so transport receive-ACK is never mistaken
-    // for product delivery.
+    // for product delivery. The total deadline must leave the documented
+    // Critical ACK-route budget after one bounded raw/attempt leg.
     x0x::dm::DmSendConfig {
-        timeout_per_attempt: Duration::from_secs(8),
+        timeout_per_attempt: PRODUCT_DM_ATTEMPT_TIMEOUT,
         require_gossip: false,
         require_gossip_ack: true,
         require_durable_app_ack: true,
         prefer_raw_quic_if_connected: true,
-        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        raw_quic_receive_ack_timeout: Some(PRODUCT_DM_TOTAL_TIMEOUT),
         stop_fallback_on_raw_error: false,
         ..x0x::dm::DmSendConfig::default()
     }
@@ -120,7 +127,7 @@ fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendCon
     let _legacy_require_gossip_ack = req.require_gossip_ack;
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
         let timeout = std::time::Duration::from_millis(raw_ack_ms.clamp(100, 30_000));
-        config.timeout_per_attempt = timeout;
+        config.timeout_per_attempt = timeout.min(PRODUCT_DM_ATTEMPT_TIMEOUT);
         config.raw_quic_receive_ack_timeout = Some(timeout);
     }
     config
@@ -499,7 +506,12 @@ mod tests {
         assert!(config.prefer_raw_quic_if_connected);
         assert_eq!(
             config.raw_quic_receive_ack_timeout,
-            Some(Duration::from_secs(8))
+            Some(PRODUCT_DM_TOTAL_TIMEOUT)
+        );
+        assert_eq!(config.timeout_per_attempt, PRODUCT_DM_ATTEMPT_TIMEOUT);
+        assert!(
+            config.raw_quic_receive_ack_timeout.expect("total timeout")
+                > config.timeout_per_attempt
         );
         assert!(!config.stop_fallback_on_raw_error);
     }
@@ -565,7 +577,7 @@ mod tests {
         assert!(omitted_config.require_gossip_ack);
         assert_eq!(
             omitted_config.raw_quic_receive_ack_timeout,
-            Some(Duration::from_secs(8))
+            Some(PRODUCT_DM_TOTAL_TIMEOUT)
         );
 
         let legacy_requested: DirectSendRequest = serde_json::from_value(serde_json::json!({
@@ -588,6 +600,20 @@ mod tests {
             config.raw_quic_receive_ack_timeout,
             Some(Duration::from_millis(375))
         );
+        assert_eq!(config.timeout_per_attempt, Duration::from_millis(375));
+
+        let long_override: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "raw_quic_receive_ack_ms": 20_000
+        }))
+        .expect("long timeout request should deserialize");
+        let long_config = direct_send_config_for_request(&long_override);
+        assert_eq!(
+            long_config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(20))
+        );
+        assert_eq!(long_config.timeout_per_attempt, PRODUCT_DM_ATTEMPT_TIMEOUT);
     }
 
     #[test]

@@ -217,6 +217,20 @@ struct DurableRawPreference<'a> {
     logical_id: Option<&'a dm::DmLogicalId>,
 }
 
+fn durable_raw_transport_budget(
+    total_deadline: std::time::Duration,
+    attempt_budget: std::time::Duration,
+) -> std::time::Duration {
+    if total_deadline > attempt_budget {
+        attempt_budget
+    } else {
+        // An explicitly short total still needs a fallback window. Split it
+        // evenly rather than letting raw preference consume the whole caller
+        // budget and make the configured gossip fallback unreachable.
+        total_deadline / 2
+    }
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -5516,12 +5530,14 @@ impl Agent {
             *to,
             Some(recipient_machine_id),
         );
+        let raw_transport_budget =
+            durable_raw_transport_budget(total_deadline, config.timeout_per_attempt);
 
         let raw_result = self
             .send_direct_raw_quic_with_deadline(
                 to,
                 &raw_frame,
-                Some(total_deadline),
+                Some(raw_transport_budget),
                 prefer_newest_grace,
             )
             .await;
@@ -14317,6 +14333,18 @@ mod tests {
                 elapsed,
             } if elapsed == budget
         ));
+    }
+
+    #[test]
+    fn durable_raw_leg_cannot_consume_strict_total_deadline() {
+        let total = std::time::Duration::from_secs(30);
+        let attempt = std::time::Duration::from_secs(8);
+        assert_eq!(durable_raw_transport_budget(total, attempt), attempt);
+        let short_total = std::time::Duration::from_millis(375);
+        assert!(
+            durable_raw_transport_budget(short_total, attempt) < short_total,
+            "an explicit short deadline must still reserve gossip fallback time"
+        );
     }
 
     #[test]

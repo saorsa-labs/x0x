@@ -1017,6 +1017,64 @@ mod tests {
         inflight.cancel(&request_id);
     }
 
+    #[tokio::test]
+    async fn v3_deadline_drop_makes_exact_ack_late_but_logical_retry_resolves() {
+        let inflight = Arc::new(InFlightAcks::new());
+        let recipient = AgentId([0x91; 32]);
+        let current_card_machine = MachineId([0x92; 32]);
+        let request_id = [0x93; 16];
+        let prepared = PreparedDmEnvelope {
+            request_id,
+            protocol_version: DM_PROTOCOL_THREADED,
+            wire: Vec::new(),
+        };
+
+        // The outer product deadline drops the send future, whose guard owns
+        // and removes this exact v3 waiter. A correctly authenticated ACK that
+        // arrives just afterwards is therefore reported unresolved even
+        // though card machine and protocol both match.
+        let first = DmAckWaiter::register(
+            Arc::clone(&inflight),
+            &prepared,
+            recipient,
+            Some(current_card_machine),
+        );
+        drop(first);
+        assert!(!inflight.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            current_card_machine,
+            DmAckOutcome::Accepted,
+        ));
+
+        // An exact logical-id retry recreates the same request id with a fresh
+        // waiter. The receiver's cached Accepted ACK now resolves normally,
+        // matching the installed two-machine asymmetry.
+        let mut retry = DmAckWaiter::register(
+            Arc::clone(&inflight),
+            &prepared,
+            recipient,
+            Some(current_card_machine),
+        );
+        assert!(inflight.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_THREADED,
+            recipient,
+            current_card_machine,
+            DmAckOutcome::Accepted,
+        ));
+        let outcome = retry
+            .wait_for_raw_ack(Duration::from_secs(1))
+            .await
+            .expect("retry waiter stays registered")
+            .expect("cached exact ACK resolves retry");
+        let receipt = retry
+            .finish_raw(outcome, request_id)
+            .expect("accepted retry receipt");
+        assert_eq!(receipt.request_id, request_id);
+    }
+
     #[test]
     fn fresh_request_id_generates_unique_ids() {
         let id1 = fresh_request_id();
