@@ -41,6 +41,12 @@ pub const DM_CAPABILITY_TOPIC: &str = "x0x/caps/v1";
 /// cannot weaken the advert's AgentId + MachineId binding.
 pub const DM_CAPABILITY_REQUEST_TOPIC: &str = "x0x/caps/v1/request";
 
+/// Targeted capability refreshes use a distinct topic and wire version from
+/// the legacy fleet request. Keeping them separate is the compatibility
+/// boundary: pre-v2 responders subscribe only to [`DM_CAPABILITY_REQUEST_TOPIC`]
+/// and therefore cannot misinterpret a targeted refresh as a fleet-wide one.
+pub const DM_CAPABILITY_TARGETED_REQUEST_TOPIC: &str = "x0x/caps/v1/request/targeted-v2";
+
 /// Domain-separation prefix for the advert signature bytes.
 const ADVERT_SIGN_DOMAIN: &[u8] = b"x0x-caps-v1";
 
@@ -106,6 +112,7 @@ impl CapabilityAdvert {
 pub struct CapabilityStore {
     inner: Mutex<HashMap<[u8; 32], CachedAdvert>>,
     ttl: Duration,
+    change_tx: tokio::sync::watch::Sender<u64>,
 }
 
 struct CachedAdvert {
@@ -133,19 +140,30 @@ impl CapabilityStore {
     /// Construct an empty store with the default TTL.
     #[must_use]
     pub fn new() -> Self {
+        let (change_tx, _change_rx) = tokio::sync::watch::channel(0);
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
+            change_tx,
         }
     }
 
     /// Custom-TTL store (primarily for tests).
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
+        let (change_tx, _change_rx) = tokio::sync::watch::channel(0);
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
+            change_tx,
         }
+    }
+
+    /// Subscribe to cache mutations. Strict-send convergence waiters use this
+    /// instead of independent polling loops; one verified advert wakes every
+    /// waiter that is checking the affected recipient.
+    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.change_tx.subscribe()
     }
 
     /// Look up a peer's capability. Returns `None` if unknown or expired.
@@ -222,6 +240,9 @@ impl CapabilityStore {
                 created_at_unix_ms,
             },
         );
+        drop(inner);
+        self.change_tx
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Current cache size (diagnostic).

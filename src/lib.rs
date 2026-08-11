@@ -2484,6 +2484,14 @@ fn raw_dm_history_record(
     })
 }
 
+fn capability_binding_supports_durable_ack(
+    binding: Option<&dm_capability::CapabilityBinding>,
+) -> bool {
+    binding.is_some_and(|binding| {
+        binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
+    })
+}
+
 impl Agent {
     /// Create a new offline agent with default identity configuration.
     ///
@@ -4206,11 +4214,14 @@ impl Agent {
     async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
         const LOCAL_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
         const CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+        const TARGETED_ONLY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
 
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
+        // Subscribe before publishing so an immediate response cannot land in
+        // the cache between the request and waiter registration.
+        let mut changes = self.capability_store.subscribe_changes();
         let should_publish = {
             let now = tokio::time::Instant::now();
             let mut last_requests = self.last_capability_refresh_requests.lock().await;
@@ -4240,18 +4251,49 @@ impl Agent {
         }
 
         let deadline = tokio::time::Instant::now() + CONVERGENCE_WAIT;
+        let fallback_at = tokio::time::Instant::now() + TARGETED_ONLY_WAIT;
+        // Only the caller that won the per-recipient request slot publishes
+        // the compatibility fallback. Other concurrent waiters share the
+        // store notification and never amplify either request.
+        let mut fallback_sent = !should_publish;
         loop {
-            let converged = self
-                .capability_store
-                .lookup_binding(&recipient)
-                .is_some_and(|binding| {
-                    binding.machine_id.0 != [0_u8; 32]
-                        && binding.capabilities.supports_durable_app_ack()
-                });
+            let converged = self.capability_store.lookup_binding(&recipient);
+            let converged = capability_binding_supports_durable_ack(converged.as_ref());
             if converged || tokio::time::Instant::now() >= deadline {
                 return;
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let next_deadline = if fallback_sent { deadline } else { fallback_at };
+            tokio::select! {
+                changed = changes.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep_until(next_deadline) => {
+                    if next_deadline == deadline {
+                        return;
+                    }
+                    // Compatibility with the already-built v1 requester:
+                    // new peers get a full targeted-only window first. Only
+                    // when no signed advert converges do we emit the exact
+                    // legacy one-byte fleet request on its old topic.
+                    if let Err(error) =
+                        dm_capability_service::publish_capability_advert_request(
+                            runtime.pubsub(),
+                            None,
+                        )
+                        .await
+                    {
+                        tracing::warn!(
+                            target: "dm.trace",
+                            recipient = %hex::encode(recipient.as_bytes()),
+                            %error,
+                            "legacy fleet capability refresh fallback publish failed"
+                        );
+                    }
+                    fallback_sent = true;
+                }
+            }
         }
     }
 
@@ -4489,10 +4531,7 @@ impl Agent {
 
         let mut advert_binding = self.capability_store.lookup_binding(to);
         if config.require_durable_app_ack
-            && !advert_binding.as_ref().is_some_and(|binding| {
-                binding.machine_id.0 != [0_u8; 32]
-                    && binding.capabilities.supports_durable_app_ack()
-            })
+            && !capability_binding_supports_durable_ack(advert_binding.as_ref())
         {
             self.refresh_strict_dm_capability(*to).await;
             advert_binding = self.capability_store.lookup_binding(to);
@@ -17449,7 +17488,7 @@ async fn dm_inbox_capability_upgrade_visible_to_late_subscriber() {
 }
 
 #[tokio::test]
-async fn strict_capability_miss_publishes_targeted_refresh_and_waits_for_cache() {
+async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waiters() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let agent = std::sync::Arc::new(
         Agent::builder()
@@ -17462,35 +17501,137 @@ async fn strict_capability_miss_publishes_targeted_refresh_and_waits_for_cache()
             .expect("agent"),
     );
     let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
-    let mut request_sub = runtime
+    let mut fleet_request_sub = runtime
         .pubsub()
         .subscribe(dm_capability::DM_CAPABILITY_REQUEST_TOPIC.to_string())
         .await;
-    let recipient = identity::AgentId([0xD1; 32]);
+    let mut request_sub = runtime
+        .pubsub()
+        .subscribe(dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string())
+        .await;
+    let remote_keypair = identity::AgentKeypair::generate().expect("remote keypair");
+    let recipient = remote_keypair.agent_id();
+    let remote_machine = identity::MachineId([0xD2; 32]);
 
-    let refresh_agent = std::sync::Arc::clone(&agent);
-    let refresh = tokio::spawn(async move {
-        refresh_agent.refresh_strict_dm_capability(recipient).await;
+    let first_agent = std::sync::Arc::clone(&agent);
+    let first_waiter = tokio::spawn(async move {
+        first_agent.refresh_strict_dm_capability(recipient).await;
+    });
+    let second_agent = std::sync::Arc::clone(&agent);
+    let second_waiter = tokio::spawn(async move {
+        second_agent.refresh_strict_dm_capability(recipient).await;
     });
 
     let request = tokio::time::timeout(std::time::Duration::from_secs(1), request_sub.recv())
         .await
         .expect("targeted refresh request timeout")
         .expect("request subscription closed");
-    assert_eq!(request.topic, dm_capability::DM_CAPABILITY_REQUEST_TOPIC);
+    assert_eq!(
+        request.topic,
+        dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC
+    );
     assert!(request.verified, "refresh request must be authenticated");
     assert_eq!(request.sender, Some(agent.identity.agent_id()));
-
-    agent.capability_store.insert(
-        recipient,
-        identity::MachineId([0xD2; 32]),
-        dm::DmCapabilities::v2_durable_gossip_ready(vec![0xD3; 1184]),
-        dm_capability::now_unix_ms(),
+    let decoded =
+        dm_capability_service::decode_capability_advert_request(&request.topic, &request.payload)
+            .expect("decode captured request");
+    let dm_capability_service::DecodedCapabilityAdvertRequest::Targeted {
+        requested_agent_id,
+        request_id,
+    } = decoded
+    else {
+        panic!("strict miss published a fleet request");
+    };
+    assert_eq!(requested_agent_id, recipient);
+    assert_ne!(request_id, [0_u8; 16], "targeted request needs a nonce");
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), request_sub.recv())
+            .await
+            .is_err(),
+        "concurrent waiters must coalesce to one per-recipient request"
     );
-    tokio::time::timeout(std::time::Duration::from_secs(1), refresh)
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(300),
+            fleet_request_sub.recv(),
+        )
         .await
-        .expect("refresh did not observe converged cache")
-        .expect("refresh task failed");
+        .is_err(),
+        "legacy fleet fallback must not race the targeted-only window"
+    );
+    let fleet_fallback =
+        tokio::time::timeout(std::time::Duration::from_secs(2), fleet_request_sub.recv())
+            .await
+            .expect("legacy fleet fallback timeout")
+            .expect("fleet request subscription closed");
+    assert!(fleet_fallback.verified);
+    assert_eq!(fleet_fallback.payload.as_ref(), &[1]);
+    assert_eq!(
+        dm_capability_service::decode_capability_advert_request(
+            &fleet_fallback.topic,
+            &fleet_fallback.payload,
+        ),
+        Some(dm_capability_service::DecodedCapabilityAdvertRequest::Fleet)
+    );
+
+    // The remote responder builds its signed advert, then its own PubSub
+    // manager produces and verifies the authenticated outer envelope. Feed
+    // that exact decoded message through the same verifier/store helper used
+    // by the production capability subscriber.
+    let remote_signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(&remote_keypair));
+    let remote_network = std::sync::Arc::new(
+        network::NetworkNode::new(network::NetworkConfig::default(), None, None)
+            .await
+            .expect("remote network"),
+    );
+    let remote_pubsub =
+        gossip::PubSubManager::new(remote_network, Some(std::sync::Arc::clone(&remote_signing)))
+            .expect("remote pubsub");
+    let mut remote_advert_sub = remote_pubsub
+        .subscribe(dm_capability::DM_CAPABILITY_TOPIC.to_string())
+        .await;
+    let advert_bytes = dm_capability_service::build_signed_advert(
+        &remote_signing,
+        recipient,
+        remote_machine,
+        dm::DmCapabilities::v2_durable_gossip_ready(vec![0xD3; 1184]),
+    )
+    .expect("remote signed advert");
+    remote_pubsub
+        .publish(
+            dm_capability::DM_CAPABILITY_TOPIC.to_string(),
+            bytes::Bytes::from(advert_bytes),
+        )
+        .await
+        .expect("remote advert publish");
+    let remote_message =
+        tokio::time::timeout(std::time::Duration::from_secs(1), remote_advert_sub.recv())
+            .await
+            .expect("remote advert timeout")
+            .expect("remote advert subscription closed");
+    assert!(remote_message.verified, "outer remote envelope must verify");
+    assert!(dm_capability_service::ingest_verified_capability_advert(
+        &agent.capability_store,
+        agent.identity.agent_id(),
+        &remote_message,
+    ));
+
+    tokio::time::timeout(std::time::Duration::from_secs(1), first_waiter)
+        .await
+        .expect("first waiter did not observe converged cache")
+        .expect("first waiter failed");
+    tokio::time::timeout(std::time::Duration::from_secs(1), second_waiter)
+        .await
+        .expect("second waiter did not observe converged cache")
+        .expect("second waiter failed");
+    let retry_binding = agent.capability_store.lookup_binding(&recipient);
+    assert!(capability_binding_supports_durable_ack(
+        retry_binding.as_ref()
+    ));
+    assert_eq!(
+        retry_binding.expect("retry binding").machine_id,
+        remote_machine
+    );
 
     agent.shutdown().await;
 }

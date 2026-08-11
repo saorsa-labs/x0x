@@ -5,10 +5,10 @@
 use crate::dm::DmCapabilities;
 use crate::dm_capability::{
     now_unix_ms, CapabilityAdvert, CapabilityStore, ADVERT_PUBLISH_INTERVAL_SECS,
-    DM_CAPABILITY_REQUEST_TOPIC, DM_CAPABILITY_TOPIC,
+    DM_CAPABILITY_REQUEST_TOPIC, DM_CAPABILITY_TARGETED_REQUEST_TOPIC, DM_CAPABILITY_TOPIC,
 };
 use crate::error::{NetworkError, NetworkResult};
-use crate::gossip::{PubSubManager, SigningContext};
+use crate::gossip::{PubSubManager, PubSubMessage, SigningContext};
 use crate::identity::{AgentId, MachineId};
 use bytes::Bytes;
 use serde::{Deserialize, Serialize};
@@ -17,6 +17,8 @@ use std::time::Duration;
 use tokio::task::JoinHandle;
 
 pub const ADVERT_PROTOCOL_VERSION: u16 = 1;
+const FLEET_REQUEST_PROTOCOL_VERSION: u16 = 1;
+const TARGETED_REQUEST_PROTOCOL_VERSION: u16 = 2;
 
 const FIRST_PUBLISH_DELAY_MS: u64 = 250;
 
@@ -36,15 +38,55 @@ const MIN_TARGETED_RESPONSE_INTERVAL_SECS: u64 = 1;
 const STARTUP_BURST_INTERVALS_MS: &[u64] = &[5_000, 10_000, 20_000, 45_000];
 
 #[derive(Debug, Serialize, Deserialize)]
-struct CapabilityAdvertRequest {
+struct FleetCapabilityAdvertRequest {
     protocol_version: u16,
-    /// `None` is the fleet-wide startup convergence hint. A strict send uses
-    /// `Some(agent_id)` so every non-target daemon can discard the request
-    /// without producing a response.
-    requested_agent_id: Option<[u8; 32]>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct TargetedCapabilityAdvertRequest {
+    protocol_version: u16,
+    requested_agent_id: [u8; 32],
     /// Makes every request attempt distinct independently of the outer
     /// signature implementation and gives operators a stable trace token.
     request_id: [u8; 16],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DecodedCapabilityAdvertRequest {
+    Fleet,
+    Targeted {
+        requested_agent_id: AgentId,
+        request_id: [u8; 16],
+    },
+}
+
+/// Decode a request according to its exact topic-owned wire contract.
+///
+/// The fleet topic remains the original one-field postcard layout. Targeted
+/// requests are never decoded on that topic, preventing an older responder
+/// (whose v1 decoder accepts trailing postcard bytes) from amplifying them as
+/// fleet requests.
+pub(crate) fn decode_capability_advert_request(
+    topic: &str,
+    payload: &[u8],
+) -> Option<DecodedCapabilityAdvertRequest> {
+    match topic {
+        DM_CAPABILITY_REQUEST_TOPIC => {
+            let request: FleetCapabilityAdvertRequest = postcard::from_bytes(payload).ok()?;
+            (request.protocol_version == FLEET_REQUEST_PROTOCOL_VERSION)
+                .then_some(DecodedCapabilityAdvertRequest::Fleet)
+        }
+        DM_CAPABILITY_TARGETED_REQUEST_TOPIC => {
+            let request: TargetedCapabilityAdvertRequest = postcard::from_bytes(payload).ok()?;
+            (request.protocol_version == TARGETED_REQUEST_PROTOCOL_VERSION).then_some(
+                DecodedCapabilityAdvertRequest::Targeted {
+                    requested_agent_id: AgentId(request.requested_agent_id),
+                    request_id: request.request_id,
+                },
+            )
+        }
+        _ => None,
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -81,26 +123,78 @@ pub(crate) async fn publish_capability_advert_request(
     pubsub: &PubSubManager,
     requested_agent_id: Option<AgentId>,
 ) -> NetworkResult<()> {
-    let request = CapabilityAdvertRequest {
-        protocol_version: ADVERT_PROTOCOL_VERSION,
-        requested_agent_id: requested_agent_id.map(|agent_id| *agent_id.as_bytes()),
-        request_id: crate::dm_send::fresh_request_id(),
+    let (topic, request_bytes) = match requested_agent_id {
+        Some(requested_agent_id) => {
+            let request = TargetedCapabilityAdvertRequest {
+                protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
+                requested_agent_id: *requested_agent_id.as_bytes(),
+                request_id: crate::dm_send::fresh_request_id(),
+            };
+            let bytes = postcard::to_stdvec(&request).map_err(|error| {
+                NetworkError::SerializationError(format!(
+                    "targeted capability advert request encode: {error}"
+                ))
+            })?;
+            (DM_CAPABILITY_TARGETED_REQUEST_TOPIC, bytes)
+        }
+        None => {
+            let request = FleetCapabilityAdvertRequest {
+                protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
+            };
+            let bytes = postcard::to_stdvec(&request).map_err(|error| {
+                NetworkError::SerializationError(format!(
+                    "fleet capability advert request encode: {error}"
+                ))
+            })?;
+            (DM_CAPABILITY_REQUEST_TOPIC, bytes)
+        }
     };
-    let request_bytes = postcard::to_stdvec(&request).map_err(|error| {
-        NetworkError::SerializationError(format!("capability advert request encode: {error}"))
-    })?;
     pubsub
-        .publish(
-            DM_CAPABILITY_REQUEST_TOPIC.to_string(),
-            Bytes::from(request_bytes),
-        )
+        .publish(topic.to_string(), Bytes::from(request_bytes))
         .await
+}
+
+/// Verify and ingest one capability advert using the same checks as the live
+/// subscriber. Kept as one function so tests can exercise the complete
+/// authenticated sender -> advert signature -> exact AgentId/MachineId store
+/// boundary without duplicating acceptance logic.
+pub(crate) fn ingest_verified_capability_advert(
+    store: &CapabilityStore,
+    self_agent_id: AgentId,
+    message: &PubSubMessage,
+) -> bool {
+    let (pubsub_sender, sender_pubkey) =
+        match (message.sender, message.sender_public_key.as_deref()) {
+            (Some(sender), Some(public_key)) if message.verified => (sender, public_key),
+            _ => return false,
+        };
+    if pubsub_sender == self_agent_id {
+        return false;
+    }
+    let advert: CapabilityAdvert = match postcard::from_bytes(&message.payload) {
+        Ok(advert) => advert,
+        Err(_) => return false,
+    };
+    if advert.protocol_version != ADVERT_PROTOCOL_VERSION
+        || advert.agent_id != *pubsub_sender.as_bytes()
+        || !verify_advert_signature(&advert, sender_pubkey)
+    {
+        return false;
+    }
+    store.insert(
+        AgentId(advert.agent_id),
+        MachineId(advert.machine_id),
+        advert.capabilities,
+        advert.created_at_unix_ms,
+    );
+    true
 }
 
 pub struct CapabilityAdvertService {
     publisher: JoinHandle<()>,
     subscriber: JoinHandle<()>,
     request_responder: JoinHandle<()>,
+    targeted_request_responder: JoinHandle<()>,
     requester: JoinHandle<()>,
 }
 
@@ -147,44 +241,21 @@ impl CapabilityAdvertService {
         let mut request_subscription = pubsub
             .subscribe(DM_CAPABILITY_REQUEST_TOPIC.to_string())
             .await;
+        let mut targeted_request_subscription = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string())
+            .await;
         let store_sub = Arc::clone(&store);
         let self_agent_for_sub = self_agent_id;
         let (reannounce_tx, mut reannounce_rx) =
             tokio::sync::mpsc::channel::<ReannounceRequest>(16);
+        let targeted_reannounce_tx = reannounce_tx.clone();
 
         let subscriber = tokio::spawn(async move {
             while let Some(message) = subscription.recv().await {
-                let (pubsub_sender, sender_pubkey) =
-                    match (message.sender, message.sender_public_key.as_deref()) {
-                        (Some(s), Some(pk)) if message.verified => (s, pk.to_vec()),
-                        _ => continue,
-                    };
-                if pubsub_sender == self_agent_for_sub {
-                    continue;
+                let sender = message.sender;
+                if ingest_verified_capability_advert(&store_sub, self_agent_for_sub, &message) {
+                    tracing::debug!(?sender, "cached verified capability advert");
                 }
-                let advert: CapabilityAdvert = match postcard::from_bytes(&message.payload) {
-                    Ok(a) => a,
-                    Err(_) => continue,
-                };
-                if advert.protocol_version != ADVERT_PROTOCOL_VERSION {
-                    continue;
-                }
-                if advert.agent_id != *pubsub_sender.as_bytes() {
-                    continue;
-                }
-                if !verify_advert_signature(&advert, &sender_pubkey) {
-                    continue;
-                }
-                store_sub.insert(
-                    AgentId(advert.agent_id),
-                    MachineId(advert.machine_id),
-                    advert.capabilities,
-                    advert.created_at_unix_ms,
-                );
-                tracing::debug!(
-                    "cached capability advert from {}",
-                    hex::encode(advert.agent_id)
-                );
             }
             tracing::debug!("capability advert subscriber exited");
         });
@@ -197,25 +268,40 @@ impl CapabilityAdvertService {
                 {
                     continue;
                 }
-                let request: CapabilityAdvertRequest = match postcard::from_bytes(&message.payload)
-                {
-                    Ok(request) => request,
-                    Err(_) => continue,
-                };
-                if request.protocol_version != ADVERT_PROTOCOL_VERSION {
+                if !matches!(
+                    decode_capability_advert_request(&message.topic, &message.payload),
+                    Some(DecodedCapabilityAdvertRequest::Fleet)
+                ) {
                     continue;
                 }
-                let request_kind = match request.requested_agent_id {
-                    Some(requested) if requested != *self_agent_id.as_bytes() => continue,
-                    Some(_) => ReannounceRequest::Targeted,
-                    None => ReannounceRequest::Fleet,
-                };
                 // The bounded channel absorbs a mixed fleet/targeted burst;
                 // the publisher coalesces every queued request into one
                 // signed advert and applies the per-kind rate limits.
-                let _ = reannounce_tx.try_send(request_kind);
+                let _ = reannounce_tx.try_send(ReannounceRequest::Fleet);
             }
-            tracing::debug!("capability advert request responder exited");
+            tracing::debug!("fleet capability advert request responder exited");
+        });
+
+        let targeted_request_responder = tokio::spawn(async move {
+            while let Some(message) = targeted_request_subscription.recv().await {
+                if !message.verified
+                    || message.sender.is_none()
+                    || message.sender_public_key.is_none()
+                {
+                    continue;
+                }
+                let Some(DecodedCapabilityAdvertRequest::Targeted {
+                    requested_agent_id, ..
+                }) = decode_capability_advert_request(&message.topic, &message.payload)
+                else {
+                    continue;
+                };
+                if requested_agent_id != self_agent_id {
+                    continue;
+                }
+                let _ = targeted_reannounce_tx.try_send(ReannounceRequest::Targeted);
+            }
+            tracing::debug!("targeted capability advert request responder exited");
         });
 
         let requester_pubsub = Arc::clone(&pubsub);
@@ -374,6 +460,7 @@ impl CapabilityAdvertService {
             publisher,
             subscriber,
             request_responder,
+            targeted_request_responder,
             requester,
         })
     }
@@ -402,6 +489,7 @@ impl CapabilityAdvertService {
         self.publisher.abort();
         self.subscriber.abort();
         self.request_responder.abort();
+        self.targeted_request_responder.abort();
         self.requester.abort();
     }
 }
@@ -498,6 +586,47 @@ mod tests {
         )
         .expect("build signed advert");
         postcard::from_bytes(&encoded).expect("decode advert")
+    }
+
+    #[test]
+    fn request_wire_keeps_legacy_fleet_bytes_and_separates_targeted_v2() {
+        let fleet = FleetCapabilityAdvertRequest {
+            protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
+        };
+        let fleet_bytes = postcard::to_stdvec(&fleet).expect("encode fleet request");
+        assert_eq!(
+            fleet_bytes,
+            vec![1],
+            "legacy startup request must remain byte-for-byte compatible"
+        );
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_REQUEST_TOPIC, &fleet_bytes),
+            Some(DecodedCapabilityAdvertRequest::Fleet)
+        );
+
+        let target = AgentId([0xA7; 32]);
+        let request_id = [0xB8; 16];
+        let targeted = TargetedCapabilityAdvertRequest {
+            protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
+            requested_agent_id: *target.as_bytes(),
+            request_id,
+        };
+        let targeted_bytes = postcard::to_stdvec(&targeted).expect("encode targeted request");
+        // Postcard's old one-field decoder accepts trailing bytes. Topic
+        // separation, not wishful decoder strictness, is therefore the wire
+        // safety boundary that keeps old responders from amplifying this.
+        assert!(postcard::from_bytes::<FleetCapabilityAdvertRequest>(&targeted_bytes).is_ok());
+        assert_ne!(
+            DM_CAPABILITY_REQUEST_TOPIC,
+            DM_CAPABILITY_TARGETED_REQUEST_TOPIC
+        );
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_TARGETED_REQUEST_TOPIC, &targeted_bytes,),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: target,
+                request_id,
+            })
+        );
     }
 
     #[test]
@@ -818,10 +947,8 @@ mod tests {
         let mut late_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         tokio::time::sleep(Duration::from_millis(50)).await;
 
-        let request = CapabilityAdvertRequest {
-            protocol_version: ADVERT_PROTOCOL_VERSION,
-            requested_agent_id: None,
-            request_id: [0xA1; 16],
+        let request = FleetCapabilityAdvertRequest {
+            protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
         };
         let request_bytes = postcard::to_stdvec(&request).expect("encode request");
         pubsub
@@ -999,10 +1126,8 @@ mod tests {
             .expect("initial subscriber closed");
         let mut late_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
 
-        let request = CapabilityAdvertRequest {
-            protocol_version: ADVERT_PROTOCOL_VERSION,
-            requested_agent_id: None,
-            request_id: [0xB2; 16],
+        let request = FleetCapabilityAdvertRequest {
+            protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
         };
         pubsub
             .publish(
@@ -1050,6 +1175,7 @@ mod tests {
         assert!(!service.publisher.is_finished());
         assert!(!service.subscriber.is_finished());
         assert!(!service.request_responder.is_finished());
+        assert!(!service.targeted_request_responder.is_finished());
         assert!(!service.requester.is_finished());
 
         service.abort();
@@ -1060,6 +1186,7 @@ mod tests {
                 if service.publisher.is_finished()
                     && service.subscriber.is_finished()
                     && service.request_responder.is_finished()
+                    && service.targeted_request_responder.is_finished()
                     && service.requester.is_finished()
                 {
                     return;
