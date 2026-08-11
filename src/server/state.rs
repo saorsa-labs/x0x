@@ -25,6 +25,7 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 // name private items of its parent, so no `pub(super)` is needed on them —
 // they are imported here and claimed by their own submodules later.
 use super::auth::SessionStore;
+use super::routes::named_groups::PublicGroupBootstrapObligation;
 use super::routes::{
     ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingCausalApproval,
     PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
@@ -733,6 +734,12 @@ pub(super) struct AppState {
     /// envelopes. The authority persists the exact V2 bytes and relays them
     /// to active witnesses on a bounded retry schedule.
     pub(super) predecessor_relay_outbox: RwLock<HashMap<String, Vec<PredecessorRelayObligation>>>,
+    /// Durable signed-public bootstrap obligations keyed by an exact binding
+    /// over recipient, stable group, committed frontier, and canonical typed
+    /// payload digest. Entries survive daemon restart and are removed only
+    /// after a v2 application ACK or a committed membership cancellation.
+    pub(super) public_group_bootstrap_outbox:
+        RwLock<HashMap<String, PublicGroupBootstrapObligation>>,
     /// ADR 0028 B3: digests rejected by conflict, keyed by group_id.
     /// Prevents re-admission of a conflicting entry after restart.
     /// Finding 4: entries carry timestamps for deterministic oldest-first.
@@ -747,12 +754,17 @@ pub(super) struct AppState {
     pub(super) causal_approval_queue_path: PathBuf,
     /// ADR 0028: disk location for the durable predecessor relay outbox.
     pub(super) predecessor_relay_outbox_path: PathBuf,
+    /// Disk location for durable signed-public bootstrap obligations.
+    pub(super) public_group_bootstrap_outbox_path: PathBuf,
     /// Serializes snapshot-and-write of the causal approval queue sidecar so
     /// an older snapshot cannot rename over a newer conflict tombstone.
     pub(super) causal_approval_queue_persistence_lock: Mutex<()>,
     /// Serializes snapshot-and-write of the predecessor relay outbox sidecar
     /// so an older snapshot cannot rename over a newer completed receipt.
     pub(super) predecessor_relay_outbox_persistence_lock: Mutex<()>,
+    /// Serializes bootstrap outbox mutation and durable replacement. The
+    /// retry worker never holds this while awaiting network delivery.
+    pub(super) public_group_bootstrap_outbox_persistence_lock: Mutex<()>,
     /// ADR 0028 B5: write-ahead journal for the cross-file B8 operation
     /// (outbox refresh + roster save). Set before the outbox refresh save;
     /// cleared after both saves succeed. On restart, a pending entry triggers

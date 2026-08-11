@@ -145,6 +145,10 @@ static NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST: StdMutex<
 > = StdMutex::new(Vec::new());
 
 #[cfg(test)]
+static NAMED_GROUP_DIRECT_PAYLOADS_FOR_TEST: StdMutex<Vec<(String, Vec<u8>)>> =
+    StdMutex::new(Vec::new());
+
+#[cfg(test)]
 static TREEKEM_FINAL_INSTALL_BEFORE_MAP_WRITE_NOTIFY: StdMutex<
     Option<(String, Arc<tokio::sync::Notify>)>,
 > = StdMutex::new(None);
@@ -184,6 +188,28 @@ static GROUP_PUBLIC_HISTORY_INSERT_FAILURES: std::sync::LazyLock<StdMutex<HashSe
 #[cfg(test)]
 static GROUP_PUBLIC_BACKGROUND_ATTEMPTS: StdMutex<Vec<(String, &'static str)>> =
     StdMutex::new(Vec::new());
+
+#[cfg(test)]
+#[derive(Clone)]
+struct PublicGroupBootstrapDeliveryHookControl {
+    entered: Arc<tokio::sync::Notify>,
+    release: Arc<tokio::sync::Notify>,
+}
+
+#[cfg(test)]
+static PUBLIC_GROUP_BOOTSTRAP_DELIVERY_HOOKS: std::sync::LazyLock<
+    StdMutex<HashMap<String, PublicGroupBootstrapDeliveryHookControl>>,
+> = std::sync::LazyLock::new(|| StdMutex::new(HashMap::new()));
+
+#[cfg(test)]
+fn take_public_group_bootstrap_delivery_hook(
+    group_id: &str,
+) -> Option<PublicGroupBootstrapDeliveryHookControl> {
+    PUBLIC_GROUP_BOOTSTRAP_DELIVERY_HOOKS
+        .lock()
+        .expect("public-group bootstrap delivery hook poisoned")
+        .remove(group_id)
+}
 
 #[cfg(test)]
 fn take_group_public_primary_publish_hook(
@@ -409,15 +435,30 @@ fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     config
 }
 
-fn public_group_bootstrap_delivery_config() -> x0x::dm::DmSendConfig {
+fn public_group_bootstrap_raw_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
-    // A bootstrap carries its own signed state-commit chain and is therefore
-    // safe to send on the receive-ACKed raw path. Prefer that path when a
-    // contact already has a live direct binding: the gossip-inbox ACK can be
-    // lost after the receiver has installed the snapshot, which made the
-    // authority log a 24-second timeout despite successful installation.
+    // A transport receipt is insufficient for Gate 4b: the recipient may
+    // reject the snapshot at its consent gate. Strict v2 completion is
+    // resolved only after the typed handler validates and durably installs the
+    // snapshot. Keep the raw probe separately bounded so gossip repair gets
+    // its own full application-ACK window.
     config.prefer_raw_quic_if_connected = true;
     config.require_gossip = false;
+    config.require_durable_app_ack = true;
+    config.raw_quic_receive_ack_timeout = Some(GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT);
+    config.stop_fallback_on_raw_error = true;
+    config.max_retries = 0;
+    config
+}
+
+fn public_group_bootstrap_gossip_repair_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_gossip = true;
+    config.require_durable_app_ack = true;
+    config.prefer_raw_quic_if_connected = false;
+    config.raw_quic_receive_ack_timeout = Some(Duration::from_secs(8));
+    config.stop_fallback_on_raw_error = true;
+    config.max_retries = 0;
     config
 }
 
@@ -705,6 +746,45 @@ pub(in crate::server) struct TreeKemCatchupResponse {
 pub(in crate::server) struct PublicGroupBootstrap {
     message_type: String,
     group: Box<x0x::groups::GroupInfo>,
+}
+
+/// Strict typed-DM framing for a signed-public group bootstrap. The legacy
+/// unprefixed JSON listener remains active for mixed-version inbound traffic;
+/// this prefix opts new senders into the durable application-ACK boundary.
+pub(in crate::server) const PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX: &[u8] =
+    b"X0X-PUBLIC-GROUP-BOOTSTRAP-V2\n";
+
+const PUBLIC_GROUP_BOOTSTRAP_OUTBOX_VERSION: u32 = 1;
+const PUBLIC_GROUP_BOOTSTRAP_OUTBOX_MAX_ENTRIES: usize = 1024;
+const PUBLIC_GROUP_BOOTSTRAP_RETRY_MAX_DELAY_MS: u64 = 60_000;
+
+/// Directory-durable delivery obligation for one exact signed-public
+/// membership frontier. `payload_digest` covers the canonical typed bytes,
+/// while `key` additionally binds the intended recipient and group frontier.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub(in crate::server) struct PublicGroupBootstrapObligation {
+    pub(in crate::server) key: String,
+    recipient_hex: String,
+    group_id: String,
+    state_revision: u64,
+    state_hash: String,
+    payload_digest: String,
+    payload: Vec<u8>,
+    created_at_ms: u64,
+    next_attempt_at_ms: u64,
+    attempt_count: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PublicGroupBootstrapOutboxSidecar {
+    version: u32,
+    entries: Vec<PublicGroupBootstrapObligation>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PublicGroupBootstrapWireVersion {
+    StrictV2,
+    LegacyV1,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2243,6 +2323,10 @@ pub(in crate::server) fn spawn_named_group_event_delivery(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut recorded) = NAMED_GROUP_DIRECT_PAYLOADS_FOR_TEST.lock() {
+        recorded.push((recipient_hex.to_string(), payload.clone()));
+    }
     let agent = Arc::clone(&state.agent);
     let requester = recipient_hex.to_string();
     tokio::spawn(async move {
@@ -2292,6 +2376,10 @@ fn spawn_named_group_event_delivery_after(
             return;
         }
     };
+    #[cfg(test)]
+    if let Ok(mut recorded) = NAMED_GROUP_DIRECT_PAYLOADS_FOR_TEST.lock() {
+        recorded.push((recipient_hex.to_string(), payload.clone()));
+    }
     let agent = Arc::clone(&state.agent);
     let requester = recipient_hex.to_string();
     tokio::spawn(async move {
@@ -2337,7 +2425,7 @@ fn spawn_named_group_event_delivery_to_active_members(
     }
 }
 
-fn signed_public_bootstrap_snapshot(
+fn sanitize_signed_public_bootstrap_snapshot(
     mut group: x0x::groups::GroupInfo,
 ) -> Option<x0x::groups::GroupInfo> {
     if group.withdrawn
@@ -2361,6 +2449,13 @@ fn signed_public_bootstrap_snapshot(
         member.treekem_key_package_b64 = None;
         member.treekem_key_package_hash = None;
     }
+    Some(group)
+}
+
+fn signed_public_bootstrap_snapshot(
+    group: x0x::groups::GroupInfo,
+) -> Option<x0x::groups::GroupInfo> {
+    let mut group = sanitize_signed_public_bootstrap_snapshot(group)?;
     let head = group.commit_log.last()?.clone();
     group.commit_log.clear();
     group.commit_log.push(head);
@@ -2371,70 +2466,710 @@ fn signed_public_bootstrap_snapshot(
 /// The receiver independently verifies the retained head commit before it
 /// installs anything, so this is a bootstrap transport rather than an
 /// authorization bypass.
-fn spawn_public_group_bootstrap_delivery(
-    state: &AppState,
+fn public_group_bootstrap_binding_digest(
     recipient_hex: &str,
+    group_id: &str,
+    state_revision: u64,
+    state_hash: &str,
+    payload_digest: &str,
+) -> std::result::Result<String, String> {
+    let binding = serde_json::to_vec(&(
+        "public_group_bootstrap",
+        recipient_hex,
+        group_id,
+        state_revision,
+        state_hash,
+        payload_digest,
+    ))
+    .map_err(|error| format!("failed to encode bootstrap delivery binding: {error}"))?;
+    Ok(blake3::hash(&binding).to_hex().to_string())
+}
+
+fn public_group_bootstrap_logical_id(
+    obligation: &PublicGroupBootstrapObligation,
+) -> std::result::Result<x0x::dm::DmLogicalId, String> {
+    let binding_digest = public_group_bootstrap_binding_digest(
+        &obligation.recipient_hex,
+        &obligation.group_id,
+        obligation.state_revision,
+        &obligation.state_hash,
+        &obligation.payload_digest,
+    )?;
+    x0x::dm::DmLogicalId::parse(&format!("public-group-bootstrap:{binding_digest}"))
+}
+
+fn encode_public_group_bootstrap_typed_payload(
     group: x0x::groups::GroupInfo,
-) {
-    let recipient = match parse_agent_id_hex(recipient_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                recipient = %LogHexId::agent(&recipient_hex),
-                "cannot direct-deliver public-group bootstrap: {e}"
-            );
-            return;
-        }
-    };
-    let Some(group) = signed_public_bootstrap_snapshot(group) else {
-        tracing::warn!(
-            recipient = %LogHexId::agent(&recipient_hex),
-            "refusing to direct-deliver a non-public or unverifiable group bootstrap"
-        );
-        return;
-    };
-    let group_id = group.stable_group_id().to_string();
-    let payload = match serde_json::to_vec(&PublicGroupBootstrap {
+) -> std::result::Result<Vec<u8>, String> {
+    let encoded = serde_json::to_vec(&PublicGroupBootstrap {
         message_type: "public_group_bootstrap".to_string(),
         group: Box::new(group),
-    }) {
-        Ok(payload) => payload,
-        Err(e) => {
-            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize public-group bootstrap: {e}");
-            return;
-        }
-    };
-    let agent = Arc::clone(&state.agent);
-    tokio::spawn(async move {
-        if let Err(e) = agent
+    })
+    .map_err(|error| format!("failed to serialize public-group bootstrap: {error}"))?;
+    let mut payload = Vec::with_capacity(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX.len() + encoded.len());
+    payload.extend_from_slice(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX);
+    payload.extend_from_slice(&encoded);
+    Ok(payload)
+}
+
+fn prepare_public_group_bootstrap_obligation(
+    recipient: AgentId,
+    group: x0x::groups::GroupInfo,
+) -> std::result::Result<PublicGroupBootstrapObligation, String> {
+    let recipient_hex = hex::encode(recipient.as_bytes());
+    let group_id = group.stable_group_id().to_string();
+    let state_revision = group.state_revision;
+    let state_hash = group.state_hash.clone();
+    let payload = encode_public_group_bootstrap_typed_payload(group)?;
+    let payload_digest = blake3::hash(&payload).to_hex().to_string();
+    let binding_digest = public_group_bootstrap_binding_digest(
+        &recipient_hex,
+        &group_id,
+        state_revision,
+        &state_hash,
+        &payload_digest,
+    )?;
+    let now_ms = now_millis_u64();
+    Ok(PublicGroupBootstrapObligation {
+        key: format!("public-group-bootstrap:{binding_digest}"),
+        recipient_hex,
+        group_id,
+        state_revision,
+        state_hash,
+        payload_digest,
+        payload,
+        created_at_ms: now_ms,
+        next_attempt_at_ms: now_ms,
+        attempt_count: 0,
+    })
+}
+
+fn public_group_bootstrap_legacy_delivery_config() -> x0x::dm::DmSendConfig {
+    let mut config = named_group_direct_delivery_config();
+    config.require_durable_app_ack = false;
+    config.max_retries = 0;
+    config
+}
+
+fn public_group_bootstrap_legacy_payload(
+    obligation: &PublicGroupBootstrapObligation,
+) -> std::result::Result<Vec<u8>, x0x::dm::DmError> {
+    obligation
+        .payload
+        .strip_prefix(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX)
+        .map(<[u8]>::to_vec)
+        .ok_or_else(|| {
+            x0x::dm::DmError::EnvelopeConstruction(
+                "bootstrap outbox payload is missing the v2 typed prefix".to_string(),
+            )
+        })
+}
+
+fn public_group_bootstrap_group_from_payload(
+    payload: &[u8],
+) -> std::result::Result<x0x::groups::GroupInfo, String> {
+    let encoded = payload
+        .strip_prefix(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX)
+        .ok_or_else(|| "bootstrap typed prefix is missing".to_string())?;
+    let bootstrap: PublicGroupBootstrap = serde_json::from_slice(encoded)
+        .map_err(|error| format!("bootstrap payload decode failed: {error}"))?;
+    if bootstrap.message_type != "public_group_bootstrap" {
+        return Err("unsupported public-group bootstrap message type".to_string());
+    }
+    Ok(*bootstrap.group)
+}
+
+async fn public_group_bootstrap_wire_version(
+    state: &AppState,
+    recipient: &AgentId,
+) -> PublicGroupBootstrapWireVersion {
+    if let Some(binding) = state.agent.capability_store().lookup_binding(recipient) {
+        return if binding.capabilities.max_protocol_version < 2 {
+            PublicGroupBootstrapWireVersion::LegacyV1
+        } else {
+            PublicGroupBootstrapWireVersion::StrictV2
+        };
+    }
+    let card_reports_v1 = state
+        .contacts
+        .read()
+        .await
+        .get(recipient)
+        .and_then(|contact| contact.dm_capabilities.as_ref())
+        .is_some_and(|capabilities| capabilities.max_protocol_version < 2);
+    if card_reports_v1 {
+        PublicGroupBootstrapWireVersion::LegacyV1
+    } else {
+        // Missing capability information is not permission to downgrade. Keep
+        // the obligation pending until a current v2 advert or an explicit
+        // verified v1 advert/card binding is available.
+        PublicGroupBootstrapWireVersion::StrictV2
+    }
+}
+
+#[derive(Debug)]
+enum PublicGroupBootstrapDelivery {
+    V2ApplicationAck(x0x::dm::DmReceipt),
+    LegacyV1Sent(x0x::dm::DmReceipt),
+}
+
+async fn deliver_public_group_bootstrap(
+    state: &AppState,
+    obligation: &PublicGroupBootstrapObligation,
+) -> std::result::Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    deliver_public_group_bootstrap_with_configs(
+        state,
+        obligation,
+        public_group_bootstrap_raw_delivery_config(),
+        public_group_bootstrap_gossip_repair_config(),
+    )
+    .await
+}
+
+async fn deliver_public_group_bootstrap_with_configs(
+    state: &AppState,
+    obligation: &PublicGroupBootstrapObligation,
+    raw_config: x0x::dm::DmSendConfig,
+    gossip_config: x0x::dm::DmSendConfig,
+) -> std::result::Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    let recipient = parse_agent_id_hex(&obligation.recipient_hex)
+        .map_err(x0x::dm::DmError::EnvelopeConstruction)?;
+    if public_group_bootstrap_wire_version(state, &recipient).await
+        == PublicGroupBootstrapWireVersion::LegacyV1
+    {
+        let payload = public_group_bootstrap_legacy_payload(obligation)?;
+        return state
+            .agent
             .send_direct_with_config(
                 &recipient,
                 payload,
-                public_group_bootstrap_delivery_config(),
+                public_group_bootstrap_legacy_delivery_config(),
             )
             .await
-        {
-            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to direct-deliver public-group bootstrap: {e}");
+            .map(PublicGroupBootstrapDelivery::LegacyV1Sent);
+    }
+
+    let logical_id = public_group_bootstrap_logical_id(obligation)
+        .map_err(x0x::dm::DmError::EnvelopeConstruction)?;
+    match state
+        .agent
+        .send_direct_with_config_and_thread(
+            &recipient,
+            obligation.payload.clone(),
+            raw_config,
+            None,
+            Some(logical_id.clone()),
+        )
+        .await
+    {
+        Ok(receipt) => Ok(PublicGroupBootstrapDelivery::V2ApplicationAck(receipt)),
+        Err(raw_error) => {
+            deliver_public_group_bootstrap_gossip_repair(
+                state,
+                recipient,
+                obligation,
+                logical_id,
+                gossip_config,
+                &raw_error,
+            )
+            .await
         }
+    }
+}
+
+async fn deliver_public_group_bootstrap_gossip_repair(
+    state: &AppState,
+    recipient: AgentId,
+    obligation: &PublicGroupBootstrapObligation,
+    logical_id: x0x::dm::DmLogicalId,
+    gossip_config: x0x::dm::DmSendConfig,
+    raw_error: &x0x::dm::DmError,
+) -> std::result::Result<PublicGroupBootstrapDelivery, x0x::dm::DmError> {
+    tracing::debug!(
+        recipient = %LogHexId::agent(&hex::encode(recipient.as_bytes())),
+        error = %raw_error,
+        "strict public-group bootstrap raw probe failed; starting gossip repair"
+    );
+    state
+        .agent
+        .send_direct_with_config_and_thread(
+            &recipient,
+            obligation.payload.clone(),
+            gossip_config,
+            None,
+            Some(logical_id),
+        )
+        .await
+        .map(PublicGroupBootstrapDelivery::V2ApplicationAck)
+}
+
+fn invalid_bootstrap_outbox(message: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidData, message.into())
+}
+
+fn validate_public_group_bootstrap_obligation(
+    obligation: &PublicGroupBootstrapObligation,
+) -> std::io::Result<()> {
+    if obligation.payload.len() > x0x::direct::MAX_DIRECT_PAYLOAD_SIZE {
+        return Err(invalid_bootstrap_outbox(
+            "public-group bootstrap outbox payload exceeds the DM limit",
+        ));
+    }
+    let payload_digest = blake3::hash(&obligation.payload).to_hex().to_string();
+    if payload_digest != obligation.payload_digest {
+        return Err(invalid_bootstrap_outbox(
+            "public-group bootstrap outbox payload digest mismatch",
+        ));
+    }
+    let binding_digest = public_group_bootstrap_binding_digest(
+        &obligation.recipient_hex,
+        &obligation.group_id,
+        obligation.state_revision,
+        &obligation.state_hash,
+        &obligation.payload_digest,
+    )
+    .map_err(invalid_bootstrap_outbox)?;
+    if obligation.key != format!("public-group-bootstrap:{binding_digest}") {
+        return Err(invalid_bootstrap_outbox(
+            "public-group bootstrap outbox key mismatch",
+        ));
+    }
+    let group = public_group_bootstrap_group_from_payload(&obligation.payload)
+        .map_err(invalid_bootstrap_outbox)?;
+    if group.stable_group_id() != obligation.group_id
+        || group.state_revision != obligation.state_revision
+        || group.state_hash != obligation.state_hash
+        || !public_group_bootstrap_retained_log_valid(&group)
+    {
+        return Err(invalid_bootstrap_outbox(
+            "public-group bootstrap outbox frontier does not match its payload",
+        ));
+    }
+    Ok(())
+}
+
+async fn save_public_group_bootstrap_outbox_unlocked(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let mut entries: Vec<PublicGroupBootstrapObligation> = state
+        .public_group_bootstrap_outbox
+        .read()
+        .await
+        .values()
+        .cloned()
+        .collect();
+    entries.sort_by(|left, right| left.key.cmp(&right.key));
+    let json = serde_json::to_string(&PublicGroupBootstrapOutboxSidecar {
+        version: PUBLIC_GROUP_BOOTSTRAP_OUTBOX_VERSION,
+        entries,
+    })
+    .map_err(|error| std::io::Error::other(format!("serialize bootstrap outbox: {error}")))?;
+    write_named_groups_json_atomic(&state.public_group_bootstrap_outbox_path, &json).await
+}
+
+async fn replace_public_group_bootstrap_outbox_unlocked(
+    state: &AppState,
+    next: HashMap<String, PublicGroupBootstrapObligation>,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let previous = {
+        let mut outbox = state.public_group_bootstrap_outbox.write().await;
+        if *outbox == next {
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+        std::mem::replace(&mut *outbox, next)
+    };
+    let outcome = save_public_group_bootstrap_outbox_unlocked(state).await;
+    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        *state.public_group_bootstrap_outbox.write().await = previous;
+    }
+    outcome
+}
+
+async fn upsert_public_group_bootstrap_obligation_unlocked(
+    state: &AppState,
+    obligation: PublicGroupBootstrapObligation,
+) -> std::io::Result<AtomicWriteOutcome> {
+    validate_public_group_bootstrap_obligation(&obligation)?;
+    let mut next = state.public_group_bootstrap_outbox.read().await.clone();
+    next.retain(|_, existing| {
+        existing.recipient_hex != obligation.recipient_hex
+            || existing.group_id != obligation.group_id
+    });
+    if next.len() >= PUBLIC_GROUP_BOOTSTRAP_OUTBOX_MAX_ENTRIES {
+        return Err(std::io::Error::other(
+            "public-group bootstrap outbox capacity reached",
+        ));
+    }
+    next.insert(obligation.key.clone(), obligation);
+    replace_public_group_bootstrap_outbox_unlocked(state, next).await
+}
+
+async fn persist_named_group_info_with_bootstrap_obligation(
+    state: &Arc<AppState>,
+    group_key: &str,
+    next_group: x0x::groups::GroupInfo,
+    obligation: PublicGroupBootstrapObligation,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _outbox_guard = state
+        .public_group_bootstrap_outbox_persistence_lock
+        .lock()
+        .await;
+    let previous_outbox = state.public_group_bootstrap_outbox.read().await.clone();
+    match upsert_public_group_bootstrap_obligation_unlocked(state, obligation).await {
+        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            return Ok(AtomicWriteOutcome::ReplacedNotDurable);
+        }
+        Ok(AtomicWriteOutcome::NotReplaced) => return Ok(AtomicWriteOutcome::NotReplaced),
+        Err(error) => return Err(error),
+    }
+
+    let roster_outcome = persist_named_group_info(state, group_key, next_group).await;
+    if matches!(roster_outcome, Ok(AtomicWriteOutcome::Durable)) {
+        return roster_outcome;
+    }
+    // A post-rename durability failure can still leave the roster visible and
+    // recoverable. Keep its equally-visible outbox sidecar so startup either
+    // confirms both or drops the obligation when the roster did not survive.
+    if matches!(roster_outcome, Ok(AtomicWriteOutcome::ReplacedNotDurable)) {
+        return roster_outcome;
+    }
+
+    match replace_public_group_bootstrap_outbox_unlocked(state, previous_outbox).await {
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            tracing::error!("bootstrap outbox rollback replacement was not directory-durable")
+        }
+        Err(error) => {
+            tracing::error!(%error, "failed to roll back bootstrap outbox after roster persistence failure")
+        }
+    }
+    roster_outcome
+}
+
+async fn cancel_public_group_bootstrap_obligations(
+    state: &AppState,
+    recipient_hex: &str,
+    group_id: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _guard = state
+        .public_group_bootstrap_outbox_persistence_lock
+        .lock()
+        .await;
+    let mut next = state.public_group_bootstrap_outbox.read().await.clone();
+    next.retain(|_, obligation| {
+        obligation.recipient_hex != recipient_hex || obligation.group_id != group_id
+    });
+    replace_public_group_bootstrap_outbox_unlocked(state, next).await
+}
+
+fn public_group_bootstrap_retry_delay_ms(attempt_count: u32) -> u64 {
+    let shift = attempt_count.min(6);
+    1_000_u64
+        .checked_shl(shift)
+        .unwrap_or(PUBLIC_GROUP_BOOTSTRAP_RETRY_MAX_DELAY_MS)
+        .min(PUBLIC_GROUP_BOOTSTRAP_RETRY_MAX_DELAY_MS)
+}
+
+fn public_group_bootstrap_successor_snapshot(
+    obligation: &PublicGroupBootstrapObligation,
+    current: &x0x::groups::GroupInfo,
+) -> Option<x0x::groups::GroupInfo> {
+    let installed = public_group_bootstrap_group_from_payload(&obligation.payload).ok()?;
+    if installed.stable_group_id() != current.stable_group_id()
+        || installed.state_revision >= current.state_revision
+    {
+        return None;
+    }
+    let installed_head = installed.commit_log.last()?;
+    let anchor_index = current.commit_log.iter().position(|retained| {
+        retained.commit.revision == installed_head.commit.revision
+            && retained.commit.state_hash == installed_head.commit.state_hash
+            && retained.commit.signature == installed_head.commit.signature
+            && retained.roster == installed_head.roster
+    })?;
+    if current.commit_log.get(anchor_index + 1..)?.is_empty() {
+        return None;
+    }
+
+    let mut snapshot = sanitize_signed_public_bootstrap_snapshot(current.clone())?;
+    snapshot.commit_log = current.commit_log.get(anchor_index..)?.to_vec();
+    public_group_bootstrap_successor_chain_valid(&installed, &snapshot).then_some(snapshot)
+}
+
+async fn reconcile_public_group_bootstrap_outbox(
+    state: &AppState,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _guard = state
+        .public_group_bootstrap_outbox_persistence_lock
+        .lock()
+        .await;
+    let current = state.public_group_bootstrap_outbox.read().await.clone();
+    let groups = state.named_groups.read().await.clone();
+    let mut next = HashMap::new();
+    for obligation in current.values() {
+        let Ok(recipient) = parse_agent_id_hex(&obligation.recipient_hex) else {
+            continue;
+        };
+        let Some(group) = groups
+            .values()
+            .find(|group| group.stable_group_id() == obligation.group_id)
+        else {
+            continue;
+        };
+        if !group.has_active_member(&obligation.recipient_hex) {
+            continue;
+        }
+        if group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
+            || group.withdrawn
+        {
+            continue;
+        }
+        let mut replacement = match public_group_bootstrap_successor_snapshot(obligation, group) {
+            Some(snapshot) => prepare_public_group_bootstrap_obligation(recipient, snapshot)
+                .map_err(invalid_bootstrap_outbox)?,
+            None => obligation.clone(),
+        };
+        replacement.created_at_ms = obligation.created_at_ms;
+        if replacement.key == obligation.key {
+            replacement.next_attempt_at_ms = obligation.next_attempt_at_ms;
+            replacement.attempt_count = obligation.attempt_count;
+        }
+        validate_public_group_bootstrap_obligation(&replacement)?;
+        next.insert(replacement.key.clone(), replacement);
+    }
+    replace_public_group_bootstrap_outbox_unlocked(state, next).await
+}
+
+pub(in crate::server) async fn load_public_group_bootstrap_outbox(
+    state: &AppState,
+) -> std::io::Result<()> {
+    let bytes = match tokio::fs::read(&state.public_group_bootstrap_outbox_path).await {
+        Ok(bytes) => bytes,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            state.public_group_bootstrap_outbox.write().await.clear();
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    let sidecar: PublicGroupBootstrapOutboxSidecar = serde_json::from_slice(&bytes)
+        .map_err(|error| invalid_bootstrap_outbox(error.to_string()))?;
+    if sidecar.version != PUBLIC_GROUP_BOOTSTRAP_OUTBOX_VERSION {
+        return Err(invalid_bootstrap_outbox(format!(
+            "unsupported public-group bootstrap outbox version {}",
+            sidecar.version
+        )));
+    }
+    if sidecar.entries.len() > PUBLIC_GROUP_BOOTSTRAP_OUTBOX_MAX_ENTRIES {
+        return Err(invalid_bootstrap_outbox(
+            "public-group bootstrap outbox capacity exceeded",
+        ));
+    }
+    let mut loaded = HashMap::new();
+    for obligation in sidecar.entries {
+        validate_public_group_bootstrap_obligation(&obligation)?;
+        if loaded.insert(obligation.key.clone(), obligation).is_some() {
+            return Err(invalid_bootstrap_outbox(
+                "duplicate public-group bootstrap outbox key",
+            ));
+        }
+    }
+    *state.public_group_bootstrap_outbox.write().await = loaded;
+    match reconcile_public_group_bootstrap_outbox(state).await? {
+        AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced => Ok(()),
+        AtomicWriteOutcome::ReplacedNotDurable => Err(std::io::Error::other(
+            "public-group bootstrap outbox reconciliation was not directory-durable",
+        )),
+    }
+}
+
+async fn reschedule_public_group_bootstrap_obligation(
+    state: &AppState,
+    key: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _guard = state
+        .public_group_bootstrap_outbox_persistence_lock
+        .lock()
+        .await;
+    let mut next = state.public_group_bootstrap_outbox.read().await.clone();
+    let Some(obligation) = next.get_mut(key) else {
+        return Ok(AtomicWriteOutcome::NotReplaced);
+    };
+    obligation.attempt_count = obligation.attempt_count.saturating_add(1);
+    obligation.next_attempt_at_ms = now_millis_u64().saturating_add(
+        public_group_bootstrap_retry_delay_ms(obligation.attempt_count),
+    );
+    replace_public_group_bootstrap_outbox_unlocked(state, next).await
+}
+
+async fn clear_public_group_bootstrap_obligation_after_ack(
+    state: &AppState,
+    key: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    let _guard = state
+        .public_group_bootstrap_outbox_persistence_lock
+        .lock()
+        .await;
+    let mut next = state.public_group_bootstrap_outbox.read().await.clone();
+    next.remove(key);
+    replace_public_group_bootstrap_outbox_unlocked(state, next).await
+}
+
+async fn finish_public_group_bootstrap_obligation_after_ack(
+    state: &AppState,
+    obligation: &PublicGroupBootstrapObligation,
+) -> std::io::Result<AtomicWriteOutcome> {
+    match reconcile_public_group_bootstrap_outbox(state).await? {
+        AtomicWriteOutcome::ReplacedNotDurable => {
+            return Ok(AtomicWriteOutcome::ReplacedNotDurable);
+        }
+        AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced => {}
+    }
+    let exact_obligation_remains = state
+        .public_group_bootstrap_outbox
+        .read()
+        .await
+        .contains_key(&obligation.key);
+    if !exact_obligation_remains {
+        // Reconciliation replaced the ACKed ancestor with a verifiable current
+        // suffix. Leave that new obligation durable for the next worker pass.
+        return Ok(AtomicWriteOutcome::Durable);
+    }
+    let current_matches_ack = state
+        .named_groups
+        .read()
+        .await
+        .values()
+        .find(|group| group.stable_group_id() == obligation.group_id)
+        .is_some_and(|group| {
+            group.state_revision == obligation.state_revision
+                && group.state_hash == obligation.state_hash
+        });
+    if current_matches_ack {
+        clear_public_group_bootstrap_obligation_after_ack(state, &obligation.key).await
+    } else {
+        // A retained-log gap or payload bound made the newer frontier
+        // temporarily unprovable. Never silently clear to a stale ancestor.
+        reschedule_public_group_bootstrap_obligation(state, &obligation.key).await
+    }
+}
+
+pub(in crate::server) async fn public_group_bootstrap_outbox_step(state: &Arc<AppState>) {
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::SeqCst)
+    {
+        tracing::debug!(
+            "deferring public-group bootstrap delivery until roster durability is confirmed"
+        );
+        return;
+    }
+    let now_ms = now_millis_u64();
+    let Some(candidate_group_id) = state
+        .public_group_bootstrap_outbox
+        .read()
+        .await
+        .values()
+        .filter(|obligation| obligation.next_attempt_at_ms <= now_ms)
+        .min_by_key(|obligation| (obligation.next_attempt_at_ms, obligation.created_at_ms))
+        .map(|obligation| obligation.group_id.clone())
+    else {
+        return;
+    };
+
+    // Every signed-public frontier mutation uses this same stable per-group
+    // lock. Holding it from reconciliation through application ACK and durable
+    // outbox transition makes the ordering unambiguous: either this snapshot
+    // installs before the mutation (so its metadata event can apply), or the
+    // mutation/cancellation wins and this worker never sends a stale clone.
+    let membership_lock = group_membership_lock(state, &candidate_group_id).await;
+    let _membership_guard = membership_lock.lock().await;
+    match reconcile_public_group_bootstrap_outbox(state).await {
+        Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            tracing::warn!(
+                "public-group bootstrap reconciliation was not directory-durable; delivery deferred"
+            );
+            return;
+        }
+        Err(error) => {
+            tracing::warn!(%error, "failed to reconcile public-group bootstrap outbox");
+            return;
+        }
+    }
+    let due = state
+        .public_group_bootstrap_outbox
+        .read()
+        .await
+        .values()
+        .filter(|obligation| {
+            obligation.group_id == candidate_group_id && obligation.next_attempt_at_ms <= now_ms
+        })
+        .min_by_key(|obligation| (obligation.next_attempt_at_ms, obligation.created_at_ms))
+        .cloned();
+    let Some(obligation) = due else {
+        return;
+    };
+    #[cfg(test)]
+    if let Some(hook) = take_public_group_bootstrap_delivery_hook(&obligation.group_id) {
+        hook.entered.notify_one();
+        hook.release.notified().await;
+    }
+    match deliver_public_group_bootstrap(state, &obligation).await {
+        Ok(PublicGroupBootstrapDelivery::V2ApplicationAck(receipt)) => {
+            tracing::debug!(
+                group_id = %LogHexId::group(&obligation.group_id),
+                recipient = %LogHexId::agent(&obligation.recipient_hex),
+                path = ?receipt.path,
+                "public-group bootstrap received durable application ACK"
+            );
+            match finish_public_group_bootstrap_obligation_after_ack(state, &obligation).await {
+                Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => tracing::warn!(
+                    "public-group bootstrap ACK completion was not directory-durable"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "failed to persist public-group bootstrap ACK completion")
+                }
+            }
+        }
+        Ok(PublicGroupBootstrapDelivery::LegacyV1Sent(receipt)) => {
+            tracing::debug!(
+                group_id = %LogHexId::group(&obligation.group_id),
+                recipient = %LogHexId::agent(&obligation.recipient_hex),
+                path = ?receipt.path,
+                "sent explicit verified-v1 public-group bootstrap fallback; retaining outbox until v2 ACK"
+            );
+            if let Err(error) =
+                reschedule_public_group_bootstrap_obligation(state, &obligation.key).await
+            {
+                tracing::warn!(%error, "failed to persist v1 bootstrap retry schedule");
+            }
+        }
+        Err(error) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(&obligation.group_id),
+                recipient = %LogHexId::agent(&obligation.recipient_hex),
+                %error,
+                "public-group bootstrap delivery attempt failed"
+            );
+            if let Err(schedule_error) =
+                reschedule_public_group_bootstrap_obligation(state, &obligation.key).await
+            {
+                tracing::warn!(%schedule_error, "failed to persist bootstrap retry schedule");
+            }
+        }
+    }
+}
+
+fn spawn_public_group_bootstrap_delivery(state: &Arc<AppState>) {
+    let state = Arc::clone(state);
+    tokio::spawn(async move {
+        public_group_bootstrap_outbox_step(&state).await;
     });
 }
 
-fn validate_public_group_bootstrap(
-    group: &x0x::groups::GroupInfo,
-    sender_hex: &str,
-    local_agent_hex: &str,
-) -> bool {
-    if group.withdrawn
-        || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
-        || group.shared_secret.is_some()
-        || group.security_binding.is_some()
-        || !group.has_active_member(local_agent_hex)
-        || !group
-            .caller_role(sender_hex)
-            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
-    {
-        return false;
-    }
+fn public_group_bootstrap_retained_log_valid(group: &x0x::groups::GroupInfo) -> bool {
     let Some(genesis) = group.genesis.as_ref() else {
         return false;
     };
@@ -2444,16 +3179,25 @@ fn validate_public_group_bootstrap(
     {
         return false;
     }
+    if group.commit_log.is_empty()
+        || group.commit_log.iter().any(|retained| {
+            !retained.roster_root_consistent()
+                || retained.commit.verify_structure().is_err()
+                || retained.commit.group_id != group.stable_group_id()
+        })
+        || group.commit_log.windows(2).any(|pair| {
+            pair[1].commit.revision != pair[0].commit.revision.saturating_add(1)
+                || pair[1].commit.prev_state_hash.as_deref()
+                    != Some(pair[0].commit.state_hash.as_str())
+        })
+    {
+        return false;
+    }
     let Some(retained) = group.commit_log.last() else {
         return false;
     };
     let commit = &retained.commit;
-    if group.commit_log.len() != 1
-        || !retained.roster_root_consistent()
-        || retained.roster != x0x::groups::roster_projection(&group.members_v2)
-        || commit.verify_structure().is_err()
-        || commit.committed_by != sender_hex
-        || commit.group_id != group.stable_group_id()
+    if retained.roster != x0x::groups::roster_projection(&group.members_v2)
         || commit.revision != group.state_revision
         || commit.state_hash != group.state_hash
         || commit.prev_state_hash != group.prev_state_hash
@@ -2468,26 +3212,199 @@ fn validate_public_group_bootstrap(
     x0x::groups::enforce_last_admin_invariant(&group.members_v2, group.withdrawn).is_ok()
 }
 
+fn validate_public_group_bootstrap(
+    group: &x0x::groups::GroupInfo,
+    sender_hex: &str,
+    local_agent_hex: &str,
+) -> bool {
+    !group.withdrawn
+        && group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic
+        && group.shared_secret.is_none()
+        && group.security_binding.is_none()
+        && group.has_active_member(local_agent_hex)
+        && group
+            .caller_role(sender_hex)
+            .is_some_and(|role| role.at_least(x0x::groups::GroupRole::Admin))
+        && public_group_bootstrap_retained_log_valid(group)
+}
+
 /// Hard cap on named groups installable via the remote bootstrap path;
 /// bounds attacker-driven state growth and listener-task spawn.
 const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
-/// Validate and install a signed-public bootstrap received over the
-/// authenticated direct channel. Existing local state is never overwritten;
-/// normal metadata commits remain the only update path after bootstrap.
-pub(in crate::server) async fn handle_public_group_bootstrap(
+fn public_group_bootstrap_canonical_frontier_matches(
+    installed: &x0x::groups::GroupInfo,
+    incoming: &x0x::groups::GroupInfo,
+) -> bool {
+    installed.stable_group_id() == incoming.stable_group_id()
+        && installed.genesis == incoming.genesis
+        && installed.state_revision == incoming.state_revision
+        && installed.roster_revision == incoming.roster_revision
+        && installed.state_hash == incoming.state_hash
+        && installed.prev_state_hash == incoming.prev_state_hash
+        && installed.withdrawn == incoming.withdrawn
+        && installed.security_binding == incoming.security_binding
+        && x0x::groups::compute_policy_hash(&installed.policy)
+            == x0x::groups::compute_policy_hash(&incoming.policy)
+        && x0x::groups::compute_public_meta_hash(&installed.public_meta())
+            == x0x::groups::compute_public_meta_hash(&incoming.public_meta())
+        && x0x::groups::roster_projection(&installed.members_v2)
+            == x0x::groups::roster_projection(&incoming.members_v2)
+        && public_group_bootstrap_retained_log_valid(installed)
+        && public_group_bootstrap_retained_log_valid(incoming)
+}
+
+fn public_group_bootstrap_snapshot_matches(
+    installed: &x0x::groups::GroupInfo,
+    incoming: &x0x::groups::GroupInfo,
+) -> bool {
+    if public_group_bootstrap_canonical_frontier_matches(installed, incoming) {
+        return true;
+    }
+    if installed.stable_group_id() != incoming.stable_group_id()
+        || installed.state_revision <= incoming.state_revision
+    {
+        return false;
+    }
+    let Some(incoming_head) = incoming.commit_log.last() else {
+        return false;
+    };
+    if incoming_head.commit.revision != incoming.state_revision
+        || incoming_head.commit.state_hash != incoming.state_hash
+        || !incoming_head.roster_root_consistent()
+        || incoming_head.commit.verify_structure().is_err()
+    {
+        return false;
+    }
+    let Some(ancestor_index) = installed.commit_log.iter().position(|retained| {
+        retained.commit.revision == incoming_head.commit.revision
+            && retained.commit.state_hash == incoming_head.commit.state_hash
+            && retained.commit.signature == incoming_head.commit.signature
+            && retained.roster == incoming_head.roster
+    }) else {
+        return false;
+    };
+    let mut expected_revision = incoming_head.commit.revision;
+    let mut expected_hash = incoming_head.commit.state_hash.as_str();
+    for retained in installed.commit_log.iter().skip(ancestor_index + 1) {
+        if !retained.roster_root_consistent()
+            || retained.commit.verify_structure().is_err()
+            || retained.commit.group_id != installed.stable_group_id()
+            || retained.commit.revision != expected_revision.saturating_add(1)
+            || retained.commit.prev_state_hash.as_deref() != Some(expected_hash)
+        {
+            return false;
+        }
+        expected_revision = retained.commit.revision;
+        expected_hash = &retained.commit.state_hash;
+    }
+    expected_revision == installed.state_revision && expected_hash == installed.state_hash
+}
+
+fn public_group_bootstrap_successor_chain_valid(
+    installed: &x0x::groups::GroupInfo,
+    incoming: &x0x::groups::GroupInfo,
+) -> bool {
+    if installed.stable_group_id() != incoming.stable_group_id()
+        || incoming.state_revision <= installed.state_revision
+        || !public_group_bootstrap_retained_log_valid(installed)
+        || !public_group_bootstrap_retained_log_valid(incoming)
+    {
+        return false;
+    }
+    let Some(installed_head) = installed.commit_log.last() else {
+        return false;
+    };
+    let Some(anchor_index) = incoming.commit_log.iter().position(|retained| {
+        retained.commit.revision == installed_head.commit.revision
+            && retained.commit.state_hash == installed_head.commit.state_hash
+            && retained.commit.signature == installed_head.commit.signature
+            && retained.roster == installed_head.roster
+    }) else {
+        return false;
+    };
+    let Some(successors) = incoming.commit_log.get(anchor_index + 1..) else {
+        return false;
+    };
+    if successors.is_empty() {
+        return false;
+    }
+    let Ok(successor_count) = u64::try_from(successors.len()) else {
+        return false;
+    };
+    let mut previous_revision = installed.state_revision;
+    let mut previous_hash = installed.state_hash.as_str();
+    let mut previous_roster = x0x::groups::roster_projection(&installed.members_v2);
+    let mut roster_changes = 0_u64;
+    for retained in successors {
+        let commit = &retained.commit;
+        let signer_is_authorized =
+            previous_roster
+                .get(&commit.committed_by)
+                .is_some_and(|member| {
+                    member.state == x0x::groups::GroupMemberState::Active
+                        && member.role.at_least(x0x::groups::GroupRole::Admin)
+                });
+        let roster_is_canonical = retained.roster.iter().all(|(agent_id, member)| {
+            parse_agent_id_hex(agent_id).is_ok()
+                && matches!(
+                    member.state,
+                    x0x::groups::GroupMemberState::Active | x0x::groups::GroupMemberState::Banned
+                )
+        });
+        let roster_has_admin = retained.roster.values().any(|member| {
+            member.state == x0x::groups::GroupMemberState::Active
+                && member.role.at_least(x0x::groups::GroupRole::Admin)
+        });
+        if commit.group_id != installed.stable_group_id()
+            || commit.revision != previous_revision.saturating_add(1)
+            || commit.prev_state_hash.as_deref() != Some(previous_hash)
+            || commit.withdrawn
+            || commit.verify_structure().is_err()
+            || !retained.roster_root_consistent()
+            || !signer_is_authorized
+            || !roster_is_canonical
+            || !roster_has_admin
+        {
+            return false;
+        }
+        if retained.roster != previous_roster {
+            roster_changes = roster_changes.saturating_add(1);
+        }
+        previous_revision = commit.revision;
+        previous_hash = &commit.state_hash;
+        previous_roster = retained.roster.clone();
+    }
+
+    let minimum_roster_revision = installed.roster_revision.saturating_add(roster_changes);
+    let maximum_roster_revision = installed.roster_revision.saturating_add(successor_count);
+    previous_revision == incoming.state_revision
+        && previous_hash == incoming.state_hash
+        && previous_roster == x0x::groups::roster_projection(&incoming.members_v2)
+        && incoming.roster_revision >= minimum_roster_revision
+        && incoming.roster_revision <= maximum_roster_revision
+}
+
+fn public_group_bootstrap_successor_state(
+    installed: &x0x::groups::GroupInfo,
+    incoming: &x0x::groups::GroupInfo,
+) -> Option<x0x::groups::GroupInfo> {
+    public_group_bootstrap_successor_chain_valid(installed, incoming).then(|| incoming.clone())
+}
+
+async fn admit_public_group_bootstrap(
     state: &Arc<AppState>,
-    sender: &AgentId,
+    sender: AgentId,
     bootstrap: PublicGroupBootstrap,
-) {
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
     if bootstrap.message_type != "public_group_bootstrap" {
-        return;
+        return Err("unsupported public-group bootstrap message type".to_string());
     }
     let sender_hex = hex::encode(sender.as_bytes());
     {
         let revoked = state.agent.revocation_set();
-        if revoked.read().await.is_agent_revoked(sender) {
-            return;
+        if revoked.read().await.is_agent_revoked(&sender) {
+            return Err("public-group bootstrap sender is revoked".to_string());
         }
     }
     // Consent gate: a bootstrap persists a group and spawns listener tasks,
@@ -2497,38 +3414,80 @@ pub(in crate::server) async fn handle_public_group_bootstrap(
     // groups (mirrors the pending-welcome convention for encrypted groups).
     {
         let contacts = state.contacts.read().await;
-        if contacts.trust_level(sender).rank() < crate::contacts::TrustLevel::Known.rank() {
+        if contacts.trust_level(&sender).rank() < crate::contacts::TrustLevel::Known.rank() {
             tracing::debug!(
                 sender = %LogHexId::agent(&sender_hex),
                 "ignoring public-group bootstrap from unknown or blocked sender"
             );
-            return;
+            return Err("public-group bootstrap sender is not a known contact".to_string());
         }
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
     if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
         tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
-        return;
+        return Err("public-group bootstrap failed signed frontier validation".to_string());
     }
     let group_id = group.stable_group_id().to_string();
+    let membership_lock = group_membership_lock(state, &group_id).await;
+    let _membership_guard = membership_lock.lock().await;
     {
         let groups = state.named_groups.read().await;
+        let installed = groups
+            .iter()
+            .find(|(key, existing)| {
+                key.as_str() == group_id || existing.stable_group_id() == group_id
+            })
+            .map(|(key, existing)| (key.clone(), existing.clone()));
+        if let Some((installed_key, installed)) = installed {
+            drop(groups);
+            if public_group_bootstrap_snapshot_matches(&installed, &group) {
+                return Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate);
+            }
+            let Some(advanced) = public_group_bootstrap_successor_state(&installed, &group) else {
+                return Err(
+                    "public-group bootstrap conflicts with installed group state".to_string(),
+                );
+            };
+            return match persist_named_group_info(state, &installed_key, advanced).await {
+                Ok(AtomicWriteOutcome::Durable) => {
+                    ensure_named_group_listeners(Arc::clone(state), &installed_key).await;
+                    tracing::info!(
+                        group_id = %LogHexId::group(&group_id),
+                        sender = %LogHexId::agent(&sender_hex),
+                        "advanced signed-public group from verifiable bootstrap commit suffix"
+                    );
+                    Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted)
+                }
+                Ok(AtomicWriteOutcome::NotReplaced) => Err(
+                    "public-group bootstrap successor did not replace installed state".to_string(),
+                ),
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    Err("public-group bootstrap successor is not directory-durable".to_string())
+                }
+                Err(error) => Err(format!(
+                    "public-group bootstrap successor persistence failed: {error}"
+                )),
+            };
+        }
         if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
             tracing::warn!(
                 sender = %LogHexId::agent(&sender_hex),
                 "refusing public-group bootstrap: named-group capacity reached"
             );
-            return;
-        }
-        if groups.contains_key(&group_id)
-            || groups
-                .values()
-                .any(|existing| existing.stable_group_id() == group_id)
-        {
-            return;
+            return Err("public-group bootstrap capacity reached".to_string());
         }
     }
+    if group
+        .commit_log
+        .last()
+        .is_none_or(|retained| retained.commit.committed_by != sender_hex)
+    {
+        return Err(
+            "cold public-group bootstrap head was not authored by its direct sender".to_string(),
+        );
+    }
+    let candidate = group.clone();
     let outcome = persist_named_groups_mutation(state, |groups| {
         if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS
             || groups.contains_key(&group_id)
@@ -2542,11 +3501,78 @@ pub(in crate::server) async fn handle_public_group_bootstrap(
         true
     })
     .await;
-    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-        ensure_named_group_listeners(Arc::clone(state), &group_id).await;
-        tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
+    match outcome {
+        Ok(AtomicWriteOutcome::Durable) => {
+            ensure_named_group_listeners(Arc::clone(state), &group_id).await;
+            tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
+            Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Inserted)
+        }
+        Ok(AtomicWriteOutcome::NotReplaced) => {
+            let groups = state.named_groups.read().await;
+            let installed = groups.get(&group_id).or_else(|| {
+                groups
+                    .values()
+                    .find(|existing| existing.stable_group_id() == group_id)
+            });
+            match installed {
+                Some(installed)
+                    if public_group_bootstrap_snapshot_matches(installed, &candidate) =>
+                {
+                    Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate)
+                }
+                _ => Err("public-group bootstrap raced conflicting local state".to_string()),
+            }
+        }
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap replacement was not directory-durable");
+            Err("public-group bootstrap replacement is not directory-durable".to_string())
+        }
+        Err(error) => {
+            tracing::warn!(group_id = %LogHexId::group(&group_id), %error, "public-group bootstrap persistence failed");
+            Err(format!(
+                "public-group bootstrap persistence failed: {error}"
+            ))
+        }
+    }
+}
+
+/// Validate and install a signed-public bootstrap received over the
+/// authenticated direct channel. Existing state advances only through a fully
+/// retained, contiguous commit suffix validated by the ordinary apply path.
+pub(in crate::server) async fn handle_public_group_bootstrap(
+    state: &Arc<AppState>,
+    sender: &AgentId,
+    bootstrap: PublicGroupBootstrap,
+) {
+    let _ = admit_public_group_bootstrap(state, *sender, bootstrap).await;
+}
+
+/// Strict typed-DM bootstrap admission. Completion is resolved only after the
+/// consent gate, signed-frontier validation, and directory-durable install.
+pub(in crate::server) async fn handle_public_group_bootstrap_typed_payload(
+    state: &Arc<AppState>,
+    typed: x0x::dm_inbox::DmTypedPayload,
+) {
+    let x0x::dm_inbox::DmTypedPayload {
+        sender,
+        payload,
+        verified,
+        completion,
+        ..
+    } = typed;
+    let result = if !verified {
+        Err("typed public-group bootstrap is not verified".to_string())
     } else {
-        tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap was not durably installed");
+        match payload.strip_prefix(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX) {
+            Some(encoded) => match serde_json::from_slice::<PublicGroupBootstrap>(encoded) {
+                Ok(bootstrap) => admit_public_group_bootstrap(state, sender, bootstrap).await,
+                Err(error) => Err(format!("public-group bootstrap decode failed: {error}")),
+            },
+            None => Err("typed public-group bootstrap prefix is missing".to_string()),
+        }
+    };
+    if let Some(completion) = completion {
+        let _ = completion.send(result);
     }
 }
 
@@ -11411,7 +12437,7 @@ pub(in crate::server) async fn add_named_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
 
-    let (metadata_topic, event, members, epoch, bootstrap_group, added_agent_hex) = {
+    let (metadata_topic, event, members, epoch, bootstrap_group) = {
         let named_groups = state.named_groups.read().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -11456,15 +12482,36 @@ pub(in crate::server) async fn add_named_group_member(
         let event_group_id = next.stable_group_id().to_string();
         let members = named_group_member_values(&next);
         let bootstrap_group = next.clone();
+        let bootstrap_obligation =
+            if next.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
+                let Some(snapshot) = signed_public_bootstrap_snapshot(next.clone()) else {
+                    return api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to construct a signed public-group bootstrap snapshot",
+                    );
+                };
+                match prepare_public_group_bootstrap_obligation(agent_id, snapshot) {
+                    Ok(obligation) => Some(obligation),
+                    Err(error) => {
+                        return api_error(StatusCode::INTERNAL_SERVER_ERROR, error);
+                    }
+                }
+            } else {
+                None
+            };
         drop(named_groups);
 
-        if !matches!(
-            persist_named_group_info(&state, &id, next).await,
-            Ok(AtomicWriteOutcome::Durable)
-        ) {
+        let persist_outcome = match bootstrap_obligation {
+            Some(obligation) => {
+                persist_named_group_info_with_bootstrap_obligation(&state, &id, next, obligation)
+                    .await
+            }
+            None => persist_named_group_info(&state, &id, next).await,
+        };
+        if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "named-group state is not directory-durable",
+                "named-group state and bootstrap obligation are not directory-durable",
             );
         }
 
@@ -11499,19 +12546,12 @@ pub(in crate::server) async fn add_named_group_member(
             member_recovery_history: Vec::new(),
             commit: Some(commit),
         };
-        (
-            metadata_topic,
-            event,
-            members,
-            epoch,
-            bootstrap_group,
-            agent_hex,
-        )
+        (metadata_topic, event, members, epoch, bootstrap_group)
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     if bootstrap_group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
-        spawn_public_group_bootstrap_delivery(&state, &added_agent_hex, bootstrap_group.clone());
+        spawn_public_group_bootstrap_delivery(&state);
     }
     spawn_named_group_event_delivery_to_active_members(&state, &bootstrap_group, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
@@ -11964,6 +13004,28 @@ pub(in crate::server) async fn remove_named_group_member(
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if delivery_roster.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
+        match cancel_public_group_bootstrap_obligations(
+            &state,
+            &agent_id_hex,
+            delivery_roster.stable_group_id(),
+        )
+        .await
+        {
+            Ok(AtomicWriteOutcome::Durable | AtomicWriteOutcome::NotReplaced) => {}
+            Ok(AtomicWriteOutcome::ReplacedNotDurable) => tracing::warn!(
+                group_id = %LogHexId::group(delivery_roster.stable_group_id()),
+                recipient = %LogHexId::agent(&agent_id_hex),
+                "bootstrap cancellation replacement was not directory-durable; retry reconciliation will keep the removed member suppressed"
+            ),
+            Err(error) => tracing::warn!(
+                group_id = %LogHexId::group(delivery_roster.stable_group_id()),
+                recipient = %LogHexId::agent(&agent_id_hex),
+                %error,
+                "failed to persist bootstrap cancellation; retry reconciliation will keep the removed member suppressed"
+            ),
+        }
+    }
     // Direct + delayed delivery of the signed MemberRemoved to active survivors
     // AND the removed member. The removed member is no longer in
     // active_members(), so it is passed via extra_recipients — the same shape
@@ -21392,6 +22454,17 @@ mod tests {
         Arc<AppState>,
         Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
     )> {
+        networked_public_message_history_test_state_with_bootstrap(root, name, Vec::new()).await
+    }
+
+    async fn networked_public_message_history_test_state_with_bootstrap(
+        root: &FsPath,
+        name: &str,
+        bootstrap_nodes: Vec<std::net::SocketAddr>,
+    ) -> Result<(
+        Arc<AppState>,
+        Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
+    )> {
         let data_dir = root.join(name);
         tokio::fs::create_dir_all(&data_dir).await?;
         let history = x0x::history::HistoryConfig {
@@ -21399,6 +22472,8 @@ mod tests {
             db_path: Some(data_dir.join("history.db")),
             ..x0x::history::HistoryConfig::default()
         };
+        let mut network_config = group_redelivery_loopback_network_config();
+        network_config.bootstrap_nodes = bootstrap_nodes;
         let agent = Arc::new(
             Agent::builder()
                 .with_machine_key(data_dir.join("machine.key"))
@@ -21406,7 +22481,7 @@ mod tests {
                 .with_agent_cert_path(data_dir.join("agent.cert"))
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
-                .with_network_config(group_redelivery_loopback_network_config())
+                .with_network_config(network_config)
                 .with_history(history)
                 .build()
                 .await?,
@@ -21463,6 +22538,7 @@ mod tests {
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+            public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -21489,10 +22565,12 @@ mod tests {
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
+            public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
             causal_conflict_tombstones: RwLock::new(HashMap::new()),
             completed_relay_tombstones: RwLock::new(HashMap::new()),
             causal_approval_queue_path: treekem_dir.join("causal_approval_queue.json"),
             predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
+            public_group_bootstrap_outbox_path: data_dir.join("public_group_bootstrap_outbox.json"),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -21695,14 +22773,130 @@ mod tests {
     }
 
     #[test]
-    fn public_group_bootstrap_prefers_receive_acked_raw_delivery() {
-        let config = public_group_bootstrap_delivery_config();
-        assert!(config.prefer_raw_quic_if_connected);
-        assert!(!config.require_gossip);
+    fn public_group_bootstrap_uses_strict_raw_then_gossip_repair() {
+        let raw = public_group_bootstrap_raw_delivery_config();
+        assert!(raw.prefer_raw_quic_if_connected);
+        assert!(!raw.require_gossip);
+        assert!(raw.require_durable_app_ack);
+        assert!(raw.stop_fallback_on_raw_error);
+        assert_eq!(raw.max_retries, 0);
         assert_eq!(
-            config.raw_quic_receive_ack_timeout,
+            raw.raw_quic_receive_ack_timeout,
+            Some(GROUP_PUBLIC_RAW_ATTEMPT_TIMEOUT)
+        );
+
+        let gossip = public_group_bootstrap_gossip_repair_config();
+        assert!(gossip.require_gossip);
+        assert!(!gossip.prefer_raw_quic_if_connected);
+        assert!(gossip.require_durable_app_ack);
+        assert!(gossip.stop_fallback_on_raw_error);
+        assert_eq!(gossip.max_retries, 0);
+        assert_eq!(
+            gossip.raw_quic_receive_ack_timeout,
             Some(Duration::from_secs(8))
         );
+    }
+
+    #[test]
+    fn public_group_bootstrap_logical_id_binds_exact_payload_digest() -> Result<()> {
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let authority_hex = hex::encode(authority.agent_id().as_bytes());
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Digest binding".to_string(),
+            String::new(),
+            authority.agent_id(),
+            "digest-binding".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            recipient_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        group.seal_commit(&authority, now_millis_u64())?;
+        let snapshot = signed_public_bootstrap_snapshot(group).context("snapshot")?;
+        let first = prepare_public_group_bootstrap_obligation(recipient, snapshot)
+            .map_err(anyhow::Error::msg)?;
+        let mut second = first.clone();
+        second.payload.push(b' ');
+        second.payload_digest = blake3::hash(&second.payload).to_hex().to_string();
+        let second_binding = public_group_bootstrap_binding_digest(
+            &second.recipient_hex,
+            &second.group_id,
+            second.state_revision,
+            &second.state_hash,
+            &second.payload_digest,
+        )
+        .map_err(anyhow::Error::msg)?;
+        second.key = format!("public-group-bootstrap:{second_binding}");
+
+        validate_public_group_bootstrap_obligation(&first)?;
+        validate_public_group_bootstrap_obligation(&second)?;
+        let legacy_payload = public_group_bootstrap_legacy_payload(&first)?;
+        assert!(!legacy_payload.starts_with(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX));
+        let legacy: PublicGroupBootstrap = serde_json::from_slice(&legacy_payload)?;
+        assert_eq!(legacy.message_type, "public_group_bootstrap");
+        assert_ne!(first.payload_digest, second.payload_digest);
+        assert_ne!(
+            public_group_bootstrap_logical_id(&first).map_err(anyhow::Error::msg)?,
+            public_group_bootstrap_logical_id(&second).map_err(anyhow::Error::msg)?
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_group_bootstrap_v1_fallback_requires_explicit_binding() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let card_peer = x0x::identity::AgentKeypair::generate()?.agent_id();
+        assert_eq!(
+            public_group_bootstrap_wire_version(&state, &card_peer).await,
+            PublicGroupBootstrapWireVersion::StrictV2,
+            "a capability miss must not downgrade to unprefixed v1"
+        );
+
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: card_peer,
+            trust_level: x0x::contacts::TrustLevel::Known,
+            label: Some("verified v1 card".to_string()),
+            added_at: 1,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: Some(x0x::dm::DmCapabilities::v1_gossip_ready(vec![0x81; 1184])),
+        });
+        assert_eq!(
+            public_group_bootstrap_wire_version(&state, &card_peer).await,
+            PublicGroupBootstrapWireVersion::LegacyV1
+        );
+
+        state.agent.insert_capability_for_testing(
+            card_peer,
+            x0x::identity::MachineId([0x22; 32]),
+            x0x::dm::DmCapabilities::v2_durable_gossip_ready(vec![0x82; 1184]),
+        );
+        assert_eq!(
+            public_group_bootstrap_wire_version(&state, &card_peer).await,
+            PublicGroupBootstrapWireVersion::StrictV2,
+            "a current v2 advert must override an older v1 card"
+        );
+
+        let advert_peer = x0x::identity::AgentKeypair::generate()?.agent_id();
+        state.agent.insert_capability_for_testing(
+            advert_peer,
+            x0x::identity::MachineId([0x23; 32]),
+            x0x::dm::DmCapabilities::v1_gossip_ready(vec![0x83; 1184]),
+        );
+        assert_eq!(
+            public_group_bootstrap_wire_version(&state, &advert_peer).await,
+            PublicGroupBootstrapWireVersion::LegacyV1
+        );
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
     }
 
     /// A stranger bootstrap must install nothing. Once the recipient removes
@@ -21712,7 +22906,9 @@ mod tests {
     #[tokio::test]
     async fn public_bootstrap_refuses_stranger_then_contact_and_member_readd_installs() -> Result<()>
     {
-        let (state, _dir) = secure_endpoint_test_state().await?;
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("bootstrap-restart");
+        let state = restartable_public_message_history_test_state(&data_dir).await?;
         let authority = x0x::identity::AgentKeypair::generate()?;
         let authority_id = authority.agent_id();
         let authority_hex = hex::encode(authority_id.as_bytes());
@@ -21743,9 +22939,9 @@ mod tests {
             machines: Vec::new(),
             dm_capabilities: None,
         });
-        handle_public_group_bootstrap(
+        let stranger_error = admit_public_group_bootstrap(
             &state,
-            &authority_id,
+            authority_id,
             PublicGroupBootstrap {
                 message_type: "public_group_bootstrap".to_string(),
                 group: Box::new(
@@ -21754,7 +22950,9 @@ mod tests {
                 ),
             },
         )
-        .await;
+        .await
+        .expect_err("unknown authority must not receive an application ACK");
+        assert!(stranger_error.contains("not a known contact"));
         assert!(
             state.named_groups.read().await.is_empty(),
             "unknown authority must not install persistent group state"
@@ -21784,18 +22982,24 @@ mod tests {
         );
         group.seal_commit(&authority, now_millis_u64())?;
         let stable_id = group.stable_group_id().to_string();
-        handle_public_group_bootstrap(
-            &state,
-            &authority_id,
-            PublicGroupBootstrap {
-                message_type: "public_group_bootstrap".to_string(),
-                group: Box::new(
-                    signed_public_bootstrap_snapshot(group)
-                        .context("restored bootstrap snapshot")?,
-                ),
-            },
-        )
-        .await;
+        let restored_snapshot =
+            signed_public_bootstrap_snapshot(group).context("restored bootstrap snapshot")?;
+        let restored_bootstrap = PublicGroupBootstrap {
+            message_type: "public_group_bootstrap".to_string(),
+            group: Box::new(restored_snapshot),
+        };
+        assert_eq!(
+            admit_public_group_bootstrap(&state, authority_id, restored_bootstrap.clone())
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Inserted
+        );
+        assert_eq!(
+            admit_public_group_bootstrap(&state, authority_id, restored_bootstrap.clone())
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate
+        );
 
         let groups = state.named_groups.read().await;
         let installed = groups
@@ -21803,6 +23007,1345 @@ mod tests {
             .context("trusted fresh bootstrap installed")?;
         assert!(installed.has_active_member(&local_hex));
         assert_eq!(installed.state_revision, 3);
+        drop(groups);
+
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        drop(state);
+
+        let restarted = restartable_public_message_history_test_state(&data_dir).await?;
+        restarted
+            .contacts
+            .write()
+            .await
+            .add(x0x::contacts::Contact {
+                agent_id: authority_id,
+                trust_level: x0x::contacts::TrustLevel::Known,
+                label: Some("known authority after restart".to_string()),
+                added_at: 2,
+                last_seen: None,
+                identity_type: x0x::contacts::IdentityType::Anonymous,
+                machines: Vec::new(),
+                dm_capabilities: None,
+            });
+        assert_eq!(restarted.named_groups.read().await.len(), 1);
+        assert_eq!(
+            admit_public_group_bootstrap(&restarted, authority_id, restored_bootstrap)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate
+        );
+        restarted.exec_service.shutdown().await;
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bootstrap_accepts_verifiable_descendant_and_rejects_divergence() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let authority_id = authority.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: authority_id,
+            trust_level: x0x::contacts::TrustLevel::Known,
+            label: Some("known authority".to_string()),
+            added_at: 1,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+
+        let mut ancestor = x0x::groups::GroupInfo::with_policy(
+            "Descendant".to_string(),
+            String::new(),
+            authority_id,
+            "descendant-bootstrap".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        ancestor.roster_revision = 1;
+        ancestor.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        ancestor.seal_commit(&authority, now_millis_u64())?;
+        let ancestor_bootstrap = PublicGroupBootstrap {
+            message_type: "public_group_bootstrap".to_string(),
+            group: Box::new(
+                signed_public_bootstrap_snapshot(ancestor.clone()).context("ancestor snapshot")?,
+            ),
+        };
+
+        let mut installed_descendant = ancestor.clone();
+        installed_descendant.description = "later committed metadata".to_string();
+        installed_descendant.seal_commit(&authority, now_millis_u64())?;
+        let group_id = installed_descendant.stable_group_id().to_string();
+        let same_frontier_trimmed = PublicGroupBootstrap {
+            message_type: "public_group_bootstrap".to_string(),
+            group: Box::new(
+                signed_public_bootstrap_snapshot(installed_descendant.clone())
+                    .context("same-frontier trimmed snapshot")?,
+            ),
+        };
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), installed_descendant.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        assert_eq!(
+            admit_public_group_bootstrap(&state, authority_id, same_frontier_trimmed)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate,
+            "a trimmed snapshot must ACK when revision/hash and signed head semantics converge"
+        );
+        assert_eq!(
+            admit_public_group_bootstrap(&state, authority_id, ancestor_bootstrap)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate,
+            "a retained, cryptographically linked installed descendant is idempotent"
+        );
+
+        let mut divergent = ancestor;
+        divergent.description = "sibling branch".to_string();
+        divergent.seal_commit(&authority, now_millis_u64())?;
+        let divergence_error = admit_public_group_bootstrap(
+            &state,
+            authority_id,
+            PublicGroupBootstrap {
+                message_type: "public_group_bootstrap".to_string(),
+                group: Box::new(
+                    signed_public_bootstrap_snapshot(divergent).context("divergent snapshot")?,
+                ),
+            },
+        )
+        .await
+        .expect_err("a sibling frontier must not be accepted as a duplicate");
+        assert!(divergence_error.contains("conflicts"));
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bootstrap_missed_event_requires_and_applies_authorized_successor_suffix(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let other_admin = x0x::identity::AgentKeypair::generate()?;
+        let authority_id = authority.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let other_admin_hex = hex::encode(other_admin.agent_id().as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: authority_id,
+            trust_level: x0x::contacts::TrustLevel::Known,
+            label: Some("bootstrap authority".to_string()),
+            added_at: 1,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+
+        let mut ancestor = x0x::groups::GroupInfo::with_policy(
+            "Missed event".to_string(),
+            String::new(),
+            authority_id,
+            "missed-event-bootstrap".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        ancestor.roster_revision = 1;
+        ancestor.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        ancestor.add_member(
+            other_admin_hex,
+            x0x::groups::GroupRole::Admin,
+            Some(authority_hex),
+            None,
+        );
+        ancestor.seal_commit(&authority, now_millis_u64())?;
+        let group_id = ancestor.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), ancestor.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+
+        let mut successor = ancestor;
+        successor.description = "metadata event missed while recipient was offline".to_string();
+        successor.seal_commit(&other_admin, now_millis_u64())?;
+        let trimmed = PublicGroupBootstrap {
+            message_type: "public_group_bootstrap".to_string(),
+            group: Box::new(
+                signed_public_bootstrap_snapshot(successor.clone())
+                    .context("ambiguous trimmed successor")?,
+            ),
+        };
+        let trimmed_error = admit_public_group_bootstrap(&state, authority_id, trimmed)
+            .await
+            .expect_err("a head-only newer snapshot must not skip a missed event");
+        assert!(trimmed_error.contains("conflicts"));
+
+        let chained = PublicGroupBootstrap {
+            message_type: "public_group_bootstrap".to_string(),
+            group: Box::new(
+                sanitize_signed_public_bootstrap_snapshot(successor.clone())
+                    .context("retained successor suffix")?,
+            ),
+        };
+        assert_eq!(
+            admit_public_group_bootstrap(&state, authority_id, chained)
+                .await
+                .map_err(anyhow::Error::msg)?,
+            x0x::dm_inbox::DmTypedPayloadCompletion::Inserted,
+            "the previous-roster-authorized mixed-admin suffix must advance atomically"
+        );
+        {
+            let groups = state.named_groups.read().await;
+            let installed = groups.get(&group_id).context("advanced group")?;
+            assert_eq!(installed.state_revision, successor.state_revision);
+            assert_eq!(installed.state_hash, successor.state_hash);
+            assert_eq!(installed.description, successor.description);
+        }
+
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bootstrap_persist_failure_withholds_typed_application_ack() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let authority_id = authority.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        state.contacts.write().await.add(x0x::contacts::Contact {
+            agent_id: authority_id,
+            trust_level: x0x::contacts::TrustLevel::Known,
+            label: Some("known authority".to_string()),
+            added_at: 1,
+            last_seen: None,
+            identity_type: x0x::contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: None,
+        });
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Persistence failure".to_string(),
+            String::new(),
+            authority_id,
+            "bootstrap-persist-failure".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            local_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        group.seal_commit(&authority, now_millis_u64())?;
+        let snapshot = signed_public_bootstrap_snapshot(group).context("snapshot")?;
+        let payload =
+            encode_public_group_bootstrap_typed_payload(snapshot).map_err(anyhow::Error::msg)?;
+
+        tokio::fs::create_dir_all(&state.named_groups_path).await?;
+        let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+        handle_public_group_bootstrap_typed_payload(
+            &state,
+            x0x::dm_inbox::DmTypedPayload {
+                sender: authority_id,
+                request_id: [0x51; 16],
+                machine_id: x0x::identity::MachineId([0x52; 32]),
+                payload,
+                verified: true,
+                trust_decision: Some(x0x::trust::TrustDecision::Accept),
+                received_at_unix_ms: now_millis_u64(),
+                completion: Some(completion_tx),
+            },
+        )
+        .await;
+        let result = completion_rx.await?;
+        assert!(result.is_err(), "a non-durable install must not ACK");
+        assert!(state.named_groups.read().await.is_empty());
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bootstrap_outbox_persist_failure_aborts_roster_commit() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let base_group = x0x::groups::GroupInfo::with_policy(
+            "Outbox persist failure".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "bootstrap-outbox-persist-failure".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let group_id = base_group.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), base_group.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        let mut group = base_group.clone();
+        group.roster_revision = 1;
+        group.add_member(
+            recipient_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        let obligation = prepare_public_group_bootstrap_obligation(
+            recipient,
+            signed_public_bootstrap_snapshot(group.clone()).context("snapshot")?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        tokio::fs::create_dir_all(&state.public_group_bootstrap_outbox_path).await?;
+        let outcome = persist_named_group_info_with_bootstrap_obligation(
+            &state, &group_id, group, obligation,
+        )
+        .await;
+        assert!(
+            !matches!(outcome, Ok(AtomicWriteOutcome::Durable)),
+            "the roster commit must abort when its delivery obligation is not durable"
+        );
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(&group_id).context("base group remains")?;
+        assert!(!stored.has_active_member(&hex::encode(recipient.as_bytes())));
+        assert_eq!(stored.state_revision, base_group.state_revision);
+        drop(groups);
+        assert!(state.public_group_bootstrap_outbox.read().await.is_empty());
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn public_bootstrap_outbox_supersedes_with_verifiable_suffix_cancels_and_reloads_empty(
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path().join("bootstrap-outbox-lifecycle");
+        let state = restartable_public_message_history_test_state(&data_dir).await?;
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Outbox lifecycle".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "bootstrap-outbox-lifecycle".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = 1;
+        group.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        let group_id = group.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), group.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        let initial = prepare_public_group_bootstrap_obligation(
+            recipient,
+            signed_public_bootstrap_snapshot(group.clone()).context("initial snapshot")?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        let initial_key = initial.key.clone();
+        {
+            let _guard = state
+                .public_group_bootstrap_outbox_persistence_lock
+                .lock()
+                .await;
+            assert_eq!(
+                upsert_public_group_bootstrap_obligation_unlocked(&state, initial).await?,
+                AtomicWriteOutcome::Durable
+            );
+        }
+
+        group.description = "newer metadata folded into bootstrap".to_string();
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        assert_eq!(
+            persist_named_group_info(&state, &group_id, group.clone()).await?,
+            AtomicWriteOutcome::Durable
+        );
+        assert_eq!(
+            reconcile_public_group_bootstrap_outbox(&state).await?,
+            AtomicWriteOutcome::Durable
+        );
+        let outbox = state.public_group_bootstrap_outbox.read().await;
+        assert_eq!(outbox.len(), 1);
+        let replacement = outbox.values().next().context("replacement obligation")?;
+        assert_ne!(replacement.key, initial_key);
+        assert_eq!(replacement.state_revision, group.state_revision);
+        assert_eq!(
+            public_group_bootstrap_group_from_payload(&replacement.payload)
+                .map_err(anyhow::Error::msg)?
+                .commit_log
+                .len(),
+            2
+        );
+        validate_public_group_bootstrap_obligation(replacement)?;
+        drop(outbox);
+
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.remove_member(&recipient_hex, Some(authority_hex));
+        group.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        assert_eq!(
+            persist_named_group_info(&state, &group_id, group).await?,
+            AtomicWriteOutcome::Durable
+        );
+        assert_eq!(
+            cancel_public_group_bootstrap_obligations(&state, &recipient_hex, &group_id).await?,
+            AtomicWriteOutcome::Durable
+        );
+        assert!(state.public_group_bootstrap_outbox.read().await.is_empty());
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        drop(state);
+
+        let restarted = restartable_public_message_history_test_state(&data_dir).await?;
+        load_public_group_bootstrap_outbox(&restarted).await?;
+        assert!(restarted
+            .public_group_bootstrap_outbox
+            .read()
+            .await
+            .is_empty());
+        restarted.exec_service.shutdown().await;
+        restarted.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn public_bootstrap_inflight_send_fences_removal_and_both_metadata_deliveries(
+    ) -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let recipient = x0x::identity::AgentKeypair::generate()?.agent_id();
+        let recipient_hex = hex::encode(recipient.as_bytes());
+        let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let base_group = x0x::groups::GroupInfo::with_policy(
+            "Bootstrap removal fence".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "bootstrap-removal-fence".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let group_id = base_group.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), base_group.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        let mut added = base_group;
+        added.roster_revision = 1;
+        added.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        added.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        let obligation = prepare_public_group_bootstrap_obligation(
+            recipient,
+            signed_public_bootstrap_snapshot(added.clone()).context("fenced snapshot")?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            persist_named_group_info_with_bootstrap_obligation(
+                &state, &group_id, added, obligation,
+            )
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        PUBLIC_GROUP_BOOTSTRAP_DELIVERY_HOOKS
+            .lock()
+            .expect("public-group bootstrap delivery hook poisoned")
+            .insert(
+                group_id.clone(),
+                PublicGroupBootstrapDeliveryHookControl {
+                    entered: Arc::clone(&entered),
+                    release,
+                },
+            );
+        NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+            .lock()
+            .expect("named-group delivery recorder poisoned")
+            .retain(|(_, recorded_group, _, _)| recorded_group != &group_id);
+
+        let delivery_state = Arc::clone(&state);
+        let delivery_task = tokio::spawn(async move {
+            public_group_bootstrap_outbox_step(&delivery_state).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .context("bootstrap send did not reach the deterministic in-flight point")?;
+
+        let remove_state = Arc::clone(&state);
+        let remove_group_id = group_id.clone();
+        let remove_recipient = recipient_hex.clone();
+        let remove_task = tokio::spawn(async move {
+            let response = remove_named_group_member(
+                State(remove_state),
+                Path((remove_group_id, remove_recipient)),
+            )
+            .await
+            .into_response();
+            response_json(response).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(
+            !remove_task.is_finished(),
+            "removal must wait for the in-flight bootstrap's stable group lock"
+        );
+        assert!(state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .is_some_and(|group| group.has_active_member(&recipient_hex)));
+
+        // Cancellation of the paused worker models process/task teardown. Its
+        // guard must drop before removal can persist, cancel the obligation,
+        // and schedule both immediate and delayed MemberRemoved deliveries.
+        delivery_task.abort();
+        let _ = delivery_task.await;
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), remove_task)
+            .await
+            .context("fenced removal did not complete")???;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        assert!(state.public_group_bootstrap_outbox.read().await.is_empty());
+        assert!(state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .is_some_and(|group| !group.has_active_member(&recipient_hex)));
+        let paths: HashSet<&'static str> = {
+            let recorded = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST
+                .lock()
+                .expect("named-group delivery recorder poisoned");
+            recorded
+                .iter()
+                .filter(|(recipient, recorded_group, kind, _)| {
+                    recipient == &recipient_hex
+                        && recorded_group == &group_id
+                        && *kind == "member_removed"
+                })
+                .map(|(_, _, _, path)| *path)
+                .collect()
+        };
+        assert_eq!(paths, HashSet::from(["direct", "delayed"]));
+
+        state.exec_service.shutdown().await;
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn public_bootstrap_released_inflight_send_installs_before_blocked_removal_applies(
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (authority, authority_kem) =
+            networked_public_message_history_test_state(dir.path(), "fenced-real-authority")
+                .await?;
+        let (recipient, recipient_kem) =
+            networked_public_message_history_test_state(dir.path(), "fenced-real-recipient")
+                .await?;
+        authority.agent.join_network().await?;
+        recipient.agent.join_network().await?;
+
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(16);
+        authority
+            .agent
+            .start_dm_inbox(authority_kem, x0x::dm_inbox::DmInboxConfig::default())
+            .await?;
+        recipient
+            .agent
+            .start_dm_inbox(
+                Arc::clone(&recipient_kem),
+                x0x::dm_inbox::DmInboxConfig::default()
+                    .with_typed_payload_route(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX, bootstrap_tx),
+            )
+            .await?;
+        let recipient_for_bootstrap = Arc::clone(&recipient);
+        let bootstrap_task = tokio::spawn(async move {
+            while let Some(typed) = bootstrap_rx.recv().await {
+                handle_public_group_bootstrap_typed_payload(&recipient_for_bootstrap, typed).await;
+            }
+        });
+        let mut metadata_rx = recipient.agent.subscribe_direct();
+        let recipient_for_metadata = Arc::clone(&recipient);
+        let metadata_task = tokio::spawn(async move {
+            while let Some(msg) = metadata_rx.recv().await {
+                let Ok(event) = serde_json::from_slice::<NamedGroupMetadataEvent>(&msg.payload)
+                else {
+                    continue;
+                };
+                apply_named_group_metadata_event(
+                    &recipient_for_metadata,
+                    event,
+                    msg.sender,
+                    msg.verified,
+                    None,
+                )
+                .await;
+            }
+        });
+
+        let authority_network = authority
+            .agent
+            .network()
+            .context("fenced authority network")?
+            .clone();
+        let recipient_network = recipient
+            .agent
+            .network()
+            .context("fenced recipient network")?
+            .clone();
+        let authority_addr = normalize_group_redelivery_loopback(
+            authority_network
+                .bound_addr()
+                .await
+                .context("fenced authority address")?,
+        );
+        let recipient_addr = normalize_group_redelivery_loopback(
+            recipient_network
+                .bound_addr()
+                .await
+                .context("fenced recipient address")?,
+        );
+        let authority_peer = ant_quic::PeerId(authority.agent.machine_id().0);
+        let recipient_peer = ant_quic::PeerId(recipient.agent.machine_id().0);
+        authority_network.connect_addr(recipient_addr).await?;
+        let connected_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < connected_deadline {
+            if authority_network.is_connected(&recipient_peer).await
+                && recipient_network.is_connected(&authority_peer).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(authority_network.is_connected(&recipient_peer).await);
+        assert!(recipient_network.is_connected(&authority_peer).await);
+        authority
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &recipient.agent,
+                recipient_addr,
+            ))
+            .await;
+        recipient
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &authority.agent,
+                authority_addr,
+            ))
+            .await;
+        authority.agent.insert_capability_for_testing(
+            recipient.agent.agent_id(),
+            recipient.agent.machine_id(),
+            x0x::dm::DmCapabilities::v3_threaded_durable_gossip_ready(
+                recipient_kem.public_bytes.clone(),
+            ),
+        );
+
+        let authority_id = authority.agent.agent_id();
+        let recipient_id = recipient.agent.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let recipient_hex = hex::encode(recipient_id.as_bytes());
+        recipient
+            .contacts
+            .write()
+            .await
+            .add(x0x::contacts::Contact {
+                agent_id: authority_id,
+                trust_level: x0x::contacts::TrustLevel::Known,
+                label: Some("fenced bootstrap authority".to_string()),
+                added_at: 1,
+                last_seen: None,
+                identity_type: x0x::contacts::IdentityType::Known,
+                machines: Vec::new(),
+                dm_capabilities: None,
+            });
+        let base_group = x0x::groups::GroupInfo::with_policy(
+            "Real bootstrap removal fence".to_string(),
+            String::new(),
+            authority_id,
+            "real-bootstrap-removal-fence".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let group_id = base_group.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&authority, |groups| {
+                groups.insert(group_id.clone(), base_group.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        let mut added = base_group;
+        added.roster_revision = 1;
+        added.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        added.seal_commit(authority.agent.identity().agent_keypair(), now_millis_u64())?;
+        let obligation = prepare_public_group_bootstrap_obligation(
+            recipient_id,
+            signed_public_bootstrap_snapshot(added.clone()).context("real fenced snapshot")?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            persist_named_group_info_with_bootstrap_obligation(
+                &authority, &group_id, added, obligation,
+            )
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        PUBLIC_GROUP_BOOTSTRAP_DELIVERY_HOOKS
+            .lock()
+            .expect("public-group bootstrap delivery hook poisoned")
+            .insert(
+                group_id.clone(),
+                PublicGroupBootstrapDeliveryHookControl {
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                },
+            );
+        let delivery_state = Arc::clone(&authority);
+        let delivery_task = tokio::spawn(async move {
+            public_group_bootstrap_outbox_step(&delivery_state).await;
+        });
+        tokio::time::timeout(Duration::from_secs(2), entered.notified())
+            .await
+            .context("real bootstrap did not pause in flight")?;
+
+        let remove_state = Arc::clone(&authority);
+        let remove_group_id = group_id.clone();
+        let remove_recipient = recipient_hex.clone();
+        let remove_task = tokio::spawn(async move {
+            let response = remove_named_group_member(
+                State(remove_state),
+                Path((remove_group_id, remove_recipient)),
+            )
+            .await
+            .into_response();
+            response_json(response).await
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert!(!remove_task.is_finished());
+        assert!(recipient.named_groups.read().await.is_empty());
+
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(15), delivery_task)
+            .await
+            .context("released bootstrap delivery deadline")??;
+        let (status, body) = tokio::time::timeout(Duration::from_secs(15), remove_task)
+            .await
+            .context("blocked removal deadline")???;
+        assert_eq!(status, StatusCode::OK, "response: {body}");
+        let exact_removal_payload = {
+            let recorded = NAMED_GROUP_DIRECT_PAYLOADS_FOR_TEST
+                .lock()
+                .expect("named-group direct payload recorder poisoned");
+            recorded
+                .iter()
+                .filter(|(recipient, _)| recipient == &recipient_hex)
+                .find_map(|(_, payload)| {
+                    serde_json::from_slice::<NamedGroupMetadataEvent>(payload)
+                        .ok()
+                        .filter(|event| {
+                            named_group_metadata_event_kind(event) == "member_removed"
+                                && named_group_metadata_event_group_id(event) == group_id
+                        })
+                })
+                .context("production removal path did not emit its exact direct payload")?
+        };
+        // Deterministic transport seam: feed the exact bytes emitted by the
+        // production direct-delivery path through the same admission function
+        // as the daemon listener. The live task above remains active, so this
+        // is either the first apply or an idempotent duplicate.
+        let apply_result = apply_named_group_metadata_event(
+            &recipient,
+            exact_removal_payload,
+            authority_id,
+            true,
+            None,
+        )
+        .await;
+        let removed_deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            let removed = recipient
+                .named_groups
+                .read()
+                .await
+                .get(&group_id)
+                .is_none_or(|group| !group.has_active_member(&recipient_hex));
+            if removed || Instant::now() >= removed_deadline {
+                assert!(
+                    removed,
+                    "recipient retained a stale active-member bootstrap"
+                );
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            apply_result.accepted
+                || recipient
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_id)
+                    .is_none_or(|group| !group.has_active_member(&recipient_hex)),
+            "exact production MemberRemoved payload was neither applied nor already converged"
+        );
+        assert!(authority
+            .public_group_bootstrap_outbox
+            .read()
+            .await
+            .is_empty());
+        assert!(authority
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .is_some_and(|group| !group.has_active_member(&recipient_hex)));
+
+        bootstrap_task.abort();
+        metadata_task.abort();
+        authority.exec_service.shutdown().await;
+        authority.agent.shutdown().await;
+        recipient.exec_service.shutdown().await;
+        recipient.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn public_bootstrap_strict_transport_restores_after_contact_consent() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let (authority, authority_kem) =
+            networked_public_message_history_test_state(dir.path(), "bootstrap-authority").await?;
+        let (recipient, recipient_kem) =
+            networked_public_message_history_test_state(dir.path(), "bootstrap-recipient").await?;
+
+        authority.agent.join_network().await?;
+        recipient.agent.join_network().await?;
+
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(16);
+        authority
+            .agent
+            .start_dm_inbox(authority_kem, x0x::dm_inbox::DmInboxConfig::default())
+            .await?;
+        recipient
+            .agent
+            .start_dm_inbox(
+                Arc::clone(&recipient_kem),
+                x0x::dm_inbox::DmInboxConfig::default()
+                    .with_typed_payload_route(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX, bootstrap_tx),
+            )
+            .await?;
+        let recipient_for_bootstrap = Arc::clone(&recipient);
+        let bootstrap_task = tokio::spawn(async move {
+            while let Some(typed) = bootstrap_rx.recv().await {
+                handle_public_group_bootstrap_typed_payload(&recipient_for_bootstrap, typed).await;
+            }
+        });
+
+        let authority_network = authority
+            .agent
+            .network()
+            .context("authority network")?
+            .clone();
+        let recipient_network = recipient
+            .agent
+            .network()
+            .context("recipient network")?
+            .clone();
+        let authority_addr = normalize_group_redelivery_loopback(
+            authority_network
+                .bound_addr()
+                .await
+                .context("authority bound address")?,
+        );
+        let recipient_addr = normalize_group_redelivery_loopback(
+            recipient_network
+                .bound_addr()
+                .await
+                .context("recipient bound address")?,
+        );
+        let authority_peer = ant_quic::PeerId(authority.agent.machine_id().0);
+        let recipient_peer = ant_quic::PeerId(recipient.agent.machine_id().0);
+        let connected = authority_network.connect_addr(recipient_addr).await?;
+        assert_eq!(connected.0, recipient.agent.machine_id().0);
+        let connected_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < connected_deadline {
+            if authority_network.is_connected(&recipient_peer).await
+                && recipient_network.is_connected(&authority_peer).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(authority_network.is_connected(&recipient_peer).await);
+        assert!(recipient_network.is_connected(&authority_peer).await);
+
+        authority
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &recipient.agent,
+                recipient_addr,
+            ))
+            .await;
+        recipient
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &authority.agent,
+                authority_addr,
+            ))
+            .await;
+        authority.agent.insert_capability_for_testing(
+            recipient.agent.agent_id(),
+            recipient.agent.machine_id(),
+            x0x::dm::DmCapabilities::v3_threaded_durable_gossip_ready(
+                recipient_kem.public_bytes.clone(),
+            ),
+        );
+
+        let authority_id = authority.agent.agent_id();
+        let recipient_id = recipient.agent.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let recipient_hex = hex::encode(recipient_id.as_bytes());
+        recipient
+            .contacts
+            .write()
+            .await
+            .add(x0x::contacts::Contact {
+                agent_id: authority_id,
+                trust_level: x0x::contacts::TrustLevel::Unknown,
+                label: Some("stranger authority".to_string()),
+                added_at: 0,
+                last_seen: None,
+                identity_type: x0x::contacts::IdentityType::Anonymous,
+                machines: Vec::new(),
+                dm_capabilities: None,
+            });
+
+        let group_id = "strict-bootstrap-consent";
+        let mut group = x0x::groups::GroupInfo::with_policy(
+            "Strict bootstrap consent".to_string(),
+            String::new(),
+            authority_id,
+            group_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        group.roster_revision = group.roster_revision.saturating_add(1);
+        group.add_member(
+            recipient_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex.clone()),
+            None,
+        );
+        group.seal_commit(authority.agent.identity().agent_keypair(), now_millis_u64())?;
+        let stranger_snapshot =
+            signed_public_bootstrap_snapshot(group.clone()).context("stranger snapshot")?;
+        let stranger_obligation =
+            prepare_public_group_bootstrap_obligation(recipient_id, stranger_snapshot.clone())
+                .map_err(anyhow::Error::msg)?;
+        let stranger_logical =
+            public_group_bootstrap_logical_id(&stranger_obligation).map_err(anyhow::Error::msg)?;
+        let mut stranger_config = public_group_bootstrap_raw_delivery_config();
+        stranger_config.raw_quic_receive_ack_timeout = Some(Duration::from_millis(500));
+        let stranger_result = authority
+            .agent
+            .send_direct_with_config_and_thread(
+                &recipient_id,
+                stranger_obligation.payload.clone(),
+                stranger_config,
+                None,
+                Some(stranger_logical),
+            )
+            .await;
+        assert!(
+            stranger_result.is_err(),
+            "unknown authority must not receive an accepted application ACK"
+        );
+        assert!(recipient.named_groups.read().await.is_empty());
+
+        recipient.contacts.write().await.remove(&authority_id);
+        recipient
+            .contacts
+            .write()
+            .await
+            .add(x0x::contacts::Contact {
+                agent_id: authority_id,
+                trust_level: x0x::contacts::TrustLevel::Known,
+                label: Some("known authority".to_string()),
+                added_at: 1,
+                last_seen: None,
+                identity_type: x0x::contacts::IdentityType::Anonymous,
+                machines: Vec::new(),
+                dm_capabilities: None,
+            });
+
+        let delivery = tokio::time::timeout(
+            Duration::from_secs(15),
+            deliver_public_group_bootstrap(&authority, &stranger_obligation),
+        )
+        .await
+        .context("same-payload consent-restored bootstrap delivery deadline")??;
+        let PublicGroupBootstrapDelivery::V2ApplicationAck(receipt) = delivery else {
+            anyhow::bail!("v2 recipient unexpectedly used legacy bootstrap fallback");
+        };
+        assert_eq!(receipt.path, x0x::dm::DmPath::RawQuicAcked);
+        let installed = recipient.named_groups.read().await;
+        assert_eq!(installed.len(), 1);
+        let installed_group = installed
+            .get(group_id)
+            .context("known-contact bootstrap installed")?;
+        assert_eq!(installed_group.state_revision, 1);
+        drop(installed);
+
+        let duplicate_delivery = tokio::time::timeout(
+            Duration::from_secs(15),
+            deliver_public_group_bootstrap(&authority, &stranger_obligation),
+        )
+        .await
+        .context("exact bootstrap retry deadline")??;
+        let PublicGroupBootstrapDelivery::V2ApplicationAck(duplicate_receipt) = duplicate_delivery
+        else {
+            anyhow::bail!("v2 duplicate unexpectedly used legacy bootstrap fallback");
+        };
+        assert_eq!(duplicate_receipt.path, x0x::dm::DmPath::RawQuicAcked);
+        assert_eq!(recipient.named_groups.read().await.len(), 1);
+
+        bootstrap_task.abort();
+        authority.agent.shutdown().await;
+        recipient.agent.shutdown().await;
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn public_bootstrap_outbox_failed_send_survives_restart_and_gossip_drains() -> Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let authority_dir = dir.path().join("outbox-restart-authority");
+        let recipient_dir = dir.path().join("outbox-restart-recipient");
+        let (recipient, recipient_kem) =
+            networked_public_message_history_test_state(dir.path(), "outbox-restart-recipient")
+                .await?;
+        let recipient_addr = normalize_group_redelivery_loopback(
+            recipient
+                .agent
+                .network()
+                .context("recipient bootstrap network")?
+                .bound_addr()
+                .await
+                .context("recipient bootstrap address")?,
+        );
+        let (authority, _authority_kem) =
+            networked_public_message_history_test_state_with_bootstrap(
+                dir.path(),
+                "outbox-restart-authority",
+                vec![recipient_addr],
+            )
+            .await?;
+        assert_eq!(
+            authority.public_group_bootstrap_outbox_path,
+            authority_dir.join("public_group_bootstrap_outbox.json")
+        );
+        assert_eq!(
+            recipient.named_groups_path,
+            recipient_dir.join("named_groups.json")
+        );
+        recipient.agent.join_network().await?;
+        authority.agent.join_network().await?;
+
+        let (bootstrap_tx, mut bootstrap_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(16);
+        recipient
+            .agent
+            .start_dm_inbox(
+                Arc::clone(&recipient_kem),
+                x0x::dm_inbox::DmInboxConfig::default()
+                    .with_typed_payload_route(PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX, bootstrap_tx),
+            )
+            .await?;
+        let recipient_for_bootstrap = Arc::clone(&recipient);
+        let bootstrap_task = tokio::spawn(async move {
+            while let Some(typed) = bootstrap_rx.recv().await {
+                handle_public_group_bootstrap_typed_payload(&recipient_for_bootstrap, typed).await;
+            }
+        });
+
+        let authority_id = authority.agent.agent_id();
+        let recipient_id = recipient.agent.agent_id();
+        let authority_hex = hex::encode(authority_id.as_bytes());
+        let recipient_hex = hex::encode(recipient_id.as_bytes());
+        recipient
+            .contacts
+            .write()
+            .await
+            .add(x0x::contacts::Contact {
+                agent_id: authority_id,
+                trust_level: x0x::contacts::TrustLevel::Known,
+                label: Some("restart authority".to_string()),
+                added_at: 1,
+                last_seen: None,
+                identity_type: x0x::contacts::IdentityType::Known,
+                machines: Vec::new(),
+                dm_capabilities: None,
+            });
+        let base_group = x0x::groups::GroupInfo::with_policy(
+            "Restart outbox".to_string(),
+            String::new(),
+            authority_id,
+            "restart-outbox-bootstrap".to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let group_id = base_group.stable_group_id().to_string();
+        assert_eq!(
+            persist_named_groups_mutation(&authority, |groups| {
+                groups.insert(group_id.clone(), base_group.clone());
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+        let mut group = base_group;
+        group.roster_revision = 1;
+        group.add_member(
+            recipient_hex,
+            x0x::groups::GroupRole::Member,
+            Some(authority_hex),
+            None,
+        );
+        group.seal_commit(authority.agent.identity().agent_keypair(), now_millis_u64())?;
+        let obligation = prepare_public_group_bootstrap_obligation(
+            recipient_id,
+            signed_public_bootstrap_snapshot(group.clone()).context("restart snapshot")?,
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert_eq!(
+            persist_named_group_info_with_bootstrap_obligation(
+                &authority, &group_id, group, obligation,
+            )
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            public_group_bootstrap_outbox_step(&authority),
+        )
+        .await
+        .context("initial disconnected outbox attempt")?;
+        let failed = authority.public_group_bootstrap_outbox.read().await;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(
+            failed
+                .values()
+                .next()
+                .context("failed obligation")?
+                .attempt_count,
+            1
+        );
+        drop(failed);
+
+        authority.exec_service.shutdown().await;
+        authority.agent.shutdown().await;
+        drop(authority);
+
+        let (restarted, restarted_kem) =
+            networked_public_message_history_test_state_with_bootstrap(
+                dir.path(),
+                "outbox-restart-authority",
+                vec![recipient_addr],
+            )
+            .await?;
+        assert_eq!(restarted.agent.agent_id(), authority_id);
+        load_public_group_bootstrap_outbox(&restarted).await?;
+        assert_eq!(
+            restarted.public_group_bootstrap_outbox.read().await.len(),
+            1
+        );
+        restarted.agent.join_network().await?;
+        restarted
+            .agent
+            .start_dm_inbox(restarted_kem, x0x::dm_inbox::DmInboxConfig::default())
+            .await?;
+
+        let restarted_network = restarted
+            .agent
+            .network()
+            .context("restarted authority network")?
+            .clone();
+        let recipient_network = recipient
+            .agent
+            .network()
+            .context("recipient network")?
+            .clone();
+        let restarted_addr = normalize_group_redelivery_loopback(
+            restarted_network
+                .bound_addr()
+                .await
+                .context("restarted authority address")?,
+        );
+        assert_eq!(
+            normalize_group_redelivery_loopback(
+                recipient_network
+                    .bound_addr()
+                    .await
+                    .context("recipient address")?,
+            ),
+            recipient_addr
+        );
+        restarted_network.connect_addr(recipient_addr).await?;
+        let restarted_peer = ant_quic::PeerId(restarted.agent.machine_id().0);
+        let recipient_peer = ant_quic::PeerId(recipient.agent.machine_id().0);
+        let connected_deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < connected_deadline {
+            if restarted_network.is_connected(&recipient_peer).await
+                && recipient_network.is_connected(&restarted_peer).await
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        assert!(restarted_network.is_connected(&recipient_peer).await);
+        assert!(recipient_network.is_connected(&restarted_peer).await);
+        restarted
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &recipient.agent,
+                recipient_addr,
+            ))
+            .await;
+        recipient
+            .agent
+            .insert_discovered_agent_for_testing(group_redelivery_discovered_agent(
+                &restarted.agent,
+                restarted_addr,
+            ))
+            .await;
+        restarted.agent.insert_capability_for_testing(
+            recipient_id,
+            recipient.agent.machine_id(),
+            x0x::dm::DmCapabilities::v3_threaded_durable_gossip_ready(
+                recipient_kem.public_bytes.clone(),
+            ),
+        );
+        // The explicit raw-failure branch below publishes immediately to the
+        // per-recipient inbox topic. Give the newly-connected gossip neighbor
+        // one heartbeat to enter the topic mesh first; waiting after publish
+        // cannot recover a one-shot message emitted before mesh convergence.
+        tokio::time::sleep(Duration::from_secs(2)).await;
+
+        let due = {
+            let _guard = restarted
+                .public_group_bootstrap_outbox_persistence_lock
+                .lock()
+                .await;
+            let mut next = restarted.public_group_bootstrap_outbox.read().await.clone();
+            for obligation in next.values_mut() {
+                obligation.next_attempt_at_ms = 0;
+            }
+            assert_eq!(
+                replace_public_group_bootstrap_outbox_unlocked(&restarted, next).await?,
+                AtomicWriteOutcome::Durable
+            );
+            restarted
+                .public_group_bootstrap_outbox
+                .read()
+                .await
+                .values()
+                .next()
+                .cloned()
+                .context("due restart obligation")?
+        };
+        let logical_id = public_group_bootstrap_logical_id(&due).map_err(anyhow::Error::msg)?;
+        let forced_raw_failure = x0x::dm::DmError::NoConnectivity(
+            "forced raw failure for gossip-repair regression".to_string(),
+        );
+        let delivery = tokio::time::timeout(
+            Duration::from_secs(15),
+            deliver_public_group_bootstrap_gossip_repair(
+                &restarted,
+                recipient_id,
+                &due,
+                logical_id,
+                public_group_bootstrap_gossip_repair_config(),
+                &forced_raw_failure,
+            ),
+        )
+        .await
+        .context("forced raw failure gossip repair deadline")??;
+        let PublicGroupBootstrapDelivery::V2ApplicationAck(receipt) = delivery else {
+            anyhow::bail!("v2 restart drain unexpectedly used v1 fallback");
+        };
+        assert_eq!(receipt.path, x0x::dm::DmPath::GossipInbox);
+        assert_eq!(recipient.named_groups.read().await.len(), 1);
+
+        tokio::time::timeout(
+            Duration::from_secs(15),
+            public_group_bootstrap_outbox_step(&restarted),
+        )
+        .await
+        .context("restart outbox duplicate drain deadline")?;
+        assert!(restarted
+            .public_group_bootstrap_outbox
+            .read()
+            .await
+            .is_empty());
+
+        bootstrap_task.abort();
+        restarted.exec_service.shutdown().await;
+        restarted.agent.shutdown().await;
+        recipient.exec_service.shutdown().await;
+        recipient.agent.shutdown().await;
         Ok(())
     }
 
