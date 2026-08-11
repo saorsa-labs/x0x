@@ -20606,6 +20606,7 @@ mod tests {
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
+            dm_capability_test_controls: false,
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
                 x0x::connect::ConnectPolicy::default().summary(),
             )),

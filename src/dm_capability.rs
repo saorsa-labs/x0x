@@ -111,6 +111,7 @@ impl CapabilityAdvert {
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
     inner: Mutex<HashMap<[u8; 32], CachedAdvert>>,
+    forced_test_misses: Mutex<std::collections::HashSet<[u8; 32]>>,
     ttl: Duration,
 }
 
@@ -141,6 +142,7 @@ impl CapabilityStore {
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            forced_test_misses: Mutex::new(std::collections::HashSet::new()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
         }
     }
@@ -150,6 +152,7 @@ impl CapabilityStore {
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
             inner: Mutex::new(HashMap::new()),
+            forced_test_misses: Mutex::new(std::collections::HashSet::new()),
             ttl,
         }
     }
@@ -179,9 +182,17 @@ impl CapabilityStore {
 
     /// Testable clock seam for [`Self::lookup_binding`].
     pub fn lookup_binding_at(&self, agent_id: &AgentId, now: Instant) -> Option<CapabilityBinding> {
+        let forced_miss = self
+            .forced_test_misses
+            .lock()
+            .is_ok_and(|mut forced| forced.remove(agent_id.as_bytes()));
         let Ok(mut inner) = self.inner.lock() else {
             return None;
         };
+        if forced_miss {
+            inner.remove(agent_id.as_bytes());
+            return None;
+        }
         let entry = inner.get(agent_id.as_bytes())?;
         if now.duration_since(entry.seen_at) > self.ttl {
             inner.remove(agent_id.as_bytes());
@@ -230,6 +241,25 @@ impl CapabilityStore {
         );
     }
 
+    /// Arm one deterministic cache miss for an authenticated daemon test.
+    ///
+    /// The next lookup for `agent_id` removes any cached advert and returns
+    /// `None`, regardless of intervening startup adverts. The hook is inert
+    /// unless explicitly armed through the daemon's disabled-by-default test
+    /// control. The bounded set prevents even an authenticated test client
+    /// from growing process memory without limit.
+    #[doc(hidden)]
+    pub fn force_miss_once_for_testing(&self, agent_id: AgentId) -> bool {
+        const MAX_FORCED_TEST_MISSES: usize = 256;
+        let Ok(mut forced) = self.forced_test_misses.lock() else {
+            return false;
+        };
+        if forced.len() >= MAX_FORCED_TEST_MISSES && !forced.contains(agent_id.as_bytes()) {
+            return false;
+        }
+        forced.insert(*agent_id.as_bytes())
+    }
+
     /// Current cache size (diagnostic).
     pub fn len(&self) -> usize {
         self.inner.lock().map(|g| g.len()).unwrap_or_default()
@@ -271,6 +301,26 @@ mod tests {
         assert_eq!(
             binding.capabilities.max_protocol_version,
             caps.max_protocol_version
+        );
+    }
+
+    #[test]
+    fn forced_test_miss_survives_intervening_advert_then_consumes_once() {
+        let store = CapabilityStore::new();
+        let agent_id = AgentId([0x31; 32]);
+        let machine_id = MachineId([0x42; 32]);
+        let caps = DmCapabilities::v2_durable_gossip_ready(vec![0x53; 1184]);
+        store.insert(agent_id, machine_id, caps.clone(), 1_000);
+        assert!(store.force_miss_once_for_testing(agent_id));
+
+        // A startup-burst advert racing between control arming and strict send
+        // cannot defeat the deterministic next-lookup miss.
+        store.insert(agent_id, machine_id, caps.clone(), 2_000);
+        assert!(store.lookup_binding(&agent_id).is_none());
+        store.insert(agent_id, machine_id, caps, 3_000);
+        assert!(
+            store.lookup_binding(&agent_id).is_some(),
+            "the forced miss must be consumed exactly once"
         );
     }
 

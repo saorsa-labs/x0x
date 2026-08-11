@@ -2500,11 +2500,14 @@ enum CapabilityRefreshState {
 #[derive(Debug)]
 struct CapabilityRefreshEntry {
     flight_id: u64,
+    deadline: tokio::time::Instant,
     completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
+    worker: Option<tokio::task::JoinHandle<()>>,
 }
 
 #[derive(Debug, Default)]
 struct CapabilityRefreshRegistryState {
+    closed: bool,
     next_flight_id: u64,
     inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
 }
@@ -2519,50 +2522,125 @@ struct CapabilityRefreshRegistry {
 }
 
 enum CapabilityRefreshRegistration {
-    Joined(tokio::sync::watch::Receiver<CapabilityRefreshState>),
+    Joined {
+        completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
+        deadline: tokio::time::Instant,
+    },
     Started {
         completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
-        completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>,
-        guard: CapabilityRefreshGuard,
+        deadline: tokio::time::Instant,
     },
-    AtCapacity,
+    Unavailable,
 }
 
 impl CapabilityRefreshRegistry {
-    fn register(
+    fn register_or_start<F, Fut>(
         self: &std::sync::Arc<Self>,
         recipient: identity::AgentId,
-    ) -> CapabilityRefreshRegistration {
+        worker: F,
+    ) -> CapabilityRefreshRegistration
+    where
+        F: FnOnce(
+            CapabilityRefreshGuard,
+            tokio::sync::watch::Sender<CapabilityRefreshState>,
+            tokio::time::Instant,
+            tokio::time::Instant,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        self.register_or_start_with_timeout(recipient, CAPABILITY_REFRESH_CONVERGENCE_WAIT, worker)
+    }
+
+    fn register_or_start_with_timeout<F, Fut>(
+        self: &std::sync::Arc<Self>,
+        recipient: identity::AgentId,
+        timeout: std::time::Duration,
+        worker: F,
+    ) -> CapabilityRefreshRegistration
+    where
+        F: FnOnce(
+            CapabilityRefreshGuard,
+            tokio::sync::watch::Sender<CapabilityRefreshState>,
+            tokio::time::Instant,
+            tokio::time::Instant,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
         let Ok(mut state) = self.state.lock() else {
-            return CapabilityRefreshRegistration::AtCapacity;
+            return CapabilityRefreshRegistration::Unavailable;
         };
         let recipient_key = *recipient.as_bytes();
         if let Some(existing) = state.inflight.get(&recipient_key) {
-            return CapabilityRefreshRegistration::Joined(existing.completion.clone());
+            return CapabilityRefreshRegistration::Joined {
+                completion: existing.completion.clone(),
+                deadline: existing.deadline,
+            };
         }
-        if state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
-            return CapabilityRefreshRegistration::AtCapacity;
+        if state.closed || state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
+            return CapabilityRefreshRegistration::Unavailable;
         }
         state.next_flight_id = state.next_flight_id.wrapping_add(1);
         let flight_id = state.next_flight_id;
+        let started_at = tokio::time::Instant::now();
+        let deadline = started_at + timeout;
+        let fallback_at =
+            std::cmp::min(started_at + CAPABILITY_REFRESH_TARGETED_ONLY_WAIT, deadline);
         let (completion_tx, completion) =
             tokio::sync::watch::channel(CapabilityRefreshState::Pending);
         state.inflight.insert(
             recipient_key,
             CapabilityRefreshEntry {
                 flight_id,
+                deadline,
                 completion: completion.clone(),
+                worker: None,
             },
         );
+        // Spawn while holding the registry mutex, then attach the handle before
+        // releasing it. If the future finishes immediately, its Drop guard
+        // waits on this mutex; shutdown can therefore never observe an entry
+        // without its authoritative worker handle.
+        let guard = CapabilityRefreshGuard {
+            registry: std::sync::Arc::clone(self),
+            recipient_key,
+            flight_id,
+        };
+        let handle = tokio::spawn(worker(guard, completion_tx, fallback_at, deadline));
+        if let Some(entry) = state.inflight.get_mut(&recipient_key) {
+            entry.worker = Some(handle);
+        }
         CapabilityRefreshRegistration::Started {
             completion,
-            completion_tx,
-            guard: CapabilityRefreshGuard {
-                registry: std::sync::Arc::clone(self),
-                recipient_key,
-                flight_id,
-            },
+            deadline,
         }
+    }
+
+    fn close(&self) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        state.closed = true;
+    }
+
+    async fn shutdown_workers(&self) {
+        let handles = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            state.closed = true;
+            state
+                .inflight
+                .drain()
+                .filter_map(|(_, mut entry)| entry.worker.take())
+                .collect::<Vec<_>>()
+        };
+        if handles.is_empty() {
+            return;
+        }
+        for handle in &handles {
+            handle.abort();
+        }
+        let _results = futures::future::join_all(handles).await;
     }
 
     fn remove(&self, recipient_key: &[u8; 32], flight_id: u64) {
@@ -2609,18 +2687,30 @@ fn capability_binding_supports_durable_ack(
 
 async fn run_strict_capability_refresh(
     recipient: identity::AgentId,
-    pubsub: std::sync::Arc<gossip::PubSubManager>,
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
     shutdown_token: tokio_util::sync::CancellationToken,
+    fallback_at: tokio::time::Instant,
+    deadline: tokio::time::Instant,
+    mut publish: impl FnMut(
+        Option<identity::AgentId>,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = error::NetworkResult<()>> + Send>,
+    >,
 ) {
     if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
     {
         return;
     }
 
-    if let Err(error) =
-        dm_capability_service::publish_capability_advert_request(&pubsub, Some(recipient)).await
-    {
+    let targeted_result = tokio::select! {
+        result = publish(Some(recipient)) => Some(result),
+        () = tokio::time::sleep_until(deadline) => None,
+        () = shutdown_token.cancelled() => None,
+    };
+    let Some(targeted_result) = targeted_result else {
+        return;
+    };
+    if let Err(error) = targeted_result {
         tracing::warn!(
             target: "dm.trace",
             recipient = %hex::encode(recipient.as_bytes()),
@@ -2629,9 +2719,6 @@ async fn run_strict_capability_refresh(
         );
     }
 
-    let started_at = tokio::time::Instant::now();
-    let fallback_at = started_at + CAPABILITY_REFRESH_TARGETED_ONLY_WAIT;
-    let deadline = started_at + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
     let mut fallback_sent = false;
     loop {
         if capability_binding_supports_durable_ack(
@@ -2644,9 +2731,15 @@ async fn run_strict_capability_refresh(
             return;
         }
         if !fallback_sent && now >= fallback_at {
-            if let Err(error) =
-                dm_capability_service::publish_capability_advert_request(&pubsub, None).await
-            {
+            let fallback_result = tokio::select! {
+                result = publish(None) => Some(result),
+                () = tokio::time::sleep_until(deadline) => None,
+                () = shutdown_token.cancelled() => None,
+            };
+            let Some(fallback_result) = fallback_result else {
+                return;
+            };
+            if let Err(error) = fallback_result {
                 tracing::warn!(
                     target: "dm.trace",
                     recipient = %hex::encode(recipient.as_bytes()),
@@ -2666,6 +2759,7 @@ async fn run_strict_capability_refresh(
         tokio::select! {
             () = tokio::time::sleep_until(next_wake) => {}
             () = shutdown_token.cancelled() => return,
+            () = tokio::time::sleep_until(deadline) => return,
         }
     }
 }
@@ -4098,6 +4192,7 @@ impl Agent {
     /// token itself (idempotent), so calling `shutdown()` alone remains correct.
     pub fn begin_shutdown(&self) {
         self.shutdown_token.cancel();
+        self.capability_refreshes.close();
         let mut guard = match self.tracked_tasks.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -4122,6 +4217,7 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
+        self.capability_refreshes.shutdown_workers().await;
 
         // 2. Stop the simple Option<JoinHandle> background tasks.
         self.stop_identity_heartbeat().await;
@@ -4394,35 +4490,53 @@ impl Agent {
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
-        let (mut completion, started) = match self.capability_refreshes.register(recipient) {
-            CapabilityRefreshRegistration::Joined(completion) => (completion, false),
+        let pubsub = std::sync::Arc::clone(runtime.pubsub());
+        let capability_store = std::sync::Arc::clone(&self.capability_store);
+        let shutdown_token = self.shutdown_token.clone();
+        let registration = self.capability_refreshes.register_or_start(
+            recipient,
+            move |guard, completion_tx, fallback_at, deadline| async move {
+                let publisher = move |requested_agent_id| {
+                    let pubsub = std::sync::Arc::clone(&pubsub);
+                    let future: std::pin::Pin<
+                        Box<dyn std::future::Future<Output = error::NetworkResult<()>> + Send>,
+                    > = Box::pin(async move {
+                        dm_capability_service::publish_capability_advert_request(
+                            &pubsub,
+                            requested_agent_id,
+                        )
+                        .await
+                    });
+                    future
+                };
+                run_strict_capability_refresh(
+                    recipient,
+                    capability_store,
+                    shutdown_token,
+                    fallback_at,
+                    deadline,
+                    publisher,
+                )
+                .await;
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            },
+        );
+        let (mut completion, deadline, started) = match registration {
+            CapabilityRefreshRegistration::Joined {
+                completion,
+                deadline,
+            } => (completion, deadline, false),
             CapabilityRefreshRegistration::Started {
                 completion,
-                completion_tx,
-                guard,
-            } => {
-                let pubsub = std::sync::Arc::clone(runtime.pubsub());
-                let capability_store = std::sync::Arc::clone(&self.capability_store);
-                let shutdown_token = self.shutdown_token.clone();
-                tokio::spawn(async move {
-                    run_strict_capability_refresh(
-                        recipient,
-                        pubsub,
-                        capability_store,
-                        shutdown_token,
-                    )
-                    .await;
-                    completion_tx.send_replace(CapabilityRefreshState::Finished);
-                    drop(guard);
-                });
-                (completion, true)
-            }
-            CapabilityRefreshRegistration::AtCapacity => {
+                deadline,
+            } => (completion, deadline, true),
+            CapabilityRefreshRegistration::Unavailable => {
                 tracing::warn!(
                     target: "dm.trace",
                     recipient = %hex::encode(recipient.as_bytes()),
                     limit = MAX_INFLIGHT_CAPABILITY_REFRESHES,
-                    "strict capability refresh registry at capacity"
+                    "strict capability refresh registry unavailable"
                 );
                 return;
             }
@@ -4436,11 +4550,11 @@ impl Agent {
         if *completion.borrow() == CapabilityRefreshState::Finished {
             return;
         }
-        let _ = tokio::time::timeout(
-            CAPABILITY_REFRESH_CONVERGENCE_WAIT + std::time::Duration::from_secs(1),
-            completion.changed(),
-        )
-        .await;
+        tokio::select! {
+            _ = completion.changed() => {}
+            () = tokio::time::sleep_until(deadline) => {}
+            () = self.shutdown_token.cancelled() => {}
+        }
     }
 
     async fn dm_peer_rtt_ms(&self, agent_id: &identity::AgentId) -> Option<u32> {
@@ -14563,6 +14677,12 @@ mod tests {
             agent.tracked_tasks.lock().expect("tracked_tasks").closed,
             "begin_shutdown must close the tracked-task registry"
         );
+        assert!(matches!(
+            agent
+                .capability_refreshes
+                .register_or_start(identity::AgentId([0xE1; 32]), |_, _, _, _| async {}),
+            CapabilityRefreshRegistration::Unavailable
+        ));
 
         // begin_shutdown does NOT drain — that is shutdown()'s job. The handles
         // must still be present (untouched) until shutdown() runs.
@@ -17805,52 +17925,145 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
     agent.shutdown().await;
 }
 
-#[test]
-fn capability_refresh_registry_is_hard_bounded_and_reuses_released_slots() {
+#[tokio::test]
+async fn capability_refresh_registry_is_hard_bounded_and_reuses_released_slots() {
     let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
-    let mut guards = Vec::with_capacity(MAX_INFLIGHT_CAPABILITY_REFRESHES);
+    let release_first = std::sync::Arc::new(tokio::sync::Notify::new());
     for index in 0..MAX_INFLIGHT_CAPABILITY_REFRESHES {
         let mut bytes = [0_u8; 32];
         bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
-        match registry.register(identity::AgentId(bytes)) {
-            CapabilityRefreshRegistration::Started { guard, .. } => guards.push(guard),
-            CapabilityRefreshRegistration::Joined(_)
-            | CapabilityRefreshRegistration::AtCapacity => {
+        let release_first = std::sync::Arc::clone(&release_first);
+        match registry.register_or_start(
+            identity::AgentId(bytes),
+            move |guard, completion_tx, _, _| async move {
+                let _guard = guard;
+                if index == 0 {
+                    release_first.notified().await;
+                    completion_tx.send_replace(CapabilityRefreshState::Finished);
+                } else {
+                    std::future::pending::<()>().await;
+                }
+            },
+        ) {
+            CapabilityRefreshRegistration::Started { .. } => {}
+            CapabilityRefreshRegistration::Joined { .. }
+            | CapabilityRefreshRegistration::Unavailable => {
                 panic!("unique recipient {index} must get a flight slot")
             }
         }
     }
     assert_eq!(registry.len(), MAX_INFLIGHT_CAPABILITY_REFRESHES);
     assert!(matches!(
-        registry.register(identity::AgentId([0xFF; 32])),
-        CapabilityRefreshRegistration::AtCapacity
+        registry.register_or_start(identity::AgentId([0xFF; 32]), |_, _, _, _| async {}),
+        CapabilityRefreshRegistration::Unavailable
     ));
 
-    guards.pop();
+    release_first.notify_one();
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while registry.len() == MAX_INFLIGHT_CAPABILITY_REFRESHES {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("released flight did not clean its registry slot");
     assert_eq!(registry.len(), MAX_INFLIGHT_CAPABILITY_REFRESHES - 1);
-    let replacement = registry.register(identity::AgentId([0xFF; 32]));
+    let replacement =
+        registry.register_or_start(identity::AgentId([0xFF; 32]), |guard, _, _, _| async move {
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        });
     assert!(matches!(
         replacement,
         CapabilityRefreshRegistration::Started { .. }
     ));
+    registry.shutdown_workers().await;
+    assert_eq!(registry.len(), 0);
 }
 
 #[tokio::test]
-async fn capability_refresh_guard_cleans_slot_when_worker_is_aborted() {
+async fn stalled_capability_publish_obeys_caller_deadline_and_cleans_slot() {
     let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
-    let registration = registry.register(identity::AgentId([0xAB; 32]));
-    let CapabilityRefreshRegistration::Started { guard, .. } = registration else {
+    let capability_store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let recipient = identity::AgentId([0xAB; 32]);
+    let registration = registry.register_or_start_with_timeout(
+        recipient,
+        std::time::Duration::from_millis(100),
+        move |guard, completion_tx, fallback_at, deadline| async move {
+            run_strict_capability_refresh(
+                recipient,
+                capability_store,
+                shutdown,
+                fallback_at,
+                deadline,
+                |_| Box::pin(std::future::pending()),
+            )
+            .await;
+            completion_tx.send_replace(CapabilityRefreshState::Finished);
+            drop(guard);
+        },
+    );
+    let CapabilityRefreshRegistration::Started {
+        mut completion,
+        deadline,
+    } = registration
+    else {
         panic!("first registration must start a flight");
     };
-    let worker = tokio::spawn(async move {
-        let _guard = guard;
-        std::future::pending::<()>().await;
-    });
+    tokio::select! {
+        _ = completion.changed() => {}
+        () = tokio::time::sleep_until(deadline) => {}
+    }
+    tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        while registry.len() != 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .expect("deadline-cancelled publish retained its registry slot");
+}
+
+#[tokio::test]
+async fn shutdown_aborts_and_drains_worker_stalled_inside_publish() {
+    let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
+    let capability_store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let worker_shutdown = shutdown.clone();
+    let recipient = identity::AgentId([0xBC; 32]);
+    let registration = registry.register_or_start_with_timeout(
+        recipient,
+        std::time::Duration::from_secs(10),
+        move |guard, completion_tx, fallback_at, deadline| async move {
+            run_strict_capability_refresh(
+                recipient,
+                capability_store,
+                worker_shutdown,
+                fallback_at,
+                deadline,
+                |_| Box::pin(std::future::pending()),
+            )
+            .await;
+            completion_tx.send_replace(CapabilityRefreshState::Finished);
+            drop(guard);
+        },
+    );
+    assert!(matches!(
+        registration,
+        CapabilityRefreshRegistration::Started { .. }
+    ));
     assert_eq!(registry.len(), 1);
-    worker.abort();
-    let result = worker.await;
-    assert!(result.is_err_and(|error| error.is_cancelled()));
+    shutdown.cancel();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        registry.shutdown_workers(),
+    )
+    .await
+    .expect("shutdown did not abort and join stalled capability worker");
     assert_eq!(registry.len(), 0);
+    assert!(matches!(
+        registry.register_or_start(identity::AgentId([0xCD; 32]), |_, _, _, _| async {}),
+        CapabilityRefreshRegistration::Unavailable
+    ));
 }
 
 #[test]

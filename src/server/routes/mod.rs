@@ -97,8 +97,8 @@ pub(super) use named_groups::{
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
-    gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
-    probe_peer_handler,
+    force_dm_capability_miss, gossip_diagnostics, groups_diagnostics, network_status,
+    peer_health_handler, peers, probe_peer_handler,
 };
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,

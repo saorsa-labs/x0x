@@ -300,6 +300,11 @@ pub struct DaemonConfig {
     #[serde(default)]
     pub(super) dm_capability_cache_ttl_secs: Option<u64>,
 
+    /// Enable authenticated deterministic DM-capability test controls.
+    /// Disabled in every production/default configuration.
+    #[serde(default)]
+    pub(super) dm_capability_test_controls: bool,
+
     /// Optional path to a user keypair file for human identity.
     /// When set, the agent can announce with `include_user_identity: true`.
     #[serde(default)]
@@ -598,6 +603,7 @@ impl Default for DaemonConfig {
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
             dm_capability_cache_ttl_secs: None,
+            dm_capability_test_controls: false,
             user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),
             rendezvous_validity_ms: default_rendezvous_validity_ms(),
@@ -838,6 +844,9 @@ pub(super) struct AppState {
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.
     pub(super) groups_diagnostics: Arc<x0x::groups::GroupsDiagnostics>,
+    /// Disabled-by-default gate for authenticated deterministic capability
+    /// miss controls used only by real-daemon integration tests.
+    pub(super) dm_capability_test_controls: bool,
     /// Connect-ACL allow/deny counters + policy summary for
     /// `/diagnostics/connect`. Counters reflect live forwards when connect is
     /// enabled (the forwarder calls `record_allowed`/`record_denied`) and read
@@ -935,10 +944,15 @@ mod tests {
     fn dm_capability_cache_ttl_is_opt_in_and_toml_configurable() {
         let default = DaemonConfig::default();
         assert_eq!(default.dm_capability_cache_ttl_secs, None);
+        assert!(!default.dm_capability_test_controls);
 
-        let configured: DaemonConfig = toml::from_str("dm_capability_cache_ttl_secs = 1")
-            .expect("capability cache TTL TOML parses");
+        let configured: DaemonConfig = toml::from_str(
+            "dm_capability_cache_ttl_secs = 1\n\
+             dm_capability_test_controls = true",
+        )
+        .expect("capability test-control TOML parses");
         assert_eq!(configured.dm_capability_cache_ttl_secs, Some(1));
+        assert!(configured.dm_capability_test_controls);
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.

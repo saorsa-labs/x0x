@@ -694,6 +694,52 @@ pub(in crate::server) async fn dm_diagnostics(
     )
 }
 
+/// POST `/diagnostics/dm/capabilities/:agent_id/force-miss` — arm one
+/// deterministic next-lookup miss for real-daemon convergence tests.
+///
+/// The route is bearer-authenticated with the rest of the control plane and
+/// additionally hidden behind `dm_capability_test_controls = true`; production
+/// defaults return 404 and cannot mutate capability routing state.
+pub(in crate::server) async fn force_dm_capability_miss(
+    State(state): State<Arc<AppState>>,
+    Path(agent_id_hex): Path<String>,
+) -> axum::response::Response {
+    if !state.dm_capability_test_controls {
+        return api_error(StatusCode::NOT_FOUND, "not found").into_response();
+    }
+    let Ok(bytes) = hex::decode(&agent_id_hex) else {
+        return bad_request("agent_id must be 64 hex characters").into_response();
+    };
+    let Ok(agent_bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+        return bad_request("agent_id must be 32 bytes").into_response();
+    };
+    let agent_id = x0x::identity::AgentId(agent_bytes);
+    let store = state.agent.capability_store();
+    if store.lookup_binding(&agent_id).is_none() {
+        return api_error(
+            StatusCode::CONFLICT,
+            "recipient capability is not currently cached",
+        )
+        .into_response();
+    }
+    if !store.force_miss_once_for_testing(agent_id) {
+        return api_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "capability force-miss controls are at capacity",
+        )
+        .into_response();
+    }
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "agent_id": agent_id_hex,
+            "next_lookup": "forced_miss",
+        })),
+    )
+        .into_response()
+}
+
 /// Parse a hex `peer_id` path segment into an ant-quic `PeerId` (32 bytes).
 fn parse_peer_id(hex_str: &str) -> Result<ant_quic::PeerId, (StatusCode, Json<serde_json::Value>)> {
     let bytes =

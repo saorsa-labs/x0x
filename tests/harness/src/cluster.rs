@@ -10,6 +10,12 @@ use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
+#[derive(Clone, Copy, Default)]
+struct StartOptions<'a> {
+    log_dir: Option<&'a std::path::Path>,
+    rust_log: Option<&'a str>,
+}
+
 /// A single x0xd daemon instance.
 pub struct AgentInstance {
     process: Child,
@@ -364,6 +370,24 @@ pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
 /// Start a fresh pair with the same extra TOML appended to each daemon's
 /// generated config. Useful for test-only timing overrides.
 pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
+    pair_with_options(extra_config, None, None).await
+}
+
+/// Start a fresh pair while capturing child logs and overriding their tracing
+/// filter without relying on process-global environment variables.
+pub async fn pair_with_captured_logs(
+    extra_config: &str,
+    log_dir: &std::path::Path,
+    rust_log: &str,
+) -> AgentPair {
+    pair_with_options(extra_config, Some(log_dir), Some(rust_log)).await
+}
+
+async fn pair_with_options(
+    extra_config: &str,
+    log_dir: Option<&std::path::Path>,
+    rust_log: Option<&str>,
+) -> AgentPair {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
     let alice_api = allocate_unused_tcp_port();
@@ -371,26 +395,28 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
     let bob_api = allocate_unused_tcp_port();
     let bob_bind = allocate_unused_udp_port();
 
-    let alice = start_instance(
+    let alice = start_instance_with_options(
         &binary,
         &format!("pair-alice-{suffix}"),
         alice_api,
         alice_bind,
         "",
         extra_config,
+        StartOptions { log_dir, rust_log },
     )
     .await;
     // Rolling start: use the same empirically-required delay as the trio so
     // bob has a stable alice to bootstrap against. The previous 5s was too
     // short and let propagation-dependent tests race mesh formation.
     tokio::time::sleep(ROLLING_START_DELAY).await;
-    let bob = start_instance(
+    let bob = start_instance_with_options(
         &binary,
         &format!("pair-bob-{suffix}"),
         bob_api,
         bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
+        StartOptions { log_dir, rust_log },
     )
     .await;
     tokio::time::sleep(MESH_SETTLE_TIME).await;
@@ -597,24 +623,38 @@ fn allocate_unused_udp_port() -> u16 {
 
 /// Test-only daemon log capture.
 ///
-/// When `X0X_TEST_LOG_DIR` is set, returns stdout/stderr `Stdio` handles that
-/// append to `{dir}/{name}.{suffix}.{out,err}.log`. That path lives outside the
-/// per-node temp data_dir, so the logs survive data-dir cleanup and are
-/// preserved on test failure. Returns `None` when the env var is unset so the
-/// caller's default sink (per-node data-dir files, or `Stdio::null()`) is used
-/// and other tests are unaffected.
+/// When an explicit directory is supplied (or `X0X_TEST_LOG_DIR` is set),
+/// returns stdout/stderr handles that append to
+/// `{dir}/{name}.{suffix}.log`. That path lives outside the per-node temp
+/// data_dir, so logs survive daemon cleanup and remain available on failure.
+/// Returns `None` when neither source is configured, preserving every other
+/// test's existing sink.
 ///
 /// The daemon inherits `RUST_LOG` from this process, so set `RUST_LOG` (e.g.
 /// `x0x::crdt=debug,x0x::server=debug`) in the test environment to raise
 /// verbosity; the directive is honoured by the daemon's `init_logging`.
 fn test_log_stdio(name: &str, suffix: &str) -> Option<(Stdio, Stdio)> {
-    let dir = std::env::var("X0X_TEST_LOG_DIR").ok()?;
-    let dir = dir.trim();
-    if dir.is_empty() {
-        return None;
-    }
-    let _ = std::fs::create_dir_all(dir);
-    let base = std::path::Path::new(dir).join(format!("{name}.{suffix}"));
+    test_log_stdio_in(name, suffix, None)
+}
+
+fn test_log_stdio_in(
+    name: &str,
+    suffix: &str,
+    explicit_dir: Option<&std::path::Path>,
+) -> Option<(Stdio, Stdio)> {
+    let env_dir = std::env::var("X0X_TEST_LOG_DIR").ok();
+    let directory = match explicit_dir {
+        Some(directory) => directory.to_path_buf(),
+        None => {
+            let directory = env_dir?.trim().to_string();
+            if directory.is_empty() {
+                return None;
+            }
+            std::path::PathBuf::from(directory)
+        }
+    };
+    let _ = std::fs::create_dir_all(&directory);
+    let base = directory.join(format!("{name}.{suffix}"));
     let open = || {
         std::fs::OpenOptions::new()
             .create(true)
@@ -634,6 +674,27 @@ async fn start_instance(
     bind_port: u16,
     bootstrap: &str,
     extra_config: &str,
+) -> AgentInstance {
+    start_instance_with_options(
+        binary,
+        name,
+        api_port,
+        bind_port,
+        bootstrap,
+        extra_config,
+        StartOptions::default(),
+    )
+    .await
+}
+
+async fn start_instance_with_options(
+    binary: &PathBuf,
+    name: &str,
+    api_port: u16,
+    bind_port: u16,
+    bootstrap: &str,
+    extra_config: &str,
+    options: StartOptions<'_>,
 ) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
     let _ = std::fs::remove_dir_all(&config_dir);
@@ -669,7 +730,7 @@ async fn start_instance(
 
     // Test-only capture (see `test_log_stdio`); fall back to per-node data-dir
     // logs so the default behaviour is unchanged.
-    let (stdout, stderr) = match test_log_stdio(name, "start") {
+    let (stdout, stderr) = match test_log_stdio_in(name, "start", options.log_dir) {
         Some(pair) => pair,
         None => {
             let stdout_path = config_dir.join("daemon.stdout.log");
@@ -682,14 +743,19 @@ async fn start_instance(
         }
     };
 
-    let process = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--config")
         .arg(&config_path)
         .arg("--name")
         .arg(name)
         .arg("--no-hard-coded-bootstrap")
         .stdout(stdout)
-        .stderr(stderr)
+        .stderr(stderr);
+    if let Some(rust_log) = options.rust_log {
+        command.env("RUST_LOG", rust_log);
+    }
+    let process = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
 
