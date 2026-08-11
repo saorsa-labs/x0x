@@ -13,7 +13,11 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
-use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
+use saorsa_gossip_pubsub::{
+    InboundEagerPayloadRejection, InboundEagerPayloadValidation,
+    InboundEagerPayloadValidationStatsSnapshot, InboundEagerPayloadValidator, PlumtreePubSub,
+    PubSub,
+};
 use saorsa_gossip_types::{PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -105,6 +109,62 @@ const MSG_V2_PREFIX: &[u8] = b"x0x-msg-v2";
 
 /// Version byte for signed messages.
 const VERSION_V2: u8 = 0x02;
+
+/// Crypto-only validator installed at PlumTree's inbound EAGER admission gate.
+///
+/// This validates only x0x envelope format and ML-DSA authenticity. Contact,
+/// consent, revocation, and group policy deliberately remain in the delivery
+/// layer and cannot affect whether a cryptographically valid envelope is safe
+/// to propagate.
+#[derive(Debug, Clone, Copy)]
+pub struct X0xInboundEnvelopeValidator {
+    require_v2: bool,
+}
+
+impl X0xInboundEnvelopeValidator {
+    /// Create a validator. Signed production managers pass `true`; unsigned
+    /// test managers may pass `false` to retain legacy V1 behavior.
+    #[must_use]
+    pub const fn new(require_v2: bool) -> Self {
+        Self { require_v2 }
+    }
+
+    fn validate_with_hash(&self, payload: &[u8]) -> (InboundEagerPayloadValidation, blake3::Hash) {
+        let payload_hash = x0x_envelope_blake3(payload);
+        let decision = match decode_auto(Bytes::copy_from_slice(payload)) {
+            Err(_) => {
+                InboundEagerPayloadValidation::Reject(InboundEagerPayloadRejection::Malformed)
+            }
+            Ok(message) if message.sender.is_none() && self.require_v2 => {
+                InboundEagerPayloadValidation::Reject(InboundEagerPayloadRejection::Unsigned)
+            }
+            Ok(message) if message.sender.is_some() && !message.verified => {
+                InboundEagerPayloadValidation::Reject(
+                    InboundEagerPayloadRejection::AuthenticationFailed,
+                )
+            }
+            Ok(_) => InboundEagerPayloadValidation::Accept,
+        };
+        (decision, payload_hash)
+    }
+}
+
+impl InboundEagerPayloadValidator for X0xInboundEnvelopeValidator {
+    fn validate(&self, payload: &[u8]) -> InboundEagerPayloadValidation {
+        let (decision, payload_hash) = self.validate_with_hash(payload);
+        tracing::debug!(
+            payload_blake3 = %payload_hash,
+            payload_len = payload.len(),
+            validation = ?decision,
+            "Validated exact inbound x0x envelope bytes before PlumTree admission"
+        );
+        decision
+    }
+}
+
+fn x0x_envelope_blake3(payload: &[u8]) -> blake3::Hash {
+    blake3::hash(payload)
+}
 
 /// Signing context for message authentication.
 ///
@@ -340,8 +400,11 @@ impl PubSubManager {
                 NetworkError::NodeCreation(format!("failed to create PlumTree signing key: {e}"))
             })?;
 
+        let inbound_validator: Arc<dyn InboundEagerPayloadValidator> =
+            Arc::new(X0xInboundEnvelopeValidator::new(signing.is_some()));
         let plumtree_inner =
-            PlumtreePubSub::new(peer_id, Arc::clone(&network), plumtree_signing_key);
+            PlumtreePubSub::new(peer_id, Arc::clone(&network), plumtree_signing_key)
+                .with_inbound_eager_payload_validator(inbound_validator);
         let plumtree_inner = match oracle {
             Some(oracle) => plumtree_inner.with_health_oracle(oracle),
             None => plumtree_inner,
@@ -375,6 +438,11 @@ impl PubSubManager {
     /// phase of inbound PubSub handling owns dispatcher wall-clock time.
     pub fn stage_stats(&self) -> saorsa_gossip_pubsub::PubSubStageStatsSnapshot {
         self.plumtree.stage_stats()
+    }
+
+    /// Snapshot of the pre-admission x0x envelope validation quarantine.
+    pub fn inbound_validation_stats(&self) -> InboundEagerPayloadValidationStatsSnapshot {
+        self.plumtree.inbound_eager_payload_validation_stats()
     }
 
     /// Attach a contact store for trust-based message filtering.
@@ -637,6 +705,13 @@ impl PubSubManager {
             let encoded = encode_v1(&topic, &payload)?;
             (encoded, None)
         };
+
+        tracing::debug!(
+            payload_blake3 = %x0x_envelope_blake3(&encoded),
+            payload_len = encoded.len(),
+            topic = %topic,
+            "Publishing exact x0x envelope bytes to PlumTree"
+        );
 
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
@@ -1402,6 +1477,30 @@ mod tests {
         )
     }
 
+    fn outer_eager_message(
+        topic: TopicId,
+        msg_id: [u8; 32],
+        payload: Bytes,
+    ) -> saorsa_gossip_pubsub::GossipMessage {
+        let key = saorsa_gossip_identity::MlDsaKeyPair::generate().expect("outer keygen");
+        let header = saorsa_gossip_types::MessageHeader {
+            version: 1,
+            topic,
+            msg_id,
+            kind: saorsa_gossip_types::MessageKind::Eager,
+            hop: 0,
+            ttl: 10,
+        };
+        let header_bytes = postcard::to_stdvec(&header).expect("outer header encode");
+        let signature = key.sign(&header_bytes).expect("outer header sign");
+        saorsa_gossip_pubsub::GossipMessage {
+            header,
+            payload: Some(payload),
+            signature,
+            public_key: key.public_key().to_vec(),
+        }
+    }
+
     // -----------------------------------------------------------------------
     // V1 wire format tests
     // -----------------------------------------------------------------------
@@ -1809,6 +1908,99 @@ mod tests {
         assert!(decode_auto(Bytes::new()).is_err());
     }
 
+    #[test]
+    fn inbound_validator_accepts_valid_v2_and_hashes_exact_envelope_bytes() {
+        let encoded = valid_v2_buffer();
+        let publisher_hash = x0x_envelope_blake3(&encoded);
+        let validator = X0xInboundEnvelopeValidator::new(true);
+        let (decision, validator_hash) = validator.validate_with_hash(&encoded);
+
+        assert_eq!(decision, InboundEagerPayloadValidation::Accept);
+        assert_eq!(
+            publisher_hash, validator_hash,
+            "publish and validation logs must hash the identical V2 byte envelope"
+        );
+        assert_eq!(publisher_hash, blake3::hash(&encoded));
+    }
+
+    #[test]
+    fn inbound_validator_rejects_tampered_v2_signature_and_payload() {
+        let validator = X0xInboundEnvelopeValidator::new(true);
+        let original = valid_v2_buffer();
+
+        let mut signature_tampered = original.to_vec();
+        let public_key_len =
+            u16::from_be_bytes([signature_tampered[33], signature_tampered[34]]) as usize;
+        let signature_len_pos = 35 + public_key_len;
+        let signature_start = signature_len_pos + 2;
+        signature_tampered[signature_start] ^= 0x01;
+        assert_eq!(
+            validator.validate(&signature_tampered),
+            InboundEagerPayloadValidation::Reject(
+                InboundEagerPayloadRejection::AuthenticationFailed
+            )
+        );
+
+        let mut payload_tampered = original.to_vec();
+        let last = payload_tampered
+            .last_mut()
+            .expect("valid fixture has application payload bytes");
+        *last ^= 0x01;
+        assert_eq!(
+            validator.validate(&payload_tampered),
+            InboundEagerPayloadValidation::Reject(
+                InboundEagerPayloadRejection::AuthenticationFailed
+            )
+        );
+    }
+
+    #[test]
+    fn inbound_validator_classifies_truncated_v2_as_malformed() {
+        let validator = X0xInboundEnvelopeValidator::new(true);
+        assert_eq!(
+            validator.validate(&[VERSION_V2, 0, 1]),
+            InboundEagerPayloadValidation::Reject(InboundEagerPayloadRejection::Malformed)
+        );
+    }
+
+    #[test]
+    fn signed_manager_validator_rejects_v1_but_unsigned_test_validator_accepts_it() {
+        let v1 = encode_v1("legacy-test", &Bytes::from_static(b"payload")).expect("encode v1");
+        assert_eq!(
+            X0xInboundEnvelopeValidator::new(true).validate(&v1),
+            InboundEagerPayloadValidation::Reject(InboundEagerPayloadRejection::Unsigned)
+        );
+        assert_eq!(
+            X0xInboundEnvelopeValidator::new(false).validate(&v1),
+            InboundEagerPayloadValidation::Accept
+        );
+    }
+
+    #[tokio::test]
+    async fn inbound_crypto_validation_is_independent_of_contact_policy() {
+        let encoded = valid_v2_buffer();
+        let decoded = decode_auto(encoded.clone()).expect("valid V2 fixture");
+        let sender = decoded.sender.expect("V2 fixture has sender");
+        let validator = X0xInboundEnvelopeValidator::new(true);
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut blocked_contacts = ContactStore::new(dir.path().join("contacts.json"));
+        blocked_contacts.set_trust(&sender, TrustLevel::Blocked);
+        let blocked_contacts = Arc::new(RwLock::new(blocked_contacts));
+
+        assert_eq!(
+            validator.validate(&encoded),
+            InboundEagerPayloadValidation::Accept,
+            "authenticity admission must not consult contact consent"
+        );
+        assert!(
+            decode_for_delivery(encoded, Some(&blocked_contacts), None)
+                .await
+                .is_none(),
+            "the independent delivery-policy layer still blocks the sender"
+        );
+    }
+
     // -----------------------------------------------------------------------
     // Signing payload tests
     // -----------------------------------------------------------------------
@@ -1833,6 +2025,43 @@ mod tests {
     async fn test_pubsub_creation() {
         let node = test_node().await;
         let _manager = PubSubManager::new(node, None).expect("manager");
+    }
+
+    #[tokio::test]
+    async fn manager_construction_requires_v2_only_when_signing_context_exists() {
+        let topic = TopicId::from_entity(b"manager-validator-mode");
+        let v1 = encode_v1("manager-validator-mode", &Bytes::from_static(b"payload"))
+            .expect("encode v1");
+        let from = PeerId::new([91u8; 32]);
+
+        let signed_keypair = AgentKeypair::generate().expect("agent keygen");
+        let signed_manager = PubSubManager::new(
+            test_node().await,
+            Some(Arc::new(SigningContext::from_keypair(&signed_keypair))),
+        )
+        .expect("signed manager");
+        signed_manager
+            .plumtree
+            .handle_eager(
+                from,
+                topic,
+                outer_eager_message(topic, [92u8; 32], v1.clone()),
+            )
+            .await
+            .expect("unsigned inner payload is a handled drop");
+        assert_eq!(
+            signed_manager.inbound_validation_stats().rejected_unsigned,
+            1
+        );
+
+        let unsigned_manager =
+            PubSubManager::new(test_node().await, None).expect("unsigned test manager");
+        unsigned_manager
+            .plumtree
+            .handle_eager(from, topic, outer_eager_message(topic, [93u8; 32], v1))
+            .await
+            .expect("unsigned test manager accepts V1");
+        assert_eq!(unsigned_manager.inbound_validation_stats().accepted, 1);
     }
 
     #[tokio::test]

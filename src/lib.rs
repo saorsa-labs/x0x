@@ -195,6 +195,7 @@ pub mod cli;
 pub mod server;
 
 // Re-export key gossip types (including new pubsub components)
+pub use gossip::pubsub::X0xInboundEnvelopeValidator;
 pub use gossip::{
     GossipConfig, GossipRuntime, PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot,
     SigningContext, Subscription,
@@ -2625,6 +2626,18 @@ impl Agent {
         self.gossip_runtime
             .as_ref()
             .map(|rt| rt.pubsub().stage_stats())
+    }
+
+    /// Snapshot of pre-admission x0x envelope validation and quarantine.
+    ///
+    /// Returns `None` when the agent has no gossip runtime.
+    #[must_use]
+    pub fn gossip_inbound_validation_stats(
+        &self,
+    ) -> Option<saorsa_gossip_pubsub::InboundEagerPayloadValidationStatsSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().inbound_validation_stats())
     }
 
     /// Snapshot of ant-quic → gossip receive-pump diagnostics.
