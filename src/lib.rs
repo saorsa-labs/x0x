@@ -2498,6 +2498,8 @@ fn raw_dm_history_record(
         replace_key: None,
         thread_root: None,
         thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     })
 }
 
@@ -4965,6 +4967,8 @@ impl Agent {
             replace_key: None,
             thread_root: thread_meta.map(dm::DmThreadMeta::thread_root_hex),
             thread_parent: thread_meta.and_then(dm::DmThreadMeta::thread_parent_hex),
+            ingress_sender_agent: None,
+            logical_request_id: None,
         });
     }
 
@@ -5060,6 +5064,8 @@ impl Agent {
                         replace_key: None,
                         thread_root: thread_root.clone(),
                         thread_parent: thread_parent.clone(),
+                        ingress_sender_agent: None,
+                        logical_request_id: None,
                     })
                     .await
                     .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?;
@@ -5309,7 +5315,6 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
-                    None,
                 )
                 .await
             {
@@ -5396,7 +5401,6 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
-                        None,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -5518,7 +5522,6 @@ impl Agent {
                 &raw_frame,
                 Some(total_deadline),
                 prefer_newest_grace,
-                Some(prepared.request_id),
             )
             .await;
         match raw_result {
@@ -5761,15 +5764,9 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
-        raw_request_id: Option<[u8; 16]>,
     ) -> error::NetworkResult<dm::DmPath> {
-        let send = self.send_direct_raw_quic(
-            agent_id,
-            payload,
-            receive_ack_timeout,
-            prefer_newest_grace,
-            raw_request_id,
-        );
+        let send =
+            self.send_direct_raw_quic(agent_id, payload, receive_ack_timeout, prefer_newest_grace);
         let Some(deadline) = receive_ack_timeout else {
             return send.await;
         };
@@ -5818,7 +5815,6 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
-        raw_request_id: Option<[u8; 16]>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -6031,9 +6027,12 @@ impl Agent {
         // Send via network layer. Prefer receive-pipeline ACK when configured:
         // success then means the remote ant-quic reader drained the direct
         // message bytes, not merely that the local socket accepted them.
-        // One request id is reused by every same-send reissue so ant-quic's
-        // receiver dedupe prevents duplicate application admission.
-        let raw_ack_request_id = raw_request_id.unwrap_or_else(dm_send::fresh_request_id);
+        // The receive-ACK id identifies this transport attempt, not the
+        // authenticated logical DM carried inside `payload`. A fresh outer
+        // send of stable logical-id ciphertext must reach DmInbox so its exact
+        // durable binding can re-ACK it. Reissues within this one transport
+        // attempt still reuse the id so ant-quic dedupes ambiguous retries.
+        let raw_ack_request_id = dm_send::fresh_request_id();
         let mut send_result = if let Some(timeout) = receive_ack_timeout {
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
             tracing::debug!(

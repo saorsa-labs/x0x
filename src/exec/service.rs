@@ -2432,6 +2432,7 @@ mod tests {
     fn inbound_payload(verified: bool, trust_decision: Option<TrustDecision>) -> DmTypedPayload {
         DmTypedPayload {
             sender: AgentId([53; 32]),
+            request_id: [55; 16],
             machine_id: MachineId([54; 32]),
             payload: Vec::new(),
             verified,

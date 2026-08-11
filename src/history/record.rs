@@ -209,6 +209,15 @@ pub struct HistoryRecord {
     /// Canonical direct parent. Requires [`Self::thread_root`].
     #[serde(default)]
     pub thread_parent: Option<String>,
+    /// Authenticated outer transport sender for a durable typed ingress.
+    /// This is distinct from `author_agent`, which names the artifact author
+    /// and may legitimately differ when another member relays it.
+    #[serde(default)]
+    pub ingress_sender_agent: Option<String>,
+    /// Authenticated outer logical request id for durable typed ingress.
+    /// Legacy, locally-authored, and non-typed records leave this unset.
+    #[serde(default)]
+    pub logical_request_id: Option<[u8; 16]>,
 }
 
 impl HistoryRecord {
@@ -257,6 +266,11 @@ impl HistoryRecord {
     pub fn validate(&self) -> HistoryResult<()> {
         if self.payload.is_empty() {
             return Err(HistoryError::InvalidRecord("empty payload".into()));
+        }
+        if self.ingress_sender_agent.is_some() != self.logical_request_id.is_some() {
+            return Err(HistoryError::InvalidRecord(
+                "durable typed ingress sender and logical request id must be set together".into(),
+            ));
         }
         if self.signature.is_some() && self.signed_artifact.is_none() {
             return Err(HistoryError::InvalidRecord(

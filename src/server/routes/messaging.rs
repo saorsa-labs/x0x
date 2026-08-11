@@ -60,6 +60,8 @@ fn record_topic_message(
         replace_key: None,
         thread_root: None,
         thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     });
 }
 

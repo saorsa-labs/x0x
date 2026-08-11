@@ -18,7 +18,7 @@ use crate::error::{HistoryError, HistoryResult};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_LIMIT: usize = 500;
@@ -171,14 +171,44 @@ impl Store {
             .map_err(|e| HistoryError::Database(format!("begin failed: {e}")))?;
 
         let msg_id: &[u8] = &record.msg_id;
-        let dup: Option<i64> = tx
+        let dup: Option<(i64, Option<String>, Option<Vec<u8>>)> = tx
             .query_row(
-                "SELECT id FROM history WHERE msg_id = ?1",
+                "SELECT id, ingress_sender_agent, logical_request_id \
+                 FROM history WHERE msg_id = ?1",
                 rusqlite::params![msg_id],
-                |r| r.get(0),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .optional()?;
-        if dup.is_some() {
+        if let Some((id, stored_sender, stored_request_id)) = dup {
+            if let (Some(incoming_sender), Some(incoming_request_id)) = (
+                record.ingress_sender_agent.as_ref(),
+                record.logical_request_id.as_ref(),
+            ) {
+                match (stored_sender.as_deref(), stored_request_id.as_deref()) {
+                    (None, None) => {
+                        let updated = tx.execute(
+                            "UPDATE history SET ingress_sender_agent = ?1, logical_request_id = ?2 \
+                             WHERE id = ?3 AND ingress_sender_agent IS NULL \
+                             AND logical_request_id IS NULL",
+                            rusqlite::params![incoming_sender, incoming_request_id.as_slice(), id],
+                        )?;
+                        if updated != 1 {
+                            return Err(HistoryError::Database(
+                                "duplicate durable ingress binding update lost serialization"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    (Some(existing_sender), Some(existing_request_id))
+                        if existing_sender == incoming_sender
+                            && existing_request_id == incoming_request_id.as_slice() => {}
+                    _ => {
+                        return Err(HistoryError::InvalidRecord(
+                            "duplicate msg_id carries a conflicting durable ingress binding".into(),
+                        ));
+                    }
+                }
+            }
             tx.commit()?;
             return Ok(InsertOutcome::Duplicate);
         }
@@ -231,7 +261,7 @@ impl Store {
             "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
              author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
              signed_artifact, signature, sig_context, provenance, replace_key, \
-             thread_root, thread_parent \
+             thread_root, thread_parent, ingress_sender_agent, logical_request_id \
              FROM history",
         );
         let mut parts: Vec<String> = Vec::new();
@@ -253,7 +283,8 @@ impl Store {
         let sql = "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
                    author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
                    signed_artifact, signature, sig_context, provenance, replace_key, \
-                   thread_root, thread_parent FROM history WHERE msg_id = ?1 LIMIT 1";
+                   thread_root, thread_parent, ingress_sender_agent, logical_request_id \
+                   FROM history WHERE msg_id = ?1 LIMIT 1";
         let guard = lock_conn(&self.conn)?;
         let mut rows = collect_rows(
             &guard,
@@ -276,7 +307,8 @@ impl Store {
             "SELECT h.id, h.msg_id, h.scope_kind, h.scope_id, h.author_agent, \
              h.author_machine, h.author_pubkey, h.sent_at_ms, h.seen_at_ms, h.direction, \
              h.content_type, h.payload, h.signed_artifact, h.signature, h.sig_context, \
-             h.provenance, h.replace_key, h.thread_root, h.thread_parent FROM history h \
+             h.provenance, h.replace_key, h.thread_root, h.thread_parent, \
+             h.ingress_sender_agent, h.logical_request_id FROM history h \
              WHERE h.id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?)",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::from(fts)];
@@ -518,6 +550,8 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
     let replace_key: Option<String> = r.get(16)?;
     let thread_root: Option<String> = r.get(17)?;
     let thread_parent: Option<String> = r.get(18)?;
+    let ingress_sender_agent: Option<String> = r.get(19)?;
+    let logical_request_id_blob: Option<Vec<u8>> = r.get(20)?;
 
     let record = (|| -> HistoryResult<HistoryRecord> {
         let mut msg_id = [0u8; 32];
@@ -525,6 +559,18 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
             return Err(HistoryError::InvalidRecord("msg_id not 32 bytes".into()));
         }
         msg_id.copy_from_slice(&msg_id_blob);
+        let logical_request_id = logical_request_id_blob
+            .map(|blob| {
+                let mut request_id = [0_u8; 16];
+                if blob.len() != request_id.len() {
+                    return Err(HistoryError::InvalidRecord(
+                        "logical_request_id not 16 bytes".into(),
+                    ));
+                }
+                request_id.copy_from_slice(&blob);
+                Ok(request_id)
+            })
+            .transpose()?;
         Ok(HistoryRecord {
             msg_id,
             scope: Scope::from_columns(scope_kind, scope_id)?,
@@ -543,6 +589,8 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
             replace_key,
             thread_root,
             thread_parent,
+            ingress_sender_agent,
+            logical_request_id,
         })
     })();
     Ok((id, record))
@@ -555,8 +603,8 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
         "INSERT INTO history (msg_id, scope_kind, scope_id, author_agent, author_machine, \
          author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
          payload_text, signed_artifact, signature, sig_context, provenance, replace_key, \
-         thread_root, thread_parent) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
+         thread_root, thread_parent, ingress_sender_agent, logical_request_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21)",
         rusqlite::params![
             msg_id,
             record.scope.kind(),
@@ -577,6 +625,8 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
             record.replace_key,
             record.thread_root,
             record.thread_parent,
+            record.ingress_sender_agent,
+            record.logical_request_id.as_ref().map(<[u8; 16]>::as_slice),
         ],
     )
     .map_err(|e| HistoryError::Database(format!("insert failed: {e}")))?;
@@ -599,14 +649,20 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
                 rusqlite::params![1_i64],
             )?;
             migrate_v1_to_v2(conn)?;
-            migrate_v2_to_v3(conn)
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
         }
         Some(v) if v == SCHEMA_VERSION => Ok(()),
         Some(1) => {
             migrate_v1_to_v2(conn)?;
-            migrate_v2_to_v3(conn)
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
         }
-        Some(2) => migrate_v2_to_v3(conn),
+        Some(2) => {
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
+        }
+        Some(3) => migrate_v3_to_v4(conn),
         Some(v) if v < SCHEMA_VERSION => {
             // Future migrations chain here, bumping stored version each step.
             Err(HistoryError::Database(format!(
@@ -668,6 +724,22 @@ fn migrate_v2_to_v3(conn: &Connection) -> HistoryResult<()> {
     tx.execute_batch(
         "ALTER TABLE history ADD COLUMN thread_root TEXT; \
          ALTER TABLE history ADD COLUMN thread_parent TEXT;",
+    )?;
+    tx.execute(
+        "UPDATE schema_version SET version = ?1",
+        rusqlite::params![3_i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Schema v4 adds authenticated transport/logical-request binding for strict
+/// durable typed ingress. Existing rows remain intentionally unbound.
+fn migrate_v3_to_v4(conn: &Connection) -> HistoryResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE history ADD COLUMN ingress_sender_agent TEXT; \
+         ALTER TABLE history ADD COLUMN logical_request_id BLOB;",
     )?;
     tx.execute(
         "UPDATE schema_version SET version = ?1",
@@ -851,7 +923,54 @@ mod tests {
             replace_key: None,
             thread_root: None,
             thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
         }
+    }
+
+    #[test]
+    fn duplicate_exact_artifact_enriches_durable_ingress_binding() {
+        let (store, _dir) = open();
+        let original = rec(b"same signed artifact", Scope::Group("group-1".into()));
+        assert_eq!(store.insert(&original).unwrap(), InsertOutcome::Inserted);
+
+        let mut strict_retry = original.clone();
+        strict_retry.ingress_sender_agent = Some("ab".repeat(32));
+        strict_retry.logical_request_id = Some([0x31; 16]);
+        assert_eq!(
+            store.insert(&strict_retry).unwrap(),
+            InsertOutcome::Duplicate
+        );
+
+        let stored = store.get_by_msg_id(&original.msg_id).unwrap().unwrap();
+        assert_eq!(
+            stored.record.ingress_sender_agent,
+            strict_retry.ingress_sender_agent
+        );
+        assert_eq!(
+            stored.record.logical_request_id,
+            strict_retry.logical_request_id
+        );
+    }
+
+    #[test]
+    fn duplicate_artifact_rejects_conflicting_durable_ingress_binding() {
+        let (store, _dir) = open();
+        let mut original = rec(b"bound signed artifact", Scope::Group("group-1".into()));
+        original.ingress_sender_agent = Some("ab".repeat(32));
+        original.logical_request_id = Some([0x31; 16]);
+        assert_eq!(store.insert(&original).unwrap(), InsertOutcome::Inserted);
+
+        let mut conflict = original.clone();
+        conflict.logical_request_id = Some([0x32; 16]);
+        assert!(matches!(
+            store.insert(&conflict),
+            Err(HistoryError::InvalidRecord(message))
+                if message.contains("conflicting durable ingress binding")
+        ));
+
+        let stored = store.get_by_msg_id(&original.msg_id).unwrap().unwrap();
+        assert_eq!(stored.record.logical_request_id, Some([0x31; 16]));
     }
 
     /// ADR-0023 §3: rows re-verify offline from signed_artifact +

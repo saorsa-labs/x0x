@@ -6,8 +6,9 @@ use crate::contacts::ContactStore;
 use crate::direct::{DirectInboundMetadata, DirectMessaging};
 use crate::dm::{
     decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
-    DmEnvelope, DmOriginAttestation, DmPayload, DmThreadMeta, EnvelopeBuilder, InFlightAcks,
-    RecentDeliveryCache, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
+    DmDurableBindingDigest, DmEnvelope, DmOriginAttestation, DmPayload, DmThreadMeta,
+    EnvelopeBuilder, InFlightAcks, RecentDeliveryCache, DM_PROTOCOL_DURABLE_ACK,
+    DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
@@ -276,6 +277,9 @@ pub struct DmTypedPayloadRoute {
 #[derive(Debug)]
 pub struct DmTypedPayload {
     pub sender: AgentId,
+    /// Authenticated outer logical request id. Durable typed handlers persist
+    /// this separately from the artifact author for exact restart replay.
+    pub request_id: [u8; 16],
     pub machine_id: MachineId,
     pub payload: Vec<u8>,
     pub verified: bool,
@@ -1191,6 +1195,15 @@ impl InboxPipeline {
                     return;
                 }
             };
+        let durable_binding = DmDurableBindingDigest::accepted(
+            protocol_version,
+            &application_payload,
+            thread_meta.as_ref(),
+        );
+        let matches_typed_route = self
+            .typed_payload_routes
+            .iter()
+            .any(|route| application_payload.starts_with(&route.prefix));
 
         // Serialize every protocol generation for one logical request. This
         // prevents simultaneous v1/v2 or primary/legacy copies from each
@@ -1218,9 +1231,41 @@ impl InboxPipeline {
                     .await;
                 return;
             }
-            // A durable cache hit still requires the exact durable binding
-            // comparison below. It may be a same-request mutation rather than
-            // an exact retransmission.
+            if cached.outcome != DmAckOutcome::Accepted {
+                let _ = self
+                    .publish_ack(
+                        sender_agent_id,
+                        envelope.request_id,
+                        cached_ack_for_protocol(&cached, protocol_version),
+                        protocol_version,
+                        ack_route,
+                    )
+                    .await;
+                return;
+            }
+            if cached.protocol_version != protocol_version
+                || cached.durable_binding != Some(durable_binding)
+            {
+                tracing::warn!(
+                    request_id = %hex::encode(envelope.request_id),
+                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    cached_protocol_version = cached.protocol_version,
+                    protocol_version,
+                    typed = matches_typed_route,
+                    "durable replay-cache request binding mismatch; withholding ACK and app dispatch"
+                );
+                return;
+            }
+            let _ = self
+                .publish_ack(
+                    sender_agent_id,
+                    envelope.request_id,
+                    DmAckOutcome::Accepted,
+                    protocol_version,
+                    ack_route,
+                )
+                .await;
+            return;
         }
 
         // Atomic dedupe claim BEFORE delivery. The same envelope can arrive
@@ -1257,7 +1302,7 @@ impl InboxPipeline {
         // same stable request id. Consult durable history before app
         // dispatch so a timed-out envelope racing an explicit retry cannot
         // create a second row or a second live delivery after restart.
-        if durable_ack {
+        if durable_ack && !matches_typed_route {
             let Some(history) = self.history.as_ref() else {
                 tracing::warn!(
                     request_id = %hex::encode(envelope.request_id),
@@ -1279,22 +1324,11 @@ impl InboxPipeline {
             .await
             {
                 Ok(DurableLogicalRequestLookup::Exact) => {
-                    if let Some(cached) = self.cache.lookup(&envelope.dedupe_key()) {
-                        if cached.protocol_version != protocol_version
-                            || cached.outcome != DmAckOutcome::Accepted
-                        {
-                            tracing::error!(
-                                request_id = %hex::encode(envelope.request_id),
-                                cached_protocol_version = cached.protocol_version,
-                                protocol_version,
-                                "exact durable history binding conflicts with replay-cache completion; withholding ACK"
-                            );
-                            return;
-                        }
-                    } else if let Err(error) = self.cache.complete_durable(
+                    if let Err(error) = self.cache.complete_durable(
                         envelope.dedupe_key(),
                         DmAckOutcome::Accepted,
                         protocol_version,
+                        durable_binding,
                     ) {
                         tracing::error!(
                             request_id = %hex::encode(envelope.request_id),
@@ -1335,15 +1369,12 @@ impl InboxPipeline {
             }
         }
 
-        let matches_typed_route = self
-            .typed_payload_routes
-            .iter()
-            .any(|route| application_payload.starts_with(&route.prefix));
         if durable_ack && matches_typed_route {
             let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
             if !self
                 .route_typed_payload(
                     sender_agent_id,
+                    envelope.request_id,
                     sender_machine_id,
                     application_payload,
                     Some(decision),
@@ -1388,6 +1419,7 @@ impl InboxPipeline {
                 envelope.dedupe_key(),
                 DmAckOutcome::Accepted,
                 protocol_version,
+                durable_binding,
             ) {
                 tracing::error!(
                     request_id = %hex::encode(envelope.request_id),
@@ -1411,6 +1443,7 @@ impl InboxPipeline {
         let is_typed_payload = self
             .route_typed_payload(
                 sender_agent_id,
+                envelope.request_id,
                 sender_machine_id,
                 application_payload.clone(),
                 Some(decision),
@@ -1452,6 +1485,8 @@ impl InboxPipeline {
                                 thread_parent: thread_meta
                                     .as_ref()
                                     .and_then(DmThreadMeta::thread_parent_hex),
+                                ingress_sender_agent: None,
+                                logical_request_id: None,
                             }),
                             Err(e) => {
                                 tracing::debug!(
@@ -1526,6 +1561,7 @@ impl InboxPipeline {
                 envelope.dedupe_key(),
                 DmAckOutcome::Accepted,
                 protocol_version,
+                durable_binding,
             ) {
                 tracing::error!(
                     request_id = %hex::encode(envelope.request_id),
@@ -1550,6 +1586,7 @@ impl InboxPipeline {
     async fn route_typed_payload(
         &self,
         sender_agent_id: AgentId,
+        request_id: [u8; 16],
         sender_machine_id: MachineId,
         payload: Vec<u8>,
         trust_decision: Option<TrustDecision>,
@@ -1564,6 +1601,7 @@ impl InboxPipeline {
         };
         let typed = DmTypedPayload {
             sender: sender_agent_id,
+            request_id,
             machine_id: sender_machine_id,
             payload,
             verified: true,
@@ -2186,6 +2224,190 @@ mod tests {
         if let Some(service) = harness.history_service.take() {
             service.shutdown().await;
         }
+    }
+
+    #[tokio::test]
+    async fn durable_typed_lost_ack_exact_retry_reacks_without_handler_or_dm_history() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let (typed_tx, mut typed_rx) = mpsc::channel(4);
+        harness
+            .pipeline
+            .typed_payload_routes
+            .push(DmTypedPayloadRoute {
+                prefix: b"x0x-typed-v1\0".to_vec(),
+                sender: typed_tx,
+            });
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let first = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            0xD1,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"x0x-typed-v1\0exact artifact",
+            None,
+        );
+        let exact_retry = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            0xD1,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"x0x-typed-v1\0exact artifact",
+            None,
+        );
+        assert_ne!(
+            first.payload, exact_retry.payload,
+            "retry must use fresh ciphertext"
+        );
+
+        let initial_pipeline = harness.pipeline.clone();
+        let initial = tokio::spawn(async move {
+            initial_pipeline.handle_incoming(first, false).await;
+        });
+        let typed = tokio::time::timeout(Duration::from_secs(2), typed_rx.recv())
+            .await
+            .expect("typed handler receive timeout")
+            .expect("typed route closed");
+        assert_eq!(typed.request_id, [0xD1; 16]);
+        typed
+            .completion
+            .expect("strict typed completion")
+            .send(Ok(DmTypedPayloadCompletion::Inserted))
+            .expect("complete typed admission");
+        initial.await.expect("initial typed pipeline task");
+        expect_accepted_ack(&mut ack_jobs, [0xD1; 16], DM_PROTOCOL_DURABLE_ACK).await;
+
+        harness.pipeline.handle_incoming(exact_retry, false).await;
+        expect_accepted_ack(&mut ack_jobs, [0xD1; 16], DM_PROTOCOL_DURABLE_ACK).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), typed_rx.recv())
+                .await
+                .is_err(),
+            "exact durable retry must not invoke the typed handler twice"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness.pipeline.history.is_none(),
+            "typed ACK must not require DM history"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_typed_same_request_mutation_is_rejected_before_handler() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let (typed_tx, mut typed_rx) = mpsc::channel(4);
+        harness
+            .pipeline
+            .typed_payload_routes
+            .push(DmTypedPayloadRoute {
+                prefix: b"x0x-typed-v1\0".to_vec(),
+                sender: typed_tx,
+            });
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let first = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            0xD2,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"x0x-typed-v1\0accepted artifact",
+            None,
+        );
+        let mutation = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            0xD2,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"x0x-typed-v1\0mutated artifact",
+            None,
+        );
+
+        let initial_pipeline = harness.pipeline.clone();
+        let initial = tokio::spawn(async move {
+            initial_pipeline.handle_incoming(first, false).await;
+        });
+        let typed = tokio::time::timeout(Duration::from_secs(2), typed_rx.recv())
+            .await
+            .expect("typed handler receive timeout")
+            .expect("typed route closed");
+        typed
+            .completion
+            .expect("strict typed completion")
+            .send(Ok(DmTypedPayloadCompletion::Inserted))
+            .expect("complete typed admission");
+        initial.await.expect("initial typed pipeline task");
+        expect_accepted_ack(&mut ack_jobs, [0xD2; 16], DM_PROTOCOL_DURABLE_ACK).await;
+
+        harness.pipeline.handle_incoming(mutation, false).await;
+        assert_no_ack(&mut ack_jobs).await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), typed_rx.recv())
+                .await
+                .is_err(),
+            "same-request mutation reached the typed handler"
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    #[tokio::test]
+    async fn dropped_durable_typed_completion_leaves_exact_request_retryable() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let (typed_tx, mut typed_rx) = mpsc::channel(4);
+        harness
+            .pipeline
+            .typed_payload_routes
+            .push(DmTypedPayloadRoute {
+                prefix: b"x0x-typed-v1\0".to_vec(),
+                sender: typed_tx,
+            });
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let first = durable_attested_payload_message_with_binding(
+            &harness,
+            &sender,
+            &machine,
+            0xD3,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"x0x-typed-v1\0retry after cancellation",
+            None,
+        );
+        let retry = first.clone();
+
+        let failed_pipeline = harness.pipeline.clone();
+        let failed = tokio::spawn(async move {
+            failed_pipeline.handle_incoming(first, false).await;
+        });
+        let cancelled = tokio::time::timeout(Duration::from_secs(2), typed_rx.recv())
+            .await
+            .expect("typed handler receive timeout")
+            .expect("typed route closed");
+        drop(cancelled);
+        failed.await.expect("cancelled typed pipeline task");
+        assert_no_ack(&mut ack_jobs).await;
+
+        let retry_pipeline = harness.pipeline.clone();
+        let retried = tokio::spawn(async move {
+            retry_pipeline.handle_incoming(retry, false).await;
+        });
+        let typed = tokio::time::timeout(Duration::from_secs(2), typed_rx.recv())
+            .await
+            .expect("typed retry handler receive timeout")
+            .expect("typed route closed");
+        typed
+            .completion
+            .expect("strict typed retry completion")
+            .send(Ok(DmTypedPayloadCompletion::Duplicate))
+            .expect("complete typed retry admission");
+        retried.await.expect("retried typed pipeline task");
+        expect_accepted_ack(&mut ack_jobs, [0xD3; 16], DM_PROTOCOL_DURABLE_ACK).await;
+        assert_no_delivery(&mut harness.receiver).await;
     }
 
     #[tokio::test]

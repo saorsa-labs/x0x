@@ -25,6 +25,8 @@ fn record(payload: &[u8], scope: Scope, seen_at_ms: i64) -> HistoryRecord {
         replace_key: None,
         thread_root: None,
         thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     }
 }
 

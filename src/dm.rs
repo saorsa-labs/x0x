@@ -927,9 +927,9 @@ impl DedupeKey {
 
 /// Bounded, TTL-aware dedupe cache.
 ///
-/// Receivers consult this on every inbound envelope. A cache hit short-
-/// circuits all expensive work (signature, decrypt, policy, handler);
-/// the sender is re-ACKed with the cached outcome so retries terminate.
+/// Receivers consult this on every inbound envelope. Legacy cache hits can
+/// short-circuit authentication. Durable accepted hits are re-authenticated
+/// and decrypted, then re-ACKed only when their exact binding digest matches.
 pub struct RecentDeliveryCache {
     inner: Mutex<RecentDeliveryCacheInner>,
 }
@@ -947,6 +947,51 @@ struct RecentDeliveryCacheInner {
     delivery_lock_order: VecDeque<DedupeKey>,
 }
 
+/// Exact authenticated application binding for one completed durable request.
+///
+/// Sender and request id are carried by [`DedupeKey`]; the recipient is scoped
+/// by the per-inbox cache. This digest binds every remaining application-level
+/// input which must be identical before a durable completion may be replayed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmDurableBindingDigest([u8; 32]);
+
+impl DmDurableBindingDigest {
+    /// Bind the negotiated protocol, exact decrypted application bytes, and
+    /// canonical thread ancestry into one domain-separated digest.
+    #[must_use]
+    pub fn accepted(
+        protocol_version: u16,
+        application_payload: &[u8],
+        thread_meta: Option<&DmThreadMeta>,
+    ) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-dm-durable-accepted-binding-v1");
+        hasher.update(&protocol_version.to_be_bytes());
+        let payload_len = u64::try_from(application_payload.len()).unwrap_or(u64::MAX);
+        hasher.update(&payload_len.to_be_bytes());
+        hasher.update(application_payload);
+        match thread_meta {
+            Some(meta) => {
+                hasher.update(&[1]);
+                hasher.update(&meta.thread_root);
+                match meta.thread_parent {
+                    Some(parent) => {
+                        hasher.update(&[1]);
+                        hasher.update(&parent);
+                    }
+                    None => {
+                        hasher.update(&[0]);
+                    }
+                }
+            }
+            None => {
+                hasher.update(&[0]);
+            }
+        }
+        Self(*hasher.finalize().as_bytes())
+    }
+}
+
 /// A cached per-DM outcome.
 #[derive(Debug, Clone)]
 pub struct CachedOutcome {
@@ -955,6 +1000,9 @@ pub struct CachedOutcome {
     /// part of the logical dedupe key: changing protocol versions must never
     /// make one request dispatch twice.
     pub protocol_version: u16,
+    /// Exact accepted application binding for durable completions. Legacy and
+    /// policy-rejection entries do not have one.
+    pub durable_binding: Option<DmDurableBindingDigest>,
     pub first_seen: Instant,
 }
 
@@ -1057,6 +1105,7 @@ impl RecentDeliveryCache {
             CachedOutcome {
                 outcome,
                 protocol_version,
+                durable_binding: None,
                 first_seen: Instant::now(),
             },
         );
@@ -1083,6 +1132,7 @@ impl RecentDeliveryCache {
         key: DedupeKey,
         outcome: DmAckOutcome,
         protocol_version: u16,
+        durable_binding: DmDurableBindingDigest,
     ) -> std::result::Result<(), DurableCacheError> {
         let mut inner = self.inner.lock().map_err(|_| DurableCacheError::Poisoned)?;
         if inner.entries.contains_key(&key) {
@@ -1093,6 +1143,7 @@ impl RecentDeliveryCache {
             CachedOutcome {
                 outcome,
                 protocol_version,
+                durable_binding: Some(durable_binding),
                 first_seen: Instant::now(),
             },
         );
@@ -1956,7 +2007,12 @@ mod tests {
         let key = DedupeKey::new(dummy_agent_id(7), [0x77; 16]);
         cache.poison_for_testing();
         assert_eq!(
-            cache.complete_durable(key, DmAckOutcome::Accepted, DM_PROTOCOL_DURABLE_ACK,),
+            cache.complete_durable(
+                key,
+                DmAckOutcome::Accepted,
+                DM_PROTOCOL_DURABLE_ACK,
+                DmDurableBindingDigest::accepted(DM_PROTOCOL_DURABLE_ACK, b"payload", None),
+            ),
             Err(DurableCacheError::Poisoned)
         );
         assert!(cache.lookup(&key).is_none());
