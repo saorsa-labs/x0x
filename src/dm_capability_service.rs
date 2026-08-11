@@ -46,18 +46,18 @@ struct FleetCapabilityAdvertRequest {
 struct TargetedCapabilityAdvertRequest {
     protocol_version: u16,
     requested_agent_id: [u8; 32],
-    /// Makes every request attempt distinct independently of the outer
-    /// signature implementation and gives operators a stable trace token.
-    request_id: [u8; 16],
 }
+
+// There is deliberately no request nonce here. PubSub authenticates the
+// requester, while the responder emits its independently signed current-state
+// advert on `DM_CAPABILITY_TOPIC`; that advert is not a challenge response.
+// A nonce that is neither echoed nor bound into the accepted advert would add
+// bytes and security claims without providing replay protection.
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DecodedCapabilityAdvertRequest {
     Fleet,
-    Targeted {
-        requested_agent_id: AgentId,
-        request_id: [u8; 16],
-    },
+    Targeted { requested_agent_id: AgentId },
 }
 
 /// Decode a request according to its exact topic-owned wire contract.
@@ -81,7 +81,6 @@ pub(crate) fn decode_capability_advert_request(
             (request.protocol_version == TARGETED_REQUEST_PROTOCOL_VERSION).then_some(
                 DecodedCapabilityAdvertRequest::Targeted {
                     requested_agent_id: AgentId(request.requested_agent_id),
-                    request_id: request.request_id,
                 },
             )
         }
@@ -128,7 +127,6 @@ pub(crate) async fn publish_capability_advert_request(
             let request = TargetedCapabilityAdvertRequest {
                 protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
                 requested_agent_id: *requested_agent_id.as_bytes(),
-                request_id: crate::dm_send::fresh_request_id(),
             };
             let bytes = postcard::to_stdvec(&request).map_err(|error| {
                 NetworkError::SerializationError(format!(
@@ -151,7 +149,14 @@ pub(crate) async fn publish_capability_advert_request(
     };
     pubsub
         .publish(topic.to_string(), Bytes::from(request_bytes))
-        .await
+        .await?;
+    tracing::debug!(
+        target: "dm.trace",
+        stage = "capability_refresh_request_published",
+        kind = if requested_agent_id.is_some() { "targeted_v2" } else { "fleet_v1" },
+        recipient = requested_agent_id.map(|agent_id| hex::encode(agent_id.as_bytes())),
+    );
+    Ok(())
 }
 
 /// Verify and ingest one capability advert using the same checks as the live
@@ -254,7 +259,11 @@ impl CapabilityAdvertService {
             while let Some(message) = subscription.recv().await {
                 let sender = message.sender;
                 if ingest_verified_capability_advert(&store_sub, self_agent_for_sub, &message) {
-                    tracing::debug!(?sender, "cached verified capability advert");
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_advert_ingested",
+                        sender = sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
+                    );
                 }
             }
             tracing::debug!("capability advert subscriber exited");
@@ -290,15 +299,20 @@ impl CapabilityAdvertService {
                 {
                     continue;
                 }
-                let Some(DecodedCapabilityAdvertRequest::Targeted {
-                    requested_agent_id, ..
-                }) = decode_capability_advert_request(&message.topic, &message.payload)
+                let Some(DecodedCapabilityAdvertRequest::Targeted { requested_agent_id }) =
+                    decode_capability_advert_request(&message.topic, &message.payload)
                 else {
                     continue;
                 };
                 if requested_agent_id != self_agent_id {
                     continue;
                 }
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "capability_refresh_request_received",
+                    kind = "targeted_v2",
+                    requester = message.sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
+                );
                 let _ = targeted_reannounce_tx.try_send(ReannounceRequest::Targeted);
             }
             tracing::debug!("targeted capability advert request responder exited");
@@ -393,6 +407,11 @@ impl CapabilityAdvertService {
                             }
                             if pending_responses.targeted {
                                 last_targeted_response_at = Some(published_at);
+                                tracing::debug!(
+                                    target: "dm.trace",
+                                    stage = "capability_advert_response_published",
+                                    kind = "targeted_v2",
+                                );
                             }
                             pending_responses.clear();
                             tracing::debug!("capability advert published");
@@ -605,13 +624,17 @@ mod tests {
         );
 
         let target = AgentId([0xA7; 32]);
-        let request_id = [0xB8; 16];
         let targeted = TargetedCapabilityAdvertRequest {
             protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
             requested_agent_id: *target.as_bytes(),
-            request_id,
         };
         let targeted_bytes = postcard::to_stdvec(&targeted).expect("encode targeted request");
+        let mut expected_targeted_bytes = vec![2];
+        expected_targeted_bytes.extend_from_slice(target.as_bytes());
+        assert_eq!(
+            targeted_bytes, expected_targeted_bytes,
+            "targeted v2 carries only its wire version and exact recipient"
+        );
         // Postcard's old one-field decoder accepts trailing bytes. Topic
         // separation, not wishful decoder strictness, is therefore the wire
         // safety boundary that keeps old responders from amplifying this.
@@ -624,7 +647,6 @@ mod tests {
             decode_capability_advert_request(DM_CAPABILITY_TARGETED_REQUEST_TOPIC, &targeted_bytes,),
             Some(DecodedCapabilityAdvertRequest::Targeted {
                 requested_agent_id: target,
-                request_id,
             })
         );
     }

@@ -112,7 +112,6 @@ impl CapabilityAdvert {
 pub struct CapabilityStore {
     inner: Mutex<HashMap<[u8; 32], CachedAdvert>>,
     ttl: Duration,
-    change_tx: tokio::sync::watch::Sender<u64>,
 }
 
 struct CachedAdvert {
@@ -140,30 +139,19 @@ impl CapabilityStore {
     /// Construct an empty store with the default TTL.
     #[must_use]
     pub fn new() -> Self {
-        let (change_tx, _change_rx) = tokio::sync::watch::channel(0);
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
-            change_tx,
         }
     }
 
     /// Custom-TTL store (primarily for tests).
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
-        let (change_tx, _change_rx) = tokio::sync::watch::channel(0);
         Self {
             inner: Mutex::new(HashMap::new()),
             ttl,
-            change_tx,
         }
-    }
-
-    /// Subscribe to cache mutations. Strict-send convergence waiters use this
-    /// instead of independent polling loops; one verified advert wakes every
-    /// waiter that is checking the affected recipient.
-    pub(crate) fn subscribe_changes(&self) -> tokio::sync::watch::Receiver<u64> {
-        self.change_tx.subscribe()
     }
 
     /// Look up a peer's capability. Returns `None` if unknown or expired.
@@ -240,9 +228,6 @@ impl CapabilityStore {
                 created_at_unix_ms,
             },
         );
-        drop(inner);
-        self.change_tx
-            .send_modify(|generation| *generation = generation.wrapping_add(1));
     }
 
     /// Current cache size (diagnostic).

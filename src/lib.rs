@@ -318,11 +318,11 @@ pub struct Agent {
     /// Handle for the running capability advert service.
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
-    /// Last strict-send capability solicitation per recipient. Concurrent UI
-    /// actions targeting one agent coalesce, while independent agent sends do
-    /// not suppress one another.
-    last_capability_refresh_requests:
-        tokio::sync::Mutex<std::collections::HashMap<[u8; 32], tokio::time::Instant>>,
+    /// Hard-bounded per-recipient strict-capability refresh flights. One
+    /// detached, cancellation-safe worker owns the network solicitation and
+    /// convergence loop; all concurrent sends to that recipient share its
+    /// completion receiver.
+    capability_refreshes: std::sync::Arc<CapabilityRefreshRegistry>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
@@ -2095,6 +2095,7 @@ pub struct AgentBuilder {
     disable_peer_cache: bool,
     heartbeat_interval_secs: Option<u64>,
     identity_ttl_secs: Option<u64>,
+    capability_cache_ttl: Option<std::time::Duration>,
     presence_beacon_interval_secs: Option<u64>,
     presence_event_poll_interval_secs: Option<u64>,
     presence_offline_timeout_secs: Option<u64>,
@@ -2484,12 +2485,189 @@ fn raw_dm_history_record(
     })
 }
 
+const MAX_INFLIGHT_CAPABILITY_REFRESHES: usize = 256;
+const CAPABILITY_REFRESH_TARGETED_ONLY_WAIT: std::time::Duration =
+    std::time::Duration::from_secs(1);
+const CAPABILITY_REFRESH_CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+const CAPABILITY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityRefreshState {
+    Pending,
+    Finished,
+}
+
+#[derive(Debug)]
+struct CapabilityRefreshEntry {
+    flight_id: u64,
+    completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityRefreshRegistryState {
+    next_flight_id: u64,
+    inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
+}
+
+/// Bounded, recipient-keyed single-flight registry for strict capability
+/// discovery. The synchronous mutex is intentional: registration and Drop
+/// cleanup are tiny, non-awaiting operations, which lets an aborted worker
+/// remove its slot deterministically.
+#[derive(Debug, Default)]
+struct CapabilityRefreshRegistry {
+    state: std::sync::Mutex<CapabilityRefreshRegistryState>,
+}
+
+enum CapabilityRefreshRegistration {
+    Joined(tokio::sync::watch::Receiver<CapabilityRefreshState>),
+    Started {
+        completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
+        completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>,
+        guard: CapabilityRefreshGuard,
+    },
+    AtCapacity,
+}
+
+impl CapabilityRefreshRegistry {
+    fn register(
+        self: &std::sync::Arc<Self>,
+        recipient: identity::AgentId,
+    ) -> CapabilityRefreshRegistration {
+        let Ok(mut state) = self.state.lock() else {
+            return CapabilityRefreshRegistration::AtCapacity;
+        };
+        let recipient_key = *recipient.as_bytes();
+        if let Some(existing) = state.inflight.get(&recipient_key) {
+            return CapabilityRefreshRegistration::Joined(existing.completion.clone());
+        }
+        if state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
+            return CapabilityRefreshRegistration::AtCapacity;
+        }
+        state.next_flight_id = state.next_flight_id.wrapping_add(1);
+        let flight_id = state.next_flight_id;
+        let (completion_tx, completion) =
+            tokio::sync::watch::channel(CapabilityRefreshState::Pending);
+        state.inflight.insert(
+            recipient_key,
+            CapabilityRefreshEntry {
+                flight_id,
+                completion: completion.clone(),
+            },
+        );
+        CapabilityRefreshRegistration::Started {
+            completion,
+            completion_tx,
+            guard: CapabilityRefreshGuard {
+                registry: std::sync::Arc::clone(self),
+                recipient_key,
+                flight_id,
+            },
+        }
+    }
+
+    fn remove(&self, recipient_key: &[u8; 32], flight_id: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .inflight
+            .get(recipient_key)
+            .is_some_and(|entry| entry.flight_id == flight_id)
+        {
+            state.inflight.remove(recipient_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.inflight.len())
+            .unwrap_or_default()
+    }
+}
+
+struct CapabilityRefreshGuard {
+    registry: std::sync::Arc<CapabilityRefreshRegistry>,
+    recipient_key: [u8; 32],
+    flight_id: u64,
+}
+
+impl Drop for CapabilityRefreshGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.recipient_key, self.flight_id);
+    }
+}
+
 fn capability_binding_supports_durable_ack(
     binding: Option<&dm_capability::CapabilityBinding>,
 ) -> bool {
     binding.is_some_and(|binding| {
         binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
     })
+}
+
+async fn run_strict_capability_refresh(
+    recipient: identity::AgentId,
+    pubsub: std::sync::Arc<gossip::PubSubManager>,
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+) {
+    if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
+    {
+        return;
+    }
+
+    if let Err(error) =
+        dm_capability_service::publish_capability_advert_request(&pubsub, Some(recipient)).await
+    {
+        tracing::warn!(
+            target: "dm.trace",
+            recipient = %hex::encode(recipient.as_bytes()),
+            %error,
+            "targeted capability refresh publish failed"
+        );
+    }
+
+    let started_at = tokio::time::Instant::now();
+    let fallback_at = started_at + CAPABILITY_REFRESH_TARGETED_ONLY_WAIT;
+    let deadline = started_at + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+    let mut fallback_sent = false;
+    loop {
+        if capability_binding_supports_durable_ack(
+            capability_store.lookup_binding(&recipient).as_ref(),
+        ) {
+            return;
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return;
+        }
+        if !fallback_sent && now >= fallback_at {
+            if let Err(error) =
+                dm_capability_service::publish_capability_advert_request(&pubsub, None).await
+            {
+                tracing::warn!(
+                    target: "dm.trace",
+                    recipient = %hex::encode(recipient.as_bytes()),
+                    %error,
+                    "legacy fleet capability refresh fallback publish failed"
+                );
+            }
+            fallback_sent = true;
+            continue;
+        }
+        let next_poll = now + CAPABILITY_REFRESH_POLL_INTERVAL;
+        let next_wake = if fallback_sent {
+            std::cmp::min(next_poll, deadline)
+        } else {
+            std::cmp::min(next_poll, fallback_at)
+        };
+        tokio::select! {
+            () = tokio::time::sleep_until(next_wake) => {}
+            () = shutdown_token.cancelled() => return,
+        }
+    }
 }
 
 impl Agent {
@@ -2526,6 +2704,7 @@ impl Agent {
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
             identity_ttl_secs: None,
+            capability_cache_ttl: None,
             presence_beacon_interval_secs: None,
             presence_event_poll_interval_secs: None,
             presence_offline_timeout_secs: None,
@@ -4212,89 +4391,56 @@ impl Agent {
     /// remain unchanged, while a daemon whose startup-only solicitation was
     /// lost no longer stays wedged until the five-minute advert cadence.
     async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
-        const LOCAL_REQUEST_MIN_INTERVAL: std::time::Duration = std::time::Duration::from_secs(1);
-        const CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
-        const TARGETED_ONLY_WAIT: std::time::Duration = std::time::Duration::from_secs(1);
-
         let Some(runtime) = self.gossip_runtime.as_ref() else {
             return;
         };
-        // Subscribe before publishing so an immediate response cannot land in
-        // the cache between the request and waiter registration.
-        let mut changes = self.capability_store.subscribe_changes();
-        let should_publish = {
-            let now = tokio::time::Instant::now();
-            let mut last_requests = self.last_capability_refresh_requests.lock().await;
-            last_requests.retain(|_, last| now.duration_since(*last) < LOCAL_REQUEST_MIN_INTERVAL);
-            let recipient_key = *recipient.as_bytes();
-            let allowed = !last_requests.contains_key(&recipient_key);
-            if allowed {
-                last_requests.insert(recipient_key, now);
+        let (mut completion, started) = match self.capability_refreshes.register(recipient) {
+            CapabilityRefreshRegistration::Joined(completion) => (completion, false),
+            CapabilityRefreshRegistration::Started {
+                completion,
+                completion_tx,
+                guard,
+            } => {
+                let pubsub = std::sync::Arc::clone(runtime.pubsub());
+                let capability_store = std::sync::Arc::clone(&self.capability_store);
+                let shutdown_token = self.shutdown_token.clone();
+                tokio::spawn(async move {
+                    run_strict_capability_refresh(
+                        recipient,
+                        pubsub,
+                        capability_store,
+                        shutdown_token,
+                    )
+                    .await;
+                    completion_tx.send_replace(CapabilityRefreshState::Finished);
+                    drop(guard);
+                });
+                (completion, true)
             }
-            allowed
-        };
-
-        if should_publish {
-            if let Err(error) = dm_capability_service::publish_capability_advert_request(
-                runtime.pubsub(),
-                Some(recipient),
-            )
-            .await
-            {
+            CapabilityRefreshRegistration::AtCapacity => {
                 tracing::warn!(
                     target: "dm.trace",
                     recipient = %hex::encode(recipient.as_bytes()),
-                    %error,
-                    "targeted capability refresh publish failed"
+                    limit = MAX_INFLIGHT_CAPABILITY_REFRESHES,
+                    "strict capability refresh registry at capacity"
                 );
-            }
-        }
-
-        let deadline = tokio::time::Instant::now() + CONVERGENCE_WAIT;
-        let fallback_at = tokio::time::Instant::now() + TARGETED_ONLY_WAIT;
-        // Only the caller that won the per-recipient request slot publishes
-        // the compatibility fallback. Other concurrent waiters share the
-        // store notification and never amplify either request.
-        let mut fallback_sent = !should_publish;
-        loop {
-            let converged = self.capability_store.lookup_binding(&recipient);
-            let converged = capability_binding_supports_durable_ack(converged.as_ref());
-            if converged || tokio::time::Instant::now() >= deadline {
                 return;
             }
-            let next_deadline = if fallback_sent { deadline } else { fallback_at };
-            tokio::select! {
-                changed = changes.changed() => {
-                    if changed.is_err() {
-                        return;
-                    }
-                }
-                () = tokio::time::sleep_until(next_deadline) => {
-                    if next_deadline == deadline {
-                        return;
-                    }
-                    // Compatibility with the already-built v1 requester:
-                    // new peers get a full targeted-only window first. Only
-                    // when no signed advert converges do we emit the exact
-                    // legacy one-byte fleet request on its old topic.
-                    if let Err(error) =
-                        dm_capability_service::publish_capability_advert_request(
-                            runtime.pubsub(),
-                            None,
-                        )
-                        .await
-                    {
-                        tracing::warn!(
-                            target: "dm.trace",
-                            recipient = %hex::encode(recipient.as_bytes()),
-                            %error,
-                            "legacy fleet capability refresh fallback publish failed"
-                        );
-                    }
-                    fallback_sent = true;
-                }
-            }
+        };
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "capability_refresh_singleflight",
+            recipient = %hex::encode(recipient.as_bytes()),
+            role = if started { "started" } else { "joined" },
+        );
+        if *completion.borrow() == CapabilityRefreshState::Finished {
+            return;
         }
+        let _ = tokio::time::timeout(
+            CAPABILITY_REFRESH_CONVERGENCE_WAIT + std::time::Duration::from_secs(1),
+            completion.changed(),
+        )
+        .await;
     }
 
     async fn dm_peer_rtt_ms(&self, agent_id: &identity::AgentId) -> Option<u32> {
@@ -10682,6 +10828,17 @@ impl AgentBuilder {
         self
     }
 
+    /// Override the signed runtime capability cache TTL.
+    ///
+    /// The default remains [`dm_capability::ADVERT_CACHE_TTL_SECS`]. A short
+    /// TTL is useful for deterministic convergence tests and for deployments
+    /// that prefer more frequent proof of current durable-ACK readiness.
+    #[must_use]
+    pub fn with_capability_cache_ttl(mut self, ttl: std::time::Duration) -> Self {
+        self.capability_cache_ttl = Some(ttl.max(std::time::Duration::from_secs(1)));
+        self
+    }
+
     /// Override the presence beacon broadcast interval in seconds.
     #[must_use]
     pub fn with_presence_beacon_interval(mut self, secs: u64) -> Self {
@@ -11164,7 +11321,10 @@ impl AgentBuilder {
             observed_prefix_enabled,
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            capability_store: std::sync::Arc::new(match self.capability_cache_ttl {
+                Some(ttl) => dm_capability::CapabilityStore::with_ttl(ttl),
+                None => dm_capability::CapabilityStore::new(),
+            }),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
@@ -11172,9 +11332,7 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
-            last_capability_refresh_requests: tokio::sync::Mutex::new(
-                std::collections::HashMap::new(),
-            ),
+            capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             dm_inbox_service: tokio::sync::Mutex::new(None),
             revocation_set,
             identity_dir: self.identity_dir,
@@ -17535,15 +17693,25 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
     let decoded =
         dm_capability_service::decode_capability_advert_request(&request.topic, &request.payload)
             .expect("decode captured request");
-    let dm_capability_service::DecodedCapabilityAdvertRequest::Targeted {
-        requested_agent_id,
-        request_id,
-    } = decoded
+    let dm_capability_service::DecodedCapabilityAdvertRequest::Targeted { requested_agent_id } =
+        decoded
     else {
         panic!("strict miss published a fleet request");
     };
     assert_eq!(requested_agent_id, recipient);
-    assert_ne!(request_id, [0_u8; 16], "targeted request needs a nonce");
+    first_waiter.abort();
+    let first_result = first_waiter.await;
+    assert!(
+        first_result.is_err_and(|error| error.is_cancelled()),
+        "cancelling one caller must not cancel the shared refresh worker"
+    );
+    assert_eq!(agent.capability_refreshes.len(), 1);
+    let replacement_agent = std::sync::Arc::clone(&agent);
+    let replacement_waiter = tokio::spawn(async move {
+        replacement_agent
+            .refresh_strict_dm_capability(recipient)
+            .await;
+    });
     assert!(
         tokio::time::timeout(std::time::Duration::from_millis(150), request_sub.recv())
             .await
@@ -17616,14 +17784,15 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
         &remote_message,
     ));
 
-    tokio::time::timeout(std::time::Duration::from_secs(1), first_waiter)
-        .await
-        .expect("first waiter did not observe converged cache")
-        .expect("first waiter failed");
     tokio::time::timeout(std::time::Duration::from_secs(1), second_waiter)
         .await
         .expect("second waiter did not observe converged cache")
         .expect("second waiter failed");
+    tokio::time::timeout(std::time::Duration::from_secs(1), replacement_waiter)
+        .await
+        .expect("replacement waiter did not share converged flight")
+        .expect("replacement waiter failed");
+    assert_eq!(agent.capability_refreshes.len(), 0);
     let retry_binding = agent.capability_store.lookup_binding(&recipient);
     assert!(capability_binding_supports_durable_ack(
         retry_binding.as_ref()
@@ -17634,6 +17803,54 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
     );
 
     agent.shutdown().await;
+}
+
+#[test]
+fn capability_refresh_registry_is_hard_bounded_and_reuses_released_slots() {
+    let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
+    let mut guards = Vec::with_capacity(MAX_INFLIGHT_CAPABILITY_REFRESHES);
+    for index in 0..MAX_INFLIGHT_CAPABILITY_REFRESHES {
+        let mut bytes = [0_u8; 32];
+        bytes[..8].copy_from_slice(&(index as u64).to_le_bytes());
+        match registry.register(identity::AgentId(bytes)) {
+            CapabilityRefreshRegistration::Started { guard, .. } => guards.push(guard),
+            CapabilityRefreshRegistration::Joined(_)
+            | CapabilityRefreshRegistration::AtCapacity => {
+                panic!("unique recipient {index} must get a flight slot")
+            }
+        }
+    }
+    assert_eq!(registry.len(), MAX_INFLIGHT_CAPABILITY_REFRESHES);
+    assert!(matches!(
+        registry.register(identity::AgentId([0xFF; 32])),
+        CapabilityRefreshRegistration::AtCapacity
+    ));
+
+    guards.pop();
+    assert_eq!(registry.len(), MAX_INFLIGHT_CAPABILITY_REFRESHES - 1);
+    let replacement = registry.register(identity::AgentId([0xFF; 32]));
+    assert!(matches!(
+        replacement,
+        CapabilityRefreshRegistration::Started { .. }
+    ));
+}
+
+#[tokio::test]
+async fn capability_refresh_guard_cleans_slot_when_worker_is_aborted() {
+    let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
+    let registration = registry.register(identity::AgentId([0xAB; 32]));
+    let CapabilityRefreshRegistration::Started { guard, .. } = registration else {
+        panic!("first registration must start a flight");
+    };
+    let worker = tokio::spawn(async move {
+        let _guard = guard;
+        std::future::pending::<()>().await;
+    });
+    assert_eq!(registry.len(), 1);
+    worker.abort();
+    let result = worker.await;
+    assert!(result.is_err_and(|error| error.is_cancelled()));
+    assert_eq!(registry.len(), 0);
 }
 
 #[test]

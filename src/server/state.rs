@@ -293,6 +293,13 @@ pub struct DaemonConfig {
     #[serde(default = "default_identity_ttl")]
     pub(super) identity_ttl_secs: u64,
 
+    /// Override the signed runtime DM-capability cache TTL. Unset keeps the
+    /// library default (10 minutes); values are clamped to at least one second.
+    /// This is primarily an operational freshness knob and enables real-daemon
+    /// forced-miss convergence tests without a cache mutation backdoor.
+    #[serde(default)]
+    pub(super) dm_capability_cache_ttl_secs: Option<u64>,
+
     /// Optional path to a user keypair file for human identity.
     /// When set, the agent can announce with `include_user_identity: true`.
     #[serde(default)]
@@ -590,6 +597,7 @@ impl Default for DaemonConfig {
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             identity_ttl_secs: default_identity_ttl(),
+            dm_capability_cache_ttl_secs: None,
             user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),
             rendezvous_validity_ms: default_rendezvous_validity_ms(),
@@ -921,6 +929,16 @@ mod tests {
         let cfg: DaemonConfig =
             toml::from_str("network_id = 'x0x.testnet'").expect("network_id TOML parses");
         assert_eq!(cfg.network_id.as_deref(), Some("x0x.testnet"));
+    }
+
+    #[test]
+    fn dm_capability_cache_ttl_is_opt_in_and_toml_configurable() {
+        let default = DaemonConfig::default();
+        assert_eq!(default.dm_capability_cache_ttl_secs, None);
+
+        let configured: DaemonConfig = toml::from_str("dm_capability_cache_ttl_secs = 1")
+            .expect("capability cache TTL TOML parses");
+        assert_eq!(configured.dm_capability_cache_ttl_secs, Some(1));
     }
 
     // The two canonical messages enforced by `InstanceName::try_from`.
