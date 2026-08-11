@@ -904,8 +904,9 @@ async fn decode_for_delivery(
     // Drop signed messages with failed verification.
     if message.sender.is_some() && !message.verified {
         tracing::warn!(
-            "Dropping pubsub payload with invalid signature from sender {:?}",
-            message.sender
+            claimed_sender = ?message.sender,
+            authenticated = false,
+            "Dropping pubsub payload with invalid signature from an untrusted claimed identity"
         );
         return None;
     }
@@ -1245,8 +1246,9 @@ fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
 
     if !verified {
         tracing::warn!(
-            "ML-DSA-65 signature verification failed for sender {}",
-            agent_id
+            claimed_agent_id = %agent_id,
+            authenticated = false,
+            "ML-DSA-65 signature verification failed for an untrusted claimed identity"
         );
     }
 
