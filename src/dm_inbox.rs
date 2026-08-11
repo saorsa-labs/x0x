@@ -16,11 +16,16 @@ use crate::identity::{AgentId, MachineId, MachineKeypair};
 use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::JoinHandle;
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
+/// Upper bound for one ACK publication route. PubSub's per-peer fan-out is
+/// itself bounded at four seconds; the extra second lets normal completion
+/// accounting settle without allowing one wedged route to pin the serial DM
+/// inbox loop indefinitely.
+const ACK_PUBLISH_ROUTE_TIMEOUT: Duration = Duration::from_secs(5);
 
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
@@ -371,6 +376,7 @@ fn ack_requires_legacy_bus_hedge(protocol_version: u16, received_on_legacy_bus: 
 
 async fn publish_ack_routes<Primary, Legacy>(
     hedge_on_legacy_bus: bool,
+    route_timeout: Duration,
     primary: Primary,
     legacy: Legacy,
 ) -> NetworkResult<()>
@@ -379,17 +385,38 @@ where
     Legacy: std::future::Future<Output = NetworkResult<()>>,
 {
     if !hedge_on_legacy_bus {
-        return primary.await;
+        return publish_ack_route_with_timeout("targeted", route_timeout, primary).await;
     }
 
     // A targeted inbox publish can deliver remotely yet remain pending under
     // per-topic fan-out backpressure. Poll the compatibility-bus hedge at the
     // same time so a durable recipient does not commit and dispatch the DM
     // while the sender exhausts its complete ACK budget waiting on the reverse
-    // targeted topic. Await both rather than dropping the slower future as
-    // soon as one route finishes, preserving ownership of both PubSub calls.
-    let (primary, legacy) = tokio::join!(primary, legacy);
+    // targeted topic. Each independently-polled route has an explicit
+    // deadline: the successful hedge can reach the sender immediately, while
+    // a wedged sibling is cancelled at the deadline instead of pinning this
+    // serial inbox loop and blocking later DMs/ACKs forever.
+    let (primary, legacy) = tokio::join!(
+        publish_ack_route_with_timeout("targeted", route_timeout, primary),
+        publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
+    );
     primary.and(legacy)
+}
+
+async fn publish_ack_route_with_timeout<Route>(
+    route: &'static str,
+    route_timeout: Duration,
+    publish: Route,
+) -> NetworkResult<()>
+where
+    Route: std::future::Future<Output = NetworkResult<()>>,
+{
+    match tokio::time::timeout(route_timeout, publish).await {
+        Ok(result) => result,
+        Err(_) => Err(NetworkError::BroadcastError(format!(
+            "ACK {route} publish timed out after {route_timeout:?}"
+        ))),
+    }
 }
 
 impl InboxPipeline {
@@ -1013,7 +1040,7 @@ impl InboxPipeline {
             .pubsub
             .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded));
         let hedged = ack_requires_legacy_bus_hedge(protocol_version, ack_legacy_bus);
-        let result = publish_ack_routes(hedged, primary, legacy).await;
+        let result = publish_ack_routes(hedged, ACK_PUBLISH_ROUTE_TIMEOUT, primary, legacy).await;
         if let Err(error) = &result {
             self.dm.record_ack_publish_route_failed();
             tracing::warn!(
@@ -1091,7 +1118,7 @@ mod tests {
     use crate::history::{HistoryConfig, HistoryQuery, HistoryService};
     use crate::identity::{AgentKeypair, MachineKeypair};
     use crate::network::{NetworkConfig, NetworkNode};
-    use std::time::Duration;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn test_keypair() -> AgentKeypair {
         AgentKeypair::generate().expect("keygen")
@@ -1688,7 +1715,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_ack_bus_hedge_resolves_exact_waiter_while_targeted_publish_stalls() {
+    async fn durable_ack_bus_hedge_is_bounded_and_does_not_block_followup_dm() {
         assert!(!ack_requires_legacy_bus_hedge(
             crate::dm::DM_PROTOCOL_V1,
             false
@@ -1728,12 +1755,23 @@ mod tests {
             recipient,
             Some(machine),
         );
-        let targeted_started = Arc::new(tokio::sync::Notify::new());
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let targeted_started = Arc::new(AtomicBool::new(false));
+        let targeted_dropped = Arc::new(AtomicBool::new(false));
         let targeted_started_tx = Arc::clone(&targeted_started);
+        let targeted_dropped_tx = Arc::clone(&targeted_dropped);
         let legacy_inflight = Arc::clone(&inflight);
 
         let targeted = async move {
-            targeted_started_tx.notify_one();
+            let _drop_flag = DropFlag(targeted_dropped_tx);
+            targeted_started_tx.store(true, Ordering::SeqCst);
             std::future::pending::<NetworkResult<()>>().await
         };
         let legacy = async move {
@@ -1746,18 +1784,29 @@ mod tests {
             ));
             Ok(())
         };
-        let publish_task = tokio::spawn(async move {
+        let publish_result = tokio::time::timeout(Duration::from_secs(1), async move {
             publish_ack_routes(
                 ack_requires_legacy_bus_hedge(DM_PROTOCOL_DURABLE_ACK, false),
+                Duration::from_millis(50),
                 targeted,
                 legacy,
             )
             .await
-        });
-
-        tokio::time::timeout(Duration::from_secs(1), targeted_started.notified())
-            .await
-            .expect("targeted ACK publish was not polled");
+        })
+        .await
+        .expect("hedged ACK publisher remained head-of-line blocked");
+        assert!(
+            publish_result.is_err(),
+            "the stalled targeted route must report its bounded timeout"
+        );
+        assert!(
+            targeted_started.load(Ordering::SeqCst),
+            "targeted ACK publish was not polled concurrently"
+        );
+        assert!(
+            targeted_dropped.load(Ordering::SeqCst),
+            "timed-out targeted ACK publish was not cancelled"
+        );
         assert_eq!(
             tokio::time::timeout(Duration::from_secs(1), receipt)
                 .await
@@ -1766,12 +1815,6 @@ mod tests {
             DmAckOutcome::Accepted
         );
         assert_eq!(inflight.outstanding(), 0);
-        assert!(
-            !publish_task.is_finished(),
-            "stalled targeted publish should remain owned while the hedge resolves the sender"
-        );
-        publish_task.abort();
-        let _ = publish_task.await;
 
         // The sender can retry the same logical envelope before observing the
         // hedge. Stable request_id replay must re-ACK from the completion cache
@@ -1796,6 +1839,40 @@ mod tests {
                 .written_total
                 .load(std::sync::atomic::Ordering::Relaxed),
             1
+        );
+
+        // This is the same serial processing order as the subscription loop:
+        // the next distinct envelope cannot enter `handle_incoming` until the
+        // previous ACK publication returns. Its delivery proves the bounded
+        // cancellation above prevents a stalled route from causing HoL.
+        let followup = durable_attested_payload_message(&harness, &sender, &sender_machine, 0xC2);
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            harness.pipeline.handle_incoming(followup, false),
+        )
+        .await
+        .expect("follow-up DM remained head-of-line blocked");
+        let followup_delivered =
+            tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("follow-up durable app dispatch timed out")
+                .expect("direct-message receiver closed");
+        assert_eq!(followup_delivered.payload, b"security regression payload");
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query follow-up durable history")
+                .len(),
+            2,
+            "the original logical request and the distinct follow-up each need one row"
+        );
+        assert_eq!(
+            history
+                .counters()
+                .written_total
+                .load(std::sync::atomic::Ordering::Relaxed),
+            2
         );
 
         if let Some(service) = harness.history_service.take() {
