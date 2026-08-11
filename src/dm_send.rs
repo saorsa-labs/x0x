@@ -1,8 +1,9 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmLogicalId, DmPath, DmReceipt,
+    DmSendConfig, DmThreadMeta, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK,
+    DM_PROTOCOL_THREADED, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -34,6 +35,13 @@ pub struct DmLifecycleHint {
 pub const DEFAULT_ENVELOPE_LIFETIME_MS: u64 = 120_000;
 const PUBLISH_ONLY_REDUNDANT_REPUBLISH_DELAY: Duration = Duration::from_millis(250);
 const ACK_LEGACY_BUS_FALLBACK_DELAY: Duration = Duration::from_millis(250);
+const THREADED_PAYLOAD_MAGIC: &[u8; 16] = b"x0x-dm-thread-v1";
+
+#[derive(serde::Serialize, serde::Deserialize)]
+struct ThreadedDmPayload {
+    payload: Vec<u8>,
+    thread_meta: DmThreadMeta,
+}
 
 /// Stable per-sender context for [`send_via_gossip`].
 ///
@@ -55,29 +63,83 @@ pub struct DmSendContext<'a> {
     pub machine_keypair: &'a MachineKeypair,
     /// Shared in-flight ACK registry.
     pub inflight: Arc<InFlightAcks>,
+    /// Absolute expiry for a strict logical send, computed before discovery
+    /// and transport work so anti-entropy cannot outlive the caller deadline.
+    pub expires_at_unix_ms: Option<u64>,
+    /// Negotiated v3 thread metadata. `None` keeps plaintext application
+    /// bytes byte-identical for v1/v2 and unthreaded recipients.
+    pub thread_meta: Option<&'a DmThreadMeta>,
+    /// Explicit caller idempotency key. Omission retains a random request id.
+    pub logical_id: Option<&'a DmLogicalId>,
 }
 
-pub async fn send_via_gossip(
-    ctx: DmSendContext<'_>,
+#[derive(Debug, Clone)]
+pub(crate) struct PreparedDmEnvelope {
+    pub(crate) request_id: [u8; 16],
+    pub(crate) protocol_version: u16,
+    pub(crate) wire: Vec<u8>,
+}
+
+pub(crate) struct DmAckWaiter {
+    rx: tokio::sync::oneshot::Receiver<DmAckOutcome>,
+    guard: InFlightGuard,
+}
+
+impl DmAckWaiter {
+    pub(crate) fn register(
+        inflight: Arc<InFlightAcks>,
+        prepared: &PreparedDmEnvelope,
+        recipient_agent_id: AgentId,
+        recipient_machine_id: Option<MachineId>,
+    ) -> Self {
+        let rx = inflight.register_for_protocol(
+            prepared.request_id,
+            prepared.protocol_version,
+            recipient_agent_id,
+            recipient_machine_id,
+        );
+        let guard = InFlightGuard::new(inflight, prepared.request_id);
+        Self { rx, guard }
+    }
+
+    pub(crate) async fn wait_for_raw_ack(
+        &mut self,
+        timeout: Duration,
+    ) -> Result<Option<DmAckOutcome>, DmError> {
+        match tokio::time::timeout(timeout, &mut self.rx).await {
+            Ok(Ok(outcome)) => Ok(Some(outcome)),
+            Ok(Err(_)) => Err(DmError::PublishFailed(
+                "in-flight ACK registry replaced our raw waiter".to_string(),
+            )),
+            Err(_) => Ok(None),
+        }
+    }
+
+    pub(crate) fn finish_raw(
+        mut self,
+        outcome: DmAckOutcome,
+        request_id: [u8; 16],
+    ) -> Result<DmReceipt, DmError> {
+        self.guard.mark_resolved();
+        ack_outcome_to_receipt_for_path(outcome, request_id, 0, DmPath::RawQuicAcked)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_dm_envelope(
+    signing: &SigningContext,
+    self_agent_id: AgentId,
+    self_machine_id: MachineId,
+    machine_keypair: &MachineKeypair,
     recipient_agent_id: AgentId,
-    recipient_machine_id: Option<MachineId>,
     recipient_kem_public_key: &[u8],
     payload: Vec<u8>,
-    config: &DmSendConfig,
-    lifecycle_hint: Option<DmLifecycleHint>,
-) -> Result<DmReceipt, DmError> {
-    let DmSendContext {
-        pubsub,
-        signing,
-        self_agent_id,
-        self_machine_id,
-        machine_keypair,
-        inflight,
-    } = ctx;
+    protocol_version: u16,
+    expires_at_unix_ms: Option<u64>,
+    thread_meta: Option<&DmThreadMeta>,
+    logical_id: Option<&DmLogicalId>,
+) -> Result<PreparedDmEnvelope, DmError> {
     if payload.len() > MAX_PAYLOAD_BYTES {
-        // 413-class rejection, not `EnvelopeConstruction`: the API layer must
-        // be able to distinguish an oversized payload from a crypto/build
-        // failure (issue #188).
         return Err(DmError::PayloadTooLarge {
             len: payload.len(),
             max: MAX_PAYLOAD_BYTES,
@@ -88,15 +150,18 @@ pub async fn send_via_gossip(
             "recipient has no published KEM public key".to_string(),
         ));
     }
-
-    let request_id = fresh_request_id();
-
+    let request_id = request_id_for_logical(self_agent_id, recipient_agent_id, logical_id);
+    let payload = encode_application_payload(payload, protocol_version, thread_meta)?;
     let created = now_unix_ms();
-    let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
-    let protocol_version = if config.require_durable_app_ack {
-        DM_PROTOCOL_DURABLE_ACK
-    } else {
-        DM_PROTOCOL_V1
+    let expires = match expires_at_unix_ms {
+        Some(expires) if expires > created => expires,
+        Some(_) => {
+            return Err(DmError::Timeout {
+                retries: 0,
+                elapsed: Duration::ZERO,
+            });
+        }
+        None => created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS),
     };
     let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
         protocol_version,
@@ -109,9 +174,85 @@ pub async fn send_via_gossip(
         created,
         expires,
         payload,
-        |bytes| signing.sign(bytes).map_err(|e| e.to_string()),
+        |bytes| signing.sign(bytes).map_err(|error| error.to_string()),
     )?;
-    let wire = envelope.to_wire_bytes().map_err(map_identity_err)?;
+    Ok(PreparedDmEnvelope {
+        request_id,
+        protocol_version,
+        wire: envelope.to_wire_bytes().map_err(map_identity_err)?,
+    })
+}
+
+pub async fn send_via_gossip(
+    ctx: DmSendContext<'_>,
+    recipient_agent_id: AgentId,
+    recipient_machine_id: Option<MachineId>,
+    recipient_kem_public_key: &[u8],
+    payload: Vec<u8>,
+    config: &DmSendConfig,
+    lifecycle_hint: Option<DmLifecycleHint>,
+) -> Result<DmReceipt, DmError> {
+    let protocol_version = if ctx.thread_meta.is_some() {
+        DM_PROTOCOL_THREADED
+    } else if config.require_durable_app_ack {
+        DM_PROTOCOL_DURABLE_ACK
+    } else {
+        DM_PROTOCOL_V1
+    };
+    let prepared = prepare_dm_envelope(
+        ctx.signing,
+        ctx.self_agent_id,
+        ctx.self_machine_id,
+        ctx.machine_keypair,
+        recipient_agent_id,
+        recipient_kem_public_key,
+        payload,
+        protocol_version,
+        ctx.expires_at_unix_ms,
+        ctx.thread_meta,
+        ctx.logical_id,
+    )?;
+    let waiter = DmAckWaiter::register(
+        Arc::clone(&ctx.inflight),
+        &prepared,
+        recipient_agent_id,
+        recipient_machine_id,
+    );
+    send_prepared_via_gossip(
+        ctx,
+        recipient_agent_id,
+        prepared,
+        config,
+        lifecycle_hint,
+        waiter,
+    )
+    .await
+}
+
+pub(crate) async fn send_prepared_via_gossip(
+    ctx: DmSendContext<'_>,
+    recipient_agent_id: AgentId,
+    prepared: PreparedDmEnvelope,
+    config: &DmSendConfig,
+    lifecycle_hint: Option<DmLifecycleHint>,
+    waiter: DmAckWaiter,
+) -> Result<DmReceipt, DmError> {
+    let DmSendContext {
+        pubsub,
+        signing: _,
+        self_agent_id: _,
+        self_machine_id: _,
+        machine_keypair: _,
+        inflight: _,
+        expires_at_unix_ms: _,
+        thread_meta: _,
+        logical_id: _,
+    } = ctx;
+    let PreparedDmEnvelope {
+        request_id,
+        protocol_version: _,
+        wire,
+    } = prepared;
     let topic = DmInboxService::inbox_topic_name(&recipient_agent_id);
     let topic_id = dm_inbox_topic(&recipient_agent_id);
 
@@ -131,13 +272,7 @@ pub async fn send_via_gossip(
         bytes = wire.len(),
     );
 
-    let mut rx = inflight.register_for_protocol(
-        request_id,
-        protocol_version,
-        recipient_agent_id,
-        recipient_machine_id,
-    );
-    let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
+    let DmAckWaiter { mut rx, mut guard } = waiter;
 
     // X0X-0041: split the lifecycle hint into the per-peer match key and the
     // mutable receiver so we can both filter events and short-circuit the
@@ -474,12 +609,21 @@ fn ack_outcome_to_receipt(
     request_id: [u8; 16],
     retries_used: u8,
 ) -> Result<DmReceipt, DmError> {
+    ack_outcome_to_receipt_for_path(outcome, request_id, retries_used, DmPath::GossipInbox)
+}
+
+fn ack_outcome_to_receipt_for_path(
+    outcome: DmAckOutcome,
+    request_id: [u8; 16],
+    retries_used: u8,
+    path: DmPath,
+) -> Result<DmReceipt, DmError> {
     match outcome {
         DmAckOutcome::Accepted => Ok(DmReceipt {
             request_id,
             accepted_at: Instant::now(),
             retries_used,
-            path: DmPath::GossipInbox,
+            path,
         }),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
         DmAckOutcome::AckSemanticsUnavailable { reason } => {
@@ -510,6 +654,80 @@ pub(crate) fn fresh_request_id() -> [u8; 16] {
     let mut rid = [0u8; 16];
     rand::thread_rng().fill_bytes(&mut rid);
     rid
+}
+
+pub(crate) fn encode_application_payload(
+    payload: Vec<u8>,
+    protocol_version: u16,
+    thread_meta: Option<&DmThreadMeta>,
+) -> Result<Vec<u8>, DmError> {
+    let Some(thread_meta) = thread_meta else {
+        return Ok(payload);
+    };
+    if protocol_version < DM_PROTOCOL_THREADED {
+        return Err(DmError::AckSemanticsUnavailable(
+            "recipient did not negotiate direct-message thread metadata".to_string(),
+        ));
+    }
+    let encoded = postcard::to_stdvec(&ThreadedDmPayload {
+        payload,
+        thread_meta: thread_meta.clone(),
+    })
+    .map_err(|error| DmError::EnvelopeConstruction(format!("threaded DM payload: {error}")))?;
+    let mut framed = Vec::with_capacity(THREADED_PAYLOAD_MAGIC.len() + encoded.len());
+    framed.extend_from_slice(THREADED_PAYLOAD_MAGIC);
+    framed.extend_from_slice(&encoded);
+    if framed.len() > MAX_PAYLOAD_BYTES {
+        return Err(DmError::PayloadTooLarge {
+            len: framed.len(),
+            max: MAX_PAYLOAD_BYTES,
+        });
+    }
+    Ok(framed)
+}
+
+pub(crate) fn decode_application_payload(
+    protocol_version: u16,
+    payload: Vec<u8>,
+) -> Result<(Vec<u8>, Option<DmThreadMeta>), DmError> {
+    if protocol_version < DM_PROTOCOL_THREADED {
+        return Ok((payload, None));
+    }
+    let encoded = payload
+        .strip_prefix(THREADED_PAYLOAD_MAGIC)
+        .ok_or_else(|| {
+            DmError::EnvelopeConstruction("v3 DM is missing its thread payload wrapper".to_string())
+        })?;
+    let threaded: ThreadedDmPayload = postcard::from_bytes(encoded).map_err(|error| {
+        DmError::EnvelopeConstruction(format!("threaded DM payload decode: {error}"))
+    })?;
+    Ok((threaded.payload, Some(threaded.thread_meta)))
+}
+
+/// Scope an explicit caller idempotency key to this authenticated sender and
+/// recipient. x0x never infers identity by parsing opaque application bytes.
+fn logical_request_id(
+    sender: AgentId,
+    recipient: AgentId,
+    logical_id: Option<&DmLogicalId>,
+) -> Option<[u8; 16]> {
+    let logical_id = logical_id?;
+    let mut hasher = blake3::Hasher::new_derive_key("x0x dm logical request id v1");
+    hasher.update(sender.as_bytes());
+    hasher.update(recipient.as_bytes());
+    hasher.update(logical_id.as_str().as_bytes());
+    let digest = hasher.finalize();
+    let mut request_id = [0_u8; 16];
+    request_id.copy_from_slice(&digest.as_bytes()[..16]);
+    Some(request_id)
+}
+
+pub(crate) fn request_id_for_logical(
+    sender: AgentId,
+    recipient: AgentId,
+    logical_id: Option<&DmLogicalId>,
+) -> [u8; 16] {
+    logical_request_id(sender, recipient, logical_id).unwrap_or_else(fresh_request_id)
 }
 
 fn map_identity_err(e: IdentityError) -> DmError {
@@ -793,6 +1011,67 @@ mod tests {
         assert_ne!(id1, id2, "two request IDs should be different");
         assert_eq!(id1.len(), 16);
         assert_eq!(id2.len(), 16);
+    }
+
+    #[test]
+    fn explicit_logical_id_is_stable_and_conversation_scoped() {
+        let sender = AgentId([0x11; 32]);
+        let recipient = AgentId([0x22; 32]);
+        let logical_id = DmLogicalId::parse("retry-123").expect("logical id");
+
+        assert_eq!(
+            logical_request_id(sender, recipient, Some(&logical_id)),
+            logical_request_id(sender, recipient, Some(&logical_id)),
+            "the explicit logical id must be stable across fresh envelopes"
+        );
+        assert_ne!(
+            logical_request_id(sender, recipient, Some(&logical_id)),
+            logical_request_id(sender, AgentId([0x23; 32]), Some(&logical_id)),
+            "the same logical id in another conversation must remain independent"
+        );
+    }
+
+    #[test]
+    fn omitted_logical_id_keeps_random_id_contract() {
+        assert_eq!(
+            logical_request_id(AgentId([0x31; 32]), AgentId([0x32; 32]), None,),
+            None
+        );
+    }
+
+    #[test]
+    fn negotiated_v3_thread_wrapper_roundtrips_exact_application_payload() {
+        let thread = DmThreadMeta::from_hex(Some(&"ab".repeat(32)), Some(&"cd".repeat(32)))
+            .expect("valid thread")
+            .expect("thread present");
+        let original = b"exact legacy-visible bytes".to_vec();
+        let wrapped =
+            encode_application_payload(original.clone(), DM_PROTOCOL_THREADED, Some(&thread))
+                .expect("encode threaded payload");
+        assert_ne!(wrapped, original);
+        let (decoded, decoded_thread) =
+            decode_application_payload(DM_PROTOCOL_THREADED, wrapped).expect("decode wrapper");
+        assert_eq!(decoded, original);
+        assert_eq!(decoded_thread, Some(thread));
+    }
+
+    #[test]
+    fn legacy_protocol_keeps_exact_bytes_and_never_accepts_thread_wrapper() {
+        let original = b"legacy app payload".to_vec();
+        assert_eq!(
+            encode_application_payload(original.clone(), DM_PROTOCOL_DURABLE_ACK, None)
+                .expect("legacy exact payload"),
+            original
+        );
+        let thread = DmThreadMeta::from_hex(Some(&"ab".repeat(32)), None)
+            .expect("valid root")
+            .expect("thread present");
+        assert!(encode_application_payload(
+            b"must not wrap".to_vec(),
+            DM_PROTOCOL_DURABLE_ACK,
+            Some(&thread),
+        )
+        .is_err());
     }
 
     #[test]

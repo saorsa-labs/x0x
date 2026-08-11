@@ -2437,6 +2437,7 @@ mod tests {
             verified,
             trust_decision,
             received_at_unix_ms: 1,
+            completion: None,
         }
     }
 

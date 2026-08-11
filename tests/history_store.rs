@@ -23,6 +23,8 @@ fn record(payload: &[u8], scope: Scope, seen_at_ms: i64) -> HistoryRecord {
         sig_context: None,
         provenance: Provenance::LocalAppDecrypt,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
     }
 }
 

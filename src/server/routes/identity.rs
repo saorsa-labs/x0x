@@ -748,6 +748,8 @@ pub(in crate::server) async fn import_agent_card(
                 sig_context: None,
                 provenance,
                 replace_key: Some(format!("agent-card:{}", card.agent_id)),
+                thread_root: None,
+                thread_parent: None,
             });
         }
     }

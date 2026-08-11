@@ -207,6 +207,16 @@ pub use direct::{DirectMessage, DirectMessageReceiver, DirectMessaging};
 // Import Membership trait for HyParView join() method
 use saorsa_gossip_membership::Membership as _;
 
+struct DurableRawPreference<'a> {
+    recipient_machine_id: Option<identity::MachineId>,
+    recipient_kem_public_key: &'a [u8],
+    config: &'a dm::DmSendConfig,
+    prefer_newest_grace: std::time::Duration,
+    expires_at_unix_ms: Option<u64>,
+    thread_meta: Option<&'a dm::DmThreadMeta>,
+    logical_id: Option<&'a dm::DmLogicalId>,
+}
+
 /// The core agent that participates in the x0x gossip network.
 ///
 /// Each agent is a peer — there is no client/server distinction.
@@ -325,6 +335,10 @@ pub struct Agent {
     capability_refreshes: std::sync::Arc<CapabilityRefreshRegistry>,
     /// Handle for the running DM inbox service.
     dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    /// Raw-QUIC ingress for signed/encrypted v2 envelopes. Set and cleared
+    /// with `dm_inbox_service` so the direct listener never bypasses the
+    /// durable inbox admission pipeline.
+    dm_inbox_ingress: std::sync::Arc<tokio::sync::RwLock<Option<dm_inbox::DmInboxIngress>>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
     /// and never await while holding it — write lock is taken only when
     /// applying a new revocation (rare) and when persisting to disk.
@@ -2482,6 +2496,8 @@ fn raw_dm_history_record(
         // this layer. This matches artifact-less verified pub/sub history.
         provenance: history::Provenance::VerifiedEnvelope,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
     })
 }
 
@@ -2806,6 +2822,16 @@ fn capability_binding_supports_durable_ack(
     binding.is_some_and(|binding| {
         binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
     })
+}
+
+fn negotiated_dm_thread_meta(
+    capabilities: Option<&dm::DmCapabilities>,
+    requested: Option<dm::DmThreadMeta>,
+) -> Option<dm::DmThreadMeta> {
+    capabilities
+        .is_some_and(dm::DmCapabilities::supports_thread_metadata)
+        .then_some(requested)
+        .flatten()
 }
 
 async fn run_strict_capability_refresh(
@@ -4776,6 +4802,20 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        self.send_direct_with_config_and_thread(to, payload, config, None, None)
+            .await
+    }
+
+    /// Strict direct send with optional v3 encrypted thread ancestry.
+    /// A v1/v2 recipient receives the exact original payload and no metadata.
+    pub async fn send_direct_with_config_and_thread(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        config: dm::DmSendConfig,
+        thread_meta: Option<dm::DmThreadMeta>,
+        logical_id: Option<dm::DmLogicalId>,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
         let mut outgoing = self.direct_messaging.outgoing_send_guard(*to);
         // ADR-0023 §4: every DM egress surface (REST, WS, files, a2a,
         // internal senders) funnels through here — the single outbound
@@ -4791,7 +4831,22 @@ impl Agent {
             None
         };
         let total_deadline = config.raw_quic_receive_ack_timeout;
-        let send = self.send_direct_with_config_inner(to, payload, config);
+        let strict_expires_at_unix_ms = if config.require_durable_app_ack {
+            total_deadline.map(|deadline| {
+                let deadline_ms = u64::try_from(deadline.as_millis()).unwrap_or(u64::MAX);
+                dm::now_unix_ms().saturating_add(deadline_ms)
+            })
+        } else {
+            None
+        };
+        let send = self.send_direct_with_config_inner(
+            to,
+            payload,
+            config,
+            strict_expires_at_unix_ms,
+            thread_meta,
+            logical_id,
+        );
         let result = if let Some(deadline) = total_deadline {
             match tokio::time::timeout(deadline, send).await {
                 Ok(result) => result,
@@ -4803,11 +4858,18 @@ impl Agent {
         } else {
             send.await
         };
-        if let (Ok(receipt), Some(recorded_payload)) = (&result, history_payload) {
-            self.record_dm_outbound(to, &recorded_payload, receipt.request_id);
+        if let (Ok((receipt, effective_thread_meta)), Some(recorded_payload)) =
+            (&result, history_payload)
+        {
+            self.record_dm_outbound(
+                to,
+                &recorded_payload,
+                receipt.request_id,
+                effective_thread_meta.as_ref(),
+            );
         }
-        outgoing.finish(result.as_ref().ok().map(|receipt| receipt.path));
-        result
+        outgoing.finish(result.as_ref().ok().map(|(receipt, _)| receipt.path));
+        result.map(|(receipt, _)| receipt)
     }
 
     /// Record a durable outbound DM row after a successful send (ADR-0023).
@@ -4817,7 +4879,13 @@ impl Agent {
     /// (the receipt's `request_id`, so retries of one logical send dedupe).
     /// The recipient's inbound row carries the re-verifiable artifact when
     /// an envelope path ran.
-    fn record_dm_outbound(&self, to: &identity::AgentId, payload: &[u8], request_id: [u8; 16]) {
+    fn record_dm_outbound(
+        &self,
+        to: &identity::AgentId,
+        payload: &[u8],
+        request_id: [u8; 16],
+        thread_meta: Option<&dm::DmThreadMeta>,
+    ) {
         let Some(history_handle) = self.history_handle.as_ref() else {
             return;
         };
@@ -4843,6 +4911,8 @@ impl Agent {
             sig_context: None,
             provenance: history::Provenance::LocalSend,
             replace_key: None,
+            thread_root: thread_meta.map(dm::DmThreadMeta::thread_root_hex),
+            thread_parent: thread_meta.and_then(dm::DmThreadMeta::thread_parent_hex),
         });
     }
 
@@ -4851,14 +4921,23 @@ impl Agent {
         to: &identity::AgentId,
         payload: Vec<u8>,
         mut config: dm::DmSendConfig,
-    ) -> Result<dm::DmReceipt, dm::DmError> {
+        strict_expires_at_unix_ms: Option<u64>,
+        thread_meta: Option<dm::DmThreadMeta>,
+        logical_id: Option<dm::DmLogicalId>,
+    ) -> Result<(dm::DmReceipt, Option<dm::DmThreadMeta>), dm::DmError> {
         if config.require_durable_app_ack {
             // A strict receipt is never satisfied by transport acceptance,
-            // publish-only gossip, or relay forwarding.
-            config.require_gossip = true;
+            // publish-only gossip, or relay forwarding. Raw preference is
+            // permitted only when it carries the exact v2 envelope and has a
+            // total deadline; its success is resolved by the authenticated
+            // application ACK, not ant-quic's earlier receive-ACK.
             config.require_gossip_ack = true;
-            config.prefer_raw_quic_if_connected = false;
-            config.stop_fallback_on_raw_error = true;
+            if !config.prefer_raw_quic_if_connected || config.raw_quic_receive_ack_timeout.is_none()
+            {
+                config.require_gossip = true;
+                config.prefer_raw_quic_if_connected = false;
+                config.stop_fallback_on_raw_error = true;
+            }
         }
         if *to == self.identity.agent_id() {
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
@@ -4868,7 +4947,8 @@ impl Agent {
                 });
             }
 
-            let request_id = dm_send::fresh_request_id();
+            let request_id =
+                dm_send::request_id_for_logical(self.identity.agent_id(), *to, logical_id.as_ref());
             if config.require_durable_app_ack {
                 let history::classify::DmPayloadClass::Durable(content_type) =
                     history::classify::classify_dm_payload(&payload)
@@ -4904,6 +4984,10 @@ impl Agent {
                         sig_context: None,
                         provenance: history::Provenance::LocalSend,
                         replace_key: None,
+                        thread_root: thread_meta.as_ref().map(dm::DmThreadMeta::thread_root_hex),
+                        thread_parent: thread_meta
+                            .as_ref()
+                            .and_then(dm::DmThreadMeta::thread_parent_hex),
                     })
                     .await
                     .map_err(|error| dm::DmError::HistoryCommitFailed(error.to_string()))?;
@@ -4919,10 +5003,11 @@ impl Agent {
 
             let delivered = self
                 .direct_messaging
-                .handle_loopback(
+                .handle_loopback_with_thread(
                     self.identity.machine_id(),
                     self.identity.agent_id(),
                     payload,
+                    thread_meta.clone(),
                 )
                 .await;
             let receipt = dm_send::loopback_receipt_with_request_id(request_id);
@@ -4935,7 +5020,7 @@ impl Agent {
                 path = "loopback",
                 delivered_subscribers = delivered,
             );
-            return Ok(receipt);
+            return Ok((receipt, thread_meta));
         }
 
         let (mut advert_binding, force_refresh) =
@@ -5012,6 +5097,16 @@ impl Agent {
             )));
         }
 
+        let requested_thread_metadata = thread_meta.is_some();
+        let effective_thread_meta = negotiated_dm_thread_meta(cap.as_ref(), thread_meta);
+        if requested_thread_metadata && effective_thread_meta.is_none() {
+            tracing::info!(
+                target: "dm.trace",
+                recipient = %hex::encode(to.as_bytes()),
+                "recipient advert is pre-v3; sending exact original payload without thread metadata"
+            );
+        }
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
@@ -5057,7 +5152,36 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
-        let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
+        let durable_raw_result = if config.require_durable_app_ack
+            && config.prefer_raw_quic_if_connected
+            && !config.require_gossip
+        {
+            let kem_public_key = cap
+                .as_ref()
+                .map(|capability| capability.kem_public_key.as_slice())
+                .unwrap_or_default();
+            Some(
+                self.send_durable_raw_preferred(
+                    to,
+                    payload.clone(),
+                    DurableRawPreference {
+                        recipient_machine_id: cap_machine,
+                        recipient_kem_public_key: kem_public_key,
+                        config: &config,
+                        prefer_newest_grace,
+                        expires_at_unix_ms: strict_expires_at_unix_ms,
+                        thread_meta: effective_thread_meta.as_ref(),
+                        logical_id: logical_id.as_ref(),
+                    },
+                )
+                .await,
+            )
+        } else {
+            None
+        };
+        let preferred_raw_receipt = if !config.require_durable_app_ack
+            && config.prefer_raw_quic_if_connected
+            && !config.require_gossip
         {
             match self
                 .send_direct_raw_quic_with_deadline(
@@ -5065,6 +5189,7 @@ impl Agent {
                     &payload,
                     config.raw_quic_receive_ack_timeout,
                     prefer_newest_grace,
+                    None,
                 )
                 .await
             {
@@ -5084,7 +5209,9 @@ impl Agent {
             None
         };
 
-        let result = if let Some(receipt) = preferred_raw_receipt {
+        let result = if let Some(result) = durable_raw_result {
+            result
+        } else if let Some(receipt) = preferred_raw_receipt {
             Ok(receipt)
         } else if preferred_raw_err.as_ref().is_some_and(|err| {
             config.stop_fallback_on_raw_error
@@ -5118,6 +5245,9 @@ impl Agent {
                             self_machine_id: self.identity.machine_id(),
                             machine_keypair: self.identity.machine_keypair(),
                             inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
+                            expires_at_unix_ms: strict_expires_at_unix_ms,
+                            thread_meta: effective_thread_meta.as_ref(),
+                            logical_id: logical_id.as_ref(),
                         },
                         *to,
                         cap_machine,
@@ -5146,6 +5276,7 @@ impl Agent {
                         &payload,
                         config.raw_quic_receive_ack_timeout,
                         prefer_newest_grace,
+                        None,
                     )
                     .await
                     .map(dm_send::raw_quic_receipt_for_path)
@@ -5161,7 +5292,7 @@ impl Agent {
                 // `direct_recovered_after_relay` exactly once - proving the
                 // fallback is transient.
                 self.peer_relay.record_direct_success(to);
-                Ok(receipt)
+                Ok((receipt, effective_thread_meta))
             }
             Err(direct_err) => {
                 // X0X-0070b: count this direct-DM failure on the relay engine.
@@ -5180,7 +5311,7 @@ impl Agent {
                     if self.peer_relay.needs_relay(to) {
                         match self.try_relay_fallback(to, saved_payload, &kem_pub).await {
                             Ok(relay_receipt) => {
-                                return Ok(relay_receipt);
+                                return Ok((relay_receipt, None));
                             }
                             Err(relay_err) => {
                                 tracing::debug!(
@@ -5197,6 +5328,129 @@ impl Agent {
                 Err(direct_err)
             }
         }
+    }
+
+    async fn send_durable_raw_preferred(
+        &self,
+        to: &identity::AgentId,
+        payload: Vec<u8>,
+        preference: DurableRawPreference<'_>,
+    ) -> Result<dm::DmReceipt, dm::DmError> {
+        let DurableRawPreference {
+            recipient_machine_id,
+            recipient_kem_public_key,
+            config,
+            prefer_newest_grace,
+            expires_at_unix_ms,
+            thread_meta,
+            logical_id,
+        } = preference;
+        let total_deadline = config.raw_quic_receive_ack_timeout.ok_or_else(|| {
+            dm::DmError::AckSemanticsUnavailable(
+                "durable raw preference requires a bounded total deadline".to_string(),
+            )
+        })?;
+        let recipient_machine_id = recipient_machine_id.ok_or_else(|| {
+            dm::DmError::AckSemanticsUnavailable(
+                "durable raw preference requires the recipient's signed machine binding"
+                    .to_string(),
+            )
+        })?;
+        let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
+            dm::DmError::LocalGossipUnavailable(
+                "durable raw send requires gossip for the exact-envelope fallback".to_string(),
+            )
+        })?;
+        let signing = gossip::SigningContext::from_keypair(self.identity.agent_keypair());
+        let protocol_version = if thread_meta.is_some() {
+            dm::DM_PROTOCOL_THREADED
+        } else {
+            dm::DM_PROTOCOL_DURABLE_ACK
+        };
+        let prepared = dm_send::prepare_dm_envelope(
+            &signing,
+            self.identity.agent_id(),
+            self.identity.machine_id(),
+            self.identity.machine_keypair(),
+            *to,
+            recipient_kem_public_key,
+            payload,
+            protocol_version,
+            expires_at_unix_ms,
+            thread_meta,
+            logical_id,
+        )?;
+        let raw_frame = dm_inbox::encode_raw_durable_frame(
+            self.identity.agent_keypair().public_key().as_bytes(),
+            &prepared.wire,
+        )
+        .map_err(Self::map_raw_quic_dm_error)?;
+        let mut waiter = dm_send::DmAckWaiter::register(
+            std::sync::Arc::clone(&self.dm_inflight_acks),
+            &prepared,
+            *to,
+            Some(recipient_machine_id),
+        );
+
+        let raw_result = self
+            .send_direct_raw_quic_with_deadline(
+                to,
+                &raw_frame,
+                Some(total_deadline),
+                prefer_newest_grace,
+                Some(prepared.request_id),
+            )
+            .await;
+        match raw_result {
+            Ok(_) => {
+                let app_ack_grace = total_deadline.min(std::time::Duration::from_secs(1));
+                if let Some(outcome) = waiter.wait_for_raw_ack(app_ack_grace).await? {
+                    return waiter.finish_raw(outcome, prepared.request_id);
+                }
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "raw_durable_app_ack_delayed",
+                    request_id = %hex::encode(prepared.request_id),
+                    recipient = %hex::encode(to.as_bytes()),
+                    grace_ms = app_ack_grace.as_millis() as u64,
+                    "raw transport accepted the exact envelope but no authenticated application ACK arrived; publishing exact gossip fallback"
+                );
+            }
+            Err(error) if config.stop_fallback_on_raw_error => {
+                return Err(Self::map_raw_quic_dm_error(error));
+            }
+            Err(error) => {
+                tracing::debug!(
+                    target: "dm.trace",
+                    stage = "raw_durable_transport_failed",
+                    request_id = %hex::encode(prepared.request_id),
+                    recipient = %hex::encode(to.as_bytes()),
+                    %error,
+                    "raw durable transport failed; publishing exact gossip fallback"
+                );
+            }
+        }
+
+        let lifecycle_hint = self.dm_lifecycle_hint(to).await;
+        dm_send::send_prepared_via_gossip(
+            dm_send::DmSendContext {
+                pubsub: std::sync::Arc::clone(runtime.pubsub()),
+                signing: &signing,
+                self_agent_id: self.identity.agent_id(),
+                self_machine_id: self.identity.machine_id(),
+                machine_keypair: self.identity.machine_keypair(),
+                inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
+                expires_at_unix_ms,
+                thread_meta,
+                logical_id,
+            },
+            *to,
+            prepared,
+            config,
+            lifecycle_hint,
+            waiter,
+        )
+        .await
     }
 
     /// X0X-0070b: wrap `payload` in a fresh sealed [`dm::DmEnvelope`] +
@@ -5387,9 +5641,15 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        raw_request_id: Option<[u8; 16]>,
     ) -> error::NetworkResult<dm::DmPath> {
-        let send =
-            self.send_direct_raw_quic(agent_id, payload, receive_ack_timeout, prefer_newest_grace);
+        let send = self.send_direct_raw_quic(
+            agent_id,
+            payload,
+            receive_ack_timeout,
+            prefer_newest_grace,
+            raw_request_id,
+        );
         let Some(deadline) = receive_ack_timeout else {
             return send.await;
         };
@@ -5438,6 +5698,7 @@ impl Agent {
         payload: &[u8],
         receive_ack_timeout: Option<std::time::Duration>,
         prefer_newest_grace: std::time::Duration,
+        raw_request_id: Option<[u8; 16]>,
     ) -> error::NetworkResult<dm::DmPath> {
         let send_start = std::time::Instant::now();
         let agent_prefix = network::hex_prefix(&agent_id.0, 4);
@@ -5652,7 +5913,7 @@ impl Agent {
         // message bytes, not merely that the local socket accepted them.
         // One request id is reused by every same-send reissue so ant-quic's
         // receiver dedupe prevents duplicate application admission.
-        let raw_ack_request_id = dm_send::fresh_request_id();
+        let raw_ack_request_id = raw_request_id.unwrap_or_else(dm_send::fresh_request_id);
         let mut send_result = if let Some(timeout) = receive_ack_timeout {
             let wire = direct::DirectMessaging::encode_message(&self.identity.agent_id(), payload)?;
             tracing::debug!(
@@ -8257,6 +8518,11 @@ impl Agent {
                 "cannot start DM inbox: no gossip runtime configured",
             ))
         })?;
+        let network = self.network.as_ref().cloned().ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "cannot start DM inbox: no network configured",
+            ))
+        })?;
         let signing = std::sync::Arc::new(gossip::SigningContext::from_keypair(
             self.identity.agent_keypair(),
         ));
@@ -8276,6 +8542,7 @@ impl Agent {
         );
         let service = dm_inbox::DmInboxService::spawn(
             std::sync::Arc::clone(runtime.pubsub()),
+            network,
             signing,
             self.identity.agent_id(),
             self.identity.machine_id(),
@@ -8305,16 +8572,18 @@ impl Agent {
             service.abort();
             return Ok(());
         }
+        let ingress = service.ingress();
         if let Some(prev) = guard.take() {
             prev.abort();
         }
         *guard = Some(service);
+        *self.dm_inbox_ingress.write().await = Some(ingress);
 
         // Upgrade our advertised capabilities so peers stop falling back
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
         let upgraded = if self.history_handle.is_some() {
-            dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
+            dm::DmCapabilities::v3_threaded_durable_gossip_ready(kem_keypair.public_bytes.clone())
         } else {
             dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
         };
@@ -8331,7 +8600,9 @@ impl Agent {
     /// Stop the DM inbox service, if running. Idempotent.
     pub async fn stop_dm_inbox(&self) {
         let mut guard = self.dm_inbox_service.lock().await;
-        if let Some(service) = guard.take() {
+        let service = guard.take();
+        self.dm_inbox_ingress.write().await.take();
+        if let Some(service) = service {
             service.abort();
         }
     }
@@ -9477,6 +9748,7 @@ impl Agent {
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let history_handle = self.history_handle.clone();
+        let dm_inbox_ingress = std::sync::Arc::clone(&self.dm_inbox_ingress);
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
 
@@ -9521,6 +9793,25 @@ impl Agent {
                 let data = payload[32..].to_vec();
                 let payload_bytes = data.len();
                 let digest = direct::dm_payload_digest_hex(&data);
+
+                if dm_inbox::is_raw_durable_frame(&data) {
+                    let ingress = dm_inbox_ingress.read().await.clone();
+                    if let Some(ingress) = ingress {
+                        ingress
+                            .handle_raw_frame(machine_id, sender, &data)
+                            .await;
+                    } else {
+                        dm.record_incoming_decode_failed();
+                        tracing::warn!(
+                            target: "dm.trace",
+                            stage = "raw_durable_ingress_unavailable",
+                            sender = %hex::encode(sender.as_bytes()),
+                            machine = %hex::encode(machine_id.as_bytes()),
+                            "signed raw DM arrived before the durable inbox ingress was ready"
+                        );
+                    }
+                    continue;
+                }
 
                 tracing::debug!(
                     target: "dm.trace",
@@ -11598,6 +11889,7 @@ impl AgentBuilder {
             capability_advert_service: tokio::sync::Mutex::new(None),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             dm_inbox_service: tokio::sync::Mutex::new(None),
+            dm_inbox_ingress: std::sync::Arc::new(tokio::sync::RwLock::new(None)),
             revocation_set,
             identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
@@ -16327,7 +16619,14 @@ mod tests {
         };
 
         let error = agent
-            .send_direct_with_config_inner(&recipient, b"strict v2".to_vec(), config)
+            .send_direct_with_config_inner(
+                &recipient,
+                b"strict v2".to_vec(),
+                config,
+                None,
+                None,
+                None,
+            )
             .await
             .expect_err("v1-only recipient cannot satisfy durable application ACK");
         assert!(matches!(error, dm::DmError::AckSemanticsUnavailable(_)));
@@ -18079,6 +18378,25 @@ async fn strict_capability_miss_round_trips_remote_signed_advert_and_wakes_waite
     );
 
     agent.shutdown().await;
+}
+
+#[test]
+fn mixed_version_thread_negotiation_drops_metadata_for_v2_only_peer() {
+    let thread = dm::DmThreadMeta::from_hex(Some(&"ab".repeat(32)), Some(&"cd".repeat(32)))
+        .expect("valid thread")
+        .expect("thread present");
+    let v2 = dm::DmCapabilities::v2_durable_gossip_ready(vec![0x22; 1184]);
+    let v3 = dm::DmCapabilities::v3_threaded_durable_gossip_ready(vec![0x33; 1184]);
+
+    assert_eq!(
+        negotiated_dm_thread_meta(Some(&v2), Some(thread.clone())),
+        None,
+        "a mixed-version recipient must see exact original app bytes, never a wrapper"
+    );
+    assert_eq!(
+        negotiated_dm_thread_meta(Some(&v3), Some(thread.clone())),
+        Some(thread)
+    );
 }
 
 #[tokio::test]

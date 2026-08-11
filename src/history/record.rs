@@ -203,6 +203,12 @@ pub struct HistoryRecord {
     pub provenance: Provenance,
     /// Non-`None` marks the row replaceable, keyed by this string.
     pub replace_key: Option<String>,
+    /// Canonical 64-lowercase-hex DM/group thread root, when supplied.
+    #[serde(default)]
+    pub thread_root: Option<String>,
+    /// Canonical direct parent. Requires [`Self::thread_root`].
+    #[serde(default)]
+    pub thread_parent: Option<String>,
 }
 
 impl HistoryRecord {
@@ -258,6 +264,11 @@ impl HistoryRecord {
                 "signature present without signed_artifact".into(),
             ));
         }
+        crate::dm::DmThreadMeta::from_hex(
+            self.thread_root.as_deref(),
+            self.thread_parent.as_deref(),
+        )
+        .map_err(HistoryError::InvalidRecord)?;
         // Artifact-less local sends carry a nonce-derived msg_id (see
         // `compute_local_send_msg_id`) that cannot be recomputed from the
         // row alone; every other row must match the canonical computation.

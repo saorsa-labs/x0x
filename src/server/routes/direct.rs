@@ -18,9 +18,9 @@ use std::time::Duration;
 use x0x::contacts::TrustLevel;
 
 pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
-    // Internal daemon protocols retain their existing v1-compatible transport
-    // policy. The product `/direct/send` route applies the stricter durable
-    // application-ACK contract in `direct_product_send_config` below.
+    // Internal daemon protocols retain their existing v1-compatible raw
+    // transport policy. Product DMs additionally require the v2 application
+    // ACK in `direct_product_send_config` below.
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
         prefer_raw_quic_if_connected: true,
@@ -30,16 +30,19 @@ pub(in crate::server) fn direct_message_send_config() -> x0x::dm::DmSendConfig {
 }
 
 fn direct_product_send_config() -> x0x::dm::DmSendConfig {
-    // Product/UI success is strict: only a v2 recipient ACK emitted after
-    // authenticated history commit and local application dispatch qualifies.
+    // Product/UI success is strict: the live path carries the signed/encrypted
+    // v2 envelope over raw QUIC, but only the recipient's authenticated ACK
+    // after history commit and app dispatch qualifies. The same envelope is
+    // the bounded gossip fallback, so transport receive-ACK is never mistaken
+    // for product delivery.
     x0x::dm::DmSendConfig {
         timeout_per_attempt: Duration::from_secs(8),
-        require_gossip: true,
+        require_gossip: false,
         require_gossip_ack: true,
         require_durable_app_ack: true,
-        prefer_raw_quic_if_connected: false,
-        raw_quic_receive_ack_timeout: None,
-        stop_fallback_on_raw_error: true,
+        prefer_raw_quic_if_connected: true,
+        raw_quic_receive_ack_timeout: Some(Duration::from_secs(8)),
+        stop_fallback_on_raw_error: false,
         ..x0x::dm::DmSendConfig::default()
     }
 }
@@ -65,6 +68,15 @@ pub(in crate::server) struct DirectSendRequest {
     pub(in crate::server) agent_id: String,
     /// Base64-encoded payload.
     pub(in crate::server) payload: String,
+    /// Optional canonical 64-lowercase-hex thread root.
+    #[serde(default)]
+    pub(in crate::server) thread_root: Option<String>,
+    /// Optional canonical direct parent; requires `thread_root`.
+    #[serde(default)]
+    pub(in crate::server) thread_parent: Option<String>,
+    /// Optional canonical idempotency key supplied by the application.
+    #[serde(default)]
+    pub(in crate::server) logical_id: Option<String>,
     /// Prefer the raw-QUIC path when a live direct connection exists.
     #[serde(default)]
     pub(in crate::server) prefer_raw_quic_if_connected: Option<bool>,
@@ -94,20 +106,37 @@ pub(in crate::server) struct DirectSendRequest {
 
 fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendConfig {
     let mut config = direct_product_send_config();
-    let _legacy_transport_request = (
-        req.prefer_raw_quic_if_connected,
-        req.stop_fallback_on_raw_error,
-        req.require_gossip,
-        req.require_gossip_ack,
-    );
-    // Preserve the historical timeout input as a caller-controlled strict
-    // per-attempt budget, but never let legacy transport knobs weaken the
-    // product endpoint's receipt contract.
+    if let Some(prefer_raw_quic_if_connected) = req.prefer_raw_quic_if_connected {
+        config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
+    }
+    config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
+    if req.require_gossip {
+        config.require_gossip = true;
+        config.prefer_raw_quic_if_connected = false;
+    }
+    // `require_gossip_ack: false` was a legacy publish-only escape hatch. It
+    // remains accepted on the wire for compatibility but cannot weaken the
+    // product endpoint's authenticated v2 completion contract.
+    let _legacy_require_gossip_ack = req.require_gossip_ack;
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
-        config.timeout_per_attempt =
-            std::time::Duration::from_millis(raw_ack_ms.clamp(100, 30_000));
+        let timeout = std::time::Duration::from_millis(raw_ack_ms.clamp(100, 30_000));
+        config.timeout_per_attempt = timeout;
+        config.raw_quic_receive_ack_timeout = Some(timeout);
     }
     config
+}
+
+fn direct_metadata_for_request(
+    req: &DirectSendRequest,
+) -> Result<(Option<x0x::dm::DmThreadMeta>, Option<x0x::dm::DmLogicalId>), String> {
+    let thread_meta =
+        x0x::dm::DmThreadMeta::from_hex(req.thread_root.as_deref(), req.thread_parent.as_deref())?;
+    let logical_id = req
+        .logical_id
+        .as_deref()
+        .map(x0x::dm::DmLogicalId::parse)
+        .transpose()?;
+    Ok((thread_meta, logical_id))
 }
 
 fn direct_send_error_status(error: &x0x::dm::DmError) -> (StatusCode, &'static str) {
@@ -312,11 +341,27 @@ pub(in crate::server) async fn direct_send(
         Err(resp) => return resp,
     };
 
+    let (thread_meta, logical_id) = match direct_metadata_for_request(&req) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({ "ok": false, "error": error })),
+            );
+        }
+    };
+
     let send_config = direct_send_config_for_request(&req);
 
     match state
         .agent
-        .send_direct_with_config(&agent_id, payload, send_config)
+        .send_direct_with_config_and_thread(
+            &agent_id,
+            payload,
+            send_config,
+            thread_meta,
+            logical_id,
+        )
         .await
     {
         Ok(receipt) => {
@@ -445,17 +490,69 @@ mod tests {
     use super::*;
 
     #[test]
-    fn direct_product_send_config_requires_durable_v2_gossip_ack() {
+    fn direct_product_send_config_prefers_strict_bounded_raw_envelope() {
         let config = direct_product_send_config();
         assert!(config.require_gossip_ack);
-        assert!(config.require_gossip);
+        assert!(!config.require_gossip);
         assert!(config.require_durable_app_ack);
-        assert!(!config.prefer_raw_quic_if_connected);
-        assert_eq!(config.raw_quic_receive_ack_timeout, None);
+        assert!(config.prefer_raw_quic_if_connected);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
+        assert!(!config.stop_fallback_on_raw_error);
     }
 
     #[test]
-    fn direct_send_request_cannot_weaken_durable_ack_contract() {
+    fn direct_metadata_validates_thread_ancestry_and_logical_id() {
+        let root = "ab".repeat(32);
+        let req: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "11".repeat(32),
+            "payload": "aGk=",
+            "thread_root": root,
+            "thread_parent": "cd".repeat(32),
+            "logical_id": "550e8400-e29b-41d4-a716-446655440000"
+        }))
+        .expect("deserialize direct request");
+        let (thread, logical) = direct_metadata_for_request(&req).expect("valid metadata");
+        let thread = thread.expect("thread metadata");
+        assert_eq!(thread.thread_root_hex(), "ab".repeat(32));
+        assert_eq!(thread.thread_parent_hex(), Some("cd".repeat(32)));
+        assert_eq!(
+            logical.expect("logical id").as_str(),
+            "550e8400-e29b-41d4-a716-446655440000"
+        );
+    }
+
+    #[test]
+    fn direct_metadata_rejects_parent_without_root_and_noncanonical_ids() {
+        let parent_only: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "11".repeat(32),
+            "payload": "aGk=",
+            "thread_parent": "cd".repeat(32)
+        }))
+        .expect("deserialize parent-only request");
+        assert!(direct_metadata_for_request(&parent_only).is_err());
+
+        let uppercase_root: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "11".repeat(32),
+            "payload": "aGk=",
+            "thread_root": "AB".repeat(32)
+        }))
+        .expect("deserialize uppercase request");
+        assert!(direct_metadata_for_request(&uppercase_root).is_err());
+
+        let bad_logical: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "11".repeat(32),
+            "payload": "aGk=",
+            "logical_id": "not canonical"
+        }))
+        .expect("deserialize bad logical request");
+        assert!(direct_metadata_for_request(&bad_logical).is_err());
+    }
+
+    #[test]
+    fn omitted_direct_send_request_is_raw_preferred_and_cannot_weaken_fallback_ack() {
         let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "00".repeat(32),
             "payload": ""
@@ -463,14 +560,21 @@ mod tests {
         .expect("minimal direct-send request should deserialize");
         let omitted_config = direct_send_config_for_request(&omitted);
         assert!(omitted_config.require_durable_app_ack);
-        assert!(!omitted_config.prefer_raw_quic_if_connected);
+        assert!(omitted_config.prefer_raw_quic_if_connected);
+        assert!(omitted_config.require_gossip_ack);
+        assert_eq!(
+            omitted_config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8))
+        );
 
         let legacy_requested: DirectSendRequest = serde_json::from_value(serde_json::json!({
             "agent_id": "00".repeat(32),
             "payload": "",
-            "prefer_raw_quic_if_connected": true,
-            "require_gossip": false,
-            "require_gossip_ack": false
+            "prefer_raw_quic_if_connected": false,
+            "raw_quic_receive_ack_ms": 375,
+            "require_gossip": true,
+            "require_gossip_ack": false,
+            "stop_fallback_on_raw_error": true
         }))
         .expect("legacy direct-send knobs should still deserialize");
         let config = direct_send_config_for_request(&legacy_requested);
@@ -478,6 +582,11 @@ mod tests {
         assert!(config.require_gossip);
         assert!(config.require_gossip_ack);
         assert!(!config.prefer_raw_quic_if_connected);
+        assert!(config.stop_fallback_on_raw_error);
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_millis(375))
+        );
     }
 
     #[test]

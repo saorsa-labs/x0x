@@ -67,7 +67,7 @@
 //! ```
 
 use crate::connectivity::ObservedOrigin;
-use crate::dm::DmPath;
+use crate::dm::{DmPath, DmThreadMeta};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
@@ -373,6 +373,10 @@ pub struct DirectMessage {
     /// IP yields a maskable prefix (loopback/unspecified do not). Never
     /// gossiped, never announced, never on `/peers`.
     pub observed_origin: Option<ObservedOrigin>,
+    /// Canonical 64-hex root message id for negotiated v3 DMs.
+    pub thread_root: Option<String>,
+    /// Canonical 64-hex direct-parent message id for negotiated v3 replies.
+    pub thread_parent: Option<String>,
 }
 
 impl DirectMessage {
@@ -404,6 +408,8 @@ impl DirectMessage {
             verified,
             trust_decision,
             observed_origin: None,
+            thread_root: None,
+            thread_parent: None,
         }
     }
 
@@ -831,6 +837,12 @@ pub struct DirectMessaging {
 
     /// Internal receiver (owned by the processing task).
     internal_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectMessage>>>,
+}
+
+#[derive(Default)]
+pub(crate) struct DirectInboundMetadata {
+    pub(crate) observed_origin: Option<ObservedOrigin>,
+    pub(crate) thread_meta: Option<DmThreadMeta>,
 }
 
 impl DirectMessaging {
@@ -1312,20 +1324,23 @@ impl DirectMessaging {
     /// This is used when an agent sends a DM to its own [`AgentId`]. It avoids
     /// creating an impossible QUIC self-connection while preserving the same
     /// subscriber and pull-API fan-out semantics as a remote direct message.
-    pub(crate) async fn handle_loopback(
+    pub(crate) async fn handle_loopback_with_thread(
         &self,
         machine_id: MachineId,
         agent_id: AgentId,
         payload: Vec<u8>,
+        thread_meta: Option<DmThreadMeta>,
     ) -> u64 {
-        self.handle_incoming(
+        self.handle_incoming_with_thread(
             machine_id,
             agent_id,
             payload,
             true,
             Some(TrustDecision::Accept),
-            // Loopback never carries a transport observation (issue #120).
-            None,
+            DirectInboundMetadata {
+                observed_origin: None,
+                thread_meta,
+            },
         )
         .await
     }
@@ -1355,6 +1370,34 @@ impl DirectMessaging {
         trust_decision: Option<TrustDecision>,
         observed_origin: Option<ObservedOrigin>,
     ) -> u64 {
+        self.handle_incoming_with_thread(
+            machine_id,
+            sender_agent_id,
+            payload,
+            verified,
+            trust_decision,
+            DirectInboundMetadata {
+                observed_origin,
+                thread_meta: None,
+            },
+        )
+        .await
+    }
+
+    /// Thread-aware v3 variant of [`Self::handle_incoming`].
+    pub(crate) async fn handle_incoming_with_thread(
+        &self,
+        machine_id: MachineId,
+        sender_agent_id: AgentId,
+        payload: Vec<u8>,
+        verified: bool,
+        trust_decision: Option<TrustDecision>,
+        metadata: DirectInboundMetadata,
+    ) -> u64 {
+        let DirectInboundMetadata {
+            observed_origin,
+            thread_meta,
+        } = metadata;
         self.diagnostics
             .incoming_envelopes_total
             .fetch_add(1, Ordering::Relaxed);
@@ -1375,6 +1418,8 @@ impl DirectMessaging {
             trust_decision,
         );
         msg.observed_origin = observed_origin;
+        msg.thread_root = thread_meta.as_ref().map(DmThreadMeta::thread_root_hex);
+        msg.thread_parent = thread_meta.and_then(|meta| meta.thread_parent_hex());
 
         let subscribers = self.subscriber_snapshot();
         let mut delivered = 0_u64;

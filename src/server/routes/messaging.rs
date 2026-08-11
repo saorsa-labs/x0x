@@ -58,6 +58,8 @@ fn record_topic_message(
         sig_context: None,
         provenance: x0x::history::Provenance::VerifiedEnvelope,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
     });
 }
 

@@ -29,8 +29,13 @@ pub const DM_PROTOCOL_V1: u16 = 1;
 /// verified payload commits to history and local dispatch completes.
 pub const DM_PROTOCOL_DURABLE_ACK: u16 = 2;
 
+/// Durable ACK plus encrypted direct-message thread metadata. The envelope
+/// layout is unchanged; v3 gates a versioned wrapper inside the encrypted
+/// application payload so v1/v2 recipients never render wrapper bytes.
+pub const DM_PROTOCOL_THREADED: u16 = 3;
+
 /// Highest DM protocol version understood by this build.
-pub const DM_PROTOCOL_VERSION: u16 = DM_PROTOCOL_DURABLE_ACK;
+pub const DM_PROTOCOL_VERSION: u16 = DM_PROTOCOL_THREADED;
 
 /// Maximum envelope bytes (postcard-serialised). Soft cap: receivers drop
 /// envelopes over this size without processing or ACKing.
@@ -98,6 +103,12 @@ impl DmCapabilities {
             && self.max_protocol_version >= DM_PROTOCOL_DURABLE_ACK
     }
 
+    /// Whether this peer explicitly negotiated the encrypted thread wrapper.
+    #[must_use]
+    pub fn supports_thread_metadata(&self) -> bool {
+        self.supports_durable_app_ack() && self.max_protocol_version >= DM_PROTOCOL_THREADED
+    }
+
     /// Placeholder capability advert for agents that have not yet wired
     /// their KEM keypair. `gossip_inbox` is `false` and `kem_public_key`
     /// is empty — senders will fall back to the raw-QUIC path.
@@ -138,12 +149,117 @@ impl DmCapabilities {
         }
     }
 
+    /// Fully-wired v3 advert supporting durable ACKs and encrypted DM thread
+    /// metadata while retaining the v2 outer envelope layout.
+    #[must_use]
+    pub fn v3_threaded_durable_gossip_ready(kem_public_key: Vec<u8>) -> Self {
+        Self {
+            max_protocol_version: DM_PROTOCOL_THREADED,
+            gossip_inbox: true,
+            kem_algorithm: "ML-KEM-768".to_string(),
+            max_envelope_bytes: MAX_ENVELOPE_BYTES,
+            kem_public_key,
+        }
+    }
+
     /// Return a clone with the given KEM public key and `gossip_inbox=true`.
     #[must_use]
     pub fn with_kem_public_key(mut self, kem_public_key: Vec<u8>) -> Self {
         self.kem_public_key = kem_public_key;
         self.gossip_inbox = true;
         self
+    }
+}
+
+/// Canonical direct-message thread ancestry carried only by negotiated v3
+/// payloads. Values are 32-byte message ids rendered as lowercase hex at API
+/// and history boundaries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DmThreadMeta {
+    thread_root: [u8; 32],
+    thread_parent: Option<[u8; 32]>,
+}
+
+impl DmThreadMeta {
+    /// Validate optional REST metadata. `thread_parent` requires a root and
+    /// every supplied id must be exactly 64 lowercase hexadecimal chars.
+    pub fn from_hex(
+        thread_root: Option<&str>,
+        thread_parent: Option<&str>,
+    ) -> std::result::Result<Option<Self>, String> {
+        let Some(root) = thread_root else {
+            return if thread_parent.is_some() {
+                Err("thread_parent requires thread_root to also be set".to_string())
+            } else {
+                Ok(None)
+            };
+        };
+        let thread_root = decode_thread_id("thread_root", root)?;
+        let thread_parent = thread_parent
+            .map(|parent| decode_thread_id("thread_parent", parent))
+            .transpose()?;
+        Ok(Some(Self {
+            thread_root,
+            thread_parent,
+        }))
+    }
+
+    /// Canonical root id.
+    #[must_use]
+    pub fn thread_root_hex(&self) -> String {
+        hex::encode(self.thread_root)
+    }
+
+    /// Canonical direct-parent id, when this is a reply.
+    #[must_use]
+    pub fn thread_parent_hex(&self) -> Option<String> {
+        self.thread_parent.map(hex::encode)
+    }
+}
+
+fn decode_thread_id(field: &str, value: &str) -> std::result::Result<[u8; 32], String> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Err(format!("{field} must be exactly 64 lowercase hex chars"));
+    }
+    let mut decoded = [0_u8; 32];
+    hex::decode_to_slice(value, &mut decoded)
+        .map_err(|_| format!("{field} must be exactly 64 lowercase hex chars"))?;
+    Ok(decoded)
+}
+
+/// Canonical caller-supplied idempotency key for one logical DM send.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmLogicalId(String);
+
+impl DmLogicalId {
+    /// Accept a compact lowercase token suitable for UUIDs and namespaced
+    /// client ids. Whitespace, uppercase, controls, and ambiguous Unicode are
+    /// rejected instead of silently normalized into collisions.
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        if value.is_empty() || value.len() > 128 {
+            return Err("logical_id must contain 1 to 128 ASCII chars".to_string());
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b':')
+        }) {
+            return Err(
+                "logical_id must use lowercase ASCII letters, digits, '-', '_', '.', or ':'"
+                    .to_string(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Canonical bytes used by the domain-separated request-id derivation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
@@ -2017,12 +2133,31 @@ mod tests {
     fn durable_ack_capability_is_explicit_and_v1_stays_legacy() {
         let kem_key = vec![7u8; 1184];
         let v1 = DmCapabilities::v1_gossip_ready(kem_key.clone());
-        let v2 = DmCapabilities::v2_durable_gossip_ready(kem_key);
+        let v2 = DmCapabilities::v2_durable_gossip_ready(kem_key.clone());
+        let v3 = DmCapabilities::v3_threaded_durable_gossip_ready(kem_key);
 
         assert_eq!(v1.max_protocol_version, DM_PROTOCOL_V1);
         assert!(!v1.supports_durable_app_ack());
         assert_eq!(v2.max_protocol_version, DM_PROTOCOL_DURABLE_ACK);
         assert!(v2.supports_durable_app_ack());
+        assert!(!v2.supports_thread_metadata());
+        assert_eq!(v3.max_protocol_version, DM_PROTOCOL_THREADED);
+        assert!(v3.supports_thread_metadata());
+    }
+
+    #[test]
+    fn dm_thread_and_logical_metadata_require_canonical_forms() {
+        let root = "ab".repeat(32);
+        let parent = "cd".repeat(32);
+        let thread = DmThreadMeta::from_hex(Some(&root), Some(&parent))
+            .expect("canonical thread metadata")
+            .expect("thread present");
+        assert_eq!(thread.thread_root_hex(), root);
+        assert_eq!(thread.thread_parent_hex(), Some(parent));
+        assert!(DmThreadMeta::from_hex(None, Some(&"ef".repeat(32))).is_err());
+        assert!(DmThreadMeta::from_hex(Some(&"AB".repeat(32)), None).is_err());
+        assert!(DmLogicalId::parse("550e8400-e29b-41d4-a716-446655440000").is_ok());
+        assert!(DmLogicalId::parse("Not Canonical").is_err());
     }
 
     #[test]

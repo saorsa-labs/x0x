@@ -18,7 +18,7 @@ use crate::error::{HistoryError, HistoryResult};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_LIMIT: usize = 500;
@@ -230,7 +230,8 @@ impl Store {
         let mut sql = String::from(
             "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
              author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
-             signed_artifact, signature, sig_context, provenance, replace_key \
+             signed_artifact, signature, sig_context, provenance, replace_key, \
+             thread_root, thread_parent \
              FROM history",
         );
         let mut parts: Vec<String> = Vec::new();
@@ -260,7 +261,7 @@ impl Store {
             "SELECT h.id, h.msg_id, h.scope_kind, h.scope_id, h.author_agent, \
              h.author_machine, h.author_pubkey, h.sent_at_ms, h.seen_at_ms, h.direction, \
              h.content_type, h.payload, h.signed_artifact, h.signature, h.sig_context, \
-             h.provenance, h.replace_key FROM history h \
+             h.provenance, h.replace_key, h.thread_root, h.thread_parent FROM history h \
              WHERE h.id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?)",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::from(fts)];
@@ -500,6 +501,8 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
     let sig_context: Option<String> = r.get(14)?;
     let provenance: i64 = r.get(15)?;
     let replace_key: Option<String> = r.get(16)?;
+    let thread_root: Option<String> = r.get(17)?;
+    let thread_parent: Option<String> = r.get(18)?;
 
     let record = (|| -> HistoryResult<HistoryRecord> {
         let mut msg_id = [0u8; 32];
@@ -523,6 +526,8 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
             sig_context,
             provenance: Provenance::from_i64(provenance)?,
             replace_key,
+            thread_root,
+            thread_parent,
         })
     })();
     Ok((id, record))
@@ -534,8 +539,9 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
     tx.execute(
         "INSERT INTO history (msg_id, scope_kind, scope_id, author_agent, author_machine, \
          author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
-         payload_text, signed_artifact, signature, sig_context, provenance, replace_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         payload_text, signed_artifact, signature, sig_context, provenance, replace_key, \
+         thread_root, thread_parent) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19)",
         rusqlite::params![
             msg_id,
             record.scope.kind(),
@@ -554,6 +560,8 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
             record.sig_context,
             record.provenance.as_i64(),
             record.replace_key,
+            record.thread_root,
+            record.thread_parent,
         ],
     )
     .map_err(|e| HistoryError::Database(format!("insert failed: {e}")))?;
@@ -573,12 +581,17 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
             conn.execute_batch(SCHEMA_V1)?;
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
-                rusqlite::params![SCHEMA_VERSION],
+                rusqlite::params![1_i64],
             )?;
-            Ok(())
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)
         }
         Some(v) if v == SCHEMA_VERSION => Ok(()),
-        Some(1) => migrate_v1_to_v2(conn),
+        Some(1) => {
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)
+        }
+        Some(2) => migrate_v2_to_v3(conn),
         Some(v) if v < SCHEMA_VERSION => {
             // Future migrations chain here, bumping stored version each step.
             Err(HistoryError::Database(format!(
@@ -626,6 +639,21 @@ fn migrate_v1_to_v2(conn: &Connection) -> HistoryResult<()> {
             }
         }
     }
+    tx.execute(
+        "UPDATE schema_version SET version = ?1",
+        rusqlite::params![2_i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Schema v3 adds first-class nullable thread ancestry to every durable row.
+fn migrate_v2_to_v3(conn: &Connection) -> HistoryResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE history ADD COLUMN thread_root TEXT; \
+         ALTER TABLE history ADD COLUMN thread_parent TEXT;",
+    )?;
     tx.execute(
         "UPDATE schema_version SET version = ?1",
         rusqlite::params![SCHEMA_VERSION],
@@ -806,6 +834,8 @@ mod tests {
             sig_context: None,
             provenance: Provenance::LocalAppDecrypt,
             replace_key: None,
+            thread_root: None,
+            thread_parent: None,
         }
     }
 

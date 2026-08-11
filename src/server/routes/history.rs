@@ -62,10 +62,12 @@ fn row_json(row: &StoredRecord) -> serde_json::Value {
         .unwrap_or_else(|| hex::encode(r.msg_id));
     let thread_root = group_message
         .as_ref()
-        .and_then(|message| message.thread_root.as_deref());
+        .and_then(|message| message.thread_root.as_deref())
+        .or(r.thread_root.as_deref());
     let thread_parent = group_message
         .as_ref()
-        .and_then(|message| message.thread_parent.as_deref());
+        .and_then(|message| message.thread_parent.as_deref())
+        .or(r.thread_parent.as_deref());
     serde_json::json!({
         "id": row.id,
         "msg_id": msg_id,
@@ -295,6 +297,8 @@ mod tests {
                 sig_context: Some("x0x.group.public-message.v2".to_string()),
                 provenance: Provenance::VerifiedEnvelope,
                 replace_key: None,
+                thread_root: None,
+                thread_parent: None,
             },
         };
 

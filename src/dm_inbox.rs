@@ -3,19 +3,21 @@
 //! bridges decrypted payloads into [`crate::direct::DirectMessaging`].
 
 use crate::contacts::ContactStore;
-use crate::direct::DirectMessaging;
+use crate::direct::{DirectInboundMetadata, DirectMessaging};
 use crate::dm::{
     decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
-    DmEnvelope, DmOriginAttestation, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache,
-    DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
+    DmEnvelope, DmOriginAttestation, DmPayload, DmThreadMeta, EnvelopeBuilder, InFlightAcks,
+    RecentDeliveryCache, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::identity::{AgentId, MachineId, MachineKeypair};
+use crate::network::NetworkNode;
 use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 use std::{future::Future, sync::Arc, time::Duration};
 use tokio::sync::{mpsc, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
@@ -30,6 +32,72 @@ const DURABLE_ACK_ROUTE_TIMEOUT: Duration = Duration::from_secs(22);
 const DURABLE_ACK_QUEUE_CAPACITY: usize = 256;
 /// Bound the number of ACK jobs simultaneously holding pubsub fan-out work.
 const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
+
+/// A collision-resistant discriminator for signed/encrypted v2 DM envelopes
+/// carried over the legacy direct-message stream. Legacy raw payloads remain
+/// byte-for-byte unchanged and are only interpreted as envelopes when this
+/// complete prefix is present.
+const RAW_DURABLE_DM_MAGIC: &[u8; 16] = b"x0x-dm-v2-raw\0\0\0";
+const MAX_RAW_DURABLE_FRAME_BYTES: usize = MAX_ENVELOPE_BYTES + 4_096;
+
+#[derive(Debug, Serialize, Deserialize)]
+struct RawDurableDmFrame {
+    sender_public_key: Vec<u8>,
+    envelope: Vec<u8>,
+}
+
+pub(crate) fn encode_raw_durable_frame(
+    sender_public_key: &[u8],
+    envelope: &[u8],
+) -> NetworkResult<Vec<u8>> {
+    if envelope.len() > MAX_ENVELOPE_BYTES {
+        return Err(NetworkError::SerializationError(format!(
+            "raw durable DM envelope exceeds limit ({} > {})",
+            envelope.len(),
+            MAX_ENVELOPE_BYTES
+        )));
+    }
+    let encoded = postcard::to_stdvec(&RawDurableDmFrame {
+        sender_public_key: sender_public_key.to_vec(),
+        envelope: envelope.to_vec(),
+    })
+    .map_err(|error| {
+        NetworkError::SerializationError(format!("raw durable DM frame encode: {error}"))
+    })?;
+    let mut framed = Vec::with_capacity(RAW_DURABLE_DM_MAGIC.len() + encoded.len());
+    framed.extend_from_slice(RAW_DURABLE_DM_MAGIC);
+    framed.extend_from_slice(&encoded);
+    Ok(framed)
+}
+
+fn decode_raw_durable_frame(payload: &[u8]) -> NetworkResult<RawDurableDmFrame> {
+    if payload.len() > MAX_RAW_DURABLE_FRAME_BYTES {
+        return Err(NetworkError::SerializationError(format!(
+            "raw durable DM frame exceeds limit ({} > {})",
+            payload.len(),
+            MAX_RAW_DURABLE_FRAME_BYTES
+        )));
+    }
+    let encoded = payload
+        .strip_prefix(RAW_DURABLE_DM_MAGIC)
+        .ok_or_else(|| NetworkError::SerializationError("missing raw durable DM magic".into()))?;
+    let frame: RawDurableDmFrame = postcard::from_bytes(encoded).map_err(|error| {
+        NetworkError::SerializationError(format!("raw durable DM frame decode: {error}"))
+    })?;
+    if frame.envelope.len() > MAX_ENVELOPE_BYTES {
+        return Err(NetworkError::SerializationError(format!(
+            "raw durable DM envelope exceeds limit ({} > {})",
+            frame.envelope.len(),
+            MAX_ENVELOPE_BYTES
+        )));
+    }
+    Ok(frame)
+}
+
+#[must_use]
+pub(crate) fn is_raw_durable_frame(payload: &[u8]) -> bool {
+    payload.starts_with(RAW_DURABLE_DM_MAGIC)
+}
 
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
@@ -205,7 +273,7 @@ pub struct DmTypedPayloadRoute {
 }
 
 /// A decrypted, verified DM payload routed before generic direct-message fan-out.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct DmTypedPayload {
     pub sender: AgentId,
     pub machine_id: MachineId,
@@ -213,11 +281,39 @@ pub struct DmTypedPayload {
     pub verified: bool,
     pub trust_decision: Option<TrustDecision>,
     pub received_at_unix_ms: u64,
+    /// Present only for strict v2/v3 typed routes. The handler must resolve
+    /// this after durable application admission; enqueue alone never ACKs.
+    pub completion: Option<tokio::sync::oneshot::Sender<DmTypedPayloadCompletionResult>>,
 }
+
+/// Successful durable disposition reported by a typed application handler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmTypedPayloadCompletion {
+    Inserted,
+    Duplicate,
+}
+
+/// Error text is authenticated indirectly: failures withhold the signed ACK
+/// and remain local diagnostics rather than crossing the wire.
+pub type DmTypedPayloadCompletionResult = Result<DmTypedPayloadCompletion, String>;
 
 pub struct DmInboxService {
     handles: Vec<JoinHandle<()>>,
     topic: String,
+    ingress: DmInboxIngress,
+}
+
+/// Cloneable ingress that lets the authenticated raw-QUIC listener feed an
+/// exact v2 envelope through the same durable pipeline as gossip delivery.
+#[derive(Clone)]
+pub(crate) struct DmInboxIngress {
+    pipeline: InboxPipeline,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum AckRoute {
+    Gossip { ack_legacy_bus: bool },
+    Raw { peer_machine_id: MachineId },
 }
 
 struct AckPublishJob {
@@ -264,6 +360,7 @@ impl DmInboxService {
     #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         pubsub: Arc<PubSubManager>,
+        network: Arc<NetworkNode>,
         signing: Arc<SigningContext>,
         self_agent_id: AgentId,
         self_machine_id: MachineId,
@@ -288,6 +385,7 @@ impl DmInboxService {
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
+            network,
             signing,
             self_agent_id,
             self_machine_id,
@@ -311,7 +409,7 @@ impl DmInboxService {
             DM_BUS_TOPIC.to_string(),
             true,
             legacy_subscription,
-            pipeline,
+            pipeline.clone(),
         );
 
         Ok(Self {
@@ -319,6 +417,7 @@ impl DmInboxService {
             // route publications. A graceful channel close drains them.
             handles: vec![primary_handle, legacy_handle, ack_worker],
             topic,
+            ingress: DmInboxIngress { pipeline },
         })
     }
 
@@ -327,10 +426,107 @@ impl DmInboxService {
         &self.topic
     }
 
+    #[must_use]
+    pub(crate) fn ingress(&self) -> DmInboxIngress {
+        self.ingress.clone()
+    }
+
     pub fn abort(&self) {
         for handle in &self.handles {
             handle.abort();
         }
+    }
+}
+
+impl DmInboxIngress {
+    /// Return `false` when `payload` is an ordinary legacy raw DM. A matching
+    /// durable-frame discriminator is always consumed: malformed or
+    /// unauthenticated frames are dropped here and must never fall through to
+    /// the plaintext legacy delivery path.
+    pub(crate) async fn handle_raw_frame(
+        &self,
+        peer_machine_id: MachineId,
+        outer_sender: AgentId,
+        payload: &[u8],
+    ) -> bool {
+        if !is_raw_durable_frame(payload) {
+            return false;
+        }
+        let frame = match decode_raw_durable_frame(payload) {
+            Ok(frame) => frame,
+            Err(error) => {
+                self.pipeline.dm.record_incoming_decode_failed();
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "raw_durable_frame_decode_failed",
+                    sender = %hex::encode(outer_sender.as_bytes()),
+                    machine = %hex::encode(peer_machine_id.as_bytes()),
+                    %error,
+                );
+                return true;
+            }
+        };
+        let sender_public_key = match ant_quic::MlDsaPublicKey::from_bytes(&frame.sender_public_key)
+        {
+            Ok(public_key) => public_key,
+            Err(error) => {
+                self.pipeline.dm.record_incoming_signature_failed();
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "raw_durable_sender_key_invalid",
+                    sender = %hex::encode(outer_sender.as_bytes()),
+                    machine = %hex::encode(peer_machine_id.as_bytes()),
+                    error = ?error,
+                );
+                return true;
+            }
+        };
+        if AgentId::from_public_key(&sender_public_key) != outer_sender {
+            self.pipeline.dm.record_incoming_signature_failed();
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "raw_durable_outer_sender_mismatch",
+                sender = %hex::encode(outer_sender.as_bytes()),
+                machine = %hex::encode(peer_machine_id.as_bytes()),
+            );
+            return true;
+        }
+        match DmEnvelope::from_wire_bytes(&frame.envelope) {
+            Ok(envelope) if envelope.protocol_version >= DM_PROTOCOL_DURABLE_ACK => {}
+            Ok(envelope) => {
+                self.pipeline.dm.record_incoming_decode_failed();
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "raw_durable_protocol_downgrade",
+                    protocol_version = envelope.protocol_version,
+                );
+                return true;
+            }
+            Err(error) => {
+                self.pipeline.dm.record_incoming_decode_failed();
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "raw_durable_envelope_decode_failed",
+                    %error,
+                );
+                return true;
+            }
+        }
+        self.pipeline
+            .handle_incoming_routed(
+                PubSubMessage {
+                    topic: "x0x/dm/v2/raw".to_string(),
+                    payload: Bytes::from(frame.envelope),
+                    sender: Some(outer_sender),
+                    sender_public_key: Some(frame.sender_public_key),
+                    verified: true,
+                    trust_level: None,
+                    raw_envelope: None,
+                },
+                AckRoute::Raw { peer_machine_id },
+            )
+            .await;
+        true
     }
 }
 
@@ -457,6 +653,7 @@ async fn publish_durable_ack_job(
 #[derive(Clone)]
 struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
+    network: Arc<NetworkNode>,
     signing: Arc<SigningContext>,
     self_agent_id: AgentId,
     self_machine_id: MachineId,
@@ -506,6 +703,46 @@ fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool
     )
 }
 
+async fn durable_history_contains_logical_request(
+    history: &crate::history::HistoryHandle,
+    sender: AgentId,
+    request_id: [u8; 16],
+) -> crate::error::HistoryResult<bool> {
+    let store = Arc::clone(history.store());
+    tokio::task::spawn_blocking(move || {
+        let mut before_id = None;
+        loop {
+            let rows = store.query(&crate::history::HistoryQuery {
+                scope: Some(crate::history::Scope::Dm(hex::encode(sender.as_bytes()))),
+                limit: crate::history::MAX_QUERY_LIMIT,
+                before_id,
+                ..Default::default()
+            })?;
+            for row in &rows {
+                let Some(artifact) = row.record.signed_artifact.as_deref() else {
+                    continue;
+                };
+                let Ok(envelope) = DmEnvelope::from_wire_bytes(artifact) else {
+                    continue;
+                };
+                if envelope.sender_agent_id == *sender.as_bytes()
+                    && envelope.request_id == request_id
+                {
+                    return Ok(true);
+                }
+            }
+            if rows.len() < crate::history::MAX_QUERY_LIMIT {
+                return Ok(false);
+            }
+            before_id = rows.last().map(|row| row.id);
+        }
+    })
+    .await
+    .map_err(|error| {
+        crate::error::HistoryError::Database(format!("logical request lookup task failed: {error}"))
+    })?
+}
+
 async fn publish_durable_ack_routes<Primary, Legacy>(
     route_timeout: Duration,
     primary: Primary,
@@ -550,6 +787,11 @@ where
 
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
+        self.handle_incoming_routed(msg, AckRoute::Gossip { ack_legacy_bus })
+            .await;
+    }
+
+    async fn handle_incoming_routed(&self, msg: PubSubMessage, ack_route: AckRoute) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
             (Some(s), Some(pk)) if msg.verified => (s, pk.to_vec()),
             _ => {
@@ -617,7 +859,7 @@ impl InboxPipeline {
                             envelope.request_id,
                             cached_ack_for_protocol(&cached, envelope.protocol_version),
                             envelope.protocol_version,
-                            ack_legacy_bus,
+                            ack_route,
                         )
                         .await;
                     return;
@@ -753,6 +995,21 @@ impl InboxPipeline {
             }
         };
 
+        if let AckRoute::Raw { peer_machine_id } = ack_route {
+            if sender_machine_id != peer_machine_id {
+                self.dm.record_incoming_trust_rejected(sender_agent_id);
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "raw_durable_transport_machine_mismatch",
+                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    attested_machine = %hex::encode(sender_machine_id.as_bytes()),
+                    transport_machine = %hex::encode(peer_machine_id.as_bytes()),
+                    "raw durable DM origin does not match the authenticated QUIC peer"
+                );
+                return;
+            }
+        }
+
         {
             let revoked = self.revocation_set.read().await;
             if drop_if_sender_revoked(&self.dm, &revoked, &sender_agent_id, &sender_machine_id) {
@@ -800,7 +1057,7 @@ impl InboxPipeline {
                     payload,
                     sender_machine_id,
                     sender_pubkey,
-                    ack_legacy_bus,
+                    ack_route,
                 )
                 .await;
             }
@@ -813,7 +1070,7 @@ impl InboxPipeline {
         payload: DmPayload,
         sender_machine_id: MachineId,
         sender_pubkey: Vec<u8>,
-        ack_legacy_bus: bool,
+        ack_route: AckRoute,
     ) {
         let sender_agent_id = AgentId(envelope.sender_agent_id);
         let protocol_version = envelope.protocol_version;
@@ -852,7 +1109,7 @@ impl InboxPipeline {
                             envelope.request_id,
                             outcome,
                             protocol_version,
-                            ack_legacy_bus,
+                            ack_route,
                         )
                         .await;
                 }
@@ -873,6 +1130,19 @@ impl InboxPipeline {
             self.dm.record_incoming_decode_failed();
             return;
         }
+        let (application_payload, thread_meta) =
+            match crate::dm_send::decode_application_payload(protocol_version, plaintext.payload) {
+                Ok(decoded) => decoded,
+                Err(error) => {
+                    self.dm.record_incoming_decode_failed();
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        %error,
+                        "threaded DM payload wrapper rejected"
+                    );
+                    return;
+                }
+            };
 
         // Serialize every protocol generation for one logical request. This
         // prevents simultaneous v1/v2 or primary/legacy copies from each
@@ -894,7 +1164,7 @@ impl InboxPipeline {
                     envelope.request_id,
                     cached_ack_for_protocol(&cached, protocol_version),
                     protocol_version,
-                    ack_legacy_bus,
+                    ack_route,
                 )
                 .await;
             return;
@@ -923,21 +1193,136 @@ impl InboxPipeline {
                     envelope.request_id,
                     DmAckOutcome::Accepted,
                     protocol_version,
-                    ack_legacy_bus,
+                    ack_route,
                 )
                 .await;
             return;
         }
 
+        // The in-memory replay cache is deliberately lost on restart, while
+        // An explicit logical-id retry can rebuild fresh ciphertext for the
+        // same stable request id. Consult durable history before app
+        // dispatch so a timed-out envelope racing an explicit retry cannot
+        // create a second row or a second live delivery after restart.
+        if durable_ack {
+            let Some(history) = self.history.as_ref() else {
+                tracing::warn!(
+                    request_id = %hex::encode(envelope.request_id),
+                    "v2 durable ACK unavailable: history is disabled"
+                );
+                return;
+            };
+            match durable_history_contains_logical_request(
+                history,
+                sender_agent_id,
+                envelope.request_id,
+            )
+            .await
+            {
+                Ok(true) => {
+                    if let Err(error) = self
+                        .cache
+                        .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
+                    {
+                        tracing::error!(
+                            request_id = %hex::encode(envelope.request_id),
+                            ?error,
+                            "durable retry was found in history but replay-cache completion failed; withholding ACK"
+                        );
+                        return;
+                    }
+                    let _ = self
+                        .publish_ack(
+                            sender_agent_id,
+                            envelope.request_id,
+                            DmAckOutcome::Accepted,
+                            protocol_version,
+                            ack_route,
+                        )
+                        .await;
+                    return;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        %error,
+                        "v2 logical-request history lookup failed; withholding ACK and app dispatch"
+                    );
+                    return;
+                }
+            }
+        }
+
         let matches_typed_route = self
             .typed_payload_routes
             .iter()
-            .any(|route| plaintext.payload.starts_with(&route.prefix));
+            .any(|route| application_payload.starts_with(&route.prefix));
         if durable_ack && matches_typed_route {
-            tracing::warn!(
-                request_id = %hex::encode(envelope.request_id),
-                "v2 durable ACK requested for typed protocol payload; withholding ACK"
-            );
+            let (completion_tx, completion_rx) = tokio::sync::oneshot::channel();
+            if !self
+                .route_typed_payload(
+                    sender_agent_id,
+                    sender_machine_id,
+                    application_payload,
+                    Some(decision),
+                    Some(completion_tx),
+                )
+                .await
+            {
+                return;
+            }
+            let remaining_ms = envelope.expires_at_unix_ms.saturating_sub(now_unix_ms());
+            let completion =
+                tokio::time::timeout(Duration::from_millis(remaining_ms.max(1)), completion_rx)
+                    .await;
+            match completion {
+                Ok(Ok(Ok(
+                    DmTypedPayloadCompletion::Inserted | DmTypedPayloadCompletion::Duplicate,
+                ))) => {}
+                Ok(Ok(Err(error))) => {
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        %error,
+                        "strict typed DM handler rejected durable admission; withholding ACK"
+                    );
+                    return;
+                }
+                Ok(Err(_)) => {
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        "strict typed DM handler dropped its completion channel; withholding ACK"
+                    );
+                    return;
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        request_id = %hex::encode(envelope.request_id),
+                        "strict typed DM handler did not complete before envelope expiry; withholding ACK"
+                    );
+                    return;
+                }
+            }
+            if let Err(error) = self
+                .cache
+                .complete_durable(envelope.dedupe_key(), DmAckOutcome::Accepted)
+            {
+                tracing::error!(
+                    request_id = %hex::encode(envelope.request_id),
+                    ?error,
+                    "strict typed DM committed but replay-cache completion failed; withholding ACK"
+                );
+                return;
+            }
+            let _ = self
+                .publish_ack(
+                    sender_agent_id,
+                    envelope.request_id,
+                    DmAckOutcome::Accepted,
+                    protocol_version,
+                    ack_route,
+                )
+                .await;
             return;
         }
 
@@ -945,20 +1330,21 @@ impl InboxPipeline {
             .route_typed_payload(
                 sender_agent_id,
                 sender_machine_id,
-                plaintext.payload.clone(),
+                application_payload.clone(),
                 Some(decision),
+                None,
             )
             .await;
 
         if !is_typed_payload {
             let history_record =
-                match crate::history::classify::classify_dm_payload(&plaintext.payload) {
+                match crate::history::classify::classify_dm_payload(&application_payload) {
                     crate::history::classify::DmPayloadClass::Durable(content_type) => {
                         match envelope.to_wire_bytes() {
                             Ok(artifact) => Some(crate::history::HistoryRecord {
                                 msg_id: crate::history::HistoryRecord::compute_msg_id(
                                     Some(&artifact),
-                                    &plaintext.payload,
+                                    &application_payload,
                                 ),
                                 scope: crate::history::Scope::Dm(hex::encode(
                                     envelope.sender_agent_id,
@@ -971,13 +1357,19 @@ impl InboxPipeline {
                                 seen_at_ms: i64::try_from(now_unix_ms()).unwrap_or(i64::MAX),
                                 direction: crate::history::Direction::Inbound,
                                 content_type: content_type.to_string(),
-                                payload: plaintext.payload.clone(),
+                                payload: application_payload.clone(),
                                 signed_artifact: Some(artifact),
                                 signature: Some(envelope.signature.clone()),
                                 // Mirrors `DM_SIGN_DOMAIN` in `dm.rs`.
                                 sig_context: Some("x0x-dm-v1".to_string()),
                                 provenance: crate::history::Provenance::VerifiedEnvelope,
                                 replace_key: None,
+                                thread_root: thread_meta
+                                    .as_ref()
+                                    .map(DmThreadMeta::thread_root_hex),
+                                thread_parent: thread_meta
+                                    .as_ref()
+                                    .and_then(DmThreadMeta::thread_parent_hex),
                             }),
                             Err(e) => {
                                 tracing::debug!(
@@ -1022,15 +1414,18 @@ impl InboxPipeline {
                 history.record(record);
             }
             self.dm
-                .handle_incoming(
+                .handle_incoming_with_thread(
                     sender_machine_id,
                     sender_agent_id,
-                    plaintext.payload,
+                    application_payload,
                     true,
                     Some(decision),
-                    // Gossip-inbox deliveries carry no point-to-point
-                    // transport observation (issue #120).
-                    None,
+                    DirectInboundMetadata {
+                        // Gossip-inbox deliveries carry no point-to-point
+                        // transport observation (issue #120).
+                        observed_origin: None,
+                        thread_meta,
+                    },
                 )
                 .await;
 
@@ -1062,7 +1457,7 @@ impl InboxPipeline {
                 envelope.request_id,
                 DmAckOutcome::Accepted,
                 protocol_version,
-                ack_legacy_bus,
+                ack_route,
             )
             .await;
     }
@@ -1073,6 +1468,7 @@ impl InboxPipeline {
         sender_machine_id: MachineId,
         payload: Vec<u8>,
         trust_decision: Option<TrustDecision>,
+        completion: Option<tokio::sync::oneshot::Sender<DmTypedPayloadCompletionResult>>,
     ) -> bool {
         let Some(route) = self
             .typed_payload_routes
@@ -1088,6 +1484,7 @@ impl InboxPipeline {
             verified: true,
             trust_decision,
             received_at_unix_ms: now_unix_ms(),
+            completion,
         };
         // Best-effort, NON-BLOCKING hand-off. These typed routes (the
         // group-public-message and KvStore-delta gossip-DM fallbacks) are
@@ -1123,7 +1520,7 @@ impl InboxPipeline {
         acks_request_id: [u8; 16],
         outcome: DmAckOutcome,
         protocol_version: u16,
-        ack_legacy_bus: bool,
+        ack_route: AckRoute,
     ) -> NetworkResult<()> {
         let body = EnvelopeBuilder::build_ack_body(acks_request_id, outcome);
         let created = now_unix_ms();
@@ -1161,34 +1558,61 @@ impl InboxPipeline {
         let encoded = envelope
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
-        let result = if protocol_version >= DM_PROTOCOL_DURABLE_ACK {
-            // Durable v2 owns both publications in the bounded background
-            // worker. The inbox loop can immediately process a subsequent DM
-            // while the target and compatibility-bus routes retain their full
-            // healthy-congestion budgets.
-            self.ack_publisher.try_publish(AckPublishJob {
-                recipient: to,
-                acked_request_id: acks_request_id,
-                protocol_version,
-                encoded: Bytes::from(encoded),
-            })
-        } else {
-            // Preserve v1 exactly: target first, and only publish back on the
-            // compatibility bus when this payload itself arrived there. No
-            // new deadline or background ownership changes legacy behavior.
-            let topic = DmInboxService::inbox_topic_name(&to);
-            let primary = self
-                .pubsub
-                .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
-                .await;
-            let legacy = if ack_legacy_bus {
-                self.pubsub
-                    .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
-                    .await
-            } else {
-                Ok(())
-            };
-            primary.and(legacy)
+        let durable_gossip_job = || AckPublishJob {
+            recipient: to,
+            acked_request_id: acks_request_id,
+            protocol_version,
+            encoded: Bytes::from(encoded.clone()),
+        };
+        let result = match ack_route {
+            AckRoute::Raw { peer_machine_id } => {
+                // The transport receive-ACK fires before x0x admission. Only
+                // this signed v2 ACK, constructed after durable commit,
+                // dispatch, and replay-cache completion, may resolve the
+                // product send. Hedge it through gossip in the bounded ACK
+                // worker so a raw reverse-path race cannot strand the sender.
+                let raw_frame = encode_raw_durable_frame(&self.signing.public_key_bytes, &encoded)?;
+                let raw = self
+                    .network
+                    .send_direct(
+                        &ant_quic::PeerId(peer_machine_id.0),
+                        self.self_agent_id.as_bytes(),
+                        &raw_frame,
+                    )
+                    .await;
+                let hedge = self.ack_publisher.try_publish(durable_gossip_job());
+                match (raw, hedge) {
+                    (Ok(()), _) | (_, Ok(())) => Ok(()),
+                    (Err(raw_error), Err(hedge_error)) => Err(NetworkError::BroadcastError(
+                        format!("raw ACK failed: {raw_error}; gossip hedge failed: {hedge_error}"),
+                    )),
+                }
+            }
+            AckRoute::Gossip { .. } if protocol_version >= DM_PROTOCOL_DURABLE_ACK => {
+                // Durable v2 owns both publications in the bounded background
+                // worker. The inbox loop can immediately process a subsequent
+                // DM while both routes retain their congestion budgets.
+                self.ack_publisher.try_publish(durable_gossip_job())
+            }
+            AckRoute::Gossip { ack_legacy_bus } => {
+                // Preserve v1 exactly: target first, and only publish back on
+                // the compatibility bus when this payload itself arrived
+                // there. No new deadline or background ownership changes
+                // legacy behavior.
+                let topic = DmInboxService::inbox_topic_name(&to);
+                let primary = self
+                    .pubsub
+                    .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
+                    .await;
+                let legacy = if ack_legacy_bus {
+                    self.pubsub
+                        .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
+                        .await
+                } else {
+                    Ok(())
+                };
+                primary.and(legacy)
+            }
         };
         if let Err(error) = &result {
             self.dm.record_ack_publish_route_failed();
@@ -1332,7 +1756,7 @@ mod tests {
                 .await
                 .expect("network node"),
         );
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let pubsub = Arc::new(PubSubManager::new(Arc::clone(&node), None).expect("pubsub"));
         let authenticated_machine_bindings =
             Arc::new(RwLock::new(AuthenticatedMachineBindingCache::default()));
         if let Some(machine_id) = authenticated_machine {
@@ -1364,6 +1788,7 @@ mod tests {
             spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
         let pipeline = InboxPipeline {
             pubsub,
+            network: node,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
             self_agent_id: recipient_agent_id,
             self_machine_id: recipient_machine_id,
@@ -1515,6 +1940,50 @@ mod tests {
         wrap_in_pubsub(harness, sender, &envelope)
     }
 
+    fn threaded_attested_payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        request_byte: u8,
+        thread_meta: &DmThreadMeta,
+    ) -> PubSubMessage {
+        let created_at = now_unix_ms();
+        let application_payload = crate::dm_send::encode_application_payload(
+            b"security regression payload".to_vec(),
+            crate::dm::DM_PROTOCOL_THREADED,
+            Some(thread_meta),
+        )
+        .expect("encode threaded application payload");
+        let body = EnvelopeBuilder::build_payload_body(
+            &[request_byte; 16],
+            sender.agent_id().as_bytes(),
+            harness.recipient_agent_id.as_bytes(),
+            created_at,
+            application_payload,
+            None,
+            &harness.recipient_kem.public_bytes,
+        )
+        .expect("build threaded payload body");
+        let mut envelope = DmEnvelope {
+            protocol_version: crate::dm::DM_PROTOCOL_THREADED,
+            request_id: [request_byte; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created_at,
+            expires_at_unix_ms: created_at + 60_000,
+            body,
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(machine).expect("machine attest v3");
+        envelope.origin_attestation = Some(attestation);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
     fn durable_attested_ack_message(
         harness: &InboxHarness,
         sender: &AgentKeypair,
@@ -1578,13 +2047,258 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn durable_v2_restart_replay_keeps_one_history_row_but_may_redispatch() {
+    async fn raw_durable_v2_uses_strict_pipeline_before_dispatch() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xB1);
+        let exact_envelope = message.payload.clone();
+        let frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), exact_envelope.as_ref())
+                .expect("encode raw durable frame");
+        let ingress = DmInboxIngress {
+            pipeline: harness.pipeline.clone(),
+        };
+
+        assert!(
+            ingress
+                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &frame)
+                .await,
+            "the durable discriminator must be consumed"
+        );
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("raw v2 dispatch timeout")
+            .expect("raw v2 delivery stream closed");
+        assert_eq!(delivered.payload, b"security regression payload");
+        assert_eq!(delivered.machine_id, machine.machine_id());
+
+        let rows = history
+            .store()
+            .query(&HistoryQuery::default())
+            .expect("query committed raw history");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].record.payload, delivered.payload);
+        assert_eq!(
+            rows[0].record.signed_artifact.as_deref(),
+            Some(exact_envelope.as_ref()),
+            "raw and gossip paths must commit the exact same signed envelope"
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_durable_v2_rejects_transport_machine_mismatch_before_commit() {
+        let sender = test_keypair();
+        let attesting_machine = MachineKeypair::generate().expect("sender machine");
+        let different_transport_machine = MachineKeypair::generate()
+            .expect("different transport machine")
+            .machine_id();
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &attesting_machine, 0xB2);
+        let frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), message.payload.as_ref())
+                .expect("encode raw durable frame");
+        let ingress = DmInboxIngress {
+            pipeline: harness.pipeline.clone(),
+        };
+
+        assert!(
+            ingress
+                .handle_raw_frame(different_transport_machine, sender.agent_id(), &frame)
+                .await
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query raw mismatch history")
+                .is_empty(),
+            "a raw transport/envelope binding mismatch must never commit"
+        );
+        assert_eq!(
+            harness
+                .pipeline
+                .dm
+                .diagnostics_snapshot()
+                .stats
+                .incoming_trust_rejected,
+            1
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn raw_v3_root_and_reply_metadata_survive_wire_history_and_restart_retry() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let root_id = "ab".repeat(32);
+        let parent_id = "cd".repeat(32);
+        let root_meta = DmThreadMeta::from_hex(Some(&root_id), None)
+            .expect("root metadata")
+            .expect("root present");
+        let reply_meta = DmThreadMeta::from_hex(Some(&root_id), Some(&parent_id))
+            .expect("reply metadata")
+            .expect("reply present");
+        let ingress = DmInboxIngress {
+            pipeline: harness.pipeline.clone(),
+        };
+
+        let root = threaded_attested_payload_message(&harness, &sender, &machine, 0xB4, &root_meta);
+        let root_frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), root.payload.as_ref())
+                .expect("encode root frame");
+        assert!(
+            ingress
+                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &root_frame)
+                .await
+        );
+        let delivered_root = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("root delivery timeout")
+            .expect("root stream closed");
+        assert_eq!(delivered_root.payload, b"security regression payload");
+        assert_eq!(
+            delivered_root.thread_root.as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(delivered_root.thread_parent, None);
+
+        let reply =
+            threaded_attested_payload_message(&harness, &sender, &machine, 0xB5, &reply_meta);
+        let reply_frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), reply.payload.as_ref())
+                .expect("encode reply frame");
+        assert!(
+            ingress
+                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &reply_frame)
+                .await
+        );
+        let delivered_reply = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("reply delivery timeout")
+            .expect("reply stream closed");
+        assert_eq!(delivered_reply.payload, b"security regression payload");
+        assert_eq!(
+            delivered_reply.thread_root.as_deref(),
+            Some(root_id.as_str())
+        );
+        assert_eq!(
+            delivered_reply.thread_parent.as_deref(),
+            Some(parent_id.as_str())
+        );
+
+        let rows = history
+            .store()
+            .query(&HistoryQuery::default())
+            .expect("query threaded history");
+        assert_eq!(rows.len(), 2);
+        assert!(rows.iter().any(|row| {
+            row.record.thread_root.as_deref() == Some(root_id.as_str())
+                && row.record.thread_parent.is_none()
+        }));
+        assert!(rows.iter().any(|row| {
+            row.record.thread_root.as_deref() == Some(root_id.as_str())
+                && row.record.thread_parent.as_deref() == Some(parent_id.as_str())
+        }));
+
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        let restart_ingress = DmInboxIngress {
+            pipeline: harness.pipeline.clone(),
+        };
+        let retry =
+            threaded_attested_payload_message(&harness, &sender, &machine, 0xB5, &reply_meta);
+        assert_ne!(
+            retry.payload, reply.payload,
+            "retry must use fresh ciphertext"
+        );
+        let retry_frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), retry.payload.as_ref())
+                .expect("encode retry frame");
+        assert!(
+            restart_ingress
+                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &retry_frame)
+                .await
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+        assert_eq!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query threaded history after retry")
+                .len(),
+            2,
+            "restart retry must not duplicate either the row or live dispatch"
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_v2_late_anti_entropy_replay_is_expired_before_commit() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xB3);
+        let mut envelope =
+            DmEnvelope::from_wire_bytes(&message.payload).expect("decode durable envelope");
+        envelope.expires_at_unix_ms = now_unix_ms().saturating_add(20);
+        envelope.signature.clear();
+        envelope.origin_attestation = None;
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(&machine).expect("machine attest");
+        envelope.origin_attestation = Some(attestation);
+        let late_anti_entropy = wrap_in_pubsub(&harness, &sender, &envelope);
+
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        harness
+            .pipeline
+            .handle_incoming(late_anti_entropy, false)
+            .await;
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query expired anti-entropy history")
+                .is_empty(),
+            "a failed logical send must not appear after its deadline through anti-entropy"
+        );
+
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
+    #[tokio::test]
+    async fn durable_v2_restart_retry_with_fresh_ciphertext_does_not_redispatch() {
         let sender = test_keypair();
         let machine = MachineKeypair::generate().expect("sender machine");
         let mut harness = make_inbox_harness(&sender, None, None).await;
         let history = enable_durable_history(&mut harness).await;
         let message = durable_attested_payload_message(&harness, &sender, &machine, 0xA5);
-        let replay_after_restart = message.clone();
+        let retry_after_restart =
+            durable_attested_payload_message(&harness, &sender, &machine, 0xA5);
+        assert_ne!(
+            message.payload, retry_after_restart.payload,
+            "a logical retry should exercise fresh KEM ciphertext"
+        );
 
         harness.pipeline.handle_incoming(message, false).await;
         tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
@@ -1597,12 +2311,9 @@ mod tests {
         harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
         harness
             .pipeline
-            .handle_incoming(replay_after_restart, false)
+            .handle_incoming(retry_after_restart, false)
             .await;
-        tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
-            .await
-            .expect("post-restart replay dispatch timeout")
-            .expect("post-restart delivery stream closed");
+        assert_no_delivery(&mut harness.receiver).await;
 
         assert_eq!(
             history
@@ -1611,7 +2322,7 @@ mod tests {
                 .expect("query post-restart history")
                 .len(),
             1,
-            "SQLite dedupes the exact signed envelope even though the app can see a replay after restart"
+            "stable logical request id must dedupe fresh retry ciphertext across restart"
         );
 
         if let Some(service) = harness.history_service.take() {

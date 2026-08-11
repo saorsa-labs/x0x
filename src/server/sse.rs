@@ -154,7 +154,34 @@ fn direct_message_event_data(msg: &crate::direct::DirectMessage) -> serde_json::
             obj.insert("observed_origin".to_string(), value);
         }
     }
+    insert_thread_fields(
+        &mut data,
+        msg.thread_root.as_ref(),
+        msg.thread_parent.as_ref(),
+    );
     data
+}
+
+fn insert_thread_fields(
+    data: &mut serde_json::Value,
+    thread_root: Option<&String>,
+    thread_parent: Option<&String>,
+) {
+    let Some(object) = data.as_object_mut() else {
+        return;
+    };
+    if let Some(root) = thread_root {
+        object.insert(
+            "thread_root".to_string(),
+            serde_json::Value::String(root.clone()),
+        );
+    }
+    if let Some(parent) = thread_parent {
+        object.insert(
+            "thread_parent".to_string(),
+            serde_json::Value::String(parent.clone()),
+        );
+    }
 }
 
 /// Query parameters for `GET /direct/events` (ADR-0023 §7 backfill).
@@ -195,7 +222,7 @@ pub(super) async fn direct_events_sse(
                     for row in &rows {
                         let r = &row.record;
                         hashes.insert(*blake3::hash(&r.payload).as_bytes());
-                        backfill_rows.push(serde_json::json!({
+                        let mut data = serde_json::json!({
                             "sender": r.author_agent,
                             "machine_id": r.author_machine,
                             "payload": BASE64.encode(&r.payload),
@@ -204,7 +231,13 @@ pub(super) async fn direct_events_sse(
                                 r.provenance,
                                 crate::history::Provenance::VerifiedEnvelope
                             ),
-                        }));
+                        });
+                        insert_thread_fields(
+                            &mut data,
+                            r.thread_root.as_ref(),
+                            r.thread_parent.as_ref(),
+                        );
+                        backfill_rows.push(data);
                     }
                     backfill_hashes = Some(hashes);
                 }

@@ -101,6 +101,10 @@ enum WsOutbound {
         received_at: u64,
         verified: bool,
         trust_decision: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_root: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        thread_parent: Option<String>,
         /// Issue #120: opt-in coarsened origin token. Entirely absent
         /// (never `null`) unless the daemon opted in via
         /// `observed_prefix_enabled` AND the message arrived over the live
@@ -495,6 +499,8 @@ async fn handle_ws_connection(
                                 ),
                                 trust_decision: None,
                                 observed_origin: None,
+                                thread_root: r.thread_root.clone(),
+                                thread_parent: r.thread_parent.clone(),
                             };
                             // Backfill frames are droppable: the store still
                             // holds them and `/history` can re-serve them.
@@ -547,6 +553,8 @@ async fn handle_ws_connection(
                     verified: msg.verified,
                     trust_decision: msg.trust_decision.map(|d| d.to_string()),
                     observed_origin: msg.observed_origin,
+                    thread_root: msg.thread_root,
+                    thread_parent: msg.thread_parent,
                 };
                 // DMs are fire-and-forget (DirectSubscriberQueue, drop-oldest,
                 // 8192 deep — no retaining inbox behind subscribe_direct), so a
@@ -1144,6 +1152,8 @@ mod tests {
             verified: true,
             trust_decision: None,
             observed_origin,
+            thread_root: None,
+            thread_parent: None,
         }
     }
 
