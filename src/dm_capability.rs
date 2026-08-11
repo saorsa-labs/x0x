@@ -30,6 +30,17 @@ use std::time::{Duration, Instant};
 /// subscribes on mesh join.
 pub const DM_CAPABILITY_TOPIC: &str = "x0x/caps/v1";
 
+/// Side-channel on which a late subscriber asks current mesh members to
+/// republish their signed capability advert.
+///
+/// Capability adverts are intentionally ephemeral and normally refresh only
+/// every five minutes. A daemon that joins after another peer's startup burst
+/// would otherwise have to wait for that steady-state refresh. Requests are
+/// themselves carried in authenticated pub/sub envelopes; responders still
+/// build and sign a fresh advert, so this channel grants no capability and
+/// cannot weaken the advert's AgentId + MachineId binding.
+pub const DM_CAPABILITY_REQUEST_TOPIC: &str = "x0x/caps/v1/request";
+
 /// Domain-separation prefix for the advert signature bytes.
 const ADVERT_SIGN_DOMAIN: &[u8] = b"x0x-caps-v1";
 
