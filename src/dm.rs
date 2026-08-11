@@ -1021,6 +1021,15 @@ impl RecentDeliveryCache {
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
+
+    #[cfg(test)]
+    pub(crate) fn poison_for_testing(&self) {
+        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inner.lock().expect("initial cache lock");
+            panic!("poison recent-delivery cache for fail-closed testing");
+        }));
+        assert!(poisoned.is_err(), "cache poison hook must catch its panic");
+    }
 }
 
 // ─── Timestamp window validation ───────────────────────────────────────────
@@ -1482,6 +1491,8 @@ pub struct InFlightAcks {
 }
 
 struct InFlightAck {
+    expected_recipient: AgentId,
+    expected_machine: Option<MachineId>,
     protocol_version: u16,
     reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
 }
@@ -1507,21 +1518,36 @@ impl InFlightAcks {
     /// retry that was already resolved), the existing waiter is silently
     /// replaced. This matches sender-retry semantics where only the most
     /// recent attempt's waiter is of interest.
-    pub fn register(&self, request_id: [u8; 16]) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
-        self.register_for_protocol(request_id, DM_PROTOCOL_V1)
+    pub fn register(
+        &self,
+        request_id: [u8; 16],
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
+    ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
+        self.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_V1,
+            expected_recipient,
+            expected_machine,
+        )
     }
 
-    /// Register a waiter that accepts only an ACK using the negotiated
-    /// protocol version.
+    /// Register a waiter that accepts only an ACK from the intended recipient
+    /// agent using the negotiated protocol version. Strict v2 callers also
+    /// supply the exact signed-advert machine; legacy v1 callers may omit it.
     pub fn register_for_protocol(
         &self,
         request_id: [u8; 16],
         protocol_version: u16,
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
     ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.inner.insert(
             request_id,
             InFlightAck {
+                expected_recipient,
+                expected_machine,
                 protocol_version,
                 reply: tx,
             },
@@ -1532,21 +1558,34 @@ impl InFlightAcks {
     /// Resolve a waiter for `request_id`. Returns true if a waiter was
     /// present, false otherwise (e.g. late ACK arriving after sender gave
     /// up).
-    pub fn resolve(&self, request_id: &[u8; 16], outcome: DmAckOutcome) -> bool {
-        self.resolve_for_protocol(request_id, DM_PROTOCOL_V1, outcome)
+    pub fn resolve(
+        &self,
+        request_id: &[u8; 16],
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: DmAckOutcome,
+    ) -> bool {
+        self.resolve_for_protocol(request_id, DM_PROTOCOL_V1, ack_sender, ack_machine, outcome)
     }
 
-    /// Resolve a waiter only when the ACK matches its negotiated semantics.
+    /// Resolve a waiter only when the authenticated ACK sender agent and
+    /// machine are the intended advert binding and its protocol version
+    /// matches the negotiated semantics.
     pub fn resolve_for_protocol(
         &self,
         request_id: &[u8; 16],
         protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
         outcome: DmAckOutcome,
     ) -> bool {
-        let matches = self
-            .inner
-            .get(request_id)
-            .is_some_and(|pending| pending.protocol_version == protocol_version);
+        let matches = self.inner.get(request_id).is_some_and(|pending| {
+            pending.protocol_version == protocol_version
+                && pending.expected_recipient == ack_sender
+                && pending
+                    .expected_machine
+                    .is_none_or(|expected| expected == ack_machine)
+        });
         if !matches {
             return false;
         }
@@ -1704,11 +1743,7 @@ mod tests {
     fn durable_completion_fails_closed_when_cache_is_poisoned() {
         let cache = RecentDeliveryCache::with_defaults();
         let key = DedupeKey::new(dummy_agent_id(7), [0x77; 16]);
-        let poisoned = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let _guard = cache.inner.lock().expect("initial cache lock");
-            panic!("poison cache for durable completion test");
-        }));
-        assert!(poisoned.is_err());
+        cache.poison_for_testing();
         assert_eq!(
             cache.complete_durable(key, DmAckOutcome::Accepted),
             Err(DurableCacheError::Poisoned)
@@ -1990,16 +2025,18 @@ mod tests {
     fn in_flight_acks_resolve_and_cancel() {
         let acks = InFlightAcks::new();
         let rid = [1u8; 16];
-        let rx = acks.register(rid);
-        assert!(acks.resolve(&rid, DmAckOutcome::Accepted));
+        let recipient = AgentId([7u8; 32]);
+        let machine = MachineId([8u8; 32]);
+        let rx = acks.register(rid, recipient, Some(machine));
+        assert!(acks.resolve(&rid, recipient, machine, DmAckOutcome::Accepted));
         let received = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
         assert_eq!(received.expect("ok"), DmAckOutcome::Accepted);
         // Second resolve → no-op.
-        assert!(!acks.resolve(&rid, DmAckOutcome::Accepted));
+        assert!(!acks.resolve(&rid, recipient, machine, DmAckOutcome::Accepted));
 
         // Cancellation path.
         let rid2 = [2u8; 16];
-        let _rx2 = acks.register(rid2);
+        let _rx2 = acks.register(rid2, recipient, Some(machine));
         acks.cancel(&rid2);
         assert_eq!(acks.outstanding(), 0);
     }
@@ -2008,15 +2045,83 @@ mod tests {
     async fn durable_waiter_rejects_legacy_ack_version() {
         let acks = InFlightAcks::new();
         let rid = [3u8; 16];
-        let mut rx = acks.register_for_protocol(rid, DM_PROTOCOL_DURABLE_ACK);
+        let recipient = AgentId([9u8; 32]);
+        let machine = MachineId([10u8; 32]);
+        let mut rx =
+            acks.register_for_protocol(rid, DM_PROTOCOL_DURABLE_ACK, recipient, Some(machine));
 
-        assert!(!acks.resolve_for_protocol(&rid, DM_PROTOCOL_V1, DmAckOutcome::Accepted));
+        assert!(!acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_V1,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted
+        ));
         assert!(matches!(
             rx.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
-        assert!(acks.resolve_for_protocol(&rid, DM_PROTOCOL_DURABLE_ACK, DmAckOutcome::Accepted));
+        assert!(acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted
+        ));
         assert_eq!(rx.await.expect("v2 ACK"), DmAckOutcome::Accepted);
+    }
+
+    #[tokio::test]
+    async fn durable_waiter_requires_exact_recipient_agent_and_machine() {
+        let acks = InFlightAcks::new();
+        let request_id = [4u8; 16];
+        let intended = AgentId([11u8; 32]);
+        let intended_machine = MachineId([12u8; 32]);
+        let third_party = AgentId([13u8; 32]);
+        let wrong_machine = MachineId([14u8; 32]);
+        let mut receipt = acks.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            intended,
+            Some(intended_machine),
+        );
+
+        assert!(!acks.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            third_party,
+            intended_machine,
+            DmAckOutcome::Accepted
+        ));
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert!(!acks.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            intended,
+            wrong_machine,
+            DmAckOutcome::Accepted
+        ));
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(acks.outstanding(), 1);
+
+        assert!(acks.resolve_for_protocol(
+            &request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            intended,
+            intended_machine,
+            DmAckOutcome::Accepted
+        ));
+        assert_eq!(
+            receipt.await.expect("exact pair ACK"),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(acks.outstanding(), 0);
     }
 
     // ── Issue #213: origin-machine attestation ────────────────────────

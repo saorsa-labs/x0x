@@ -99,9 +99,17 @@ pub struct CapabilityStore {
 
 struct CachedAdvert {
     capabilities: DmCapabilities,
-    _machine_id: [u8; 32],
+    machine_id: [u8; 32],
     seen_at: Instant,
     created_at_unix_ms: u64,
+}
+
+/// TTL-validated capability material together with the signed machine binding
+/// from the same advert.
+#[derive(Debug, Clone)]
+pub struct CapabilityBinding {
+    pub capabilities: DmCapabilities,
+    pub machine_id: MachineId,
 }
 
 impl Default for CapabilityStore {
@@ -131,7 +139,13 @@ impl CapabilityStore {
 
     /// Look up a peer's capability. Returns `None` if unknown or expired.
     pub fn lookup(&self, agent_id: &AgentId) -> Option<DmCapabilities> {
-        self.lookup_at(agent_id, Instant::now())
+        self.lookup_binding(agent_id)
+            .map(|binding| binding.capabilities)
+    }
+
+    /// Look up capability material and its exact signed advert machine.
+    pub fn lookup_binding(&self, agent_id: &AgentId) -> Option<CapabilityBinding> {
+        self.lookup_binding_at(agent_id, Instant::now())
     }
 
     /// Look up a peer's capability as of `now`.
@@ -142,6 +156,12 @@ impl CapabilityStore {
     /// deterministically instead of sleeping past a wall-clock boundary —
     /// the documented CI flake for that assertion (issue: CI de-flake).
     pub fn lookup_at(&self, agent_id: &AgentId, now: Instant) -> Option<DmCapabilities> {
+        self.lookup_binding_at(agent_id, now)
+            .map(|binding| binding.capabilities)
+    }
+
+    /// Testable clock seam for [`Self::lookup_binding`].
+    pub fn lookup_binding_at(&self, agent_id: &AgentId, now: Instant) -> Option<CapabilityBinding> {
         let Ok(mut inner) = self.inner.lock() else {
             return None;
         };
@@ -150,7 +170,10 @@ impl CapabilityStore {
             inner.remove(agent_id.as_bytes());
             return None;
         }
-        Some(entry.capabilities.clone())
+        Some(CapabilityBinding {
+            capabilities: entry.capabilities.clone(),
+            machine_id: MachineId(entry.machine_id),
+        })
     }
 
     /// Insert / refresh a cache entry.
@@ -183,7 +206,7 @@ impl CapabilityStore {
             *agent_id.as_bytes(),
             CachedAdvert {
                 capabilities,
-                _machine_id: *machine_id.as_bytes(),
+                machine_id: *machine_id.as_bytes(),
                 seen_at: Instant::now(),
                 created_at_unix_ms,
             },
@@ -226,6 +249,12 @@ mod tests {
         let got = store.lookup(&agent_id).expect("hit");
         assert_eq!(got.max_protocol_version, caps.max_protocol_version);
         assert_eq!(got.gossip_inbox, caps.gossip_inbox);
+        let binding = store.lookup_binding(&agent_id).expect("bound hit");
+        assert_eq!(binding.machine_id, machine_id);
+        assert_eq!(
+            binding.capabilities.max_protocol_version,
+            caps.max_protocol_version
+        );
     }
 
     /// Gossip delivers adverts out of order. A daemon publishes a `pending`

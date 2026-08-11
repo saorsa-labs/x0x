@@ -358,6 +358,13 @@ fn cached_ack_for_protocol(
     }
 }
 
+fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool {
+    matches!(
+        outcome,
+        crate::history::InsertOutcome::Inserted | crate::history::InsertOutcome::Duplicate
+    )
+}
+
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
@@ -582,6 +589,8 @@ impl InboxPipeline {
                 let resolved = self.inflight.resolve_for_protocol(
                     &ack.acks_request_id,
                     envelope.protocol_version,
+                    sender_agent_id,
+                    sender_machine_id,
                     ack.outcome,
                 );
                 tracing::debug!(
@@ -795,10 +804,7 @@ impl InboxPipeline {
                     return;
                 };
                 match history.record_committed(record).await {
-                    Ok(
-                        crate::history::InsertOutcome::Inserted
-                        | crate::history::InsertOutcome::Duplicate,
-                    ) => {}
+                    Ok(outcome) if exact_durable_history_outcome(outcome) => {}
                     Ok(outcome) => {
                         tracing::warn!(
                             request_id = %hex::encode(envelope.request_id),
@@ -1279,6 +1285,37 @@ mod tests {
         wrap_in_pubsub(harness, sender, &envelope)
     }
 
+    fn durable_attested_ack_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        machine: &MachineKeypair,
+        acked_request_id: [u8; 16],
+        envelope_request_byte: u8,
+    ) -> PubSubMessage {
+        let created_at = now_unix_ms();
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            request_id: [envelope_request_byte; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.machine_id().as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created_at,
+            expires_at_unix_ms: created_at + 60_000,
+            body: DmBody::Ack(crate::dm::DmAckBody {
+                acks_request_id: acked_request_id,
+                outcome: DmAckOutcome::Accepted,
+            }),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope_with_agent(&mut envelope, sender);
+        let mut attestation =
+            DmOriginAttestation::for_envelope(&envelope, machine.public_key().as_bytes().to_vec());
+        attestation.sign(machine).expect("ACK machine attestation");
+        envelope.origin_attestation = Some(attestation);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
     #[tokio::test]
     async fn durable_v2_requires_history_before_dispatch_and_dedupes() {
         let sender = test_keypair();
@@ -1471,6 +1508,47 @@ mod tests {
         assert_no_delivery(&mut harness.receiver).await;
     }
 
+    #[test]
+    fn stale_or_replaced_history_outcome_cannot_complete_durable_delivery() {
+        assert!(exact_durable_history_outcome(
+            crate::history::InsertOutcome::Inserted
+        ));
+        assert!(exact_durable_history_outcome(
+            crate::history::InsertOutcome::Duplicate
+        ));
+        assert!(!exact_durable_history_outcome(
+            crate::history::InsertOutcome::Replaced
+        ));
+        assert!(!exact_durable_history_outcome(
+            crate::history::InsertOutcome::StaleRejected
+        ));
+    }
+
+    #[tokio::test]
+    async fn durable_v2_poisoned_cache_withholds_before_history_and_dispatch() {
+        let sender = test_keypair();
+        let machine = MachineKeypair::generate().expect("sender machine");
+        let mut harness = make_inbox_harness(&sender, None, None).await;
+        let history = enable_durable_history(&mut harness).await;
+        harness.pipeline.cache.poison_for_testing();
+        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xA7);
+
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            history
+                .store()
+                .query(&HistoryQuery::default())
+                .expect("query history")
+                .is_empty(),
+            "poisoned replay cache must withhold before durable history commit"
+        );
+        if let Some(service) = harness.history_service.take() {
+            service.shutdown().await;
+        }
+    }
+
     #[tokio::test]
     async fn durable_v2_rejects_unattested_machine_claim() {
         let sender = test_keypair();
@@ -1485,6 +1563,60 @@ mod tests {
         harness.pipeline.handle_incoming(message, false).await;
 
         assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    #[tokio::test]
+    async fn durable_v2_ack_requires_exact_advertised_agent_and_machine() {
+        let intended = test_keypair();
+        let intended_machine = MachineKeypair::generate().expect("intended machine");
+        let third_party = test_keypair();
+        let third_party_machine = MachineKeypair::generate().expect("third-party machine");
+        let wrong_intended_machine = MachineKeypair::generate().expect("wrong intended machine");
+        let harness = make_inbox_harness(&intended, None, None).await;
+        let request_id = [0xB1; 16];
+        let mut receipt = harness.pipeline.inflight.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            intended.agent_id(),
+            Some(intended_machine.machine_id()),
+        );
+
+        let wrong_agent = durable_attested_ack_message(
+            &harness,
+            &third_party,
+            &third_party_machine,
+            request_id,
+            0xB2,
+        );
+        harness.pipeline.handle_incoming(wrong_agent, false).await;
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(harness.pipeline.inflight.outstanding(), 1);
+
+        let wrong_machine = durable_attested_ack_message(
+            &harness,
+            &intended,
+            &wrong_intended_machine,
+            request_id,
+            0xB3,
+        );
+        harness.pipeline.handle_incoming(wrong_machine, false).await;
+        assert!(matches!(
+            receipt.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        assert_eq!(harness.pipeline.inflight.outstanding(), 1);
+
+        let exact =
+            durable_attested_ack_message(&harness, &intended, &intended_machine, request_id, 0xB4);
+        harness.pipeline.handle_incoming(exact, false).await;
+        assert_eq!(
+            receipt.await.expect("exact recipient ACK"),
+            DmAckOutcome::Accepted
+        );
+        assert_eq!(harness.pipeline.inflight.outstanding(), 0);
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {

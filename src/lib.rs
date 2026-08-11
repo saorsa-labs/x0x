@@ -4425,17 +4425,25 @@ impl Agent {
             return Ok(receipt);
         }
 
-        let advert_cap = self.capability_store.lookup(to);
+        let advert_binding = self.capability_store.lookup_binding(to);
+        let advert_cap = advert_binding
+            .as_ref()
+            .map(|binding| binding.capabilities.clone());
+        let advert_machine = advert_binding.as_ref().map(|binding| binding.machine_id);
         let advert_gossip_ready = advert_cap
             .as_ref()
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
-        let (cap, cap_source) = if advert_gossip_ready {
-            (advert_cap, "advert_cache")
+        let (cap, cap_machine, cap_source) = if advert_gossip_ready {
+            (advert_cap, advert_machine, "advert_cache")
         } else if config.require_durable_app_ack {
             // Static contact cards are not proof that the recipient currently
             // has a functioning history writer. Strict semantics require the
             // signed, TTL-bounded runtime advert.
-            (advert_cap, "advert_cache_unusable_for_durable_ack")
+            (
+                advert_cap,
+                advert_machine,
+                "advert_cache_unusable_for_durable_ack",
+            )
         } else {
             let contact_cap = {
                 let contacts = self.contact_store.read().await;
@@ -4449,11 +4457,13 @@ impl Agent {
             };
             match contact_cap {
                 Some(cap) if advert_cap.is_some() => {
-                    (Some(cap), "contact_card_after_unusable_advert")
+                    (Some(cap), None, "contact_card_after_unusable_advert")
                 }
-                Some(cap) => (Some(cap), "contact_card"),
-                None if advert_cap.is_some() => (advert_cap, "advert_cache_unusable"),
-                None => (None, "none"),
+                Some(cap) => (Some(cap), None, "contact_card"),
+                None if advert_cap.is_some() => {
+                    (advert_cap, advert_machine, "advert_cache_unusable")
+                }
+                None => (None, None, "none"),
             }
         };
         let gossip_ok = cap
@@ -4471,9 +4481,10 @@ impl Agent {
         );
 
         if config.require_durable_app_ack
-            && !cap
+            && (!cap
                 .as_ref()
                 .is_some_and(dm::DmCapabilities::supports_durable_app_ack)
+                || cap_machine.is_none())
         {
             return Err(dm::DmError::AckSemanticsUnavailable(format!(
                 "recipient {} has no current v2 durable-ACK capability advert",
@@ -4589,6 +4600,7 @@ impl Agent {
                             inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
                         },
                         *to,
+                        cap_machine,
                         &kem_pub,
                         payload,
                         &config,
@@ -13328,6 +13340,45 @@ mod tests {
         assert!(
             matches!(err, dm::DmError::LocalGossipUnavailable(_)),
             "unexpected error: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn v1_contact_card_without_runtime_advert_keeps_legacy_gossip_path() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x71; 32]);
+        agent.contacts().write().await.add(contacts::Contact {
+            agent_id: target,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Known,
+            machines: Vec::new(),
+            dm_capabilities: Some(dm::DmCapabilities::v1_gossip_ready(vec![0x72; 1184])),
+        });
+
+        let error = agent
+            .send_direct_with_config(
+                &target,
+                b"legacy contact-only gossip".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("no local gossip runtime");
+        assert!(
+            matches!(error, dm::DmError::LocalGossipUnavailable(_)),
+            "contact-only v1 must reach the legacy gossip gate, not fail machine binding: {error:?}"
         );
     }
 

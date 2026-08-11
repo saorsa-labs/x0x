@@ -60,6 +60,7 @@ pub struct DmSendContext<'a> {
 pub async fn send_via_gossip(
     ctx: DmSendContext<'_>,
     recipient_agent_id: AgentId,
+    recipient_machine_id: Option<MachineId>,
     recipient_kem_public_key: &[u8],
     payload: Vec<u8>,
     config: &DmSendConfig,
@@ -130,7 +131,12 @@ pub async fn send_via_gossip(
         bytes = wire.len(),
     );
 
-    let mut rx = inflight.register_for_protocol(request_id, protocol_version);
+    let mut rx = inflight.register_for_protocol(
+        request_id,
+        protocol_version,
+        recipient_agent_id,
+        recipient_machine_id,
+    );
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
     // X0X-0041: split the lifecycle hint into the per-peer match key and the
@@ -760,7 +766,7 @@ mod tests {
     fn inflight_guard_drop_cancels_unresolved_waiter() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x88; 16];
-        let _rx = inflight.register(request_id);
+        let _rx = inflight.register(request_id, AgentId([0x81; 32]), Some(MachineId([0x82; 32])));
         assert_eq!(inflight.outstanding(), 1);
         {
             let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
@@ -772,7 +778,7 @@ mod tests {
     fn inflight_guard_mark_resolved_preserves_waiter_on_drop() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x89; 16];
-        let _rx = inflight.register(request_id);
+        let _rx = inflight.register(request_id, AgentId([0x83; 32]), Some(MachineId([0x84; 32])));
         let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
         guard.mark_resolved();
         drop(guard);
