@@ -141,6 +141,7 @@ pub struct RawQuicAckRaceTestHook {
     fail_first_attempt_before_send: AtomicBool,
     fail_first_attempt_backpressured: AtomicBool,
     queue_replaced_after_first_result: AtomicBool,
+    queue_lagged_replaced_after_first_result: AtomicBool,
     hold_repair_retry_before_send: AtomicBool,
 }
 
@@ -164,6 +165,7 @@ impl Default for RawQuicAckRaceTestHook {
             fail_first_attempt_before_send: AtomicBool::new(false),
             fail_first_attempt_backpressured: AtomicBool::new(false),
             queue_replaced_after_first_result: AtomicBool::new(false),
+            queue_lagged_replaced_after_first_result: AtomicBool::new(false),
             hold_repair_retry_before_send: AtomicBool::new(false),
         }
     }
@@ -223,6 +225,27 @@ impl RawQuicAckRaceTestHook {
         }
     }
 
+    /// Queue a same-peer `Replaced` plus enough unrelated events to force
+    /// broadcast lag, then return the successful send result to the select.
+    #[must_use]
+    pub fn new_ready_lagged_replaced_after_success() -> Self {
+        Self {
+            hold_first_attempt_result: AtomicBool::new(false),
+            queue_lagged_replaced_after_first_result: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
+    /// Queue the same deterministic lag burst but keep the successful send
+    /// result pending, forcing the select's `RecvError::Lagged` branch.
+    #[must_use]
+    pub fn new_pending_lagged_replaced_after_success() -> Self {
+        Self {
+            queue_lagged_replaced_after_first_result: AtomicBool::new(true),
+            ..Self::default()
+        }
+    }
+
     pub async fn wait_first_attempt_started(&self) {
         self.first_attempt_started.notified().await;
     }
@@ -277,6 +300,11 @@ impl RawQuicAckRaceTestHook {
 
     pub(crate) fn take_queue_replaced_after_first_result(&self) -> bool {
         self.queue_replaced_after_first_result
+            .swap(false, Ordering::Relaxed)
+    }
+
+    pub(crate) fn take_queue_lagged_replaced_after_first_result(&self) -> bool {
+        self.queue_lagged_replaced_after_first_result
             .swap(false, Ordering::Relaxed)
     }
 

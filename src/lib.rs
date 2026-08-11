@@ -5385,6 +5385,25 @@ impl Agent {
                     self.direct_messaging
                         .record_lifecycle_replaced(machine_id, next_generation);
                 }
+                if result.as_ref().is_some_and(Result::is_ok)
+                    && hook.take_queue_lagged_replaced_after_first_result()
+                {
+                    let next_generation = pre_send_generation.unwrap_or(0).saturating_add(1);
+                    self.direct_messaging
+                        .record_lifecycle_replaced(machine_id, next_generation);
+                    // The lifecycle broadcast retains 256 entries. Queue the
+                    // target first, then 300 unrelated entries synchronously
+                    // inside this polled future, before yielding to select, so
+                    // the target can only be recovered from lifecycle state.
+                    for marker in 0_u16..300 {
+                        let mut unrelated = [0xF0_u8; 32];
+                        unrelated[..2].copy_from_slice(&marker.to_be_bytes());
+                        self.direct_messaging.record_lifecycle_replaced(
+                            identity::MachineId(unrelated),
+                            u64::from(marker),
+                        );
+                    }
+                }
                 hook.hold_first_attempt_result().await;
             }
             result
