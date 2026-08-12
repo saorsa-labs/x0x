@@ -1155,6 +1155,16 @@ pub async fn serve_with_options(
                 else {
                     continue;
                 };
+                // Installing a group persists state and spawns listener tasks,
+                // so require the transport-verified AgentId→MachineId binding
+                // before the consent gate consults contact trust for `sender`.
+                if !msg.verified {
+                    tracing::warn!(
+                        sender = %hex::encode(msg.sender.as_bytes()),
+                        "dropping signed-public group bootstrap from unverified direct sender"
+                    );
+                    continue;
+                }
                 tracing::debug!(
                     sender = %hex::encode(msg.sender.as_bytes()),
                     len = msg.payload.len(),
