@@ -29,3 +29,23 @@ test-group = "quic-localhost"
 [[profile.default.overrides]]
 filter = "binary(f2_public_group_bootstrap_wiring)"
 test-group = "quic-localhost"
+
+# Issue #316: these two loopback tests flake only under full parallel load
+# (never in isolation). Serial-group placement alone proved insufficient —
+# the trigger is ambient suite load starving their timing windows, not
+# group-internal contention — so they also reserve scheduler slots via
+# threads-required. Not retries, not wider deadlines (ADR 0025 — a flake
+# is not an observation).
+[[profile.default.overrides]]
+filter = "test(direct_send_with_require_ack_round_trips_to_live_peer) | test(=tests::suppressed_peer_inbound_redial_is_rejected)"
+test-group = "quic-localhost"
+threads-required = 4
+
+# The slice-1 regression tests each stand up multiple loopback QUIC
+# endpoints; unserialized they add enough contention to break the
+# gossip_plane_isolation stay-down window (2-of-2 full-run repro, green
+# with these excluded, green on the v0.37.1 baseline). The plane-isolation
+# binary itself is multi-endpoint loopback and belongs in the group too.
+[[profile.default.overrides]]
+filter = "test(discovered_but_disconnected_peer_is_dialed_by_same_send) | test(identity_epoch_converges_with_linear_application_publishes) | test(non_treekem_self_leave_directly_delivers_member_removed_to_retained_owner) | binary(gossip_plane_isolation)"
+test-group = "quic-localhost"
