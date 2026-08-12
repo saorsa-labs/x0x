@@ -1,9 +1,9 @@
 # ADR 0021: DM origin-machine attestation for gossip DMs
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-08-12, approved by David Irvine)
 - **Date:** 2026-07-17
 - **Decision owners:** x0x maintainers
-- **Reviewers:** (pending)
+- **Reviewers:** David Irvine (acceptance review, 2026-08-12)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** issue #213; issue #184 (retained-binding mitigation); #204 ForwardV2 attestation (`src/forward.rs`); ADR 0018 (key lifecycle / revocation)
