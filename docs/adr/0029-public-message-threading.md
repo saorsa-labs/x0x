@@ -1,9 +1,16 @@
 # ADR 0029: First-Class Threading on Signed Public Group Messages
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-08-12, approved by David Irvine; delivery
+  ahead of acceptance is ratified — v0.36.0 (PR #293) shipped the core:
+  the `x0x.group.public-message.v2` signing domain, `msg_id =
+  BLAKE3(signable_bytes())`, `thread_root`/`thread_parent` on
+  `GroupPublicMessage` and `POST /groups/:id/send`, v1 byte-identity when
+  the fields are absent, and the `GET /groups/:id/messages?thread_root=`
+  filter; v0.37.0 added the `GET /history` thread-field exposure. The
+  remaining follow-up is the GUI migration off the side-topic scheme)
 - **Date:** 2026-08-06
 - **Decision owners:** David Irvine
-- **Reviewers:** (pending)
+- **Reviewers:** David Irvine (acceptance review, 2026-08-12)
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** ADR 0023 (durable local history); ADR 0028 (delivery order is
