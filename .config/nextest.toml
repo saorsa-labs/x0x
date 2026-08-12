@@ -25,3 +25,7 @@ test-group = "quic-localhost"
 [[profile.default.overrides]]
 filter = "binary(threading_integration)"
 test-group = "quic-localhost"
+
+[[profile.default.overrides]]
+filter = "binary(f2_public_group_bootstrap_wiring)"
+test-group = "quic-localhost"

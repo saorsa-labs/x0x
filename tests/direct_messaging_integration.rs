@@ -7,6 +7,7 @@
 
 use std::time::{Duration, Instant};
 use tempfile::TempDir;
+use x0x::history::{Direction, HistoryConfig, HistoryQuery, HistoryRecord, Provenance, Scope};
 use x0x::identity::{AgentId, MachineId};
 use x0x::network::NetworkConfig;
 use x0x::{Agent, DirectMessage, DiscoveredAgent};
@@ -248,6 +249,161 @@ async fn test_send_direct_loopback_delivery_between_agents(
     assert!(received.verified);
 
     Ok(())
+}
+
+/// The raw-QUIC receive loop — not just `raw_dm_history_record` in isolation —
+/// must persist an inbound history row for a verified direct message.
+///
+/// The two unit tests in `src/lib.rs` (`verified_raw_dm_builds_durable_inbound_history`
+/// and `raw_dm_history_rejects_unverified_blocked_and_plumbing_payloads`) call
+/// `raw_dm_history_record` directly and never reach the listener, so they stay
+/// green if the production call site is deleted. This test drives a real DM
+/// down the raw path and reads the receiver's durable store.
+///
+/// REVERT GUARD: delete the `if let (Some(history), Some(record)) = (...)
+/// { history.record(record); }` block from `Agent::start_direct_listener`
+/// (src/lib.rs, the ADR-0023 comment above the raw-QUIC recorder) and this
+/// test fails with "raw-QUIC receive loop must persist an inbound history
+/// row". Both `raw_dm_history_record` unit tests keep passing.
+///
+/// Why only the raw path can satisfy this assertion: the other inbound
+/// recorder is `dm_inbox::DmInboxService`, which is spawned exclusively by
+/// `Agent::start_dm_inbox` — called only by the daemon (`src/server/mod.rs`),
+/// never by `Agent::builder()`. Bob therefore has no gossip inbox at all, and
+/// the `DmPath::RawQuic` receipt asserted below confirms Alice used the raw
+/// stream rather than a gossip envelope. Alice's outbound recorder writes to
+/// *her* store, and she has history disabled.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn raw_dm_receive_loop_records_inbound_history() {
+    let temp_dir = TempDir::new().unwrap();
+
+    // Alice sends with history disabled so the only writer touching a store in
+    // this test is Bob's inbound raw-QUIC recorder.
+    let alice = Agent::builder()
+        .with_machine_key(temp_dir.path().join("alice_history_machine.key"))
+        .with_agent_key_path(temp_dir.path().join("alice_history_agent.key"))
+        .with_contact_store_path(temp_dir.path().join("alice_history_contacts.json"))
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .build()
+        .await
+        .expect("alice");
+
+    let bob = Agent::builder()
+        .with_machine_key(temp_dir.path().join("bob_history_machine.key"))
+        .with_agent_key_path(temp_dir.path().join("bob_history_agent.key"))
+        .with_contact_store_path(temp_dir.path().join("bob_history_contacts.json"))
+        .with_peer_cache_disabled()
+        .with_network_config(loopback_network_config())
+        .with_history(HistoryConfig {
+            enabled: true,
+            db_path: Some(temp_dir.path().join("bob_history.db")),
+            ..HistoryConfig::default()
+        })
+        .build()
+        .await
+        .expect("bob");
+
+    alice.join_network().await.expect("alice join_network");
+    bob.join_network().await.expect("bob join_network");
+
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_network = bob.network().expect("bob network").clone();
+    let alice_addr = normalize_loopback(alice_network.bound_addr().await.expect("alice bound"));
+    let bob_addr = normalize_loopback(bob_network.bound_addr().await.expect("bob bound"));
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+    let connected = alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("alice must connect to bob");
+    assert_eq!(connected.0, bob.machine_id().0);
+
+    let connected_deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < connected_deadline {
+        if alice_network.is_connected(&bob_peer).await {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(alice_network.is_connected(&bob_peer).await);
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("system time after epoch")
+        .as_secs();
+    // Bob's discovery cache is what makes the inbound AgentId->MachineId
+    // binding `verified`; without it `raw_dm_history_record` returns None and
+    // no row is ever built, regardless of the call site.
+    alice
+        .insert_discovered_agent_for_testing(discovered_agent(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_agent(&alice, alice_addr, now_secs))
+        .await;
+    alice
+        .direct_messaging()
+        .mark_connected(bob.agent_id(), bob.machine_id())
+        .await;
+
+    let payload = br#"{"text":"raw-history-wiring","clientId":"f2-raw-dm"}"#.to_vec();
+    let receipt = alice
+        .send_direct(&bob.agent_id(), payload.clone())
+        .await
+        .expect("send_direct must succeed");
+    assert_eq!(
+        receipt.path,
+        x0x::dm::DmPath::RawQuic,
+        "this test only guards the raw-QUIC recorder; a gossip-path receipt \
+         would mean the message never reached the listener under test"
+    );
+
+    let history = bob.history().expect("bob history enabled").clone();
+    let scope = Scope::Dm(hex::encode(alice.agent_id().as_bytes()));
+    let expected_msg_id = HistoryRecord::compute_msg_id(None, &payload);
+
+    // The history writer is a background thread, so the row lands
+    // asynchronously; poll rather than sleep a fixed interval.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let row = loop {
+        let query_handle = history.clone();
+        let query_scope = scope.clone();
+        let rows = tokio::task::spawn_blocking(move || {
+            query_handle
+                .store()
+                .query(&HistoryQuery {
+                    scope: Some(query_scope),
+                    limit: 16,
+                    ..HistoryQuery::default()
+                })
+                .expect("history query")
+        })
+        .await
+        .expect("history query task");
+
+        if let Some(row) = rows
+            .into_iter()
+            .find(|row| row.record.msg_id == expected_msg_id)
+        {
+            break row;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "raw-QUIC receive loop must persist an inbound history row for a \
+             verified DM within 5 s; if this fails, the `history.record(record)` \
+             call was removed from Agent::start_direct_listener (the two \
+             raw_dm_history_record unit tests cannot catch that)"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    };
+
+    assert_eq!(
+        row.record.author_agent,
+        Some(hex::encode(alice.agent_id().as_bytes())),
+        "the persisted row must attribute the message to the sending agent"
+    );
+    assert_eq!(row.record.direction, Direction::Inbound);
+    assert_eq!(row.record.payload, payload);
+    assert_eq!(row.record.provenance, Provenance::VerifiedEnvelope);
 }
 
 /// Test the DirectMessageReceiver subscription mechanism.
