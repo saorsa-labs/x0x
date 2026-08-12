@@ -2,6 +2,32 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.37.1] - 2026-08-12
+
+Hardening follow-up to v0.37.0: the signed-public bootstrap listener now
+requires the transport-verified sender binding, and the v0.37.0 delivery
+features gain handler-level wiring tests that fail if their dispatch is
+removed.
+
+### Fixed
+
+- **Verified-sender gate on the signed-public bootstrap listener.** The
+  direct-channel listener that installs SignedPublic group bootstraps now
+  drops messages whose transport AgentId→MachineId binding is unverified
+  before the consent gate consults contact trust, matching the sibling
+  direct-channel handlers. Defense-in-depth: the ML-DSA commit validation
+  and Known-trust consent gate already guarded the install path.
+
+### Testing
+
+- **Handler-level wiring tests with proven revert guards** (PR #315).
+  `raw_dm_receive_loop_records_inbound_history` fails if the raw-QUIC
+  receive loop stops recording durable history;
+  `serve_installs_signed_public_group_from_direct_bootstrap` boots two
+  in-process daemons and fails if `serve_with_options` stops dispatching
+  `PublicGroupBootstrap`. The new dual-daemon binary runs in the
+  `quic-localhost` serial nextest group.
+
 ## [v0.37.0] - 2026-08-10
 
 Delivery-path follow-up to the v0.36.2 transport wedge fix: raw-QUIC direct
