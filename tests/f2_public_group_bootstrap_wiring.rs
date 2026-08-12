@@ -222,12 +222,17 @@ async fn serve_installs_signed_public_group_from_direct_bootstrap() {
     }
 
     // The installed group must be bob's, not a locally-created shell: the
-    // authority is the sender and alice is an active member.
+    // creator is the sending authority (alice cannot locally create a group
+    // whose creator is bob) and the roster carries both members.
     let groups = alice.get_json("/groups").await;
     let installed = group_entry(&groups, &group_name).expect("installed group entry");
-    assert!(
-        installed.to_string().contains(&bob_agent),
-        "the installed roster must carry bob as the authority: {installed:?}"
+    assert_eq!(
+        installed["creator"], bob_agent,
+        "the installed group's creator must be the sending authority: {installed:?}"
+    );
+    assert_eq!(
+        installed["member_count"], 2,
+        "the installed roster must carry both the authority and alice: {installed:?}"
     );
 }
 
