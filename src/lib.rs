@@ -2572,6 +2572,8 @@ async fn persist_and_deliver_legacy_raw_dm(
 const MAX_INFLIGHT_CAPABILITY_REFRESHES: usize = 256;
 const CAPABILITY_REFRESH_TARGETED_ONLY_WAIT: std::time::Duration =
     std::time::Duration::from_secs(1);
+const CAPABILITY_REFRESH_TARGETED_RETRY_INTERVAL: std::time::Duration =
+    std::time::Duration::from_secs(1);
 const CAPABILITY_REFRESH_CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
 const CAPABILITY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
@@ -2939,6 +2941,7 @@ async fn run_strict_capability_refresh(
     }
 
     let mut fallback_sent = false;
+    let mut next_targeted_retry = fallback_at;
     loop {
         if capability_binding_supports_durable_ack(
             capability_store.lookup_binding(&recipient).as_ref(),
@@ -2948,6 +2951,27 @@ async fn run_strict_capability_refresh(
         let now = tokio::time::Instant::now();
         if now >= deadline {
             return;
+        }
+        if now >= next_targeted_retry {
+            let retry_result = tokio::select! {
+                result = publish(Some(recipient)) => Some(result),
+                () = tokio::time::sleep_until(deadline) => None,
+                () = shutdown_token.cancelled() => None,
+            };
+            let Some(retry_result) = retry_result else {
+                return;
+            };
+            if let Err(error) = retry_result {
+                tracing::warn!(
+                    target: "dm.trace",
+                    recipient = %hex::encode(recipient.as_bytes()),
+                    %error,
+                    "targeted capability refresh retry publish failed"
+                );
+            }
+            next_targeted_retry =
+                tokio::time::Instant::now() + CAPABILITY_REFRESH_TARGETED_RETRY_INTERVAL;
+            continue;
         }
         if !fallback_sent && now >= fallback_at {
             let fallback_result = tokio::select! {
@@ -2970,11 +2994,10 @@ async fn run_strict_capability_refresh(
             continue;
         }
         let next_poll = now + CAPABILITY_REFRESH_POLL_INTERVAL;
-        let next_wake = if fallback_sent {
-            std::cmp::min(next_poll, deadline)
-        } else {
-            std::cmp::min(next_poll, fallback_at)
-        };
+        let next_wake = std::cmp::min(
+            std::cmp::min(next_poll, next_targeted_retry),
+            if fallback_sent { deadline } else { fallback_at },
+        );
         tokio::select! {
             () = tokio::time::sleep_until(next_wake) => {}
             () = shutdown_token.cancelled() => return,
@@ -19087,6 +19110,141 @@ async fn stalled_capability_publish_obeys_caller_deadline_and_cleans_slot() {
     })
     .await
     .expect("deadline-cancelled publish retained its registry slot");
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_restart_refresh_retries_targeted_request_until_v3_card_arrives() {
+    let capability_store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+    let recipient_keypair = identity::AgentKeypair::generate().expect("recipient keypair");
+    let recipient = recipient_keypair.agent_id();
+    let recipient_machine = identity::MachineId([0xAE; 32]);
+    let recipient_signing =
+        std::sync::Arc::new(gossip::SigningContext::from_keypair(&recipient_keypair));
+    let signed_v3 = bytes::Bytes::from(
+        dm_capability_service::build_signed_advert(
+            &recipient_signing,
+            recipient,
+            recipient_machine,
+            dm::DmCapabilities::v3_threaded_durable_gossip_ready(vec![0xAF; 1184]),
+        )
+        .expect("signed current v3 advert"),
+    );
+    let targeted_publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started_at = tokio::time::Instant::now();
+    let fallback_at = started_at + CAPABILITY_REFRESH_TARGETED_ONLY_WAIT;
+    let deadline = started_at + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+
+    run_strict_capability_refresh(
+        recipient,
+        std::sync::Arc::clone(&capability_store),
+        tokio_util::sync::CancellationToken::new(),
+        std::sync::Arc::new(CapabilityRefreshIntent::new(false)),
+        fallback_at,
+        deadline,
+        {
+            let capability_store = std::sync::Arc::clone(&capability_store);
+            let recipient_signing = std::sync::Arc::clone(&recipient_signing);
+            let signed_v3 = signed_v3.clone();
+            let targeted_publishes = std::sync::Arc::clone(&targeted_publishes);
+            move |requested_agent_id| {
+                let capability_store = std::sync::Arc::clone(&capability_store);
+                let recipient_signing = std::sync::Arc::clone(&recipient_signing);
+                let signed_v3 = signed_v3.clone();
+                let targeted_publishes = std::sync::Arc::clone(&targeted_publishes);
+                Box::pin(async move {
+                    if requested_agent_id == Some(recipient)
+                        && targeted_publishes.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                            == 1
+                    {
+                        // A fresh multi-hop topic can lose the first request
+                        // while relay eager sets are forming. Model the exact
+                        // target answering the retry with its current signed
+                        // v3 runtime card.
+                        let response = gossip::PubSubMessage {
+                            topic: dm_capability_service::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC
+                                .to_string(),
+                            payload: signed_v3,
+                            sender: Some(recipient),
+                            sender_public_key: Some(recipient_signing.public_key_bytes.clone()),
+                            verified: true,
+                            trust_level: None,
+                            raw_envelope: None,
+                        };
+                        assert!(dm_capability_service::ingest_verified_capability_advert(
+                            &capability_store,
+                            identity::AgentId([0xAC; 32]),
+                            &response,
+                        ));
+                    }
+                    Ok(())
+                })
+            }
+        },
+    )
+    .await;
+
+    assert!(
+        targeted_publishes.load(std::sync::atomic::Ordering::Relaxed) >= 2,
+        "an empty post-restart cache must retry the exact-recipient request"
+    );
+    let binding = capability_store
+        .lookup_binding(&recipient)
+        .expect("current signed v3 response must satisfy the bounded refresh");
+    assert_eq!(binding.machine_id, recipient_machine);
+    assert!(binding.capabilities.supports_thread_metadata());
+}
+
+#[tokio::test(start_paused = true)]
+async fn fresh_restart_refresh_stays_bounded_without_a_signed_card() {
+    let capability_store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
+    let recipient = identity::AgentId([0xB4; 32]);
+    let targeted_publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let fleet_publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let started_at = tokio::time::Instant::now();
+    let fallback_at = started_at + CAPABILITY_REFRESH_TARGETED_ONLY_WAIT;
+    let deadline = started_at + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+
+    run_strict_capability_refresh(
+        recipient,
+        std::sync::Arc::clone(&capability_store),
+        tokio_util::sync::CancellationToken::new(),
+        std::sync::Arc::new(CapabilityRefreshIntent::new(false)),
+        fallback_at,
+        deadline,
+        {
+            let targeted_publishes = std::sync::Arc::clone(&targeted_publishes);
+            let fleet_publishes = std::sync::Arc::clone(&fleet_publishes);
+            move |requested_agent_id| {
+                let targeted_publishes = std::sync::Arc::clone(&targeted_publishes);
+                let fleet_publishes = std::sync::Arc::clone(&fleet_publishes);
+                Box::pin(async move {
+                    if requested_agent_id == Some(recipient) {
+                        targeted_publishes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        fleet_publishes.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    }
+                    Ok(())
+                })
+            }
+        },
+    )
+    .await;
+
+    assert_eq!(tokio::time::Instant::now(), deadline);
+    assert_eq!(
+        targeted_publishes.load(std::sync::atomic::Ordering::Relaxed),
+        3,
+        "the bounded window carries one initial request and two retries"
+    );
+    assert_eq!(
+        fleet_publishes.load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "the mixed-version fleet hint remains single-shot"
+    );
+    assert!(
+        capability_store.lookup_binding(&recipient).is_none(),
+        "request publication alone must never manufacture ACK semantics"
+    );
 }
 
 #[tokio::test]

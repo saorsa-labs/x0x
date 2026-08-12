@@ -19,6 +19,7 @@ use tokio::task::JoinHandle;
 pub const ADVERT_PROTOCOL_VERSION: u16 = 1;
 const FLEET_REQUEST_PROTOCOL_VERSION: u16 = 1;
 const TARGETED_REQUEST_PROTOCOL_VERSION: u16 = 2;
+const WARM_TARGETED_REQUEST_DOMAIN: &[u8] = b"x0x/caps/v1/targeted-request-v2\0";
 
 /// Dedicated response topic for an exact-recipient strict refresh.
 ///
@@ -70,10 +71,11 @@ pub(crate) enum DecodedCapabilityAdvertRequest {
 
 /// Decode a request according to its exact topic-owned wire contract.
 ///
-/// The fleet topic remains the original one-field postcard layout. Targeted
-/// requests are never decoded on that topic, preventing an older responder
-/// (whose v1 decoder accepts trailing postcard bytes) from amplifying them as
-/// fleet requests.
+/// The fleet-request topic remains the original one-field postcard layout.
+/// The steady advert topic accepts a targeted request only behind an explicit
+/// domain prefix and exact postcard consumption. Older responders therefore
+/// see an invalid advert rather than mistaking the targeted payload for the
+/// legacy fleet request whose decoder accepts trailing bytes.
 pub(crate) fn decode_capability_advert_request(
     topic: &str,
     payload: &[u8],
@@ -92,8 +94,41 @@ pub(crate) fn decode_capability_advert_request(
                 },
             )
         }
+        DM_CAPABILITY_TOPIC => {
+            let encoded = payload.strip_prefix(WARM_TARGETED_REQUEST_DOMAIN)?;
+            let (request, trailing) =
+                postcard::take_from_bytes::<TargetedCapabilityAdvertRequest>(encoded).ok()?;
+            (trailing.is_empty() && request.protocol_version == TARGETED_REQUEST_PROTOCOL_VERSION)
+                .then_some(DecodedCapabilityAdvertRequest::Targeted {
+                    requested_agent_id: AgentId(request.requested_agent_id),
+                })
+        }
         _ => None,
     }
+}
+
+fn encode_targeted_capability_advert_request(
+    requested_agent_id: AgentId,
+) -> NetworkResult<Vec<u8>> {
+    let request = TargetedCapabilityAdvertRequest {
+        protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
+        requested_agent_id: *requested_agent_id.as_bytes(),
+    };
+    postcard::to_stdvec(&request).map_err(|error| {
+        NetworkError::SerializationError(format!(
+            "targeted capability advert request encode: {error}"
+        ))
+    })
+}
+
+fn encode_warm_targeted_capability_advert_request(
+    requested_agent_id: AgentId,
+) -> NetworkResult<Vec<u8>> {
+    let targeted = encode_targeted_capability_advert_request(requested_agent_id)?;
+    let mut warm = Vec::with_capacity(WARM_TARGETED_REQUEST_DOMAIN.len() + targeted.len());
+    warm.extend_from_slice(WARM_TARGETED_REQUEST_DOMAIN);
+    warm.extend_from_slice(&targeted);
+    Ok(warm)
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -125,39 +160,67 @@ pub(crate) async fn publish_capability_advert_request(
     pubsub: &PubSubManager,
     requested_agent_id: Option<AgentId>,
 ) -> NetworkResult<()> {
-    let (topic, request_bytes) = match requested_agent_id {
-        Some(requested_agent_id) => {
-            let request = TargetedCapabilityAdvertRequest {
-                protocol_version: TARGETED_REQUEST_PROTOCOL_VERSION,
-                requested_agent_id: *requested_agent_id.as_bytes(),
-            };
-            let bytes = postcard::to_stdvec(&request).map_err(|error| {
-                NetworkError::SerializationError(format!(
-                    "targeted capability advert request encode: {error}"
-                ))
-            })?;
-            (DM_CAPABILITY_TARGETED_REQUEST_TOPIC, bytes)
+    if let Some(requested_agent_id) = requested_agent_id {
+        let targeted = encode_targeted_capability_advert_request(requested_agent_id)?;
+        let warm = encode_warm_targeted_capability_advert_request(requested_agent_id)?;
+        let (targeted_result, warm_result) = tokio::join!(
+            pubsub.publish(
+                DM_CAPABILITY_TARGETED_REQUEST_TOPIC.to_string(),
+                Bytes::from(targeted),
+            ),
+            pubsub.publish(DM_CAPABILITY_TOPIC.to_string(), Bytes::from(warm)),
+        );
+        match (targeted_result, warm_result) {
+            (Ok(()), Ok(())) => {}
+            (Ok(()), Err(error)) => tracing::warn!(
+                target: "dm.trace",
+                recipient = %hex::encode(requested_agent_id.as_bytes()),
+                %error,
+                "warm capability refresh request carrier publish failed"
+            ),
+            (Err(error), Ok(())) => tracing::warn!(
+                target: "dm.trace",
+                recipient = %hex::encode(requested_agent_id.as_bytes()),
+                %error,
+                "critical capability refresh request carrier publish failed"
+            ),
+            (Err(targeted_error), Err(warm_error)) => {
+                return Err(NetworkError::ConnectionFailed(format!(
+                    "both targeted capability request carriers failed: critical={targeted_error}; warm={warm_error}"
+                )));
+            }
         }
-        None => {
-            let request = FleetCapabilityAdvertRequest {
-                protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
-            };
-            let bytes = postcard::to_stdvec(&request).map_err(|error| {
-                NetworkError::SerializationError(format!(
-                    "fleet capability advert request encode: {error}"
-                ))
-            })?;
-            (DM_CAPABILITY_REQUEST_TOPIC, bytes)
-        }
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "capability_refresh_request_published",
+            kind = "targeted_v2",
+            recipient = %hex::encode(requested_agent_id.as_bytes()),
+            carriers = "critical_and_warm",
+        );
+        return Ok(());
+    }
+
+    let request_bytes = {
+        let request = FleetCapabilityAdvertRequest {
+            protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
+        };
+        postcard::to_stdvec(&request).map_err(|error| {
+            NetworkError::SerializationError(format!(
+                "fleet capability advert request encode: {error}"
+            ))
+        })?
     };
     pubsub
-        .publish(topic.to_string(), Bytes::from(request_bytes))
+        .publish(
+            DM_CAPABILITY_REQUEST_TOPIC.to_string(),
+            Bytes::from(request_bytes),
+        )
         .await?;
     tracing::debug!(
         target: "dm.trace",
         stage = "capability_refresh_request_published",
-        kind = if requested_agent_id.is_some() { "targeted_v2" } else { "fleet_v1" },
-        recipient = requested_agent_id.map(|agent_id| hex::encode(agent_id.as_bytes())),
+        kind = "fleet_v1",
+        recipient = Option::<String>::None,
     );
     Ok(())
 }
@@ -261,11 +324,31 @@ impl CapabilityAdvertService {
         let self_agent_for_targeted_sub = self_agent_id;
         let (reannounce_tx, mut reannounce_rx) =
             tokio::sync::mpsc::channel::<ReannounceRequest>(16);
+        let warm_reannounce_tx = reannounce_tx.clone();
         let targeted_reannounce_tx = reannounce_tx.clone();
 
         let subscriber = tokio::spawn(async move {
             while let Some(message) = subscription.recv().await {
                 let sender = message.sender;
+                if message.verified
+                    && message.sender.is_some()
+                    && message.sender_public_key.is_some()
+                    && matches!(
+                        decode_capability_advert_request(&message.topic, &message.payload),
+                        Some(DecodedCapabilityAdvertRequest::Targeted {
+                            requested_agent_id,
+                        }) if requested_agent_id == self_agent_for_sub
+                    )
+                {
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_refresh_request_received",
+                        kind = "targeted_v2_warm",
+                        requester = message.sender.map(|agent_id| hex::encode(agent_id.as_bytes())),
+                    );
+                    let _ = warm_reannounce_tx.try_send(ReannounceRequest::Targeted);
+                    continue;
+                }
                 if ingest_verified_capability_advert(&store_sub, self_agent_for_sub, &message) {
                     tracing::debug!(
                         target: "dm.trace",
@@ -713,6 +796,34 @@ mod tests {
                 requested_agent_id: target,
             })
         );
+
+        let warm =
+            encode_warm_targeted_capability_advert_request(target).expect("encode warm request");
+        assert!(warm.starts_with(WARM_TARGETED_REQUEST_DOMAIN));
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_TOPIC, &warm),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: target,
+            })
+        );
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_TOPIC, &targeted_bytes),
+            None,
+            "untagged targeted bytes must never be decoded on the warm carrier"
+        );
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_TARGETED_REQUEST_TOPIC, &warm),
+            None,
+            "warm domain bytes must never alias the dedicated request wire"
+        );
+        let mut trailing = warm.clone();
+        trailing.push(0xFF);
+        assert_eq!(
+            decode_capability_advert_request(DM_CAPABILITY_TOPIC, &trailing),
+            None,
+            "the warm carrier must consume the exact domain-owned wire"
+        );
+        assert!(postcard::from_bytes::<CapabilityAdvert>(&warm).is_err());
     }
 
     #[test]
@@ -1235,6 +1346,16 @@ mod tests {
         publish_capability_advert_request(&pubsub, Some(AgentId([0xEE; 32])))
             .await
             .expect("foreign targeted request");
+        let foreign_warm = tokio::time::timeout(Duration::from_secs(1), steady_subscriber.recv())
+            .await
+            .expect("foreign warm carrier timeout")
+            .expect("steady subscriber closed");
+        assert_eq!(
+            decode_capability_advert_request(&foreign_warm.topic, &foreign_warm.payload),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: AgentId([0xEE; 32]),
+            })
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
                 .await
@@ -1257,12 +1378,81 @@ mod tests {
             &advert,
             &response.sender_public_key.expect("response public key"),
         ));
+        let self_warm = tokio::time::timeout(Duration::from_secs(1), steady_subscriber.recv())
+            .await
+            .expect("self warm carrier timeout")
+            .expect("steady subscriber closed");
+        assert_eq!(
+            decode_capability_advert_request(&self_warm.topic, &self_warm.payload),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: self_agent,
+            })
+        );
         let compatibility_response =
             tokio::time::timeout(Duration::from_secs(2), steady_subscriber.recv())
                 .await
                 .expect("legacy advert-topic compatibility response timeout")
                 .expect("steady subscriber closed");
         assert_eq!(compatibility_response.payload, response.payload);
+
+        service.abort();
+    }
+
+    #[tokio::test]
+    async fn warm_steady_carrier_alone_triggers_exact_target_signed_v3_response() {
+        let keypair = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&keypair));
+        let self_agent = keypair.agent_id();
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing))).expect("pubsub"),
+        );
+        let mut steady_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut targeted_subscriber = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v3_threaded_durable_gossip_ready(vec![
+                0xC1;
+                1184
+            ]));
+        let service = CapabilityAdvertService::spawn_with_timing(
+            Arc::clone(&pubsub),
+            Arc::clone(&signing),
+            self_agent,
+            MachineId([0xC2; 32]),
+            caps_rx,
+            Arc::new(CapabilityStore::new()),
+            Duration::from_secs(3_600),
+            Duration::from_millis(25),
+            &[],
+            false,
+        )
+        .await
+        .expect("spawn service");
+
+        tokio::time::timeout(Duration::from_secs(3), steady_subscriber.recv())
+            .await
+            .expect("initial advert timeout")
+            .expect("steady subscriber closed");
+        let warm =
+            encode_warm_targeted_capability_advert_request(self_agent).expect("warm request");
+        pubsub
+            .publish(DM_CAPABILITY_TOPIC.to_string(), Bytes::from(warm))
+            .await
+            .expect("publish warm carrier only");
+
+        let response = tokio::time::timeout(Duration::from_secs(2), targeted_subscriber.recv())
+            .await
+            .expect("warm carrier did not trigger targeted response")
+            .expect("targeted subscriber closed");
+        let advert: CapabilityAdvert =
+            postcard::from_bytes(&response.payload).expect("decode signed v3 response");
+        assert_eq!(advert.agent_id, *self_agent.as_bytes());
+        assert!(advert.capabilities.supports_thread_metadata());
+        assert!(verify_advert_signature(
+            &advert,
+            &response.sender_public_key.expect("response public key"),
+        ));
 
         service.abort();
     }
@@ -1298,6 +1488,16 @@ mod tests {
         publish_capability_advert_request(&pubsub, Some(self_agent))
             .await
             .expect("targeted request while pending");
+        let pending_warm = tokio::time::timeout(Duration::from_secs(1), bulk_subscriber.recv())
+            .await
+            .expect("pending warm carrier timeout")
+            .expect("bulk subscriber closed");
+        assert_eq!(
+            decode_capability_advert_request(&pending_warm.topic, &pending_warm.payload),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: self_agent,
+            })
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
                 .await
@@ -1329,6 +1529,16 @@ mod tests {
         publish_capability_advert_request(&pubsub, Some(self_agent))
             .await
             .expect("targeted request after stop");
+        let stopped_warm = tokio::time::timeout(Duration::from_secs(1), bulk_subscriber.recv())
+            .await
+            .expect("stopped warm carrier timeout")
+            .expect("bulk subscriber closed");
+        assert_eq!(
+            decode_capability_advert_request(&stopped_warm.topic, &stopped_warm.payload),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: self_agent,
+            })
+        );
         assert!(
             tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
                 .await
@@ -1388,6 +1598,9 @@ mod tests {
             .expect("initial advert timeout")
             .expect("initial subscriber closed");
         let mut late_subscriber = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        let mut targeted_subscriber = pubsub
+            .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
+            .await;
 
         let request = FleetCapabilityAdvertRequest {
             protocol_version: FLEET_REQUEST_PROTOCOL_VERSION,
@@ -1405,6 +1618,34 @@ mod tests {
                 .await
                 .is_err(),
             "an unsigned request must not trigger a capability reannounce"
+        );
+
+        let warm = encode_warm_targeted_capability_advert_request(agent_id).expect("warm request");
+        pubsub
+            .publish(DM_CAPABILITY_TOPIC.to_string(), Bytes::from(warm))
+            .await
+            .expect("publish unsigned warm request");
+        let delivered_warm = tokio::time::timeout(Duration::from_secs(1), late_subscriber.recv())
+            .await
+            .expect("unsigned warm request was not delivered")
+            .expect("late subscriber closed");
+        assert_eq!(
+            decode_capability_advert_request(&delivered_warm.topic, &delivered_warm.payload),
+            Some(DecodedCapabilityAdvertRequest::Targeted {
+                requested_agent_id: agent_id,
+            })
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), targeted_subscriber.recv())
+                .await
+                .is_err(),
+            "an unsigned warm request must not trigger a targeted response"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), late_subscriber.recv())
+                .await
+                .is_err(),
+            "an unsigned warm request must not trigger a compatibility advert"
         );
 
         service.abort();

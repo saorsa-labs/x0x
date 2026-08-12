@@ -325,6 +325,13 @@ struct AckPublishJob {
     acked_request_id: [u8; 16],
     protocol_version: u16,
     encoded: Bytes,
+    raw: Option<RawAckPublish>,
+}
+
+struct RawAckPublish {
+    peer_machine_id: MachineId,
+    sender_agent_id: AgentId,
+    frame: Bytes,
 }
 
 #[derive(Clone)]
@@ -385,11 +392,10 @@ impl DmInboxService {
             .await;
         let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
         let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&network), Arc::clone(&dm));
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
-            network,
             signing,
             self_agent_id,
             self_machine_id,
@@ -557,14 +563,16 @@ fn spawn_subscription_loop(
 
 fn spawn_durable_ack_publisher(
     pubsub: Arc<PubSubManager>,
+    network: Arc<NetworkNode>,
     dm: Arc<DirectMessaging>,
 ) -> (AckPublisherHandle, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
     let worker = spawn_ack_publish_worker(receiver, move |job| {
         let pubsub = Arc::clone(&pubsub);
+        let network = Arc::clone(&network);
         let dm = Arc::clone(&dm);
         async move {
-            publish_durable_ack_job(pubsub, dm, job).await;
+            publish_durable_ack_job(pubsub, network, dm, job).await;
         }
     });
     (AckPublisherHandle { sender }, worker)
@@ -628,6 +636,7 @@ fn log_ack_publish_join_result(result: Result<(), tokio::task::JoinError>) {
 
 async fn publish_durable_ack_job(
     pubsub: Arc<PubSubManager>,
+    network: Arc<NetworkNode>,
     dm: Arc<DirectMessaging>,
     job: AckPublishJob,
 ) {
@@ -638,7 +647,18 @@ async fn publish_durable_ack_job(
         Bytes::clone(&job.encoded),
     );
     let legacy = pubsub.publish(DM_BUS_TOPIC.to_string(), job.encoded);
-    let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+    let gossip = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy);
+    let result = if let Some(raw) = job.raw {
+        let peer_id = ant_quic::PeerId(raw.peer_machine_id.0);
+        publish_raw_and_gossip_ack_routes(
+            DURABLE_ACK_ROUTE_TIMEOUT,
+            network.send_direct(&peer_id, raw.sender_agent_id.as_bytes(), &raw.frame),
+            gossip,
+        )
+        .await
+    } else {
+        gossip.await
+    };
     if let Err(error) = result {
         dm.record_ack_publish_route_failed();
         tracing::warn!(
@@ -657,7 +677,6 @@ async fn publish_durable_ack_job(
 #[derive(Clone)]
 struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
-    network: Arc<NetworkNode>,
     signing: Arc<SigningContext>,
     self_agent_id: AgentId,
     self_machine_id: MachineId,
@@ -816,6 +835,25 @@ where
         publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
     );
     primary.and(legacy)
+}
+
+async fn publish_raw_and_gossip_ack_routes<Raw, Gossip>(
+    route_timeout: Duration,
+    raw: Raw,
+    gossip: Gossip,
+) -> NetworkResult<()>
+where
+    Raw: std::future::Future<Output = NetworkResult<()>>,
+    Gossip: std::future::Future<Output = NetworkResult<()>>,
+{
+    let raw = publish_ack_route_with_timeout("raw", route_timeout, raw);
+    let (raw_result, gossip_result) = tokio::join!(raw, gossip);
+    match (raw_result, gossip_result) {
+        (Ok(()), _) | (_, Ok(())) => Ok(()),
+        (Err(raw_error), Err(gossip_error)) => Err(NetworkError::BroadcastError(format!(
+            "raw ACK failed: {raw_error}; gossip ACK routes failed: {gossip_error}"
+        ))),
+    }
 }
 
 async fn publish_ack_route_with_timeout<Route>(
@@ -1681,11 +1719,12 @@ impl InboxPipeline {
         let encoded = envelope
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
-        let durable_gossip_job = || AckPublishJob {
+        let durable_ack_job = |raw| AckPublishJob {
             recipient: to,
             acked_request_id: acks_request_id,
             protocol_version,
             encoded: Bytes::from(encoded.clone()),
+            raw,
         };
         let result = match ack_route {
             AckRoute::Raw { peer_machine_id } => {
@@ -1695,27 +1734,18 @@ impl InboxPipeline {
                 // product send. Hedge it through gossip in the bounded ACK
                 // worker so a raw reverse-path race cannot strand the sender.
                 let raw_frame = encode_raw_durable_frame(&self.signing.public_key_bytes, &encoded)?;
-                let raw = self
-                    .network
-                    .send_direct(
-                        &ant_quic::PeerId(peer_machine_id.0),
-                        self.self_agent_id.as_bytes(),
-                        &raw_frame,
-                    )
-                    .await;
-                let hedge = self.ack_publisher.try_publish(durable_gossip_job());
-                match (raw, hedge) {
-                    (Ok(()), _) | (_, Ok(())) => Ok(()),
-                    (Err(raw_error), Err(hedge_error)) => Err(NetworkError::BroadcastError(
-                        format!("raw ACK failed: {raw_error}; gossip hedge failed: {hedge_error}"),
-                    )),
-                }
+                self.ack_publisher
+                    .try_publish(durable_ack_job(Some(RawAckPublish {
+                        peer_machine_id,
+                        sender_agent_id: self.self_agent_id,
+                        frame: Bytes::from(raw_frame),
+                    })))
             }
             AckRoute::Gossip { .. } if protocol_version >= DM_PROTOCOL_DURABLE_ACK => {
                 // Durable v2 owns both publications in the bounded background
                 // worker. The inbox loop can immediately process a subsequent
                 // DM while both routes retain their congestion budgets.
-                self.ack_publisher.try_publish(durable_gossip_job())
+                self.ack_publisher.try_publish(durable_ack_job(None))
             }
             AckRoute::Gossip { ack_legacy_bus } => {
                 // Preserve v1 exactly: target first, and only publish back on
@@ -1908,10 +1938,9 @@ mod tests {
         }
 
         let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&node), Arc::clone(&dm));
         let pipeline = InboxPipeline {
             pubsub,
-            network: node,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
             self_agent_id: recipient_agent_id,
             self_machine_id: recipient_machine_id,
@@ -2411,43 +2440,87 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn raw_durable_v2_uses_strict_pipeline_before_dispatch() {
+    async fn raw_durable_v2_enqueues_owned_ack_without_head_of_line_blocking() {
         let sender = test_keypair();
         let machine = MachineKeypair::generate().expect("sender machine");
         let mut harness = make_inbox_harness(&sender, None, None).await;
         let history = enable_durable_history(&mut harness).await;
-        let message = durable_attested_payload_message(&harness, &sender, &machine, 0xB1);
-        let exact_envelope = message.payload.clone();
-        let frame =
-            encode_raw_durable_frame(sender.public_key().as_bytes(), exact_envelope.as_ref())
-                .expect("encode raw durable frame");
+        let mut ack_jobs = capture_ack_jobs(&mut harness);
+        let first = durable_attested_payload_message(&harness, &sender, &machine, 0xB1);
+        let second = durable_attested_payload_message(&harness, &sender, &machine, 0xB2);
+        let exact_first = first.payload.clone();
+        let exact_second = second.payload.clone();
+        let first_frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), exact_first.as_ref())
+                .expect("encode first raw durable frame");
+        let second_frame =
+            encode_raw_durable_frame(sender.public_key().as_bytes(), exact_second.as_ref())
+                .expect("encode second raw durable frame");
         let ingress = DmInboxIngress {
             pipeline: harness.pipeline.clone(),
         };
 
         assert!(
-            ingress
-                .handle_raw_frame(machine.machine_id(), sender.agent_id(), &frame)
-                .await,
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                ingress.handle_raw_frame(machine.machine_id(), sender.agent_id(), &first_frame,),
+            )
+            .await
+            .expect("first raw ingress blocked on reverse ACK"),
             "the durable discriminator must be consumed"
         );
-        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+        assert!(
+            tokio::time::timeout(
+                Duration::from_secs(2),
+                ingress.handle_raw_frame(machine.machine_id(), sender.agent_id(), &second_frame,),
+            )
+            .await
+            .expect("second raw ingress was head-of-line blocked"),
+            "the follow-up durable discriminator must be consumed"
+        );
+
+        let first_job = tokio::time::timeout(Duration::from_secs(2), ack_jobs.recv())
+            .await
+            .expect("first raw ACK enqueue timeout")
+            .expect("raw ACK capture closed");
+        let second_job = tokio::time::timeout(Duration::from_secs(2), ack_jobs.recv())
+            .await
+            .expect("second raw ACK enqueue timeout")
+            .expect("raw ACK capture closed");
+        for (job, request_id) in [(first_job, [0xB1; 16]), (second_job, [0xB2; 16])] {
+            assert_eq!(job.acked_request_id, request_id);
+            let raw = job.raw.expect("raw ingress must own a raw ACK route");
+            assert_eq!(raw.peer_machine_id, machine.machine_id());
+            assert_eq!(raw.sender_agent_id, harness.pipeline.self_agent_id);
+            assert!(is_raw_durable_frame(&raw.frame));
+        }
+
+        let first_delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
             .await
             .expect("raw v2 dispatch timeout")
             .expect("raw v2 delivery stream closed");
-        assert_eq!(delivered.payload, b"security regression payload");
-        assert_eq!(delivered.machine_id, machine.machine_id());
+        let second_delivered =
+            tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+                .await
+                .expect("second raw v2 dispatch timeout")
+                .expect("raw v2 delivery stream closed");
+        assert_eq!(first_delivered.payload, b"security regression payload");
+        assert_eq!(second_delivered.payload, b"security regression payload");
+        assert_eq!(first_delivered.machine_id, machine.machine_id());
+        assert_eq!(second_delivered.machine_id, machine.machine_id());
 
         let rows = history
             .store()
             .query(&HistoryQuery::default())
             .expect("query committed raw history");
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].record.payload, delivered.payload);
-        assert_eq!(
-            rows[0].record.signed_artifact.as_deref(),
-            Some(exact_envelope.as_ref()),
-            "raw and gossip paths must commit the exact same signed envelope"
+        assert_eq!(rows.len(), 2);
+        let artifacts = rows
+            .iter()
+            .filter_map(|row| row.record.signed_artifact.as_deref())
+            .collect::<Vec<_>>();
+        assert!(
+            artifacts.contains(&exact_first.as_ref()) && artifacts.contains(&exact_second.as_ref()),
+            "both raw deliveries must commit their exact signed envelope"
         );
 
         if let Some(service) = harness.history_service.take() {
@@ -3278,6 +3351,43 @@ mod tests {
         assert!(
             targeted_dropped.load(Ordering::SeqCst),
             "the stalled route future must be cancelled at its deadline"
+        );
+    }
+
+    #[tokio::test]
+    async fn raw_ack_worker_polls_gossip_and_cancels_stalled_raw_route() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let raw_dropped = Arc::new(AtomicBool::new(false));
+        let raw_drop = Arc::clone(&raw_dropped);
+        let raw = async move {
+            let _drop_flag = DropFlag(raw_drop);
+            std::future::pending::<NetworkResult<()>>().await
+        };
+        let gossip_polled = Arc::new(AtomicBool::new(false));
+        let gossip_observed = Arc::clone(&gossip_polled);
+        let gossip = async move {
+            gossip_observed.store(true, Ordering::SeqCst);
+            Ok(())
+        };
+
+        let result =
+            publish_raw_and_gossip_ack_routes(Duration::from_millis(20), raw, gossip).await;
+
+        assert!(result.is_ok(), "the completed gossip hedge is sufficient");
+        assert!(
+            gossip_polled.load(Ordering::SeqCst),
+            "the worker must poll gossip while the raw reverse path is stalled"
+        );
+        assert!(
+            raw_dropped.load(Ordering::SeqCst),
+            "the worker deadline must cancel the stalled raw future"
         );
     }
 
