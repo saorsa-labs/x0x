@@ -23,6 +23,10 @@ fn record(payload: &[u8], scope: Scope, seen_at_ms: i64) -> HistoryRecord {
         sig_context: None,
         provenance: Provenance::LocalAppDecrypt,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     }
 }
 
@@ -355,6 +359,51 @@ fn config_defaults_match_adr() {
         HistoryConfig::default().max_bytes,
         x0x::history::DEFAULT_MAX_BYTES
     );
+}
+
+/// The schema v4 ingress columns are two halves of one authenticated fact:
+/// which transport peer delivered the row, and which logical request bound
+/// it. Recording a sender with no request id (or vice versa) would let a
+/// future durable-ingress writer persist a binding nothing can be checked
+/// against, so `validate` rejects the half-set pair at the store boundary.
+#[test]
+fn ingress_sender_and_logical_request_id_must_be_set_together() {
+    let scope = Scope::Dm("peer".into());
+    let base = record(b"typed ingress row", scope, 1_000);
+
+    let mut sender_only = base.clone();
+    sender_only.ingress_sender_agent = Some("aa".repeat(32));
+    let err = sender_only.validate().unwrap_err().to_string();
+    assert!(
+        err.contains("must be set together"),
+        "sender without logical request id must be rejected, got: {err}"
+    );
+
+    let mut request_only = base.clone();
+    request_only.logical_request_id = Some([0x31; 16]);
+    assert!(
+        request_only.validate().is_err(),
+        "logical request id without a sender must be rejected"
+    );
+
+    let mut both = base.clone();
+    both.ingress_sender_agent = Some("aa".repeat(32));
+    both.logical_request_id = Some([0x31; 16]);
+    both.validate().expect("a fully bound pair is valid");
+
+    // Neither set is the normal case for every row main writes today.
+    base.validate().expect("an unbound record is valid");
+}
+
+/// The store applies the same rule, so a half-set pair cannot reach SQLite
+/// even if a caller skips `validate` itself.
+#[test]
+fn insert_rejects_half_set_ingress_binding() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Store::open(&dir.path().join("history.db")).unwrap();
+    let mut r = record(b"half bound row", Scope::Dm("peer".into()), 1_000);
+    r.ingress_sender_agent = Some("aa".repeat(32));
+    assert!(store.insert(&r).is_err());
 }
 
 #[test]

@@ -2475,6 +2475,10 @@ fn raw_dm_history_record(
         // this layer. This matches artifact-less verified pub/sub history.
         provenance: history::Provenance::VerifiedEnvelope,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     })
 }
 
@@ -4305,6 +4309,10 @@ impl Agent {
             sig_context: None,
             provenance: history::Provenance::LocalSend,
             replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
         });
     }
 
