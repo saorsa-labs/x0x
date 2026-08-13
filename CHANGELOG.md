@@ -2,6 +2,29 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.37.3] - 2026-08-14
+
+Gossip wire-integrity mitigation (x0x #323), delivered via
+saorsa-gossip 0.5.69.
+
+### Fixed
+
+- **Zero-tail forward guard.** Forwarders no longer launder zero-window
+  corrupted pubsub payloads under fresh header signatures: the three
+  peer-egress points (EAGER forward, IWANT serve, anti-entropy serve)
+  drop payloads whose zero-tail exceeds 512 bytes, with a WARN. Local
+  delivery is unchanged — application-layer payload signatures remain
+  the delivery authority. Root cause and forensics: x0x #323; upstream
+  truncation-on-cancel fix tracked at ant-quic #244.
+
+### Governance
+
+- **ADR 0030 accepted** (DM protocol v2 — durable application ACK,
+  capability-gated): strict-409 mixed-version policy, two named send
+  tiers, capability advert v2-iff-history, bootstrap-outbox extraction
+  precondition. Governs landing the durable-ACK campaign; no protocol
+  code in this release.
+
 ## [v0.37.2] - 2026-08-13
 
 Slice 1 of the delivery-recovery campaign: six ops-correctness fixes
