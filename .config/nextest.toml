@@ -27,7 +27,7 @@ filter = "binary(threading_integration)"
 test-group = "quic-localhost"
 
 [[profile.default.overrides]]
-filter = "binary(f2_public_group_bootstrap_wiring)"
+filter = "binary(f2_public_group_bootstrap_wiring) | binary(history_point_lookup_wiring)"
 test-group = "quic-localhost"
 
 # Issue #316: these two loopback tests flake only under full parallel load

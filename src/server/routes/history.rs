@@ -8,7 +8,7 @@
 use super::super::api_error;
 use super::super::state::AppState;
 use crate as x0x;
-use axum::extract::{Query, State};
+use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -133,6 +133,111 @@ pub(in crate::server) async fn history_list(
             )
         }
         Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("query: {e}")),
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
+    }
+}
+
+/// Optional query for `GET /history/message/:msg_id`.
+#[derive(Debug, serde::Deserialize)]
+pub(in crate::server) struct HistoryMessageParams {
+    /// Scope hint (`group:<stable_id>` | `dm:<agent_hex>` | `topic:<name>`).
+    /// Required to resolve a *canonical* group-message id (ADR 0029): the
+    /// store's `msg_id` column is the dedupe key `BLAKE3(signed_artifact)`,
+    /// not the canonical signing-domain id, so group canonical ids are found
+    /// by a bounded newest-first scan of the scope's rows.
+    scope: Option<String>,
+}
+
+/// Newest-first rows scanned per request when resolving a canonical group id
+/// within a scope. Callers holding older ids should use `GET /history` paging.
+const HISTORY_MESSAGE_SCAN_BUDGET: usize = 4096;
+const HISTORY_MESSAGE_SCAN_PAGE: usize = 256;
+
+/// GET /history/message/:msg_id — point lookup of one durable row (issue
+/// #319, ADR-0023 completeness). Accepts either the store dedupe id (DM and
+/// topic rows expose exactly that id) or a canonical ADR-0029 group-message
+/// id when `?scope=group:<stable_id>` is supplied. 400 on malformed id, 404
+/// when absent; the record uses the same JSON shape as `/history`.
+pub(in crate::server) async fn history_message(
+    State(state): State<Arc<AppState>>,
+    Path(msg_id_hex): Path<String>,
+    Query(params): Query<HistoryMessageParams>,
+) -> impl IntoResponse {
+    let Some(history) = state.agent.history() else {
+        return api_error(StatusCode::SERVICE_UNAVAILABLE, "history store disabled");
+    };
+    let requested_hex = msg_id_hex.trim().to_ascii_lowercase();
+    let msg_id: [u8; 32] = match hex::decode(&requested_hex) {
+        Ok(bytes) => match bytes.try_into() {
+            Ok(arr) => arr,
+            Err(_) => {
+                return api_error(
+                    StatusCode::BAD_REQUEST,
+                    "msg_id must be 64 hex characters (32 bytes)",
+                )
+            }
+        },
+        Err(_) => return api_error(StatusCode::BAD_REQUEST, "msg_id must be lowercase hex"),
+    };
+    let scope = match params.scope.as_deref().map(parse_scope).transpose() {
+        Ok(s) => s,
+        Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
+    };
+
+    let store = Arc::clone(history.store());
+    let lookup = tokio::task::spawn_blocking(move || -> Result<Option<StoredRecord>, String> {
+        // Fast path: the store dedupe key. DM/topic rows expose exactly this
+        // id via row_json, and pre-ADR-0029 callers hold it directly.
+        if let Some(row) = store.get_by_msg_id(msg_id).map_err(|e| e.to_string())? {
+            return Ok(Some(row));
+        }
+        // Canonical group-message ids differ from the dedupe key and are
+        // recomputable only from the signed artifact; resolve them with a
+        // bounded newest-first scan inside the caller's scope.
+        let Some(scope) = scope else {
+            return Ok(None);
+        };
+        let mut before_id: Option<i64> = None;
+        let mut scanned = 0usize;
+        while scanned < HISTORY_MESSAGE_SCAN_BUDGET {
+            let q = HistoryQuery {
+                scope: Some(scope.clone()),
+                scope_kind: None,
+                since_ms: None,
+                until_ms: None,
+                limit: HISTORY_MESSAGE_SCAN_PAGE,
+                before_id,
+            };
+            let rows = store.query(&q).map_err(|e| e.to_string())?;
+            if rows.is_empty() {
+                return Ok(None);
+            }
+            scanned += rows.len();
+            before_id = rows.last().map(|r| r.id);
+            for row in rows {
+                let canonical = group_history_message(&row.record)
+                    .map(|m| m.msg_id())
+                    .unwrap_or_else(|| hex::encode(row.record.msg_id));
+                if canonical == requested_hex {
+                    return Ok(Some(row));
+                }
+            }
+        }
+        Ok(None)
+    })
+    .await;
+
+    match lookup {
+        Ok(Ok(Some(row))) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "record": row_json(&row) })),
+        ),
+        Ok(Ok(None)) => api_error(
+            StatusCode::NOT_FOUND,
+            "no history row for msg_id (canonical group ids require ?scope=group:<stable_id>; \
+             scan budget covers the newest 4096 rows of the scope)",
+        ),
+        Ok(Err(e)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("lookup: {e}")),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("join: {e}")),
     }
 }

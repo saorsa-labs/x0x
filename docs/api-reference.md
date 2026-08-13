@@ -338,6 +338,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
 | POST | `/direct/send` | `x0x direct send <agent_id> <message>` | Send a direct base64 payload |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
+| GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
 
 ### Direct send request body

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 147,
+  "endpoint_count": 148,
   "endpoints": [
     {
       "category": "status",
@@ -210,6 +210,13 @@
       "description": "List durable history for one scope (dm:/group:/topic:), keyset-paginated",
       "method": "GET",
       "path": "/history"
+    },
+    {
+      "category": "history",
+      "cli_name": "history message",
+      "description": "Point lookup of one durable history row by exposed msg_id (canonical group ids need ?scope=)",
+      "method": "GET",
+      "path": "/history/message/:msg_id"
     },
     {
       "category": "history",

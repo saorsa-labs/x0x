@@ -108,6 +108,11 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Get,
+        "/history/message/:msg_id",
+        history_message_point_lookup_serves_group_row_by_canonical_id
+    ),
+    covered!(
+        Get,
         "/history/search",
         rest_history_list_search_stats_purge_roundtrip
     ),
@@ -471,6 +476,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         include_str!("daemon_api_integration.rs"),
     ),
     ("tests/history_api.rs", include_str!("history_api.rs")),
+    (
+        "tests/history_point_lookup_wiring.rs",
+        include_str!("history_point_lookup_wiring.rs"),
+    ),
     (
         "tests/peer_lifecycle_integration.rs",
         include_str!("peer_lifecycle_integration.rs"),
