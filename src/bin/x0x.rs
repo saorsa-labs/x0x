@@ -484,6 +484,15 @@ enum HistorySub {
         #[arg(long)]
         before_id: Option<i64>,
     },
+    /// Point lookup of one durable history row by exposed msg_id.
+    Message {
+        /// The msg_id as shown by `history list` (64 hex chars).
+        msg_id: String,
+        /// Scope hint, required to resolve canonical group-message ids:
+        /// `group:<stable_id>`, `dm:<agent_hex>`, or `topic:<name>`.
+        #[arg(long)]
+        scope: Option<String>,
+    },
     /// Full-text search over text history within a scope.
     Search {
         /// Scope: `dm:<agent_hex>`, `group:<stable_id>`, or `topic:<name>`.
@@ -1518,6 +1527,9 @@ async fn run(
                     &client, &scope, &query, since_ms, until_ms, limit, before_id,
                 )
                 .await
+            }
+            HistorySub::Message { msg_id, scope } => {
+                commands::history::message(&client, &msg_id, scope.as_deref()).await
             }
             HistorySub::Stats => commands::history::stats(&client).await,
             HistorySub::Purge { scope } => commands::history::purge(&client, &scope).await,

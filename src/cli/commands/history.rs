@@ -48,6 +48,20 @@ pub async fn list(
     client.run_get_query("/history", &q).await
 }
 
+/// `x0x history message` — GET /history/message/:msg_id
+///
+/// Point lookup by any id the listing exposes; canonical group ids need
+/// the scope hint (issue #319).
+pub async fn message(client: &DaemonClient, msg_id: &str, scope: Option<&str>) -> Result<()> {
+    let mut q: Vec<(&str, &str)> = Vec::new();
+    if let Some(scope) = scope {
+        q.push(("scope", scope));
+    }
+    client
+        .run_get_query(&format!("/history/message/{msg_id}"), &q)
+        .await
+}
+
 /// `x0x history search` — GET /history/search
 ///
 /// Full-text search over text payloads within a scope.

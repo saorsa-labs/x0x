@@ -266,6 +266,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/history/message/:msg_id",
+        cli_name: "history message",
+        description: "Point lookup of one durable history row by exposed msg_id (canonical group ids need ?scope=)",
+        category: "history",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/history/search",
         cli_name: "history search",
         description: "Full-text search over text history payloads within a scope",

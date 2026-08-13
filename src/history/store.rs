@@ -247,6 +247,19 @@ impl Store {
         collect_rows(&guard, &sql, params)
     }
 
+    /// Point lookup of a single row by canonical `msg_id` (issue #319,
+    /// ADR-0023 completeness). `msg_id` is the store dedupe key, so at most
+    /// one row matches; newest wins defensively if that invariant ever bends.
+    pub fn get_by_msg_id(&self, msg_id: [u8; 32]) -> HistoryResult<Option<StoredRecord>> {
+        let sql = "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
+             author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
+             signed_artifact, signature, sig_context, provenance, replace_key \
+             FROM history WHERE msg_id = ?1 ORDER BY id DESC LIMIT 1";
+        let params = vec![rusqlite::types::Value::from(msg_id.to_vec())];
+        let guard = lock_conn(&self.conn)?;
+        Ok(collect_rows(&guard, sql, params)?.into_iter().next())
+    }
+
     /// Full-text search over searchable payload text. Tokens are quoted so
     /// user input is literal terms, never FTS operators (donor
     /// `fts_match_expr`).
