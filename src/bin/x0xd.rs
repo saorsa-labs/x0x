@@ -11,7 +11,7 @@
 //! x0xd --config /path/to/config.toml    # custom config
 //! x0xd --check                          # validate config and exit
 //! x0xd --check-updates                  # check/apply updates and exit
-//! x0xd --skip-update-check              # start daemon without startup update check
+//! x0xd --skip-update-check              # run daemon with self-update disabled
 //! x0xd --name alice                     # run a named instance (separate identity)
 //! x0xd --list                           # list running instances
 //! ```
@@ -100,7 +100,7 @@ async fn main() -> anyhow::Result<()> {
         println!("    --connect-acl <PATH>            Override default connect ACL path");
         println!("    --check                         Check configuration and exit");
         println!("    --check-updates       Check for updates and exit");
-        println!("    --skip-update-check   Skip update check on startup");
+        println!("    --skip-update-check   Disable self-update for this process");
         println!("    --doctor              Run diagnostics");
         println!("    --version, -V         Print version and exit");
         println!("    --help, -h            Print this help and exit");
@@ -303,8 +303,9 @@ async fn main() -> anyhow::Result<()> {
     }
 
     // Phase 2 (Issue #110): start the server via the library handle. The daemon
-    // opts in to self-update (so behaviour is unchanged) and owns Ctrl-C itself
-    // — the library must not steal the host's signal.
+    // opts in to configured self-update unless this invocation supplied the
+    // process-scoped skip flag, and owns Ctrl-C itself — the library must not
+    // steal the host's signal.
     let self_update_enabled = config.update_enabled();
     let options = ServeOptions {
         skip_update_check,

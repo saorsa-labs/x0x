@@ -93,7 +93,12 @@ impl TryFrom<String> for InstanceName {
 /// Phase 1: minimal — do not redesign config here.
 #[derive(Default)]
 pub struct ServeOptions {
-    /// Skip the startup GitHub update check.
+    /// Disable self-update for this process invocation.
+    ///
+    /// This suppresses the startup GitHub check, gossip-delivered apply,
+    /// fallback polling, manifest broadcast side effects, and manual apply.
+    /// It does not change the persisted update configuration, so later
+    /// invocations without the flag retain normal updater behavior.
     pub skip_update_check: bool,
     /// Disable ant-quic UPnP IGD port mapping for this invocation.
     pub cli_no_port_mapping: bool,
@@ -111,13 +116,20 @@ pub struct ServeOptions {
     pub connect_policy: x0x::connect::ConnectPolicy,
     /// Whether the self-update install/restart paths are allowed to run.
     ///
-    /// AND-ed with `config.update.enabled`. The daemon binary sets this to
-    /// `config.update.enabled` so its behaviour is unchanged. The public
+    /// AND-ed with `config.update.enabled` and disabled by
+    /// [`ServeOptions::skip_update_check`]. The daemon binary sets this to
+    /// `config.update.enabled`. The public
     /// [`crate::server::serve`] entrypoint defaults it to `false` — an embedded library must
-    /// never replace or restart the host application. Manifest *propagation*
-    /// (broadcast/listen for informational purposes) is unaffected; only the
-    /// paths that download + install + restart are gated.
+    /// never replace or restart the host application. Updater-owned manifest
+    /// broadcast/listener side effects are gated with the install paths.
     pub self_update_enabled: bool,
+}
+
+pub(super) const fn effective_self_update_enabled(
+    configured_for_process: bool,
+    skip_update_check: bool,
+) -> bool {
+    configured_for_process && !skip_update_check
 }
 
 /// Handle to a running, in-process x0x server.
@@ -518,8 +530,8 @@ fn default_rendezvous_validity_ms() -> u64 {
 
 impl DaemonConfig {
     /// Whether self-update is enabled in this config. The daemon binary uses
-    /// this to set [`ServeOptions::self_update_enabled`] so its behaviour is
-    /// unchanged by the embed-path default of `false`.
+    /// this to set [`ServeOptions::self_update_enabled`]; the process-scoped
+    /// skip flag is applied separately by [`crate::server::serve_with_options`].
     #[must_use]
     pub fn update_enabled(&self) -> bool {
         self.update.enabled
@@ -833,6 +845,14 @@ pub(super) struct CachedUpgradeCheck {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skip_update_check_disables_every_process_update_path_without_changing_defaults() {
+        assert!(effective_self_update_enabled(true, false));
+        assert!(!effective_self_update_enabled(true, true));
+        assert!(!effective_self_update_enabled(false, false));
+        assert!(!effective_self_update_enabled(false, true));
+    }
 
     #[test]
     fn resolved_network_id_maps_unset_to_prod_and_empty_to_open() {

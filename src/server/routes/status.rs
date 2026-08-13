@@ -12,6 +12,9 @@ use axum::Json;
 use serde::Serialize;
 use std::sync::Arc;
 
+const CONNECTIVITY_GRACE_SECS: u64 = 120;
+const STATUS_CONNECTING_GRACE_SECS: u64 = 45;
+
 /// Generic JSON response wrapper.
 #[derive(Debug, Serialize)]
 pub(in crate::server) struct ApiResponse<T: Serialize> {
@@ -26,6 +29,7 @@ pub(in crate::server) struct HealthData {
     status: String,
     version: String,
     peers: usize,
+    send_ready_peers: usize,
     uptime_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
@@ -38,18 +42,50 @@ pub(in crate::server) struct HealthData {
 /// 6+ hours (wedged transport, silent socket) while fleet monitoring read
 /// `healthy` and stayed quiet. `ok` remains `true` (the process is alive and
 /// serving); `status: "degraded"` is the monitorable signal.
-fn classify_health(peers: usize, uptime_secs: u64) -> (&'static str, Option<String>) {
-    const ZERO_PEER_GRACE_SECS: u64 = 120;
-    if peers == 0 && uptime_secs >= ZERO_PEER_GRACE_SECS {
+fn classify_health(
+    peers: usize,
+    send_ready_peers: usize,
+    uptime_secs: u64,
+) -> (&'static str, Option<String>) {
+    if peers == 0 && uptime_secs >= CONNECTIVITY_GRACE_SECS {
         (
             "degraded",
             Some(format!(
-                "zero peers for the whole uptime window (>{ZERO_PEER_GRACE_SECS}s); \
+                "zero peers for the whole uptime window (>{CONNECTIVITY_GRACE_SECS}s); \
                  transport may be wedged or the network unreachable"
+            )),
+        )
+    } else if peers > 0 && send_ready_peers == 0 && uptime_secs >= CONNECTIVITY_GRACE_SECS {
+        (
+            "degraded",
+            Some(format!(
+                "{peers} peers remain in the outer connection table but none are send-ready; \
+                 ant-quic has no routable transport winner"
             )),
         )
     } else {
         ("healthy", None)
+    }
+}
+
+/// Classify the richer `/status` connectivity state from the same transport
+/// readiness predicate used by `/health` while preserving its shorter startup
+/// state transition from `connecting` to `isolated`.
+fn classify_runtime_status(
+    peers: usize,
+    send_ready_peers: usize,
+    uptime_secs: u64,
+    has_warnings: bool,
+) -> (&'static str, Option<String>) {
+    let (health, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
+    if has_warnings || health == "degraded" {
+        ("degraded", degraded_reason)
+    } else if send_ready_peers > 0 {
+        ("connected", None)
+    } else if uptime_secs < STATUS_CONNECTING_GRACE_SECS {
+        ("connecting", None)
+    } else {
+        ("isolated", None)
     }
 }
 
@@ -63,6 +99,7 @@ pub(in crate::server) struct StatusData {
     external_addrs: Vec<String>,
     agent_id: String,
     peers: usize,
+    send_ready_peers: usize,
     warnings: Vec<String>,
 }
 
@@ -75,8 +112,12 @@ pub(in crate::server) async fn health(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<HealthData>> {
     let peers = state.agent.peers().await.map(|p| p.len()).unwrap_or(0);
+    let send_ready_peers = match state.agent.network() {
+        Some(network) => network.send_ready_peers().await.len(),
+        None => 0,
+    };
     let uptime_secs = state.start_time.elapsed().as_secs();
-    let (status, degraded_reason) = classify_health(peers, uptime_secs);
+    let (status, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
 
     Json(ApiResponse {
         ok: true,
@@ -84,6 +125,7 @@ pub(in crate::server) async fn health(
             status: status.to_string(),
             version: x0x::VERSION.to_string(),
             peers,
+            send_ready_peers,
             uptime_secs,
             degraded_reason,
         },
@@ -103,6 +145,11 @@ pub(in crate::server) async fn status(
             warnings.push(format!("failed to query peers: {err}"));
             0
         }
+    };
+
+    let send_ready_peers = match state.agent.network() {
+        Some(network) => network.send_ready_peers().await.len(),
+        None => 0,
     };
 
     // Get external addresses: ant-quic observed + local IPv4/IPv6 discovery.
@@ -151,27 +198,23 @@ pub(in crate::server) async fn status(
         }
     }
 
-    let connectivity = if !warnings.is_empty() {
-        "degraded"
-    } else if peers > 0 {
-        "connected"
-    } else if uptime_secs < 45 {
-        "connecting"
-    } else {
-        "isolated"
+    let (connectivity, degraded_reason) =
+        classify_runtime_status(peers, send_ready_peers, uptime_secs, !warnings.is_empty());
+    if let Some(reason) = degraded_reason {
+        warnings.push(reason);
     }
-    .to_string();
 
     Json(ApiResponse {
         ok: true,
         data: StatusData {
-            status: connectivity,
+            status: connectivity.to_string(),
             version: x0x::VERSION.to_string(),
             uptime_secs,
             api_address: state.api_address.to_string(),
             external_addrs,
             agent_id: hex::encode(state.agent.agent_id().as_bytes()),
             peers,
+            send_ready_peers,
             warnings,
         },
     })
@@ -215,14 +258,14 @@ pub(in crate::server) async fn get_constitution_json() -> impl IntoResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::classify_health;
+    use super::{classify_health, classify_runtime_status};
 
     /// WHY (issue #262): a wedged-transport daemon — up for hours, zero
     /// peers, silent socket — must not read `healthy` to fleet monitoring.
     /// That exact state hid the NYC prod bootstrap outage for 6+ hours.
     #[test]
     fn zero_peers_past_grace_is_degraded() {
-        let (status, reason) = classify_health(0, 121);
+        let (status, reason) = classify_health(0, 0, 121);
         assert_eq!(status, "degraded");
         assert!(reason.is_some(), "degraded must carry a reason");
     }
@@ -231,7 +274,7 @@ mod tests {
     /// flagging a freshly started daemon would page on every restart.
     #[test]
     fn zero_peers_within_grace_is_still_healthy() {
-        let (status, reason) = classify_health(0, 30);
+        let (status, reason) = classify_health(0, 0, 30);
         assert_eq!(status, "healthy");
         assert!(reason.is_none());
     }
@@ -239,8 +282,62 @@ mod tests {
     /// Any live peer means the transport works — healthy regardless of age.
     #[test]
     fn connected_daemon_is_healthy() {
-        let (status, reason) = classify_health(1, 999_999);
+        let (status, reason) = classify_health(1, 1, 999_999);
         assert_eq!(status, "healthy");
+        assert!(reason.is_none());
+    }
+
+    /// An outer-table peer is not evidence that ant-quic still has a routable
+    /// transport winner. This exact split produced PeerNotFound storms while
+    /// `/health` reported healthy.
+    #[test]
+    fn outer_peers_without_transport_winner_are_degraded() {
+        let (status, reason) = classify_health(17, 0, 2_400);
+        assert_eq!(status, "degraded");
+        assert!(
+            reason
+                .as_deref()
+                .is_some_and(|value| value.contains("send-ready")),
+            "degraded response must name the cross-layer mismatch: {reason:?}"
+        );
+    }
+
+    /// A partially stale outer table still has a functioning transport when
+    /// at least one routable transport winner remains.
+    #[test]
+    fn at_least_one_transport_winner_is_healthy() {
+        let (status, reason) = classify_health(17, 1, 2_400);
+        assert_eq!(status, "healthy");
+        assert!(reason.is_none());
+    }
+
+    /// `/status` must not report `connected` for the stale-outer state which
+    /// `/health` classifies as degraded.
+    #[test]
+    fn runtime_status_degrades_without_a_transport_winner() {
+        let (status, reason) = classify_runtime_status(17, 0, 2_400, false);
+        assert_eq!(status, "degraded");
+        assert!(reason.is_some());
+    }
+
+    #[test]
+    fn runtime_status_connects_only_with_a_send_ready_peer() {
+        let (status, reason) = classify_runtime_status(17, 1, 2_400, false);
+        assert_eq!(status, "connected");
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn runtime_status_is_connecting_during_transport_grace() {
+        let (status, reason) = classify_runtime_status(17, 0, 30, false);
+        assert_eq!(status, "connecting");
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn runtime_status_preserves_isolated_state_before_degraded_grace() {
+        let (status, reason) = classify_runtime_status(0, 0, 60, false);
+        assert_eq!(status, "isolated");
         assert!(reason.is_none());
     }
 }

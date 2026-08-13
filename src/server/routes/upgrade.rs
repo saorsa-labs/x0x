@@ -701,7 +701,7 @@ pub(in crate::server) async fn apply_upgrade(
             Json(serde_json::json!({
                 "ok": true,
                 "applied": false,
-                "reason": "self-update disabled for embedded server",
+                "reason": "self-update disabled for this process",
                 "current_version": env!("CARGO_PKG_VERSION")
             })),
         );
