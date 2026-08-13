@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.37.2] - 2026-08-13
+
+Slice 1 of the delivery-recovery campaign: six ops-correctness fixes
+cherry-picked from field diagnosis, with no change to the send contract —
+mixed 0.37.1/0.37.2 fleets interoperate in both directions (verified:
+DMs and SignedPublic group messages, both ways, against a v0.37.1 peer).
+
+### Fixed
+
+- **Process-wide `--skip-update-check` honored.** A bundled desktop
+  sidecar daemon can no longer be replaced under the desktop app by fleet
+  update gossip.
+- **Send-path redial from fresh discovery.** A peer that looks live but
+  has a dead transport path (the 0.36.2 wedge aftermath) is re-dialed
+  from current discovery state by the same send instead of failing.
+- **Direct self-leave fanout.** A member's self-leave is direct-delivered
+  to the retained owner, so the owner no longer stays stale when the
+  group has zero gossip listeners.
+- **FTS indexes native JSON `.text`.** Native-format messages are now
+  searchable (schema v2 backfill); previously search returned zero hits
+  for visible DMs.
+- **`/health` counts send-ready peers.** A peer table full of zombies no
+  longer reports healthy; `send_ready_peers` is exposed.
+- **Receiver identity republish stopped.** Only locally authored identity
+  announcements republish on the legacy topic, ending mesh-wide
+  amplification.
+
+### Testing
+
+- Issue #316 flaky loopback tests are serialized **and** reserve
+  scheduler slots (`threads-required = 4`) — serial-group placement alone
+  proved insufficient under ambient suite load. The multi-endpoint
+  slice-1 regression tests and `gossip_plane_isolation` join the
+  `quic-localhost` serial group.
+
 ## [v0.37.1] - 2026-08-12
 
 Hardening follow-up to v0.37.0: the signed-public bootstrap listener now
