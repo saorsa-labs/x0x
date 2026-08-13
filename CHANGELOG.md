@@ -2,6 +2,27 @@
 
 All notable changes to this project will be documented in this file.
 
+## [v0.37.4] - 2026-08-14
+
+History schema v4 (ADR 0030 continuity) + gossip guard v2.
+
+### Added
+
+- **History schema v4.** Additive migrations over the released FTS v2
+  store: v2→v3 adds `thread_root`/`thread_parent`; v3→v4 adds
+  `ingress_sender_agent`/`logical_request_id`. Columns land dormant
+  (writers arrive with the durable-ACK campaign slices); fresh databases
+  walk the same migration path as upgrades; each migration stamps its
+  own target version. Unblocks the tic-tac-toe 0.5.2 history reader.
+
+### Fixed
+
+- **Interior zero-window forward guard (guard v2)**, via saorsa-gossip
+  0.5.70: forwarders refuse payloads containing a >1024-byte interior
+  zero run — the field-confirmed dominant corruption form (#323) that
+  the v0.37.3 tail guard could not see. No wire change; local delivery
+  remains ungated.
+
 ## [v0.37.3] - 2026-08-14
 
 Gossip wire-integrity mitigation (x0x #323), delivered via
