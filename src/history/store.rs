@@ -18,7 +18,7 @@ use crate::error::{HistoryError, HistoryResult};
 use super::record::{Direction, HistoryRecord, Provenance, Scope};
 
 /// Current schema version (forward-only migrations).
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 4;
 
 /// Maximum rows a single query may return.
 pub const MAX_QUERY_LIMIT: usize = 500;
@@ -230,7 +230,8 @@ impl Store {
         let mut sql = String::from(
             "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
              author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
-             signed_artifact, signature, sig_context, provenance, replace_key \
+             signed_artifact, signature, sig_context, provenance, replace_key, \
+             thread_root, thread_parent, ingress_sender_agent, logical_request_id \
              FROM history",
         );
         let mut parts: Vec<String> = Vec::new();
@@ -253,7 +254,8 @@ impl Store {
     pub fn get_by_msg_id(&self, msg_id: [u8; 32]) -> HistoryResult<Option<StoredRecord>> {
         let sql = "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
              author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
-             signed_artifact, signature, sig_context, provenance, replace_key \
+             signed_artifact, signature, sig_context, provenance, replace_key, \
+             thread_root, thread_parent, ingress_sender_agent, logical_request_id \
              FROM history WHERE msg_id = ?1 ORDER BY id DESC LIMIT 1";
         let params = vec![rusqlite::types::Value::from(msg_id.to_vec())];
         let guard = lock_conn(&self.conn)?;
@@ -273,7 +275,8 @@ impl Store {
             "SELECT h.id, h.msg_id, h.scope_kind, h.scope_id, h.author_agent, \
              h.author_machine, h.author_pubkey, h.sent_at_ms, h.seen_at_ms, h.direction, \
              h.content_type, h.payload, h.signed_artifact, h.signature, h.sig_context, \
-             h.provenance, h.replace_key FROM history h \
+             h.provenance, h.replace_key, h.thread_root, h.thread_parent, \
+             h.ingress_sender_agent, h.logical_request_id FROM history h \
              WHERE h.id IN (SELECT rowid FROM history_fts WHERE history_fts MATCH ?)",
         );
         let mut params: Vec<rusqlite::types::Value> = vec![rusqlite::types::Value::from(fts)];
@@ -513,6 +516,10 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
     let sig_context: Option<String> = r.get(14)?;
     let provenance: i64 = r.get(15)?;
     let replace_key: Option<String> = r.get(16)?;
+    let thread_root: Option<String> = r.get(17)?;
+    let thread_parent: Option<String> = r.get(18)?;
+    let ingress_sender_agent: Option<String> = r.get(19)?;
+    let logical_request_id_blob: Option<Vec<u8>> = r.get(20)?;
 
     let record = (|| -> HistoryResult<HistoryRecord> {
         let mut msg_id = [0u8; 32];
@@ -520,6 +527,18 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
             return Err(HistoryError::InvalidRecord("msg_id not 32 bytes".into()));
         }
         msg_id.copy_from_slice(&msg_id_blob);
+        let logical_request_id = logical_request_id_blob
+            .map(|blob| {
+                let mut request_id = [0_u8; 16];
+                if blob.len() != request_id.len() {
+                    return Err(HistoryError::InvalidRecord(
+                        "logical_request_id not 16 bytes".into(),
+                    ));
+                }
+                request_id.copy_from_slice(&blob);
+                Ok(request_id)
+            })
+            .transpose()?;
         Ok(HistoryRecord {
             msg_id,
             scope: Scope::from_columns(scope_kind, scope_id)?,
@@ -536,6 +555,10 @@ fn row_to_record(r: &rusqlite::Row<'_>) -> RowResult {
             sig_context,
             provenance: Provenance::from_i64(provenance)?,
             replace_key,
+            thread_root,
+            thread_parent,
+            ingress_sender_agent,
+            logical_request_id,
         })
     })();
     Ok((id, record))
@@ -547,8 +570,10 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
     tx.execute(
         "INSERT INTO history (msg_id, scope_kind, scope_id, author_agent, author_machine, \
          author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
-         payload_text, signed_artifact, signature, sig_context, provenance, replace_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+         payload_text, signed_artifact, signature, sig_context, provenance, replace_key, \
+         thread_root, thread_parent, ingress_sender_agent, logical_request_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
+         ?18, ?19, ?20, ?21)",
         rusqlite::params![
             msg_id,
             record.scope.kind(),
@@ -567,6 +592,10 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
             record.sig_context,
             record.provenance.as_i64(),
             record.replace_key,
+            record.thread_root,
+            record.thread_parent,
+            record.ingress_sender_agent,
+            record.logical_request_id.as_ref().map(<[u8; 16]>::as_slice),
         ],
     )
     .map_err(|e| HistoryError::Database(format!("insert failed: {e}")))?;
@@ -582,16 +611,31 @@ fn migrate(conn: &Connection) -> HistoryResult<()> {
         })
         .optional()?;
     match current {
+        // A fresh database is created at v1 and then walked through the same
+        // migration steps an upgrading one takes. That costs a few no-op
+        // statements at first open but guarantees the created schema and the
+        // migrated schema cannot drift apart.
         None => {
             conn.execute_batch(SCHEMA_V1)?;
             conn.execute(
                 "INSERT INTO schema_version (version) VALUES (?1)",
-                rusqlite::params![SCHEMA_VERSION],
+                rusqlite::params![1_i64],
             )?;
-            Ok(())
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
         }
         Some(v) if v == SCHEMA_VERSION => Ok(()),
-        Some(1) => migrate_v1_to_v2(conn),
+        Some(1) => {
+            migrate_v1_to_v2(conn)?;
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
+        }
+        Some(2) => {
+            migrate_v2_to_v3(conn)?;
+            migrate_v3_to_v4(conn)
+        }
+        Some(3) => migrate_v3_to_v4(conn),
         Some(v) if v < SCHEMA_VERSION => {
             // Future migrations chain here, bumping stored version each step.
             Err(HistoryError::Database(format!(
@@ -641,7 +685,40 @@ fn migrate_v1_to_v2(conn: &Connection) -> HistoryResult<()> {
     }
     tx.execute(
         "UPDATE schema_version SET version = ?1",
-        rusqlite::params![SCHEMA_VERSION],
+        rusqlite::params![2_i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Schema v3 adds first-class nullable thread ancestry to every durable row.
+/// Additive `ALTER`s only: existing rows keep their values and read back
+/// `NULL` for the new columns.
+fn migrate_v2_to_v3(conn: &Connection) -> HistoryResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE history ADD COLUMN thread_root TEXT; \
+         ALTER TABLE history ADD COLUMN thread_parent TEXT;",
+    )?;
+    tx.execute(
+        "UPDATE schema_version SET version = ?1",
+        rusqlite::params![3_i64],
+    )?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Schema v4 adds authenticated transport/logical-request binding for strict
+/// durable typed ingress. Existing rows remain intentionally unbound.
+fn migrate_v3_to_v4(conn: &Connection) -> HistoryResult<()> {
+    let tx = conn.unchecked_transaction()?;
+    tx.execute_batch(
+        "ALTER TABLE history ADD COLUMN ingress_sender_agent TEXT; \
+         ALTER TABLE history ADD COLUMN logical_request_id BLOB;",
+    )?;
+    tx.execute(
+        "UPDATE schema_version SET version = ?1",
+        rusqlite::params![4_i64],
     )?;
     tx.commit()?;
     Ok(())
@@ -801,6 +878,154 @@ mod tests {
         assert_eq!(version, SCHEMA_VERSION);
     }
 
+    /// Column names currently present on the `history` table.
+    fn history_columns(store: &Store) -> Vec<String> {
+        let guard = lock_conn(&store.conn).unwrap();
+        let mut stmt = guard.prepare("PRAGMA table_info(history)").unwrap();
+        let names = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        names
+    }
+
+    fn stored_schema_version(store: &Store) -> i64 {
+        let guard = lock_conn(&store.conn).unwrap();
+        guard
+            .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    /// ADR 0030 schema continuity: v4 must land on top of a *released* v2
+    /// store, not replace it. A v2 database carries real user history, so the
+    /// upgrade has to be additive — every pre-existing row survives byte-for-
+    /// byte and simply reads `NULL` for the columns it predates.
+    #[test]
+    fn v2_database_migrates_to_v4_preserving_existing_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        let payload = b"written under schema v2";
+        let scope = Scope::Dm("v2-peer".into());
+        let msg_id = HistoryRecord::compute_msg_id(None, payload);
+        {
+            // v2 is v1's table shape with the FTS backfill already applied,
+            // so the released v2 schema is SCHEMA_V1 stamped as version 2.
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL); \
+                 INSERT INTO schema_version (version) VALUES (2);",
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute(
+                "INSERT INTO history (msg_id, scope_kind, scope_id, author_agent, sent_at_ms, \
+                 seen_at_ms, direction, content_type, payload, payload_text, provenance) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    &msg_id[..],
+                    scope.kind(),
+                    scope.id(),
+                    "v2-author",
+                    7_000_i64,
+                    7_001_i64,
+                    Direction::Inbound.as_i64(),
+                    "text/plain",
+                    payload,
+                    "written under schema v2",
+                    Provenance::LocalAppDecrypt.as_i64(),
+                ],
+            )
+            .unwrap();
+        }
+
+        let store = Store::open(&path).unwrap();
+        assert_eq!(stored_schema_version(&store), 4);
+        let columns = history_columns(&store);
+        for added in [
+            "thread_root",
+            "thread_parent",
+            "ingress_sender_agent",
+            "logical_request_id",
+        ] {
+            assert!(
+                columns.iter().any(|c| c == added),
+                "v4 must add column {added}; found {columns:?}"
+            );
+        }
+
+        let rows = store
+            .query(&HistoryQuery {
+                scope: Some(scope),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(rows.len(), 1, "the pre-existing v2 row must survive");
+        let stored = &rows[0].record;
+        assert_eq!(stored.msg_id, msg_id);
+        assert_eq!(stored.payload, payload);
+        assert_eq!(stored.author_agent.as_deref(), Some("v2-author"));
+        assert_eq!(stored.sent_at_ms, 7_000);
+        assert_eq!(stored.seen_at_ms, 7_001);
+        // Rows that predate the columns are unbound, not defaulted.
+        assert_eq!(stored.thread_root, None);
+        assert_eq!(stored.thread_parent, None);
+        assert_eq!(stored.ingress_sender_agent, None);
+        assert_eq!(stored.logical_request_id, None);
+
+        // The v2 FTS projection still resolves after the ALTERs.
+        let hits = store.search("written", &HistoryQuery::default()).unwrap();
+        assert_eq!(hits.len(), 1, "FTS must survive the v3/v4 ALTERs");
+    }
+
+    /// A database created fresh must be indistinguishable from one migrated
+    /// up from v2 — same version, same columns. Divergence between the
+    /// `CREATE TABLE` path and the `ALTER` path is the classic migration bug.
+    #[test]
+    fn fresh_database_opens_at_v4_matching_the_migrated_shape() {
+        let (fresh, _fresh_dir) = open();
+        assert_eq!(stored_schema_version(&fresh), SCHEMA_VERSION);
+        assert_eq!(stored_schema_version(&fresh), 4);
+
+        let migrated_dir = tempfile::tempdir().unwrap();
+        let migrated_path = migrated_dir.path().join("history.db");
+        {
+            let conn = Connection::open(&migrated_path).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE schema_version (version INTEGER NOT NULL); \
+                 INSERT INTO schema_version (version) VALUES (2);",
+            )
+            .unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+        }
+        let migrated = Store::open(&migrated_path).unwrap();
+        assert_eq!(
+            history_columns(&fresh),
+            history_columns(&migrated),
+            "fresh-create and v2->v4 migration must produce the same columns"
+        );
+    }
+
+    /// Round-trip the v3/v4 columns through SQLite. They are dormant — no
+    /// production writer sets them yet — so this is the only guard that the
+    /// insert and select column lists stay aligned.
+    #[test]
+    fn thread_and_ingress_columns_round_trip() {
+        let (store, _dir) = open();
+        let mut r = rec(b"row with schema v4 columns", Scope::Dm("peer-v4".into()));
+        r.thread_root = Some("aa".repeat(32));
+        r.thread_parent = Some("bb".repeat(32));
+        r.ingress_sender_agent = Some("cc".repeat(32));
+        r.logical_request_id = Some([0x31; 16]);
+        assert_eq!(store.insert(&r).unwrap(), InsertOutcome::Inserted);
+
+        let stored = store.get_by_msg_id(r.msg_id).unwrap().unwrap().record;
+        assert_eq!(stored.thread_root, r.thread_root);
+        assert_eq!(stored.thread_parent, r.thread_parent);
+        assert_eq!(stored.ingress_sender_agent, r.ingress_sender_agent);
+        assert_eq!(stored.logical_request_id, Some([0x31; 16]));
+    }
+
     fn rec(payload: &[u8], scope: Scope) -> HistoryRecord {
         let msg_id = HistoryRecord::compute_msg_id(None, payload);
         HistoryRecord {
@@ -819,6 +1044,10 @@ mod tests {
             sig_context: None,
             provenance: Provenance::LocalAppDecrypt,
             replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
         }
     }
 

@@ -103,6 +103,94 @@ async fn start_daemon(dir: &Path) -> Daemon {
     }
 }
 
+/// Schema v4 added four columns to every history row. Readers pinned to the
+/// released response shape (tic-tac-toe 0.5.2 among them) must see no
+/// difference: rows written by today's writers leave the new columns unset,
+/// so `/history` keeps exactly the keys it served before, with `thread_root`
+/// and `thread_parent` still derived from the signed group artifact.
+///
+/// REVERT GUARD: leak a new column into `row_json` (src/server/routes/
+/// history.rs) or change the derivation and this key-set assertion fails.
+#[tokio::test]
+async fn history_row_json_shape_unchanged_by_schema_v4() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let daemon = start_daemon(dir.path()).await;
+
+    let created = daemon
+        .post_json(
+            "/groups",
+            serde_json::json!({"name": "shape-guard", "preset": "public_open"}),
+        )
+        .await;
+    assert_eq!(created["ok"], true, "create group: {created:?}");
+    let group_id = created["group_id"].as_str().expect("group_id").to_string();
+
+    let sent = daemon
+        .post_json(
+            &format!("/groups/{group_id}/send"),
+            serde_json::json!({"body": "shape guard payload"}),
+        )
+        .await;
+    assert_eq!(sent["ok"], true, "group send: {sent:?}");
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let record = loop {
+        let (status, body) = daemon
+            .get_status(&format!("/history?scope=group:{group_id}&limit=10"))
+            .await;
+        if status == reqwest::StatusCode::OK {
+            if let Some(row) = body["records"].as_array().and_then(|rows| rows.first()) {
+                break row.clone();
+            }
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the group send never produced a durable history row: {body:?}"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    };
+
+    let mut keys: Vec<&str> = record
+        .as_object()
+        .expect("record must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    keys.sort_unstable();
+    assert_eq!(
+        keys,
+        [
+            "author_agent",
+            "author_machine",
+            "content_type",
+            "direction",
+            "id",
+            "msg_id",
+            "payload",
+            "provenance",
+            "replace_key",
+            "scope",
+            "seen_at_ms",
+            "sent_at_ms",
+            "signed",
+            "thread_parent",
+            "thread_root",
+        ],
+        "schema v4 must not change the /history record shape: {record:?}"
+    );
+
+    // A rootless group message still reports null ancestry — the dormant
+    // columns must not turn into empty strings or defaults.
+    assert!(
+        record["thread_root"].is_null(),
+        "unthreaded row must report null thread_root: {record:?}"
+    );
+    assert!(
+        record["thread_parent"].is_null(),
+        "unthreaded row must report null thread_parent: {record:?}"
+    );
+}
+
 #[tokio::test]
 async fn history_message_point_lookup_serves_group_row_by_canonical_id() {
     let dir = tempfile::tempdir().expect("tmpdir");

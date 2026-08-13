@@ -692,6 +692,10 @@ impl InboxPipeline {
                                 sig_context: Some("x0x-dm-v1".to_string()),
                                 provenance: crate::history::Provenance::VerifiedEnvelope,
                                 replace_key: None,
+                                thread_root: None,
+                                thread_parent: None,
+                                ingress_sender_agent: None,
+                                logical_request_id: None,
                             };
                             history.record(record);
                         }

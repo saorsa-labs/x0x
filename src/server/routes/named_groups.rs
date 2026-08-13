@@ -9404,6 +9404,12 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
             x0x::history::Provenance::VerifiedEnvelope
         },
         replace_key: None,
+        // ADR-0029 ancestry stays recomputable from the signed artifact; the
+        // schema v3 columns are reserved for the DM plane's own thread meta.
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     });
 }
 
@@ -9450,6 +9456,10 @@ fn record_mls_history(
         sig_context: None,
         provenance: x0x::history::Provenance::LocalAppDecrypt,
         replace_key: None,
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: None,
+        logical_request_id: None,
     });
 }
 
@@ -14788,6 +14798,10 @@ pub(in crate::server) async fn import_group_card(
                 sig_context: None,
                 provenance: x0x::history::Provenance::VerifiedEnvelope,
                 replace_key: Some(format!("group-card:{group_id}")),
+                thread_root: None,
+                thread_parent: None,
+                ingress_sender_agent: None,
+                logical_request_id: None,
             });
         }
     }
@@ -25710,6 +25724,10 @@ mod tests {
                 ),
                 provenance: Provenance::VerifiedEnvelope,
                 replace_key: None,
+                thread_root: None,
+                thread_parent: None,
+                ingress_sender_agent: None,
+                logical_request_id: None,
             };
             record.validate().expect(
                 "HistoryRecord produced by record_group_public_history must pass validate()",
