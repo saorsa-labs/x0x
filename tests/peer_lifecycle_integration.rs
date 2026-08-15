@@ -241,24 +241,20 @@ async fn wait_for_peer(fixture: &DaemonFixture, peer_machine: &str, deadline: Du
     );
 }
 
-/// Wait until this daemon holds a peer's signed v2 capability advert.
+/// Wait until this daemon has *an* advert in its capability store.
 ///
-/// Since ADR 0030 slice 4 a bare `POST /direct/send` is a *durable* send, so
-/// it refuses with 409 `recipient_ack_semantics_unavailable` until the
-/// recipient's advert has converged into the sender's capability store. Tests
-/// that are about something else — the `require_ack` probe block, the response
-/// shape — must not race that convergence, or they fail intermittently for a
-/// reason unrelated to what they assert.
+/// Since ADR 0030 slice 4 a bare `POST /direct/send` is a durable send, so it
+/// depends on the recipient's advert having converged. This shortens that
+/// window but does **not** close it: `capability_store_entries` is the only
+/// REST-visible signal, and it is a count — it cannot say whether the entry is
+/// the signed, machine-bound v2 binding the strict gate actually requires.
 ///
-/// `capability_store_entries` is the available signal: in a two-daemon fixture
-/// the only advert this daemon can hold is its counterpart's, and the fixture
-/// leaves `[history]` at the daemon default (enabled), so that peer advertises
-/// the v2 ceiling. A non-zero count therefore means exactly "we hold the other
-/// side's v2 advert".
-///
-/// Deliberately a wait, not a longer timeout and not an opt-out: the strict
-/// path is what these tests should exercise, since it is now the product
-/// default.
+/// Measured on this fixture: the first durable send to a peer takes ~17.5 s
+/// even after this wait returns (subsequent sends ~200-450 ms), because the
+/// send itself still performs the ADR 0030 §2 forced targeted refresh and
+/// waits for the gossip ACK. A caller whose HTTP timeout is below that will
+/// still fail. Closing the gap properly needs either a REST surface exposing
+/// per-peer advert state, or a product change to the cold-start path.
 async fn wait_for_durable_capability(fixture: &DaemonFixture, deadline: Duration) -> usize {
     let client = fixture.authed_client(Duration::from_secs(5));
     let started = tokio::time::Instant::now();

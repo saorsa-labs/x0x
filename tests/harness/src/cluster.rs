@@ -204,26 +204,24 @@ impl AgentInstance {
             .expect("GET request failed")
     }
 
-    /// Wait until this daemon holds a peer's signed v2 capability advert.
+    /// Wait until this daemon has *an* advert in its capability store.
     ///
-    /// Since ADR 0030 slice 4 a bare `POST /direct/send` is a *durable* send:
-    /// it refuses with 409 `recipient_ack_semantics_unavailable` until the
-    /// recipient's advert has converged into this daemon's capability store.
-    /// A test whose subject is something else — history persistence, response
-    /// shape — must not race that convergence, or it fails intermittently for
-    /// a reason unrelated to what it asserts.
+    /// Since ADR 0030 slice 4 a bare `POST /direct/send` is a durable send, so it
+    /// depends on the recipient's advert having converged. This shortens that
+    /// window but does **not** close it: `capability_store_entries` is the only
+    /// REST-visible signal, and it is a count — it cannot say whether the entry is
+    /// the signed, machine-bound v2 binding the strict gate actually requires.
     ///
-    /// `capability_store_entries` is the available signal: in a two-daemon
-    /// fixture the only advert this daemon can hold is its counterpart's, and
-    /// the harness leaves `[history]` at the daemon default (enabled), so that
-    /// peer advertises the v2 ceiling. A non-zero count therefore means
-    /// exactly "we hold the other side's v2 advert".
+    /// Measured on this fixture: the first durable send to a peer takes ~17.5 s
+    /// even after this wait returns (subsequent sends ~200-450 ms), because the
+    /// send itself still performs the ADR 0030 §2 forced targeted refresh and
+    /// waits for the gossip ACK. A caller whose HTTP timeout is below that will
+    /// still fail. Closing the gap properly needs either a REST surface exposing
+    /// per-peer advert state, or a product change to the cold-start path.
     ///
     /// # Panics
     ///
-    /// Panics if no advert converges within `deadline` — a durable send would
-    /// 409, so failing here names the real cause instead of surfacing it as a
-    /// confusing assertion on the send's status code.
+    /// Panics if no advert appears within `deadline`.
     pub async fn wait_for_durable_capability(&self, deadline: std::time::Duration) {
         let started = std::time::Instant::now();
         let mut polls = 0_usize;
