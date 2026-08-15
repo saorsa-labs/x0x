@@ -19,9 +19,18 @@ use bytes::Bytes;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::{mpsc, oneshot, RwLock};
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
+/// The pinned pubsub Critical-priority contract permits ten seconds waiting
+/// at its FIFO gate plus ten seconds for the send itself. Keep each durable
+/// ACK route alive for that complete healthy-congestion budget plus slack.
+const DURABLE_ACK_ROUTE_TIMEOUT: Duration = Duration::from_secs(22);
+/// ACK envelopes are small, but the queue is bounded so a disconnected mesh
+/// cannot turn sender retries into unbounded retained work.
+const DURABLE_ACK_QUEUE_CAPACITY: usize = 256;
+/// Bound the number of ACK jobs simultaneously holding pubsub fan-out work.
+const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
 
 /// How long the durable path waits for a typed-route handler to report
 /// completion before withholding the ACK (ADR 0030 §7).
@@ -285,6 +294,36 @@ pub struct DmInboxService {
     topic: String,
 }
 
+/// One durable (v2) ACK envelope awaiting publication on both routes.
+struct AckPublishJob {
+    recipient: AgentId,
+    acked_request_id: [u8; 16],
+    protocol_version: u16,
+    encoded: Bytes,
+}
+
+#[derive(Clone)]
+struct AckPublisherHandle {
+    sender: mpsc::Sender<AckPublishJob>,
+}
+
+impl AckPublisherHandle {
+    /// Hand a job to the worker without ever blocking the inbox loop. A full
+    /// queue is reported, never awaited: the receiver has already committed
+    /// and the sender will time out, which is the documented safe failure —
+    /// whereas blocking here would stall every later DM behind one wedged ACK.
+    fn try_publish(&self, job: AckPublishJob) -> NetworkResult<()> {
+        self.sender.try_send(job).map_err(|error| match error {
+            mpsc::error::TrySendError::Full(_) => NetworkError::RemoteReceiveBackpressured(
+                "durable ACK publisher queue is full".to_string(),
+            ),
+            mpsc::error::TrySendError::Closed(_) => {
+                NetworkError::ChannelClosed("durable ACK publisher stopped".to_string())
+            }
+        })
+    }
+}
+
 /// Legacy shared DM transport topic. New sends use per-recipient inbox
 /// topics; this listener remains so rolling upgrades can still receive
 /// envelopes from older daemons.
@@ -323,6 +362,8 @@ impl DmInboxService {
             .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
             .await;
         let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
+        let (ack_publisher, ack_worker) =
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
@@ -340,6 +381,7 @@ impl DmInboxService {
             revocation_set,
             authenticated_machine_bindings,
             history,
+            ack_publisher,
         };
 
         let primary_handle =
@@ -352,7 +394,9 @@ impl DmInboxService {
         );
 
         Ok(Self {
-            handles: vec![primary_handle, legacy_handle],
+            // Aborting the worker drops its JoinSet, which aborts all owned
+            // route publications. A graceful channel close drains them.
+            handles: vec![primary_handle, legacy_handle, ack_worker],
             topic,
         })
     }
@@ -390,6 +434,153 @@ fn spawn_subscription_loop(
     })
 }
 
+fn spawn_durable_ack_publisher(
+    pubsub: Arc<PubSubManager>,
+    dm: Arc<DirectMessaging>,
+) -> (AckPublisherHandle, JoinHandle<()>) {
+    let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+    let worker = spawn_ack_publish_worker(receiver, move |job| {
+        let pubsub = Arc::clone(&pubsub);
+        let dm = Arc::clone(&dm);
+        async move {
+            publish_durable_ack_job(pubsub, dm, job).await;
+        }
+    });
+    (AckPublisherHandle { sender }, worker)
+}
+
+/// Generic over the publish closure so the worker's queue and concurrency
+/// behaviour can be tested without a live pubsub mesh.
+fn spawn_ack_publish_worker<Publish, PublishFuture>(
+    mut receiver: mpsc::Receiver<AckPublishJob>,
+    publish: Publish,
+) -> JoinHandle<()>
+where
+    Publish: Fn(AckPublishJob) -> PublishFuture + Send + Sync + 'static,
+    PublishFuture: std::future::Future<Output = ()> + Send + 'static,
+{
+    tokio::spawn(async move {
+        let publish = Arc::new(publish);
+        let mut in_flight = JoinSet::new();
+
+        loop {
+            if in_flight.len() >= DURABLE_ACK_MAX_CONCURRENT {
+                if let Some(result) = in_flight.join_next().await {
+                    log_ack_publish_join_result(result);
+                }
+                continue;
+            }
+
+            tokio::select! {
+                biased;
+                Some(result) = in_flight.join_next(), if !in_flight.is_empty() => {
+                    log_ack_publish_join_result(result);
+                }
+                job = receiver.recv() => {
+                    let Some(job) = job else {
+                        break;
+                    };
+                    let publish = Arc::clone(&publish);
+                    in_flight.spawn(async move {
+                        publish(job).await;
+                    });
+                }
+            }
+        }
+
+        // Graceful closure drains accepted jobs. DmInboxService::abort aborts
+        // this owner task; dropping JoinSet then aborts every child promptly.
+        while let Some(result) = in_flight.join_next().await {
+            log_ack_publish_join_result(result);
+        }
+    })
+}
+
+fn log_ack_publish_join_result(result: Result<(), tokio::task::JoinError>) {
+    if let Err(error) = result {
+        tracing::warn!(
+            target: "dm.trace",
+            stage = "ack_publish_worker_failed",
+            %error,
+            "durable ACK publisher task failed"
+        );
+    }
+}
+
+async fn publish_durable_ack_job(
+    pubsub: Arc<PubSubManager>,
+    dm: Arc<DirectMessaging>,
+    job: AckPublishJob,
+) {
+    let topic = DmInboxService::inbox_topic_name(&job.recipient);
+    let primary = pubsub.publish_topic_id(
+        topic,
+        dm_inbox_topic(&job.recipient),
+        Bytes::clone(&job.encoded),
+    );
+    // The durable path always hedges onto the compatibility bus, even when the
+    // payload did not arrive there. A v2 sender has already been promised a
+    // committed row; a second route costs one small publish and removes a
+    // whole class of "committed but never acked" outcomes.
+    let legacy = pubsub.publish(DM_BUS_TOPIC.to_string(), job.encoded);
+    let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+    if let Err(error) = result {
+        dm.record_ack_publish_route_failed();
+        tracing::warn!(
+            target: "dm.trace",
+            stage = "ack_publish_route_failed",
+            acked_request_id = %hex::encode(job.acked_request_id),
+            recipient = %hex::encode(job.recipient.as_bytes()),
+            protocol_version = job.protocol_version,
+            hedged = true,
+            %error,
+            "one or more durable ACK routes failed; another hedge may still have delivered"
+        );
+    }
+}
+
+async fn publish_durable_ack_routes<Primary, Legacy>(
+    route_timeout: Duration,
+    primary: Primary,
+    legacy: Legacy,
+) -> NetworkResult<()>
+where
+    Primary: std::future::Future<Output = NetworkResult<()>>,
+    Legacy: std::future::Future<Output = NetworkResult<()>>,
+{
+    // A targeted inbox publish can deliver remotely yet remain pending under
+    // per-topic fan-out backpressure. Poll the compatibility-bus hedge at the
+    // same time so a durable recipient does not commit and dispatch the DM
+    // while the sender exhausts its complete ACK budget waiting on the reverse
+    // targeted topic. Each independently-polled route has an explicit
+    // deadline: the successful hedge can reach the sender immediately, while
+    // a wedged sibling is cancelled at the deadline instead of pinning this
+    // serial inbox loop and blocking later DMs/ACKs forever. These futures
+    // are owned by a bounded background worker, so neither healthy congestion
+    // nor the full route deadline blocks subscription processing.
+    let (primary, legacy) = tokio::join!(
+        publish_ack_route_with_timeout("targeted", route_timeout, primary),
+        publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
+    );
+    primary.and(legacy)
+}
+
+async fn publish_ack_route_with_timeout<Route>(
+    route: &'static str,
+    route_timeout: Duration,
+    publish: Route,
+) -> NetworkResult<()>
+where
+    Route: std::future::Future<Output = NetworkResult<()>>,
+{
+    match tokio::time::timeout(route_timeout, publish).await {
+        Ok(result) => result,
+        Err(_) => Err(NetworkError::BroadcastError(format!(
+            "ACK {route} publish timed out after {route_timeout:?}"
+        ))),
+    }
+}
+
 #[derive(Clone)]
 struct InboxPipeline {
     pubsub: Arc<PubSubManager>,
@@ -414,6 +605,8 @@ struct InboxPipeline {
     /// ADR-0023 history handle. Recording is `try_send`-only — this loop
     /// must never block (see the typed-route comment below).
     history: Option<crate::history::HistoryHandle>,
+    /// Bounded background publisher for durable (v2) ACK envelopes.
+    ack_publisher: AckPublisherHandle,
 }
 
 /// Re-ACK semantics for a logical request that already completed.
@@ -1532,19 +1725,50 @@ impl InboxPipeline {
         let encoded = envelope
             .to_wire_bytes()
             .map_err(|e| NetworkError::SerializationError(format!("ack encode: {e}")))?;
-        let topic = DmInboxService::inbox_topic_name(&to);
-        let primary = self
-            .pubsub
-            .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
-            .await;
-        let legacy = if ack_legacy_bus {
-            self.pubsub
-                .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
-                .await
+        let result = if protocol_version >= DM_PROTOCOL_DURABLE_ACK {
+            // Durable v2 owns both publications in the bounded background
+            // worker. The inbox loop can immediately process a subsequent DM
+            // while the target and compatibility-bus routes retain their full
+            // healthy-congestion budgets. Ordering is unaffected: the history
+            // commit is already awaited before we get here, so this only makes
+            // the *publication* asynchronous, never the promise behind it.
+            self.ack_publisher.try_publish(AckPublishJob {
+                recipient: to,
+                acked_request_id: acks_request_id,
+                protocol_version,
+                encoded: Bytes::from(encoded),
+            })
         } else {
-            Ok(())
+            // Preserve v1 exactly: target first, and only publish back on the
+            // compatibility bus when this payload itself arrived there. No
+            // new deadline or background ownership changes legacy behavior.
+            let topic = DmInboxService::inbox_topic_name(&to);
+            let primary = self
+                .pubsub
+                .publish_topic_id(topic, dm_inbox_topic(&to), Bytes::from(encoded.clone()))
+                .await;
+            let legacy = if ack_legacy_bus {
+                self.pubsub
+                    .publish(DM_BUS_TOPIC.to_string(), Bytes::from(encoded))
+                    .await
+            } else {
+                Ok(())
+            };
+            primary.and(legacy)
         };
-        primary.and(legacy)
+        if let Err(error) = &result {
+            self.dm.record_ack_publish_route_failed();
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "ack_publish_route_failed",
+                acked_request_id = %hex::encode(acks_request_id),
+                recipient = %hex::encode(to.as_bytes()),
+                protocol_version,
+                %error,
+                "ACK publication could not be scheduled or completed"
+            );
+        }
+        result
     }
 }
 
@@ -1643,6 +1867,10 @@ mod tests {
     }
 
     struct InboxHarness {
+        /// Keeps the durable-ACK worker alive for the harness's lifetime.
+        /// Dropping it closes the queue and every v2 ACK would fail to
+        /// schedule, which would look like a protocol bug in every test.
+        _ack_worker: JoinHandle<()>,
         pipeline: InboxPipeline,
         recipient_agent_id: AgentId,
         recipient_kem: Arc<AgentKemKeypair>,
@@ -1698,6 +1926,8 @@ mod tests {
                 .expect("insert machine revocation");
         }
 
+        let (ack_publisher, ack_worker) =
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
         let pipeline = InboxPipeline {
             pubsub,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
@@ -1716,9 +1946,11 @@ mod tests {
             revocation_set: Arc::new(RwLock::new(revocation_set)),
             authenticated_machine_bindings,
             history: None,
+            ack_publisher,
         };
 
         InboxHarness {
+            _ack_worker: ack_worker,
             pipeline,
             recipient_agent_id,
             recipient_kem,
@@ -2326,6 +2558,109 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ADR 0030 ACK liveness: the durable publisher must never make the inbox
+    /// loop wait. A saturated queue is reported to the caller rather than
+    /// awaited — the receiver has already committed, so the sender timing out
+    /// is the documented safe failure, whereas blocking here would stall every
+    /// later DM behind one wedged ACK route.
+    #[tokio::test]
+    async fn a_saturated_ack_queue_is_reported_rather_than_awaited() {
+        let (sender, mut receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
+        let handle = AckPublisherHandle { sender };
+        let job = || AckPublishJob {
+            recipient: AgentId([7; 32]),
+            acked_request_id: [1; 16],
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            encoded: Bytes::from_static(b"ack"),
+        };
+
+        for _ in 0..DURABLE_ACK_QUEUE_CAPACITY {
+            handle
+                .try_publish(job())
+                .expect("queue accepts up to its capacity");
+        }
+        assert!(
+            matches!(
+                handle.try_publish(job()),
+                Err(NetworkError::RemoteReceiveBackpressured(_))
+            ),
+            "the job past capacity must be refused, not block the inbox loop"
+        );
+
+        receiver.close();
+        while receiver.try_recv().is_ok() {}
+        assert!(
+            matches!(
+                handle.try_publish(job()),
+                Err(NetworkError::ChannelClosed(_))
+            ),
+            "a stopped worker must surface as an error, never a silent drop"
+        );
+    }
+
+    /// Both routes are polled concurrently and each carries its own deadline,
+    /// so one wedged route cannot consume the sender's whole ACK budget. If
+    /// these were awaited in sequence, a stuck targeted publish would hide a
+    /// healthy compatibility-bus hedge behind it — the exact "committed but
+    /// never acked" outcome the hedge exists to remove.
+    #[tokio::test(start_paused = true)]
+    async fn a_wedged_ack_route_is_cancelled_at_its_deadline_not_awaited_forever() {
+        let healthy = async { Ok(()) };
+        let wedged = async {
+            tokio::time::sleep(Duration::from_secs(3600)).await;
+            Ok(())
+        };
+        let started = tokio::time::Instant::now();
+        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, healthy, wedged).await;
+
+        assert!(
+            matches!(result, Err(NetworkError::BroadcastError(_))),
+            "a route that never completes must fail at its deadline: {result:?}"
+        );
+        assert_eq!(
+            started.elapsed(),
+            DURABLE_ACK_ROUTE_TIMEOUT,
+            "the deadline, not the wedged route, must bound the wait"
+        );
+    }
+
+    /// The v1 publish path must be untouched by the hedging work: a v1 ACK
+    /// still goes to the targeted topic only, and reaches the compatibility
+    /// bus only when the payload itself arrived there. Hedging every v1 ACK
+    /// onto the shared bus would add gossip traffic for every 0.37 peer in the
+    /// mesh, which is not what this change is for.
+    #[tokio::test]
+    async fn a_v1_ack_is_not_hedged_onto_the_compatibility_bus() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD8; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let mut bus = harness
+            .pipeline
+            .pubsub
+            .subscribe(DM_BUS_TOPIC.to_string())
+            .await;
+
+        harness
+            .pipeline
+            .publish_ack_for_protocol(
+                sender.agent_id(),
+                [0x59; 16],
+                DmAckOutcome::Accepted,
+                DM_PROTOCOL_V1,
+                false,
+            )
+            .await
+            .expect("v1 ACK publishes");
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), bus.recv())
+                .await
+                .is_err(),
+            "a v1 ACK with ack_legacy_bus=false must not reach the shared bus"
+        );
     }
 
     /// The two pre-existing variants must keep their postcard discriminants,
