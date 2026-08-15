@@ -356,6 +356,25 @@ gossip inbox. **Defaults to `true` since v0.37.0** (previously `false`);
 omitting the field selects the daemon default, so clients that relied on the
 old default must now send `"prefer_raw_quic_if_connected": false` explicitly.
 
+### Direct send error codes
+
+`/direct/send` failures answer with `{"ok": false, "error": "<code>"}`.
+Notable codes:
+
+| Status | `error` | Meaning |
+|---|---|---|
+| 404 | `recipient_key_unavailable` | The recipient has published no KEM key. |
+| 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
+| 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends without the durable requirement — the daemon never downgrades silently. |
+| 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
+| 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. |
+
+**Note (as of ADR 0030 slice 1):** no REST field selects durable ACK
+semantics yet, so `recipient_ack_semantics_unavailable` is currently
+reachable only through the library (`DmSendConfig::require_durable_app_ack`).
+The product-tier default flips in ADR 0030 slice 4, at which point this
+becomes a routine response for not-yet-upgraded peers.
+
 ### `/direct/events` SSE message shape
 
 Direct messages arrive flat — no `data` envelope:

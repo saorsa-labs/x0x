@@ -350,6 +350,15 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientKeyInvalid(_) => {
                     (StatusCode::CONFLICT, "recipient_key_invalid")
                 }
+                // ADR 0030 §2: the caller demanded durable application-ACK
+                // semantics and the recipient has no current v2 capability
+                // advert. 409 rather than 400 — the request was well-formed,
+                // the peer state is not what it requires — and never a silent
+                // downgrade. Callers retry, surface "peer needs upgrade", or
+                // resend with `require_durable_app_ack = false`.
+                x0x::dm::DmError::AckSemanticsUnavailable(_) => {
+                    (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
+                }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 x0x::dm::DmError::PeerLikelyOffline { .. } => {
                     (StatusCode::BAD_GATEWAY, "peer_likely_offline")

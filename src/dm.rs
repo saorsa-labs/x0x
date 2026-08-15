@@ -22,8 +22,18 @@ use std::time::{Duration, Instant};
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Nonce};
 
-/// DM protocol version. Bumped on any backward-incompatible wire change.
-pub const DM_PROTOCOL_VERSION: u16 = 1;
+/// Legacy DM semantics: `Accepted` means verified and locally enqueued.
+pub const DM_PROTOCOL_V1: u16 = 1;
+
+/// Durable application-ACK semantics (ADR 0030): `Accepted` is emitted only
+/// after a verified payload commits to ADR-0023 history and local dispatch
+/// completes. The envelope layout is identical to v1; only ACK semantics
+/// differ.
+pub const DM_PROTOCOL_DURABLE_ACK: u16 = 2;
+
+/// Highest DM protocol version this build understands on the receive path.
+/// Envelopes above this ceiling are dropped without ACK (ADR 0030 §2).
+pub const DM_PROTOCOL_VERSION: u16 = DM_PROTOCOL_DURABLE_ACK;
 
 /// Maximum envelope bytes (postcard-serialised). Soft cap: receivers drop
 /// envelopes over this size without processing or ACKing.
@@ -83,13 +93,23 @@ pub struct DmCapabilities {
 }
 
 impl DmCapabilities {
+    /// Whether this live advert can satisfy a strict (`require_durable_app_ack`)
+    /// product send. Requires a usable gossip inbox *and* a v2+ receive path,
+    /// because durable ACK semantics are only produced by the gossip inbox.
+    #[must_use]
+    pub fn supports_durable_app_ack(&self) -> bool {
+        self.gossip_inbox
+            && !self.kem_public_key.is_empty()
+            && self.max_protocol_version >= DM_PROTOCOL_DURABLE_ACK
+    }
+
     /// Placeholder capability advert for agents that have not yet wired
     /// their KEM keypair. `gossip_inbox` is `false` and `kem_public_key`
     /// is empty — senders will fall back to the raw-QUIC path.
     #[must_use]
     pub fn pending() -> Self {
         Self {
-            max_protocol_version: DM_PROTOCOL_VERSION,
+            max_protocol_version: DM_PROTOCOL_V1,
             gossip_inbox: false,
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
@@ -102,7 +122,23 @@ impl DmCapabilities {
     #[must_use]
     pub fn v1_gossip_ready(kem_public_key: Vec<u8>) -> Self {
         Self {
-            max_protocol_version: DM_PROTOCOL_VERSION,
+            max_protocol_version: DM_PROTOCOL_V1,
+            gossip_inbox: true,
+            kem_algorithm: "ML-KEM-768".to_string(),
+            max_envelope_bytes: MAX_ENVELOPE_BYTES,
+            kem_public_key,
+        }
+    }
+
+    /// Fully-wired gossip DM advert whose v2 ACKs certify a committed local
+    /// history row plus completed local application dispatch.
+    ///
+    /// Published only when durable history is enabled (ADR 0030 §3): a daemon
+    /// with history off cannot honour the receipt and must advertise v1.
+    #[must_use]
+    pub fn v2_durable_gossip_ready(kem_public_key: Vec<u8>) -> Self {
+        Self {
+            max_protocol_version: DM_PROTOCOL_DURABLE_ACK,
             gossip_inbox: true,
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
@@ -472,6 +508,15 @@ pub enum DmError {
     #[error("recipient key material invalid: {0}")]
     RecipientKeyInvalid(String),
 
+    /// The caller required durable application-ACK semantics but the recipient
+    /// has no current, signed, machine-bound v2 capability advert (ADR 0030
+    /// §2). Terminal for this attempt: the daemon refuses rather than silently
+    /// downgrading to v1 receipt semantics. The caller decides whether to
+    /// retry, surface "peer needs upgrade", or resend with
+    /// `require_durable_app_ack = false`.
+    #[error("recipient does not advertise durable application ACK support: {0}")]
+    AckSemanticsUnavailable(String),
+
     /// No application-layer ACK received within the retry budget. The DM
     /// MAY or may not have been delivered; the sender cannot distinguish.
     /// Safe to retry (recipient dedupes on `request_id`).
@@ -653,6 +698,13 @@ pub struct DmSendConfig {
     /// ACK before returning success. If false, a successful gossip publish is
     /// reported as accepted-for-delivery and any later ACK is ignored.
     pub require_gossip_ack: bool,
+    /// Require ADR 0030 v2 semantics: the send negotiates DM protocol v2 and
+    /// only succeeds on a v2 ACK, which certifies a committed recipient
+    /// history row plus completed local dispatch. A recipient without a
+    /// current signed v2 capability advert yields
+    /// [`DmError::AckSemanticsUnavailable`] rather than a silent v1 downgrade.
+    /// Defaults to `false`; product surfaces opt in (ADR 0030 §4).
+    pub require_durable_app_ack: bool,
     /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
     /// just observed a `Replaced` event but the new `Established` has not yet
     /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
@@ -679,6 +731,7 @@ impl Default for DmSendConfig {
             raw_quic_receive_ack_timeout: None,
             stop_fallback_on_raw_error: false,
             require_gossip_ack: true,
+            require_durable_app_ack: false,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }
@@ -1235,6 +1288,56 @@ impl EnvelopeBuilder {
     where
         F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
     {
+        Self::build_payload_envelope_with_version(
+            DM_PROTOCOL_V1,
+            request_id,
+            self_agent_id,
+            self_machine_id,
+            machine_keypair,
+            recipient_agent_id,
+            recipient_kem_public_key,
+            created_at_unix_ms,
+            expires_at_unix_ms,
+            payload,
+            sign,
+        )
+    }
+
+    /// Build a payload envelope stamped with an explicitly negotiated protocol
+    /// version.
+    ///
+    /// The layout is identical across v1 and v2 (ADR 0030); only ACK semantics
+    /// differ, so the version is a promise about the *receipt* the sender will
+    /// accept. Senders must not stamp a version above what the recipient's
+    /// capability advert claims — the recipient drops it without ACKing.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::build_payload_envelope`], plus
+    /// [`DmError::EnvelopeConstruction`] when `protocol_version` is outside
+    /// `DM_PROTOCOL_V1..=DM_PROTOCOL_VERSION`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn build_payload_envelope_with_version<F>(
+        protocol_version: u16,
+        request_id: [u8; 16],
+        self_agent_id: &AgentId,
+        self_machine_id: &MachineId,
+        machine_keypair: &crate::identity::MachineKeypair,
+        recipient_agent_id: &AgentId,
+        recipient_kem_public_key: &[u8],
+        created_at_unix_ms: u64,
+        expires_at_unix_ms: u64,
+        payload: Vec<u8>,
+        sign: F,
+    ) -> std::result::Result<DmEnvelope, DmError>
+    where
+        F: FnOnce(&[u8]) -> std::result::Result<Vec<u8>, String>,
+    {
+        if !(DM_PROTOCOL_V1..=DM_PROTOCOL_VERSION).contains(&protocol_version) {
+            return Err(DmError::EnvelopeConstruction(format!(
+                "unsupported DM protocol version {protocol_version}"
+            )));
+        }
         // Classify the size cap with its dedicated variant so API layers can
         // answer 413 instead of the opaque `envelope_construction` 400
         // (issue #188). Covers the relay-fallback path, which has no earlier
@@ -1261,7 +1364,7 @@ impl EnvelopeBuilder {
         )
         .map_err(|e| DmError::EnvelopeConstruction(e.to_string()))?;
         let mut envelope = DmEnvelope {
-            protocol_version: DM_PROTOCOL_VERSION,
+            protocol_version,
             request_id,
             sender_agent_id: *self_agent_id.as_bytes(),
             sender_machine_id: *self_machine_id.as_bytes(),
@@ -1291,11 +1394,25 @@ impl EnvelopeBuilder {
 
 // ─── In-flight ACK tracking ────────────────────────────────────────────────
 
-/// Map of request_id → oneshot::Sender that the inbox handler uses to wake
-/// the sender task when an ACK arrives.
+/// Map of request_id → the pending waiter that the inbox handler wakes when an
+/// ACK arrives.
 #[derive(Default)]
 pub struct InFlightAcks {
-    inner: Arc<dashmap::DashMap<[u8; 16], tokio::sync::oneshot::Sender<DmAckOutcome>>>,
+    inner: Arc<dashmap::DashMap<[u8; 16], InFlightAck>>,
+}
+
+/// A registered waiter plus the binding an ACK must satisfy to resolve it.
+///
+/// ADR 0030 pins `(protocol_version, recipient, machine)` on the sender's
+/// waiter so a v1 ACK — or an ACK from a different machine of the same agent —
+/// can never be mistaken for the durable v2 receipt the caller asked for.
+struct InFlightAck {
+    expected_recipient: AgentId,
+    /// `None` for legacy v1 sends, which have no signed machine binding to
+    /// pin against. Strict v2 sends always supply the advert's machine.
+    expected_machine: Option<MachineId>,
+    protocol_version: u16,
+    reply: tokio::sync::oneshot::Sender<DmAckOutcome>,
 }
 
 impl Clone for InFlightAcks {
@@ -1312,31 +1429,109 @@ impl InFlightAcks {
         Self::default()
     }
 
-    /// Register a waiter for `request_id`. Returns the receiver side of the
-    /// oneshot; caller awaits it with their timeout.
+    /// Register a v1-semantics waiter for `request_id`. Returns the receiver
+    /// side of the oneshot; caller awaits it with their timeout.
     ///
     /// If a prior waiter exists for the same id (e.g. from an earlier
     /// retry that was already resolved), the existing waiter is silently
     /// replaced. This matches sender-retry semantics where only the most
     /// recent attempt's waiter is of interest.
-    pub fn register(&self, request_id: [u8; 16]) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
+    pub fn register(
+        &self,
+        request_id: [u8; 16],
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
+    ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
+        self.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_V1,
+            expected_recipient,
+            expected_machine,
+        )
+    }
+
+    /// Register a waiter that only an ACK from `expected_recipient` — on
+    /// `expected_machine` when supplied — carrying exactly `protocol_version`
+    /// may resolve.
+    pub fn register_for_protocol(
+        &self,
+        request_id: [u8; 16],
+        protocol_version: u16,
+        expected_recipient: AgentId,
+        expected_machine: Option<MachineId>,
+    ) -> tokio::sync::oneshot::Receiver<DmAckOutcome> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        self.inner.insert(request_id, tx);
+        self.inner.insert(
+            request_id,
+            InFlightAck {
+                expected_recipient,
+                expected_machine,
+                protocol_version,
+                reply: tx,
+            },
+        );
         rx
     }
 
-    /// Resolve a waiter for `request_id`. Returns true if a waiter was
-    /// present, false otherwise (e.g. late ACK arriving after sender gave
-    /// up).
-    pub fn resolve(&self, request_id: &[u8; 16], outcome: DmAckOutcome) -> bool {
-        if let Some((_, tx)) = self.inner.remove(request_id) {
-            // If the receiver was dropped we silently swallow the send
-            // error — caller already moved on.
-            let _ = tx.send(outcome);
-            true
-        } else {
-            false
+    /// Resolve a v1-semantics waiter for `request_id`.
+    pub fn resolve(
+        &self,
+        request_id: &[u8; 16],
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: DmAckOutcome,
+    ) -> bool {
+        self.resolve_for_protocol(request_id, DM_PROTOCOL_V1, ack_sender, ack_machine, outcome)
+    }
+
+    /// Resolve a waiter only when the authenticated ACK sender agent, its
+    /// machine, and the ACK's protocol version all match the registered
+    /// binding. Returns true if a waiter was resolved, false otherwise (a late
+    /// ACK after the sender gave up, or a receipt weaker than the one the
+    /// caller is waiting for).
+    ///
+    /// The match on `protocol_version` is exact, not `>=`: a v1 ACK asserts
+    /// level-2 enqueue and must never satisfy a waiter that was promised the
+    /// v2 durable receipt (ADR 0030 §2).
+    pub fn resolve_for_protocol(
+        &self,
+        request_id: &[u8; 16],
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+        outcome: DmAckOutcome,
+    ) -> bool {
+        use dashmap::mapref::entry::Entry;
+
+        match self.inner.entry(*request_id) {
+            Entry::Occupied(entry)
+                if Self::ack_binding_matches(
+                    entry.get(),
+                    protocol_version,
+                    ack_sender,
+                    ack_machine,
+                ) =>
+            {
+                // If the receiver was dropped we silently swallow the send
+                // error — caller already moved on.
+                let _ = entry.remove().reply.send(outcome);
+                true
+            }
+            Entry::Occupied(_) | Entry::Vacant(_) => false,
         }
+    }
+
+    fn ack_binding_matches(
+        pending: &InFlightAck,
+        protocol_version: u16,
+        ack_sender: AgentId,
+        ack_machine: MachineId,
+    ) -> bool {
+        pending.protocol_version == protocol_version
+            && pending.expected_recipient == ack_sender
+            && pending
+                .expected_machine
+                .is_none_or(|expected| expected == ack_machine)
     }
 
     /// Cancel a waiter (sender gave up / retry-attempt abandoned).
@@ -1715,19 +1910,177 @@ mod tests {
     #[test]
     fn in_flight_acks_resolve_and_cancel() {
         let acks = InFlightAcks::new();
+        let recipient = AgentId([9u8; 32]);
+        let machine = MachineId([8u8; 32]);
         let rid = [1u8; 16];
-        let rx = acks.register(rid);
-        assert!(acks.resolve(&rid, DmAckOutcome::Accepted));
+        let rx = acks.register(rid, recipient, Some(machine));
+        assert!(acks.resolve(&rid, recipient, machine, DmAckOutcome::Accepted));
         let received = tokio::runtime::Runtime::new().expect("rt").block_on(rx);
         assert_eq!(received.expect("ok"), DmAckOutcome::Accepted);
         // Second resolve → no-op.
-        assert!(!acks.resolve(&rid, DmAckOutcome::Accepted));
+        assert!(!acks.resolve(&rid, recipient, machine, DmAckOutcome::Accepted));
 
         // Cancellation path.
         let rid2 = [2u8; 16];
-        let _rx2 = acks.register(rid2);
+        let _rx2 = acks.register(rid2, recipient, Some(machine));
         acks.cancel(&rid2);
         assert_eq!(acks.outstanding(), 0);
+    }
+
+    /// ADR 0030 §2: a v1 ACK asserts level-2 enqueue. If it could satisfy a
+    /// waiter registered for v2 the sender would report a durable receipt the
+    /// recipient never made — the exact silent-degradation class the protocol
+    /// exists to remove. The version match is therefore exact, not `>=`.
+    #[test]
+    fn v1_ack_cannot_resolve_a_v2_waiter() {
+        let acks = InFlightAcks::new();
+        let recipient = AgentId([0x21; 32]);
+        let machine = MachineId([0x22; 32]);
+        let rid = [0x23; 16];
+        let mut rx =
+            acks.register_for_protocol(rid, DM_PROTOCOL_DURABLE_ACK, recipient, Some(machine));
+
+        assert!(
+            !acks.resolve_for_protocol(
+                &rid,
+                DM_PROTOCOL_V1,
+                recipient,
+                machine,
+                DmAckOutcome::Accepted,
+            ),
+            "a v1 ACK must not satisfy a durable v2 waiter"
+        );
+        assert!(rx.try_recv().is_err(), "the waiter must still be pending");
+        assert_eq!(acks.outstanding(), 1);
+
+        assert!(acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(rx.try_recv().expect("resolved"), DmAckOutcome::Accepted);
+    }
+
+    /// The waiter is bound to the exact signed-advert machine, so a second
+    /// daemon running the same agent identity cannot answer for it.
+    #[test]
+    fn ack_from_a_different_machine_cannot_resolve_a_bound_waiter() {
+        let acks = InFlightAcks::new();
+        let recipient = AgentId([0x31; 32]);
+        let bound_machine = MachineId([0x32; 32]);
+        let other_machine = MachineId([0x33; 32]);
+        let rid = [0x34; 16];
+        let mut rx = acks.register_for_protocol(
+            rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            Some(bound_machine),
+        );
+
+        assert!(!acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            recipient,
+            other_machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert!(!acks.resolve_for_protocol(
+            &rid,
+            DM_PROTOCOL_DURABLE_ACK,
+            AgentId([0x35; 32]),
+            bound_machine,
+            DmAckOutcome::Accepted,
+        ));
+        assert!(rx.try_recv().is_err());
+        assert_eq!(acks.outstanding(), 1);
+    }
+
+    /// Legacy v1 sends have no signed machine binding to pin, so they accept
+    /// any machine of the expected recipient agent — unchanged from pre-0030
+    /// behaviour.
+    #[test]
+    fn unbound_v1_waiter_accepts_any_machine_of_the_expected_agent() {
+        let acks = InFlightAcks::new();
+        let recipient = AgentId([0x41; 32]);
+        let rid = [0x42; 16];
+        let mut rx = acks.register(rid, recipient, None);
+
+        assert!(acks.resolve(
+            &rid,
+            recipient,
+            MachineId([0x43; 32]),
+            DmAckOutcome::Accepted,
+        ));
+        assert_eq!(rx.try_recv().expect("resolved"), DmAckOutcome::Accepted);
+    }
+
+    /// A strict send must be able to negotiate v2 on the wire while the
+    /// default builder keeps stamping v1 for every existing caller — a v1/0.37
+    /// receiver's ceiling would otherwise drop all traffic from this build.
+    #[test]
+    fn payload_envelope_defaults_to_v1_and_rejects_versions_above_the_ceiling() {
+        use crate::gossip::SigningContext;
+        use crate::identity::{AgentKeypair, MachineKeypair};
+
+        let agent = AgentKeypair::generate().expect("agent keygen");
+        let machine = MachineKeypair::generate().expect("machine keygen");
+        let recipient_kem = AgentKemKeypair::generate().expect("kem keygen");
+        let signing = SigningContext::from_keypair(&agent);
+        let recipient = AgentId([0x51; 32]);
+        let now = now_unix_ms();
+
+        let build = |version: Option<u16>| {
+            let sign = |bytes: &[u8]| signing.sign(bytes).map_err(|e| e.to_string());
+            match version {
+                None => EnvelopeBuilder::build_payload_envelope(
+                    [0x52; 16],
+                    &agent.agent_id(),
+                    &machine.machine_id(),
+                    &machine,
+                    &recipient,
+                    &recipient_kem.public_bytes,
+                    now,
+                    now + 60_000,
+                    b"hello".to_vec(),
+                    sign,
+                ),
+                Some(version) => EnvelopeBuilder::build_payload_envelope_with_version(
+                    version,
+                    [0x52; 16],
+                    &agent.agent_id(),
+                    &machine.machine_id(),
+                    &machine,
+                    &recipient,
+                    &recipient_kem.public_bytes,
+                    now,
+                    now + 60_000,
+                    b"hello".to_vec(),
+                    sign,
+                ),
+            }
+        };
+
+        assert_eq!(
+            build(None).expect("default build").protocol_version,
+            DM_PROTOCOL_V1,
+            "existing callers must keep emitting v1 envelopes"
+        );
+        assert_eq!(
+            build(Some(DM_PROTOCOL_DURABLE_ACK))
+                .expect("v2 build")
+                .protocol_version,
+            DM_PROTOCOL_DURABLE_ACK
+        );
+        assert!(matches!(
+            build(Some(DM_PROTOCOL_VERSION + 1)),
+            Err(DmError::EnvelopeConstruction(_))
+        ));
+        assert!(matches!(
+            build(Some(0)),
+            Err(DmError::EnvelopeConstruction(_))
+        ));
     }
 
     // ── Issue #213: origin-machine attestation ────────────────────────

@@ -2,7 +2,7 @@
 
 use crate::dm::{
     dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, MAX_PAYLOAD_BYTES,
+    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -57,9 +57,17 @@ pub struct DmSendContext<'a> {
     pub inflight: Arc<InFlightAcks>,
 }
 
+/// Publish a DM envelope on the recipient's gossip inbox topic and await its
+/// application ACK.
+///
+/// `recipient_machine_id` is the machine from the recipient's signed
+/// capability advert, when one is cached. Strict (ADR 0030) sends always have
+/// it — the gate in `send_direct_with_config_inner` refuses without one — and
+/// it pins the ACK waiter so only that daemon can answer.
 pub async fn send_via_gossip(
     ctx: DmSendContext<'_>,
     recipient_agent_id: AgentId,
+    recipient_machine_id: Option<MachineId>,
     recipient_kem_public_key: &[u8],
     payload: Vec<u8>,
     config: &DmSendConfig,
@@ -89,10 +97,20 @@ pub async fn send_via_gossip(
     }
 
     let request_id = fresh_request_id();
+    // The negotiated version is a promise about the receipt, not a wire-layout
+    // change: v1 and v2 envelopes are byte-identical apart from this field.
+    // Only a caller that demanded durable semantics — and therefore passed the
+    // capability gate — stamps v2.
+    let protocol_version = if config.require_durable_app_ack {
+        DM_PROTOCOL_DURABLE_ACK
+    } else {
+        DM_PROTOCOL_V1
+    };
 
     let created = now_unix_ms();
     let expires = created.saturating_add(DEFAULT_ENVELOPE_LIFETIME_MS);
-    let envelope = EnvelopeBuilder::build_payload_envelope(
+    let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
+        protocol_version,
         request_id,
         &self_agent_id,
         &self_machine_id,
@@ -124,7 +142,12 @@ pub async fn send_via_gossip(
         bytes = wire.len(),
     );
 
-    let mut rx = inflight.register(request_id);
+    let mut rx = inflight.register_for_protocol(
+        request_id,
+        protocol_version,
+        recipient_agent_id,
+        recipient_machine_id,
+    );
     let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
 
     // X0X-0041: split the lifecycle hint into the per-peer match key and the
@@ -741,7 +764,7 @@ mod tests {
     fn inflight_guard_drop_cancels_unresolved_waiter() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x88; 16];
-        let _rx = inflight.register(request_id);
+        let _rx = inflight.register(request_id, AgentId([0x77; 32]), None);
         assert_eq!(inflight.outstanding(), 1);
         {
             let _guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
@@ -753,7 +776,7 @@ mod tests {
     fn inflight_guard_mark_resolved_preserves_waiter_on_drop() {
         let inflight = Arc::new(InFlightAcks::new());
         let request_id = [0x89; 16];
-        let _rx = inflight.register(request_id);
+        let _rx = inflight.register(request_id, AgentId([0x77; 32]), None);
         let mut guard = InFlightGuard::new(Arc::clone(&inflight), request_id);
         guard.mark_resolved();
         drop(guard);

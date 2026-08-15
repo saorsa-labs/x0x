@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **DM protocol v2 capability advertisement + strict-send gate (ADR 0030,
+  slice 1 of 4).** `DM_PROTOCOL_VERSION` becomes the receive **ceiling** 2:
+  envelopes above it are dropped without an ACK. A daemon advertises
+  `max_protocol_version = 2` iff durable history is enabled, else 1 (ADR
+  0030 §3); agent cards now export the same runtime value instead of a
+  hardcoded v1, and card imports go through `CapabilityStore::insert_from_card`
+  so a stale card can never lower a live signed advert.
+- **`DmSendConfig::require_durable_app_ack`** (default `false`). A strict
+  send negotiates v2 on the wire and pins its ACK waiter to
+  `(protocol_version, recipient, machine)`; a recipient without a current
+  signed v2 advert yields `DmError::AckSemanticsUnavailable` → REST 409
+  `recipient_ack_semantics_unavailable`, after exactly one forced targeted
+  capability refresh. Never a silent downgrade to v1 receipt semantics,
+  never a hang (ADR 0030 §2).
+- **Targeted capability refresh protocol** on
+  `x0x/caps/v1/request/targeted-v2`, answered on
+  `x0x/caps/v1/response/targeted-v2` (both Critical admission, so a strict
+  send's convergence window is not cooled behind Bulk advert traffic).
+  Concurrent strict sends to one recipient share a single in-flight
+  request; responses are rate limited.
+
+### Notes
+
+- No send surface sets `require_durable_app_ack` yet: REST, CLI, WS and the
+  library default stay v1-defaulted, so this slice is behaviour-neutral for
+  existing callers. Product defaults flip in ADR 0030 slice 4.
+- The receiver durable path is slice 2. Until it lands this build ACKs with
+  `protocol_version = 1` — the semantics it actually honours — so a strict
+  send that clears the gate times out rather than receiving a durable
+  receipt no one made.
+
 ## [v0.37.4] - 2026-08-14
 
 History schema v4 (ADR 0030 continuity) + gossip guard v2.

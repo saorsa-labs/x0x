@@ -200,6 +200,35 @@ Documented explicitly so we don't overclaim:
 `DmReceipt::delivered_at` corresponds to **level 2**. Docs and API
 names use "accepted" rather than "delivered" to avoid confusion.
 
+### Protocol v2 — durable application ACK (ADR 0030)
+
+DM protocol v2 raises `Accepted` to **level 3** for sends that ask for it.
+The envelope layout is byte-identical to v1; only ACK semantics differ, so
+`protocol_version` is a promise about the *receipt*, not a wire change.
+
+Landing in slices (ADR 0030 "Landing order"). Slice 1 ships:
+
+- `DM_PROTOCOL_VERSION = 2` as the **receive ceiling**. Envelopes above it
+  are dropped without an ACK, so the sender times out rather than being
+  handed a receipt for semantics we cannot honour.
+- A daemon advertises `max_protocol_version = 2` **iff** durable history is
+  enabled, else 1 (ADR 0030 §3). Card exports and mesh adverts carry the
+  same value.
+- `DmSendConfig::require_durable_app_ack` (default `false`). When set, the
+  send negotiates v2 on the wire and its ACK waiter is pinned to
+  `(protocol_version, recipient, machine)`. A recipient without a current
+  signed v2 advert yields `DmError::AckSemanticsUnavailable` — REST 409
+  `recipient_ack_semantics_unavailable` — after one forced targeted
+  capability refresh. Never a silent downgrade, never a hang.
+- Targeted capability refresh on `x0x/caps/v1/request/targeted-v2`, answered
+  on `x0x/caps/v1/response/targeted-v2` (both Critical). Concurrent strict
+  sends to one recipient share a single in-flight request.
+
+**Not yet in slice 1:** the receiver durable path. Until it lands, this
+build ACKs every accepted payload with `protocol_version = 1` — the
+semantics it actually honours — so a strict send that clears the capability
+gate still times out rather than receiving a durable receipt no one made.
+
 ## Capability negotiation
 
 ### Advertisement
