@@ -383,9 +383,20 @@ Two consequences worth planning for:
   `(sender, request_id)`.
 
 Optional field `logical_id` (string): a caller-supplied idempotency key for
-this logical send. 1–128 characters of `a`–`z`, `0`–`9`, `-`, `_`, `.`, or
-`:`; uppercase, whitespace, and non-ASCII are rejected rather than normalized,
-so two tokens that differ only in case stay two distinct requests.
+this logical send, **valid only on a durable send**. 1–128 characters of
+`a`–`z`, `0`–`9`, `-`, `_`, `.`, or `:`; uppercase, whitespace, and non-ASCII
+are rejected rather than normalized, so two tokens that differ only in case
+stay two distinct requests.
+
+The durable requirement is not a formality: everything below is a promise the
+*recipient's* durable path makes — its replay binding and its durable-history
+lookup are what recognise a retry. A v1 send would carry a derived id on the
+wire that no receiver consults, so the guarantee would not exist. Sending
+`logical_id` with `require_durable_app_ack: false` is therefore a **400
+`logical_id_requires_durable_ack`**, not a silent no-op: a caller who asked for
+retry identity and quietly got fire-and-forget would not find out until
+duplicates appeared. (`x0x direct send` rejects `--logical-id` with
+`--no-durable-ack` at the CLI, before the round trip.)
 
 Resending the same `logical_id` to the same recipient — after a timeout, a
 reconnect, or a full process restart — is *the same request*, not a second
@@ -398,13 +409,6 @@ The daemon derives the 128-bit wire request id as
 recipient_agent_id ‖ logical_id)` truncated to its leading 16 bytes. Both agent
 ids are mixed in, so the same token addressed to two different recipients
 yields two different requests. The token itself never goes on the wire.
-
-`logical_id` **requires durable delivery**. Only the durable receiver path
-consults it, so combining it with `require_durable_app_ack: false` is a **400
-`logical_id_requires_durable_ack`** rather than a silent no-op — otherwise a
-caller would be handed an at-least-once retry identity that nothing enforces,
-and would not discover it until duplicates appeared. (`x0x direct send` rejects
-`--logical-id` with `--no-durable-ack` at the CLI, before the round trip.)
 
 Reusing a `logical_id` for *different* payload bytes is a **409
 `idempotency_conflict`** — see below.
