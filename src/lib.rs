@@ -7856,15 +7856,16 @@ impl Agent {
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
         //
-        // ADR 0030 §3: advertise v2 iff durable history is enabled. Without a
-        // history handle this daemon cannot commit a message before ACKing, so
-        // claiming v2 would promise a receipt it can never honour — senders
-        // must see v1 and either downgrade explicitly or get their 409.
-        let upgraded = if self.history_handle.is_some() {
-            dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
-        } else {
-            dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
-        };
+        // ADR 0030 §3 targets: advertise v2 iff durable history is enabled.
+        // HELD AT v1 FOR NOW (PR #327 review): this binary carries the
+        // sender-side gate (slice 1) but NOT the receiver durable path
+        // (slice 2), so a v2 advert would be a false capability — a strict
+        // sender clears its gate, this receiver ACKs with v1 semantics, the
+        // exact-protocol waiter never matches, and the send hangs to timeout:
+        // exactly the failure mode ADR 0030 §2 forbids. Flip to
+        // `v2_durable_gossip_ready(...)` iff `history_handle.is_some()` in
+        // the same change that lands the slice-2 receiver path.
+        let upgraded = dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone());
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on
