@@ -27362,6 +27362,11 @@ pub(in crate::server) mod tests {
             require_gossip: false,
             require_gossip_ack: None,
             require_ack_ms: None,
+            // These #188 malformed-request cases predate ADR 0030 and assert
+            // on shapes the durable tier does not change; keeping them on v1
+            // semantics keeps them testing what they were written to test.
+            require_durable_app_ack: Some(false),
+            logical_id: None,
         }
     }
 

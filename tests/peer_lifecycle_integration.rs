@@ -27,6 +27,20 @@ use daemon::DaemonFixture;
 
 const STARTUP_SETTLE: Duration = Duration::from_secs(5);
 
+/// HTTP client timeout for the two tests that issue a bare — and therefore,
+/// since ADR 0030 slice 4, durable — `POST /direct/send`.
+///
+/// This aligns the test's observer with the daemon's own send budget rather
+/// than widening a race: `direct_message_send_config` allows 8 s per attempt
+/// with one retry and an 8 s backoff, so a legitimate durable send can occupy
+/// ~24 s before the daemon itself gives up. A 10 s client abandons work the
+/// daemon is still correctly doing and reports it as a test failure. The
+/// bundled tic-tac-toe client already uses 30 s for exactly this reason.
+///
+/// The cold-path latency this exposes is tracked in issue #336; it is
+/// deliberately not frozen into a documented contract here.
+const DURABLE_SEND_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 struct PeerLifecycleLock(std::fs::File);
 
@@ -238,6 +252,41 @@ async fn wait_for_peer(fixture: &DaemonFixture, peer_machine: &str, deadline: Du
     panic!(
         "peer {peer_machine} not visible in /peers within {:?} ({polls} polls)",
         deadline
+    );
+}
+
+/// Wait until this daemon has *an* advert in its capability store.
+///
+/// Since ADR 0030 slice 4 a bare `POST /direct/send` is a durable send, so it
+/// depends on the recipient's advert having converged. This shortens that
+/// window but does **not** close it: `capability_store_entries` is the only
+/// REST-visible signal, and it is a count — it cannot say whether the entry is
+/// the signed, machine-bound v2 binding the strict gate actually requires.
+///
+/// Measured on this fixture: the first durable send to a peer takes ~17.5 s
+/// even after this wait returns (subsequent sends ~200-450 ms), because the
+/// send itself still performs the ADR 0030 §2 forced targeted refresh and
+/// waits for the gossip ACK. A caller whose HTTP timeout is below that will
+/// still fail. Closing the gap properly needs either a REST surface exposing
+/// per-peer advert state, or a product change to the cold-start path.
+async fn wait_for_durable_capability(fixture: &DaemonFixture, deadline: Duration) -> usize {
+    let client = fixture.authed_client(Duration::from_secs(5));
+    let started = tokio::time::Instant::now();
+    let mut polls = 0usize;
+    while started.elapsed() < deadline {
+        polls += 1;
+        if let Ok(resp) = client.get(fixture.url("/diagnostics/dm")).send().await {
+            if let Ok(body) = resp.json::<Value>().await {
+                if body["capability_store_entries"].as_u64().unwrap_or(0) > 0 {
+                    return polls;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "no peer capability advert converged within {deadline:?} ({polls} polls); \
+         a durable /direct/send would 409"
     );
 }
 
@@ -480,8 +529,12 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
         v["agent_id"].as_str().unwrap().to_string()
     };
 
+    // A bare /direct/send is durable since ADR 0030 slice 4; wait for Bob's v2
+    // advert so this test fails only on the probe behaviour it is about.
+    wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
+
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-ack-test");
-    let alice_client = alice.authed_client(Duration::from_secs(10));
+    let alice_client = alice.authed_client(DURABLE_SEND_CLIENT_TIMEOUT);
     let r = alice_client
         .post(alice.url("/direct/send"))
         .json(&serde_json::json!({
@@ -492,8 +545,12 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let status = r.status();
     let body: Value = r.json().await.unwrap();
+    // Carry status *and* body: a durable send's refusals are typed (409
+    // recipient_ack_semantics_unavailable when the advert has not converged),
+    // and a bare status code cannot distinguish that from a real regression.
+    assert_eq!(status, StatusCode::OK, "direct/send {status}: {body}");
     assert_eq!(body["ok"], true, "direct/send body: {body}");
     let ack = &body["require_ack"];
     assert_eq!(ack["ok"], true, "require_ack absent or failed: {body}");
@@ -524,8 +581,11 @@ async fn direct_send_without_require_ack_omits_ack_block() {
         v["agent_id"].as_str().unwrap().to_string()
     };
 
+    // Same durable-send convergence wait as the sibling test above.
+    wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
+
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-no-ack-test");
-    let alice_client = alice.authed_client(Duration::from_secs(10));
+    let alice_client = alice.authed_client(DURABLE_SEND_CLIENT_TIMEOUT);
     // Retry the direct-send POST: same transient-connection rationale as above.
     let r = retry_post_json(
         &alice_client,
@@ -537,9 +597,10 @@ async fn direct_send_without_require_ack_omits_ack_block() {
         5,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::OK);
+    let status = r.status();
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["ok"], true);
+    assert_eq!(status, StatusCode::OK, "direct/send {status}: {body}");
+    assert_eq!(body["ok"], true, "direct/send body: {body}");
     assert!(
         body.get("require_ack").is_none() || body["require_ack"].is_null(),
         "require_ack should be absent when not requested, got: {body}"

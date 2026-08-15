@@ -222,6 +222,76 @@ Landing in slices (ADR 0030 "Landing order"). Slices 1–2 ship:
   sends to one recipient share a single in-flight request.
 - The **receiver durable path** and the live v2 advert (below).
 
+#### Send surfaces and defaults (ADR 0030 §4)
+
+A product developer must not get different delivery semantics depending on
+which surface they reached for. Every send surface is classified into one of
+two named tiers, and the tier — not the caller's memory — picks the default:
+
+| Surface | Tier | `require_durable_app_ack` default | `logical_id` |
+|---|---|---|---|
+| `POST /direct/send` | Product | **`true`** (opt out with `require_durable_app_ack: false`) | accepted |
+| `x0x direct send` | Product | **`true`** (opt out with `--no-durable-ack`) | `--logical-id` |
+| WebSocket `send_direct` frame | Internal | `false` | not accepted |
+| `Agent::send_direct*` (library default config) | Internal | `false` | via `DmSendConfig::logical_request_id` |
+| Daemon control plane (welcome blobs, TreeKEM, group metadata) | Internal | `false`, per named config | per config |
+| Durable bootstrap outbox (ADR 0030 §5) | Internal, explicitly strict | `true` | obligation digest |
+
+The internal tier is not an oversight. Control-plane messages deliberately
+race connection establishment; forcing durable semantics on them causes
+livelock (v0.37.0's welcome-blob opt-out is the precedent). Conversely the
+product tier defaults *on* because the bug class this protocol exists to fix
+came precisely from products forgetting to opt in.
+
+The default flip is scoped to the request-scoped config builder in
+`src/server/routes/direct.rs`, **not** to the shared
+`direct_message_send_config()` helper — the WebSocket frame and every
+control-plane send read that helper, so flipping it there would silently make
+the whole internal tier strict.
+
+Two consequences of asking for durable semantics:
+
+- The raw-QUIC fast path is skipped. Raw QUIC returns a transport receipt,
+  which cannot certify a durable commit, so `prefer_raw_quic_if_connected` is
+  inert on a strict send.
+- No relay fallback. A relayed envelope is resealed by a third party and
+  cannot carry the machine-bound v2 receipt the caller demanded.
+
+#### Caller-supplied logical request identity (`logical_id`)
+
+The product tier accepts a stable idempotency key: 1–128 characters of
+`[a-z0-9._:-]`, rejected rather than normalized if it contains anything else,
+so tokens differing only in case stay distinct requests.
+
+The wire request id is derived, never transmitted:
+
+```
+request_id = blake3::derive_key(
+    "x0x dm logical request id v1",
+    sender_agent_id ‖ recipient_agent_id ‖ logical_id,
+)[..16]
+```
+
+Both agent ids are bound. The recipient dedupes on `(sender, request_id)`, so
+binding the sender is belt-and-braces; binding the *recipient* is
+load-bearing, because the sender's in-flight ACK waiter is keyed by
+`request_id` alone and one token fanned out to two peers must not produce one
+id that two waiters contend for.
+
+This is the same mechanism the durable bootstrap outbox uses internally (§5),
+where the obligation key and the wire request id are deliberately one
+identity. The only difference is who chooses it: a product caller passes a
+token, while the outbox derives its id from the obligation's own binding
+digest so an ACK can be matched back to the exact debt it discharges.
+
+That outbox persists its obligations to
+**`<data_dir>/public_group_bootstrap_outbox.json`** (1024-entry cap,
+exponential backoff to 60 s, cleared only by a frontier-matching v2
+application ACK). The sidecar is loaded fail-closed: an unsupported version,
+an over-cap file, a duplicate key, or a payload contradicting the frontier it
+claims aborts daemon startup rather than silently dropping a promised
+delivery. Operator detail in `docs/api-reference.md`.
+
 #### Receiver ordering (normative)
 
 `InboxPipeline::handle_payload_durable` runs a v2 payload in exactly this
@@ -235,19 +305,33 @@ order, per ADR 0030 §1:
    under *its own* semantics, never re-dispatched. The binding is a
    domain-separated digest over `(protocol_version, accepted bytes)`, so the
    same request id carrying different content is refused rather than
-   re-ACKed as the original delivery. Both refusals — "already completed
-   under v1 semantics" and "already bound to different content" — are
-   answered `DmAckOutcome::AckSemanticsUnavailable`, never
-   `RejectedByPolicy`: no trust decision failed, and the sender maps the
-   latter to `RecipientRejected`, which would misreport a protocol condition
-   as a blocked peer. On the sender it becomes
-   `DmError::AckSemanticsUnavailable` — the same typed error the send-side
-   capability gate raises.
+   re-ACKed as the original delivery. Neither refusal is `RejectedByPolicy`:
+   no trust decision failed, and the sender maps that variant to
+   `RecipientRejected`, which would misreport a protocol condition as a
+   blocked peer. The two refusals are distinct outcomes because they
+   prescribe opposite repairs:
+   - "already completed under v1 semantics" ⇒
+     `DmAckOutcome::AckSemanticsUnavailable` ⇒
+     `DmError::AckSemanticsUnavailable` — the same typed error the send-side
+     capability gate raises. *Retry, or the peer needs upgrading.*
+   - "already bound to different content" ⇒
+     `DmAckOutcome::IdempotencyConflict` ⇒ `DmError::IdempotencyConflict` ⇒
+     REST 409 `idempotency_conflict`. *These bytes will never be accepted
+     under this id; pick a new one.* (Before ADR 0030 slice 4 this reused the
+     variant above, which sent callers down the retry branch of a condition
+     retrying cannot fix.)
+
+   The inbox's cheap pre-decrypt replay short-circuit in `handle_incoming`
+   **stands aside** for a v2 payload replaying a completion that carries a
+   durable binding: comparing bytes requires the plaintext, so the durable
+   path owns that decision end to end. Answering from the fast path would
+   report `Accepted` for content the receiver never stored.
 3. **Durable-history lookup** — keyed on the schema v4 columns
    `(ingress_sender_agent, logical_request_id)` via
    `Store::find_by_logical_request`. This is the check that survives restart,
    where the memory-only replay cache does not. A row binding different bytes
-   is a conflict and is refused.
+   is a conflict and is refused with the same `IdempotencyConflict` outcome
+   step 2 uses — the guarantee must not change because the receiver restarted.
 4. **Dispatch** to the application.
 5. **`record_committed` awaited** — the SQLite transaction must return
    `Inserted | Duplicate`, i.e. exactly one durable row for this logical
@@ -389,10 +473,38 @@ source of truth for path selection.
 
 ### Mixed-version matrix
 
+Transport selection (0.17/0.18 era):
+
 | Sender \ Recipient | 0.17 | 0.18 |
 |---|---|---|
 | 0.17 | raw | raw (recipient accepts both, sender only sends raw) |
 | 0.18 | raw (sender sees no gossip capability) | gossip |
+
+Receipt semantics (ADR 0030 §2, normative). "0.38 product send" means a
+default `POST /direct/send` or `x0x direct send`, which is strict since
+slice 4; "0.38 opted-out" means the same surface with
+`require_durable_app_ack: false`. A 0.38 recipient advertises v2 **iff**
+durable history is enabled — it is default-on, so `history.enabled = false`
+puts a 0.38 daemon in the "advertises v1" column:
+
+| Sender \ Recipient | 0.37 / advertises v1 | 0.38 advertising v2 |
+|---|---|---|
+| **0.38 product send** (strict) | **409 `recipient_ack_semantics_unavailable`** after one forced targeted refresh — bounded, never a hang, never a silent downgrade | Durable ACK: history row committed and dispatch completed **before** the sender's 200 |
+| **0.38 opted-out** (`require_durable_app_ack: false`) | Delivered, `Ok` = level 2 | Delivered, `Ok` = level 2 — the recipient's capability does not silently upgrade the receipt |
+| **0.38 internal tier** (WS / library default / control plane) | Delivered, `Ok` = level 2 | Delivered, `Ok` = level 2 |
+| **0.37 sender** | v1, unchanged | v1, unchanged — envelope layout is identical, and a v1 envelope is answered with a v1 ACK even on a history-enabled receiver |
+
+Rows this slice owns, for the same two recipient columns:
+
+| Condition | Answer |
+|---|---|
+| Strict send, recipient unknown — no advert **and** no contact card of any kind | **404 `recipient_key_unavailable`** — not the 409. "Does not advertise v2" presupposes we know the peer |
+| Strict send, contact card present but its advert has not converged (`dm_capabilities: None`) | **409 `recipient_ack_semantics_unavailable`** — a known peer mid-convergence, plausibly one needing an upgrade. The 404/409 boundary is "do we know this agent", not "has its advert arrived" |
+| `logical_id` sent with `require_durable_app_ack: false` | **400 `logical_id_requires_durable_ack`** — only the durable path consults the id, so the combination would promise idempotency nothing enforces |
+| Same `logical_id`, same bytes, retried (incl. after either side restarts) | Re-ACKed from the binding or the durable-history row. Exactly one history row; re-dispatch is possible and documented |
+| Same `logical_id`, **different** bytes | **409 `idempotency_conflict`** — from the replay cache while hot, from the durable-history lookup after a receiver restart. Terminal for those bytes |
+| `require_gossip_ack` set in any form | **400 `require_gossip_ack_removed`** before any send is attempted |
+| Recipient's history commit fails mid-request | **No ACK.** The sender times out (504). A withheld ACK is the only honest answer — a v1 ACK would hand back a weaker receipt the sender cannot distinguish from the one it asked for |
 
 ## Replay protection and dedupe
 
@@ -580,6 +692,14 @@ pub enum DmError {
     PublishFailed(String),
 }
 ```
+
+The block above is illustrative, not exhaustive; `src/dm.rs` is authoritative.
+ADR 0030 adds two variants that a product must distinguish, because they
+prescribe opposite repairs: `AckSemanticsUnavailable` (REST 409
+`recipient_ack_semantics_unavailable`) means *retry later, or the peer needs
+upgrading*, while `IdempotencyConflict` (REST 409 `idempotency_conflict`)
+means *this `logical_id` is already bound to different bytes and retrying
+these bytes can never succeed*.
 
 There is no `NoRoute` variant. Gossip has no routing layer — if we
 can publish, we can reach anyone subscribed to the topic; if not,

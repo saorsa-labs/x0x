@@ -336,7 +336,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
-| POST | `/direct/send` | `x0x direct send <agent_id> <message>` | Send a direct base64 payload |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
@@ -346,9 +346,13 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 ```json
 {
   "agent_id": "8a3f...",
-  "payload": "aGVsbG8="
+  "payload": "aGVsbG8=",
+  "logical_id": "order-42"
 }
 ```
+
+`agent_id` and `payload` are the only required fields. Everything below is
+optional.
 
 Optional field `prefer_raw_quic_if_connected` (bool): when a live transport
 connection to the recipient exists, deliver over raw QUIC instead of the
@@ -356,42 +360,98 @@ gossip inbox. **Defaults to `true` since v0.37.0** (previously `false`);
 omitting the field selects the daemon default, so clients that relied on the
 old default must now send `"prefer_raw_quic_if_connected": false` explicitly.
 
-Optional field `require_gossip_ack` (bool): when a gossip-inbox send is used,
-wait for the recipient's application ACK before returning success. `false`
-returns as soon as the publish succeeds. Omitting the field selects the daemon
-default (`true`).
+Optional field `require_durable_app_ack` (bool): choose the receipt semantics.
+**Defaults to `true` since v0.38.0** (ADR 0030 §4) — this endpoint is a
+*product-tier* surface, so a `200` means the recipient daemon durably
+committed the message to its history store and completed local dispatch, not
+merely that it accepted the envelope.
 
-> **Deprecated (ADR 0030 §4), still honored.** This field is scheduled for
-> removal when the product tier moves to durable-by-default sends in ADR 0030
-> slice 4, at which point `require_gossip_ack: false` stops being expressible
-> and the route will reject the field with **400** rather than accept it as a
-> no-op. It is fully honored today — see `direct_send_config_for_request` in
-> `src/server/routes/direct.rs` and the branch on `config.require_gossip_ack`
-> in `src/dm_send.rs` — so no client needs to change yet.
+Pass `false` to opt out and get v1 semantics, where `200` means "accepted for
+delivery". Opting out is the right choice when reaching a peer that has not
+upgraded matters more than the stronger receipt: a durable send to a peer
+running 0.37.x — or to any peer without durable history enabled — answers
+**409 `recipient_ack_semantics_unavailable`** instead of delivering.
+
+Two consequences worth planning for:
+
+- A durable send never uses the raw-QUIC fast path, because raw QUIC yields a
+  transport receipt that cannot certify a durable commit. `prefer_raw_quic_if_connected`
+  is therefore ignored unless you also pass `require_durable_app_ack: false`.
+- Durable delivery is **at-least-once across a recipient restart** (ADR 0030
+  §1). It never implies read, and never implies exactly-once application
+  delivery. Applications needing restart-spanning exactly-once dedupe on
+  `(sender, request_id)`.
+
+Optional field `logical_id` (string): a caller-supplied idempotency key for
+this logical send, **valid only on a durable send**. 1–128 characters of
+`a`–`z`, `0`–`9`, `-`, `_`, `.`, or `:`; uppercase, whitespace, and non-ASCII
+are rejected rather than normalized, so two tokens that differ only in case
+stay two distinct requests.
+
+The durable requirement is not a formality: everything below is a promise the
+*recipient's* durable path makes — its replay binding and its durable-history
+lookup are what recognise a retry. A v1 send would carry a derived id on the
+wire that no receiver consults, so the guarantee would not exist. Sending
+`logical_id` with `require_durable_app_ack: false` is therefore a **400
+`logical_id_requires_durable_ack`**, not a silent no-op: a caller who asked for
+retry identity and quietly got fire-and-forget would not find out until
+duplicates appeared. (`x0x direct send` rejects `--logical-id` with
+`--no-durable-ack` at the CLI, before the round trip.)
+
+Resending the same `logical_id` to the same recipient — after a timeout, a
+reconnect, or a full process restart — is *the same request*, not a second
+message: the recipient recognises it and re-ACKs the original commit instead of
+storing a duplicate. Omitting the field draws a fresh random id per call, which
+is correct for fire-and-forget sends.
+
+The daemon derives the 128-bit wire request id as
+`blake3::derive_key("x0x dm logical request id v1", sender_agent_id ‖
+recipient_agent_id ‖ logical_id)` truncated to its leading 16 bytes. Both agent
+ids are mixed in, so the same token addressed to two different recipients
+yields two different requests. The token itself never goes on the wire.
+
+Reusing a `logical_id` for *different* payload bytes is a **409
+`idempotency_conflict`** — see below.
+
+> **Removed (ADR 0030 §4): `require_gossip_ack`.** Setting this field in any
+> form — `true`, `false`, or a non-boolean — is now **400
+> `require_gossip_ack_removed`**. An explicit `null`, like omitting it, is
+> accepted. Accepting the field as a silent no-op was rejected in review: a
+> client that passed `require_gossip_ack: false` for fire-and-forget would
+> otherwise get a blocking durable send and no signal that its request had been
+> reinterpreted. Choose receipt semantics with `require_durable_app_ack`
+> instead.
 
 ### Direct send error codes
 
-`/direct/send` failures answer with `{"ok": false, "error": "<code>"}`.
+`/direct/send` failures answer with
+`{"ok": false, "error": "<code>", "detail": "<human-readable>"}`.
 Notable codes:
 
 | Status | `error` | Meaning |
 |---|---|---|
-| 404 | `recipient_key_unavailable` | The recipient has published no KEM key. |
+| 400 | `require_gossip_ack_removed` | The request set the removed `require_gossip_ack` field. Drop it; use `require_durable_app_ack`. |
+| 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
+| 400 | `logical_id_requires_durable_ack` | `logical_id` was sent with `require_durable_app_ack: false`. Only the durable path honours the id; drop one or the other. |
+| 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
-| 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends without the durable requirement — the daemon never downgrades silently. |
+| 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
+| 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. |
 
-**Note (as of ADR 0030 slice 2):** no REST field selects durable ACK
-semantics yet, so `recipient_ack_semantics_unavailable` is currently
-reachable only through the library (`DmSendConfig::require_durable_app_ack`).
-The product-tier default flips in ADR 0030 slice 4, at which point this
-becomes a routine response for not-yet-upgraded peers.
+The two 409s prescribe opposite repairs and must not be conflated in client
+code: `recipient_ack_semantics_unavailable` means *retry later or tell the user
+to upgrade the peer*; `idempotency_conflict` means *these bytes will never be
+accepted under this id*. Before v0.38.0 the conflict case was reported as
+`recipient_ack_semantics_unavailable`, which sent clients down the wrong branch.
 
-Slice 2 landed the receiver durable path, so a library-level strict send now
-*succeeds* against a peer that advertises v2 — which it does only when that
-peer runs with durable history enabled. REST request and response shapes are
-unchanged by this slice.
+**Rollout note.** Because the default flipped to durable, clients that
+previously got `200` from a 0.37.x peer will now get
+`409 recipient_ack_semantics_unavailable` until that peer upgrades. This is
+deliberate (ADR 0030 §2: never a silent downgrade). Handle the 409 as a
+first-class UX state; where delivery matters more than the receipt, send
+`require_durable_app_ack: false`.
 
 ### `/direct/events` SSE message shape
 
@@ -595,6 +655,26 @@ cached history:
 - `read_access == MembersOnly` — requires active membership.
 - `MlsEncrypted` — returns 400 (encrypted history belongs elsewhere).
 - Withdrawn groups return 409 and do not restart public-message listeners.
+
+#### Bootstrap outbox sidecar (ADR 0030 §5)
+
+Adding a member to a SignedPublic group owes that member a roster snapshot.
+Since v0.38.0 the delivery is a durable obligation rather than a
+fire-and-forget send, so an offline recipient still receives it. Obligations
+are persisted to **`<data_dir>/public_group_bootstrap_outbox.json`**, capped at
+1024 entries, and retried with exponential backoff to 60 s until the recipient
+returns a durable (v2) application ACK for that exact frontier.
+
+Two operator-visible consequences:
+
+- The sidecar is loaded **fail-closed** at startup. An unsupported version, an
+  over-cap file, a duplicate key, or a payload contradicting the frontier it
+  claims **aborts daemon startup** rather than silently dropping a promised
+  delivery. If a daemon refuses to start citing this file, the file is the
+  problem — inspect it rather than deleting it blindly, since each entry is a
+  delivery someone is still waiting for.
+- Deleting the sidecar discards outstanding obligations permanently. Affected
+  members will not receive their snapshot until they are re-added.
 
 #### Threading (ADR-0029)
 
@@ -1000,6 +1080,19 @@ Client → server:
 {"type":"send_direct","agent_id":"hex64...","payload":"aGVsbG8="}
 ```
 
+> **`send_direct` over WebSocket is an internal-tier surface** (ADR 0030 §4).
+> It carries none of the product fields `POST /direct/send` accepts — no
+> `require_durable_app_ack`, no `logical_id` — and keeps v1 receipt semantics:
+> the frame is accepted for delivery, with no durable-commit guarantee and no
+> idempotency key. It shares its send configuration with the daemon's own
+> control-plane traffic (welcome blobs, TreeKEM plumbing, group metadata),
+> which must not inherit strict gating: those messages deliberately race
+> connection establishment and would livelock under it.
+>
+> Product code that needs a durable receipt or at-least-once retry identity
+> should use `POST /direct/send`, not this frame. This surface will be
+> reclassified only if it grows the product fields.
+
 Server → client:
 
 ```json
@@ -1044,6 +1137,8 @@ x0x contacts list
 x0x publish updates hello
 x0x direct connect <agent_id>
 x0x direct send <agent_id> hello
+x0x direct send <agent_id> hello --logical-id order-42   # retry-safe identity
+x0x direct send <agent_id> hello --no-durable-ack        # reach a 0.37.x peer
 x0x groups create
 x0x group create team-chat --display-name alice
 x0x tasks create inbox team.tasks

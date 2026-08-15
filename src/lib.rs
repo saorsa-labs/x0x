@@ -4669,14 +4669,44 @@ impl Agent {
                     .as_ref(),
             )
         {
+            // "This peer does not advertise v2" presupposes we know the peer.
+            // `cap` cannot answer that on its own: the branch above deliberately
+            // withholds the contact-card fallback from strict sends (a card
+            // pins no machine), so a peer we know only by card arrives here
+            // with `cap == None`. Ask what we actually know instead.
+            //
+            // *Any* contact card counts, including one with no
+            // `dm_capabilities` yet. Such a card is a known peer whose advert
+            // has not converged — plausibly one that needs upgrading, which is
+            // exactly what the 409 tells the caller. Requiring capabilities on
+            // the card would misfile it as "no such agent" and send a product
+            // UI looking for a typo instead of waiting for convergence.
+            let recipient_is_known = cap.is_some() || {
+                let contacts = self.contact_store.read().await;
+                contacts.get(to).is_some()
+            };
             tracing::info!(
                 target: "dm.trace",
                 stage = "strict_durable_ack_gate_refused",
                 recipient = %hex::encode(to.as_bytes()),
                 source = cap_source,
                 advertised_version = cap.as_ref().map(|c| c.max_protocol_version),
+                recipient_is_known,
                 "refusing strict send: recipient has no current v2 capability advert"
             );
+            // A stranger gets the same 404 a non-strict send gives. Answering
+            // 409 "peer needs upgrade" for an agent id that was never
+            // discovered would send a product UI chasing a fleet-upgrade
+            // problem it does not have — the misdiagnosis ADR 0030 §2's typed
+            // errors exist to prevent. Slice 4 makes this the common failure:
+            // every product send is strict now, so every unknown-recipient
+            // send reaches this gate.
+            if !recipient_is_known {
+                return Err(dm::DmError::RecipientKeyUnavailable(format!(
+                    "recipient {} has no known DM capability advert",
+                    hex::encode(to.as_bytes())
+                )));
+            }
             return Err(dm::DmError::AckSemanticsUnavailable(format!(
                 "recipient {} has no current v2 durable-ACK capability advert",
                 hex::encode(to.as_bytes())
@@ -13512,6 +13542,92 @@ mod tests {
         assert!(
             matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
             "unexpected error: {err:?}"
+        );
+    }
+
+    /// The 404/409 boundary sits at "do we know this agent at all", not at
+    /// "has its advert converged". A contact card with no `dm_capabilities`
+    /// yet is a *known* peer mid-convergence — plausibly one that needs
+    /// upgrading — so it gets the 409 that says so. Classifying it as a
+    /// stranger would tell a product UI to go looking for a typo in an agent
+    /// id that is demonstrably in the contact store.
+    #[tokio::test]
+    async fn a_known_contact_without_capabilities_is_a_409_not_a_404() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x65_u8; 32]);
+
+        agent.contacts().write().await.add(contacts::Contact {
+            agent_id: target,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Known,
+            // The distinguishing detail: known agent, no advert yet.
+            dm_capabilities: None,
+            machines: Vec::new(),
+        });
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"strict".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    require_durable_app_ack: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("strict send must refuse without a v2 advert");
+        assert!(
+            matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
+            "a known contact must not be reported as an unknown agent: {err:?}"
+        );
+    }
+
+    /// ADR 0030 slice 4 precedence. `AckSemanticsUnavailable` means "this peer
+    /// does not advertise v2", which presupposes we know the peer at all. For
+    /// an agent id we hold no capability record for — no advert, no contact
+    /// card — the honest answer stays the 404 a non-strict send gives, not a
+    /// 409 that sends a product UI chasing a fleet upgrade for a peer that was
+    /// never discovered. Slice 4 makes this the common failure: every product
+    /// send is strict now, so unknown recipients all arrive at this gate.
+    #[tokio::test]
+    async fn a_strict_send_to_a_wholly_unknown_peer_reports_missing_key_not_missing_v2() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        // No capability-store entry and no contact card: this id is a stranger.
+        let target = identity::AgentId([0x64_u8; 32]);
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"strict".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    require_durable_app_ack: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("strict send to a stranger must refuse");
+        assert!(
+            matches!(err, dm::DmError::RecipientKeyUnavailable(_)),
+            "a stranger must not be reported as a peer needing an upgrade: {err:?}"
         );
     }
 
