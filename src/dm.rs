@@ -719,6 +719,16 @@ pub struct DmSendConfig {
     /// [`DmError::AckSemanticsUnavailable`] rather than a silent v1 downgrade.
     /// Defaults to `false`; product surfaces opt in (ADR 0030 §4).
     pub require_durable_app_ack: bool,
+    /// Caller-supplied stable request id. When set, this send *is* that
+    /// logical request: a retry — including one issued after a daemon restart
+    /// — reuses the id, so the recipient's replay cache recognises it and
+    /// re-ACKs instead of re-delivering. `None` draws a fresh random id, which
+    /// is correct for every fire-and-forget caller.
+    ///
+    /// Used by the durable bootstrap outbox (ADR 0030 §5), whose obligation
+    /// key and this id are deliberately the same identity: an ACK can then be
+    /// matched back to the exact obligation that has to be cleared.
+    pub logical_request_id: Option<[u8; 16]>,
     /// X0X-0041: bounded grace window (ms) the DM path holds when ant-quic has
     /// just observed a `Replaced` event but the new `Established` has not yet
     /// fired. Mirrors iroh-gossip #43 "always prefer newest connection" — when
@@ -746,6 +756,7 @@ impl Default for DmSendConfig {
             stop_fallback_on_raw_error: false,
             require_gossip_ack: true,
             require_durable_app_ack: false,
+            logical_request_id: None,
             // X0X-0041: 250ms is the soak-tested grace from iroh-gossip #43.
             prefer_newest_grace_ms: DEFAULT_PREFER_NEWEST_GRACE_MS,
         }

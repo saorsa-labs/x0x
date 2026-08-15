@@ -19,6 +19,7 @@ mod messaging;
 pub(crate) mod named_groups;
 mod network;
 mod presence;
+pub(crate) mod public_group_bootstrap_outbox;
 mod status;
 mod stores;
 mod tasks;
@@ -70,9 +71,9 @@ pub(super) use named_groups::{
     discover_groups_nearby, ensure_named_group_listeners, get_group_card,
     get_group_public_messages, get_group_state, get_group_state_commits, get_named_group,
     get_named_group_members, group_membership_lock, handle_join_result_message,
-    handle_public_group_bootstrap, handle_treekem_catchup_request, handle_treekem_catchup_response,
-    handle_welcome_blob_message, import_group_card, ingest_public_message, join_group_via_invite,
-    leave_group, list_discovery_subscriptions, list_join_requests, list_named_groups,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
+    import_group_card, ingest_public_message, join_group_via_invite, leave_group,
+    list_discovery_subscriptions, list_join_requests, list_named_groups,
     load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, named_group_metadata_event_group_id,
     named_group_metadata_event_kind, now_millis_u64, publish_group_card_to_discovery,

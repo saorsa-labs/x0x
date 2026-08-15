@@ -96,7 +96,9 @@ pub async fn send_via_gossip(
         ));
     }
 
-    let request_id = fresh_request_id();
+    // A caller that owns a durable obligation supplies its own id so a retry
+    // is the same logical request across restarts (ADR 0030 §5).
+    let request_id = config.logical_request_id.unwrap_or_else(fresh_request_id);
     // The negotiated version is a promise about the receipt, not a wire-layout
     // change: v1 and v2 envelopes are byte-identical apart from this field.
     // Only a caller that demanded durable semantics — and therefore passed the
