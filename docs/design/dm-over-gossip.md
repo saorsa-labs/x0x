@@ -211,9 +211,13 @@ Landing in slices (ADR 0030 "Landing order"). Slice 1 ships:
 - `DM_PROTOCOL_VERSION = 2` as the **receive ceiling**. Envelopes above it
   are dropped without an ACK, so the sender times out rather than being
   handed a receipt for semantics we cannot honour.
-- A daemon advertises `max_protocol_version = 2` **iff** durable history is
-  enabled, else 1 (ADR 0030 §3). Card exports and mesh adverts carry the
-  same value.
+- The production advert is **held at `max_protocol_version = 1`** in this
+  slice: a binary carrying the strict-send gate but not the slice-2
+  receiver durable path must not claim v2, or a strict sender that finds
+  the advert clears its gate and hangs against a v1 ACK (exact-protocol
+  waiter). The ADR 0030 §3 rule — v2 **iff** durable history is enabled —
+  activates in the same change as slice 2. Card exports and mesh adverts
+  carry the runtime value either way.
 - `DmSendConfig::require_durable_app_ack` (default `false`). When set, the
   send negotiates v2 on the wire and its ACK waiter is pinned to
   `(protocol_version, recipient, machine)`. A recipient without a current

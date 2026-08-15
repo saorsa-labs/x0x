@@ -8,10 +8,12 @@ All notable changes to this project will be documented in this file.
 
 - **DM protocol v2 capability advertisement + strict-send gate (ADR 0030,
   slice 1 of 4).** `DM_PROTOCOL_VERSION` becomes the receive **ceiling** 2:
-  envelopes above it are dropped without an ACK. A daemon advertises
-  `max_protocol_version = 2` iff durable history is enabled, else 1 (ADR
-  0030 §3); agent cards now export the same runtime value instead of a
-  hardcoded v1, and card imports go through `CapabilityStore::insert_from_card`
+  envelopes above it are dropped without an ACK. The production advert is
+  **held at `max_protocol_version = 1`** until the slice-2 receiver durable
+  path ships in the same binary — advertising v2 without it would be a
+  false capability and hang strict senders (PR #327 review; the ADR 0030
+  §3 v2-iff-history flip lands with slice 2). Agent cards export the same
+  runtime value, and card imports go through `CapabilityStore::insert_from_card`
   so a stale card can never lower a live signed advert.
 - **`DmSendConfig::require_durable_app_ack`** (default `false`). A strict
   send negotiates v2 on the wire and pins its ACK waiter to
