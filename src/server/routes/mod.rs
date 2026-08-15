@@ -64,7 +64,7 @@ pub(super) use machines::{
 };
 pub(super) use messaging::{publish, subscribe, unsubscribe, RestSubscription};
 pub(super) use named_groups::{
-    add_named_group_member, admit_public_group_bootstrap, apply_named_group_metadata_event,
+    add_named_group_member, apply_named_group_metadata_event,
     apply_named_group_metadata_event_inner_serialized, approve_join_request, ban_group_member,
     cancel_join_request, causal_relay_step, create_discovery_subscription, create_group_invite,
     create_join_request, create_named_group, delete_discovery_subscription, discover_groups,

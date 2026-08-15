@@ -43,9 +43,11 @@ use crate::server::state::AppState;
 use x0x::identity::AgentId;
 
 use super::named_groups::{
-    admit_public_group_bootstrap, group_membership_lock, named_group_direct_delivery_config,
-    now_millis_u64, persist_named_group_info, signed_public_bootstrap_snapshot,
-    write_named_groups_json_atomic, AtomicWriteOutcome, PublicGroupBootstrap,
+    confirm_named_groups_durability, ensure_named_group_listeners, group_membership_lock,
+    named_group_direct_delivery_config, now_millis_u64, persist_named_group_info,
+    persist_named_groups_mutation, signed_public_bootstrap_snapshot,
+    validate_public_group_bootstrap, write_named_groups_json_atomic, AtomicWriteOutcome,
+    PublicGroupBootstrap, MAX_BOOTSTRAP_INSTALLED_GROUPS,
 };
 
 /// Strict typed-DM framing for a signed-public group bootstrap. The legacy
@@ -905,6 +907,129 @@ pub(in crate::server) fn spawn_public_group_bootstrap_delivery(state: &Arc<AppSt
 // Receiving side
 // ---------------------------------------------------------------------------
 
+/// Validate and install a signed-public bootstrap received over the
+/// authenticated direct channel. Existing local state is never overwritten;
+/// normal metadata commits remain the only update path after bootstrap.
+///
+/// The legacy unprefixed listener discards the outcome; the strict v2 typed
+/// route reports it as the DM completion signal (ADR 0030 §7). Every exit here
+/// therefore has to say honestly whether a **directory-durable** record now
+/// exists for this exact frontier — an in-memory roster entry is not enough,
+/// because a v2 ACK certifies durability and the sender deletes its obligation
+/// on the strength of it.
+pub(in crate::server) async fn admit_public_group_bootstrap(
+    state: &Arc<AppState>,
+    sender: AgentId,
+    bootstrap: PublicGroupBootstrap,
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    use x0x::dm_inbox::DmTypedPayloadCompletion;
+
+    if bootstrap.message_type != PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE {
+        return Err("unsupported public-group bootstrap message type".to_string());
+    }
+    let sender_hex = hex::encode(sender.as_bytes());
+    {
+        let revoked = state.agent.revocation_set();
+        if revoked.read().await.is_agent_revoked(&sender) {
+            return Err("public-group bootstrap sender is revoked".to_string());
+        }
+    }
+    // Consent gate: a bootstrap persists a group and spawns listener tasks,
+    // so an unsolicited one from a stranger is a spam/resource vector. The
+    // roster inside the bootstrap is sender-controlled and cannot carry the
+    // consent decision; only senders the local agent already knows may seed
+    // groups (mirrors the pending-welcome convention for encrypted groups).
+    {
+        let contacts = state.contacts.read().await;
+        if contacts.trust_level(&sender).rank() < crate::contacts::TrustLevel::Known.rank() {
+            tracing::debug!(
+                sender = %LogHexId::agent(&sender_hex),
+                "ignoring public-group bootstrap from unknown or blocked sender"
+            );
+            return Err("public-group bootstrap sender is not a known contact".to_string());
+        }
+    }
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group = *bootstrap.group;
+    if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
+        tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
+        return Err("public-group bootstrap failed signed frontier validation".to_string());
+    }
+    let group_id = group.stable_group_id().to_string();
+    let frontier = (group.state_revision, group.state_hash.clone());
+
+    let installed_frontier_matches = {
+        let groups = state.named_groups.read().await;
+        match groups.get(&group_id).or_else(|| {
+            groups
+                .values()
+                .find(|existing| existing.stable_group_id() == group_id)
+        }) {
+            Some(installed) => {
+                Some((installed.state_revision, installed.state_hash.clone()) == frontier)
+            }
+            None => {
+                if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
+                    tracing::warn!(
+                        sender = %LogHexId::agent(&sender_hex),
+                        "refusing public-group bootstrap: named-group capacity reached"
+                    );
+                    return Err("public-group bootstrap capacity reached".to_string());
+                }
+                None
+            }
+        }
+    };
+
+    if let Some(frontier_matches) = installed_frontier_matches {
+        // Bootstrap seeds a group; it never overwrites one. Reporting the
+        // installed frontier honestly is what keeps the sender's outbox
+        // correct: only an exact match may discharge its obligation, and a
+        // receiver that still trails the authority withholds the ACK so the
+        // obligation survives until it catches up through the ordinary
+        // metadata-commit path.
+        if !frontier_matches {
+            return Err("public-group bootstrap frontier is not the installed one".to_string());
+        }
+        // `Duplicate` certifies that a durable record already exists, so it may
+        // not be answered off the in-memory roster alone. A previous write that
+        // renamed into place but failed its parent-directory fsync leaves the
+        // group visible in memory with the confirmation flag raised; answering
+        // `Duplicate` there would let the sender delete an obligation whose
+        // only evidence might not survive a power loss. Re-establish durability
+        // first, and withhold if it cannot be re-established.
+        if !confirm_named_groups_durability(state).await {
+            return Err("public-group bootstrap duplicate is not directory-durable".to_string());
+        }
+        return Ok(DmTypedPayloadCompletion::Duplicate);
+    }
+
+    let outcome = persist_named_groups_mutation(state, |groups| {
+        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS
+            || groups.contains_key(&group_id)
+            || groups
+                .values()
+                .any(|existing| existing.stable_group_id() == group_id)
+        {
+            return false;
+        }
+        groups.insert(group_id.clone(), group);
+        true
+    })
+    .await;
+    // Only `Durable` — rename plus parent-directory fsync — earns `Inserted`.
+    // `ReplacedNotDurable` is visible but not yet proven to survive a crash, so
+    // it withholds the ACK and the sender retries.
+    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        ensure_named_group_listeners(Arc::clone(state), &group_id).await;
+        tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
+        Ok(DmTypedPayloadCompletion::Inserted)
+    } else {
+        tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap was not durably installed");
+        Err("public-group bootstrap was not durably installed".to_string())
+    }
+}
+
 /// Strict typed-DM bootstrap admission (ADR 0030 §7).
 ///
 /// The completion channel is resolved only after the consent gate, signed
@@ -952,10 +1077,10 @@ mod tests {
     /// exact shape the add-member path hands to the outbox.
     fn signed_public_group(
         authority: &x0x::identity::AgentKeypair,
-        recipient: &x0x::identity::AgentKeypair,
+        recipient_hex: &str,
     ) -> Result<x0x::groups::GroupInfo> {
         let authority_hex = hex::encode(authority.agent_id().as_bytes());
-        let recipient_hex = hex::encode(recipient.agent_id().as_bytes());
+        let recipient_hex = recipient_hex.to_string();
         let mut group = x0x::groups::GroupInfo::with_policy(
             "Outbox".to_string(),
             String::new(),
@@ -977,7 +1102,7 @@ mod tests {
     fn test_obligation() -> Result<PublicGroupBootstrapObligation> {
         let authority = x0x::identity::AgentKeypair::generate()?;
         let recipient = x0x::identity::AgentKeypair::generate()?;
-        let group = signed_public_group(&authority, &recipient)?;
+        let group = signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
         prepare_public_group_bootstrap_obligation(recipient.agent_id(), group)
             .map_err(|error| anyhow::anyhow!(error))
     }
@@ -991,7 +1116,7 @@ mod tests {
     async fn seeded_obligation(state: &AppState) -> Result<PublicGroupBootstrapObligation> {
         let authority = x0x::identity::AgentKeypair::generate()?;
         let recipient = x0x::identity::AgentKeypair::generate()?;
-        let group = signed_public_group(&authority, &recipient)?;
+        let group = signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
         state
             .named_groups
             .write()
@@ -1019,7 +1144,7 @@ mod tests {
         let authority = x0x::identity::AgentKeypair::generate()?;
         let recipient = x0x::identity::AgentKeypair::generate()?;
         let other = x0x::identity::AgentKeypair::generate()?;
-        let group = signed_public_group(&authority, &recipient)?;
+        let group = signed_public_group(&authority, &hex::encode(recipient.agent_id().as_bytes()))?;
 
         let base = prepare_public_group_bootstrap_obligation(recipient.agent_id(), group.clone())
             .map_err(|e| anyhow::anyhow!(e))?;
@@ -1291,6 +1416,70 @@ mod tests {
             .get(&key)
             .context("a failed send must not discharge the obligation")?;
         assert_eq!(retained.attempt_count, 1);
+        Ok(())
+    }
+
+    /// Why: a v2 ACK certifies durability, and the sender **deletes its
+    /// obligation** on the strength of it. `Duplicate` therefore may not be
+    /// answered off the in-memory roster: a previous write that renamed into
+    /// place but failed its parent-directory fsync leaves the group visible in
+    /// memory with `named_groups_requires_durability_confirmation` raised, and
+    /// answering `Duplicate` there would trade the last durable record of the
+    /// obligation for evidence that might not survive a power loss.
+    ///
+    /// Asserting the flag is cleared is what makes this a real guard: it can
+    /// only be false if admission actually forced the durability confirmation
+    /// before it answered.
+    #[tokio::test]
+    async fn duplicate_completion_requires_confirmed_durability() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let authority = x0x::identity::AgentKeypair::generate()?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group = signed_public_group(&authority, &local_hex)?;
+        let group_id = group.stable_group_id().to_string();
+
+        state
+            .contacts
+            .write()
+            .await
+            .set_trust(&authority.agent_id(), x0x::contacts::TrustLevel::Trusted);
+
+        let installed = group.clone();
+        assert_eq!(
+            persist_named_groups_mutation(&state, |groups| {
+                groups.insert(group_id.clone(), installed);
+                true
+            })
+            .await?,
+            AtomicWriteOutcome::Durable
+        );
+
+        // Stand in for a prior rename-visible-but-not-fsynced roster write.
+        state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release);
+
+        let completion = admit_public_group_bootstrap(
+            &state,
+            authority.agent_id(),
+            PublicGroupBootstrap {
+                message_type: PUBLIC_GROUP_BOOTSTRAP_MESSAGE_TYPE.to_string(),
+                group: Box::new(group),
+            },
+        )
+        .await;
+
+        assert_eq!(
+            completion,
+            Ok(x0x::dm_inbox::DmTypedPayloadCompletion::Duplicate),
+            "a matching frontier that is durably present must answer Duplicate"
+        );
+        assert!(
+            !state
+                .named_groups_requires_durability_confirmation
+                .load(Ordering::Acquire),
+            "Duplicate must not be answered until durability has been re-confirmed"
+        );
         Ok(())
     }
 

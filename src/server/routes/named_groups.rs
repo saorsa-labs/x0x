@@ -2300,7 +2300,7 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     Some(group)
 }
 
-fn validate_public_group_bootstrap(
+pub(in crate::server) fn validate_public_group_bootstrap(
     group: &x0x::groups::GroupInfo,
     sender_hex: &str,
     local_agent_hex: &str,
@@ -2351,105 +2351,7 @@ fn validate_public_group_bootstrap(
 
 /// Hard cap on named groups installable via the remote bootstrap path;
 /// bounds attacker-driven state growth and listener-task spawn.
-const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
-
-/// Validate and install a signed-public bootstrap received over the
-/// authenticated direct channel. Existing local state is never overwritten;
-/// normal metadata commits remain the only update path after bootstrap.
-///
-/// The legacy unprefixed listener discards the outcome; the strict v2 typed
-/// route reports it as the DM completion signal (ADR 0030 §7), so every exit
-/// here has to say honestly whether a durable record now exists for this
-/// exact frontier.
-pub(in crate::server) async fn admit_public_group_bootstrap(
-    state: &Arc<AppState>,
-    sender: AgentId,
-    bootstrap: PublicGroupBootstrap,
-) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
-    use x0x::dm_inbox::DmTypedPayloadCompletion;
-
-    if bootstrap.message_type != "public_group_bootstrap" {
-        return Err("unsupported public-group bootstrap message type".to_string());
-    }
-    let sender_hex = hex::encode(sender.as_bytes());
-    {
-        let revoked = state.agent.revocation_set();
-        if revoked.read().await.is_agent_revoked(&sender) {
-            return Err("public-group bootstrap sender is revoked".to_string());
-        }
-    }
-    // Consent gate: a bootstrap persists a group and spawns listener tasks,
-    // so an unsolicited one from a stranger is a spam/resource vector. The
-    // roster inside the bootstrap is sender-controlled and cannot carry the
-    // consent decision; only senders the local agent already knows may seed
-    // groups (mirrors the pending-welcome convention for encrypted groups).
-    {
-        let contacts = state.contacts.read().await;
-        if contacts.trust_level(&sender).rank() < crate::contacts::TrustLevel::Known.rank() {
-            tracing::debug!(
-                sender = %LogHexId::agent(&sender_hex),
-                "ignoring public-group bootstrap from unknown or blocked sender"
-            );
-            return Err("public-group bootstrap sender is not a known contact".to_string());
-        }
-    }
-    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let group = *bootstrap.group;
-    if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
-        tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
-        return Err("public-group bootstrap failed signed frontier validation".to_string());
-    }
-    let group_id = group.stable_group_id().to_string();
-    let frontier = (group.state_revision, group.state_hash.clone());
-    {
-        let groups = state.named_groups.read().await;
-        if let Some(installed) = groups.get(&group_id).or_else(|| {
-            groups
-                .values()
-                .find(|existing| existing.stable_group_id() == group_id)
-        }) {
-            // Bootstrap seeds a group; it never overwrites one. Reporting the
-            // installed frontier honestly is what keeps the sender's outbox
-            // correct: only an exact frontier match may discharge its
-            // obligation, and a receiver that still trails the authority
-            // withholds the ACK so the obligation survives until it catches up
-            // through the ordinary metadata-commit path.
-            return if (installed.state_revision, installed.state_hash.clone()) == frontier {
-                Ok(DmTypedPayloadCompletion::Duplicate)
-            } else {
-                Err("public-group bootstrap frontier is not the installed one".to_string())
-            };
-        }
-        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
-            tracing::warn!(
-                sender = %LogHexId::agent(&sender_hex),
-                "refusing public-group bootstrap: named-group capacity reached"
-            );
-            return Err("public-group bootstrap capacity reached".to_string());
-        }
-    }
-    let outcome = persist_named_groups_mutation(state, |groups| {
-        if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS
-            || groups.contains_key(&group_id)
-            || groups
-                .values()
-                .any(|existing| existing.stable_group_id() == group_id)
-        {
-            return false;
-        }
-        groups.insert(group_id.clone(), group);
-        true
-    })
-    .await;
-    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-        ensure_named_group_listeners(Arc::clone(state), &group_id).await;
-        tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
-        Ok(DmTypedPayloadCompletion::Inserted)
-    } else {
-        tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap was not durably installed");
-        Err("public-group bootstrap was not durably installed".to_string())
-    }
-}
+pub(in crate::server) const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 
 async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     let handle = state.group_metadata_tasks.write().await.remove(group_id);
@@ -2570,7 +2472,7 @@ pub(in crate::server) async fn store_named_group_info(
 /// durably capturing an uncommitted candidate. A pre-rename failure restores
 /// the exact full-map snapshot; a post-rename durability failure keeps memory
 /// aligned with the visible replacement while withholding success.
-async fn persist_named_groups_mutation<F>(
+pub(in crate::server) async fn persist_named_groups_mutation<F>(
     state: &AppState,
     mutate: F,
 ) -> std::io::Result<AtomicWriteOutcome>
@@ -2616,7 +2518,7 @@ where
 
 /// Re-establish directory durability for a previously visible roster
 /// replacement before another metadata transition may inspect it.
-async fn confirm_named_groups_durability(state: &AppState) -> bool {
+pub(in crate::server) async fn confirm_named_groups_durability(state: &AppState) -> bool {
     if !state
         .named_groups_requires_durability_confirmation
         .load(Ordering::Acquire)
