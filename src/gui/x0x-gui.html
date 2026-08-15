@@ -821,6 +821,18 @@ function trustHtml(t){const sym={Trusted:'&#10003;&#10003;',Known:'&#10003;',Unk
 function policyHtml(p){if(!p)return'';const t=typeof p==='string'?p:p.type||'Signed';const c=t.toLowerCase();return '<span class="policy policy-'+c+'">'+(c==='encrypted'?'&#128274; ':'')+t+'</span>'}
 function presenceHtml(online){return '<span class="presence '+(online?'online':'offline')+'"></span>'}
 function apiError(r){return r?(r.error||r.message||r.reason||('HTTP '+(r._http_status||'?'))):'network error'}
+// ADR 0030 §4 made /direct/send durable by default, so its refusals are now
+// routine rather than exceptional, and two of them are 409s whose repairs are
+// opposite. Showing the raw code would leave a user with "idempotency_conflict"
+// and no idea that retrying is the one thing that cannot work.
+const DM_SEND_ERRORS={
+  recipient_ack_semantics_unavailable:"Peer needs upgrading — it can't confirm durable delivery yet. Retry later, or resend without durable delivery.",
+  idempotency_conflict:"That message id was already used for different content. Retrying won't help — send it as a new message.",
+  recipient_key_unavailable:"Peer not found — no published key or contact card for that agent yet.",
+  require_gossip_ack_removed:"This client sent a field the daemon removed (require_gossip_ack). Update the app.",
+  invalid_logical_id:"Invalid message id: use 1-128 characters from a-z, 0-9, '-', '_', '.', ':'."
+};
+function dmSendError(r){return (r&&DM_SEND_ERRORS[r.error])||apiError(r)}
 function agentCardPath(displayName,includeGroups){
   const params=new URLSearchParams();
   if(displayName)params.set('display_name',displayName);
@@ -2849,10 +2861,15 @@ async function sendDm(){
   const payload=u8encode(JSON.stringify({text:t,sender_name:name,ts:Date.now()}));
   const ackBox=document.getElementById('dm-require-ack');
   const body={agent_id:target,payload};
-  if(ackBox&&ackBox.checked){body.require_ack_ms=5000;body.require_gossip_ack=true}
+  // ADR 0030 §4: require_gossip_ack was removed from /direct/send and now
+  // answers 400. Nothing replaces it here — the product default is durable
+  // delivery, which is a strictly stronger confirmation than the gossip ACK
+  // this used to request. The checkbox keeps its remaining job, the
+  // post-send liveness probe.
+  if(ackBox&&ackBox.checked){body.require_ack_ms=5000}
   const resp=await api('/direct/send',{method:'POST',body:JSON.stringify(body)});
   if(!resp||resp._http_ok===false||resp.ok===false){
-    toast('Send failed: '+apiError(resp),'error');
+    toast('Send failed: '+dmSendError(resp),'error');
     inp.focus();
     return;
   }

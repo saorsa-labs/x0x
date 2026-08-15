@@ -33,6 +33,21 @@ All notable changes to this project will be documented in this file.
 - **`idempotency_conflict`** (`DmError::IdempotencyConflict`,
   `DmAckOutcome::IdempotencyConflict`, REST **409 `idempotency_conflict`**).
   Reusing a `logical_id` for different bytes is now its own typed error.
+- **Hedged, bounded durable-ACK publication.** A v2 ACK is now published from a
+  background worker (queue 256, ≤32 in flight) that polls the recipient's
+  targeted inbox topic and the compatibility bus concurrently, each under a
+  22 s deadline, instead of awaiting both inline on the inbox loop. A targeted
+  publish can deliver remotely yet stay pending under per-topic backpressure,
+  which previously let a receiver commit and dispatch a DM while the sender
+  burned its entire ACK budget waiting on the reverse route. Commit-before-ACK
+  ordering is unchanged — only the publication is asynchronous. Durable-by-
+  default sends make this liveness path load-bearing, which is why it lands
+  with them. **v1 ACK publication is byte-for-byte unchanged**: still inline,
+  still targeted-only unless the payload arrived on the bus.
+- **`ack_publish_route_failed` on `GET /diagnostics/dm`.** The externally
+  visible signal that a committed message's ACK never reached its sender —
+  either a route failed or timed out, or the publisher queue was saturated.
+  Those senders see `504 timeout` and retry; nothing is silently lost.
 
 - **Durable signed-public bootstrap outbox (ADR 0030 §5, slice 3b).** Adding a
   member to a SignedPublic group used to direct-send the roster snapshot

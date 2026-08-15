@@ -1154,6 +1154,13 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
 
+`GET /diagnostics/dm` gained `ack_publish_route_failed` in v0.38.0. Durable
+(v2) ACKs publish from a bounded background worker, so this counter is the
+only externally visible signal that a receiver committed a message but its ACK
+never reached the sender — those senders see a `504 timeout` and retry. A
+persistently rising value means ACK routes are wedged or the publisher queue is
+saturating, not that messages were lost.
+
 ### `GET /diagnostics/groups`
 
 Per-group counters for the public-message ingest pipeline and the sender-side write-policy gate. Each row in `groups` corresponds to a locally-known group.

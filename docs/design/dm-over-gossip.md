@@ -280,7 +280,17 @@ id that two waiters contend for.
 
 This is the same mechanism the durable bootstrap outbox uses internally (§5),
 where the obligation key and the wire request id are deliberately one
-identity. The only difference is who chooses it.
+identity. The only difference is who chooses it: a product caller passes a
+token, while the outbox derives its id from the obligation's own binding
+digest so an ACK can be matched back to the exact debt it discharges.
+
+That outbox persists its obligations to
+**`<data_dir>/public_group_bootstrap_outbox.json`** (1024-entry cap,
+exponential backoff to 60 s, cleared only by a frontier-matching v2
+application ACK). The sidecar is loaded fail-closed: an unsupported version,
+an over-cap file, a duplicate key, or a payload contradicting the frontier it
+claims aborts daemon startup rather than silently dropping a promised
+delivery. Operator detail in `docs/api-reference.md`.
 
 #### Receiver ordering (normative)
 
@@ -327,6 +337,35 @@ order, per ADR 0030 §1:
    `Inserted | Duplicate`, i.e. exactly one durable row for this logical
    request.
 6. **ACK**, stamped with the semantics actually honoured.
+
+#### ACK publication — hedged, bounded, off the inbox loop
+
+Step 6 publishes; it does not block the inbox loop. A durable ACK is handed to
+a bounded background worker (queue 256, at most 32 publications in flight) that
+polls **both** routes concurrently — the recipient's targeted inbox topic and
+the compatibility bus — each under its own 22 s deadline (the pinned pubsub
+Critical contract allows 10 s at the FIFO gate plus 10 s to send, plus slack).
+
+Three properties matter, and they are separable:
+
+- **Ordering is unchanged.** The history commit is still awaited *before*
+  publication is scheduled. Only the publication became asynchronous; the
+  promise behind the ACK did not.
+- **A wedged route cannot consume the sender's ACK budget.** A targeted publish
+  can deliver remotely yet stay pending under per-topic fan-out backpressure.
+  Polling the bus hedge concurrently means the surviving route reaches the
+  sender immediately instead of after the wedged sibling's deadline, and the
+  serial inbox loop is never pinned by either.
+- **Saturation fails safe and visibly.** A full queue is reported rather than
+  awaited: the sender times out and retries, which is the documented safe
+  failure, and the drop increments `ack_publish_route_failed` on
+  `GET /diagnostics/dm`. Blocking instead would stall every later DM behind one
+  wedged ACK — trading a visible retry for an invisible stall.
+
+**v1 is untouched.** A v1 ACK still publishes to the targeted topic inline, and
+reaches the compatibility bus only when the payload itself arrived there.
+Hedging every v1 ACK onto the shared bus would add gossip traffic for every
+0.37 peer in the mesh to solve a problem only durable senders have.
 
 Steps 5→6 are the whole point: **the ACK exists only because the commit
 succeeded.** Commit error, backpressured writer, unavailable history, lost
@@ -463,10 +502,36 @@ source of truth for path selection.
 
 ### Mixed-version matrix
 
+Transport selection (0.17/0.18 era):
+
 | Sender \ Recipient | 0.17 | 0.18 |
 |---|---|---|
 | 0.17 | raw | raw (recipient accepts both, sender only sends raw) |
 | 0.18 | raw (sender sees no gossip capability) | gossip |
+
+Receipt semantics (ADR 0030 §2, normative). "0.38 product send" means a
+default `POST /direct/send` or `x0x direct send`, which is strict since
+slice 4; "0.38 opted-out" means the same surface with
+`require_durable_app_ack: false`. A 0.38 recipient advertises v2 **iff**
+durable history is enabled — it is default-on, so `history.enabled = false`
+puts a 0.38 daemon in the "advertises v1" column:
+
+| Sender \ Recipient | 0.37 / advertises v1 | 0.38 advertising v2 |
+|---|---|---|
+| **0.38 product send** (strict) | **409 `recipient_ack_semantics_unavailable`** after one forced targeted refresh — bounded, never a hang, never a silent downgrade | Durable ACK: history row committed and dispatch completed **before** the sender's 200 |
+| **0.38 opted-out** (`require_durable_app_ack: false`) | Delivered, `Ok` = level 2 | Delivered, `Ok` = level 2 — the recipient's capability does not silently upgrade the receipt |
+| **0.38 internal tier** (WS / library default / control plane) | Delivered, `Ok` = level 2 | Delivered, `Ok` = level 2 |
+| **0.37 sender** | v1, unchanged | v1, unchanged — envelope layout is identical, and a v1 envelope is answered with a v1 ACK even on a history-enabled receiver |
+
+Rows this slice owns, for the same two recipient columns:
+
+| Condition | Answer |
+|---|---|
+| Strict send, recipient unknown (no advert **and** no contact card) | **404 `recipient_key_unavailable`** — not the 409. "Does not advertise v2" presupposes we know the peer |
+| Same `logical_id`, same bytes, retried (incl. after either side restarts) | Re-ACKed from the binding or the durable-history row. Exactly one history row; re-dispatch is possible and documented |
+| Same `logical_id`, **different** bytes | **409 `idempotency_conflict`** — from the replay cache while hot, from the durable-history lookup after a receiver restart. Terminal for those bytes |
+| `require_gossip_ack` set in any form | **400 `require_gossip_ack_removed`** before any send is attempted |
+| Recipient's history commit fails mid-request | **No ACK.** The sender times out (504). A withheld ACK is the only honest answer — a v1 ACK would hand back a weaker receipt the sender cannot distinguish from the one it asked for |
 
 ## Replay protection and dedupe
 
