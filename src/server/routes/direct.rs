@@ -169,6 +169,23 @@ fn direct_send_config_for_request(
                 detail,
             }
         })?;
+        // `logical_id` only means something under durable semantics: the
+        // recipient's binding and durable-history checks are what recognise a
+        // retry and answer `idempotency_conflict`. A v1 send carries the
+        // derived id on the wire but nothing on the receiver consults it, so
+        // accepting the combination would hand back an idempotency guarantee
+        // that does not exist. Refuse instead of documenting a silent no-op —
+        // a caller who asked for at-least-once retry identity and got
+        // fire-and-forget has no way to notice.
+        if !config.require_durable_app_ack {
+            return Err(DirectSendRequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                code: "logical_id_requires_durable_ack",
+                detail: "logical_id has no effect without durable delivery; \
+                         remove require_durable_app_ack: false or drop logical_id"
+                    .to_string(),
+            });
+        }
         config.logical_request_id = Some(logical_id.request_id(self_agent_id, recipient));
     }
     Ok(config)
@@ -703,6 +720,42 @@ mod tests {
                 .is_none(),
             "omitting logical_id must keep the fresh-random-id behaviour"
         );
+    }
+
+    /// ADR 0030 slice 4 review: `logical_id` is only honoured by the durable
+    /// receiver path, so pairing it with the opt-out would hand back an
+    /// at-least-once retry identity that nothing enforces. Refused rather than
+    /// documented as a no-op — a caller who asked for idempotency and silently
+    /// got fire-and-forget has no way to discover it until duplicates appear.
+    #[test]
+    fn a_logical_id_without_durable_delivery_is_refused_not_ignored() {
+        let rejection = direct_send_config_for_request(
+            &parse_request(serde_json::json!({
+                "agent_id": "00".repeat(32),
+                "payload": "",
+                "logical_id": "order-42",
+                "require_durable_app_ack": false
+            })),
+            test_agent_id(1),
+            test_agent_id(2),
+        )
+        .expect_err("logical_id with the durable opt-out must be refused");
+        assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, "logical_id_requires_durable_ack");
+
+        // Each half alone stays valid — the refusal is about the combination.
+        assert!(config_for(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "logical_id": "order-42"
+        }))
+        .is_ok());
+        assert!(config_for(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "require_durable_app_ack": false
+        }))
+        .is_ok());
     }
 
     /// A rejected token must not reach the send path at all: silently dropping

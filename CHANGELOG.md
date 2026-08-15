@@ -33,96 +33,11 @@ All notable changes to this project will be documented in this file.
 - **`idempotency_conflict`** (`DmError::IdempotencyConflict`,
   `DmAckOutcome::IdempotencyConflict`, REST **409 `idempotency_conflict`**).
   Reusing a `logical_id` for different bytes is now its own typed error.
-- **Hedged, bounded durable-ACK publication.** A v2 ACK is now published from a
-  background worker (queue 256, ≤32 in flight) that polls the recipient's
-  targeted inbox topic and the compatibility bus concurrently, each under a
-  22 s deadline, instead of awaiting both inline on the inbox loop. A targeted
-  publish can deliver remotely yet stay pending under per-topic backpressure,
-  which previously let a receiver commit and dispatch a DM while the sender
-  burned its entire ACK budget waiting on the reverse route. Commit-before-ACK
-  ordering is unchanged — only the publication is asynchronous. Durable-by-
-  default sends make this liveness path load-bearing, which is why it lands
-  with them. **v1 ACK publication is byte-for-byte unchanged**: still inline,
-  still targeted-only unless the payload arrived on the bus.
-- **`ack_publish_route_failed` on `GET /diagnostics/dm`.** The externally
-  visible signal that a committed message's ACK never reached its sender —
-  either a route failed or timed out, or the publisher queue was saturated.
-  Those senders see `504 timeout` and retry; nothing is silently lost.
-
-- **Durable signed-public bootstrap outbox (ADR 0030 §5, slice 3b).** Adding a
-  member to a SignedPublic group used to direct-send the roster snapshot
-  fire-and-forget: an offline recipient never received it and nothing on the
-  authority remembered the debt. The send is now a durable obligation, in its
-  own module (`src/server/routes/public_group_bootstrap_outbox.rs`). It is
-  written in the same step as the roster commit, keyed by
-  `(recipient, group, frontier, payload-digest)` as one blake3 binding digest,
-  capped at 1024 entries, retried on `1s << min(attempts, 6)` clamped to 60 s,
-  and persisted to `public_group_bootstrap_outbox.json` in the data directory.
-  That sidecar is loaded **fail-closed**: an unsupported version, an over-cap
-  file, a duplicate key, or a payload that contradicts the frontier it claims
-  aborts daemon startup rather than silently dropping a promised delivery. An
-  obligation is discharged **only** by a v2 application ACK for that exact
-  frontier — released by the recipient's durable typed route after the consent
-  gate and a directory-durable install. A legacy v1 send and a failed send both
-  reschedule; neither is completion.
-- **`DmSendConfig::logical_request_id`.** An optional caller-supplied stable DM
-  request id; `None` (the default, and every existing caller) still draws a
-  fresh random one. The bootstrap outbox sets it to the head of its obligation's
-  binding digest, so obligation key and wire request id are one identity: a
-  retry after a sender restart is the *same* logical request, which is what lets
-  the recipient re-ACK instead of re-delivering and lets an ACK be matched back
-  to the obligation it discharges.
-- **Typed-route durable completion signal (ADR 0030 §7, slice 3).** Slice 2
-  withheld every v2 ACK on a typed route because typed-prefix families
-  classify `Ephemeral` and cannot be backed by a DM-history commit. A handler
-  can now report `DmTypedPayloadCompletion::{Inserted, Duplicate}` on a
-  oneshot carried in `DmTypedPayload`, and that signal releases the ACK.
-  `DmTypedPayload` also carries the envelope `request_id` so handlers can
-  dedupe on `(sender, request_id)` across restart, and is no longer `Clone`
-  (a oneshot sender has no meaningful copy). Routes opt in via
-  `DmInboxConfig::with_durable_typed_payload_route`; routes that do not opt in
-  still get no v2 ACK, by stated policy. Every non-completion — channel
-  unavailable, handler error, dropped sender, timeout — withholds the ACK.
-- **`Store::find_by_logical_request` is now indexed.** Partial index on
-  `(ingress_sender_agent, logical_request_id)` for rows where
-  `logical_request_id IS NOT NULL`, created idempotently at open rather than
-  via a schema-version bump, so a rollback to v0.37.4 can still open the
-  database.
-
-- **DM protocol v2 receiver durable path (ADR 0030 §1, slice 2 of 4).** A v2
-  envelope is answered in exactly this order: per-logical-request lock →
-  replay-cache binding check → durable-history lookup → dispatch →
-  `record_committed` awaited → ACK. A v2 ACK is emitted **only** after the
-  SQLite commit returns `Inserted | Duplicate`; every failure below that —
-  commit error, backpressured writer, unavailable history, lost delivery
-  lock, unpublishable replay completion — withholds the ACK rather than
-  degrading it. `Accepted` under v2 now means what ADR 0030 §1 says it
-  means: verified, durably committed, and dispatched.
-- **`DmAckOutcome::AckSemanticsUnavailable { reason }`** (ADR 0030 §2). The
-  receiver's answer when it cannot issue the durable receipt a request asked
-  for — the logical request already completed under weaker semantics, or is
-  already bound to different content. It maps to
-  `DmError::AckSemanticsUnavailable`, the same typed error the send-side
-  capability gate raises, rather than `RecipientRejected`: nothing about the
-  trust relationship failed, so callers surface "retry / peer needs upgrade",
-  not "peer blocked you". Appended last in the enum, so postcard variant
-  indices for `Accepted` and `RejectedByPolicy` are unchanged and 0.37 peers
-  keep decoding them; a v1-only sender can never be sent the new variant,
-  because it never asks for semantics above v1.
-- **History schema v4 columns gain writers.** Inbound DM rows populate
-  `ingress_sender_agent` and `logical_request_id`; together they key the
-  durable-history lookup that lets a restarted receiver recognise a logical
-  request it already committed, via the new
-  `Store::find_by_logical_request`.
-- **`HistoryHandle::record_committed`.** A commit-receipt write for protocol
-  surfaces whose success promises durable history. Unlike the fire-and-forget
-  `record`, it never sheds silently: a full or closed writer queue returns
-  `HistoryError::WriterBackpressured` / `WriterClosed` to the caller.
-- **DM protocol v2 capability advertisement + strict-send gate (ADR 0030,
-  slice 1 of 4).** `DM_PROTOCOL_VERSION` becomes the receive **ceiling** 2:
-  envelopes above it are dropped without an ACK. Agent cards export the same
-  runtime value, and card imports go through `CapabilityStore::insert_from_card`
-  so a stale card can never lower a live signed advert.
+- **400 `logical_id_requires_durable_ack`.** `logical_id` is only honoured by
+  the durable receiver path, so sending it with `require_durable_app_ack:
+  false` is refused rather than silently ignored — otherwise the caller holds
+  an at-least-once retry identity nothing enforces and finds out only when
+  duplicates appear. `x0x direct send` rejects the same pair at the CLI.
 
 ### Changed
 
@@ -157,11 +72,14 @@ All notable changes to this project will be documented in this file.
   callers are unaffected — `DmSendConfig::require_gossip_ack` is unchanged.
 - **The strict-send gate no longer reports a stranger as a peer needing an
   upgrade.** `AckSemanticsUnavailable` means "this peer does not advertise
-  v2", which presupposes we know the peer; an agent id with no capability
-  advert *and* no contact card now yields `RecipientKeyUnavailable` (404) as
-  it always did for non-strict sends. Without this, flipping the product
-  default would have turned every send to an undiscovered agent into a 409
-  telling the UI to chase a fleet upgrade for a peer that was never found.
+  v2", which presupposes we know the peer; an agent id with **no capability
+  advert and no contact card of any kind** now yields `RecipientKeyUnavailable`
+  (404) as it always did for non-strict sends. Without this, flipping the
+  product default would have turned every send to an undiscovered agent into a
+  409 telling the UI to chase a fleet upgrade for a peer that was never found.
+  The boundary is "do we know this agent", not "has its advert converged" — a
+  contact card whose `dm_capabilities` have not arrived yet is a known peer and
+  still gets the 409.
 - **A rebound logical request now reports `idempotency_conflict`, not
   `recipient_ack_semantics_unavailable`.** Both receiver-side binding-conflict
   paths (the in-memory replay cache and the restart-spanning durable-history

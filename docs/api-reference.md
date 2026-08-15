@@ -399,6 +399,13 @@ recipient_agent_id ‖ logical_id)` truncated to its leading 16 bytes. Both agen
 ids are mixed in, so the same token addressed to two different recipients
 yields two different requests. The token itself never goes on the wire.
 
+`logical_id` **requires durable delivery**. Only the durable receiver path
+consults it, so combining it with `require_durable_app_ack: false` is a **400
+`logical_id_requires_durable_ack`** rather than a silent no-op — otherwise a
+caller would be handed an at-least-once retry identity that nothing enforces,
+and would not discover it until duplicates appeared. (`x0x direct send` rejects
+`--logical-id` with `--no-durable-ack` at the CLI, before the round trip.)
+
 Reusing a `logical_id` for *different* payload bytes is a **409
 `idempotency_conflict`** — see below.
 
@@ -421,9 +428,10 @@ Notable codes:
 |---|---|---|
 | 400 | `require_gossip_ack_removed` | The request set the removed `require_gossip_ack` field. Drop it; use `require_durable_app_ack`. |
 | 400 | `invalid_logical_id` | `logical_id` was empty, longer than 128 characters, or contained a character outside `[a-z0-9._:-]`. |
-| 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon (no capability advert and no contact card). A durable send to a stranger answers this, **not** the 409 below — "does not advertise v2" presupposes we know the peer. |
+| 400 | `logical_id_requires_durable_ack` | `logical_id` was sent with `require_durable_app_ack: false`. Only the durable path honours the id; drop one or the other. |
+| 404 | `recipient_key_unavailable` | The recipient has published no KEM key, or is entirely unknown to this daemon — **no capability advert and no contact card at all**. A durable send to a stranger answers this, not the 409 below. |
 | 409 | `recipient_key_invalid` | Our view of the recipient's key material has not converged. Transient — retry. |
-| 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
+| 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. |
@@ -1153,13 +1161,6 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
-
-`GET /diagnostics/dm` gained `ack_publish_route_failed` in v0.38.0. Durable
-(v2) ACKs publish from a bounded background worker, so this counter is the
-only externally visible signal that a receiver committed a message but its ACK
-never reached the sender — those senders see a `504 timeout` and retry. A
-persistently rising value means ACK routes are wedged or the publisher queue is
-saturating, not that messages were lost.
 
 ### `GET /diagnostics/groups`
 

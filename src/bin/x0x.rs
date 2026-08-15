@@ -822,7 +822,12 @@ enum DirectSub {
         /// Stable idempotency key for this logical send (1-128 chars of
         /// [a-z0-9], '-', '_', '.', ':'). Resending the same value to the same
         /// recipient is a retry of one request, not a second message.
-        #[arg(long)]
+        ///
+        /// Requires durable delivery: only the durable receiver path consults
+        /// the id, so pairing it with --no-durable-ack would promise an
+        /// idempotency guarantee nothing enforces. Rejected here rather than
+        /// after a round trip to the daemon, which refuses the same pair.
+        #[arg(long, conflicts_with = "no_durable_ack")]
         logical_id: Option<String>,
     },
     /// List established direct connections.

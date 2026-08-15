@@ -4674,11 +4674,16 @@ impl Agent {
             // withholds the contact-card fallback from strict sends (a card
             // pins no machine), so a peer we know only by card arrives here
             // with `cap == None`. Ask what we actually know instead.
+            //
+            // *Any* contact card counts, including one with no
+            // `dm_capabilities` yet. Such a card is a known peer whose advert
+            // has not converged — plausibly one that needs upgrading, which is
+            // exactly what the 409 tells the caller. Requiring capabilities on
+            // the card would misfile it as "no such agent" and send a product
+            // UI looking for a typo instead of waiting for convergence.
             let recipient_is_known = cap.is_some() || {
                 let contacts = self.contact_store.read().await;
-                contacts
-                    .get(to)
-                    .is_some_and(|contact| contact.dm_capabilities.is_some())
+                contacts.get(to).is_some()
             };
             tracing::info!(
                 target: "dm.trace",
@@ -13537,6 +13542,54 @@ mod tests {
         assert!(
             matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
             "unexpected error: {err:?}"
+        );
+    }
+
+    /// The 404/409 boundary sits at "do we know this agent at all", not at
+    /// "has its advert converged". A contact card with no `dm_capabilities`
+    /// yet is a *known* peer mid-convergence — plausibly one that needs
+    /// upgrading — so it gets the 409 that says so. Classifying it as a
+    /// stranger would tell a product UI to go looking for a typo in an agent
+    /// id that is demonstrably in the contact store.
+    #[tokio::test]
+    async fn a_known_contact_without_capabilities_is_a_409_not_a_404() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x65_u8; 32]);
+
+        agent.contacts().write().await.add(contacts::Contact {
+            agent_id: target,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Known,
+            // The distinguishing detail: known agent, no advert yet.
+            dm_capabilities: None,
+            machines: Vec::new(),
+        });
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"strict".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    require_durable_app_ack: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("strict send must refuse without a v2 advert");
+        assert!(
+            matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
+            "a known contact must not be reported as an unknown agent: {err:?}"
         );
     }
 
