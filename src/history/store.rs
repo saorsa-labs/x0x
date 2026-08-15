@@ -157,6 +157,7 @@ impl Store {
             return Err(HistoryError::Locked(format!("{} ({e})", path.display())));
         }
         migrate(&conn)?;
+        ensure_indexes(&conn)?;
         Ok(Self {
             conn: Mutex::new(conn),
         })
@@ -630,6 +631,37 @@ fn insert_row(tx: &rusqlite::Transaction<'_>, record: &HistoryRecord) -> History
     Ok(())
 }
 
+/// Indexes that are pure query accelerators, created idempotently at every
+/// open rather than inside the versioned migration chain.
+///
+/// This is a deliberate departure from the migration convention, and the
+/// reason is rollback safety. An index changes no column, no row meaning, and
+/// no data: an older binary opening this database reads and writes it exactly
+/// as before, and SQLite maintains the index for those writes transparently.
+/// Adding one via a v4→v5 migration would instead bump `SCHEMA_VERSION`, and
+/// `migrate` rejects any database newer than the running binary — so a
+/// rollback from this release to v0.37.4 would leave every upgraded user with
+/// a `history.db` that refuses to open. Paying that for a performance-only
+/// change is the wrong trade. Schema changes that alter the data model still
+/// go through the versioned chain.
+///
+/// `idx_logical_request` backs `find_by_logical_request`, the ADR 0030 §1
+/// receiver durable-history lookup, which runs on every inbound v2 DM.
+/// Partial (`WHERE logical_request_id IS NOT NULL`) because only rows written
+/// by the receiver durable path populate the v4 columns — group rows and every
+/// row predating schema v4 carry NULL, and indexing those wastes space for a
+/// lookup that can never match them. Mirrors the existing `idx_replace`
+/// partial-index precedent.
+fn ensure_indexes(conn: &Connection) -> HistoryResult<()> {
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_logical_request \
+         ON history(ingress_sender_agent, logical_request_id) \
+         WHERE logical_request_id IS NOT NULL;",
+    )
+    .map_err(|e| HistoryError::Database(format!("index setup failed: {e}")))?;
+    Ok(())
+}
+
 /// Forward-only schema migration.
 fn migrate(conn: &Connection) -> HistoryResult<()> {
     conn.execute_batch("CREATE TABLE IF NOT EXISTS schema_version (version INTEGER NOT NULL)")?;
@@ -923,6 +955,72 @@ mod tests {
         guard
             .query_row("SELECT version FROM schema_version", [], |row| row.get(0))
             .unwrap()
+    }
+
+    /// The ADR 0030 §1 durable-history lookup runs on every inbound v2 DM, so
+    /// it must not degrade into a table scan as history grows. Asserting on
+    /// the query plan rather than on the index merely existing: an index that
+    /// SQLite declines to use (wrong column order, predicate mismatch) is
+    /// indistinguishable from no index at runtime, and that is the regression
+    /// worth catching.
+    #[test]
+    fn find_by_logical_request_uses_its_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("history.db")).unwrap();
+        let guard = lock_conn(&store.conn).unwrap();
+        let plan: String = guard
+            .query_row(
+                "EXPLAIN QUERY PLAN SELECT id FROM history \
+                 WHERE ingress_sender_agent = ?1 AND logical_request_id = ?2 \
+                 ORDER BY id ASC",
+                rusqlite::params!["aa", vec![0x11_u8; 16]],
+                |row| row.get(3),
+            )
+            .unwrap();
+        assert!(
+            plan.contains("idx_logical_request"),
+            "durable-history lookup must use idx_logical_request, got plan: {plan}"
+        );
+        assert!(
+            !plan.contains("SCAN history"),
+            "durable-history lookup must not table-scan, got plan: {plan}"
+        );
+    }
+
+    /// The accelerator index is created outside the versioned migration chain,
+    /// so it must reach databases that were already stamped v4 by an earlier
+    /// release — those never re-run any migration step.
+    #[test]
+    fn existing_v4_database_gains_the_index_on_open() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        {
+            let store = Store::open(&path).unwrap();
+            assert_eq!(stored_schema_version(&store), 4);
+        }
+        // Drop the index to simulate a database migrated to v4 before this
+        // release, then confirm reopening restores it without a version bump.
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch("DROP INDEX IF EXISTS idx_logical_request;")
+                .unwrap();
+        }
+        let store = Store::open(&path).unwrap();
+        assert_eq!(
+            stored_schema_version(&store),
+            4,
+            "adding an accelerator index must not bump the schema version, \
+             which would make the db unopenable by the previous release"
+        );
+        let guard = lock_conn(&store.conn).unwrap();
+        let count: i64 = guard
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type='index' AND name='idx_logical_request'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1, "reopening a v4 database must restore the index");
     }
 
     /// ADR 0030 schema continuity: v4 must land on top of a *released* v2

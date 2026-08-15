@@ -17,10 +17,24 @@ use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
 use std::sync::Arc;
-use tokio::sync::{mpsc, RwLock};
+use std::time::Duration;
+use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::JoinHandle;
 
 const ACK_ENVELOPE_LIFETIME_MS: u64 = 60_000;
+
+/// How long the durable path waits for a typed-route handler to report
+/// completion before withholding the ACK (ADR 0030 §7).
+///
+/// Deliberately shorter than the sender's per-attempt budget
+/// (`DM_TIMEOUT_MAX_MS`, 30 s): waiting longer than the sender will wait can
+/// only pin this receiver on an ACK nobody is still listening for. The
+/// campaign draft instead waited out the envelope's remaining lifetime — up
+/// to 120 s — inline on the serial inbox loop, which would stall every later
+/// DM and ACK behind one slow handler. The budget is a receiver-side
+/// liveness bound, not a correctness one: timing out withholds the ACK, and
+/// the sender retries.
+const DURABLE_TYPED_COMPLETION_TIMEOUT: Duration = Duration::from_secs(20);
 
 const AUTHENTICATED_MACHINE_BINDING_CAPACITY: usize = 65_536;
 
@@ -174,6 +188,9 @@ impl std::fmt::Debug for DmInboxConfig {
 impl DmInboxConfig {
     /// Add a typed-payload route. Matching payloads are delivered to `sender`
     /// and are not emitted to generic `/direct/events` consumers.
+    ///
+    /// Routes registered this way cannot satisfy a durable (v2) receipt — see
+    /// [`Self::with_durable_typed_payload_route`].
     #[must_use]
     pub fn with_typed_payload_route(
         mut self,
@@ -183,6 +200,30 @@ impl DmInboxConfig {
         self.typed_payload_routes.push(DmTypedPayloadRoute {
             prefix: prefix.into(),
             sender,
+            durable_completion: false,
+        });
+        self
+    }
+
+    /// Add a typed-payload route whose handler reports durable completion
+    /// (ADR 0030 §7).
+    ///
+    /// Opting in is a promise: the handler must resolve the payload's
+    /// [`DmTypedPayload::completion`] channel once the payload is durably
+    /// recorded in *its own* store, and only then. The inbox emits a v2 ACK
+    /// solely on that signal, so a route that resolves optimistically converts
+    /// a durable receipt into a lie. Routes that do not opt in never receive a
+    /// v2 ACK — that withholding is stated policy, not an oversight.
+    #[must_use]
+    pub fn with_durable_typed_payload_route(
+        mut self,
+        prefix: impl Into<Vec<u8>>,
+        sender: mpsc::Sender<DmTypedPayload>,
+    ) -> Self {
+        self.typed_payload_routes.push(DmTypedPayloadRoute {
+            prefix: prefix.into(),
+            sender,
+            durable_completion: true,
         });
         self
     }
@@ -193,10 +234,35 @@ impl DmInboxConfig {
 pub struct DmTypedPayloadRoute {
     pub prefix: Vec<u8>,
     pub sender: mpsc::Sender<DmTypedPayload>,
+    /// Whether this route's handler resolves [`DmTypedPayload::completion`],
+    /// and may therefore back a durable v2 ACK (ADR 0030 §7).
+    pub durable_completion: bool,
 }
 
+/// What a typed-route handler reports once it has durably recorded a payload.
+///
+/// Mirrors the history store's own vocabulary deliberately: these are the two
+/// outcomes that prove exactly one durable record exists for the request, and
+/// they are the only two that let the inbox emit a v2 ACK.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DmTypedPayloadCompletion {
+    /// Newly recorded in the handler's durable store.
+    Inserted,
+    /// Already present — an idempotent replay of the same logical request.
+    Duplicate,
+}
+
+/// Outcome a handler sends back on [`DmTypedPayload::completion`]. `Err`
+/// carries a reason for the trace; it withholds the ACK exactly like a
+/// dropped channel does.
+pub type DmTypedPayloadCompletionResult = Result<DmTypedPayloadCompletion, String>;
+
 /// A decrypted, verified DM payload routed before generic direct-message fan-out.
-#[derive(Debug, Clone)]
+///
+/// Deliberately NOT `Clone`: `completion` holds a `oneshot::Sender`, which has
+/// no meaningful copy — two clones could not both answer the receiver, and
+/// cloning would silently drop one caller's receipt.
+#[derive(Debug)]
 pub struct DmTypedPayload {
     pub sender: AgentId,
     pub machine_id: MachineId,
@@ -204,6 +270,14 @@ pub struct DmTypedPayload {
     pub verified: bool,
     pub trust_decision: Option<TrustDecision>,
     pub received_at_unix_ms: u64,
+    /// Logical request id of the envelope that carried this payload, so a
+    /// handler can dedupe on `(sender, request_id)` across restart.
+    pub request_id: [u8; 16],
+    /// Present only for a durable (v2) payload on a route that opted in.
+    /// Resolving it with `Inserted`/`Duplicate` is what releases the v2 ACK;
+    /// dropping it withholds the ACK, which is the safe default on any
+    /// handler path that returns early.
+    pub completion: Option<oneshot::Sender<DmTypedPayloadCompletionResult>>,
 }
 
 pub struct DmInboxService {
@@ -857,6 +931,7 @@ impl InboxPipeline {
             .route_typed_payload(
                 sender_agent_id,
                 sender_machine_id,
+                envelope.request_id,
                 plaintext.payload.clone(),
                 Some(decision),
             )
@@ -953,34 +1028,36 @@ impl InboxPipeline {
             return DurableAckDecision::Withheld("history_unavailable");
         };
 
-        // ADR 0030 §7 — typed-route obligation (documented, not closed here).
+        // ADR 0030 §7 — typed-route obligation, now discharged by the handler.
         //
-        // Typed-prefix families (group ingest, KV deltas, exec audit, card
-        // import, voice signalling) classify `Ephemeral`: their durable effect
+        // Typed-prefix families classify `Ephemeral`: their durable effect
         // lives in their own store, not in DM history, so a DM-history commit
-        // could not honestly back their receipt. They are also handed off with
-        // a non-blocking `try_send` that may drop under backpressure, so a
-        // durable ACK here would claim a dispatch that never completed.
+        // could never honestly back their receipt. Slice 2 therefore withheld
+        // every v2 ACK on a typed route. Slice 3 replaces that blanket refusal
+        // with a completion signal — the handler tells us when the payload is
+        // durably recorded on ITS surface, and that signal, not a history row,
+        // is what releases the ACK.
         //
-        // A v2 envelope on a typed route therefore gets NO ACK in this slice,
-        // and the handler carries the restart-spanning dedupe obligation via
-        // its own durable surface (the bootstrap outbox handler satisfies it
-        // with `Inserted | Duplicate` completion). Slice 3 adds the typed-route
-        // completion signal that lets these frames earn a v2 ACK.
-        if self
+        // Routes opt in via `with_durable_typed_payload_route`. A route that
+        // has not opted in still gets no v2 ACK: this daemon will not certify
+        // durability for a handler that has not promised it. That withholding
+        // is stated policy (see the PR/design doc), not an oversight.
+        let typed_route_durable = self
             .typed_payload_routes
             .iter()
-            .any(|route| application_payload.starts_with(&route.prefix))
-        {
+            .find(|route| application_payload.starts_with(&route.prefix))
+            .map(|route| route.durable_completion);
+        if typed_route_durable == Some(false) {
             tracing::info!(
                 target: "dm.trace",
-                stage = "inbound_durable_typed_route_unacked",
+                stage = "inbound_durable_typed_route_not_opted_in",
                 request_id = %hex::encode(request_id),
                 sender = %hex::encode(sender_agent_id.as_bytes()),
-                "v2 DM matched a typed route; ACK withheld pending typed-route completion (ADR 0030 §7)"
+                "v2 DM matched a typed route that does not report durable completion; ACK withheld by policy (ADR 0030 §7)"
             );
-            return DurableAckDecision::Withheld("typed_route");
+            return DurableAckDecision::Withheld("typed_route_not_durable");
         }
+        let is_durable_typed_route = typed_route_durable == Some(true);
 
         // 1. Per-logical-request lock. Serializes the primary inbox and the
         //    legacy-bus copy of the same envelope so neither can observe a
@@ -1038,6 +1115,61 @@ impl InboxPipeline {
             return DurableAckDecision::Acked {
                 protocol_version: ack_protocol,
                 accepted: accepted_replay,
+            };
+        }
+
+        // 3a. Durable typed route: the handler's own store is the durable
+        //     surface, so steps 3–5 are replaced by dispatch-and-await. The
+        //     handler reports `Inserted | Duplicate` only once the payload is
+        //     recorded, which is the same "exactly one durable record" proof
+        //     `record_committed` gives the generic path.
+        if is_durable_typed_route {
+            let decision = self
+                .dispatch_durable_typed_route(
+                    sender_agent_id,
+                    sender_machine_id,
+                    request_id,
+                    application_payload,
+                    Some(decision),
+                )
+                .await;
+            let completion = match decision {
+                Ok(completion) => completion,
+                Err(stage) => return DurableAckDecision::Withheld(stage),
+            };
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_durable_typed_completed",
+                request_id = %hex::encode(request_id),
+                ?completion,
+            );
+            if let Err(error) = self.cache.complete_durable(
+                dedupe,
+                DmAckOutcome::Accepted,
+                envelope.protocol_version,
+                binding,
+            ) {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_typed_replay_publish_failed",
+                    request_id = %hex::encode(request_id),
+                    ?error,
+                    "v2 ACK withheld: durable typed completion could not be made replay-safe"
+                );
+                return DurableAckDecision::Withheld("replay_publish_failed");
+            }
+            let _ = self
+                .publish_ack_for_protocol(
+                    sender_agent_id,
+                    request_id,
+                    DmAckOutcome::Accepted,
+                    envelope.protocol_version,
+                    ack_legacy_bus,
+                )
+                .await;
+            return DurableAckDecision::Acked {
+                protocol_version: envelope.protocol_version,
+                accepted: true,
             };
         }
 
@@ -1187,10 +1319,102 @@ impl InboxPipeline {
         }
     }
 
+    /// Hand a durable (v2) payload to its typed route and wait for the
+    /// handler's completion signal (ADR 0030 §7).
+    ///
+    /// `Err(stage)` names the reason the ACK must be withheld. Every failure
+    /// mode lands there deliberately, because each one means the durable
+    /// receipt would be unbacked:
+    ///
+    /// - the channel is full or closed — the handler never saw the payload;
+    /// - the handler dropped the completion sender — including by returning
+    ///   early on its own error path, so "forgot to answer" fails safe;
+    /// - the handler reported an error;
+    /// - the handler did not answer inside the budget.
+    ///
+    /// Only `Inserted | Duplicate` returns `Ok`.
+    async fn dispatch_durable_typed_route(
+        &self,
+        sender_agent_id: AgentId,
+        sender_machine_id: MachineId,
+        request_id: [u8; 16],
+        payload: Vec<u8>,
+        trust_decision: Option<TrustDecision>,
+    ) -> Result<DmTypedPayloadCompletion, &'static str> {
+        let Some(route) = self
+            .typed_payload_routes
+            .iter()
+            .find(|route| payload.starts_with(&route.prefix))
+        else {
+            return Err("typed_route_vanished");
+        };
+        let (completion_tx, completion_rx) = oneshot::channel();
+        let typed = DmTypedPayload {
+            sender: sender_agent_id,
+            machine_id: sender_machine_id,
+            payload,
+            verified: true,
+            trust_decision,
+            received_at_unix_ms: now_unix_ms(),
+            request_id,
+            completion: Some(completion_tx),
+        };
+        // Still `try_send`, still non-blocking: this runs inline on the serial
+        // inbox loop, so a full channel must not stall unrelated DMs. The
+        // difference from the v1 path is what a drop means — there it was a
+        // tolerable loss of a redundant fallback, here it withholds the ACK
+        // and the sender retries.
+        if let Err(error) = route.sender.try_send(typed) {
+            self.dm.record_incoming_typed_route_dropped();
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "inbound_durable_typed_route_unavailable",
+                request_id = %hex::encode(request_id),
+                sender = %crate::logging::LogAgentId::from(&sender_agent_id),
+                "v2 ACK withheld: typed route could not accept the payload ({error})"
+            );
+            return Err("typed_route_unavailable");
+        }
+
+        match tokio::time::timeout(DURABLE_TYPED_COMPLETION_TIMEOUT, completion_rx).await {
+            Ok(Ok(Ok(completion))) => Ok(completion),
+            Ok(Ok(Err(reason))) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_typed_handler_failed",
+                    request_id = %hex::encode(request_id),
+                    %reason,
+                    "v2 ACK withheld: typed-route handler reported failure"
+                );
+                Err("typed_handler_failed")
+            }
+            Ok(Err(_)) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_typed_completion_dropped",
+                    request_id = %hex::encode(request_id),
+                    "v2 ACK withheld: typed-route handler dropped the completion channel"
+                );
+                Err("typed_completion_dropped")
+            }
+            Err(_) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_typed_completion_timeout",
+                    request_id = %hex::encode(request_id),
+                    timeout_secs = DURABLE_TYPED_COMPLETION_TIMEOUT.as_secs(),
+                    "v2 ACK withheld: typed-route handler did not report completion in budget"
+                );
+                Err("typed_completion_timeout")
+            }
+        }
+    }
+
     async fn route_typed_payload(
         &self,
         sender_agent_id: AgentId,
         sender_machine_id: MachineId,
+        request_id: [u8; 16],
         payload: Vec<u8>,
         trust_decision: Option<TrustDecision>,
     ) -> bool {
@@ -1208,6 +1432,10 @@ impl InboxPipeline {
             verified: true,
             trust_decision,
             received_at_unix_ms: now_unix_ms(),
+            request_id,
+            // v1 payloads make no durability promise, so there is nothing for
+            // a handler to report; the ACK is level-2 enqueue either way.
+            completion: None,
         };
         // Best-effort, NON-BLOCKING hand-off. These typed routes (the
         // group-public-message and KvStore-delta gossip-DM fallbacks) are
@@ -1920,20 +2148,32 @@ mod tests {
         );
     }
 
-    /// ADR 0030 §7: typed routes are documented as carrying their own
-    /// restart-spanning dedupe obligation, and do not earn a v2 ACK in this
-    /// slice. Locking that in so slice 3 has to change this test deliberately.
-    #[tokio::test]
-    async fn durable_typed_route_withholds_ack_pending_handler_completion() {
+    /// Drive one v2 typed payload through the durable path with `route`
+    /// installed, returning the decision. `respond` receives the payload the
+    /// handler would see and decides what (if anything) to report back.
+    async fn durable_typed_decision<F>(
+        request_byte: u8,
+        durable_completion: bool,
+        respond: F,
+    ) -> DurableAckDecision
+    where
+        F: FnOnce(DmTypedPayload) + Send + 'static,
+    {
         let sender = test_keypair();
         let machine = MachineId([0xD8; 32]);
         let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
         let _service = attach_history(&mut harness);
-        let (tx, _rx) = mpsc::channel::<DmTypedPayload>(8);
+        let (tx, mut rx) = mpsc::channel::<DmTypedPayload>(8);
         harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            durable_completion,
             prefix: b"X0X-KV-DELTA-V1\n".to_vec(),
             sender: tx,
         }];
+        let handler = tokio::spawn(async move {
+            if let Some(typed) = rx.recv().await {
+                respond(typed);
+            }
+        });
 
         let mut payload = b"X0X-KV-DELTA-V1\n".to_vec();
         payload.extend_from_slice(b"{\"k\":1}");
@@ -1941,7 +2181,7 @@ mod tests {
             &harness,
             &sender,
             machine,
-            0x58,
+            request_byte,
             DM_PROTOCOL_DURABLE_ACK,
             payload.clone(),
         );
@@ -1958,8 +2198,80 @@ mod tests {
                 false,
             )
             .await;
+        handler.abort();
+        decision
+    }
 
-        assert_eq!(decision, DurableAckDecision::Withheld("typed_route"));
+    /// ADR 0030 §7 obligation upgrade — this is the slice-2 lock, deliberately
+    /// changed. Slice 2 withheld every v2 ACK on a typed route; slice 3 lets a
+    /// handler earn one by reporting that the payload is durably recorded on
+    /// its own surface. `Inserted` and `Duplicate` are the only signals that
+    /// release the ACK, mirroring the history store's proof that exactly one
+    /// durable record exists.
+    #[tokio::test]
+    async fn durable_typed_route_acks_on_handler_completion() {
+        for completion in [
+            DmTypedPayloadCompletion::Inserted,
+            DmTypedPayloadCompletion::Duplicate,
+        ] {
+            let decision = durable_typed_decision(0x58, true, move |typed| {
+                assert_eq!(
+                    typed.request_id, [0x58; 16],
+                    "handler must receive the logical request id it dedupes on"
+                );
+                if let Some(tx) = typed.completion {
+                    let _ = tx.send(Ok(completion));
+                }
+            })
+            .await;
+            assert_eq!(
+                decision,
+                DurableAckDecision::Acked {
+                    protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                    accepted: true,
+                },
+                "{completion:?} must release the durable ACK"
+            );
+        }
+    }
+
+    /// A route that has not opted in still gets no v2 ACK. This daemon will
+    /// not certify durability for a handler that never promised it — stated
+    /// policy, which is why it has its own distinct stage.
+    #[tokio::test]
+    async fn durable_typed_route_without_opt_in_is_withheld_by_policy() {
+        let decision = durable_typed_decision(0x59, false, |_typed| {}).await;
+        assert_eq!(
+            decision,
+            DurableAckDecision::Withheld("typed_route_not_durable")
+        );
+    }
+
+    /// Every way a handler can fail to confirm withholds the ACK. Each of
+    /// these would otherwise hand the sender a durable receipt for a payload
+    /// that was never durably recorded.
+    #[tokio::test]
+    async fn durable_typed_route_withholds_on_every_non_completion() {
+        // Handler reports failure.
+        assert_eq!(
+            durable_typed_decision(0x5A, true, |typed| {
+                if let Some(tx) = typed.completion {
+                    let _ = tx.send(Err("store write failed".to_string()));
+                }
+            })
+            .await,
+            DurableAckDecision::Withheld("typed_handler_failed")
+        );
+
+        // Handler drops the completion sender — the "forgot to answer" case,
+        // including any early return on the handler's own error path.
+        assert_eq!(
+            durable_typed_decision(0x5B, true, |typed| {
+                drop(typed.completion);
+            })
+            .await,
+            DurableAckDecision::Withheld("typed_completion_dropped")
+        );
     }
 
     #[test]
@@ -2816,6 +3128,7 @@ mod tests {
     fn typed_payload_route_matches_prefix() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(1);
         let route = DmTypedPayloadRoute {
+            durable_completion: false,
             prefix: b"x0x-exec-v1\0".to_vec(),
             sender: tx,
         };
@@ -2827,6 +3140,7 @@ mod tests {
     fn typed_payload_route_no_match_for_different_prefix() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(1);
         let route = DmTypedPayloadRoute {
+            durable_completion: false,
             prefix: b"x0x-exec-v1\0".to_vec(),
             sender: tx,
         };
@@ -2846,9 +3160,9 @@ mod tests {
     #[test]
     fn dm_inbox_config_with_route_adds_entry() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
-        let config = DmInboxConfig::default().with_typed_payload_route(b"x0x-exec-v1 ", tx);
+        let config = DmInboxConfig::default().with_typed_payload_route(b"x0x-exec-v1\x00", tx);
         assert_eq!(config.typed_payload_routes.len(), 1);
-        assert_eq!(config.typed_payload_routes[0].prefix, b"x0x-exec-v1 ");
+        assert_eq!(config.typed_payload_routes[0].prefix, b"x0x-exec-v1\x00");
     }
 
     #[test]
@@ -2856,8 +3170,8 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
         let config = DmInboxConfig::default()
-            .with_typed_payload_route(b"prefix-a ", tx1)
-            .with_typed_payload_route(b"prefix-b ", tx2);
+            .with_typed_payload_route(b"prefix-a\x00", tx1)
+            .with_typed_payload_route(b"prefix-b\x00", tx2);
         assert_eq!(config.typed_payload_routes.len(), 2);
     }
 

@@ -6,6 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Typed-route durable completion signal (ADR 0030 §7, slice 3).** Slice 2
+  withheld every v2 ACK on a typed route because typed-prefix families
+  classify `Ephemeral` and cannot be backed by a DM-history commit. A handler
+  can now report `DmTypedPayloadCompletion::{Inserted, Duplicate}` on a
+  oneshot carried in `DmTypedPayload`, and that signal releases the ACK.
+  `DmTypedPayload` also carries the envelope `request_id` so handlers can
+  dedupe on `(sender, request_id)` across restart, and is no longer `Clone`
+  (a oneshot sender has no meaningful copy). Routes opt in via
+  `DmInboxConfig::with_durable_typed_payload_route`; routes that do not opt in
+  still get no v2 ACK, by stated policy. Every non-completion — channel
+  unavailable, handler error, dropped sender, timeout — withholds the ACK.
+- **`Store::find_by_logical_request` is now indexed.** Partial index on
+  `(ingress_sender_agent, logical_request_id)` for rows where
+  `logical_request_id IS NOT NULL`, created idempotently at open rather than
+  via a schema-version bump, so a rollback to v0.37.4 can still open the
+  database.
+
 - **DM protocol v2 receiver durable path (ADR 0030 §1, slice 2 of 4).** A v2
   envelope is answered in exactly this order: per-logical-request lock →
   replay-cache binding check → durable-history lookup → dispatch →

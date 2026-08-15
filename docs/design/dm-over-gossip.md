@@ -263,19 +263,43 @@ distinguish from the durable receipt it asked for (ADR 0030 §2).
 
 #### Typed routes (ADR 0030 §7)
 
-The typed-route restart-spanning dedupe gap is **documented as a handler
-obligation, not closed in the inbox.** Typed-prefix families (group ingest,
-KV deltas, exec audit, card import, voice signalling) classify `Ephemeral`:
-their durable effect lives in their own store, not in DM history, so a
-DM-history commit could not honestly back their receipt — and they are
-handed off with a non-blocking `try_send` that may drop under backpressure,
-so a durable ACK would claim a dispatch that never completed.
+Typed-prefix families (group ingest, KV deltas, exec audit, card import,
+voice signalling) classify `Ephemeral`: their durable effect lives in their
+own store, not in DM history, so a DM-history commit could never honestly
+back their receipt. Slice 2 therefore withheld every v2 ACK on a typed route.
 
-A v2 envelope matching a typed route therefore receives **no** ACK, and each
-typed handler carries the dedupe obligation via its own durable surface (the
-bootstrap outbox handler satisfies it with `Inserted | Duplicate`
-completion). The typed-route completion signal that lets these frames earn a
-v2 ACK is slice 3.
+Slice 3 replaces that blanket refusal with a **completion signal**. The
+handler reports when the payload is durably recorded on *its* surface, and
+that report — not a history row — is what releases the ACK:
+
+```rust
+pub enum DmTypedPayloadCompletion { Inserted, Duplicate }
+pub type DmTypedPayloadCompletionResult = Result<DmTypedPayloadCompletion, String>;
+```
+
+`DmTypedPayload` carries the envelope's `request_id` (so a handler can dedupe
+on `(sender, request_id)` across restart) and a `completion` oneshot the
+inbox awaits. For a durable typed payload this replaces steps 3–5 of the
+receiver ordering: `Inserted | Duplicate` is the same "exactly one durable
+record" proof that `record_committed` gives the generic path.
+
+**Opting in is a promise.** Routes registered with
+`with_durable_typed_payload_route` may back a v2 ACK; routes registered with
+`with_typed_payload_route` may not, and a v2 envelope reaching one is
+withheld under its own trace stage. This daemon does not certify durability
+for a handler that never promised it — that withholding is **stated policy,
+not an oversight**. A route that resolves its completion optimistically,
+before its store commit, converts a durable receipt into a lie; the honest
+failure is to drop the sender, which withholds.
+
+Every non-completion withholds the ACK: channel unavailable, handler error,
+dropped sender (so a handler returning early on its own error path fails
+safe), or no answer within the completion budget. The budget is deliberately
+shorter than the sender's per-attempt budget (`DM_TIMEOUT_MAX_MS`, 30 s) —
+waiting longer than the sender will wait can only pin the receiver's serial
+inbox loop on an ACK nobody is still listening for. It is a receiver-side
+liveness bound, not a correctness one: a timeout withholds and the sender
+retries.
 
 #### At-least-once across restart
 
@@ -283,6 +307,25 @@ The replay cache is memory-only, so a restart can re-dispatch an
 already-committed envelope. The step-3 lookup holds it to exactly one
 history row. Applications needing restart-spanning exactly-once must dedupe
 on `(sender, request_id)`.
+
+Concretely, on a `DurableLogicalRequestLookup::Exact` after restart — the
+row is already committed and binds the same bytes — the receiver **still
+dispatches to the application again**, then re-commits (the store returns
+`Duplicate`, satisfying `exact_durable_history_outcome`) and re-ACKs v2.
+This is deliberate and ADR-0030-allowed, not an oversight:
+
+- The alternative, skipping dispatch on `Exact`, would silently drop the
+  message whenever the crash happened *between* the history commit and the
+  application actually finishing with it — the exact window this protocol
+  exists to close. A duplicate the application can dedupe is strictly safer
+  than a loss it cannot detect.
+- The receipt stays honest either way: the sender's `Accepted` means
+  committed **and** dispatched, and both are true on the replay.
+
+So the guarantee is precisely: **exactly one history row, at least one
+dispatch.** Anything an application does on receipt that is not idempotent
+must dedupe on `(sender, request_id)` — the same obligation §1 places on
+applications requiring restart-spanning exactly-once.
 
 ## Capability negotiation
 

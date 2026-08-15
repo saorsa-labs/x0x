@@ -2437,6 +2437,8 @@ mod tests {
             verified,
             trust_decision,
             received_at_unix_ms: 1,
+            request_id: [0u8; 16],
+            completion: None,
         }
     }
 
