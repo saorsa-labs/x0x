@@ -270,11 +270,15 @@ pub enum DmAckOutcome {
     /// and skip emitting this ACK entirely.
     RejectedByPolicy { reason: String },
     /// The recipient cannot issue the durable receipt this request asked for:
-    /// the logical request already completed under weaker semantics, or is
-    /// already bound to different content (ADR 0030 §2). Distinct from
-    /// [`Self::RejectedByPolicy`] — nothing about the trust relationship
-    /// failed, so the caller should surface "retry / peer needs upgrade"
-    /// rather than "peer rejected you".
+    /// the logical request already completed under weaker semantics (ADR 0030
+    /// §2). Distinct from [`Self::RejectedByPolicy`] — nothing about the trust
+    /// relationship failed, so the caller should surface "retry / peer needs
+    /// upgrade" rather than "peer rejected you".
+    ///
+    /// Since ADR 0030 slice 4 this variant carries *only* the
+    /// semantics-unavailable meaning. The "same logical id, different bytes"
+    /// case moved to [`Self::IdempotencyConflict`], which is a caller bug
+    /// rather than a peer-capability gap.
     ///
     /// **Wire compatibility:** appended last, so postcard's variant indices
     /// for `Accepted` (0) and `RejectedByPolicy` (1) are unchanged and an
@@ -283,6 +287,24 @@ pub enum DmAckOutcome {
     /// semantics above what completed, and a v1-only sender never asks for
     /// more than v1 (see `cached_ack_for_protocol`).
     AckSemanticsUnavailable { reason: String },
+    /// The logical request id in this envelope is already bound — in the
+    /// replay cache or in committed durable history — to *different* content.
+    /// At-least-once retry identity requires a logical id to name exactly one
+    /// payload; reusing it for new bytes would either resurrect the old bytes
+    /// or silently overwrite the binding, so the recipient refuses both
+    /// (ADR 0030 §1 / Validation "reused `logical_id` with different bytes").
+    ///
+    /// Terminal for these bytes: retrying is futile until the caller picks a
+    /// fresh logical id. That is why it is not `AckSemanticsUnavailable`,
+    /// whose actionable advice ("retry, or tell the user to upgrade the peer")
+    /// is wrong here.
+    ///
+    /// **Wire compatibility:** appended after `AckSemanticsUnavailable`
+    /// (variant 3), so every previously assigned index is unchanged. It is
+    /// only ever produced on the v2 durable receiver path answering a v2
+    /// envelope, so a v1-only peer — which never sends one — can never receive
+    /// a variant it cannot decode.
+    IdempotencyConflict { reason: String },
 }
 
 // ─── Origin-machine attestation (issue #213) ──────────────────────────────
@@ -531,6 +553,16 @@ pub enum DmError {
     #[error("recipient does not advertise durable application ACK support: {0}")]
     AckSemanticsUnavailable(String),
 
+    /// The recipient already holds this logical request id bound to different
+    /// bytes (ADR 0030 §1). Retrying cannot succeed — the caller must either
+    /// resend the *original* bytes under this id or choose a new logical id.
+    ///
+    /// Kept separate from [`Self::AckSemanticsUnavailable`]: both used to
+    /// arrive as that variant, which told a product "the peer needs
+    /// upgrading" when the truth was "your client reused an idempotency key".
+    #[error("logical request already bound to different content: {0}")]
+    IdempotencyConflict(String),
+
     /// No application-layer ACK received within the retry budget. The DM
     /// MAY or may not have been delivered; the sender cannot distinguish.
     /// Safe to retry (recipient dedupes on `request_id`).
@@ -616,6 +648,85 @@ pub enum DmError {
 impl From<IdentityError> for DmError {
     fn from(value: IdentityError) -> Self {
         Self::EnvelopeConstruction(value.to_string())
+    }
+}
+
+// ─── Caller-supplied logical request identity ──────────────────────────────
+
+/// Canonical caller-supplied idempotency key for one logical DM send
+/// (ADR 0030 §4).
+///
+/// A product that retries a send — across a network blip, a process restart,
+/// or a user mashing the button — passes the same token each time. The daemon
+/// derives a stable [`DmSendConfig::logical_request_id`] from it, so the
+/// recipient recognises the retry as *the same request* and re-ACKs instead of
+/// delivering a second copy. This is the same mechanism the durable bootstrap
+/// outbox uses internally (ADR 0030 §5); the only difference is who chooses
+/// the identity.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DmLogicalId(String);
+
+/// Domain separator for the logical-request-id derivation. A version suffix,
+/// so changing the derivation later breaks matching loudly rather than
+/// silently re-binding old ids to new bytes.
+const DM_LOGICAL_REQUEST_ID_CONTEXT: &str = "x0x dm logical request id v1";
+
+impl DmLogicalId {
+    /// Accept a compact lowercase token suitable for UUIDs and namespaced
+    /// client ids: 1–128 bytes of `[a-z0-9]`, `-`, `_`, `.`, or `:`.
+    ///
+    /// Whitespace, uppercase, control bytes, and non-ASCII are rejected rather
+    /// than normalized. Normalizing would let `Order-1` and `order-1` collapse
+    /// into one identity, which turns two distinct product requests into an
+    /// idempotency conflict the caller never asked for.
+    ///
+    /// # Errors
+    ///
+    /// Returns a human-readable reason when the token is empty, longer than
+    /// 128 bytes, or contains a byte outside the accepted set.
+    pub fn parse(value: &str) -> std::result::Result<Self, String> {
+        if value.is_empty() || value.len() > 128 {
+            return Err("logical_id must contain 1 to 128 ASCII chars".to_string());
+        }
+        if !value.bytes().all(|byte| {
+            byte.is_ascii_lowercase()
+                || byte.is_ascii_digit()
+                || matches!(byte, b'-' | b'_' | b'.' | b':')
+        }) {
+            return Err(
+                "logical_id must use lowercase ASCII letters, digits, '-', '_', '.', or ':'"
+                    .to_string(),
+            );
+        }
+        Ok(Self(value.to_string()))
+    }
+
+    /// Canonical bytes used by the domain-separated request-id derivation.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Derive the 128-bit wire request id for this token on one directed pair.
+    ///
+    /// `blake3::derive_key(DM_LOGICAL_REQUEST_ID_CONTEXT, sender ‖ recipient ‖
+    /// token)`, truncated to the leading 16 bytes.
+    ///
+    /// Both agent ids are bound, not just the token. The recipient dedupes on
+    /// `(sender, request_id)` so binding the sender is belt-and-braces, but
+    /// binding the *recipient* is load-bearing: the sender's in-flight ACK
+    /// waiter is keyed by `request_id` alone, so one token fanned out to two
+    /// peers must not produce one id that two waiters fight over.
+    #[must_use]
+    pub fn request_id(&self, sender: AgentId, recipient: AgentId) -> [u8; 16] {
+        let mut hasher = blake3::Hasher::new_derive_key(DM_LOGICAL_REQUEST_ID_CONTEXT);
+        hasher.update(sender.as_bytes());
+        hasher.update(recipient.as_bytes());
+        hasher.update(self.0.as_bytes());
+        let digest = hasher.finalize();
+        let mut request_id = [0_u8; 16];
+        request_id.copy_from_slice(&digest.as_bytes()[..16]);
+        request_id
     }
 }
 
