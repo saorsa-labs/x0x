@@ -284,6 +284,25 @@ already-committed envelope. The step-3 lookup holds it to exactly one
 history row. Applications needing restart-spanning exactly-once must dedupe
 on `(sender, request_id)`.
 
+Concretely, on a `DurableLogicalRequestLookup::Exact` after restart — the
+row is already committed and binds the same bytes — the receiver **still
+dispatches to the application again**, then re-commits (the store returns
+`Duplicate`, satisfying `exact_durable_history_outcome`) and re-ACKs v2.
+This is deliberate and ADR-0030-allowed, not an oversight:
+
+- The alternative, skipping dispatch on `Exact`, would silently drop the
+  message whenever the crash happened *between* the history commit and the
+  application actually finishing with it — the exact window this protocol
+  exists to close. A duplicate the application can dedupe is strictly safer
+  than a loss it cannot detect.
+- The receipt stays honest either way: the sender's `Accepted` means
+  committed **and** dispatched, and both are true on the replay.
+
+So the guarantee is precisely: **exactly one history row, at least one
+dispatch.** Anything an application does on receipt that is not idempotent
+must dedupe on `(sender, request_id)` — the same obligation §1 places on
+applications requiring restart-spanning exactly-once.
+
 ## Capability negotiation
 
 ### Advertisement
