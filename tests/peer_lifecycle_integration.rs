@@ -27,6 +27,20 @@ use daemon::DaemonFixture;
 
 const STARTUP_SETTLE: Duration = Duration::from_secs(5);
 
+/// HTTP client timeout for the two tests that issue a bare — and therefore,
+/// since ADR 0030 slice 4, durable — `POST /direct/send`.
+///
+/// This aligns the test's observer with the daemon's own send budget rather
+/// than widening a race: `direct_message_send_config` allows 8 s per attempt
+/// with one retry and an 8 s backoff, so a legitimate durable send can occupy
+/// ~24 s before the daemon itself gives up. A 10 s client abandons work the
+/// daemon is still correctly doing and reports it as a test failure. The
+/// bundled tic-tac-toe client already uses 30 s for exactly this reason.
+///
+/// The cold-path latency this exposes is tracked in issue #336; it is
+/// deliberately not frozen into a documented contract here.
+const DURABLE_SEND_CLIENT_TIMEOUT: Duration = Duration::from_secs(30);
+
 #[cfg(unix)]
 struct PeerLifecycleLock(std::fs::File);
 
@@ -520,7 +534,7 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
     wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
 
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-ack-test");
-    let alice_client = alice.authed_client(Duration::from_secs(10));
+    let alice_client = alice.authed_client(DURABLE_SEND_CLIENT_TIMEOUT);
     let r = alice_client
         .post(alice.url("/direct/send"))
         .json(&serde_json::json!({
@@ -531,8 +545,12 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
         .send()
         .await
         .unwrap();
-    assert_eq!(r.status(), StatusCode::OK);
+    let status = r.status();
     let body: Value = r.json().await.unwrap();
+    // Carry status *and* body: a durable send's refusals are typed (409
+    // recipient_ack_semantics_unavailable when the advert has not converged),
+    // and a bare status code cannot distinguish that from a real regression.
+    assert_eq!(status, StatusCode::OK, "direct/send {status}: {body}");
     assert_eq!(body["ok"], true, "direct/send body: {body}");
     let ack = &body["require_ack"];
     assert_eq!(ack["ok"], true, "require_ack absent or failed: {body}");
@@ -567,7 +585,7 @@ async fn direct_send_without_require_ack_omits_ack_block() {
     wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
 
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-no-ack-test");
-    let alice_client = alice.authed_client(Duration::from_secs(10));
+    let alice_client = alice.authed_client(DURABLE_SEND_CLIENT_TIMEOUT);
     // Retry the direct-send POST: same transient-connection rationale as above.
     let r = retry_post_json(
         &alice_client,
@@ -579,9 +597,10 @@ async fn direct_send_without_require_ack_omits_ack_block() {
         5,
     )
     .await;
-    assert_eq!(r.status(), StatusCode::OK);
+    let status = r.status();
     let body: Value = r.json().await.unwrap();
-    assert_eq!(body["ok"], true);
+    assert_eq!(status, StatusCode::OK, "direct/send {status}: {body}");
+    assert_eq!(body["ok"], true, "direct/send body: {body}");
     assert!(
         body.get("require_ack").is_none() || body["require_ack"].is_null(),
         "require_ack should be absent when not requested, got: {body}"
