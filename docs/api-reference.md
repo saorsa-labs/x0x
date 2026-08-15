@@ -356,6 +356,19 @@ gossip inbox. **Defaults to `true` since v0.37.0** (previously `false`);
 omitting the field selects the daemon default, so clients that relied on the
 old default must now send `"prefer_raw_quic_if_connected": false` explicitly.
 
+Optional field `require_gossip_ack` (bool): when a gossip-inbox send is used,
+wait for the recipient's application ACK before returning success. `false`
+returns as soon as the publish succeeds. Omitting the field selects the daemon
+default (`true`).
+
+> **Deprecated (ADR 0030 §4), still honored.** This field is scheduled for
+> removal when the product tier moves to durable-by-default sends in ADR 0030
+> slice 4, at which point `require_gossip_ack: false` stops being expressible
+> and the route will reject the field with **400** rather than accept it as a
+> no-op. It is fully honored today — see `direct_send_config_for_request` in
+> `src/server/routes/direct.rs` and the branch on `config.require_gossip_ack`
+> in `src/dm_send.rs` — so no client needs to change yet.
+
 ### Direct send error codes
 
 `/direct/send` failures answer with `{"ok": false, "error": "<code>"}`.
