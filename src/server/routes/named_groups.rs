@@ -17,6 +17,11 @@ use super::files::{
 };
 use super::groups::save_mls_groups;
 use super::identity::populate_invite_base_state_from_group_info;
+use super::public_group_bootstrap_outbox::{
+    cancel_public_group_bootstrap_obligations_for_removal,
+    persist_named_group_info_with_bootstrap_obligation, public_group_bootstrap_obligation_for_add,
+    spawn_public_group_bootstrap_delivery,
+};
 use crate as x0x;
 use crate::groups::aad::secure_share_aad;
 use anyhow::{Context, Result};
@@ -332,7 +337,7 @@ fn apply_withdrawn_group_card_to_group_info(
 // Request / response types
 // ---------------------------------------------------------------------------
 
-fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
+pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // Named-group metadata applies require `DirectMessage::verified == true`.
     // The gossip-inbox DM path verifies the signed DM envelope and marks the
     // bridged direct message verified. Raw QUIC can only mark messages
@@ -631,8 +636,8 @@ pub(in crate::server) struct TreeKemCatchupResponse {
 /// group/card state to validate and install the exact committed frontier.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(in crate::server) struct PublicGroupBootstrap {
-    message_type: String,
-    group: Box<x0x::groups::GroupInfo>,
+    pub(in crate::server) message_type: String,
+    pub(in crate::server) group: Box<x0x::groups::GroupInfo>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2265,7 +2270,7 @@ fn spawn_named_group_event_delivery_to_active_members(
     }
 }
 
-fn signed_public_bootstrap_snapshot(
+pub(in crate::server) fn signed_public_bootstrap_snapshot(
     mut group: x0x::groups::GroupInfo,
 ) -> Option<x0x::groups::GroupInfo> {
     if group.withdrawn
@@ -2293,54 +2298,6 @@ fn signed_public_bootstrap_snapshot(
     group.commit_log.clear();
     group.commit_log.push(head);
     Some(group)
-}
-
-/// Direct-deliver a committed signed-public snapshot to a newly-added member.
-/// The receiver independently verifies the retained head commit before it
-/// installs anything, so this is a bootstrap transport rather than an
-/// authorization bypass.
-fn spawn_public_group_bootstrap_delivery(
-    state: &AppState,
-    recipient_hex: &str,
-    group: x0x::groups::GroupInfo,
-) {
-    let recipient = match parse_agent_id_hex(recipient_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                recipient = %LogHexId::agent(&recipient_hex),
-                "cannot direct-deliver public-group bootstrap: {e}"
-            );
-            return;
-        }
-    };
-    let Some(group) = signed_public_bootstrap_snapshot(group) else {
-        tracing::warn!(
-            recipient = %LogHexId::agent(&recipient_hex),
-            "refusing to direct-deliver a non-public or unverifiable group bootstrap"
-        );
-        return;
-    };
-    let group_id = group.stable_group_id().to_string();
-    let payload = match serde_json::to_vec(&PublicGroupBootstrap {
-        message_type: "public_group_bootstrap".to_string(),
-        group: Box::new(group),
-    }) {
-        Ok(payload) => payload,
-        Err(e) => {
-            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to serialize public-group bootstrap: {e}");
-            return;
-        }
-    };
-    let agent = Arc::clone(&state.agent);
-    tokio::spawn(async move {
-        if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
-            .await
-        {
-            tracing::warn!(group_id = %LogHexId::group(&group_id), "failed to direct-deliver public-group bootstrap: {e}");
-        }
-    });
 }
 
 fn validate_public_group_bootstrap(
@@ -2399,19 +2356,26 @@ const MAX_BOOTSTRAP_INSTALLED_GROUPS: usize = 256;
 /// Validate and install a signed-public bootstrap received over the
 /// authenticated direct channel. Existing local state is never overwritten;
 /// normal metadata commits remain the only update path after bootstrap.
-pub(in crate::server) async fn handle_public_group_bootstrap(
+///
+/// The legacy unprefixed listener discards the outcome; the strict v2 typed
+/// route reports it as the DM completion signal (ADR 0030 §7), so every exit
+/// here has to say honestly whether a durable record now exists for this
+/// exact frontier.
+pub(in crate::server) async fn admit_public_group_bootstrap(
     state: &Arc<AppState>,
-    sender: &AgentId,
+    sender: AgentId,
     bootstrap: PublicGroupBootstrap,
-) {
+) -> x0x::dm_inbox::DmTypedPayloadCompletionResult {
+    use x0x::dm_inbox::DmTypedPayloadCompletion;
+
     if bootstrap.message_type != "public_group_bootstrap" {
-        return;
+        return Err("unsupported public-group bootstrap message type".to_string());
     }
     let sender_hex = hex::encode(sender.as_bytes());
     {
         let revoked = state.agent.revocation_set();
-        if revoked.read().await.is_agent_revoked(sender) {
-            return;
+        if revoked.read().await.is_agent_revoked(&sender) {
+            return Err("public-group bootstrap sender is revoked".to_string());
         }
     }
     // Consent gate: a bootstrap persists a group and spawns listener tasks,
@@ -2421,36 +2385,47 @@ pub(in crate::server) async fn handle_public_group_bootstrap(
     // groups (mirrors the pending-welcome convention for encrypted groups).
     {
         let contacts = state.contacts.read().await;
-        if contacts.trust_level(sender).rank() < crate::contacts::TrustLevel::Known.rank() {
+        if contacts.trust_level(&sender).rank() < crate::contacts::TrustLevel::Known.rank() {
             tracing::debug!(
                 sender = %LogHexId::agent(&sender_hex),
                 "ignoring public-group bootstrap from unknown or blocked sender"
             );
-            return;
+            return Err("public-group bootstrap sender is not a known contact".to_string());
         }
     }
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let group = *bootstrap.group;
     if !validate_public_group_bootstrap(&group, &sender_hex, &local_agent_hex) {
         tracing::warn!(sender = %LogHexId::agent(&sender_hex), "rejected invalid public-group bootstrap");
-        return;
+        return Err("public-group bootstrap failed signed frontier validation".to_string());
     }
     let group_id = group.stable_group_id().to_string();
+    let frontier = (group.state_revision, group.state_hash.clone());
     {
         let groups = state.named_groups.read().await;
+        if let Some(installed) = groups.get(&group_id).or_else(|| {
+            groups
+                .values()
+                .find(|existing| existing.stable_group_id() == group_id)
+        }) {
+            // Bootstrap seeds a group; it never overwrites one. Reporting the
+            // installed frontier honestly is what keeps the sender's outbox
+            // correct: only an exact frontier match may discharge its
+            // obligation, and a receiver that still trails the authority
+            // withholds the ACK so the obligation survives until it catches up
+            // through the ordinary metadata-commit path.
+            return if (installed.state_revision, installed.state_hash.clone()) == frontier {
+                Ok(DmTypedPayloadCompletion::Duplicate)
+            } else {
+                Err("public-group bootstrap frontier is not the installed one".to_string())
+            };
+        }
         if groups.len() >= MAX_BOOTSTRAP_INSTALLED_GROUPS {
             tracing::warn!(
                 sender = %LogHexId::agent(&sender_hex),
                 "refusing public-group bootstrap: named-group capacity reached"
             );
-            return;
-        }
-        if groups.contains_key(&group_id)
-            || groups
-                .values()
-                .any(|existing| existing.stable_group_id() == group_id)
-        {
-            return;
+            return Err("public-group bootstrap capacity reached".to_string());
         }
     }
     let outcome = persist_named_groups_mutation(state, |groups| {
@@ -2469,8 +2444,10 @@ pub(in crate::server) async fn handle_public_group_bootstrap(
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
         ensure_named_group_listeners(Arc::clone(state), &group_id).await;
         tracing::info!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), "installed signed-public group bootstrap");
+        Ok(DmTypedPayloadCompletion::Inserted)
     } else {
         tracing::warn!(group_id = %LogHexId::group(&group_id), "public-group bootstrap was not durably installed");
+        Err("public-group bootstrap was not durably installed".to_string())
     }
 }
 
@@ -2663,7 +2640,7 @@ async fn confirm_named_groups_durability_unlocked(state: &AppState) -> bool {
     }
 }
 
-async fn persist_named_group_info(
+pub(in crate::server) async fn persist_named_group_info(
     state: &AppState,
     group_id: &str,
     info: x0x::groups::GroupInfo,
@@ -10376,7 +10353,7 @@ pub(in crate::server) async fn add_named_group_member(
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
 
-    let (metadata_topic, event, members, epoch, bootstrap_group, added_agent_hex) = {
+    let (metadata_topic, event, members, epoch, bootstrap_group) = {
         let named_groups = state.named_groups.read().await;
         let Some(info) = named_groups.get(&id) else {
             return not_found("group not found");
@@ -10421,15 +10398,28 @@ pub(in crate::server) async fn add_named_group_member(
         let event_group_id = next.stable_group_id().to_string();
         let members = named_group_member_values(&next);
         let bootstrap_group = next.clone();
+        // ADR 0030 §5: a SignedPublic add owes the new member the committed
+        // snapshot. Record that debt durably in the same step as the roster
+        // commit, so a crash cannot leave a member on the roster that nobody
+        // remembers to bootstrap.
+        let bootstrap_obligation = match public_group_bootstrap_obligation_for_add(agent_id, &next)
+        {
+            Ok(obligation) => obligation,
+            Err(error) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, error),
+        };
         drop(named_groups);
 
-        if !matches!(
-            persist_named_group_info(&state, &id, next).await,
-            Ok(AtomicWriteOutcome::Durable)
-        ) {
+        let persist_outcome = match bootstrap_obligation {
+            Some(obligation) => {
+                persist_named_group_info_with_bootstrap_obligation(&state, &id, next, obligation)
+                    .await
+            }
+            None => persist_named_group_info(&state, &id, next).await,
+        };
+        if !matches!(persist_outcome, Ok(AtomicWriteOutcome::Durable)) {
             return api_error(
                 StatusCode::SERVICE_UNAVAILABLE,
-                "named-group state is not directory-durable",
+                "named-group state and bootstrap obligation are not directory-durable",
             );
         }
 
@@ -10464,19 +10454,12 @@ pub(in crate::server) async fn add_named_group_member(
             member_recovery_history: Vec::new(),
             commit: Some(commit),
         };
-        (
-            metadata_topic,
-            event,
-            members,
-            epoch,
-            bootstrap_group,
-            agent_hex,
-        )
+        (metadata_topic, event, members, epoch, bootstrap_group)
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
     if bootstrap_group.policy.confidentiality == x0x::groups::GroupConfidentiality::SignedPublic {
-        spawn_public_group_bootstrap_delivery(&state, &added_agent_hex, bootstrap_group.clone());
+        spawn_public_group_bootstrap_delivery(&state);
     }
     spawn_named_group_event_delivery_to_active_members(&state, &bootstrap_group, &event, &[]);
     maybe_publish_group_card_after_state_change(&state, &id).await;
@@ -10929,6 +10912,10 @@ pub(in crate::server) async fn remove_named_group_member(
     };
 
     publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    // ADR 0030 §5: the removal is committed, so the bootstrap debt to this
+    // member no longer exists.
+    cancel_public_group_bootstrap_obligations_for_removal(&state, &agent_id_hex, &delivery_roster)
+        .await;
     // Direct + delayed delivery of the signed MemberRemoved to active survivors
     // AND the removed member. The removed member is no longer in
     // active_members(), so it is passed via extra_recipients — the same shape
@@ -18348,7 +18335,7 @@ pub(in crate::server) enum AtomicWriteOutcome {
     Durable,
 }
 
-async fn write_named_groups_json_atomic(
+pub(in crate::server) async fn write_named_groups_json_atomic(
     path: &FsPath,
     json: &str,
 ) -> std::io::Result<AtomicWriteOutcome> {
@@ -19364,7 +19351,9 @@ pub(in crate::server) type WelcomeFetchWaiter =
     oneshot::Sender<std::result::Result<Vec<u8>, String>>;
 
 #[cfg(test)]
-mod tests {
+// Sibling test modules (the bootstrap outbox) reuse the AppState fixture
+// below rather than duplicating a 150-field literal.
+pub(in crate::server) mod tests {
     use super::*;
 
     use super::super::super::sse::SseEvent;
@@ -19969,7 +19958,8 @@ mod tests {
         )
     }
 
-    async fn secure_endpoint_test_state() -> Result<(Arc<AppState>, tempfile::TempDir)> {
+    pub(in crate::server) async fn secure_endpoint_test_state(
+    ) -> Result<(Arc<AppState>, tempfile::TempDir)> {
         let dir = tempfile::tempdir()?;
         let data_dir = dir.path();
         let agent = Arc::new(
@@ -20032,6 +20022,7 @@ mod tests {
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
             predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+            public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
             pending_b8_compensation: Mutex::new(None),
             pending_listener_admission: Mutex::new(None),
             group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -20057,10 +20048,13 @@ mod tests {
             treekem_pending_events: RwLock::new(HashMap::new()),
             causal_approval_queue: RwLock::new(HashMap::new()),
             predecessor_relay_outbox: RwLock::new(HashMap::new()),
+            public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
             causal_conflict_tombstones: RwLock::new(HashMap::new()),
             completed_relay_tombstones: RwLock::new(HashMap::new()),
             causal_approval_queue_path: treekem_dir.join("causal_approval_queue.json"),
             predecessor_relay_outbox_path: treekem_dir.join("predecessor_relay_outbox.json"),
+            public_group_bootstrap_outbox_path: treekem_dir
+                .join("public_group_bootstrap_outbox.json"),
             treekem_member_key_packages,
             treekem_event_log: RwLock::new(HashMap::new()),
             treekem_catchup_throttle: RwLock::new(HashMap::new()),

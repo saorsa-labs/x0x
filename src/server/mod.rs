@@ -22,38 +22,42 @@ mod ws;
 // DaemonUpdateConfig, CachedUpgradeCheck) stay private to the crate.
 pub use config::{diagnose_section_placement, warn_section_misplacements, SectionMisplacement};
 use routes::named_groups::CAUSAL_APPROVAL_RETENTION_MS;
+use routes::public_group_bootstrap_outbox::{
+    handle_public_group_bootstrap_typed_payload, load_public_group_bootstrap_outbox,
+    public_group_bootstrap_outbox_step, PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
+};
 use routes::{
     ack_diagnostics, add_contact, add_machine, add_mls_member, add_named_group_member, add_task,
-    agent_info, agent_reachability, agent_sign, agent_user_id_handler, agent_verify,
-    agents_by_user_handler, announce_identity, apply_direct_kv_store_delta,
-    apply_named_group_metadata_event, apply_named_group_metadata_event_inner_serialized,
-    apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
-    broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
-    connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
-    create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
-    create_mls_group, create_mls_welcome, create_named_group, create_task_list, delete_contact,
-    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
-    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
-    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
-    ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics, exec_run,
-    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
-    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
-    get_group_card, get_group_public_messages, get_group_state, get_group_state_commits,
-    get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
-    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
-    handle_public_group_bootstrap, handle_treekem_catchup_request, handle_treekem_catchup_response,
-    handle_welcome_blob_message, health, history_diagnostics, history_list, history_message,
-    history_purge, history_search, history_stats, identity_revocations, identity_revoke,
-    import_agent_card, import_group_card, ingest_public_message, introduction,
-    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
-    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
-    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
-    load_named_groups, load_predecessor_relay_outbox, load_treekem_member_key_packages,
-    machine_for_agent_handler, machines_by_user_handler, mls_decrypt, mls_encrypt,
-    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
-    now_millis_u64, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    admit_public_group_bootstrap, agent_info, agent_reachability, agent_sign,
+    agent_user_id_handler, agent_verify, agents_by_user_handler, announce_identity,
+    apply_direct_kv_store_delta, apply_named_group_metadata_event,
+    apply_named_group_metadata_event_inner_serialized, apply_upgrade, approve_join_request,
+    ban_group_member, bootstrap_cache_stats, broadcast_current_manifest, cancel_join_request,
+    causal_relay_step, check_upgrade, connect_agent, connect_diagnostics_handler, connect_machine,
+    connectivity_diagnostics, create_discovery_subscription, create_group_invite,
+    create_join_request, create_kv_store, create_mls_group, create_mls_welcome, create_named_group,
+    create_task_list, delete_contact, delete_discovery_subscription, delete_kv_value,
+    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
+    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
+    discovered_machines, dm_diagnostics, ensure_named_group_listeners, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
+    get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
+    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    history_list, history_message, history_purge, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
+    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
+    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
+    list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
+    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
+    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
+    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
     reject_join_request, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
@@ -414,6 +418,8 @@ pub async fn serve_with_options(
     let named_groups_path = config.data_dir.join("named_groups.json");
     let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
     let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
+    let public_group_bootstrap_outbox_path =
+        config.data_dir.join("public_group_bootstrap_outbox.json");
     let treekem_dir = config.data_dir.join("treekem");
     if let Err(e) = tokio::fs::create_dir_all(&treekem_dir).await {
         tracing::warn!(
@@ -498,6 +504,8 @@ pub async fn serve_with_options(
     let (group_public_dm_tx, mut group_public_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (kv_store_delta_dm_tx, mut kv_store_delta_dm_rx) =
+        mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
+    let (public_group_bootstrap_dm_tx, mut public_group_bootstrap_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (predecessor_relay_dm_tx, mut predecessor_relay_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
@@ -597,6 +605,7 @@ pub async fn serve_with_options(
         named_groups_requires_durability_confirmation: AtomicBool::new(false),
         causal_approval_queue_persistence_lock: Mutex::new(()),
         predecessor_relay_outbox_persistence_lock: Mutex::new(()),
+        public_group_bootstrap_outbox_persistence_lock: Mutex::new(()),
         pending_b8_compensation: Mutex::new(None),
         pending_listener_admission: Mutex::new(None),
         group_metadata_tasks: RwLock::new(HashMap::new()),
@@ -626,10 +635,12 @@ pub async fn serve_with_options(
         treekem_pending_events: RwLock::new(HashMap::new()),
         causal_approval_queue: RwLock::new(HashMap::new()),
         predecessor_relay_outbox: RwLock::new(HashMap::new()),
+        public_group_bootstrap_outbox: RwLock::new(HashMap::new()),
         causal_conflict_tombstones: RwLock::new(HashMap::new()),
         completed_relay_tombstones: RwLock::new(HashMap::new()),
         causal_approval_queue_path,
         predecessor_relay_outbox_path,
+        public_group_bootstrap_outbox_path,
         treekem_event_log: RwLock::new(HashMap::new()),
         treekem_member_key_packages,
         treekem_catchup_throttle: RwLock::new(HashMap::new()),
@@ -715,6 +726,16 @@ pub async fn serve_with_options(
         exec_service.shutdown().await;
         agent.shutdown().await;
         return Err(anyhow::anyhow!("ADR 0028 startup: {error}"));
+    }
+    // ADR 0030 §5 fail-closed: a malformed or over-cap bootstrap outbox aborts
+    // startup rather than silently dropping delivery obligations the authority
+    // has already promised.
+    if let Err(error) = load_public_group_bootstrap_outbox(&state).await {
+        exec_service.shutdown().await;
+        agent.shutdown().await;
+        return Err(anyhow::anyhow!(
+            "public-group bootstrap outbox startup: {error}"
+        ));
     }
 
     // Publish the API port only after every fallible causal-state loader has
@@ -832,12 +853,14 @@ pub async fn serve_with_options(
     let dm_inbox_exec_route_tx = exec_dm_tx.clone();
     let dm_inbox_group_public_route_tx = group_public_dm_tx.clone();
     let dm_inbox_kv_store_delta_route_tx = kv_store_delta_dm_tx.clone();
+    let dm_inbox_public_group_bootstrap_route_tx = public_group_bootstrap_dm_tx.clone();
     let dm_inbox_predecessor_relay_route_tx = predecessor_relay_dm_tx.clone();
     bg_tasks.push(tokio::spawn(start_dm_inbox_when_gossip_ready(
         dm_inbox_agent,
         dm_inbox_kem,
         dm_inbox_exec_route_tx,
         dm_inbox_group_public_route_tx,
+        dm_inbox_public_group_bootstrap_route_tx,
         dm_inbox_kv_store_delta_route_tx,
         dm_inbox_predecessor_relay_route_tx,
     )));
@@ -1178,7 +1201,9 @@ pub async fn serve_with_options(
                     verified = msg.verified,
                     "direct classified signed-public group bootstrap"
                 );
-                handle_public_group_bootstrap(&bootstrap_state, &msg.sender, bootstrap).await;
+                // The legacy unprefixed wire form carries no durable
+                // receipt, so the admission outcome has nowhere to go.
+                let _ = admit_public_group_bootstrap(&bootstrap_state, msg.sender, bootstrap).await;
             }
         }));
     }
@@ -1335,6 +1360,38 @@ pub async fn serve_with_options(
                     _ = shutdown_rx.changed() => break,
                     _ = tokio::time::sleep(sleep_dur) => {
                         causal_relay_step(&relay_step_state).await;
+                    }
+                }
+            }
+        }));
+    }
+
+    // ADR 0030 §5: strict v2 signed-public bootstrap listener. Unlike the
+    // legacy unprefixed fan-out, this route resolves the authenticated DM
+    // completion only after the consent gate and a directory-durable install,
+    // and that completion is what releases the sender's v2 ACK.
+    {
+        let bootstrap_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            while let Some(typed) = public_group_bootstrap_dm_rx.recv().await {
+                handle_public_group_bootstrap_typed_payload(&bootstrap_state, typed).await;
+            }
+        }));
+    }
+
+    // ADR 0030 §5: durable bootstrap retry worker. The outbox was loaded and
+    // reconciled before listener startup; each step sends at most one due
+    // obligation and persists its backoff, so a disconnected peer cannot
+    // create a hot loop and a restart resumes the exact canonical payload.
+    {
+        let bootstrap_state = Arc::clone(&state);
+        bg_tasks.push(tokio::spawn(async move {
+            let mut shutdown_rx = bootstrap_state.shutdown_notify.subscribe();
+            loop {
+                tokio::select! {
+                    _ = shutdown_rx.changed() => break,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {
+                        public_group_bootstrap_outbox_step(&bootstrap_state).await;
                     }
                 }
             }
@@ -1800,6 +1857,7 @@ async fn start_dm_inbox_when_gossip_ready(
     kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
     exec_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     group_public_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
+    public_group_bootstrap_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     kv_store_delta_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
     predecessor_relay_route_tx: mpsc::Sender<x0x::dm_inbox::DmTypedPayload>,
 ) {
@@ -1809,6 +1867,14 @@ async fn start_dm_inbox_when_gossip_ready(
             .with_typed_payload_route(
                 GROUP_PUBLIC_MESSAGE_DM_PREFIX,
                 group_public_route_tx.clone(),
+            )
+            // ADR 0030 §5/§7: durable, not plain. The outbox only clears an
+            // obligation on a v2 ACK, and a v2 ACK is released only by this
+            // route's completion signal — registering it as a plain typed
+            // route would withhold every ACK and livelock the outbox.
+            .with_durable_typed_payload_route(
+                PUBLIC_GROUP_BOOTSTRAP_DM_PREFIX,
+                public_group_bootstrap_route_tx.clone(),
             )
             .with_typed_payload_route(KV_STORE_DELTA_DM_PREFIX, kv_store_delta_route_tx.clone())
             .with_typed_payload_route(

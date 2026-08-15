@@ -6,6 +6,29 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Durable signed-public bootstrap outbox (ADR 0030 §5, slice 3b).** Adding a
+  member to a SignedPublic group used to direct-send the roster snapshot
+  fire-and-forget: an offline recipient never received it and nothing on the
+  authority remembered the debt. The send is now a durable obligation, in its
+  own module (`src/server/routes/public_group_bootstrap_outbox.rs`). It is
+  written in the same step as the roster commit, keyed by
+  `(recipient, group, frontier, payload-digest)` as one blake3 binding digest,
+  capped at 1024 entries, retried on `1s << min(attempts, 6)` clamped to 60 s,
+  and persisted to `public_group_bootstrap_outbox.json` in the data directory.
+  That sidecar is loaded **fail-closed**: an unsupported version, an over-cap
+  file, a duplicate key, or a payload that contradicts the frontier it claims
+  aborts daemon startup rather than silently dropping a promised delivery. An
+  obligation is discharged **only** by a v2 application ACK for that exact
+  frontier — released by the recipient's durable typed route after the consent
+  gate and a directory-durable install. A legacy v1 send and a failed send both
+  reschedule; neither is completion.
+- **`DmSendConfig::logical_request_id`.** An optional caller-supplied stable DM
+  request id; `None` (the default, and every existing caller) still draws a
+  fresh random one. The bootstrap outbox sets it to the head of its obligation's
+  binding digest, so obligation key and wire request id are one identity: a
+  retry after a sender restart is the *same* logical request, which is what lets
+  the recipient re-ACK instead of re-delivering and lets an ACK be matched back
+  to the obligation it discharges.
 - **Typed-route durable completion signal (ADR 0030 §7, slice 3).** Slice 2
   withheld every v2 ACK on a typed route because typed-prefix families
   classify `Ephemeral` and cannot be backed by a DM-history commit. A handler
