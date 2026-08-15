@@ -15,6 +15,17 @@ All notable changes to this project will be documented in this file.
   lock, unpublishable replay completion — withholds the ACK rather than
   degrading it. `Accepted` under v2 now means what ADR 0030 §1 says it
   means: verified, durably committed, and dispatched.
+- **`DmAckOutcome::AckSemanticsUnavailable { reason }`** (ADR 0030 §2). The
+  receiver's answer when it cannot issue the durable receipt a request asked
+  for — the logical request already completed under weaker semantics, or is
+  already bound to different content. It maps to
+  `DmError::AckSemanticsUnavailable`, the same typed error the send-side
+  capability gate raises, rather than `RecipientRejected`: nothing about the
+  trust relationship failed, so callers surface "retry / peer needs upgrade",
+  not "peer blocked you". Appended last in the enum, so postcard variant
+  indices for `Accepted` and `RejectedByPolicy` are unchanged and 0.37 peers
+  keep decoding them; a v1-only sender can never be sent the new variant,
+  because it never asks for semantics above v1.
 - **History schema v4 columns gain writers.** Inbound DM rows populate
   `ingress_sender_agent` and `logical_request_id`; together they key the
   durable-history lookup that lets a restarted receiver recognise a logical

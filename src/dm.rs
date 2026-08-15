@@ -269,6 +269,20 @@ pub enum DmAckOutcome {
     /// that prefer silent rejection can set `trust.silent_reject = true`
     /// and skip emitting this ACK entirely.
     RejectedByPolicy { reason: String },
+    /// The recipient cannot issue the durable receipt this request asked for:
+    /// the logical request already completed under weaker semantics, or is
+    /// already bound to different content (ADR 0030 §2). Distinct from
+    /// [`Self::RejectedByPolicy`] — nothing about the trust relationship
+    /// failed, so the caller should surface "retry / peer needs upgrade"
+    /// rather than "peer rejected you".
+    ///
+    /// **Wire compatibility:** appended last, so postcard's variant indices
+    /// for `Accepted` (0) and `RejectedByPolicy` (1) are unchanged and an
+    /// 0.37 peer still decodes those. A 0.37 peer can never *receive* this
+    /// variant: it is only produced when the request being answered asked for
+    /// semantics above what completed, and a v1-only sender never asks for
+    /// more than v1 (see `cached_ack_for_protocol`).
+    AckSemanticsUnavailable { reason: String },
 }
 
 // ─── Origin-machine attestation (issue #213) ──────────────────────────────

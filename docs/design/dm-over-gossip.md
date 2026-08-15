@@ -235,7 +235,14 @@ order, per ADR 0030 §1:
    under *its own* semantics, never re-dispatched. The binding is a
    domain-separated digest over `(protocol_version, accepted bytes)`, so the
    same request id carrying different content is refused rather than
-   re-ACKed as the original delivery.
+   re-ACKed as the original delivery. Both refusals — "already completed
+   under v1 semantics" and "already bound to different content" — are
+   answered `DmAckOutcome::AckSemanticsUnavailable`, never
+   `RejectedByPolicy`: no trust decision failed, and the sender maps the
+   latter to `RecipientRejected`, which would misreport a protocol condition
+   as a blocked peer. On the sender it becomes
+   `DmError::AckSemanticsUnavailable` — the same typed error the send-side
+   capability gate raises.
 3. **Durable-history lookup** — keyed on the schema v4 columns
    `(ingress_sender_agent, logical_request_id)` via
    `Store::find_by_logical_request`. This is the check that survives restart,

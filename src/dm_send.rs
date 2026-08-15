@@ -493,6 +493,14 @@ fn ack_outcome_to_receipt(
             path: DmPath::GossipInbox,
         }),
         DmAckOutcome::RejectedByPolicy { reason } => Err(DmError::RecipientRejected { reason }),
+        // ADR 0030 §2: the recipient refused to issue the durable receipt,
+        // but nothing about the trust relationship failed. Surfacing this as
+        // `RecipientRejected` would tell a product UI "peer blocked you" when
+        // the actionable truth is "you cannot have a durable receipt for this
+        // logical request" — the same condition the send-side gate reports.
+        DmAckOutcome::AckSemanticsUnavailable { reason } => {
+            Err(DmError::AckSemanticsUnavailable(reason))
+        }
     }
 }
 

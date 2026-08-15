@@ -355,7 +355,7 @@ fn cached_ack_for_protocol(
     if cached.protocol_version >= requested_protocol {
         cached.outcome.clone()
     } else {
-        DmAckOutcome::RejectedByPolicy {
+        DmAckOutcome::AckSemanticsUnavailable {
             reason: format!(
                 "logical request already completed under v{} semantics",
                 cached.protocol_version
@@ -1007,7 +1007,7 @@ impl InboxPipeline {
                 Some(stored) if stored == binding => {
                     cached_ack_for_protocol(&cached, envelope.protocol_version)
                 }
-                Some(_) => DmAckOutcome::RejectedByPolicy {
+                Some(_) => DmAckOutcome::AckSemanticsUnavailable {
                     reason: "logical request already completed with different content".to_string(),
                 },
                 None => cached_ack_for_protocol(&cached, envelope.protocol_version),
@@ -1078,7 +1078,7 @@ impl InboxPipeline {
                     .publish_ack_for_protocol(
                         sender_agent_id,
                         request_id,
-                        DmAckOutcome::RejectedByPolicy {
+                        DmAckOutcome::AckSemanticsUnavailable {
                             reason: "logical request already committed with different content"
                                 .to_string(),
                         },
@@ -1970,14 +1970,76 @@ mod tests {
             durable_binding: None,
             first_seen: std::time::Instant::now(),
         };
+        // ADR 0030 §2 names this outcome explicitly. It must NOT be
+        // `RejectedByPolicy`: nothing about the trust relationship failed,
+        // and the sender maps that variant to `RecipientRejected`, which
+        // would tell a product UI "peer blocked you" instead of "you cannot
+        // have a durable receipt for this request".
         assert!(matches!(
             cached_ack_for_protocol(&cached, DM_PROTOCOL_DURABLE_ACK),
-            DmAckOutcome::RejectedByPolicy { .. }
+            DmAckOutcome::AckSemanticsUnavailable { .. }
         ));
         assert!(matches!(
             cached_ack_for_protocol(&cached, DM_PROTOCOL_V1),
             DmAckOutcome::Accepted
         ));
+    }
+
+    /// Wire safety for the appended `AckSemanticsUnavailable` variant: a
+    /// v1-only 0.37 peer can never be sent it, because it asks for at most v1
+    /// and any cached completion is at least v1. If this ever regresses, an
+    /// 0.37 receiver would fail to postcard-decode the ACK and the send would
+    /// degrade to a timeout.
+    #[test]
+    fn a_v1_request_is_never_answered_with_the_new_ack_variant() {
+        for cached_version in [DM_PROTOCOL_V1, DM_PROTOCOL_DURABLE_ACK] {
+            for outcome in [
+                DmAckOutcome::Accepted,
+                DmAckOutcome::RejectedByPolicy {
+                    reason: "blocked".to_string(),
+                },
+            ] {
+                let cached = crate::dm::CachedOutcome {
+                    outcome,
+                    protocol_version: cached_version,
+                    durable_binding: None,
+                    first_seen: std::time::Instant::now(),
+                };
+                assert!(
+                    !matches!(
+                        cached_ack_for_protocol(&cached, DM_PROTOCOL_V1),
+                        DmAckOutcome::AckSemanticsUnavailable { .. }
+                    ),
+                    "a v1 request must never be answered with a variant 0.37 cannot decode"
+                );
+            }
+        }
+    }
+
+    /// The two pre-existing variants must keep their postcard discriminants,
+    /// or every 0.37 peer stops decoding our ACKs.
+    #[test]
+    fn appending_the_new_ack_variant_preserves_legacy_discriminants() {
+        let accepted = postcard::to_stdvec(&DmAckOutcome::Accepted).expect("encode accepted");
+        assert_eq!(accepted.first(), Some(&0u8), "Accepted must stay variant 0");
+        let rejected = postcard::to_stdvec(&DmAckOutcome::RejectedByPolicy {
+            reason: String::new(),
+        })
+        .expect("encode rejected");
+        assert_eq!(
+            rejected.first(),
+            Some(&1u8),
+            "RejectedByPolicy must stay variant 1"
+        );
+        let unavailable = postcard::to_stdvec(&DmAckOutcome::AckSemanticsUnavailable {
+            reason: String::new(),
+        })
+        .expect("encode unavailable");
+        assert_eq!(
+            unavailable.first(),
+            Some(&2u8),
+            "AckSemanticsUnavailable must be appended last"
+        );
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {
