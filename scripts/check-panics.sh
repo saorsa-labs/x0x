@@ -70,7 +70,13 @@ scan_pattern() {
         # Found in production code
         echo "  $match"
         found_in_prod=1
-    done < <(grep -rn "$pattern" $paths 2>/dev/null || true)
+    # -a (treat binary as text) is defence in depth. GNU/BSD grep decide
+    # binary-or-not from an early read buffer, so a NUL near the top of a file
+    # would make the whole file emit no file:line matches and drop silently out
+    # of this scan. The NUL tripwire above is the primary guard; -a means the
+    # scan itself stays correct regardless of where such a byte lands or which
+    # grep implementation runs it.
+    done < <(grep -arn "$pattern" $paths 2>/dev/null || true)
 
     if [ $found_in_prod -eq 1 ]; then
         echo -e "${RED}✗ FOUND: $description in production code${NC}"
@@ -80,6 +86,46 @@ scan_pattern() {
     fi
     echo ""
 }
+
+# Tripwire: fail if any .rs file contains a raw NUL byte.
+#
+# A NUL in a source file makes text tools classify it as binary and skip it
+# silently. Which tools, and from where in the file, varies: ripgrep and ugrep
+# bail on the first NUL wherever it sits, while GNU/BSD grep decide from an
+# early read buffer and will happily scan past a NUL that lands late. So a
+# late NUL can leave this gate working while breaking every rg-based code
+# search — a split that is worse than a clean failure, because the gate looks
+# healthy.
+#
+# Testing for the defect itself (a NUL byte) rather than for "some grep thinks
+# this is binary" makes the check deterministic and independent of which tool
+# and which implementation happens to run. src/dm_inbox.rs carried four raw
+# NULs in byte-string literals where \x00 escapes were meant; this is what
+# would have caught them.
+check_no_nul_bytes() {
+    echo "Checking for: raw NUL bytes in .rs sources"
+    local binary_found=0
+    while IFS= read -r f; do
+        [ -s "$f" ] || continue
+        # Strip NULs and compare: identical means the file had none.
+        if ! LC_ALL=C tr -d '\000' < "$f" | cmp -s - "$f"; then
+            echo "  $f contains raw NUL byte(s)"
+            binary_found=1
+        fi
+    done < <(find src/ x0x/ -name '*.rs' -type f 2>/dev/null)
+
+    if [ $binary_found -eq 1 ]; then
+        echo -e "${RED}✗ FOUND: raw NUL bytes in .rs sources — text tools"
+        echo -e "  classify these files as binary and skip them silently.${NC}"
+        echo -e "  Write the byte escaped instead (\\\\x00, not a literal NUL)."
+        FOUND_ISSUES=$((FOUND_ISSUES + 1))
+    else
+        echo -e "${GREEN}✓ PASS: No raw NUL bytes in .rs sources${NC}"
+    fi
+    echo ""
+}
+
+check_no_nul_bytes
 
 # Scan for problematic patterns
 scan_pattern "\.unwrap()" ".unwrap() calls"

@@ -2846,9 +2846,9 @@ mod tests {
     #[test]
     fn dm_inbox_config_with_route_adds_entry() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
-        let config = DmInboxConfig::default().with_typed_payload_route(b"x0x-exec-v1 ", tx);
+        let config = DmInboxConfig::default().with_typed_payload_route(b"x0x-exec-v1\x00", tx);
         assert_eq!(config.typed_payload_routes.len(), 1);
-        assert_eq!(config.typed_payload_routes[0].prefix, b"x0x-exec-v1 ");
+        assert_eq!(config.typed_payload_routes[0].prefix, b"x0x-exec-v1\x00");
     }
 
     #[test]
@@ -2856,8 +2856,8 @@ mod tests {
         let (tx1, _rx1) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
         let (tx2, _rx2) = tokio::sync::mpsc::channel::<DmTypedPayload>(8);
         let config = DmInboxConfig::default()
-            .with_typed_payload_route(b"prefix-a ", tx1)
-            .with_typed_payload_route(b"prefix-b ", tx2);
+            .with_typed_payload_route(b"prefix-a\x00", tx1)
+            .with_typed_payload_route(b"prefix-b\x00", tx2);
         assert_eq!(config.typed_payload_routes.len(), 2);
     }
 
