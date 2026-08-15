@@ -475,6 +475,11 @@ pub enum HistoryError {
     #[error("history writer is shut down")]
     WriterClosed,
 
+    /// The bounded history writer queue is full. Callers that require a
+    /// commit receipt must retry instead of silently shedding the record.
+    #[error("history writer is backpressured")]
+    WriterBackpressured,
+
     /// Filesystem error touching the database path.
     #[error("history io error: {0}")]
     Io(#[from] std::io::Error),

@@ -7856,16 +7856,18 @@ impl Agent {
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
         //
-        // ADR 0030 §3 targets: advertise v2 iff durable history is enabled.
-        // HELD AT v1 FOR NOW (PR #327 review): this binary carries the
-        // sender-side gate (slice 1) but NOT the receiver durable path
-        // (slice 2), so a v2 advert would be a false capability — a strict
-        // sender clears its gate, this receiver ACKs with v1 semantics, the
-        // exact-protocol waiter never matches, and the send hangs to timeout:
-        // exactly the failure mode ADR 0030 §2 forbids. Flip to
-        // `v2_durable_gossip_ready(...)` iff `history_handle.is_some()` in
-        // the same change that lands the slice-2 receiver path.
-        let upgraded = dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone());
+        // ADR 0030 §3: advertise v2 iff durable history is enabled. The
+        // receiver durable path (slice 2) is what makes that claim true — it
+        // only emits a v2 ACK after `record_committed` returns, and withholds
+        // the ACK entirely when history is unavailable. Without a history
+        // handle there is nothing to commit to, so the honest advert is v1:
+        // a strict sender then gets a typed 409 rather than clearing its gate
+        // and hanging on a waiter this daemon can never satisfy.
+        let upgraded = if self.history_handle.is_some() {
+            dm::DmCapabilities::v2_durable_gossip_ready(kem_keypair.public_bytes.clone())
+        } else {
+            dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone())
+        };
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on
@@ -17552,6 +17554,58 @@ fn sort_discovered_machine_sorts_fields() {
     assert_eq!(machine.agent_ids[1], identity::AgentId([2u8; 32]));
     assert_eq!(machine.user_ids[0], identity::UserId([1u8; 32]));
     assert_eq!(machine.user_ids[1], identity::UserId([2u8; 32]));
+}
+
+/// ADR 0030 §3: the advertised ceiling is a promise about this receiver, so
+/// it must track the thing that makes the promise true. Durable history on ⇒
+/// advertise 2 (the receiver durable path can commit before it ACKs);
+/// history off ⇒ advertise 1, so a strict sender gets a typed 409 instead of
+/// clearing its gate and hanging on a v2 waiter nothing will ever satisfy.
+#[tokio::test]
+async fn dm_capability_advert_tracks_durable_history_presence() {
+    async fn advertised_ceiling(with_history: bool) -> u16 {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mut builder = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_peer_cache_dir(dir.path().join("peers"))
+            .with_network_config(network::NetworkConfig::default());
+        if with_history {
+            builder = builder.with_history(history::HistoryConfig {
+                db_path: Some(dir.path().join("history.db")),
+                ..history::HistoryConfig::daemon_default()
+            });
+        }
+        let agent = builder.build().await.expect("agent");
+        assert_eq!(
+            agent.history_handle.is_some(),
+            with_history,
+            "test setup: history handle presence must match the requested mode"
+        );
+
+        let kem = std::sync::Arc::new(
+            groups::kem_envelope::AgentKemKeypair::generate().expect("kem keypair"),
+        );
+        agent
+            .start_dm_inbox(kem, dm_inbox::DmInboxConfig::default())
+            .await
+            .expect("start dm inbox");
+        let caps = agent.dm_capabilities_tx.subscribe().borrow().clone();
+        agent.stop_dm_inbox().await;
+        assert!(caps.gossip_inbox, "inbox must be advertised in both modes");
+        caps.max_protocol_version
+    }
+
+    assert_eq!(
+        advertised_ceiling(true).await,
+        dm::DM_PROTOCOL_DURABLE_ACK,
+        "durable history enabled must advertise the v2 ceiling"
+    );
+    assert_eq!(
+        advertised_ceiling(false).await,
+        dm::DM_PROTOCOL_V1,
+        "without durable history the advert must stay at v1"
+    );
 }
 
 #[tokio::test]

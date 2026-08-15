@@ -262,6 +262,34 @@ impl Store {
         Ok(collect_rows(&guard, sql, params)?.into_iter().next())
     }
 
+    /// Look up the durable rows a logical request has already committed.
+    ///
+    /// Keyed on the schema v4 columns the DM inbox writes
+    /// (`ingress_sender_agent`, `logical_request_id`), so the receiver durable
+    /// path can answer "did this logical request already commit, and with
+    /// which bytes?" without scanning and decoding an entire DM scope
+    /// (ADR 0030 §1). Ordinarily at most one row matches; the query returns
+    /// all of them so a caller can detect a binding conflict rather than
+    /// silently trusting the newest.
+    pub fn find_by_logical_request(
+        &self,
+        ingress_sender_agent: &str,
+        logical_request_id: [u8; 16],
+    ) -> HistoryResult<Vec<StoredRecord>> {
+        let sql = "SELECT id, msg_id, scope_kind, scope_id, author_agent, author_machine, \
+             author_pubkey, sent_at_ms, seen_at_ms, direction, content_type, payload, \
+             signed_artifact, signature, sig_context, provenance, replace_key, \
+             thread_root, thread_parent, ingress_sender_agent, logical_request_id \
+             FROM history WHERE ingress_sender_agent = ?1 AND logical_request_id = ?2 \
+             ORDER BY id ASC";
+        let params = vec![
+            rusqlite::types::Value::from(ingress_sender_agent.to_string()),
+            rusqlite::types::Value::from(logical_request_id.to_vec()),
+        ];
+        let guard = lock_conn(&self.conn)?;
+        collect_rows(&guard, sql, params)
+    }
+
     /// Full-text search over searchable payload text. Tokens are quoted so
     /// user input is literal terms, never FTS operators (donor
     /// `fts_match_expr`).

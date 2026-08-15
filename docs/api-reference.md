@@ -382,11 +382,16 @@ Notable codes:
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
 | 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. |
 
-**Note (as of ADR 0030 slice 1):** no REST field selects durable ACK
+**Note (as of ADR 0030 slice 2):** no REST field selects durable ACK
 semantics yet, so `recipient_ack_semantics_unavailable` is currently
 reachable only through the library (`DmSendConfig::require_durable_app_ack`).
 The product-tier default flips in ADR 0030 slice 4, at which point this
 becomes a routine response for not-yet-upgraded peers.
+
+Slice 2 landed the receiver durable path, so a library-level strict send now
+*succeeds* against a peer that advertises v2 — which it does only when that
+peer runs with durable history enabled. REST request and response shapes are
+unchanged by this slice.
 
 ### `/direct/events` SSE message shape
 

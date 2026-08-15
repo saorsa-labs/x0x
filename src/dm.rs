@@ -818,13 +818,58 @@ struct RecentDeliveryCacheInner {
     entries: HashMap<DedupeKey, CachedOutcome>,
     ttl: Duration,
     max_size: usize,
+    /// Per-logical-message serialization used by v2 so concurrent primary
+    /// inbox and legacy-bus copies cannot observe a provisional success.
+    delivery_locks: HashMap<DedupeKey, Arc<tokio::sync::Mutex<()>>>,
+    delivery_lock_order: VecDeque<DedupeKey>,
+}
+
+/// Exact authenticated application binding for one completed durable request.
+///
+/// Sender and request id are carried by [`DedupeKey`]; the recipient is scoped
+/// by the per-inbox cache. This digest binds every remaining application-level
+/// input which must be identical before a durable completion may be replayed,
+/// so a replay carrying the same `(sender, request_id)` but different accepted
+/// bytes is detected instead of being re-ACKed as the original.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmDurableBindingDigest([u8; 32]);
+
+impl DmDurableBindingDigest {
+    /// Bind the negotiated protocol and the exact decrypted application bytes
+    /// into one domain-separated digest.
+    #[must_use]
+    pub fn accepted(protocol_version: u16, application_payload: &[u8]) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x-dm-durable-accepted-binding-v1");
+        hasher.update(&protocol_version.to_be_bytes());
+        let payload_len = u64::try_from(application_payload.len()).unwrap_or(u64::MAX);
+        hasher.update(&payload_len.to_be_bytes());
+        hasher.update(application_payload);
+        Self(*hasher.finalize().as_bytes())
+    }
 }
 
 /// A cached per-DM outcome.
 #[derive(Debug, Clone)]
 pub struct CachedOutcome {
     pub outcome: DmAckOutcome,
+    /// Semantics under which the outcome completed. This is metadata, not
+    /// part of the logical dedupe key: changing protocol versions must never
+    /// make one request dispatch twice.
+    pub protocol_version: u16,
+    /// Exact accepted application binding for durable completions. Legacy and
+    /// policy-rejection entries do not have one.
+    pub durable_binding: Option<DmDurableBindingDigest>,
     pub first_seen: Instant,
+}
+
+/// Failure to durably publish a completed v2 outcome into the replay cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DurableCacheError {
+    /// The cache mutex was poisoned; callers must withhold the ACK.
+    Poisoned,
+    /// A completion already exists for this logical request.
+    AlreadyCompleted,
 }
 
 impl RecentDeliveryCache {
@@ -858,6 +903,8 @@ impl RecentDeliveryCache {
                 entries: HashMap::new(),
                 ttl,
                 max_size,
+                delivery_locks: HashMap::new(),
+                delivery_lock_order: VecDeque::new(),
             }),
         }
     }
@@ -894,6 +941,16 @@ impl RecentDeliveryCache {
     /// (proceed) so a poisoned cache degrades to possible double-delivery
     /// rather than silent message loss.
     pub fn insert(&self, key: DedupeKey, outcome: DmAckOutcome) -> bool {
+        self.insert_for_protocol(key, outcome, DM_PROTOCOL_V1)
+    }
+
+    /// Insert an outcome and record which protocol semantics produced it.
+    pub fn insert_for_protocol(
+        &self,
+        key: DedupeKey,
+        outcome: DmAckOutcome,
+        protocol_version: u16,
+    ) -> bool {
         let Ok(mut inner) = self.inner.lock() else {
             return true;
         };
@@ -904,6 +961,8 @@ impl RecentDeliveryCache {
             key,
             CachedOutcome {
                 outcome,
+                protocol_version,
+                durable_binding: None,
                 first_seen: Instant::now(),
             },
         );
@@ -917,6 +976,77 @@ impl RecentDeliveryCache {
             inner.entries.remove(&oldest);
         }
         true
+    }
+
+    /// Publish a completed durable delivery into the replay cache.
+    ///
+    /// Unlike the legacy insertion path, mutex poisoning and a competing
+    /// completion are explicit failures. The receiver must withhold its ACK
+    /// unless this succeeds, so it can never acknowledge a completion that
+    /// was not made replay-safe.
+    pub fn complete_durable(
+        &self,
+        key: DedupeKey,
+        outcome: DmAckOutcome,
+        protocol_version: u16,
+        durable_binding: DmDurableBindingDigest,
+    ) -> std::result::Result<(), DurableCacheError> {
+        let mut inner = self.inner.lock().map_err(|_| DurableCacheError::Poisoned)?;
+        if inner.entries.contains_key(&key) {
+            return Err(DurableCacheError::AlreadyCompleted);
+        }
+        inner.entries.insert(
+            key,
+            CachedOutcome {
+                outcome,
+                protocol_version,
+                durable_binding: Some(durable_binding),
+                first_seen: Instant::now(),
+            },
+        );
+        inner.order.push_back(key);
+        while inner.entries.len() > inner.max_size {
+            let Some(oldest) = inner.order.pop_front() else {
+                break;
+            };
+            inner.entries.remove(&oldest);
+        }
+        Ok(())
+    }
+
+    /// Return the shared per-logical-request lock used by the durable v2
+    /// pipeline (ADR 0030 §1, first ordering step). Locks are bounded by the
+    /// same capacity as cached outcomes.
+    ///
+    /// Returns `None` when every slot has a live owner or waiter: the caller
+    /// must then withhold its ACK rather than proceed unserialized, because
+    /// evicting an in-flight lock would permit duplicate durable dispatch.
+    pub fn delivery_lock(&self, key: DedupeKey) -> Option<Arc<tokio::sync::Mutex<()>>> {
+        let Ok(mut inner) = self.inner.lock() else {
+            return None;
+        };
+        if let Some(lock) = inner.delivery_locks.get(&key) {
+            return Some(Arc::clone(lock));
+        }
+        while inner.delivery_locks.len() >= inner.max_size {
+            let removable = inner.delivery_lock_order.iter().position(|candidate| {
+                inner
+                    .delivery_locks
+                    .get(candidate)
+                    .is_some_and(|lock| Arc::strong_count(lock) == 1)
+            });
+            // `None` here means every slot has a live owner or waiter. Fail
+            // closed: evicting an in-flight lock would let a second copy of
+            // the same envelope dispatch concurrently.
+            let position = removable?;
+            if let Some(oldest_idle) = inner.delivery_lock_order.remove(position) {
+                inner.delivery_locks.remove(&oldest_idle);
+            }
+        }
+        let lock = Arc::new(tokio::sync::Mutex::new(()));
+        inner.delivery_locks.insert(key, Arc::clone(&lock));
+        inner.delivery_lock_order.push_back(key);
+        Some(lock)
     }
 
     /// Current cache size (diagnostic).
