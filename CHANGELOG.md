@@ -6,6 +6,19 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **Hedged bounded background publisher for durable v2 ACKs (#335).** A
+  durable ACK used to be published inline from the inbox loop: the targeted
+  topic was awaited first, and a wedged targeted publish consumed the
+  sender's whole ACK budget before the compatibility bus was even attempted —
+  observable as sends that were committed on the receiver yet timed out on
+  the sender. The v2 ACK now goes to a bounded background worker (queue 256,
+  32 concurrent, one 22 s deadline per route) that publishes the targeted
+  topic and the compatibility bus concurrently. The history commit is still
+  awaited before the ACK is scheduled; a saturated queue is reported
+  (`RemoteReceiveBackpressured`) rather than blocking the inbox loop, and
+  route errors or timeouts increment the new `ack_publish_route_failed`
+  diagnostic counter. The v1 ACK path is byte-for-byte unchanged.
+
 - **Durable signed-public bootstrap outbox (ADR 0030 §5, slice 3b).** Adding a
   member to a SignedPublic group used to direct-send the roster snapshot
   fire-and-forget: an offline recipient never received it and nothing on the

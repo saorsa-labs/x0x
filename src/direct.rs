@@ -565,7 +565,8 @@ pub struct DmDiagnosticsStats {
     pub incoming_typed_route_dropped: u64,
     /// ACK publish operations where at least one required route returned an
     /// explicit error or exceeded its deadline. Zero-fanout `Ok` results are
-    /// not counted here. Non-zero means some sender waited out its ACK budget.
+    /// not counted here. The hedged sibling route may still have delivered
+    /// the ACK, so this reads as route health, not senders left waiting.
     #[serde(default)]
     pub ack_publish_route_failed: u64,
     pub incoming_delivered_to_subscribe: u64,
@@ -979,10 +980,10 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record an ACK publication whose route returned an explicit error or
-    /// timed out. The durable path publishes in a bounded background worker,
-    /// so this counter is the only externally visible signal that an ACK the
-    /// receiver committed for never reached the sender.
+    /// Record an ACK publication in which a route returned an explicit error
+    /// or timed out. The durable path publishes in a bounded background
+    /// worker, so this counter is the externally visible signal of ACK route
+    /// trouble — the hedged sibling route may still have delivered the ACK.
     pub(crate) fn record_ack_publish_route_failed(&self) {
         self.diagnostics
             .ack_publish_route_failed

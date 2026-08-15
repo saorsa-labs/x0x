@@ -2663,6 +2663,46 @@ mod tests {
         );
     }
 
+    /// The other half of the hedge contract: a durable v2 ACK reaches the
+    /// compatibility bus even when the payload itself never arrived there
+    /// (`ack_legacy_bus = false`). The bus route is what rescues a sender
+    /// whose targeted-topic delivery is wedged — the "committed but never
+    /// acked" 504 — so if v2 ever stops hedging onto the bus, the failure
+    /// this worker exists to remove comes back silently.
+    #[tokio::test]
+    async fn a_v2_ack_is_always_hedged_onto_the_compatibility_bus() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD9; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let mut bus = harness
+            .pipeline
+            .pubsub
+            .subscribe(DM_BUS_TOPIC.to_string())
+            .await;
+
+        harness
+            .pipeline
+            .publish_ack_for_protocol(
+                sender.agent_id(),
+                [0x60; 16],
+                DmAckOutcome::Accepted,
+                DM_PROTOCOL_DURABLE_ACK,
+                false,
+            )
+            .await
+            .expect("v2 ACK schedules in the background publisher");
+
+        let message = tokio::time::timeout(Duration::from_secs(5), bus.recv())
+            .await
+            .expect("a v2 ACK must reach the shared bus even with ack_legacy_bus=false")
+            .expect("bus subscription stays open");
+        let envelope = DmEnvelope::from_wire_bytes(&message.payload)
+            .expect("bus payload decodes as a DM envelope");
+        assert_eq!(envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
+        assert_eq!(envelope.recipient_agent_id, *sender.agent_id().as_bytes());
+    }
+
     /// The two pre-existing variants must keep their postcard discriminants,
     /// or every 0.37 peer stops decoding our ACKs.
     #[test]
