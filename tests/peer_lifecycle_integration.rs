@@ -241,6 +241,45 @@ async fn wait_for_peer(fixture: &DaemonFixture, peer_machine: &str, deadline: Du
     );
 }
 
+/// Wait until this daemon holds a peer's signed v2 capability advert.
+///
+/// Since ADR 0030 slice 4 a bare `POST /direct/send` is a *durable* send, so
+/// it refuses with 409 `recipient_ack_semantics_unavailable` until the
+/// recipient's advert has converged into the sender's capability store. Tests
+/// that are about something else — the `require_ack` probe block, the response
+/// shape — must not race that convergence, or they fail intermittently for a
+/// reason unrelated to what they assert.
+///
+/// `capability_store_entries` is the available signal: in a two-daemon fixture
+/// the only advert this daemon can hold is its counterpart's, and the fixture
+/// leaves `[history]` at the daemon default (enabled), so that peer advertises
+/// the v2 ceiling. A non-zero count therefore means exactly "we hold the other
+/// side's v2 advert".
+///
+/// Deliberately a wait, not a longer timeout and not an opt-out: the strict
+/// path is what these tests should exercise, since it is now the product
+/// default.
+async fn wait_for_durable_capability(fixture: &DaemonFixture, deadline: Duration) -> usize {
+    let client = fixture.authed_client(Duration::from_secs(5));
+    let started = tokio::time::Instant::now();
+    let mut polls = 0usize;
+    while started.elapsed() < deadline {
+        polls += 1;
+        if let Ok(resp) = client.get(fixture.url("/diagnostics/dm")).send().await {
+            if let Ok(body) = resp.json::<Value>().await {
+                if body["capability_store_entries"].as_u64().unwrap_or(0) > 0 {
+                    return polls;
+                }
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    panic!(
+        "no peer capability advert converged within {deadline:?} ({polls} polls); \
+         a durable /direct/send would 409"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // /peers/:peer_id/probe — active liveness with finite RTT
 // ---------------------------------------------------------------------------
@@ -480,6 +519,10 @@ async fn direct_send_with_require_ack_round_trips_to_live_peer() {
         v["agent_id"].as_str().unwrap().to_string()
     };
 
+    // A bare /direct/send is durable since ADR 0030 slice 4; wait for Bob's v2
+    // advert so this test fails only on the probe behaviour it is about.
+    wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
+
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-ack-test");
     let alice_client = alice.authed_client(Duration::from_secs(10));
     let r = alice_client
@@ -523,6 +566,9 @@ async fn direct_send_without_require_ack_omits_ack_block() {
         let v: Value = r.json().await.unwrap();
         v["agent_id"].as_str().unwrap().to_string()
     };
+
+    // Same durable-send convergence wait as the sibling test above.
+    wait_for_durable_capability(&alice, Duration::from_secs(30)).await;
 
     let payload = base64::engine::general_purpose::STANDARD.encode(b"plc-no-ack-test");
     let alice_client = alice.authed_client(Duration::from_secs(10));

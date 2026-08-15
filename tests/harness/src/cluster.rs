@@ -204,6 +204,45 @@ impl AgentInstance {
             .expect("GET request failed")
     }
 
+    /// Wait until this daemon holds a peer's signed v2 capability advert.
+    ///
+    /// Since ADR 0030 slice 4 a bare `POST /direct/send` is a *durable* send:
+    /// it refuses with 409 `recipient_ack_semantics_unavailable` until the
+    /// recipient's advert has converged into this daemon's capability store.
+    /// A test whose subject is something else — history persistence, response
+    /// shape — must not race that convergence, or it fails intermittently for
+    /// a reason unrelated to what it asserts.
+    ///
+    /// `capability_store_entries` is the available signal: in a two-daemon
+    /// fixture the only advert this daemon can hold is its counterpart's, and
+    /// the harness leaves `[history]` at the daemon default (enabled), so that
+    /// peer advertises the v2 ceiling. A non-zero count therefore means
+    /// exactly "we hold the other side's v2 advert".
+    ///
+    /// # Panics
+    ///
+    /// Panics if no advert converges within `deadline` — a durable send would
+    /// 409, so failing here names the real cause instead of surfacing it as a
+    /// confusing assertion on the send's status code.
+    pub async fn wait_for_durable_capability(&self, deadline: std::time::Duration) {
+        let started = std::time::Instant::now();
+        let mut polls = 0_usize;
+        while started.elapsed() < deadline {
+            polls += 1;
+            let resp = self.get("/diagnostics/dm").await;
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if body["capability_store_entries"].as_u64().unwrap_or(0) > 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        panic!(
+            "no peer capability advert converged within {deadline:?} ({polls} polls); \
+             a durable /direct/send would 409"
+        );
+    }
+
     /// Authenticated POST request with JSON body.
     pub async fn post(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
         reqwest::Client::new()
