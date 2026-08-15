@@ -7,7 +7,7 @@ use crate::direct::DirectMessaging;
 use crate::dm::{
     decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
     DmEnvelope, DmOriginAttestation, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache,
-    DM_PROTOCOL_V1, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
+    DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
@@ -342,6 +342,144 @@ struct InboxPipeline {
     history: Option<crate::history::HistoryHandle>,
 }
 
+/// Re-ACK semantics for a logical request that already completed.
+///
+/// ADR 0030 §2: a request completed under weaker semantics is answered
+/// `AckSemanticsUnavailable`, never re-ACKed as durable — otherwise a v2
+/// sender racing a v1 delivery of the same request would be handed a durable
+/// receipt nobody made.
+fn cached_ack_for_protocol(
+    cached: &crate::dm::CachedOutcome,
+    requested_protocol: u16,
+) -> DmAckOutcome {
+    if cached.protocol_version >= requested_protocol {
+        cached.outcome.clone()
+    } else {
+        DmAckOutcome::RejectedByPolicy {
+            reason: format!(
+                "logical request already completed under v{} semantics",
+                cached.protocol_version
+            ),
+        }
+    }
+}
+
+/// A commit outcome that proves exactly one durable row exists for this
+/// record. `Inserted` is the first commit; `Duplicate` is the idempotent
+/// replay of an identical record (ADR 0030 validation: "exactly one durable
+/// history row (`Duplicate` re-ACK)"). Anything else means the row we
+/// promised is not the row that is there, so the ACK must be withheld.
+fn exact_durable_history_outcome(outcome: crate::history::InsertOutcome) -> bool {
+    matches!(
+        outcome,
+        crate::history::InsertOutcome::Inserted | crate::history::InsertOutcome::Duplicate
+    )
+}
+
+/// Build the ADR-0023 history row for a verified inbound DM.
+///
+/// `Ok(None)` means the payload classifies `Ephemeral` — protocol plumbing
+/// whose durable effect lives in its own store, never in DM history.
+///
+/// Schema v4 (`ingress_sender_agent`, `logical_request_id`) is populated here:
+/// together they key the ADR 0030 §1 durable-history lookup, which is what
+/// lets a receiver recognise a logical request it has already committed.
+fn inbound_dm_history_record(
+    envelope: &DmEnvelope,
+    application_payload: &[u8],
+    sender_machine_id: MachineId,
+    sender_pubkey: &[u8],
+) -> Result<Option<crate::history::HistoryRecord>, String> {
+    let crate::history::classify::DmPayloadClass::Durable(content_type) =
+        crate::history::classify::classify_dm_payload(application_payload)
+    else {
+        return Ok(None);
+    };
+    let artifact = envelope.to_wire_bytes().map_err(|e| e.to_string())?;
+    Ok(Some(crate::history::HistoryRecord {
+        msg_id: crate::history::HistoryRecord::compute_msg_id(Some(&artifact), application_payload),
+        scope: crate::history::Scope::Dm(hex::encode(envelope.sender_agent_id)),
+        author_agent: Some(hex::encode(envelope.sender_agent_id)),
+        author_machine: Some(hex::encode(sender_machine_id.as_bytes())),
+        author_pubkey: Some(sender_pubkey.to_vec()),
+        sent_at_ms: i64::try_from(envelope.created_at_unix_ms).unwrap_or(i64::MAX),
+        seen_at_ms: i64::try_from(now_unix_ms()).unwrap_or(i64::MAX),
+        direction: crate::history::Direction::Inbound,
+        content_type: content_type.to_string(),
+        payload: application_payload.to_vec(),
+        signed_artifact: Some(artifact),
+        signature: Some(envelope.signature.clone()),
+        // Mirrors `DM_SIGN_DOMAIN` in `dm.rs`.
+        sig_context: Some("x0x-dm-v1".to_string()),
+        provenance: crate::history::Provenance::VerifiedEnvelope,
+        replace_key: None,
+        thread_root: None,
+        thread_parent: None,
+        ingress_sender_agent: Some(hex::encode(envelope.sender_agent_id)),
+        logical_request_id: Some(envelope.request_id),
+    }))
+}
+
+/// What the receiver durable path decided for one v2 envelope.
+///
+/// Returned rather than inferred from side effects so the commit-before-ACK
+/// ordering is directly assertable: "no ACK when the commit fails" is the
+/// central promise of ADR 0030 §1 and must not be tested by proxy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableAckDecision {
+    /// An ACK was emitted with these semantics. `accepted` distinguishes a
+    /// delivery receipt from a refusal; a refusal never claims durability.
+    Acked {
+        protocol_version: u16,
+        accepted: bool,
+    },
+    /// No ACK was emitted — the sender times out. The stage names why.
+    Withheld(&'static str),
+}
+
+/// Result of the ADR 0030 §1 durable-history lookup for one logical request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DurableLogicalRequestLookup {
+    /// No durable row for this `(sender, request_id)` yet.
+    Missing,
+    /// A durable row exists and binds exactly the bytes now being accepted.
+    Exact,
+    /// A durable row exists under this logical request but binds different
+    /// bytes — the sender reused a request id for different content.
+    Conflict,
+}
+
+/// Durable-history lookup keyed on the schema v4 columns this path writes.
+///
+/// Runs on `spawn_blocking`: `Store` is synchronous SQLite and this is called
+/// from the inbox task.
+async fn durable_history_logical_request(
+    history: &crate::history::HistoryHandle,
+    sender: AgentId,
+    request_id: [u8; 16],
+    accepted_payload: Vec<u8>,
+) -> crate::error::HistoryResult<DurableLogicalRequestLookup> {
+    let store = Arc::clone(history.store());
+    let ingress = hex::encode(sender.as_bytes());
+    tokio::task::spawn_blocking(move || {
+        let rows = store.find_by_logical_request(&ingress, request_id)?;
+        if rows.is_empty() {
+            return Ok(DurableLogicalRequestLookup::Missing);
+        }
+        if rows
+            .iter()
+            .any(|row| row.record.payload != accepted_payload)
+        {
+            return Ok(DurableLogicalRequestLookup::Conflict);
+        }
+        Ok(DurableLogicalRequestLookup::Exact)
+    })
+    .await
+    .map_err(|error| {
+        crate::error::HistoryError::Database(format!("logical request lookup task failed: {error}"))
+    })?
+}
+
 impl InboxPipeline {
     async fn handle_incoming(&self, msg: PubSubMessage, ack_legacy_bus: bool) {
         let (pubsub_sender, sender_pubkey) = match (msg.sender, msg.sender_public_key.as_deref()) {
@@ -415,11 +553,27 @@ impl InboxPipeline {
         let dedupe = envelope.dedupe_key();
         if let Some(cached) = self.cache.lookup(&dedupe) {
             if matches!(envelope.body, DmBody::Payload(_)) {
+                // ADR 0030 §2: re-ACK under the semantics the completion was
+                // actually made with. A v1 completion answers a v2 request
+                // with a refusal, never with a durable-looking receipt.
+                let outcome = cached_ack_for_protocol(&cached, envelope.protocol_version);
+                // Accepted re-ACKs carry the semantics actually honoured;
+                // refusals carry the requested version so they reach the
+                // sender's exact-protocol waiter instead of timing out.
+                let ack_protocol = if matches!(outcome, DmAckOutcome::Accepted) {
+                    cached
+                        .protocol_version
+                        .min(envelope.protocol_version)
+                        .max(DM_PROTOCOL_V1)
+                } else {
+                    envelope.protocol_version
+                };
                 let _ = self
-                    .publish_ack(
+                    .publish_ack_for_protocol(
                         AgentId(envelope.sender_agent_id),
                         envelope.request_id,
-                        cached.outcome,
+                        outcome,
+                        ack_protocol,
                         ack_legacy_bus,
                     )
                     .await;
@@ -616,13 +770,23 @@ impl InboxPipeline {
                 let outcome = DmAckOutcome::RejectedByPolicy {
                     reason: decision.to_string(),
                 };
-                self.cache.insert(envelope.dedupe_key(), outcome.clone());
+                self.cache.insert_for_protocol(
+                    envelope.dedupe_key(),
+                    outcome.clone(),
+                    envelope.protocol_version,
+                );
                 if !self.silent_reject {
+                    // A refusal makes no durability claim, so it is stamped
+                    // with the requested version rather than downgraded to v1:
+                    // a strict v2 sender must learn it was rejected instead of
+                    // waiting out its ACK budget on a receipt it would ignore
+                    // (ADR 0030 drivers — no black hole, bounded latency).
                     let _ = self
-                        .publish_ack(
+                        .publish_ack_for_protocol(
                             sender_agent_id,
                             envelope.request_id,
                             outcome,
+                            envelope.protocol_version,
                             ack_legacy_bus,
                         )
                         .await;
@@ -642,6 +806,25 @@ impl InboxPipeline {
         };
         if plaintext.request_id != envelope.request_id {
             self.dm.record_incoming_decode_failed();
+            return;
+        }
+
+        // ADR 0030 §1/§2: a v2 envelope is answered by the durable path or not
+        // at all. There is no silent v1 downgrade of a v2 request — if durable
+        // history is unavailable the ACK is withheld and the sender times out,
+        // which can only happen against a peer that believed a false v2
+        // capability advert (this daemon advertises v2 iff history is on).
+        if envelope.protocol_version >= DM_PROTOCOL_DURABLE_ACK {
+            let _decision = self
+                .handle_payload_durable(
+                    envelope,
+                    plaintext.payload,
+                    decision,
+                    sender_machine_id,
+                    sender_pubkey,
+                    ack_legacy_bus,
+                )
+                .await;
             return;
         }
 
@@ -684,47 +867,23 @@ impl InboxPipeline {
             // signature/trust/revocation gate has passed. Non-blocking
             // (`HistoryHandle::record` is try_send); plumbing payload
             // families classify Ephemeral and are skipped.
-            if let Some(history) = self.history.as_ref() {
-                if let crate::history::classify::DmPayloadClass::Durable(content_type) =
-                    crate::history::classify::classify_dm_payload(&plaintext.payload)
-                {
-                    match envelope.to_wire_bytes() {
-                        Ok(artifact) => {
-                            let record = crate::history::HistoryRecord {
-                                msg_id: crate::history::HistoryRecord::compute_msg_id(
-                                    Some(&artifact),
-                                    &plaintext.payload,
-                                ),
-                                scope: crate::history::Scope::Dm(hex::encode(
-                                    envelope.sender_agent_id,
-                                )),
-                                author_agent: Some(hex::encode(envelope.sender_agent_id)),
-                                author_machine: Some(hex::encode(sender_machine_id.as_bytes())),
-                                author_pubkey: Some(sender_pubkey.clone()),
-                                sent_at_ms: i64::try_from(envelope.created_at_unix_ms)
-                                    .unwrap_or(i64::MAX),
-                                seen_at_ms: i64::try_from(now_unix_ms()).unwrap_or(i64::MAX),
-                                direction: crate::history::Direction::Inbound,
-                                content_type: content_type.to_string(),
-                                payload: plaintext.payload.clone(),
-                                signed_artifact: Some(artifact),
-                                signature: Some(envelope.signature.clone()),
-                                // Mirrors `DM_SIGN_DOMAIN` in `dm.rs`.
-                                sig_context: Some("x0x-dm-v1".to_string()),
-                                provenance: crate::history::Provenance::VerifiedEnvelope,
-                                replace_key: None,
-                                thread_root: None,
-                                thread_parent: None,
-                                ingress_sender_agent: None,
-                                logical_request_id: None,
-                            };
+            if self.history.is_some() {
+                match inbound_dm_history_record(
+                    &envelope,
+                    &plaintext.payload,
+                    sender_machine_id,
+                    &sender_pubkey,
+                ) {
+                    Ok(Some(record)) => {
+                        if let Some(history) = self.history.as_ref() {
                             history.record(record);
                         }
-                        Err(e) => {
-                            tracing::debug!(
-                                "history: DM envelope wire encode failed, row skipped: {e}"
-                            );
-                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        tracing::debug!(
+                            "history: DM envelope wire encode failed, row skipped: {e}"
+                        );
                     }
                 }
             }
@@ -757,6 +916,275 @@ impl InboxPipeline {
                 ack_legacy_bus,
             )
             .await;
+    }
+
+    /// Receiver durable path for a v2 envelope (ADR 0030 §1).
+    ///
+    /// Ordering is normative and implemented in exactly this order:
+    /// per-logical-request lock → replay-cache binding check →
+    /// durable-history lookup → dispatch → `record_committed` awaited → ACK.
+    ///
+    /// Every failure below withholds the ACK. A withheld ACK costs the sender
+    /// a timeout; a premature ACK costs it a lost message it was told had
+    /// arrived, which is the defect this protocol exists to remove. No branch
+    /// here may fall back to a v1 ACK: that would answer a durable request
+    /// with a weaker receipt the sender cannot distinguish (ADR 0030 §2).
+    async fn handle_payload_durable(
+        &self,
+        envelope: DmEnvelope,
+        application_payload: Vec<u8>,
+        decision: TrustDecision,
+        sender_machine_id: MachineId,
+        sender_pubkey: Vec<u8>,
+        ack_legacy_bus: bool,
+    ) -> DurableAckDecision {
+        let sender_agent_id = AgentId(envelope.sender_agent_id);
+        let request_id = envelope.request_id;
+        let dedupe = envelope.dedupe_key();
+
+        let Some(history) = self.history.clone() else {
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "inbound_durable_history_unavailable",
+                request_id = %hex::encode(request_id),
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+                "v2 DM withheld: durable history is not enabled on this daemon"
+            );
+            return DurableAckDecision::Withheld("history_unavailable");
+        };
+
+        // ADR 0030 §7 — typed-route obligation (documented, not closed here).
+        //
+        // Typed-prefix families (group ingest, KV deltas, exec audit, card
+        // import, voice signalling) classify `Ephemeral`: their durable effect
+        // lives in their own store, not in DM history, so a DM-history commit
+        // could not honestly back their receipt. They are also handed off with
+        // a non-blocking `try_send` that may drop under backpressure, so a
+        // durable ACK here would claim a dispatch that never completed.
+        //
+        // A v2 envelope on a typed route therefore gets NO ACK in this slice,
+        // and the handler carries the restart-spanning dedupe obligation via
+        // its own durable surface (the bootstrap outbox handler satisfies it
+        // with `Inserted | Duplicate` completion). Slice 3 adds the typed-route
+        // completion signal that lets these frames earn a v2 ACK.
+        if self
+            .typed_payload_routes
+            .iter()
+            .any(|route| application_payload.starts_with(&route.prefix))
+        {
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_durable_typed_route_unacked",
+                request_id = %hex::encode(request_id),
+                sender = %hex::encode(sender_agent_id.as_bytes()),
+                "v2 DM matched a typed route; ACK withheld pending typed-route completion (ADR 0030 §7)"
+            );
+            return DurableAckDecision::Withheld("typed_route");
+        }
+
+        // 1. Per-logical-request lock. Serializes the primary inbox and the
+        //    legacy-bus copy of the same envelope so neither can observe a
+        //    provisional success from the other.
+        let Some(lock) = self.cache.delivery_lock(dedupe) else {
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "inbound_durable_lock_unavailable",
+                request_id = %hex::encode(request_id),
+                "v2 DM withheld: no durable delivery lock slot available"
+            );
+            return DurableAckDecision::Withheld("lock_unavailable");
+        };
+        let _guard = lock.lock().await;
+
+        // 2. Replay-cache binding check. A completion already exists ⇒ re-ACK
+        //    it under its own semantics, never re-dispatch.
+        let binding = crate::dm::DmDurableBindingDigest::accepted(
+            envelope.protocol_version,
+            &application_payload,
+        );
+        if let Some(cached) = self.cache.lookup(&dedupe) {
+            let outcome = match cached.durable_binding {
+                Some(stored) if stored == binding => {
+                    cached_ack_for_protocol(&cached, envelope.protocol_version)
+                }
+                Some(_) => DmAckOutcome::RejectedByPolicy {
+                    reason: "logical request already completed with different content".to_string(),
+                },
+                None => cached_ack_for_protocol(&cached, envelope.protocol_version),
+            };
+            let accepted_replay = matches!(outcome, DmAckOutcome::Accepted);
+            // An accepted re-ACK is stamped with the semantics actually
+            // honoured (never above what this request asked for). A refusal
+            // makes no durability claim and is stamped with the requested
+            // version instead, so it reaches the sender's exact-protocol
+            // waiter and is answered rather than waited out.
+            let ack_protocol = if accepted_replay {
+                cached
+                    .protocol_version
+                    .min(envelope.protocol_version)
+                    .max(DM_PROTOCOL_V1)
+            } else {
+                envelope.protocol_version
+            };
+            let _ = self
+                .publish_ack_for_protocol(
+                    sender_agent_id,
+                    request_id,
+                    outcome,
+                    ack_protocol,
+                    ack_legacy_bus,
+                )
+                .await;
+            return DurableAckDecision::Acked {
+                protocol_version: ack_protocol,
+                accepted: accepted_replay,
+            };
+        }
+
+        // 3. Durable-history lookup. Survives restart, where the in-memory
+        //    replay cache above does not.
+        let Ok(Some(record)) = inbound_dm_history_record(
+            &envelope,
+            &application_payload,
+            sender_machine_id,
+            &sender_pubkey,
+        ) else {
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "inbound_durable_record_unbuildable",
+                request_id = %hex::encode(request_id),
+                "v2 DM withheld: payload has no durable history representation"
+            );
+            return DurableAckDecision::Withheld("no_durable_representation");
+        };
+        match durable_history_logical_request(
+            &history,
+            sender_agent_id,
+            request_id,
+            application_payload.clone(),
+        )
+        .await
+        {
+            Ok(DurableLogicalRequestLookup::Missing | DurableLogicalRequestLookup::Exact) => {}
+            Ok(DurableLogicalRequestLookup::Conflict) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_logical_request_conflict",
+                    request_id = %hex::encode(request_id),
+                    sender = %hex::encode(sender_agent_id.as_bytes()),
+                    "v2 DM rejected: logical request already committed with different content"
+                );
+                let _ = self
+                    .publish_ack_for_protocol(
+                        sender_agent_id,
+                        request_id,
+                        DmAckOutcome::RejectedByPolicy {
+                            reason: "logical request already committed with different content"
+                                .to_string(),
+                        },
+                        envelope.protocol_version,
+                        ack_legacy_bus,
+                    )
+                    .await;
+                return DurableAckDecision::Acked {
+                    protocol_version: envelope.protocol_version,
+                    accepted: false,
+                };
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_history_lookup_failed",
+                    request_id = %hex::encode(request_id),
+                    %error,
+                    "v2 DM withheld: durable history lookup failed"
+                );
+                return DurableAckDecision::Withheld("history_lookup_failed");
+            }
+        }
+
+        // 4. Dispatch.
+        self.dm
+            .handle_incoming(
+                sender_machine_id,
+                sender_agent_id,
+                application_payload.clone(),
+                true,
+                Some(decision),
+                // Gossip-inbox deliveries carry no point-to-point transport
+                // observation (issue #120).
+                None,
+            )
+            .await;
+
+        // 5. Commit awaited. This is the step the v2 receipt is actually
+        //    about: the ACK below may not exist unless this returned.
+        match history.record_committed(record).await {
+            Ok(outcome) if exact_durable_history_outcome(outcome) => {}
+            Ok(outcome) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_commit_inexact",
+                    request_id = %hex::encode(request_id),
+                    ?outcome,
+                    "v2 ACK withheld: history commit did not yield exactly one durable row"
+                );
+                return DurableAckDecision::Withheld("commit_inexact");
+            }
+            Err(error) => {
+                tracing::warn!(
+                    target: "dm.trace",
+                    stage = "inbound_durable_commit_failed",
+                    request_id = %hex::encode(request_id),
+                    %error,
+                    "v2 ACK withheld: durable history commit failed"
+                );
+                return DurableAckDecision::Withheld("commit_failed");
+            }
+        }
+
+        // Publish the completion into the replay cache before acknowledging,
+        // so a concurrent copy of this envelope can never be dispatched twice
+        // by a peer that has already been told the request completed.
+        if let Err(error) = self.cache.complete_durable(
+            dedupe,
+            DmAckOutcome::Accepted,
+            envelope.protocol_version,
+            binding,
+        ) {
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "inbound_durable_replay_publish_failed",
+                request_id = %hex::encode(request_id),
+                ?error,
+                "v2 ACK withheld: durable completion could not be made replay-safe"
+            );
+            return DurableAckDecision::Withheld("replay_publish_failed");
+        }
+
+        // 6. ACK, stamped with the semantics actually honoured.
+        let _ = self
+            .publish_ack_for_protocol(
+                sender_agent_id,
+                request_id,
+                DmAckOutcome::Accepted,
+                envelope.protocol_version,
+                ack_legacy_bus,
+            )
+            .await;
+
+        tracing::info!(
+            target: "dm.trace",
+            stage = "inbound_durable_ack_published",
+            request_id = %hex::encode(request_id),
+            sender = %hex::encode(sender_agent_id.as_bytes()),
+            protocol_version = envelope.protocol_version,
+        );
+
+        DurableAckDecision::Acked {
+            protocol_version: envelope.protocol_version,
+            accepted: true,
+        }
     }
 
     async fn route_typed_payload(
@@ -809,11 +1237,30 @@ impl InboxPipeline {
         true
     }
 
+    /// Emit a v1 ACK: verified and locally enqueued (receipt level 2).
     async fn publish_ack(
         &self,
         to: AgentId,
         acks_request_id: [u8; 16],
         outcome: DmAckOutcome,
+        ack_legacy_bus: bool,
+    ) -> NetworkResult<()> {
+        self.publish_ack_for_protocol(to, acks_request_id, outcome, DM_PROTOCOL_V1, ack_legacy_bus)
+            .await
+    }
+
+    /// Emit an ACK stamped with the semantics this receiver actually honoured.
+    ///
+    /// ADR 0030: `protocol_version` names the receipt the recipient is
+    /// claiming, and the sender's waiter matches it exactly. Callers must pass
+    /// [`DM_PROTOCOL_DURABLE_ACK`] only from the durable path, after
+    /// `record_committed` has returned — never as an optimistic stamp.
+    async fn publish_ack_for_protocol(
+        &self,
+        to: AgentId,
+        acks_request_id: [u8; 16],
+        outcome: DmAckOutcome,
+        protocol_version: u16,
         ack_legacy_bus: bool,
     ) -> NetworkResult<()> {
         let body = EnvelopeBuilder::build_ack_body(acks_request_id, outcome);
@@ -825,11 +1272,11 @@ impl InboxPipeline {
 
         let mut envelope = DmEnvelope {
             // ADR 0030: an ACK is stamped with the semantics this receiver
-            // actually honoured, not with the local ceiling. Until the
-            // receiver durable path lands (slice 2) every accepted payload is
-            // level-2 enqueue, so every ACK is v1 — a v2 waiter must time out
-            // rather than be handed a receipt no one made.
-            protocol_version: DM_PROTOCOL_V1,
+            // actually honoured, not with the local ceiling. Only the durable
+            // path passes v2, and only once the history commit has returned;
+            // everything else stays v1 so a v2 waiter times out rather than
+            // being handed a receipt no one made.
+            protocol_version,
             request_id: ack_rid,
             sender_agent_id: *self.self_agent_id.as_bytes(),
             sender_machine_id: *self.self_machine_id.as_bytes(),
@@ -1054,11 +1501,34 @@ mod tests {
 
     /// Build a signed-but-unattested payload envelope, simulating a
     /// pre-#213 (legacy) sender: agent signature only, no origin attestation.
+    /// The trust/origin/revocation regression suite below is about the gates
+    /// that run before any protocol version matters, so it builds v1
+    /// envelopes: these tests predate DM v2 and only became v2 incidentally
+    /// when slice 1 raised `DM_PROTOCOL_VERSION` to the durable-ACK ceiling.
+    /// The durable path has its own envelopes via `durable_payload_message`.
     fn craft_unsigned_payload_envelope(
         harness: &InboxHarness,
         sender: &AgentKeypair,
         claimed_machine: MachineId,
         request_byte: u8,
+    ) -> DmEnvelope {
+        craft_unsigned_payload_envelope_versioned(
+            harness,
+            sender,
+            claimed_machine,
+            request_byte,
+            DM_PROTOCOL_V1,
+            b"security regression payload".to_vec(),
+        )
+    }
+
+    fn craft_unsigned_payload_envelope_versioned(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        claimed_machine: MachineId,
+        request_byte: u8,
+        protocol_version: u16,
+        application_payload: Vec<u8>,
     ) -> DmEnvelope {
         let created_at = now_unix_ms();
         let body = EnvelopeBuilder::build_payload_body(
@@ -1066,13 +1536,13 @@ mod tests {
             sender.agent_id().as_bytes(),
             harness.recipient_agent_id.as_bytes(),
             created_at,
-            b"security regression payload".to_vec(),
+            application_payload,
             None,
             &harness.recipient_kem.public_bytes,
         )
         .expect("build payload body");
         DmEnvelope {
-            protocol_version: DM_PROTOCOL_VERSION,
+            protocol_version,
             request_id: [request_byte; 16],
             sender_agent_id: *sender.agent_id().as_bytes(),
             sender_machine_id: *claimed_machine.as_bytes(),
@@ -1138,6 +1608,376 @@ mod tests {
         attestation.sign(machine).expect("machine attest");
         envelope.origin_attestation = Some(attestation);
         wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    // ── ADR 0030 §1 receiver durable path ─────────────────────────────
+
+    /// Start a real history service in the harness tempdir and attach its
+    /// handle to the pipeline. The service is returned so a test can shut the
+    /// writer down mid-flight to force a commit failure.
+    fn attach_history(harness: &mut InboxHarness) -> crate::history::HistoryService {
+        let config = crate::history::HistoryConfig {
+            db_path: Some(harness._tempdir.path().join("history.db")),
+            ..crate::history::HistoryConfig::daemon_default()
+        };
+        let service = crate::history::HistoryService::start(&config, harness._tempdir.path())
+            .expect("history service");
+        harness.pipeline.history = Some(service.handle());
+        service
+    }
+
+    /// A signed v2 (durable) payload envelope carrying `application_payload`.
+    fn durable_payload_message(
+        harness: &InboxHarness,
+        sender: &AgentKeypair,
+        claimed_machine: MachineId,
+        request_byte: u8,
+        application_payload: &[u8],
+    ) -> PubSubMessage {
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            harness,
+            sender,
+            claimed_machine,
+            request_byte,
+            DM_PROTOCOL_DURABLE_ACK,
+            application_payload.to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, sender);
+        wrap_in_pubsub(harness, sender, &envelope)
+    }
+
+    fn committed_rows(
+        history: &crate::history::HistoryHandle,
+        sender: &AgentKeypair,
+        request_byte: u8,
+    ) -> Vec<crate::history::StoredRecord> {
+        history
+            .store()
+            .find_by_logical_request(
+                &hex::encode(sender.agent_id().as_bytes()),
+                [request_byte; 16],
+            )
+            .expect("logical request lookup")
+    }
+
+    /// ADR 0030 §1: the ACK exists only because the commit succeeded. With the
+    /// writer stopped the commit cannot succeed, so no ACK may be emitted —
+    /// and crucially it must NOT degrade to a v1 ACK, which would hand the
+    /// sender a weaker receipt it cannot tell apart from the durable one.
+    #[tokio::test]
+    async fn durable_ack_is_withheld_when_history_commit_fails() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD1; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+
+        // Stop the writer thread; the retained handle now fails every commit.
+        service.shutdown().await;
+
+        let message = durable_payload_message(&harness, &sender, machine, 0x51, b"durable hello");
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert!(
+            committed_rows(&history, &sender, 0x51).is_empty(),
+            "a failed commit must leave no durable row"
+        );
+        assert!(
+            harness
+                .pipeline
+                .cache
+                .lookup(&crate::dm::DedupeKey::new(
+                    *sender.agent_id().as_bytes(),
+                    [0x51; 16]
+                ))
+                .is_none(),
+            "a withheld ACK must not publish a completion into the replay cache"
+        );
+    }
+
+    /// The same ordering asserted directly on the durable path's decision, so
+    /// "no ACK" is a checked outcome rather than an absence inferred from
+    /// side effects.
+    #[tokio::test]
+    async fn durable_path_reports_withheld_ack_on_commit_failure() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD2; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let service = attach_history(&mut harness);
+        service.shutdown().await;
+
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x52,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"durable hello".to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                b"durable hello".to_vec(),
+                TrustDecision::Accept,
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+
+        assert_eq!(decision, DurableAckDecision::Withheld("commit_failed"));
+    }
+
+    /// Happy path: commit lands first, then a v2-stamped ACK, and the schema
+    /// v4 columns are populated — they are what makes the restart-spanning
+    /// lookup in step 3 possible at all.
+    #[tokio::test]
+    async fn durable_path_commits_before_acking_and_stamps_v2() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD3; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x53,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"durable hello".to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                b"durable hello".to_vec(),
+                TrustDecision::Accept,
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            decision,
+            DurableAckDecision::Acked {
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                accepted: true,
+            }
+        );
+
+        let rows = committed_rows(&history, &sender, 0x53);
+        assert_eq!(rows.len(), 1, "exactly one durable row per logical request");
+        assert_eq!(rows[0].record.payload, b"durable hello".to_vec());
+        assert_eq!(
+            rows[0].record.ingress_sender_agent.as_deref(),
+            Some(hex::encode(sender.agent_id().as_bytes()).as_str()),
+            "schema v4 ingress_sender_agent must be written"
+        );
+        assert_eq!(
+            rows[0].record.logical_request_id,
+            Some([0x53; 16]),
+            "schema v4 logical_request_id must be written"
+        );
+    }
+
+    /// ADR 0030 §1 step 2: a replayed logical request is re-ACKed from the
+    /// binding, never dispatched or committed a second time.
+    #[tokio::test]
+    async fn durable_replay_rebinds_instead_of_committing_twice() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD4; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+
+        for _ in 0..2 {
+            let message =
+                durable_payload_message(&harness, &sender, machine, 0x54, b"durable hello");
+            harness.pipeline.handle_incoming(message, false).await;
+        }
+
+        let rows = committed_rows(&history, &sender, 0x54);
+        assert_eq!(
+            rows.len(),
+            1,
+            "a replayed logical request must not commit a second durable row"
+        );
+    }
+
+    /// ADR 0030 §1 step 2: the binding is over the accepted bytes, so the
+    /// same request id carrying different content is refused rather than
+    /// re-ACKed as the original delivery.
+    #[tokio::test]
+    async fn durable_replay_with_different_bytes_is_refused() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD5; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+
+        let first = durable_payload_message(&harness, &sender, machine, 0x55, b"original bytes");
+        harness.pipeline.handle_incoming(first, false).await;
+
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x55,
+            DM_PROTOCOL_DURABLE_ACK,
+            b"different bytes".to_vec(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                b"different bytes".to_vec(),
+                TrustDecision::Accept,
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+
+        assert_eq!(
+            decision,
+            DurableAckDecision::Acked {
+                protocol_version: DM_PROTOCOL_DURABLE_ACK,
+                accepted: false,
+            },
+            "a rebound logical request must be refused, not accepted"
+        );
+    }
+
+    /// ADR 0030 §2 mixed version: a 0.37 peer's v1 envelope keeps exactly its
+    /// old behaviour on a durable-capable receiver — delivered, and ACKed with
+    /// v1 semantics. Enabling durable history must not silently upgrade the
+    /// receipt an old sender is handed.
+    #[tokio::test]
+    async fn v1_envelope_receives_v1_ack_even_with_durable_history_enabled() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD6; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+
+        let message = payload_message(&harness, &sender, machine, 0x56);
+        harness.pipeline.handle_incoming(message, false).await;
+
+        let delivered = tokio::time::timeout(Duration::from_secs(2), harness.receiver.recv())
+            .await
+            .expect("v1 delivery timeout")
+            .expect("v1 delivery stream closed");
+        assert_eq!(delivered.sender, sender.agent_id());
+
+        let cached = harness
+            .pipeline
+            .cache
+            .lookup(&crate::dm::DedupeKey::new(
+                *sender.agent_id().as_bytes(),
+                [0x56; 16],
+            ))
+            .expect("v1 completion is cached");
+        assert_eq!(
+            cached.protocol_version, DM_PROTOCOL_V1,
+            "a v1 envelope must complete under v1 semantics"
+        );
+        assert!(
+            cached.durable_binding.is_none(),
+            "the v1 path must not publish a durable binding"
+        );
+    }
+
+    /// ADR 0030 §2: a v2 request is never silently downgraded. Without a
+    /// history handle there is nothing to commit to, so the ACK is withheld
+    /// rather than answered at v1.
+    #[tokio::test]
+    async fn v2_envelope_without_history_is_never_downgraded_to_v1() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD7; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        assert!(harness.pipeline.history.is_none());
+
+        let message = durable_payload_message(&harness, &sender, machine, 0x57, b"durable hello");
+        harness.pipeline.handle_incoming(message, false).await;
+
+        assert_no_delivery(&mut harness.receiver).await;
+        assert!(
+            harness
+                .pipeline
+                .cache
+                .lookup(&crate::dm::DedupeKey::new(
+                    *sender.agent_id().as_bytes(),
+                    [0x57; 16]
+                ))
+                .is_none(),
+            "a withheld v2 request must leave no completion behind"
+        );
+    }
+
+    /// ADR 0030 §7: typed routes are documented as carrying their own
+    /// restart-spanning dedupe obligation, and do not earn a v2 ACK in this
+    /// slice. Locking that in so slice 3 has to change this test deliberately.
+    #[tokio::test]
+    async fn durable_typed_route_withholds_ack_pending_handler_completion() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD8; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let (tx, _rx) = mpsc::channel::<DmTypedPayload>(8);
+        harness.pipeline.typed_payload_routes = vec![DmTypedPayloadRoute {
+            prefix: b"X0X-KV-DELTA-V1\n".to_vec(),
+            sender: tx,
+        }];
+
+        let mut payload = b"X0X-KV-DELTA-V1\n".to_vec();
+        payload.extend_from_slice(b"{\"k\":1}");
+        let mut envelope = craft_unsigned_payload_envelope_versioned(
+            &harness,
+            &sender,
+            machine,
+            0x58,
+            DM_PROTOCOL_DURABLE_ACK,
+            payload.clone(),
+        );
+        sign_envelope_with_agent(&mut envelope, &sender);
+
+        let decision = harness
+            .pipeline
+            .handle_payload_durable(
+                envelope,
+                payload,
+                TrustDecision::Accept,
+                machine,
+                sender.public_key().as_bytes().to_vec(),
+                false,
+            )
+            .await;
+
+        assert_eq!(decision, DurableAckDecision::Withheld("typed_route"));
+    }
+
+    #[test]
+    fn cached_v1_completion_refuses_a_v2_request() {
+        let cached = crate::dm::CachedOutcome {
+            outcome: DmAckOutcome::Accepted,
+            protocol_version: DM_PROTOCOL_V1,
+            durable_binding: None,
+            first_seen: std::time::Instant::now(),
+        };
+        assert!(matches!(
+            cached_ack_for_protocol(&cached, DM_PROTOCOL_DURABLE_ACK),
+            DmAckOutcome::RejectedByPolicy { .. }
+        ));
+        assert!(matches!(
+            cached_ack_for_protocol(&cached, DM_PROTOCOL_V1),
+            DmAckOutcome::Accepted
+        ));
     }
 
     async fn assert_no_delivery(receiver: &mut crate::direct::DirectMessageReceiver) {

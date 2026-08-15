@@ -194,7 +194,7 @@ Documented explicitly so we don't overclaim:
 |---|---|---|---|
 | 1 | Transport accepted | — | Gossip `publish()` returned Ok. We don't expose this as a receipt. |
 | 2 | **Recipient agent accepted** | **YES** | Recipient's process decrypted, verified, passed policy, enqueued to the DM handler. This is what `send_direct` returns on success. |
-| 3 | Durable locally stored | future | Recipient wrote the DM to a persistent inbox. Not in v1. |
+| 3 | Durable locally stored | v2 | Recipient committed the DM to ADR-0023 history (SQLite transaction awaited) and completed dispatch, before ACKing. Reached only by a v2 send to a v2-advertising receiver; at-least-once across restart. |
 | 4 | User read | future/never | Human read the DM in a UI. Out of scope. |
 
 `DmReceipt::delivered_at` corresponds to **level 2**. Docs and API
@@ -206,18 +206,11 @@ DM protocol v2 raises `Accepted` to **level 3** for sends that ask for it.
 The envelope layout is byte-identical to v1; only ACK semantics differ, so
 `protocol_version` is a promise about the *receipt*, not a wire change.
 
-Landing in slices (ADR 0030 "Landing order"). Slice 1 ships:
+Landing in slices (ADR 0030 "Landing order"). Slices 1–2 ship:
 
 - `DM_PROTOCOL_VERSION = 2` as the **receive ceiling**. Envelopes above it
   are dropped without an ACK, so the sender times out rather than being
   handed a receipt for semantics we cannot honour.
-- The production advert is **held at `max_protocol_version = 1`** in this
-  slice: a binary carrying the strict-send gate but not the slice-2
-  receiver durable path must not claim v2, or a strict sender that finds
-  the advert clears its gate and hangs against a v1 ACK (exact-protocol
-  waiter). The ADR 0030 §3 rule — v2 **iff** durable history is enabled —
-  activates in the same change as slice 2. Card exports and mesh adverts
-  carry the runtime value either way.
 - `DmSendConfig::require_durable_app_ack` (default `false`). When set, the
   send negotiates v2 on the wire and its ACK waiter is pinned to
   `(protocol_version, recipient, machine)`. A recipient without a current
@@ -227,11 +220,62 @@ Landing in slices (ADR 0030 "Landing order"). Slice 1 ships:
 - Targeted capability refresh on `x0x/caps/v1/request/targeted-v2`, answered
   on `x0x/caps/v1/response/targeted-v2` (both Critical). Concurrent strict
   sends to one recipient share a single in-flight request.
+- The **receiver durable path** and the live v2 advert (below).
 
-**Not yet in slice 1:** the receiver durable path. Until it lands, this
-build ACKs every accepted payload with `protocol_version = 1` — the
-semantics it actually honours — so a strict send that clears the capability
-gate still times out rather than receiving a durable receipt no one made.
+#### Receiver ordering (normative)
+
+`InboxPipeline::handle_payload_durable` runs a v2 payload in exactly this
+order, per ADR 0030 §1:
+
+1. **Per-logical-request lock** (`RecentDeliveryCache::delivery_lock`) —
+   serializes the primary-inbox and legacy-bus copies of one envelope so
+   neither observes the other's provisional success. No free slot ⇒ ACK
+   withheld; evicting an in-flight lock would permit duplicate dispatch.
+2. **Replay-cache binding check** — a completion already present is re-ACKed
+   under *its own* semantics, never re-dispatched. The binding is a
+   domain-separated digest over `(protocol_version, accepted bytes)`, so the
+   same request id carrying different content is refused rather than
+   re-ACKed as the original delivery.
+3. **Durable-history lookup** — keyed on the schema v4 columns
+   `(ingress_sender_agent, logical_request_id)` via
+   `Store::find_by_logical_request`. This is the check that survives restart,
+   where the memory-only replay cache does not. A row binding different bytes
+   is a conflict and is refused.
+4. **Dispatch** to the application.
+5. **`record_committed` awaited** — the SQLite transaction must return
+   `Inserted | Duplicate`, i.e. exactly one durable row for this logical
+   request.
+6. **ACK**, stamped with the semantics actually honoured.
+
+Steps 5→6 are the whole point: **the ACK exists only because the commit
+succeeded.** Commit error, backpressured writer, unavailable history, lost
+lock, or an unpublishable replay completion each **withhold** the ACK. None
+of them may fall back to a v1 ACK — a withheld ACK costs the sender a
+timeout, whereas a downgraded one hands it a weaker receipt it cannot
+distinguish from the durable receipt it asked for (ADR 0030 §2).
+
+#### Typed routes (ADR 0030 §7)
+
+The typed-route restart-spanning dedupe gap is **documented as a handler
+obligation, not closed in the inbox.** Typed-prefix families (group ingest,
+KV deltas, exec audit, card import, voice signalling) classify `Ephemeral`:
+their durable effect lives in their own store, not in DM history, so a
+DM-history commit could not honestly back their receipt — and they are
+handed off with a non-blocking `try_send` that may drop under backpressure,
+so a durable ACK would claim a dispatch that never completed.
+
+A v2 envelope matching a typed route therefore receives **no** ACK, and each
+typed handler carries the dedupe obligation via its own durable surface (the
+bootstrap outbox handler satisfies it with `Inserted | Duplicate`
+completion). The typed-route completion signal that lets these frames earn a
+v2 ACK is slice 3.
+
+#### At-least-once across restart
+
+The replay cache is memory-only, so a restart can re-dispatch an
+already-committed envelope. The step-3 lookup holds it to exactly one
+history row. Applications needing restart-spanning exactly-once must dedupe
+on `(sender, request_id)`.
 
 ## Capability negotiation
 
@@ -258,6 +302,24 @@ pub struct DmCapabilities {
 `dm_capabilities` is signed as part of the AgentCard's existing
 signature (AgentCard version bump required — see *Identity evolution*
 below).
+
+#### `max_protocol_version` is v2 **iff** durable history is enabled
+
+ADR 0030 §3. `start_dm_inbox` advertises `max_protocol_version = 2` when the
+agent holds a durable history handle, and `1` otherwise. The advert is a
+promise about *this receiver*, so it tracks the only thing that can make the
+promise true: without history there is nothing for the durable path to
+commit to, and it would withhold every v2 ACK.
+
+Advertising v2 without the receiver path would be a false capability — a
+strict sender clears its gate, the receiver never produces a matching v2
+ACK, and the exact-protocol waiter hangs to timeout, exactly the failure
+ADR 0030 §2 forbids. Advertising v1 instead routes that sender to a typed
+409 it can act on. Card exports and mesh adverts carry the runtime value
+either way, and a card import can never lower a live signed advert.
+
+A strict v2 send can therefore still time out, but only against a peer
+advertising a **false** v2 capability — never against this daemon.
 
 ### Sender path selection
 

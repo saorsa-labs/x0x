@@ -115,6 +115,14 @@ impl HistoryHandle {
         self.writer.record(record);
     }
 
+    /// Enqueue a record and wait for its SQLite transaction to commit.
+    ///
+    /// This is reserved for protocol surfaces whose success receipt promises
+    /// durable local history. Hot paths should continue using [`Self::record`].
+    pub async fn record_committed(&self, record: HistoryRecord) -> HistoryResult<InsertOutcome> {
+        self.writer.record_committed(record).await
+    }
+
     /// Read access to the store. Synchronous — call from `spawn_blocking`
     /// on async paths.
     #[must_use]

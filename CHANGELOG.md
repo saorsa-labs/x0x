@@ -6,15 +6,38 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
+- **DM protocol v2 receiver durable path (ADR 0030 §1, slice 2 of 4).** A v2
+  envelope is answered in exactly this order: per-logical-request lock →
+  replay-cache binding check → durable-history lookup → dispatch →
+  `record_committed` awaited → ACK. A v2 ACK is emitted **only** after the
+  SQLite commit returns `Inserted | Duplicate`; every failure below that —
+  commit error, backpressured writer, unavailable history, lost delivery
+  lock, unpublishable replay completion — withholds the ACK rather than
+  degrading it. `Accepted` under v2 now means what ADR 0030 §1 says it
+  means: verified, durably committed, and dispatched.
+- **History schema v4 columns gain writers.** Inbound DM rows populate
+  `ingress_sender_agent` and `logical_request_id`; together they key the
+  durable-history lookup that lets a restarted receiver recognise a logical
+  request it already committed, via the new
+  `Store::find_by_logical_request`.
+- **`HistoryHandle::record_committed`.** A commit-receipt write for protocol
+  surfaces whose success promises durable history. Unlike the fire-and-forget
+  `record`, it never sheds silently: a full or closed writer queue returns
+  `HistoryError::WriterBackpressured` / `WriterClosed` to the caller.
 - **DM protocol v2 capability advertisement + strict-send gate (ADR 0030,
   slice 1 of 4).** `DM_PROTOCOL_VERSION` becomes the receive **ceiling** 2:
-  envelopes above it are dropped without an ACK. The production advert is
-  **held at `max_protocol_version = 1`** until the slice-2 receiver durable
-  path ships in the same binary — advertising v2 without it would be a
-  false capability and hang strict senders (PR #327 review; the ADR 0030
-  §3 v2-iff-history flip lands with slice 2). Agent cards export the same
+  envelopes above it are dropped without an ACK. Agent cards export the same
   runtime value, and card imports go through `CapabilityStore::insert_from_card`
   so a stale card can never lower a live signed advert.
+
+### Changed
+
+- **The v2 capability advert is now live and conditional (ADR 0030 §3).**
+  `start_dm_inbox` advertises `max_protocol_version = 2` **iff** a durable
+  history handle is present, else 1. The slice-1 hold is lifted because the
+  receiver path in this release is what makes the v2 claim true. Daemons
+  without history keep advertising v1, so a strict sender gets the typed 409
+  instead of clearing its gate against a receiver that could never commit.
 - **`DmSendConfig::require_durable_app_ack`** (default `false`). A strict
   send negotiates v2 on the wire and pins its ACK waiter to
   `(protocol_version, recipient, machine)`; a recipient without a current
@@ -32,12 +55,31 @@ All notable changes to this project will be documented in this file.
 ### Notes
 
 - No send surface sets `require_durable_app_ack` yet: REST, CLI, WS and the
-  library default stay v1-defaulted, so this slice is behaviour-neutral for
-  existing callers. Product defaults flip in ADR 0030 slice 4.
-- The receiver durable path is slice 2. Until it lands this build ACKs with
-  `protocol_version = 1` — the semantics it actually honours — so a strict
-  send that clears the gate times out rather than receiving a durable
-  receipt no one made.
+  library default stay v1-defaulted, so these slices remain behaviour-neutral
+  for existing callers. Product defaults flip in ADR 0030 slice 4.
+- **v1 senders are unaffected.** A v1 envelope takes the unchanged legacy
+  path and receives a v1 ACK even on a receiver with durable history enabled;
+  enabling history never silently upgrades the receipt an 0.37 peer is handed.
+- A strict v2 send can still end in a timeout, but now only against a peer
+  advertising a **false** v2 capability — one claiming the durable ceiling
+  without a receiver that can commit. This daemon cannot be that peer: it
+  advertises v2 only when history is enabled, and withholds the ACK rather
+  than downgrading if history becomes unavailable at runtime.
+- **Typed routes (ADR 0030 §7): the obligation is documented, not closed.**
+  Typed-prefix families (group ingest, KV deltas, exec audit, card import,
+  voice signalling) classify `Ephemeral` — their durable effect lives in
+  their own store, not in DM history — and are handed off with a
+  non-blocking `try_send` that may drop. A DM-history commit therefore
+  cannot honestly back their receipt, so a v2 envelope matching a typed
+  route gets **no** ACK in this slice, and each handler carries the
+  restart-spanning dedupe obligation via its own durable surface. The
+  typed-route completion signal that lets these frames earn a v2 ACK is
+  slice 3.
+- Durable v2 is **at-least-once across restart**: the replay cache is
+  memory-only, so a restart can re-dispatch an already-committed envelope.
+  The durable-history lookup keeps it to exactly one history row, and
+  applications needing restart-spanning exactly-once dedupe on
+  `(sender, request_id)`.
 
 ## [v0.37.4] - 2026-08-14
 
