@@ -897,6 +897,12 @@ const CRITICAL_TOPIC_PREFIXES: &[&str] = &[
     "x0x.identity.announce.v2", // Identity announce — control-plane
     "x0x.test.discover.v1", // Test orchestrator discover (X0X-0076 harness)
     "x0x.test.control.v1", // Test orchestrator control commands
+    // ADR 0030 strict-send capability refresh. These share the `x0x/caps/v1`
+    // prefix with the Bulk steady advert topic, so they rely on Critical being
+    // matched first: a strict send has a three-second convergence window and
+    // cannot wait behind Bulk cooling.
+    "x0x/caps/v1/request/targeted-v2",
+    "x0x/caps/v1/response/targeted-v2",
 ];
 
 const BULK_TOPIC_PREFIXES: &[&str] = &[
@@ -966,6 +972,14 @@ fn register_x0x_topic_priorities(
     );
     registry.register(
         TopicId::from_entity("x0x.test.control.v1".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/caps/v1/request/targeted-v2".as_bytes()),
+        TopicPriority::Critical,
+    );
+    registry.register(
+        TopicId::from_entity("x0x/caps/v1/response/targeted-v2".as_bytes()),
         TopicPriority::Critical,
     );
     // Per-recipient DM inbox topics (`x0x/dm/v1/inbox/<hash>`) are
@@ -1371,6 +1385,45 @@ mod tests {
         assert_eq!(
             classify_x0x_topic("x0x.group.cards.v1"),
             TopicPriority::Bulk
+        );
+    }
+
+    /// ADR 0030: the targeted refresh topics share the `x0x/caps/v1` prefix
+    /// with the Bulk steady advert topic, so they only land on Critical
+    /// because Critical is matched first. A reordering of the two prefix lists
+    /// would silently cool a strict send's three-second convergence window
+    /// behind Bulk admission — this pins the ordering.
+    #[test]
+    fn targeted_capability_refresh_topics_outrank_the_bulk_advert_topic() {
+        assert_eq!(
+            classify_x0x_topic(crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            classify_x0x_topic(crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            classify_x0x_topic(crate::dm_capability::DM_CAPABILITY_TOPIC),
+            TopicPriority::Bulk,
+            "the steady advert topic must stay Bulk"
+        );
+
+        // The seeded registry must agree with the dynamic classifier, or the
+        // priority depends on whether the topic was pre-registered.
+        let registry = saorsa_gossip_pubsub::admission::TopicPriorityRegistry::default();
+        register_x0x_topic_priorities(&registry);
+        assert_eq!(
+            registry.priority_for(&TopicId::from_entity(
+                crate::dm_capability::DM_CAPABILITY_TARGETED_REQUEST_TOPIC.as_bytes()
+            )),
+            TopicPriority::Critical
+        );
+        assert_eq!(
+            registry.priority_for(&TopicId::from_entity(
+                crate::dm_capability::DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.as_bytes()
+            )),
+            TopicPriority::Critical
         );
     }
 

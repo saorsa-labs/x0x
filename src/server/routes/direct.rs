@@ -350,6 +350,15 @@ pub(in crate::server) async fn direct_send(
                 x0x::dm::DmError::RecipientKeyInvalid(_) => {
                     (StatusCode::CONFLICT, "recipient_key_invalid")
                 }
+                // ADR 0030 §2: the caller demanded durable application-ACK
+                // semantics and the recipient has no current v2 capability
+                // advert. 409 rather than 400 — the request was well-formed,
+                // the peer state is not what it requires — and never a silent
+                // downgrade. Callers retry, surface "peer needs upgrade", or
+                // resend with `require_durable_app_ack = false`.
+                x0x::dm::DmError::AckSemanticsUnavailable(_) => {
+                    (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
+                }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 x0x::dm::DmError::PeerLikelyOffline { .. } => {
                     (StatusCode::BAD_GATEWAY, "peer_likely_offline")
@@ -468,6 +477,37 @@ mod tests {
         }))
         .expect("direct-send request with explicit override should deserialize");
         assert!(!direct_send_config_for_request(&disabled).prefer_raw_quic_if_connected);
+    }
+
+    /// ADR 0030 §4 deprecates `require_gossip_ack` but objects specifically to
+    /// *silently discarding* it — the campaign branch accepted
+    /// `require_gossip_ack: false` and ignored it, so a caller asking for
+    /// fire-and-forget got a blocking send with no signal. This route honors
+    /// it, and must keep honoring it until slice 4 replaces acceptance with an
+    /// explicit 400. If a later slice makes the field a no-op, this test fails
+    /// rather than letting the silence back in.
+    #[test]
+    fn deprecated_require_gossip_ack_is_honored_not_silently_discarded() {
+        let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": ""
+        }))
+        .expect("minimal direct-send request should deserialize");
+        assert!(
+            direct_send_config_for_request(&omitted).require_gossip_ack,
+            "omitting the field must select the daemon default (true)"
+        );
+
+        let disabled: DirectSendRequest = serde_json::from_value(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "require_gossip_ack": false
+        }))
+        .expect("direct-send request with explicit override should deserialize");
+        assert!(
+            !direct_send_config_for_request(&disabled).require_gossip_ack,
+            "an explicit false must reach the send config, not be discarded"
+        );
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

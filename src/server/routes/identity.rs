@@ -400,9 +400,16 @@ pub(in crate::server) async fn get_agent_card(
     let display_name = query.display_name.unwrap_or_default();
 
     let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
-    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
-        state.agent_kem_keypair.public_bytes.clone(),
-    ));
+    // ADR 0030 §3: the card must carry the same protocol version the mesh
+    // advert claims. Hardcoding v1 here made an imported card contradict the
+    // live advert, and a lower-version card import would then have to be
+    // ignored by the capability store.
+    card.dm_capabilities = Some(
+        state
+            .agent
+            .current_dm_capabilities()
+            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
+    );
 
     // Add user ID if available
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
@@ -510,9 +517,16 @@ pub(in crate::server) async fn get_a2a_agent_card(
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
 
     let mut card = x0x::groups::card::AgentCard::new(String::new(), &agent_id, &machine_id);
-    card.dm_capabilities = Some(x0x::dm::DmCapabilities::v1_gossip_ready(
-        state.agent_kem_keypair.public_bytes.clone(),
-    ));
+    // ADR 0030 §3: the card must carry the same protocol version the mesh
+    // advert claims. Hardcoding v1 here made an imported card contradict the
+    // live advert, and a lower-version card import would then have to be
+    // ignored by the capability store.
+    card.dm_capabilities = Some(
+        state
+            .agent
+            .current_dm_capabilities()
+            .with_kem_public_key(state.agent_kem_keypair.public_bytes.clone()),
+    );
     card.user_id = state.agent.user_id().map(|u| hex::encode(u.as_bytes()));
 
     // Only globally-advertisable addresses belong in a publicly-served card.
@@ -675,13 +689,15 @@ pub(in crate::server) async fn import_agent_card(
     if machine_id_bytes != [0u8; 32] {
         if let Some(caps) = card.dm_capabilities.clone() {
             if caps.gossip_inbox && !caps.kem_public_key.is_empty() {
-                capability_store.insert(
+                // ADR 0030 §3: card imports go through `insert_from_card`, so a
+                // stale or legacy card cannot lower a live signed advert's
+                // protocol version and quarantine strict sends to that peer.
+                inserted_dm_capability = capability_store.insert_from_card(
                     agent_id,
                     x0x::identity::MachineId(machine_id_bytes),
                     caps,
                     x0x::dm_capability::now_unix_ms(),
                 );
-                inserted_dm_capability = true;
             }
         }
     }

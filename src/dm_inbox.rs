@@ -7,7 +7,7 @@ use crate::direct::DirectMessaging;
 use crate::dm::{
     decrypt_payload, dm_inbox_topic, now_unix_ms, validate_timestamp_window, DmAckOutcome, DmBody,
     DmEnvelope, DmOriginAttestation, DmPayload, EnvelopeBuilder, InFlightAcks, RecentDeliveryCache,
-    DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
+    DM_PROTOCOL_V1, DM_PROTOCOL_VERSION, MAX_ENVELOPE_BYTES,
 };
 use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
@@ -374,7 +374,18 @@ impl InboxPipeline {
             }
         };
 
+        // ADR 0030 §2 receiver ceiling: an envelope above what this build
+        // understands is dropped WITHOUT an ACK, so the sender times out
+        // rather than being handed a receipt for semantics we cannot honour.
         if envelope.protocol_version > DM_PROTOCOL_VERSION {
+            tracing::info!(
+                target: "dm.trace",
+                stage = "inbound_protocol_above_ceiling_dropped",
+                sender = %hex::encode(envelope.sender_agent_id),
+                protocol_version = envelope.protocol_version,
+                ceiling = DM_PROTOCOL_VERSION,
+                "DM dropped without ACK: envelope protocol version exceeds local ceiling"
+            );
             return;
         }
 
@@ -544,9 +555,19 @@ impl InboxPipeline {
 
         match envelope.body.clone() {
             DmBody::Ack(ack) => {
-                let resolved = self.inflight.resolve(&ack.acks_request_id, ack.outcome);
+                // The ACK's own `protocol_version` names the receipt semantics
+                // the recipient is claiming; the waiter accepts it only if
+                // that matches what the send negotiated (ADR 0030 §2).
+                let resolved = self.inflight.resolve_for_protocol(
+                    &ack.acks_request_id,
+                    envelope.protocol_version,
+                    sender_agent_id,
+                    sender_machine_id,
+                    ack.outcome,
+                );
                 tracing::debug!(
                     acked = %hex::encode(ack.acks_request_id),
+                    protocol_version = envelope.protocol_version,
                     resolved,
                     "DM ACK received"
                 );
@@ -803,7 +824,12 @@ impl InboxPipeline {
         rand::thread_rng().fill_bytes(&mut ack_rid);
 
         let mut envelope = DmEnvelope {
-            protocol_version: DM_PROTOCOL_VERSION,
+            // ADR 0030: an ACK is stamped with the semantics this receiver
+            // actually honoured, not with the local ceiling. Until the
+            // receiver durable path lands (slice 2) every accepted payload is
+            // level-2 enqueue, so every ACK is v1 — a v2 waiter must time out
+            // rather than be handed a receipt no one made.
+            protocol_version: DM_PROTOCOL_V1,
             request_id: ack_rid,
             sender_agent_id: *self.self_agent_id.as_bytes(),
             sender_machine_id: *self.self_machine_id.as_bytes(),

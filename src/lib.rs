@@ -305,6 +305,10 @@ pub struct Agent {
     /// Capability store populated by the advert service and consulted by
     /// `send_direct` to choose between gossip and raw-QUIC paths.
     capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    /// Single-flight registry for ADR 0030 strict capability refreshes, so
+    /// concurrent strict sends to one recipient publish a single targeted
+    /// request between them.
+    capability_refreshes: std::sync::Arc<CapabilityRefreshRegistry>,
     /// Watch channel that carries this agent's *outgoing* DM capabilities.
     /// `join_network` spawns the advert service with a placeholder (empty
     /// KEM pubkey). `start_dm_inbox` upgrades via this sender to trigger
@@ -2482,6 +2486,237 @@ fn raw_dm_history_record(
     })
 }
 
+// ─── ADR 0030: strict capability refresh ───────────────────────────────────
+
+/// Cap on concurrent refresh flights, so a burst of strict sends to distinct
+/// unknown recipients cannot grow unbounded task state.
+const MAX_INFLIGHT_CAPABILITY_REFRESHES: usize = 256;
+
+/// How long a forced refresh waits for the targeted response to arrive and be
+/// ingested before the gate gives up and returns 409. Bounded on purpose: ADR
+/// 0030 promises a fast, deterministic refusal rather than a hang.
+const CAPABILITY_REFRESH_CONVERGENCE_WAIT: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// Poll cadence while waiting for the subscriber task to ingest the response.
+const CAPABILITY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CapabilityRefreshState {
+    Pending,
+    Finished,
+}
+
+#[derive(Debug)]
+struct CapabilityRefreshEntry {
+    flight_id: u64,
+    completion: tokio::sync::watch::Receiver<CapabilityRefreshState>,
+    worker: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[derive(Debug, Default)]
+struct CapabilityRefreshRegistryState {
+    closed: bool,
+    next_flight_id: u64,
+    inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
+}
+
+/// Bounded, recipient-keyed single-flight registry for strict capability
+/// discovery.
+///
+/// Without it, N concurrent strict sends to the same not-yet-known recipient
+/// would each publish their own targeted request — turning the gate into a
+/// gossip amplifier exactly when the mesh is already struggling to converge.
+/// The synchronous mutex is deliberate: registration and Drop cleanup are
+/// tiny non-awaiting operations, which lets an aborted worker remove its slot
+/// deterministically.
+#[derive(Debug, Default)]
+struct CapabilityRefreshRegistry {
+    state: std::sync::Mutex<CapabilityRefreshRegistryState>,
+}
+
+enum CapabilityRefreshRegistration {
+    /// Another flight for this recipient is already running; await it.
+    Joined(tokio::sync::watch::Receiver<CapabilityRefreshState>),
+    /// This caller started the flight.
+    Started(tokio::sync::watch::Receiver<CapabilityRefreshState>),
+    /// Shutting down or at the concurrency cap — proceed straight to the gate.
+    Unavailable,
+}
+
+impl CapabilityRefreshRegistry {
+    fn register_or_start<F, Fut>(
+        self: &std::sync::Arc<Self>,
+        recipient: identity::AgentId,
+        worker: F,
+    ) -> CapabilityRefreshRegistration
+    where
+        F: FnOnce(
+            CapabilityRefreshGuard,
+            tokio::sync::watch::Sender<CapabilityRefreshState>,
+        ) -> Fut,
+        Fut: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let Ok(mut state) = self.state.lock() else {
+            return CapabilityRefreshRegistration::Unavailable;
+        };
+        let recipient_key = *recipient.as_bytes();
+        if let Some(existing) = state.inflight.get(&recipient_key) {
+            return CapabilityRefreshRegistration::Joined(existing.completion.clone());
+        }
+        if state.closed || state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
+            return CapabilityRefreshRegistration::Unavailable;
+        }
+        state.next_flight_id = state.next_flight_id.wrapping_add(1);
+        let flight_id = state.next_flight_id;
+        let (completion_tx, completion) =
+            tokio::sync::watch::channel(CapabilityRefreshState::Pending);
+        state.inflight.insert(
+            recipient_key,
+            CapabilityRefreshEntry {
+                flight_id,
+                completion: completion.clone(),
+                worker: None,
+            },
+        );
+        // Spawn while holding the registry mutex, then attach the handle before
+        // releasing it. If the future finishes immediately its Drop guard waits
+        // on this mutex, so shutdown can never observe an entry without its
+        // authoritative worker handle.
+        let guard = CapabilityRefreshGuard {
+            registry: std::sync::Arc::clone(self),
+            recipient_key,
+            flight_id,
+        };
+        let handle = tokio::spawn(worker(guard, completion_tx));
+        if let Some(entry) = state.inflight.get_mut(&recipient_key) {
+            entry.worker = Some(handle);
+        }
+        CapabilityRefreshRegistration::Started(completion)
+    }
+
+    fn close(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.closed = true;
+        }
+    }
+
+    async fn shutdown_workers(&self) {
+        let handles = {
+            let Ok(mut state) = self.state.lock() else {
+                return;
+            };
+            state.closed = true;
+            state
+                .inflight
+                .drain()
+                .filter_map(|(_, mut entry)| entry.worker.take())
+                .collect::<Vec<_>>()
+        };
+        for handle in &handles {
+            handle.abort();
+        }
+        let _results = futures::future::join_all(handles).await;
+    }
+
+    fn remove(&self, recipient_key: &[u8; 32], flight_id: u64) {
+        let Ok(mut state) = self.state.lock() else {
+            return;
+        };
+        if state
+            .inflight
+            .get(recipient_key)
+            .is_some_and(|entry| entry.flight_id == flight_id)
+        {
+            state.inflight.remove(recipient_key);
+        }
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.state
+            .lock()
+            .map(|state| state.inflight.len())
+            .unwrap_or_default()
+    }
+}
+
+struct CapabilityRefreshGuard {
+    registry: std::sync::Arc<CapabilityRefreshRegistry>,
+    recipient_key: [u8; 32],
+    flight_id: u64,
+}
+
+impl Drop for CapabilityRefreshGuard {
+    fn drop(&mut self) {
+        self.registry.remove(&self.recipient_key, self.flight_id);
+    }
+}
+
+/// Publish exactly one targeted capability request for `recipient`, then wait
+/// (bounded) for the signed response to be ingested.
+///
+/// ADR 0030 §2 specifies "one forced targeted capability refresh" — a single
+/// publish, not a retry loop. Returning early on a cache hit keeps a strict
+/// send that raced an in-flight advert from paying the full window.
+async fn run_strict_capability_refresh(
+    recipient: identity::AgentId,
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
+    shutdown_token: tokio_util::sync::CancellationToken,
+    deadline: tokio::time::Instant,
+    publish: impl std::future::Future<Output = error::NetworkResult<()>> + Send,
+) {
+    if capability_binding_supports_durable_ack(capability_store.lookup_binding(&recipient).as_ref())
+    {
+        return;
+    }
+
+    let published = tokio::select! {
+        result = publish => Some(result),
+        () = tokio::time::sleep_until(deadline) => None,
+        () = shutdown_token.cancelled() => None,
+    };
+    let Some(published) = published else {
+        return;
+    };
+    if let Err(error) = published {
+        tracing::warn!(
+            target: "dm.trace",
+            recipient = %hex::encode(recipient.as_bytes()),
+            %error,
+            "targeted capability refresh publish failed"
+        );
+    }
+
+    loop {
+        if capability_binding_supports_durable_ack(
+            capability_store.lookup_binding(&recipient).as_ref(),
+        ) {
+            return;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return;
+        }
+        tokio::select! {
+            _ = tokio::time::sleep(CAPABILITY_REFRESH_POLL_INTERVAL) => {}
+            () = tokio::time::sleep_until(deadline) => return,
+            () = shutdown_token.cancelled() => return,
+        }
+    }
+}
+
+/// Whether a cached binding can satisfy a strict send.
+///
+/// Requires both a v2 capability *and* a real machine binding: the ACK waiter
+/// is pinned to that machine, so a capability without one cannot produce the
+/// receipt the caller was promised.
+fn capability_binding_supports_durable_ack(
+    binding: Option<&dm_capability::CapabilityBinding>,
+) -> bool {
+    binding.is_some_and(|binding| {
+        binding.machine_id.0 != [0_u8; 32] && binding.capabilities.supports_durable_app_ack()
+    })
+}
+
 impl Agent {
     /// Create a new offline agent with default identity configuration.
     ///
@@ -3897,6 +4132,7 @@ impl Agent {
     /// token itself (idempotent), so calling `shutdown()` alone remains correct.
     pub fn begin_shutdown(&self) {
         self.shutdown_token.cancel();
+        self.capability_refreshes.close();
         let mut guard = match self.tracked_tasks.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -3921,6 +4157,7 @@ impl Agent {
         // 1. Signal every token-aware loop to break. Inert until now, so this
         //    is the first thing that changes steady-state behavior.
         self.shutdown_token.cancel();
+        self.capability_refreshes.shutdown_workers().await;
 
         // 2. Stop the simple Option<JoinHandle> background tasks.
         self.stop_identity_heartbeat().await;
@@ -4355,12 +4592,34 @@ impl Agent {
             return Ok(receipt);
         }
 
-        let advert_cap = self.capability_store.lookup(to);
+        let mut advert_binding = self.capability_store.lookup_binding(to);
+        // ADR 0030 §2: one forced targeted refresh before refusing. A daemon
+        // whose advert we simply have not heard yet must not be reported as
+        // incapable, but the refusal must still be bounded — the whole point
+        // of the 409 is that it is fast and deterministic, never a hang.
+        if config.require_durable_app_ack
+            && !capability_binding_supports_durable_ack(advert_binding.as_ref())
+        {
+            self.refresh_strict_dm_capability(*to).await;
+            advert_binding = self.capability_store.lookup_binding(to);
+        }
+        let advert_machine = advert_binding.as_ref().map(|binding| binding.machine_id);
+        let advert_cap = advert_binding.map(|binding| binding.capabilities);
         let advert_gossip_ready = advert_cap
             .as_ref()
             .is_some_and(|caps| caps.gossip_inbox && !caps.kem_public_key.is_empty());
-        let (cap, cap_source) = if advert_gossip_ready {
-            (advert_cap, "advert_cache")
+        let (cap, cap_machine, cap_source) = if advert_gossip_ready {
+            (advert_cap, advert_machine, "advert_cache")
+        } else if config.require_durable_app_ack {
+            // Strict semantics need a signed, machine-bound capability from
+            // the TTL-bounded runtime cache. The unbound contact-card fallback
+            // below cannot pin the ACK waiter to a machine, so it is never
+            // sufficient here.
+            (
+                advert_cap,
+                advert_machine,
+                "advert_cache_unusable_for_durable_ack",
+            )
         } else {
             let contact_cap = {
                 let contacts = self.contact_store.read().await;
@@ -4374,11 +4633,13 @@ impl Agent {
             };
             match contact_cap {
                 Some(cap) if advert_cap.is_some() => {
-                    (Some(cap), "contact_card_after_unusable_advert")
+                    (Some(cap), None, "contact_card_after_unusable_advert")
                 }
-                Some(cap) => (Some(cap), "contact_card"),
-                None if advert_cap.is_some() => (advert_cap, "advert_cache_unusable"),
-                None => (None, "none"),
+                Some(cap) => (Some(cap), None, "contact_card"),
+                None if advert_cap.is_some() => {
+                    (advert_cap, advert_machine, "advert_cache_unusable")
+                }
+                None => (None, None, "none"),
             }
         };
         let gossip_ok = cap
@@ -4395,17 +4656,49 @@ impl Agent {
             capability_store_entries = self.capability_store.len(),
         );
 
+        if config.require_durable_app_ack
+            && !capability_binding_supports_durable_ack(
+                cap.as_ref()
+                    .zip(cap_machine)
+                    .map(
+                        |(capabilities, machine_id)| dm_capability::CapabilityBinding {
+                            capabilities: capabilities.clone(),
+                            machine_id,
+                        },
+                    )
+                    .as_ref(),
+            )
+        {
+            tracing::info!(
+                target: "dm.trace",
+                stage = "strict_durable_ack_gate_refused",
+                recipient = %hex::encode(to.as_bytes()),
+                source = cap_source,
+                advertised_version = cap.as_ref().map(|c| c.max_protocol_version),
+                "refusing strict send: recipient has no current v2 capability advert"
+            );
+            return Err(dm::DmError::AckSemanticsUnavailable(format!(
+                "recipient {} has no current v2 durable-ACK capability advert",
+                hex::encode(to.as_bytes())
+            )));
+        }
+
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
         // key clone when the engine is enabled AND we have a key to seal
         // a fresh envelope with. With the default disabled policy this
         // closure never runs - the happy path pays nothing.
-        let relay_seed: Option<(Vec<u8>, Vec<u8>)> = if self.peer_relay.policy().enabled {
-            cap.as_ref()
-                .filter(|c| !c.kem_public_key.is_empty())
-                .map(|c| (payload.clone(), c.kem_public_key.clone()))
-        } else {
-            None
-        };
+        //
+        // A strict send never seeds the relay: a relayed envelope is resealed
+        // by a third party and cannot carry the machine-bound v2 receipt the
+        // caller demanded.
+        let relay_seed: Option<(Vec<u8>, Vec<u8>)> =
+            if self.peer_relay.policy().enabled && !config.require_durable_app_ack {
+                cap.as_ref()
+                    .filter(|c| !c.kem_public_key.is_empty())
+                    .map(|c| (payload.clone(), c.kem_public_key.clone()))
+            } else {
+                None
+            };
 
         let rtt_hint_ms = self.dm_peer_rtt_ms(to).await;
         let mut config = config;
@@ -4442,7 +4735,11 @@ impl Agent {
 
         let mut preferred_raw_err = None;
         let prefer_newest_grace = std::time::Duration::from_millis(config.prefer_newest_grace_ms);
-        let preferred_raw_receipt = if config.prefer_raw_quic_if_connected && !config.require_gossip
+        // The raw-QUIC path returns a transport receipt, never an application
+        // ACK, so it can never satisfy a strict send.
+        let preferred_raw_receipt = if config.prefer_raw_quic_if_connected
+            && !config.require_gossip
+            && !config.require_durable_app_ack
         {
             match self
                 .send_direct_raw_quic(
@@ -4505,6 +4802,7 @@ impl Agent {
                             inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
                         },
                         *to,
+                        cap_machine,
                         &kem_pub,
                         payload,
                         &config,
@@ -4783,6 +5081,55 @@ impl Agent {
     /// returned. This closes the X0X-0041 coverage gap surfaced by the
     /// SOTA-Borrow Phase A bisect (P1 finding; evidence in git history under
     /// `proofs/sota-borrow-phaseA-bisect-20260508T214634Z/ANALYSIS.md` §0.1).
+    /// Ask one recipient to republish its signed runtime capability and give
+    /// the local subscriber a bounded window to ingest it.
+    ///
+    /// Used only by strict (ADR 0030) sends after a TTL-bounded cache miss: a
+    /// daemon whose advert we simply have not heard yet gets one chance to
+    /// answer before the gate refuses. Concurrent strict sends to the same
+    /// recipient share a single flight.
+    async fn refresh_strict_dm_capability(&self, recipient: identity::AgentId) {
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        let pubsub = std::sync::Arc::clone(runtime.pubsub());
+        let capability_store = std::sync::Arc::clone(&self.capability_store);
+        let shutdown_token = self.shutdown_token.clone();
+        let deadline = tokio::time::Instant::now() + CAPABILITY_REFRESH_CONVERGENCE_WAIT;
+
+        let mut completion = match self.capability_refreshes.register_or_start(
+            recipient,
+            move |guard, completion_tx| async move {
+                run_strict_capability_refresh(
+                    recipient,
+                    capability_store,
+                    shutdown_token,
+                    deadline,
+                    dm_capability_service::publish_targeted_capability_request(&pubsub, recipient),
+                )
+                .await;
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            },
+        ) {
+            CapabilityRefreshRegistration::Started(completion)
+            | CapabilityRefreshRegistration::Joined(completion) => completion,
+            CapabilityRefreshRegistration::Unavailable => return,
+        };
+
+        while *completion.borrow() != CapabilityRefreshState::Finished {
+            tokio::select! {
+                changed = completion.changed() => {
+                    if changed.is_err() {
+                        return;
+                    }
+                }
+                () = tokio::time::sleep_until(deadline) => return,
+                () = self.shutdown_token.cancelled() => return,
+            }
+        }
+    }
+
     async fn send_direct_raw_quic(
         &self,
         agent_id: &identity::AgentId,
@@ -7508,8 +7855,17 @@ impl Agent {
         // Upgrade our advertised capabilities so peers stop falling back
         // to the raw-QUIC path. The capability advert service watches
         // this channel and republishes immediately on change.
-        let upgraded =
-            dm::DmCapabilities::pending().with_kem_public_key(kem_keypair.public_bytes.clone());
+        //
+        // ADR 0030 §3 targets: advertise v2 iff durable history is enabled.
+        // HELD AT v1 FOR NOW (PR #327 review): this binary carries the
+        // sender-side gate (slice 1) but NOT the receiver durable path
+        // (slice 2), so a v2 advert would be a false capability — a strict
+        // sender clears its gate, this receiver ACKs with v1 semantics, the
+        // exact-protocol waiter never matches, and the send hangs to timeout:
+        // exactly the failure mode ADR 0030 §2 forbids. Flip to
+        // `v2_durable_gossip_ready(...)` iff `history_handle.is_some()` in
+        // the same change that lands the slice-2 receiver path.
+        let upgraded = dm::DmCapabilities::v1_gossip_ready(kem_keypair.public_bytes.clone());
         // send_replace stores the value even when no receiver is subscribed
         // yet; a plain send() drops the upgrade if this runs before the
         // capability advert service subscribes, leaving peers cached on
@@ -7526,6 +7882,21 @@ impl Agent {
         if let Some(service) = guard.take() {
             service.abort();
         }
+        // Withdraw the advert: with no inbox running we can honour neither v1
+        // nor v2 gossip semantics, and peers must fall back rather than send
+        // into a topic nobody is reading.
+        self.dm_capabilities_tx
+            .send_replace(dm::DmCapabilities::pending());
+    }
+
+    /// This agent's currently advertised DM capabilities.
+    ///
+    /// Mirrors what the advert service publishes and what `runtime_agent_card`
+    /// exposes, so a peer importing our card sees the same protocol version
+    /// the mesh advert claims.
+    #[must_use]
+    pub fn current_dm_capabilities(&self) -> dm::DmCapabilities {
+        self.dm_capabilities_tx.borrow().clone()
     }
 
     /// Connect to cached peers in parallel, returning (succeeded, failed) peer lists.
@@ -10767,6 +11138,7 @@ impl AgentBuilder {
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
             capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
@@ -13033,6 +13405,236 @@ mod tests {
             matches!(err, dm::DmError::LocalGossipUnavailable(_)),
             "unexpected error: {err:?}"
         );
+    }
+
+    /// ADR 0030 §2, mixed-version row 2: a strict send to a peer advertising
+    /// v1 refuses with `AckSemanticsUnavailable` instead of silently
+    /// downgrading to v1 receipt semantics. The identical non-strict send
+    /// reaching a *different* error proves the refusal came from the gate and
+    /// not from the offline harness.
+    #[tokio::test]
+    async fn strict_send_to_a_v1_peer_refuses_with_ack_semantics_unavailable() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x61_u8; 32]);
+        let target_machine = identity::MachineId([0x62_u8; 32]);
+
+        assert!(agent.capability_store().insert(
+            target,
+            target_machine,
+            dm::DmCapabilities::v1_gossip_ready(vec![42_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+
+        let strict = dm::DmSendConfig {
+            require_gossip: true,
+            require_durable_app_ack: true,
+            ..dm::DmSendConfig::default()
+        };
+        let err = agent
+            .send_direct_with_config(&target, b"strict".to_vec(), strict.clone())
+            .await
+            .expect_err("strict send to a v1 peer must refuse");
+        assert!(
+            matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
+            "unexpected error: {err:?}"
+        );
+
+        let non_strict_err = agent
+            .send_direct_with_config(
+                &target,
+                b"non-strict".to_vec(),
+                dm::DmSendConfig {
+                    require_durable_app_ack: false,
+                    ..strict
+                },
+            )
+            .await
+            .expect_err("offline harness has no gossip runtime");
+        assert!(
+            matches!(non_strict_err, dm::DmError::LocalGossipUnavailable(_)),
+            "a non-strict send must be unaffected by the durable gate: {non_strict_err:?}"
+        );
+    }
+
+    /// A peer we have never heard from is indistinguishable from an
+    /// unreachable one at the gate: both refuse, neither hangs and neither
+    /// downgrades.
+    #[tokio::test]
+    async fn strict_send_to_an_unknown_peer_refuses_after_the_forced_refresh() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x63_u8; 32]);
+
+        // A trusted contact card claiming gossip support must NOT satisfy the
+        // strict gate: a card carries no signed machine binding to pin the ACK
+        // waiter to.
+        agent.contacts().write().await.add(contacts::Contact {
+            agent_id: target,
+            trust_level: contacts::TrustLevel::Trusted,
+            label: None,
+            added_at: 0,
+            last_seen: None,
+            identity_type: contacts::IdentityType::Known,
+            dm_capabilities: Some(dm::DmCapabilities::v2_durable_gossip_ready(vec![
+                42_u8;
+                1184
+            ])),
+            machines: Vec::new(),
+        });
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"strict".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    require_durable_app_ack: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("strict send to an unknown peer must refuse");
+        assert!(
+            matches!(err, dm::DmError::AckSemanticsUnavailable(_)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    /// A peer advertising v2 passes the gate. The send then fails downstream
+    /// (this harness has no gossip runtime) — asserting the *gate* moved on,
+    /// which is all slice 1 owns; end-to-end durable delivery needs the
+    /// receiver durable path.
+    #[tokio::test]
+    async fn strict_send_to_a_v2_peer_passes_the_gate() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await
+            .expect("agent");
+        let target = identity::AgentId([0x64_u8; 32]);
+
+        assert!(agent.capability_store().insert(
+            target,
+            identity::MachineId([0x65_u8; 32]),
+            dm::DmCapabilities::v2_durable_gossip_ready(vec![42_u8; 1184]),
+            dm_capability::now_unix_ms(),
+        ));
+
+        let err = agent
+            .send_direct_with_config(
+                &target,
+                b"strict".to_vec(),
+                dm::DmSendConfig {
+                    require_gossip: true,
+                    require_durable_app_ack: true,
+                    ..dm::DmSendConfig::default()
+                },
+            )
+            .await
+            .expect_err("offline harness has no gossip runtime");
+        assert!(
+            matches!(err, dm::DmError::LocalGossipUnavailable(_)),
+            "a current v2 advert must clear the gate: {err:?}"
+        );
+    }
+
+    /// Concurrent strict sends to one unknown recipient must publish a single
+    /// targeted request between them. Without single-flight the gate becomes a
+    /// gossip amplifier exactly when the mesh is least able to absorb it.
+    #[tokio::test]
+    async fn capability_refresh_registry_is_single_flight_per_recipient() {
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
+        let recipient = identity::AgentId([0x71_u8; 32]);
+        let other = identity::AgentId([0x72_u8; 32]);
+        let publishes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        // A watch latch rather than `Notify`: a worker that has not yet
+        // reached its await point would miss a notification, making the test
+        // itself the flake.
+        let (release_tx, release_rx) = tokio::sync::watch::channel(false);
+
+        let make_worker =
+            |publishes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+             mut release: tokio::sync::watch::Receiver<bool>| {
+                move |guard: CapabilityRefreshGuard,
+                  completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                publishes.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                while !*release.borrow_and_update() {
+                    if release.changed().await.is_err() {
+                        break;
+                    }
+                }
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            }
+            };
+
+        let first = registry.register_or_start(
+            recipient,
+            make_worker(publishes.clone(), release_rx.clone()),
+        );
+        assert!(matches!(first, CapabilityRefreshRegistration::Started(_)));
+        let second = registry.register_or_start(
+            recipient,
+            make_worker(publishes.clone(), release_rx.clone()),
+        );
+        assert!(
+            matches!(second, CapabilityRefreshRegistration::Joined(_)),
+            "a second strict send for the same recipient must join the flight"
+        );
+        // A different recipient is a genuinely different question and starts
+        // its own flight.
+        let third =
+            registry.register_or_start(other, make_worker(publishes.clone(), release_rx.clone()));
+        assert!(matches!(third, CapabilityRefreshRegistration::Started(_)));
+
+        release_tx.send_replace(true);
+        // The registry drains as each worker's guard drops.
+        for _ in 0..200 {
+            if registry.len() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(registry.len(), 0, "every flight must release its slot");
+        assert_eq!(
+            publishes.load(std::sync::atomic::Ordering::SeqCst),
+            2,
+            "two recipients means two flights, not three"
+        );
+    }
+
+    #[tokio::test]
+    async fn capability_refresh_registry_refuses_work_after_close() {
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::default());
+        registry.close();
+        let registration = registry.register_or_start(
+            identity::AgentId([0x73_u8; 32]),
+            |guard, completion_tx| async move {
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            },
+        );
+        assert!(matches!(
+            registration,
+            CapabilityRefreshRegistration::Unavailable
+        ));
+        assert_eq!(registry.len(), 0);
     }
 
     #[tokio::test]
