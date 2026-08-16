@@ -2,7 +2,7 @@
 
 All notable changes to this project will be documented in this file.
 
-## [Unreleased]
+## [v0.38.0] - 2026-08-16
 
 > The ADR 0030 durable-application-ACK campaign completes in this release
 > (slices 1–4). The headline behaviour change for anyone building on x0x is in
