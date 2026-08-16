@@ -21,20 +21,31 @@ pub async fn connect(client: &DaemonClient, agent_id: &str) -> Result<()> {
 /// and includes the RTT (or the failure reason) in the response under
 /// `require_ack`. This does NOT prove the specific message was delivered;
 /// it proves the peer's receive pipeline is live when the call returned.
+///
+/// `require_durable_app_ack` is sent explicitly rather than left to the
+/// daemon default (ADR 0030 §4). The CLI is a product surface, so its own
+/// default is durable; sending the field means an older CLI paired with a
+/// newer daemon — or the reverse — never silently swaps receipt semantics.
 pub async fn send(
     client: &DaemonClient,
     agent_id: &str,
     message: &str,
     require_ack_ms: Option<u64>,
+    require_durable_app_ack: bool,
+    logical_id: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let encoded = base64::engine::general_purpose::STANDARD.encode(message.as_bytes());
     let mut body = serde_json::json!({
         "agent_id": agent_id,
         "payload": encoded,
+        "require_durable_app_ack": require_durable_app_ack,
     });
     if let Some(ms) = require_ack_ms {
         body["require_ack_ms"] = serde_json::json!(ms);
+    }
+    if let Some(logical_id) = logical_id {
+        body["logical_id"] = serde_json::json!(logical_id);
     }
     let resp = client.post("/direct/send", &body).await?;
     print_value(client.format(), &resp);
@@ -106,7 +117,7 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true, "path": "gossip_inbox"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = send(&client, &"aa".repeat(32), "hello", None).await;
+        let result = send(&client, &"aa".repeat(32), "hello", None, true, None).await;
         assert!(result.is_ok(), "send should succeed: {:?}", result);
     }
 
@@ -115,8 +126,60 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true, "require_ack": {"ok": true, "rtt_ms": 12}});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = send(&client, &"aa".repeat(32), "hello", Some(500)).await;
+        let result = send(&client, &"aa".repeat(32), "hello", Some(500), true, None).await;
         assert!(result.is_ok(), "send with ack should succeed: {:?}", result);
+    }
+
+    /// ADR 0030 §4 puts the CLI in the product tier. The flag names are the
+    /// negative (`--no-durable-ack`), so a plain `x0x direct send` must put
+    /// `require_durable_app_ack: true` on the wire — and must do so explicitly,
+    /// because relying on the daemon default would make the CLI's promise
+    /// depend on which daemon version answered.
+    #[tokio::test]
+    async fn send_asks_for_durable_semantics_explicitly_and_carries_the_logical_id() {
+        let (url, _shutdown, captured) =
+            crate::cli::commands::test_support::start_capturing_mock_server(
+                serde_json::json!({"ok": true}),
+            )
+            .await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            true,
+            Some("order-7"),
+        )
+        .await
+        .unwrap();
+        send(&client, &"aa".repeat(32), "hello", None, false, None)
+            .await
+            .unwrap();
+
+        let requests: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/direct/send")
+            .map(|(_, body)| body.clone())
+            .collect();
+        assert_eq!(requests.len(), 2, "both sends should reach /direct/send");
+        assert_eq!(
+            requests[0]["require_durable_app_ack"],
+            serde_json::json!(true)
+        );
+        assert_eq!(requests[0]["logical_id"], serde_json::json!("order-7"));
+        assert_eq!(
+            requests[1]["require_durable_app_ack"],
+            serde_json::json!(false),
+            "--no-durable-ack must reach the daemon, not be dropped"
+        );
+        assert!(
+            requests[1].get("logical_id").is_none(),
+            "an omitted logical_id must not be sent as null"
+        );
     }
 
     async fn start_sse_server(body: &'static str) -> (String, tokio::sync::oneshot::Sender<()>) {

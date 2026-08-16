@@ -59,6 +59,10 @@ pub(in crate::server) struct DirectSendRequest {
     /// Base64-encoded payload.
     pub(in crate::server) payload: String,
     /// Prefer the raw-QUIC path when a live direct connection exists.
+    ///
+    /// Ignored by a durable send: raw QUIC yields a transport receipt, which
+    /// can never certify the recipient's durable commit (see
+    /// `require_durable_app_ack`).
     #[serde(default)]
     pub(in crate::server) prefer_raw_quic_if_connected: Option<bool>,
     /// Optional raw-QUIC receive-pipeline ACK timeout for the message itself.
@@ -72,34 +76,119 @@ pub(in crate::server) struct DirectSendRequest {
     /// gossip DM capability.
     #[serde(default)]
     pub(in crate::server) require_gossip: bool,
-    /// If set, override whether gossip-inbox sends wait for the recipient's
-    /// inbox ACK before returning success. When omitted, the daemon default is
-    /// used.
+    /// **Removed** (ADR 0030 §4). Setting this field in any form is a 400.
+    ///
+    /// Typed as a raw value rather than `Option<bool>` deliberately: the
+    /// contract is "this field is gone", so `"require_gossip_ack": "maybe"`
+    /// must answer the same documented 400 as `false` does, not an opaque
+    /// deserialization rejection from the JSON extractor.
     #[serde(default)]
-    pub(in crate::server) require_gossip_ack: Option<bool>,
+    pub(in crate::server) require_gossip_ack: Option<serde_json::Value>,
     /// Optional opt-in: after the DM path accepts the message, probe the
     /// recipient's ant-quic receive pipeline for liveness with this timeout.
     /// This does not force the message itself onto raw-QUIC receive-ACK.
     #[serde(default)]
     pub(in crate::server) require_ack_ms: Option<u64>,
+    /// ADR 0030 §4 opt-out. This product surface is durable-by-default:
+    /// omitting the field selects `true`, so `ok: true` means the recipient
+    /// durably committed the message and completed local dispatch. Pass
+    /// `false` for v1 semantics (`ok: true` means "accepted for delivery"),
+    /// which is what a caller does when reaching a peer that has not upgraded
+    /// matters more than the stronger receipt.
+    #[serde(default)]
+    pub(in crate::server) require_durable_app_ack: Option<bool>,
+    /// Caller-supplied idempotency key for this logical send (ADR 0030 §4).
+    ///
+    /// 1–128 chars of `[a-z0-9]`, `-`, `_`, `.`, `:`. Resending the same token
+    /// to the same recipient is *the same request*: the recipient re-ACKs the
+    /// original commit instead of storing a second copy. Reusing it for
+    /// different bytes is a 409 `idempotency_conflict`.
+    #[serde(default)]
+    pub(in crate::server) logical_id: Option<String>,
 }
 
-fn direct_send_config_for_request(req: &DirectSendRequest) -> x0x::dm::DmSendConfig {
+/// A request the route refuses before any send is attempted, carrying the
+/// exact wire contract (`error` code + `detail`) the caller sees.
+#[derive(Debug)]
+struct DirectSendRequestRejection {
+    status: StatusCode,
+    code: &'static str,
+    detail: String,
+}
+
+impl DirectSendRequestRejection {
+    fn into_response(self) -> (StatusCode, Json<serde_json::Value>) {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": self.code,
+                "detail": self.detail,
+            })),
+        )
+    }
+}
+
+fn direct_send_config_for_request(
+    req: &DirectSendRequest,
+    self_agent_id: x0x::identity::AgentId,
+    recipient: x0x::identity::AgentId,
+) -> Result<x0x::dm::DmSendConfig, DirectSendRequestRejection> {
+    // ADR 0030 §4: `require_gossip_ack` is removed from the product surface,
+    // and removal is announced, not silent. Accepting it as a no-op would let
+    // a caller keep believing it selected fire-and-forget while every send
+    // blocked on an ACK — the exact silent-degradation class ADR 0025 forbids.
+    if req.require_gossip_ack.is_some() {
+        return Err(DirectSendRequestRejection {
+            status: StatusCode::BAD_REQUEST,
+            code: "require_gossip_ack_removed",
+            detail: "require_gossip_ack was removed in ADR 0030 §4; use \
+                     require_durable_app_ack to choose receipt semantics"
+                .to_string(),
+        });
+    }
+
     let mut config = direct_message_send_config();
     if let Some(prefer_raw_quic_if_connected) = req.prefer_raw_quic_if_connected {
         config.prefer_raw_quic_if_connected = prefer_raw_quic_if_connected;
     }
     config.stop_fallback_on_raw_error = req.stop_fallback_on_raw_error;
     config.require_gossip = req.require_gossip;
-    if let Some(require_gossip_ack) = req.require_gossip_ack {
-        config.require_gossip_ack = require_gossip_ack;
-    }
+    // ADR 0030 §4 product tier: durable unless the caller opts out.
+    config.require_durable_app_ack = req.require_durable_app_ack.unwrap_or(true);
     if let Some(raw_ack_ms) = req.raw_quic_receive_ack_ms {
         config.raw_quic_receive_ack_timeout = Some(std::time::Duration::from_millis(
             raw_ack_ms.clamp(100, 30_000),
         ));
     }
-    config
+    if let Some(raw_logical_id) = &req.logical_id {
+        let logical_id = x0x::dm::DmLogicalId::parse(raw_logical_id).map_err(|detail| {
+            DirectSendRequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                code: "invalid_logical_id",
+                detail,
+            }
+        })?;
+        // `logical_id` only means something under durable semantics: the
+        // recipient's binding and durable-history checks are what recognise a
+        // retry and answer `idempotency_conflict`. A v1 send carries the
+        // derived id on the wire but nothing on the receiver consults it, so
+        // accepting the combination would hand back an idempotency guarantee
+        // that does not exist. Refuse instead of documenting a silent no-op —
+        // a caller who asked for at-least-once retry identity and got
+        // fire-and-forget has no way to notice.
+        if !config.require_durable_app_ack {
+            return Err(DirectSendRequestRejection {
+                status: StatusCode::BAD_REQUEST,
+                code: "logical_id_requires_durable_ack",
+                detail: "logical_id has no effect without durable delivery; \
+                         remove require_durable_app_ack: false or drop logical_id"
+                    .to_string(),
+            });
+        }
+        config.logical_request_id = Some(logical_id.request_id(self_agent_id, recipient));
+    }
+    Ok(config)
 }
 
 /// POST /agents/connect — connect to a discovered agent.
@@ -244,6 +333,14 @@ pub(in crate::server) async fn direct_send(
         }
     };
 
+    // Request-shape validation precedes trust and payload handling: a removed
+    // or malformed field is refused unconditionally, so a caller debugging the
+    // 400 never has to wonder whether trust state changed the answer.
+    let send_config = match direct_send_config_for_request(&req, state.agent.agent_id(), agent_id) {
+        Ok(config) => config,
+        Err(rejection) => return rejection.into_response(),
+    };
+
     // Check trust level before sending — reject blocked agents
     {
         let contacts = state.contacts.read().await;
@@ -258,8 +355,6 @@ pub(in crate::server) async fn direct_send(
         Ok(p) => p,
         Err(resp) => return resp,
     };
-
-    let send_config = direct_send_config_for_request(&req);
 
     match state
         .agent
@@ -358,6 +453,14 @@ pub(in crate::server) async fn direct_send(
                 // resend with `require_durable_app_ack = false`.
                 x0x::dm::DmError::AckSemanticsUnavailable(_) => {
                     (StatusCode::CONFLICT, "recipient_ack_semantics_unavailable")
+                }
+                // ADR 0030 §1: the recipient holds this `logical_id` bound to
+                // different bytes. 409 like the line above, but the caller's
+                // repair is the opposite — not "retry / upgrade the peer" but
+                // "you reused an idempotency key; pick a new one or resend the
+                // original bytes". Retrying this one is guaranteed to fail.
+                x0x::dm::DmError::IdempotencyConflict(_) => {
+                    (StatusCode::CONFLICT, "idempotency_conflict")
                 }
                 x0x::dm::DmError::Timeout { .. } => (StatusCode::GATEWAY_TIMEOUT, "timeout"),
                 x0x::dm::DmError::PeerLikelyOffline { .. } => {
@@ -461,53 +564,226 @@ mod tests {
         );
     }
 
-    #[test]
-    fn direct_send_request_preserves_raw_quic_default_unless_explicitly_overridden() {
-        let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
-            "agent_id": "00".repeat(32),
-            "payload": ""
-        }))
-        .expect("minimal direct-send request should deserialize");
-        assert!(direct_send_config_for_request(&omitted).prefer_raw_quic_if_connected);
-
-        let disabled: DirectSendRequest = serde_json::from_value(serde_json::json!({
-            "agent_id": "00".repeat(32),
-            "payload": "",
-            "prefer_raw_quic_if_connected": false
-        }))
-        .expect("direct-send request with explicit override should deserialize");
-        assert!(!direct_send_config_for_request(&disabled).prefer_raw_quic_if_connected);
+    fn test_agent_id(byte: u8) -> x0x::identity::AgentId {
+        x0x::identity::AgentId([byte; 32])
     }
 
-    /// ADR 0030 §4 deprecates `require_gossip_ack` but objects specifically to
-    /// *silently discarding* it — the campaign branch accepted
-    /// `require_gossip_ack: false` and ignored it, so a caller asking for
-    /// fire-and-forget got a blocking send with no signal. This route honors
-    /// it, and must keep honoring it until slice 4 replaces acceptance with an
-    /// explicit 400. If a later slice makes the field a no-op, this test fails
-    /// rather than letting the silence back in.
-    #[test]
-    fn deprecated_require_gossip_ack_is_honored_not_silently_discarded() {
-        let omitted: DirectSendRequest = serde_json::from_value(serde_json::json!({
-            "agent_id": "00".repeat(32),
-            "payload": ""
-        }))
-        .expect("minimal direct-send request should deserialize");
-        assert!(
-            direct_send_config_for_request(&omitted).require_gossip_ack,
-            "omitting the field must select the daemon default (true)"
-        );
+    fn parse_request(value: serde_json::Value) -> DirectSendRequest {
+        serde_json::from_value(value).expect("direct-send request should deserialize")
+    }
 
-        let disabled: DirectSendRequest = serde_json::from_value(serde_json::json!({
+    fn config_for(value: serde_json::Value) -> Result<x0x::dm::DmSendConfig, StatusCode> {
+        direct_send_config_for_request(&parse_request(value), test_agent_id(1), test_agent_id(2))
+            .map_err(|rejection| rejection.status)
+    }
+
+    fn config_ok(value: serde_json::Value) -> x0x::dm::DmSendConfig {
+        config_for(value).expect("request should be accepted")
+    }
+
+    #[test]
+    fn direct_send_request_preserves_raw_quic_default_unless_explicitly_overridden() {
+        assert!(
+            config_ok(serde_json::json!({ "agent_id": "00".repeat(32), "payload": "" }))
+                .prefer_raw_quic_if_connected
+        );
+        assert!(
+            !config_ok(serde_json::json!({
+                "agent_id": "00".repeat(32),
+                "payload": "",
+                "prefer_raw_quic_if_connected": false
+            }))
+            .prefer_raw_quic_if_connected
+        );
+    }
+
+    /// ADR 0030 §4: this product surface promises a durable receipt unless the
+    /// caller says otherwise. The whole bug class this ADR exists to kill is a
+    /// product believing `ok: true` meant "committed" when it meant "enqueued";
+    /// defaulting to `false` here would restore it while the docs claimed
+    /// otherwise.
+    #[test]
+    fn product_rest_sends_are_durable_unless_the_caller_opts_out() {
+        assert!(
+            config_ok(serde_json::json!({ "agent_id": "00".repeat(32), "payload": "" }))
+                .require_durable_app_ack,
+            "omitting require_durable_app_ack must select the product default (true)"
+        );
+        assert!(
+            !config_ok(serde_json::json!({
+                "agent_id": "00".repeat(32),
+                "payload": "",
+                "require_durable_app_ack": false
+            }))
+            .require_durable_app_ack,
+            "an explicit false is the documented opt-out and must reach the config"
+        );
+    }
+
+    /// ADR 0030 §4 classifies WS and daemon control-plane sends as the internal
+    /// tier. They share `direct_message_send_config` with this route, so the
+    /// product default must live in the request-scoped builder — flipping it in
+    /// the shared helper would silently make every welcome blob and TreeKEM
+    /// message a strict send, which v0.37.0 already showed causes livelock.
+    #[test]
+    fn the_shared_internal_send_config_stays_v1() {
+        assert!(!direct_message_send_config().require_durable_app_ack);
+    }
+
+    /// ADR 0030 §4 requires the removal of `require_gossip_ack` to be
+    /// *announced*. Accepting it as a no-op is the failure mode the ADR names
+    /// explicitly: a caller asking for fire-and-forget would get a blocking
+    /// durable send and no signal that its request was reinterpreted.
+    #[test]
+    fn require_gossip_ack_is_rejected_in_any_form_not_silently_accepted() {
+        for value in [
+            serde_json::json!(false),
+            serde_json::json!(true),
+            serde_json::json!("maybe"),
+        ] {
+            let rejection = direct_send_config_for_request(
+                &parse_request(serde_json::json!({
+                    "agent_id": "00".repeat(32),
+                    "payload": "",
+                    "require_gossip_ack": value
+                })),
+                test_agent_id(1),
+                test_agent_id(2),
+            )
+            .expect_err("setting the removed field must be refused");
+            assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+            assert_eq!(rejection.code, "require_gossip_ack_removed");
+        }
+
+        assert!(
+            config_for(serde_json::json!({ "agent_id": "00".repeat(32), "payload": "" })).is_ok(),
+            "omitting the field is the correct way to send and must stay accepted"
+        );
+        // An explicit JSON null asks for nothing, exactly like omission, and
+        // serde treats it that way for every other optional field on this
+        // body. Rejecting it would punish clients that serialize their whole
+        // struct with nulls rather than clients that still want the old
+        // behaviour.
+        assert!(config_for(serde_json::json!({
             "agent_id": "00".repeat(32),
             "payload": "",
-            "require_gossip_ack": false
+            "require_gossip_ack": null
         }))
-        .expect("direct-send request with explicit override should deserialize");
-        assert!(
-            !direct_send_config_for_request(&disabled).require_gossip_ack,
-            "an explicit false must reach the send config, not be discarded"
+        .is_ok());
+    }
+
+    /// The point of `logical_id` is that a retry — including one issued by a
+    /// different process after a restart — resolves to the *same* wire request
+    /// id, so the recipient re-ACKs rather than storing a second copy. A
+    /// derivation that mixed in time, randomness, or payload bytes would look
+    /// fine in a single-shot test and silently deliver duplicates in the field.
+    #[test]
+    fn logical_id_derives_a_stable_request_id_bound_to_the_directed_pair() {
+        let request = |logical_id: &str, payload: &str| {
+            parse_request(serde_json::json!({
+                "agent_id": "00".repeat(32),
+                "payload": payload,
+                "logical_id": logical_id
+            }))
+        };
+        let derive = |logical_id: &str, payload: &str, recipient: u8| {
+            direct_send_config_for_request(
+                &request(logical_id, payload),
+                test_agent_id(1),
+                test_agent_id(recipient),
+            )
+            .expect("valid logical_id should be accepted")
+            .logical_request_id
+            .expect("a logical_id must populate logical_request_id")
+        };
+
+        let first = derive("order-42", "", 2);
+        assert_eq!(
+            first,
+            derive("order-42", "aGVsbG8=", 2),
+            "the same token to the same peer is one logical request whatever the bytes"
         );
+        assert_ne!(
+            first,
+            derive("order-43", "", 2),
+            "distinct tokens must not collide"
+        );
+        assert_ne!(
+            first,
+            derive("order-42", "", 3),
+            "one token fanned out to two peers must not share a sender-side ACK waiter"
+        );
+
+        assert!(
+            config_ok(serde_json::json!({ "agent_id": "00".repeat(32), "payload": "" }))
+                .logical_request_id
+                .is_none(),
+            "omitting logical_id must keep the fresh-random-id behaviour"
+        );
+    }
+
+    /// ADR 0030 slice 4 review: `logical_id` is only honoured by the durable
+    /// receiver path, so pairing it with the opt-out would hand back an
+    /// at-least-once retry identity that nothing enforces. Refused rather than
+    /// documented as a no-op — a caller who asked for idempotency and silently
+    /// got fire-and-forget has no way to discover it until duplicates appear.
+    #[test]
+    fn a_logical_id_without_durable_delivery_is_refused_not_ignored() {
+        let rejection = direct_send_config_for_request(
+            &parse_request(serde_json::json!({
+                "agent_id": "00".repeat(32),
+                "payload": "",
+                "logical_id": "order-42",
+                "require_durable_app_ack": false
+            })),
+            test_agent_id(1),
+            test_agent_id(2),
+        )
+        .expect_err("logical_id with the durable opt-out must be refused");
+        assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+        assert_eq!(rejection.code, "logical_id_requires_durable_ack");
+
+        // Each half alone stays valid — the refusal is about the combination.
+        assert!(config_for(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "logical_id": "order-42"
+        }))
+        .is_ok());
+        assert!(config_for(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "require_durable_app_ack": false
+        }))
+        .is_ok());
+    }
+
+    /// A rejected token must not reach the send path at all: silently dropping
+    /// an unusable `logical_id` would hand the caller a fresh random id and the
+    /// at-least-once retry identity they asked for would not exist.
+    #[test]
+    fn a_malformed_logical_id_is_refused_rather_than_ignored() {
+        for bad in ["", "Order-42", "order 42", "order/42", &"a".repeat(129)] {
+            let rejection = direct_send_config_for_request(
+                &parse_request(serde_json::json!({
+                    "agent_id": "00".repeat(32),
+                    "payload": "",
+                    "logical_id": bad
+                })),
+                test_agent_id(1),
+                test_agent_id(2),
+            )
+            .err()
+            .unwrap_or_else(|| panic!("logical_id {bad:?} must be refused"));
+            assert_eq!(rejection.status, StatusCode::BAD_REQUEST);
+            assert_eq!(rejection.code, "invalid_logical_id");
+        }
+        assert!(config_for(serde_json::json!({
+            "agent_id": "00".repeat(32),
+            "payload": "",
+            "logical_id": &"a".repeat(128)
+        }))
+        .is_ok());
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

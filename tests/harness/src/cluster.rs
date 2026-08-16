@@ -204,6 +204,43 @@ impl AgentInstance {
             .expect("GET request failed")
     }
 
+    /// Wait until this daemon has *an* advert in its capability store.
+    ///
+    /// Since ADR 0030 slice 4 a bare `POST /direct/send` is a durable send, so it
+    /// depends on the recipient's advert having converged. This shortens that
+    /// window but does **not** close it: `capability_store_entries` is the only
+    /// REST-visible signal, and it is a count — it cannot say whether the entry is
+    /// the signed, machine-bound v2 binding the strict gate actually requires.
+    ///
+    /// Measured on this fixture: the first durable send to a peer takes ~17.5 s
+    /// even after this wait returns (subsequent sends ~200-450 ms), because the
+    /// send itself still performs the ADR 0030 §2 forced targeted refresh and
+    /// waits for the gossip ACK. A caller whose HTTP timeout is below that will
+    /// still fail. Closing the gap properly needs either a REST surface exposing
+    /// per-peer advert state, or a product change to the cold-start path.
+    ///
+    /// # Panics
+    ///
+    /// Panics if no advert appears within `deadline`.
+    pub async fn wait_for_durable_capability(&self, deadline: std::time::Duration) {
+        let started = std::time::Instant::now();
+        let mut polls = 0_usize;
+        while started.elapsed() < deadline {
+            polls += 1;
+            let resp = self.get("/diagnostics/dm").await;
+            if let Ok(body) = resp.json::<serde_json::Value>().await {
+                if body["capability_store_entries"].as_u64().unwrap_or(0) > 0 {
+                    return;
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+        panic!(
+            "no peer capability advert converged within {deadline:?} ({polls} polls); \
+             a durable /direct/send would 409"
+        );
+    }
+
     /// Authenticated POST request with JSON body.
     pub async fn post(&self, path: &str, body: serde_json::Value) -> reqwest::Response {
         reqwest::Client::new()

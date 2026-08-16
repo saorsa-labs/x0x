@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+> The ADR 0030 durable-application-ACK campaign completes in this release
+> (slices 1–4). The headline behaviour change for anyone building on x0x is in
+> **Changed** below: `POST /direct/send` is now durable-by-default, so a `200`
+> means the recipient committed the message, and a peer that has not upgraded
+> answers `409` instead of accepting silently.
+
 ### Added
 
 - **Hedged bounded background publisher for durable v2 ACKs (#335).** A
@@ -18,6 +24,33 @@ All notable changes to this project will be documented in this file.
   (`RemoteReceiveBackpressured`) rather than blocking the inbox loop, and
   route errors or timeouts increment the new `ack_publish_route_failed`
   diagnostic counter. The v1 ACK path is byte-for-byte unchanged.
+
+- **Product send tiers (ADR 0030 §4, slice 4).** The two send tiers named by
+  the ADR are now real. The *product* tier — `POST /direct/send` and
+  `x0x direct send` — requires ADR 0030 durable application-ACK semantics by
+  default. The *internal* tier — the WebSocket `send_direct` frame, the library
+  `Agent::send_direct*` default config, and daemon control-plane sends (welcome
+  blobs, TreeKEM plumbing, group metadata) — keeps v1 semantics; those messages
+  deliberately race connection establishment and livelock under strict gating.
+  `api-reference.md` marks the WebSocket surface internal.
+- **`logical_id` on `POST /direct/send` and `x0x direct send --logical-id`.**
+  A caller-supplied idempotency key (1–128 chars of `[a-z0-9._:-]`) giving
+  product callers the same at-least-once retry identity the bootstrap outbox
+  uses internally. Resending the same token to the same recipient — across a
+  timeout, a reconnect, or a restart — is one logical request: the recipient
+  re-ACKs the original commit rather than storing a duplicate. The wire request
+  id is `blake3::derive_key("x0x dm logical request id v1", sender ‖ recipient
+  ‖ token)[..16]`; the token itself never goes on the wire, and binding both
+  agent ids keeps one token fanned out to two peers from colliding on the
+  sender's ACK waiter.
+- **`idempotency_conflict`** (`DmError::IdempotencyConflict`,
+  `DmAckOutcome::IdempotencyConflict`, REST **409 `idempotency_conflict`**).
+  Reusing a `logical_id` for different bytes is now its own typed error.
+- **400 `logical_id_requires_durable_ack`.** `logical_id` is only honoured by
+  the durable receiver path, so sending it with `require_durable_app_ack:
+  false` is refused rather than silently ignored — otherwise the caller holds
+  an at-least-once retry identity nothing enforces and finds out only when
+  duplicates appear. `x0x direct send` rejects the same pair at the CLI.
 
 - **Durable signed-public bootstrap outbox (ADR 0030 §5, slice 3b).** Adding a
   member to a SignedPublic group used to direct-send the roster snapshot
@@ -93,9 +126,65 @@ All notable changes to this project will be documented in this file.
   envelopes above it are dropped without an ACK. Agent cards export the same
   runtime value, and card imports go through `CapabilityStore::insert_from_card`
   so a stale card can never lower a live signed advert.
-
 ### Changed
 
+- **BREAKING — `POST /direct/send` and `x0x direct send` are durable by
+  default (ADR 0030 §4, slice 4).** A `200` now means the recipient daemon
+  durably committed the message to its ADR-0023 history store and completed
+  local dispatch, not merely that it accepted the envelope. Pass
+  `require_durable_app_ack: false` (CLI: `--no-durable-ack`) for the previous
+  v1 semantics.
+
+  **What breaks:** a send to a peer running 0.37.x, or to any peer without
+  durable history enabled, now answers **409
+  `recipient_ack_semantics_unavailable`** where it previously returned `200`.
+  This is deliberate — ADR 0030 §2 forbids a silent downgrade, because a `200`
+  that sometimes means "committed" and sometimes means "enqueued" is the
+  ambiguity the whole protocol exists to remove. Handle the 409 as a
+  first-class UX state ("peer needs upgrade"), or opt out per message. The
+  refusal is fast and deterministic (one forced capability refresh), never a
+  timeout.
+
+  Durable sends also never take the raw-QUIC fast path, since a transport
+  receipt cannot certify a durable commit; `prefer_raw_quic_if_connected` is
+  ignored unless you also opt out of durable semantics.
+- **BREAKING — `require_gossip_ack` is rejected with 400 on `POST
+  /direct/send`** (ADR 0030 §4). Deprecated in the previous release, the field
+  now answers **400 `require_gossip_ack_removed`** when set in any form; an
+  explicit `null`, like omission, is still accepted. Accepting it as a silent
+  no-op was rejected in review: a client passing `require_gossip_ack: false`
+  for fire-and-forget would otherwise get a blocking durable send with no
+  signal that its request had been reinterpreted. Use
+  `require_durable_app_ack` to choose receipt semantics. Internal library
+  callers are unaffected — `DmSendConfig::require_gossip_ack` is unchanged.
+- **The strict-send gate no longer reports a stranger as a peer needing an
+  upgrade.** `AckSemanticsUnavailable` means "this peer does not advertise
+  v2", which presupposes we know the peer; an agent id with **no capability
+  advert and no contact card of any kind** now yields `RecipientKeyUnavailable`
+  (404) as it always did for non-strict sends. Without this, flipping the
+  product default would have turned every send to an undiscovered agent into a
+  409 telling the UI to chase a fleet upgrade for a peer that was never found.
+  The boundary is "do we know this agent", not "has its advert converged" — a
+  contact card whose `dm_capabilities` have not arrived yet is a known peer and
+  still gets the 409.
+- **A rebound logical request now reports `idempotency_conflict`, not
+  `recipient_ack_semantics_unavailable`.** Both receiver-side binding-conflict
+  paths (the in-memory replay cache and the restart-spanning durable-history
+  lookup) previously reused the semantics-unavailable outcome, which told a
+  product "the peer needs upgrading" when the truth was "your client reused an
+  idempotency key". The two errors prescribe opposite repairs — retry-later
+  versus never-retry-these-bytes. `AckSemanticsUnavailable` now carries only
+  its semantics-unavailable meaning.
+- **A v2 replay is no longer re-ACKed before its binding is checked.** The
+  inbox fast path re-ACKed any envelope whose logical request was already in
+  the replay cache, which for a durable envelope meant answering `Accepted`
+  without comparing the payload against the committed binding — so a caller
+  that reused a `logical_id` for different bytes was told the new bytes were
+  stored when they were not. Durable envelopes replaying a completed request
+  now fall through to the durable path, which owns the full ADR 0030 §1 replay
+  decision. This was unreachable before slice 4 (only the bootstrap outbox set
+  a logical request id, and it derives one per payload digest); exposing
+  `logical_id` to callers is what makes it reachable.
 - **The v2 capability advert is now live and conditional (ADR 0030 §3).**
   `start_dm_inbox` advertises `max_protocol_version = 2` **iff** a durable
   history handle is present, else 1. The slice-1 hold is lifted because the
@@ -118,9 +207,13 @@ All notable changes to this project will be documented in this file.
 
 ### Notes
 
-- No send surface sets `require_durable_app_ack` yet: REST, CLI, WS and the
-  library default stay v1-defaulted, so these slices remain behaviour-neutral
-  for existing callers. Product defaults flip in ADR 0030 slice 4.
+- **Send surfaces are split into two tiers as of slice 4.** The product tier
+  (`POST /direct/send`, `x0x direct send`) defaults
+  `require_durable_app_ack = true`; the internal tier (WS `send_direct`, the
+  library default config, and daemon control-plane sends) stays v1-defaulted.
+  Existing callers of the internal tier are unaffected; product callers get
+  the stronger receipt and must handle the 409 for peers that cannot honour
+  it. See **Changed** above for the migration.
 - **v1 senders are unaffected.** A v1 envelope takes the unchanged legacy
   path and receives a v1 ACK even on a receiver with durable history enabled;
   enabling history never silently upgrades the receipt an 0.37 peer is handed.
@@ -129,16 +222,15 @@ All notable changes to this project will be documented in this file.
   without a receiver that can commit. This daemon cannot be that peer: it
   advertises v2 only when history is enabled, and withholds the ACK rather
   than downgrading if history becomes unavailable at runtime.
-- **Typed routes (ADR 0030 §7): the obligation is documented, not closed.**
-  Typed-prefix families (group ingest, KV deltas, exec audit, card import,
-  voice signalling) classify `Ephemeral` — their durable effect lives in
-  their own store, not in DM history — and are handed off with a
-  non-blocking `try_send` that may drop. A DM-history commit therefore
-  cannot honestly back their receipt, so a v2 envelope matching a typed
-  route gets **no** ACK in this slice, and each handler carries the
-  restart-spanning dedupe obligation via its own durable surface. The
-  typed-route completion signal that lets these frames earn a v2 ACK is
-  slice 3.
+- **Typed routes (ADR 0030 §7): the obligation is closed.** Typed-prefix
+  families (group ingest, KV deltas, exec audit, card import, voice
+  signalling) classify `Ephemeral` — their durable effect lives in their own
+  store, not in DM history — so a DM-history commit could never honestly back
+  their receipt. Rather than withholding every v2 ACK on these routes, the
+  handler now reports when the payload is durably recorded on *its* surface,
+  and that completion signal is what releases the ACK (see the typed-route
+  durable completion signal under **Added**). Dropping the completion, like
+  dropping the channel, still withholds the ACK.
 - Durable v2 is **at-least-once across restart**: the replay cache is
   memory-only, so a restart can re-dispatch an already-committed envelope.
   The durable-history lookup keeps it to exactly one history row, and

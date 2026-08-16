@@ -812,6 +812,23 @@ enum DirectSub {
         /// (ant-quic 0.27.1 `probe_peer`). Response includes RTT or reason.
         #[arg(long)]
         require_ack_ms: Option<u64>,
+        /// Opt out of ADR 0030 durable delivery: succeed as soon as the
+        /// recipient accepts the envelope, instead of requiring proof it was
+        /// durably committed. Use to reach a peer that has not upgraded —
+        /// without this flag such a peer answers 409
+        /// `recipient_ack_semantics_unavailable`.
+        #[arg(long)]
+        no_durable_ack: bool,
+        /// Stable idempotency key for this logical send (1-128 chars of
+        /// [a-z0-9], '-', '_', '.', ':'). Resending the same value to the same
+        /// recipient is a retry of one request, not a second message.
+        ///
+        /// Requires durable delivery: only the durable receiver path consults
+        /// the id, so pairing it with --no-durable-ack would promise an
+        /// idempotency guarantee nothing enforces. Rejected here rather than
+        /// after a round trip to the daemon, which refuses the same pair.
+        #[arg(long, conflicts_with = "no_durable_ack")]
+        logical_id: Option<String>,
     },
     /// List established direct connections.
     Connections,
@@ -1667,7 +1684,19 @@ async fn run(
                 agent_id,
                 message,
                 require_ack_ms,
-            } => commands::direct::send(&client, &agent_id, &message, require_ack_ms).await,
+                no_durable_ack,
+                logical_id,
+            } => {
+                commands::direct::send(
+                    &client,
+                    &agent_id,
+                    &message,
+                    require_ack_ms,
+                    !no_durable_ack,
+                    logical_id.as_deref(),
+                )
+                .await
+            }
             DirectSub::Connections => commands::direct::connections(&client).await,
             DirectSub::Events => commands::direct::events(&client).await,
         },

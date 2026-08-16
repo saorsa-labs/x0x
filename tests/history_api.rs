@@ -312,6 +312,13 @@ async fn history_backpressure_smoke() {
         let v: serde_json::Value = bob.get("/agent").await.json().await.expect("agent");
         v["agent_id"].as_str().expect("agent_id").to_string()
     };
+    // A bare /direct/send is durable since ADR 0030 slice 4; wait for Bob's v2
+    // advert so the latency assertion below measures the burst, not advert
+    // convergence. (This suite has a separate pre-existing failure on main.)
+    alice
+        .wait_for_durable_capability(Duration::from_secs(30))
+        .await;
+
     let mut worst = Duration::ZERO;
     for i in 0..5 {
         let start = std::time::Instant::now();

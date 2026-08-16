@@ -503,6 +503,9 @@ fn ack_outcome_to_receipt(
         DmAckOutcome::AckSemanticsUnavailable { reason } => {
             Err(DmError::AckSemanticsUnavailable(reason))
         }
+        // ADR 0030 slice 4: distinct from the line above precisely because the
+        // caller's next move differs — a fresh logical id, not a retry.
+        DmAckOutcome::IdempotencyConflict { reason } => Err(DmError::IdempotencyConflict(reason)),
     }
 }
 

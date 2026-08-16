@@ -631,6 +631,24 @@ fn cached_ack_for_protocol(
     }
 }
 
+/// Whether `handle_incoming`'s fast replay re-ACK must stand aside and let the
+/// durable path decide.
+///
+/// True only for a v2 payload envelope replaying a completion that carries a
+/// durable binding — the one case where the correct answer depends on bytes
+/// this stage has not decrypted yet. Everything else (v1 replays, ACK
+/// envelopes, completions with no binding) keeps the cheap path, so the cost
+/// of a signature verification and a decrypt is paid only where it buys the
+/// ADR 0030 §1 conflict check.
+fn cached_completion_needs_binding_check(
+    cached: Option<&crate::dm::CachedOutcome>,
+    envelope: &DmEnvelope,
+) -> bool {
+    matches!(envelope.body, DmBody::Payload(_))
+        && envelope.protocol_version >= DM_PROTOCOL_DURABLE_ACK
+        && cached.is_some_and(|cached| cached.durable_binding.is_some())
+}
+
 /// A commit outcome that proves exactly one durable row exists for this
 /// record. `Inserted` is the first commit; `Duplicate` is the idempotent
 /// replay of an identical record (ADR 0030 validation: "exactly one durable
@@ -818,7 +836,21 @@ impl InboxPipeline {
         );
 
         let dedupe = envelope.dedupe_key();
-        if let Some(cached) = self.cache.lookup(&dedupe) {
+        // A v2 envelope replaying a logical request that already completed
+        // durably must have its bytes compared against the committed binding
+        // before anything is re-ACKed — otherwise a caller that reused a
+        // `logical_id` for *different* content is told `Accepted` for bytes
+        // nobody stored. That comparison needs the plaintext, which this fast
+        // path does not have, so the durable path owns the whole replay
+        // decision for these envelopes (it re-ACKs from the same cache entry
+        // at step 2 without re-dispatching).
+        let needs_durable_binding_check =
+            cached_completion_needs_binding_check(self.cache.lookup(&dedupe).as_ref(), &envelope);
+        if let Some(cached) = self
+            .cache
+            .lookup(&dedupe)
+            .filter(|_| !needs_durable_binding_check)
+        {
             if matches!(envelope.body, DmBody::Payload(_)) {
                 // ADR 0030 §2: re-ACK under the semantics the completion was
                 // actually made with. A v1 completion answers a v2 request
@@ -1277,7 +1309,11 @@ impl InboxPipeline {
                 Some(stored) if stored == binding => {
                     cached_ack_for_protocol(&cached, envelope.protocol_version)
                 }
-                Some(_) => DmAckOutcome::AckSemanticsUnavailable {
+                // ADR 0030 slice 4: the id is bound to other bytes, which is a
+                // caller-side idempotency-key reuse, not a peer-capability
+                // gap. It answered `AckSemanticsUnavailable` until the typed
+                // error existed (#329 review).
+                Some(_) => DmAckOutcome::IdempotencyConflict {
                     reason: "logical request already completed with different content".to_string(),
                 },
                 None => cached_ack_for_protocol(&cached, envelope.protocol_version),
@@ -1403,7 +1439,7 @@ impl InboxPipeline {
                     .publish_ack_for_protocol(
                         sender_agent_id,
                         request_id,
-                        DmAckOutcome::AckSemanticsUnavailable {
+                        DmAckOutcome::IdempotencyConflict {
                             reason: "logical request already committed with different content"
                                 .to_string(),
                         },
@@ -2315,6 +2351,82 @@ mod tests {
         );
     }
 
+    /// Subscribe to the topic ACKs for `sender` land on, so a test can assert
+    /// the outcome the receiver actually put on the wire. `DurableAckDecision`
+    /// records only *that* a refusal was ACKed; which refusal it was is the
+    /// whole product contract, and it is only observable here.
+    async fn watch_acks_to(harness: &InboxHarness, sender: &AgentKeypair) -> Subscription {
+        harness
+            .pipeline
+            .pubsub
+            .subscribe_topic_id(
+                DmInboxService::inbox_topic_name(&sender.agent_id()),
+                dm_inbox_topic(&sender.agent_id()),
+            )
+            .await
+    }
+
+    async fn next_ack_outcome(subscription: &mut Subscription) -> DmAckOutcome {
+        let message = tokio::time::timeout(Duration::from_secs(5), subscription.recv())
+            .await
+            .expect("an ACK must be published within the timeout")
+            .expect("ACK subscription closed before an ACK arrived");
+        let envelope =
+            DmEnvelope::from_wire_bytes(&message.payload).expect("ACK envelope should decode");
+        match envelope.body {
+            DmBody::Ack(ack) => ack.outcome,
+            other => panic!("expected an ACK envelope, got {other:?}"),
+        }
+    }
+
+    /// ADR 0030 slice 4 rebind. Both binding-conflict sites answered
+    /// `AckSemanticsUnavailable` until `IdempotencyConflict` existed, which
+    /// told a product "the peer needs upgrading" when the truth was "your
+    /// client reused an idempotency key for different bytes". The two errors
+    /// prescribe opposite repairs — retry-later versus never-retry-these-bytes
+    /// — so conflating them is a user-visible defect, not a naming quibble.
+    #[tokio::test]
+    async fn a_rebound_logical_request_is_answered_idempotency_conflict() {
+        let sender = test_keypair();
+        let machine = MachineId([0xD6; 32]);
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let _service = attach_history(&mut harness);
+        let mut acks = watch_acks_to(&harness, &sender).await;
+
+        let first = durable_payload_message(&harness, &sender, machine, 0x56, b"original bytes");
+        harness.pipeline.handle_incoming(first, false).await;
+        assert_eq!(
+            next_ack_outcome(&mut acks).await,
+            DmAckOutcome::Accepted,
+            "the first delivery is a normal durable acceptance"
+        );
+
+        // Replay-cache binding check: the id is still hot in memory.
+        let rebound = durable_payload_message(&harness, &sender, machine, 0x56, b"different bytes");
+        harness.pipeline.handle_incoming(rebound, false).await;
+        let hot = next_ack_outcome(&mut acks).await;
+        assert!(
+            matches!(hot, DmAckOutcome::IdempotencyConflict { .. }),
+            "a hot rebind must be an idempotency conflict, not a capability gap: {hot:?}"
+        );
+
+        // Restart: the replay cache is memory-only (ADR 0030 §1), so the same
+        // rebind must now be caught by the durable-history lookup instead —
+        // the site that has to reach the same verdict for the guarantee to
+        // survive a crash.
+        harness.pipeline.cache = Arc::new(RecentDeliveryCache::with_defaults());
+        let after_restart =
+            durable_payload_message(&harness, &sender, machine, 0x56, b"different bytes");
+        harness.pipeline.handle_incoming(after_restart, false).await;
+        assert!(
+            matches!(
+                next_ack_outcome(&mut acks).await,
+                DmAckOutcome::IdempotencyConflict { .. }
+            ),
+            "the durable-history conflict path must agree with the replay-cache path"
+        );
+    }
+
     /// ADR 0030 §2 mixed version: a 0.37 peer's v1 envelope keeps exactly its
     /// old behaviour on a durable-capable receiver — delivered, and ACKed with
     /// v1 semantics. Enabling durable history must not silently upgrade the
@@ -2725,7 +2837,16 @@ mod tests {
         assert_eq!(
             unavailable.first(),
             Some(&2u8),
-            "AckSemanticsUnavailable must be appended last"
+            "AckSemanticsUnavailable must keep the index slice 1 assigned it"
+        );
+        let conflict = postcard::to_stdvec(&DmAckOutcome::IdempotencyConflict {
+            reason: String::new(),
+        })
+        .expect("encode conflict");
+        assert_eq!(
+            conflict.first(),
+            Some(&3u8),
+            "IdempotencyConflict must be appended last"
         );
     }
 

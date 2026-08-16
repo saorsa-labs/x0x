@@ -160,6 +160,12 @@ async fn dm_history_survives_daemon_kill() {
     let alice_id = mesh.alice.agent_id().await;
     let bob_id = mesh.bob.agent_id().await;
 
+    // A bare /direct/send is durable since ADR 0030 slice 4; wait for Bob's v2
+    // advert so this test fails only on the history persistence it is about.
+    mesh.alice
+        .wait_for_durable_capability(std::time::Duration::from_secs(30))
+        .await;
+
     let message = b"history restart-survival probe";
     let payload_b64 = base64::Engine::encode(&base64::engine::general_purpose::STANDARD, message);
     let resp = mesh
