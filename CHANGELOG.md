@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **ant-quic 0.27.37 → 0.27.38.** Picks up the transport fixes released
+  after the durable-ACK campaign: idle timers now reset on peer-delivered
+  application payload (ant-quic #241 — removes the permanent half-open
+  links of ant-quic #234 while preserving x0x #278 zombie reaping), atomic
+  connection lifecycle (ant-quic #229), and the assembler `Bytes`-aliasing
+  torn-read fix (ant-quic #209).
+
 ## [v0.38.0] - 2026-08-16
 
 > The ADR 0030 durable-application-ACK campaign completes in this release
