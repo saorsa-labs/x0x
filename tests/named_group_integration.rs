@@ -16,7 +16,7 @@ mod cluster;
 #[path = "harness/src/daemon.rs"]
 mod daemon;
 
-use cluster::{pair, AgentInstance};
+use cluster::{pair, pair_with_bob_env, AgentInstance};
 use daemon::DaemonFixture;
 
 async fn daemon() -> DaemonFixture {
@@ -1976,4 +1976,102 @@ async fn last_admin_rest_self_demote_returns_409_exact_string() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
+}
+
+// ===========================================================================
+// #333 — MemberJoined delivery is at-least-once, not at-most-once
+// ===========================================================================
+
+/// Why: the joiner's signed `MemberJoined` is what authorizes the group
+/// authority to publish the `MemberAdded` commit. It used to be sent exactly
+/// once (a gossip publish plus a handful of best-effort DMs, all warn-and-drop)
+/// with no repair path, so losing that volley meant the join silently never
+/// completed — the authority had nothing to stage, and the joiner's 2s
+/// result-poll could only ever fetch a result that was never going to exist.
+///
+/// `X0X_TEST_DROP_INITIAL_MEMBER_JOINED` drops bob's entire initial volley, so
+/// the only way alice can ever learn of the join is the poll loop's resend arm.
+/// If that arm regresses, this test fails; a wider timeout cannot rescue it.
+#[tokio::test]
+#[ignore]
+async fn member_joined_lost_initial_volley_recovers_via_poll_resend() {
+    // Bob is the joiner, so only bob's daemon drops the volley — alice must
+    // stay a normal authority for this to prove recovery rather than
+    // symmetric breakage.
+    let pair = pair_with_bob_env(&[("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "1")]).await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let alice_create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name":"Lost MemberJoined","display_name":"Alice"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        alice_create["ok"], true,
+        "create response: {alice_create:?}"
+    );
+    let group_id = alice_create["group_id"].as_str().unwrap().to_string();
+
+    // The gap is worst on the secure default preset, where the authority's
+    // commit also carries TreeKEM key material; pin that we exercise it.
+    let alice_state = group_state(alice, &group_id).await;
+    assert!(
+        alice_state.is_some(),
+        "alice state missing after default private_secure create"
+    );
+    let Some(alice_state) = alice_state else {
+        return;
+    };
+    assert!(
+        alice_state["security_binding"]
+            .as_str()
+            .is_some_and(|binding| binding.starts_with("treekem:")),
+        "resend regression must exercise a private_secure TreeKEM group: {alice_state:?}"
+    );
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob Local"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true, "join response: {bob_join:?}");
+
+    let bob_agent_id = bob.agent_id().await;
+    let alice_sees_bob = wait_until(Duration::from_secs(30), || async {
+        let info: Value = alice
+            .get(&format!("/groups/{group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| members.iter().any(|m| m["agent_id"] == bob_agent_id))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        alice_sees_bob,
+        "alice never observed bob's join after the initial MemberJoined volley was dropped; \
+         the join-result poll's resend arm did not repair the outbound leg (#333)"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
 }

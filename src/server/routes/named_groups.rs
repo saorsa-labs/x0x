@@ -9858,6 +9858,33 @@ fn invite_join_group_info(
     info
 }
 
+/// Everything the join-result poll needs to re-send the joiner's signed
+/// `MemberJoined` if the initial volley was lost (#333).
+///
+/// Both channels of the initial volley are carried, because they fail
+/// independently: the metadata topic needs no per-recipient key material but
+/// depends on mesh coverage, while the direct message is the order-sensitive
+/// trigger for the authority's add commit but is unusable until the joiner has
+/// resolved the authority's DM key material — which, right after a join,
+/// routinely takes longer than the repair window.
+struct MemberJoinedResend {
+    metadata_topic: String,
+    event: NamedGroupMetadataEvent,
+    /// The exact bytes the volley's direct deliveries send, serialized once.
+    payload: Vec<u8>,
+}
+
+/// Test-only loss injection for #333: when `X0X_TEST_DROP_INITIAL_MEMBER_JOINED`
+/// is `1`, [`join_group_via_invite`] skips the entire initial `MemberJoined`
+/// send volley (gossip publish plus the direct deliveries to the inviter), so
+/// the regression test can prove the join still converges through the
+/// join-result poll's resend arm alone. Read once per process: the volley is
+/// either fully injected-lost or fully sent, never partially.
+static DROP_INITIAL_MEMBER_JOINED_VOLLEY: std::sync::LazyLock<bool> =
+    std::sync::LazyLock::new(|| {
+        std::env::var("X0X_TEST_DROP_INITIAL_MEMBER_JOINED").is_ok_and(|v| v == "1")
+    });
+
 /// POST /groups/join — join a group via invite link.
 pub(in crate::server) async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
@@ -10046,6 +10073,10 @@ pub(in crate::server) async fn join_group_via_invite(
                 now_ms,
                 treekem_key_package_b64.as_deref(),
             );
+            // Copy of the signed event, handed to the join-result poll so it
+            // can re-send the initial volley if that volley was lost (#333).
+            // `None` means there is nothing to resend.
+            let mut member_joined_resend: Option<MemberJoinedResend> = None;
             match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
                 signing_kp.secret_key(),
                 &canonical,
@@ -10070,49 +10101,72 @@ pub(in crate::server) async fn join_group_via_invite(
                         recovery_authority_commit: None,
                         signature_b64,
                     };
-                    tracing::info!(
-                        group_id = %group_id_hex,
-                        topic = %info.metadata_topic,
-                        member = %joiner_hex,
-                        inviter = %invite.inviter,
-                        "MemberJoined: publishing joiner-authored membership event to metadata topic"
-                    );
-                    // Publish twice: once immediately so the inviter gets it
-                    // as soon as the metadata mesh covers them, then again
-                    // after `GROUP_BACKGROUND_PUBLISH_DELAY` so members
-                    // whose Plumtree links formed late still pick it up.
-                    // The applier is idempotent (re-applying the same
-                    // event for an already-active member is a no-op), so
-                    // double-publish is safe.
-                    publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
-                    // TreeKEM membership is order-sensitive: gossip remains the
-                    // broadcast path, but the join trigger must reach the inviter
-                    // reliably so they can produce the authoritative add commit.
-                    spawn_named_group_event_delivery(&state, &invite.inviter, &event);
-                    spawn_named_group_event_delivery_after(
-                        &state,
-                        &invite.inviter,
-                        &event,
-                        GROUP_BACKGROUND_PUBLISH_DELAY,
-                    );
-                    let state_for_replay = Arc::clone(&state);
-                    let topic_for_replay = info.metadata_topic.clone();
-                    let inviter_for_replay = invite.inviter.clone();
-                    let event_for_replay = event;
-                    tokio::spawn(async move {
-                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
-                        publish_named_group_metadata_event(
-                            &state_for_replay,
-                            &topic_for_replay,
-                            &event_for_replay,
-                        )
-                        .await;
-                        spawn_named_group_event_delivery(
-                            &state_for_replay,
-                            &inviter_for_replay,
-                            &event_for_replay,
+                    match serde_json::to_vec(&event) {
+                        Ok(payload) => {
+                            member_joined_resend = Some(MemberJoinedResend {
+                                metadata_topic: info.metadata_topic.clone(),
+                                event: event.clone(),
+                                payload,
+                            })
+                        }
+                        Err(e) => tracing::warn!(
+                            group_id = %group_id_hex,
+                            "MemberJoined: failed to serialize join announcement for resend: {e}"
+                        ),
+                    }
+                    if *DROP_INITIAL_MEMBER_JOINED_VOLLEY {
+                        tracing::warn!(
+                            group_id = %group_id_hex,
+                            member = %joiner_hex,
+                            inviter = %invite.inviter,
+                            "MemberJoined: X0X_TEST_DROP_INITIAL_MEMBER_JOINED is set; dropping the initial send volley (test-only loss injection, #333)"
                         );
-                    });
+                    } else {
+                        tracing::info!(
+                            group_id = %group_id_hex,
+                            topic = %info.metadata_topic,
+                            member = %joiner_hex,
+                            inviter = %invite.inviter,
+                            "MemberJoined: publishing joiner-authored membership event to metadata topic"
+                        );
+                        // Publish twice: once immediately so the inviter gets it
+                        // as soon as the metadata mesh covers them, then again
+                        // after `GROUP_BACKGROUND_PUBLISH_DELAY` so members
+                        // whose Plumtree links formed late still pick it up.
+                        // The applier is idempotent (re-applying the same
+                        // event for an already-active member is a no-op), so
+                        // double-publish is safe.
+                        publish_named_group_metadata_event(&state, &info.metadata_topic, &event)
+                            .await;
+                        // TreeKEM membership is order-sensitive: gossip remains the
+                        // broadcast path, but the join trigger must reach the inviter
+                        // reliably so they can produce the authoritative add commit.
+                        spawn_named_group_event_delivery(&state, &invite.inviter, &event);
+                        spawn_named_group_event_delivery_after(
+                            &state,
+                            &invite.inviter,
+                            &event,
+                            GROUP_BACKGROUND_PUBLISH_DELAY,
+                        );
+                        let state_for_replay = Arc::clone(&state);
+                        let topic_for_replay = info.metadata_topic.clone();
+                        let inviter_for_replay = invite.inviter.clone();
+                        let event_for_replay = event;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                            publish_named_group_metadata_event(
+                                &state_for_replay,
+                                &topic_for_replay,
+                                &event_for_replay,
+                            )
+                            .await;
+                            spawn_named_group_event_delivery(
+                                &state_for_replay,
+                                &inviter_for_replay,
+                                &event_for_replay,
+                            );
+                        });
+                    }
                 }
                 Err(e) => {
                     tracing::warn!(
@@ -10138,6 +10192,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     inviter,
                     member_for_poll,
                     invite_is_treekem,
+                    member_joined_resend,
                 )
                 .await;
             });
@@ -18337,6 +18392,13 @@ const EXPECTED_JOIN_RESULT_INVITER_TTL: Duration = NON_TREEKEM_JOIN_RESULT_POLL_
 
 const JOIN_RESULT_POLL_INTERVAL: Duration = Duration::from_secs(2);
 
+/// How many unconfirmed join-result polls pass between `MemberJoined` resends
+/// to the authority (#333). At `JOIN_RESULT_POLL_INTERVAL` that is roughly one
+/// resend every 6s — slow enough that a merely slow authority is not spammed,
+/// fast enough that a lost join volley is repaired well inside the 30s the
+/// propagation tests allow.
+const MEMBER_JOINED_RESEND_POLL_INTERVALS: u32 = 3;
+
 const PENDING_WELCOME_TTL: Duration = Duration::from_secs(10 * 60);
 
 const WELCOME_FETCH_TIMEOUT: Duration = Duration::from_secs(90);
@@ -18635,6 +18697,14 @@ pub(in crate::server) async fn handle_join_result_message(
 /// during the join window (e.g. a gossip connection dropping right after the
 /// join was accepted) is repaired instead of leaving the joiner permanently
 /// absent from its own roster and write-locked with a 403 (#297).
+///
+/// The poll also repairs the *outbound* leg. `member_joined` carries the
+/// signed `MemberJoined` event the join volley sent; if that volley was lost
+/// outright the authority never stages a result, so nothing this loop fetches
+/// can ever succeed. Every `MEMBER_JOINED_RESEND_POLL_INTERVALS` unconfirmed
+/// polls the volley is re-sent (#333). Re-application is a documented no-op
+/// for an already-active member, and once the authority applies it the staged
+/// result satisfies the next poll — so resends stop on their own.
 async fn poll_join_result_until_membership_confirmed(
     state: Arc<AppState>,
     group_id: String,
@@ -18642,6 +18712,7 @@ async fn poll_join_result_until_membership_confirmed(
     inviter: AgentId,
     member_agent_id: String,
     await_treekem: bool,
+    member_joined: Option<MemberJoinedResend>,
 ) {
     let timeout = if await_treekem {
         JOIN_RESULT_POLL_TIMEOUT
@@ -18651,6 +18722,7 @@ async fn poll_join_result_until_membership_confirmed(
     let deadline = tokio::time::Instant::now() + timeout;
     let expected_key = join_result_key(&event_group_id, &member_agent_id);
     let mut timed_out = true;
+    let mut unconfirmed_polls: u32 = 0;
     while tokio::time::Instant::now() < deadline {
         let confirmed = if await_treekem {
             state.treekem_groups.read().await.contains_key(&group_id)
@@ -18666,6 +18738,7 @@ async fn poll_join_result_until_membership_confirmed(
             timed_out = false;
             break;
         }
+        unconfirmed_polls = unconfirmed_polls.saturating_add(1);
         let request = JoinResultMessage::FetchRequest {
             group_id: event_group_id.clone(),
             member_agent_id: member_agent_id.clone(),
@@ -18714,6 +18787,60 @@ async fn poll_join_result_until_membership_confirmed(
                 payload_len,
                 payload_hash = %payload_hash,
             );
+        }
+        // Outbound-leg repair (#333): the authority can only stage a result
+        // for a `MemberJoined` it actually received, so a lost join volley
+        // makes every fetch above answer "nothing staged" until the deadline.
+        //
+        // Both volley channels are retried, because either one alone leaves a
+        // hole: the direct message is unusable until the joiner has resolved
+        // the authority's DM key material (routinely still pending here, and
+        // the reason a DM-only retry cannot repair the very window it
+        // targets), while the metadata publish needs no key material but only
+        // reaches an authority the mesh already covers.
+        //
+        // Spawned, not awaited, for the same reason every other named-group
+        // delivery is spawned: a send can block for the full ack timeout, and
+        // blocking here would stretch the fetch cadence this loop exists to
+        // maintain. Individual attempts are expected to fail; the repair is
+        // the repetition, not any single send.
+        if let Some(member_joined) = member_joined.as_ref() {
+            if unconfirmed_polls.is_multiple_of(MEMBER_JOINED_RESEND_POLL_INTERVALS) {
+                let resend_state = Arc::clone(&state);
+                let recipient = inviter;
+                let topic = member_joined.metadata_topic.clone();
+                let event = member_joined.event.clone();
+                let payload = member_joined.payload.clone();
+                let resend_len = payload.len();
+                let resend_hash = hex::encode(blake3::hash(&payload).as_bytes());
+                let attempt = unconfirmed_polls / MEMBER_JOINED_RESEND_POLL_INTERVALS;
+                let resend_group_id = group_id.clone();
+                let resend_event_group_id = event_group_id.clone();
+                let resend_member = member_agent_id.clone();
+                tokio::spawn(async move {
+                    publish_named_group_metadata_event(&resend_state, &topic, &event).await;
+                    let error = resend_state
+                        .agent
+                        .send_direct_with_config(
+                            &recipient,
+                            payload,
+                            named_group_direct_delivery_config(),
+                        )
+                        .await
+                        .err();
+                    tracing::debug!(
+                        target: "treekem.trace",
+                        stage = "member_joined_resend",
+                        group_id = %resend_group_id,
+                        event_group_id = %resend_event_group_id,
+                        member = %resend_member,
+                        attempt,
+                        payload_len = resend_len,
+                        payload_hash = %resend_hash,
+                        direct_error = error.as_ref().map(|e| e.to_string()),
+                    );
+                });
+            }
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
@@ -20085,6 +20212,9 @@ pub(in crate::server) mod tests {
                 inviter,
                 poll_member,
                 false,
+                // No `MemberJoined` payload: this test pins the loop's exit
+                // conditions, which the #333 resend arm must leave unchanged.
+                None,
             )
             .await;
         });

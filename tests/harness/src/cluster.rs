@@ -401,6 +401,24 @@ pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
 /// Start a fresh pair with the same extra TOML appended to each daemon's
 /// generated config. Useful for test-only timing overrides.
 pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
+    pair_with_extra_config_and_bob_env(extra_config, &[]).await
+}
+
+/// Start a fresh pair with extra environment variables set on **bob only**.
+///
+/// Daemons otherwise inherit the test process environment, which is shared —
+/// so a fault-injection hook set that way would fire on both nodes. Tests that
+/// must break one side of a two-party exchange (e.g. #333: drop the joiner's
+/// initial `MemberJoined` volley while the authority behaves normally) need
+/// exactly one node configured, and bob is the harness's joiner.
+pub async fn pair_with_bob_env(env: &[(&str, &str)]) -> AgentPair {
+    pair_with_extra_config_and_bob_env("", env).await
+}
+
+async fn pair_with_extra_config_and_bob_env(
+    extra_config: &str,
+    bob_env: &[(&str, &str)],
+) -> AgentPair {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
     let alice_api = allocate_unused_tcp_port();
@@ -421,13 +439,14 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
     // bob has a stable alice to bootstrap against. The previous 5s was too
     // short and let propagation-dependent tests race mesh formation.
     tokio::time::sleep(ROLLING_START_DELAY).await;
-    let bob = start_instance(
+    let bob = start_instance_with_env(
         &binary,
         &format!("pair-bob-{suffix}"),
         bob_api,
         bob_bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{alice_bind}\"]"),
         extra_config,
+        bob_env,
     )
     .await;
     tokio::time::sleep(MESH_SETTLE_TIME).await;
@@ -672,6 +691,29 @@ async fn start_instance(
     bootstrap: &str,
     extra_config: &str,
 ) -> AgentInstance {
+    start_instance_with_env(
+        binary,
+        name,
+        api_port,
+        bind_port,
+        bootstrap,
+        extra_config,
+        &[],
+    )
+    .await
+}
+
+/// As [`start_instance`], plus environment variables applied to this daemon
+/// process only (on top of the inherited test environment).
+async fn start_instance_with_env(
+    binary: &PathBuf,
+    name: &str,
+    api_port: u16,
+    bind_port: u16,
+    bootstrap: &str,
+    extra_config: &str,
+    env: &[(&str, &str)],
+) -> AgentInstance {
     let config_dir = std::env::temp_dir().join(format!("x0x-test-{name}"));
     let _ = std::fs::remove_dir_all(&config_dir);
     let _ = std::fs::create_dir_all(&config_dir);
@@ -719,14 +761,19 @@ async fn start_instance(
         }
     };
 
-    let process = Command::new(binary)
+    let mut command = Command::new(binary);
+    command
         .arg("--config")
         .arg(&config_path)
         .arg("--name")
         .arg(name)
         .arg("--no-hard-coded-bootstrap")
         .stdout(stdout)
-        .stderr(stderr)
+        .stderr(stderr);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let process = command
         .spawn()
         .unwrap_or_else(|e| panic!("Failed to start x0xd {name}: {e}"));
 
