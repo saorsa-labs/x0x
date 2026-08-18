@@ -2391,6 +2391,7 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
         [
             ("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "member_joined"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "member_removed"),
+            ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "group_deleted"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "member_banned"),
         ]
         .into_iter()
