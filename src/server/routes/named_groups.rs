@@ -2241,12 +2241,13 @@ fn spawn_named_group_event_delivery_after(
     });
 }
 
-fn spawn_named_group_event_delivery_to_active_members(
+/// Active members plus `extra_recipients`, minus this node — the recipient set
+/// every named-group fan-out uses.
+fn named_group_event_recipients(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
-    event: &NamedGroupMetadataEvent,
     extra_recipients: &[String],
-) {
+) -> HashSet<String> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut recipients = HashSet::new();
     for member in info.active_members() {
@@ -2259,7 +2260,16 @@ fn spawn_named_group_event_delivery_to_active_members(
             recipients.insert(recipient.clone());
         }
     }
-    for recipient in recipients {
+    recipients
+}
+
+fn spawn_named_group_event_delivery_to_active_members(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    extra_recipients: &[String],
+) {
+    for recipient in named_group_event_recipients(state, info, extra_recipients) {
         spawn_named_group_event_delivery(state, &recipient, event);
         spawn_named_group_event_delivery_after(
             state,
@@ -2268,6 +2278,131 @@ fn spawn_named_group_event_delivery_to_active_members(
             GROUP_BACKGROUND_PUBLISH_DELAY,
         );
     }
+}
+
+/// Attempt offsets, measured from the initial volley, for the bounded resend of
+/// terminal group-control events (`MemberRemoved`, `GroupDeleted`) — #333 slice
+/// C/D.
+///
+/// Why the schedule is blind, with no confirmation signal: unlike the join hop,
+/// where the joiner's 2s result-poll gives retries a clock to key off, the
+/// sender of a removal or a delete has nothing to poll. The recipient's whole
+/// point is that it stops participating, so it will never answer. The schedule
+/// IS the repair.
+///
+/// Why every attempt sends BOTH channels rather than just the direct message:
+/// the removed peer's metadata listener stays subscribed until it APPLIES the
+/// removal, so a republish can still reach it right up to the moment one
+/// succeeds; and the DM leg is routinely key-cold in exactly this window
+/// (`recipient key material unavailable`, proven in slice A / PR #342), so the
+/// gossip leg and the later attempts are what actually carry the notice.
+///
+/// Why it runs out to +60s: Plumtree's anti-entropy first tick lands at 30-60s,
+/// so the final attempt is the belt to that braces.
+///
+/// Deliberately NOT persisted: a daemon crash mid-schedule still loses the
+/// notice. That is the accepted trade-off of the no-ADR ruling — the ADR 0030
+/// §5 durable outbox stays `SignedPublic`-only.
+const GROUP_CONTROL_REDELIVERY_SCHEDULE: [Duration; 4] = [
+    Duration::from_secs(6),
+    Duration::from_secs(15),
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+];
+
+/// Test-only replacement for [`GROUP_CONTROL_REDELIVERY_SCHEDULE`]:
+/// `X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS="500,1000,2000"` substitutes those
+/// millisecond offsets so a regression test converges in seconds instead of a
+/// minute. When set, the variable IS the schedule — a value with no parseable
+/// offsets (`""`, `"off"`) therefore means "no resends at all", which is how
+/// the negative-control tests switch the repair off. Read once per process;
+/// unset leaves the production schedule untouched.
+static GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE: std::sync::LazyLock<Vec<Duration>> =
+    std::sync::LazyLock::new(|| {
+        let Ok(raw) = std::env::var("X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS") else {
+            return GROUP_CONTROL_REDELIVERY_SCHEDULE.to_vec();
+        };
+        raw.split(',')
+            .filter_map(|part| part.trim().parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .collect()
+    });
+
+/// Re-send a terminal group-control event on a bounded schedule (#333 slice
+/// C/D). See [`GROUP_CONTROL_REDELIVERY_SCHEDULE`] for why this shape.
+///
+/// Callers invoke this immediately after their initial volley (the metadata
+/// publish plus [`spawn_named_group_event_delivery_to_active_members`]); the
+/// offsets are relative to that moment. Everything the schedule needs is cloned
+/// up front, so the task neither reads group state later — which for
+/// `GroupDeleted` is already gone — nor depends on the sender's own metadata
+/// listener, which `withdraw_group_state` stops before it publishes.
+fn spawn_group_control_event_redelivery(
+    state: &Arc<AppState>,
+    metadata_topic: &str,
+    info: &x0x::groups::GroupInfo,
+    event: &NamedGroupMetadataEvent,
+    extra_recipients: &[String],
+) {
+    let schedule = GROUP_CONTROL_REDELIVERY_SCHEDULE_OVERRIDE.clone();
+    if schedule.is_empty() {
+        return;
+    }
+    let recipients: Vec<String> = named_group_event_recipients(state, info, extra_recipients)
+        .into_iter()
+        .collect();
+    let state = Arc::clone(state);
+    let metadata_topic = metadata_topic.to_string();
+    let event = event.clone();
+    let kind = named_group_metadata_event_kind(&event);
+    let group_id = named_group_metadata_event_group_id(&event).to_string();
+    tokio::spawn(async move {
+        let start = tokio::time::Instant::now();
+        for (index, offset) in schedule.iter().enumerate() {
+            tokio::time::sleep_until(start + *offset).await;
+            publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+            for recipient in &recipients {
+                spawn_named_group_event_delivery(&state, recipient, &event);
+            }
+            tracing::debug!(
+                target: "treekem.trace",
+                stage = "group_control_redelivery",
+                group_id = %group_id,
+                kind,
+                attempt = index + 1,
+                attempts = schedule.len(),
+                offset_ms = offset.as_millis() as u64,
+                recipients = recipients.len(),
+            );
+        }
+    });
+}
+
+/// Test-only loss injection for #333: each `X0X_TEST_DROP_INITIAL_*` variable
+/// set to `1` makes the matching event's sender skip its ENTIRE initial volley
+/// (metadata publish plus the direct deliveries), simulating total loss so a
+/// regression test can prove the repair path alone converges.
+///
+/// All default off, and the set is read once per process, so a volley is either
+/// fully injected-lost or fully sent — never partially. These are the only
+/// production knobs this work adds and they stay `X0X_TEST_`-prefixed.
+static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
+    std::sync::LazyLock::new(|| {
+        [
+            ("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "member_joined"),
+            ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "member_removed"),
+            ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "group_deleted"),
+        ]
+        .into_iter()
+        .filter(|(var, _)| std::env::var(var).is_ok_and(|v| v == "1"))
+        .map(|(_, kind)| kind)
+        .collect()
+    });
+
+/// Whether this event's initial volley is being dropped for a test. Always
+/// `false` unless the matching `X0X_TEST_DROP_INITIAL_*` variable is set.
+fn drop_initial_volley(event: &NamedGroupMetadataEvent) -> bool {
+    DROP_INITIAL_VOLLEY_KINDS.contains(named_group_metadata_event_kind(event))
 }
 
 pub(in crate::server) fn signed_public_bootstrap_snapshot(
@@ -9874,17 +10009,6 @@ struct MemberJoinedResend {
     payload: Vec<u8>,
 }
 
-/// Test-only loss injection for #333: when `X0X_TEST_DROP_INITIAL_MEMBER_JOINED`
-/// is `1`, [`join_group_via_invite`] skips the entire initial `MemberJoined`
-/// send volley (gossip publish plus the direct deliveries to the inviter), so
-/// the regression test can prove the join still converges through the
-/// join-result poll's resend arm alone. Read once per process: the volley is
-/// either fully injected-lost or fully sent, never partially.
-static DROP_INITIAL_MEMBER_JOINED_VOLLEY: std::sync::LazyLock<bool> =
-    std::sync::LazyLock::new(|| {
-        std::env::var("X0X_TEST_DROP_INITIAL_MEMBER_JOINED").is_ok_and(|v| v == "1")
-    });
-
 /// POST /groups/join — join a group via invite link.
 pub(in crate::server) async fn join_group_via_invite(
     State(state): State<Arc<AppState>>,
@@ -10114,7 +10238,7 @@ pub(in crate::server) async fn join_group_via_invite(
                             "MemberJoined: failed to serialize join announcement for resend: {e}"
                         ),
                     }
-                    if *DROP_INITIAL_MEMBER_JOINED_VOLLEY {
+                    if drop_initial_volley(&event) {
                         tracing::warn!(
                             group_id = %group_id_hex,
                             member = %joiner_hex,
@@ -10868,7 +10992,9 @@ pub(in crate::server) async fn remove_named_group_member(
         )
     };
 
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    }
     // ADR 0030 §5: the removal is committed, so the bootstrap debt to this
     // member no longer exists.
     cancel_public_group_bootstrap_obligations_for_removal(&state, &agent_id_hex, &delivery_roster)
@@ -10884,8 +11010,19 @@ pub(in crate::server) async fn remove_named_group_member(
     // scheduling below. (Both the MemberRemoved delivery and the survivor
     // envelopes run as independent background tasks, so call order is not a
     // guaranteed recipient receipt order — no delivery barrier is claimed.)
-    spawn_named_group_event_delivery_to_active_members(
+    if !drop_initial_volley(&event) {
+        spawn_named_group_event_delivery_to_active_members(
+            &state,
+            &delivery_roster,
+            &event,
+            std::slice::from_ref(&agent_id_hex),
+        );
+    }
+    // #333 C/D: the one-shot volley above is at-most-once, and the removed
+    // member has no reason to poll for what it just lost.
+    spawn_group_control_event_redelivery(
         &state,
+        &metadata_topic,
         &delivery_roster,
         &event,
         std::slice::from_ref(&agent_id_hex),
@@ -11744,10 +11881,23 @@ async fn remove_treekem_named_group_member(
         secret_epoch: None,
         commit: Some(commit),
     };
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    }
     remember_treekem_membership_event(&state, &event).await;
-    spawn_named_group_event_delivery_to_active_members(
+    if !drop_initial_volley(&event) {
+        spawn_named_group_event_delivery_to_active_members(
+            &state,
+            &next,
+            &event,
+            std::slice::from_ref(&agent_id_hex),
+        );
+    }
+    // #333 C/D: without this the removed peer keeps its roster and TreeKEM key
+    // material indefinitely whenever the one-shot volley above is lost.
+    spawn_group_control_event_redelivery(
         &state,
+        &metadata_topic,
         &next,
         &event,
         std::slice::from_ref(&agent_id_hex),
@@ -12057,8 +12207,20 @@ pub(in crate::server) async fn withdraw_group_state(
     // is released; all required data was captured above.
     drop(membership_guard);
 
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
-    spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+        spawn_named_group_event_delivery_to_active_members(&state, &delivery_roster, &event, &[]);
+    }
+    // #333 C/D: a lost GroupDeleted leaves recipients holding a stale group and
+    // its TreeKEM snapshot forever — the withdrawn discovery card cannot wipe
+    // keyed local state. Safe to schedule here even though this handler stopped
+    // its own metadata listener above: `Agent::publish` goes straight to the
+    // gossip runtime's pubsub (src/lib.rs:8066-8082) and never consults a local
+    // subscription, while `stop_named_group_metadata_listener` only aborts this
+    // node's receive task (:2491-2496). The schedule also holds its own clones
+    // of the topic, event and roster, so it never reads the group state this
+    // handler has just torn down.
+    spawn_group_control_event_redelivery(&state, &metadata_topic, &delivery_roster, &event, &[]);
 
     (
         StatusCode::OK,

@@ -16,7 +16,7 @@ mod cluster;
 #[path = "harness/src/daemon.rs"]
 mod daemon;
 
-use cluster::{pair, pair_with_bob_env, AgentInstance};
+use cluster::{pair, pair_with_alice_env, pair_with_bob_env, AgentInstance};
 use daemon::DaemonFixture;
 
 async fn daemon() -> DaemonFixture {
@@ -2074,4 +2074,237 @@ async fn member_joined_lost_initial_volley_recovers_via_poll_resend() {
     );
 
     let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+// ===========================================================================
+// #333 C/D — terminal group-control events survive a lost initial volley
+// ===========================================================================
+
+/// Compressed stand-in for the production 6/15/30/60s resend schedule, so a
+/// regression test observes the repair in seconds rather than a minute. Four
+/// attempts, same shape.
+const FAST_REDELIVERY_SCHEDULE_MS: &str = "500,1500,4000,8000";
+
+/// Drive alice and bob to a converged two-member private_secure group and
+/// return `(alice_group_id, bob_group_id, bob_agent_id)`.
+///
+/// The #333 C/D tests all start here: the removal and delete hops can only be
+/// tested once the peer genuinely holds the group at alice's revision — a
+/// `MemberRemoved` commit applied against a stale local revision is rejected on
+/// `prev_state_hash`, so parity is load-bearing, not decorative. A join that
+/// silently failed must therefore surface as a setup failure, never as a false
+/// pass on the hop under test.
+///
+/// Setup waits use [`SETUP_CONVERGENCE_TIMEOUT`] rather than the suite's
+/// standard 30s. This is scaffolding, not the observation: the measured hop
+/// keeps the 30s bound, and giving the join room to converge stops the
+/// known-flaky invite-join wait (#333 datapoint 2 / #337) from being reported
+/// as a failure of the removal or delete path.
+const SETUP_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(60);
+
+async fn converged_pair_group(
+    alice: &AgentInstance,
+    bob: &AgentInstance,
+    name: &str,
+) -> (String, String, String) {
+    let create: Value = alice
+        .post(
+            "/groups",
+            serde_json::json!({"name": name, "display_name": "Alice"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(create["ok"], true, "create response: {create:?}");
+    let group_id = create["group_id"].as_str().unwrap().to_string();
+
+    let invite: Value = alice
+        .post(&format!("/groups/{group_id}/invite"), serde_json::json!({}))
+        .await
+        .json()
+        .await
+        .unwrap();
+    let invite_link = invite["invite_link"].as_str().unwrap().to_string();
+
+    let bob_join: Value = bob
+        .post(
+            "/groups/join",
+            serde_json::json!({"invite": invite_link, "display_name": "Bob Local"}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(bob_join["ok"], true, "join response: {bob_join:?}");
+    let bob_group_id = bob_join["group_id"]
+        .as_str()
+        .unwrap_or(&group_id)
+        .to_string();
+    let bob_agent_id = bob.agent_id().await;
+
+    let alice_sees_bob = wait_until(SETUP_CONVERGENCE_TIMEOUT, || async {
+        let info: Value = alice
+            .get(&format!("/groups/{group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| members.iter().any(|m| m["agent_id"] == bob_agent_id))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        alice_sees_bob,
+        "setup precondition failed: alice never observed bob's join, so the \
+         terminal-event hop under test was never reachable"
+    );
+
+    let alice_hash = group_state_hash(alice, &group_id)
+        .await
+        .expect("alice state hash after bob join");
+    let bob_caught_up = wait_until(SETUP_CONVERGENCE_TIMEOUT, || async {
+        group_state_hash(bob, &bob_group_id).await.as_deref() == Some(alice_hash.as_str())
+    })
+    .await;
+    assert!(
+        bob_caught_up,
+        "setup precondition failed: bob never applied alice's authoritative add"
+    );
+
+    (group_id, bob_group_id, bob_agent_id)
+}
+
+/// Why: a lost `MemberRemoved` is security-adjacent, not cosmetic — the removed
+/// peer keeps its roster entry AND its TreeKEM key material until some later
+/// event happens to trigger reactive catch-up, and nothing guarantees one ever
+/// does. The hop was one gossip publish plus two best-effort DMs, all
+/// warn-and-drop, with no recovery: unlike the join hop there is nothing the
+/// removed peer would poll, because not participating is the whole point of
+/// being removed.
+///
+/// `X0X_TEST_DROP_INITIAL_MEMBER_REMOVED` drops alice's entire initial volley,
+/// so the bounded resend schedule is the only thing that can deliver the
+/// removal. If that schedule regresses, this test fails; a wider timeout cannot
+/// rescue it.
+#[tokio::test]
+#[ignore]
+async fn member_removed_lost_initial_volley_recovers_via_bounded_resend() {
+    // Alice is the authority, so only her daemon drops the volley and only her
+    // schedule is compressed — bob must stay an ordinary recipient for this to
+    // prove delivery rather than symmetric breakage.
+    let pair = pair_with_alice_env(&[
+        ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "1"),
+        (
+            "X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS",
+            FAST_REDELIVERY_SCHEDULE_MS,
+        ),
+    ])
+    .await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let (group_id, bob_group_id, bob_agent_id) =
+        converged_pair_group(alice, bob, "Lost MemberRemoved").await;
+
+    let remove: Value = alice
+        .delete(&format!("/groups/{group_id}/members/{bob_agent_id}"))
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(remove["ok"], true, "remove response: {remove:?}");
+
+    let removed_seen = wait_until(Duration::from_secs(30), || async {
+        bob.get(&format!("/groups/{bob_group_id}")).await.status() == StatusCode::NOT_FOUND
+    })
+    .await;
+    assert!(
+        removed_seen,
+        "bob never applied his own removal after alice's initial MemberRemoved \
+         volley was dropped; the bounded resend schedule did not repair the hop \
+         (#333 C). A removed member that never learns it was removed keeps its \
+         roster and TreeKEM key material indefinitely."
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
+
+/// Why: a lost `GroupDeleted` leaves the recipient holding a live group and its
+/// TreeKEM snapshot forever. The withdrawn discovery card cannot wipe keyed
+/// local state, and the 300s card republish filters Hidden groups out, so the
+/// signed event is the only thing that terminalizes the peer's copy.
+///
+/// `X0X_TEST_DROP_INITIAL_GROUP_DELETED` drops alice's initial volley, leaving
+/// the bounded resend schedule as the sole delivery path. This also exercises
+/// the ordering hazard in `withdraw_group_state`: it stops its own metadata
+/// listener BEFORE publishing, so a repair that depended on that listener would
+/// fail here.
+#[tokio::test]
+#[ignore]
+async fn group_deleted_lost_initial_volley_recovers_via_bounded_resend() {
+    let pair = pair_with_alice_env(&[
+        ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "1"),
+        (
+            "X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS",
+            FAST_REDELIVERY_SCHEDULE_MS,
+        ),
+    ])
+    .await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let (group_id, bob_group_id, _bob_agent_id) =
+        converged_pair_group(alice, bob, "Lost GroupDeleted").await;
+
+    let withdraw: Value = alice
+        .post(
+            &format!("/groups/{group_id}/state/withdraw"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(withdraw["ok"], true, "withdraw response: {withdraw:?}");
+
+    let withdrawn_seen = wait_until(Duration::from_secs(30), || async {
+        group_state(bob, &bob_group_id)
+            .await
+            .is_some_and(|state| state["withdrawn"] == true)
+    })
+    .await;
+    assert!(
+        withdrawn_seen,
+        "bob never observed the group delete after alice's initial GroupDeleted \
+         volley was dropped; the bounded resend schedule did not repair the hop \
+         (#333 D)"
+    );
+
+    // Terminalization must be real, not just a flag: authoring is refused and
+    // the key material is gone. Without this a 'withdrawn' marker that left the
+    // snapshot on disk would pass.
+    let bob_encrypt = bob
+        .post(
+            &format!("/groups/{bob_group_id}/secure/encrypt"),
+            serde_json::json!({ "payload_b64": "aGk=" }),
+        )
+        .await;
+    assert_eq!(
+        bob_encrypt.status(),
+        StatusCode::CONFLICT,
+        "recipient authoring must be rejected after a resent GroupDeleted"
+    );
+    assert!(
+        !tokio::fs::try_exists(
+            bob.data_dir()
+                .join("treekem")
+                .join(format!("{bob_group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "recipient TreeKEM snapshot must be wiped by a resent GroupDeleted"
+    );
 }
