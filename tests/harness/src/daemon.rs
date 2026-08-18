@@ -8,8 +8,19 @@
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitStatus, Stdio};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tempfile::TempDir;
+
+/// A private gossip-plane id shared by every fixture in this test process
+/// (#337). Nextest runs each test in its own process, so this is effectively
+/// per-test: fixtures a single test starts share a plane and can connect, while
+/// other tests and ambient daemons are isolated. Computed once per process.
+fn process_gossip_plane_id() -> &'static str {
+    static PLANE_ID: LazyLock<String> =
+        LazyLock::new(|| format!("x0x-test-{}", rand::random::<u32>()));
+    PLANE_ID.as_str()
+}
 
 /// Per-test x0xd daemon fixture.
 pub struct DaemonFixture {
@@ -45,10 +56,33 @@ impl DaemonFixture {
         } else {
             "bootstrap_peers = []\n"
         };
+        // Hermetic gossip plane (#337): an unset `network_id` resolves to the
+        // PROD plane, which namespaces ant-quic's mDNS — so a fixture advertises
+        // on the prod plane's LAN discovery and auto-connects to any live x0xd
+        // on the machine (e.g. a running app daemon). Give fixtures a private
+        // plane unless the caller set one.
+        //
+        // The plane is per-PROCESS, not per-fixture: nextest runs each test in
+        // its own process, so all fixtures a single test starts share one plane
+        // and can still discover/connect to each other (e.g. bob as alice's
+        // bootstrap peer), while a different test process and any ambient daemon
+        // stay on different planes. A per-fixture plane would wrongly isolate the
+        // two daemons of a pairing test from each other. Same suppression shape
+        // as `bootstrap_peers` above: a duplicate TOML key is a parse error, and
+        // this lets a caller override the plane deliberately.
+        let extra_has_network_id = extra_config
+            .lines()
+            .any(|l| l.trim_start().starts_with("network_id"));
+        let network_line = if extra_has_network_id {
+            String::new()
+        } else {
+            format!("network_id = \"{}\"\n", process_gossip_plane_id())
+        };
         let mut config = format!(
-            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}instance_name = \"{}\"\n",
+            "bind_address = \"0.0.0.0:0\"\napi_address = \"127.0.0.1:0\"\ndata_dir = \"{}\"\nlog_level = \"warn\"\n{}{}instance_name = \"{}\"\n",
             tempdir.path().display(),
             bootstrap_line,
+            network_line,
             name,
         );
         if !extra_config.trim().is_empty() {
