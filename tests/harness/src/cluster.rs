@@ -458,9 +458,9 @@ async fn pair_with_extra_config_and_node_env(
     // passing at 39-55s each without a private plane, 6/6 at 22-25s with one.
     // The pollution manifests as slow invite-join convergence, which is what
     // those tests wait on.
-    let plane_config = format!("network_id = \"x0x-test-{}\"\n", rand::random::<u32>());
-    let extra_config = format!("{plane_config}{extra_config}");
-    let extra_config = extra_config.as_str();
+    let plane_id = format!("x0x-test-{}", rand::random::<u32>());
+    let owned_extra = with_private_plane(&plane_id, extra_config);
+    let extra_config = owned_extra.as_str();
     let alice_api = allocate_unused_tcp_port();
     let alice_bind = allocate_unused_udp_port();
     let bob_api = allocate_unused_tcp_port();
@@ -514,9 +514,33 @@ async fn create_cluster() -> AgentCluster {
     create_cluster_with_extra_config("").await
 }
 
+/// Prepend a private per-run gossip plane to `extra_config` unless the caller
+/// already set one, so every daemon this harness starts is isolated from the
+/// prod plane. See the rationale in `pair_with_extra_config_and_node_env`
+/// (#337): an unset `network_id` resolves to PROD and namespaces mDNS, so test
+/// daemons otherwise auto-connect to any live x0xd on the machine. The
+/// suppression check mirrors `daemon.rs`'s `bootstrap_peers` handling — a
+/// duplicate TOML key would be a parse error, and it lets a caller override the
+/// plane deliberately.
+fn with_private_plane(plane_id: &str, extra_config: &str) -> String {
+    let has_network_id = extra_config
+        .lines()
+        .any(|l| l.trim_start().starts_with("network_id"));
+    if has_network_id {
+        extra_config.to_string()
+    } else {
+        format!("network_id = \"{plane_id}\"\n{extra_config}")
+    }
+}
+
 async fn create_cluster_with_extra_config(extra_config: &str) -> AgentCluster {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
+    // One plane id shared by all three nodes (they must discover each other),
+    // unique to this cluster instance (no other run or ambient daemon joins).
+    let plane_id = format!("x0x-test-{}", rand::random::<u32>());
+    let owned_extra = with_private_plane(&plane_id, extra_config);
+    let extra_config = owned_extra.as_str();
     let alice_api = allocate_unused_tcp_port();
     let alice_bind = allocate_unused_udp_port();
     let bob_api = allocate_unused_tcp_port();
