@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **ant-quic 0.27.38 → 0.27.39.** Dropping a QUIC send stream without an
+  explicit `finish()` now resets it (ant-quic #244/#248) instead of
+  gracefully FINning at the current offset — a cancelled or timed-out
+  in-flight write can no longer arrive at a peer as a plausible short
+  message. This is the transport-level root fix for the
+  "Failed to deserialize PubSub message: Hit the end of buffer" family of
+  receiver errors observed whenever a sender's publish timeout cancelled a
+  stalled write.
+
 - **ant-quic 0.27.37 → 0.27.38.** Picks up the transport fixes released
   after the durable-ACK campaign: idle timers now reset on peer-delivered
   application payload (ant-quic #241 — removes the permanent half-open
