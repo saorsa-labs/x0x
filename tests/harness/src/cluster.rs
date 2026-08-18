@@ -355,6 +355,10 @@ pub async fn cluster() -> &'static AgentCluster {
 }
 
 /// Start a fresh two-daemon pair with Bob bootstrapping to Alice.
+///
+/// Hermetic: the pair gets its own gossip plane, so it neither sees nor is seen
+/// by other x0x daemons on the machine. See
+/// [`pair_with_extra_config_and_node_env`] for why that is not the default.
 pub async fn pair() -> AgentPair {
     pair_with_extra_config("").await
 }
@@ -401,7 +405,7 @@ pub async fn trio_with_extra_config(extra_config: &str) -> AgentCluster {
 /// Start a fresh pair with the same extra TOML appended to each daemon's
 /// generated config. Useful for test-only timing overrides.
 pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
-    pair_with_extra_config_and_bob_env(extra_config, &[]).await
+    pair_with_extra_config_and_node_env(extra_config, &[], &[]).await
 }
 
 /// Start a fresh pair with extra environment variables set on **bob only**.
@@ -412,27 +416,64 @@ pub async fn pair_with_extra_config(extra_config: &str) -> AgentPair {
 /// initial `MemberJoined` volley while the authority behaves normally) need
 /// exactly one node configured, and bob is the harness's joiner.
 pub async fn pair_with_bob_env(env: &[(&str, &str)]) -> AgentPair {
-    pair_with_extra_config_and_bob_env("", env).await
+    pair_with_node_env(&[], env).await
 }
 
-async fn pair_with_extra_config_and_bob_env(
+/// Start a fresh pair with extra environment variables set on **alice only**.
+///
+/// The mirror of [`pair_with_bob_env`], for exchanges where alice is the
+/// sender: she is the harness's group authority, so removals and deletes
+/// originate with her (#333 slice C/D).
+pub async fn pair_with_alice_env(env: &[(&str, &str)]) -> AgentPair {
+    pair_with_node_env(env, &[]).await
+}
+
+/// Start a fresh pair with per-node environment variables. Either slice may be
+/// empty; both nodes still inherit the test process environment on top.
+pub async fn pair_with_node_env(alice_env: &[(&str, &str)], bob_env: &[(&str, &str)]) -> AgentPair {
+    pair_with_extra_config_and_node_env("", alice_env, bob_env).await
+}
+
+/// Every `pair*` constructor funnels through here, so the hermetic-plane
+/// guarantee below is stated once and cannot be forgotten by a new variant.
+async fn pair_with_extra_config_and_node_env(
     extra_config: &str,
+    alice_env: &[(&str, &str)],
     bob_env: &[(&str, &str)],
 ) -> AgentPair {
     let binary = find_x0xd_binary();
     let suffix = rand::random::<u16>();
+    // Hermetic by default: give this pair its own gossip plane.
+    //
+    // `network_id` is unset in generated test configs, and
+    // `DaemonConfig::resolved_network_id` (src/server/state.rs:568-574) maps
+    // unset to the PROD plane. The plane id is also what namespaces ant-quic's
+    // mDNS service (src/network.rs:1612-1618), so an unset value puts every
+    // test pair on the prod plane's LAN discovery: it advertises to, browses,
+    // and auto-connects to every other x0x daemon on the machine, including
+    // unrelated app daemons. `--no-hard-coded-bootstrap` does not help — that
+    // only stops this node dialling OUT, not others finding it.
+    //
+    // Measured on the two historically-flaky propagation tests (#337): 2/6
+    // passing at 39-55s each without a private plane, 6/6 at 22-25s with one.
+    // The pollution manifests as slow invite-join convergence, which is what
+    // those tests wait on.
+    let plane_config = format!("network_id = \"x0x-test-{}\"\n", rand::random::<u32>());
+    let extra_config = format!("{plane_config}{extra_config}");
+    let extra_config = extra_config.as_str();
     let alice_api = allocate_unused_tcp_port();
     let alice_bind = allocate_unused_udp_port();
     let bob_api = allocate_unused_tcp_port();
     let bob_bind = allocate_unused_udp_port();
 
-    let alice = start_instance(
+    let alice = start_instance_with_env(
         &binary,
         &format!("pair-alice-{suffix}"),
         alice_api,
         alice_bind,
         "",
         extra_config,
+        alice_env,
     )
     .await;
     // Rolling start: use the same empirically-required delay as the trio so
