@@ -9,9 +9,12 @@
 //!   from non-owners are rejected. Use for app stores, agent skill registries.
 //! - **Allowlisted**: Only explicitly allowed writers can write. The owner
 //!   manages the allowlist. Use for team workspaces, private swarms.
-//! - **Encrypted**: Reserved for group-scoped encrypted stores. The current
-//!   KvStore sync path does not encrypt deltas; do not rely on this policy for
-//!   confidentiality until encrypted sync is wired.
+//! - **Encrypted**: Reserved for group-scoped encrypted stores. Reserved
+//!   means reserved: [`KvStore::new`] refuses to construct one (returning
+//!   [`KvError::EncryptedPolicyReserved`]), and a replica that already
+//!   carries the policy (e.g. deserialized legacy state) fails closed — no
+//!   authorized writer, no local writes, no delta application — until
+//!   encrypted sync is wired.
 //! - **AppendOnly**: Like `Signed` (owner-only writes), but existing keys are
 //!   immutable — no update, no delete, even by the owner. Use for
 //!   tamper-evident event logs where the author must not be able to rewrite
@@ -39,9 +42,14 @@ pub enum AccessPolicy {
 
     /// Reserved for group-scoped encrypted stores.
     ///
-    /// The current KvStore sync path still publishes plaintext deltas and does
-    /// not enforce group membership by itself. Do not rely on this variant for
-    /// confidentiality until encrypted sync is wired.
+    /// The variant is **unconstructible** through ordinary constructors
+    /// ([`KvStore::new`] returns
+    /// [`KvError::EncryptedPolicyReserved`]) and **fail-closed** on any
+    /// replica that already carries it: the sync path still publishes
+    /// plaintext deltas and enforces no group membership, so until encrypted
+    /// sync is wired the name must not promise confidentiality. The variant
+    /// itself stays (bincode discriminant 2 is pinned on disk and on the
+    /// wire).
     Encrypted {
         /// MLS group ID for this store.
         group_id: Vec<u8>,
@@ -645,14 +653,32 @@ impl KvStore {
     /// This is the **creator** path: ownership is anchored on `owner` at
     /// construction (channel [`AnchorChannel::Creator`]) and is immutable for
     /// the life of the store.
-    #[must_use]
-    pub fn new(id: KvStoreId, name: String, owner: AgentId, policy: AccessPolicy) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::EncryptedPolicyReserved`] if `policy` is
+    /// [`AccessPolicy::Encrypted`]: the secure sync path is not wired yet,
+    /// so an Encrypted replica would gossip plaintext while authorizing
+    /// every writer. The name must not over-promise — the variant stays
+    /// reserved (and deserialized replicas fail closed) until that lands.
+    pub fn new(id: KvStoreId, name: String, owner: AgentId, policy: AccessPolicy) -> Result<Self> {
+        if let AccessPolicy::Encrypted { group_id } = &policy {
+            tracing::warn!(
+                target: "x0x::kv",
+                "refused to construct store {} with reserved encrypted policy (group_id {}) — secure sync is not wired; use a Signed/Allowlisted/AppendOnly store until then",
+                id,
+                hex::encode(group_id)
+            );
+            return Err(KvError::EncryptedPolicyReserved {
+                group_id: group_id.clone(),
+            });
+        }
         let mut name_reg = LwwRegister::new(name.clone());
         // Stamp the creator-set name with a non-empty clock so it wins LWW
         // merge against replicas initialized with empty names and empty
         // clocks (which would otherwise be concurrent and hash-tiebroken).
         name_reg.set(name, PeerId::new(owner.0));
-        Self {
+        Ok(Self {
             id,
             keys: OrSet::new(),
             entries: HashMap::new(),
@@ -667,7 +693,30 @@ impl KvStore {
             allowed_writers: HashSet::new(),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
-        }
+        })
+    }
+
+    /// Force-build a live replica carrying the reserved
+    /// [`AccessPolicy::Encrypted`] policy, bypassing the [`new`](Self::new)
+    /// reservation guard.
+    ///
+    /// **Test-only by design** (`#[cfg(test)]`, #341 Phase A): it exists
+    /// solely so the fail-closed arms (`is_authorized`,
+    /// `authorize_local_write`, `merge_delta`) can be proven against a
+    /// replica that no ordinary constructor will build anymore. The only
+    /// production-shaped way such a replica can exist is deserializing
+    /// legacy state (snapshot/wire), which hits the same fail-closed paths.
+    #[cfg(test)]
+    pub(crate) fn new_encrypted_unchecked(
+        id: KvStoreId,
+        name: String,
+        owner: AgentId,
+        group_id: Vec<u8>,
+    ) -> Self {
+        let mut store = Self::new(id, name, owner, AccessPolicy::Signed)
+            .expect("Signed policy is always constructible");
+        store.policy = AccessPolicy::Encrypted { group_id };
+        store
     }
 
     /// Create a joined replica of a store, anchoring ownership from trusted
@@ -844,10 +893,11 @@ impl KvStore {
                     || self.allowed_writers.contains(agent_id)
             }
             AccessPolicy::Encrypted { .. } => {
-                // Reserved for encrypted sync. The store layer currently treats
-                // this as permissive; group membership enforcement belongs in
-                // the secure sync path once wired.
-                true
+                // Reserved for encrypted sync — fail closed (#341 Phase A):
+                // the sync path still carries plaintext deltas and no group
+                // membership check exists, so nobody is authorized on an
+                // Encrypted replica until the secure sync path is wired.
+                false
             }
             AccessPolicy::AppendOnly => {
                 // Owner-only writes, exactly like Signed. Immutability of
@@ -869,16 +919,29 @@ impl KvStore {
     ///
     /// # Errors
     ///
+    /// - [`KvError::EncryptedPolicyReserved`] if the store carries the
+    ///   reserved [`AccessPolicy::Encrypted`] policy: secure sync is not
+    ///   wired, so no local write may mutate such a replica (fail closed).
     /// - [`KvError::OwnerUnknown`] if the store has a policy-restricted
     ///   (`Signed`/`Allowlisted`) policy but its authoritative owner has not
     ///   been learned yet (a freshly joined replica). Fail closed.
     /// - [`KvError::Unauthorized`] if `writer` is not authorized under the
     ///   store's policy.
     pub fn authorize_local_write(&self, writer: &AgentId) -> Result<()> {
-        if matches!(self.policy, AccessPolicy::Encrypted { .. }) {
-            // Matches the inbound path: the reserved Encrypted policy is
-            // currently permissive at the store layer.
-            return Ok(());
+        if let AccessPolicy::Encrypted { group_id } = &self.policy {
+            // Matches the inbound path: the reserved Encrypted policy
+            // authorizes nobody until secure sync is wired. Fail closed,
+            // loudly — never `OwnerUnknown`, this is not an ownership issue.
+            tracing::warn!(
+                target: "x0x::kv",
+                "refused local write by {} on reserved encrypted store {} (group_id {}) — secure sync is not wired",
+                hex::encode(writer.as_bytes()),
+                self.id,
+                hex::encode(group_id)
+            );
+            return Err(KvError::EncryptedPolicyReserved {
+                group_id: group_id.clone(),
+            });
         }
         let Some(owner) = self.owner.as_ref() else {
             return Err(KvError::OwnerUnknown);
@@ -1198,19 +1261,14 @@ impl KvStore {
                 return Ok(()); // Silent rejection — don't propagate errors for spam
             }
         } else {
-            // No writer identity is only tolerated for the reserved Encrypted
-            // policy. KvStoreSync does not decrypt or verify group membership
-            // here today.
-            match &self.policy {
-                AccessPolicy::Encrypted { .. } => {} // OK
-                _ => {
-                    tracing::warn!(
-                        "rejected anonymous delta for non-encrypted store {}",
-                        self.id
-                    );
-                    return Ok(());
-                }
-            }
+            // No writer identity applies nothing under ANY policy: the
+            // gossip V2 envelope supplies the verified sender for
+            // Signed/Allowlisted/AppendOnly merges, and the reserved
+            // Encrypted policy is fail-closed (#341 Phase A) until secure
+            // sync is wired — it is no longer an anonymous-merge escape
+            // hatch.
+            tracing::warn!("rejected anonymous delta for store {}", self.id);
+            return Ok(());
         }
 
         // Canonical-map gate, ALL policies: a delta carrying the same key in
@@ -1355,16 +1413,31 @@ impl KvStore {
     /// cold-recover a Signed store from a non-owner replica while the owner is
     /// offline.
     ///
-    /// Returns `false` otherwise (unanchored, bad sig/owner, stale seq,
-    /// cross-store, entry integrity failure, root mismatch / incremental
-    /// delta / tamper), in which case [`merge_delta`] falls through to the
-    /// normal sender-auth path. Never establishes ownership (anchor gate).
+    /// Returns `false` otherwise (unanchored, reserved Encrypted policy,
+    /// bad sig/owner, stale seq, cross-store, entry integrity failure,
+    /// root mismatch / incremental delta / tamper), in which case
+    /// [`merge_delta`] falls through to the normal sender-auth path. Never
+    /// establishes ownership (anchor gate).
     fn try_adopt_full_snapshot(
         &mut self,
         delta: &KvStoreDelta,
         peer_id: PeerId,
         cp: &OwnerCheckpoint,
     ) -> bool {
+        // 0. Reserved Encrypted policy is fail-closed (#341 Phase A, I1):
+        //    this path runs in merge_delta BEFORE the sender-auth check, so
+        //    without this gate a genuine owner checkpoint would apply its
+        //    plaintext entries and refresh the policy in step 10 — flipping
+        //    the replica Encrypted→Signed and re-opening every write path.
+        if let AccessPolicy::Encrypted { group_id } = &self.policy {
+            tracing::warn!(
+                target: "x0x::kv",
+                "rejected owner checkpoint for encrypted store {} (group_id {}) — secure sync is not wired",
+                self.id,
+                hex::encode(group_id)
+            );
+            return false;
+        }
         // 1. Anchor gate: never learn the owner from a relay.
         let Some(expected_owner) = self.owner else {
             tracing::warn!("rejected owner checkpoint for unanchored store {}", self.id);
@@ -1790,7 +1863,8 @@ mod tests {
     #[test]
     fn test_new_store() {
         let owner = agent(1);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         assert_eq!(store.name(), "Test");
         assert_eq!(store.len(), 0);
         assert!(store.is_empty());
@@ -1806,7 +1880,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
 
         store
             .put(
@@ -1830,7 +1905,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
 
         store
             .put(
@@ -1861,7 +1937,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
 
         store
             .put(
@@ -1882,7 +1959,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         assert!(store.remove("nope").is_err());
     }
 
@@ -1894,7 +1972,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         let big = vec![0u8; 100_000];
         let result = store.put(
             "big".to_string(),
@@ -1913,7 +1992,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
 
         store
             .put("a".to_string(), b"1".to_vec(), "text/plain".to_string(), p)
@@ -1935,8 +2015,10 @@ mod tests {
         let id = store_id(1);
         let owner = agent(1);
 
-        let mut s1 = KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed);
-        let mut s2 = KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed);
+        let mut s1 =
+            KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        let mut s2 =
+            KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed).expect("kv store");
 
         s1.put("a".to_string(), b"1".to_vec(), "text/plain".to_string(), p1)
             .expect("put");
@@ -1950,8 +2032,10 @@ mod tests {
     #[test]
     fn test_merge_different_ids_fails() {
         let owner = agent(1);
-        let mut s1 = KvStore::new(store_id(1), "A".to_string(), owner, AccessPolicy::Signed);
-        let s2 = KvStore::new(store_id(2), "B".to_string(), owner, AccessPolicy::Signed);
+        let mut s1 = KvStore::new(store_id(1), "A".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
+        let s2 = KvStore::new(store_id(2), "B".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         assert!(s1.merge(&s2).is_err());
     }
 
@@ -1963,7 +2047,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         assert_eq!(store.current_version(), 0);
 
         store
@@ -1994,7 +2079,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "key1".to_string(),
@@ -2041,7 +2127,8 @@ mod tests {
             "Legacy".to_string(),
             owner,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "k".to_string(),
@@ -2094,7 +2181,8 @@ mod tests {
             "Test".to_string(),
             agent(1),
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         let s1 = store.next_seq();
         let s2 = store.next_seq();
         assert!(s2 > s1);
@@ -2105,7 +2193,8 @@ mod tests {
     #[test]
     fn test_signed_policy_owner_authorized() {
         let owner = agent(1);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         assert!(store.is_authorized(&owner));
     }
 
@@ -2113,7 +2202,8 @@ mod tests {
     fn test_signed_policy_non_owner_rejected() {
         let owner = agent(1);
         let other = agent(2);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         assert!(!store.is_authorized(&other));
     }
 
@@ -2121,7 +2211,8 @@ mod tests {
     fn test_signed_policy_rejects_unauthorized_delta() {
         let owner = agent(1);
         let attacker = agent(99);
-        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
 
         let entry = KvEntry::new(
             "spam".to_string(),
@@ -2140,7 +2231,8 @@ mod tests {
     #[test]
     fn test_signed_policy_accepts_owner_delta() {
         let owner = agent(1);
-        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
 
         let entry = KvEntry::new(
             "legit".to_string(),
@@ -2166,7 +2258,8 @@ mod tests {
             "Team".to_string(),
             owner,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
 
         // Owner can add writers
         store.allow_writer(writer, &owner).expect("allow");
@@ -2186,7 +2279,8 @@ mod tests {
             "Team".to_string(),
             owner,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
 
         let result = store.allow_writer(agent(3), &other);
         assert!(result.is_err());
@@ -2202,7 +2296,8 @@ mod tests {
             "Team".to_string(),
             owner,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
 
         store.allow_writer(writer, &owner).expect("allow");
         assert!(store.is_authorized(&writer));
@@ -2221,7 +2316,8 @@ mod tests {
             "Team".to_string(),
             owner,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
         store.allow_writer(writer, &owner).expect("allow");
 
         // Full delta should include the allowlist
@@ -2236,7 +2332,8 @@ mod tests {
     #[test]
     fn test_anonymous_delta_rejected_for_signed_store() {
         let owner = agent(1);
-        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let mut store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
 
         let entry = KvEntry::new(
             "anon".to_string(),
@@ -2261,7 +2358,8 @@ mod tests {
     #[test]
     fn test_local_write_owner_authorized_on_signed_store() {
         let owner = agent(1);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         store
             .authorize_local_write(&owner)
             .expect("owner must be able to write locally");
@@ -2271,7 +2369,8 @@ mod tests {
     fn test_local_write_non_owner_rejected_on_signed_store() {
         let owner = agent(1);
         let joiner = agent(2);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         let err = store
             .authorize_local_write(&joiner)
             .expect_err("non-owner local write must be rejected, not silently applied");
@@ -2528,7 +2627,8 @@ mod tests {
         // (exactly what a holder — including a v0.30.1 owner — sends on a
         // StateRequest).
         let mut owner_store =
-            KvStore::new(store_id(1), "S".to_string(), owner, AccessPolicy::Signed);
+            KvStore::new(store_id(1), "S".to_string(), owner, AccessPolicy::Signed)
+                .expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -2568,18 +2668,166 @@ mod tests {
     }
 
     #[test]
-    fn test_local_write_encrypted_policy_stays_permissive() {
-        // The reserved Encrypted policy is permissive at the store layer on
-        // the inbound path; the local path must match it, not diverge.
-        let store = KvStore::new(
+    fn encrypted_new_is_reserved() {
+        // WHY (#341 Phase A, I0): the Encrypted policy names group-scoped
+        // confidentiality, but secure sync is not wired — a constructible
+        // replica would gossip plaintext while authorizing every writer.
+        // The constructor must refuse it with the DEDICATED reserved error,
+        // never OwnerUnknown (this is not an ownership problem) and never
+        // a live store.
+        let err = KvStore::new(
             store_id(1),
             "Test".to_string(),
             agent(1),
-            AccessPolicy::Encrypted { group_id: vec![1] },
+            AccessPolicy::Encrypted {
+                group_id: vec![1, 2, 3],
+            },
+        )
+        .expect_err("Encrypted policy must not be constructible");
+        assert!(
+            matches!(
+                &err,
+                KvError::EncryptedPolicyReserved { group_id } if group_id == &vec![1, 2, 3]
+            ),
+            "expected EncryptedPolicyReserved, got {err:?}"
         );
-        store
-            .authorize_local_write(&agent(9))
-            .expect("encrypted policy is permissive at the store layer");
+        assert!(
+            !matches!(err, KvError::OwnerUnknown),
+            "the reserved-policy reject must never surface as OwnerUnknown"
+        );
+
+        // Every wired policy still constructs.
+        for policy in [
+            AccessPolicy::Signed,
+            AccessPolicy::Allowlisted,
+            AccessPolicy::AppendOnly,
+        ] {
+            assert!(
+                KvStore::new(store_id(1), "Test".to_string(), agent(1), policy.clone()).is_ok(),
+                "{policy} must stay constructible"
+            );
+        }
+    }
+
+    #[test]
+    fn encrypted_fail_closed_if_forced() {
+        // WHY (#341 Phase A, I1): a legacy/deserialized replica CAN carry
+        // the reserved Encrypted policy even though no constructor builds
+        // one anymore. Such a replica must fail closed: nobody authorized,
+        // no local writes, and no delta application — anonymous or signed —
+        // until secure sync is wired. `new_encrypted_unchecked` is the
+        // test-only bypass that proves these arms.
+        let owner = agent(1);
+        let anyone = agent(9);
+        let id = store_id(1);
+
+        let mut dest =
+            KvStore::new_encrypted_unchecked(id, "Test".to_string(), owner, vec![1, 2, 3]);
+
+        // is_authorized: false for everyone, the anchored owner included.
+        assert!(!dest.is_authorized(&owner), "owner is not authorized");
+        assert!(!dest.is_authorized(&anyone), "stranger is not authorized");
+
+        // authorize_local_write: dedicated reserved error, not Ok, not
+        // Unauthorized, not OwnerUnknown.
+        for writer in [&owner, &anyone] {
+            let err = dest
+                .authorize_local_write(writer)
+                .expect_err("local writes must fail on a forced Encrypted replica");
+            assert!(
+                matches!(
+                    &err,
+                    KvError::EncryptedPolicyReserved { group_id } if group_id == &vec![1, 2, 3]
+                ),
+                "expected EncryptedPolicyReserved, got {err:?}"
+            );
+        }
+
+        // merge_delta: a real delta from a source store applies NOTHING —
+        // neither anonymously (writer == None) nor with a named writer
+        // (even the owner). Silent-for-spam Ok, but nothing lands.
+        let mut source =
+            KvStore::new(id, "Test".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        source
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("source put");
+        let delta = source.full_delta();
+        let v_before = dest.current_version();
+
+        dest.merge_delta(&delta, peer(2), None)
+            .expect("anonymous merge is a silent reject, not an error");
+        assert!(dest.get("k").is_none(), "anonymous delta applied nothing");
+
+        dest.merge_delta(&delta, peer(2), Some(&owner))
+            .expect("signed merge is a silent reject, not an error");
+        assert!(
+            dest.get("k").is_none(),
+            "owner-signed delta applied nothing"
+        );
+        dest.merge_delta(&delta, peer(2), Some(&anyone))
+            .expect("signed merge is a silent reject, not an error");
+        assert!(dest.get("k").is_none(), "stranger delta applied nothing");
+
+        assert_eq!(dest.current_version(), v_before, "no state change at all");
+        assert!(dest.is_empty(), "forced Encrypted replica stays empty");
+    }
+
+    #[test]
+    fn encrypted_replica_rejects_owner_checkpoint_adoption() {
+        // WHY (#341 Phase A, I1): checkpoint adoption runs in merge_delta
+        // BEFORE the sender-auth check, so `try_adopt_full_snapshot` is the
+        // one write path the is_authorized fail-closed arm never sees. A
+        // forced Encrypted replica (legacy/deserialized state) receiving a
+        // delta with a GENUINE owner checkpoint must not adopt: adoption
+        // would apply the plaintext entries and refresh the policy in
+        // step 10 — silently flipping Encrypted→Signed and re-opening
+        // every write path the reservation closed.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/enc-adopt";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        owner_store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut delta = owner_store.full_delta();
+        delta.owner_checkpoint = Some(cp);
+
+        let mut dest = KvStore::new_encrypted_unchecked(id, String::new(), owner, vec![1, 2, 3]);
+        let v_before = dest.current_version();
+        dest.merge_delta(&delta, peer(9), Some(&owner))
+            .expect("silent reject, not an error");
+        assert!(
+            dest.get("k").is_none(),
+            "owner checkpoint must not apply its plaintext entries"
+        );
+        assert!(dest.is_empty(), "forced Encrypted replica stays empty");
+        assert!(
+            matches!(dest.policy, AccessPolicy::Encrypted { .. }),
+            "policy must stay Encrypted, not flip to Signed"
+        );
+        assert!(
+            dest.latest_checkpoint.is_none(),
+            "checkpoint must not be cached"
+        );
+        assert_eq!(
+            dest.highest_checkpoint_seq, 0,
+            "high-water mark must stay untouched"
+        );
+        assert_eq!(dest.current_version(), v_before, "no state change at all");
     }
 
     #[test]
@@ -2633,7 +2881,8 @@ mod tests {
         let topic = "store/cold";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -2666,7 +2915,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/inject";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -2710,7 +2960,8 @@ mod tests {
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
         // Owner at time 1: state {k1}; the broadcast delta carries cp seq 1.
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -2770,7 +3021,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/delrec";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -2822,7 +3074,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/tamper";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -2858,7 +3111,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/replay";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         let cp_old = checkpoint_for(&owner_store, topic, &kp, 1);
         let mut joiner =
             KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
@@ -2877,7 +3131,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/unanchored";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         let cp = checkpoint_for(&owner_store, topic, &kp, 1);
         let mut delta = KvStoreDelta::new(0);
         delta.owner_checkpoint = Some(cp);
@@ -2899,7 +3154,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic_a = "store/A";
         let id_a = KvStoreId::for_topic_owner(topic_a, &owner);
-        let owner_store = KvStore::new(id_a, "A".to_string(), owner, AccessPolicy::Signed);
+        let owner_store =
+            KvStore::new(id_a, "A".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         let cp = checkpoint_for(&owner_store, topic_a, &kp, 1);
         // Replay onto a different store B (different topic -> different id).
         let id_b = KvStoreId::for_topic_owner("store/B", &owner);
@@ -2951,7 +3207,8 @@ mod tests {
         let owner = kp.agent_id();
         let topic = "store/return";
         let id = KvStoreId::for_topic_owner(topic, &owner);
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -3087,7 +3344,8 @@ mod tests {
         let topic = "store/forgery";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "Legit".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "Legit".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put(
                 "k".to_string(),
@@ -3229,7 +3487,8 @@ mod tests {
         let id = KvStoreId::for_topic_owner(topic, &owner);
         let p = peer(1);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         let mut relay =
             KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
 
@@ -3329,7 +3588,8 @@ mod tests {
         let id = KvStoreId::for_topic_owner(topic, &owner);
         let p = peer(1);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         let mut relay =
             KvStore::new_replica(id, String::new(), Some(owner), AnchorChannel::RestParam);
 
@@ -3392,7 +3652,8 @@ mod tests {
         let id = KvStoreId::for_topic_owner(topic, &owner);
         let p = peer(1);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         owner_store
             .put("k".to_string(), b"v".to_vec(), "text/plain".to_string(), p)
             .expect("owner put");
@@ -3471,7 +3732,8 @@ mod tests {
             "log".to_string(),
             owner,
             AccessPolicy::AppendOnly,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "k1".to_string(),
@@ -3642,7 +3904,8 @@ mod tests {
         let topic = "store/ao-cold";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -3683,7 +3946,8 @@ mod tests {
         entries: &[(&str, &[u8])],
         seq: u64,
     ) -> KvStoreDelta {
-        let mut forged = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut forged =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         for (k, v) in entries {
             forged
                 .put(
@@ -3711,7 +3975,8 @@ mod tests {
         let topic = "store/ao-shrink";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         for (k, v) in [("k1", b"v1".as_slice()), ("k2", b"v2".as_slice())] {
             owner_store
                 .put(k.to_string(), v.to_vec(), "text/plain".to_string(), peer(1))
@@ -3750,7 +4015,8 @@ mod tests {
         let topic = "store/ao-rewrite";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -3792,7 +4058,8 @@ mod tests {
             "plain".to_string(),
             owner,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "k".to_string(),
@@ -3864,7 +4131,8 @@ mod tests {
         let topic = "store/ao-downgrade";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -3886,7 +4154,8 @@ mod tests {
 
         // Forge: identical content, policy flipped to Signed, newer seq +
         // newer policy_version.
-        let mut forged = KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed);
+        let mut forged =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
         forged
             .put(
                 "k1".to_string(),
@@ -3921,7 +4190,8 @@ mod tests {
         let topic = "store/ao-dup";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -4006,7 +4276,8 @@ mod tests {
             "log".to_string(),
             owner,
             AccessPolicy::AppendOnly,
-        );
+        )
+        .expect("kv store");
         hostile
             .put(
                 "k1".to_string(),
@@ -4048,7 +4319,8 @@ mod tests {
             "log".to_string(),
             owner,
             AccessPolicy::AppendOnly,
-        );
+        )
+        .expect("kv store");
         additive
             .put(
                 "k2".to_string(),
@@ -4151,7 +4423,8 @@ mod tests {
         let topic = "store/ao-truncate";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         for (k, v) in [("k1", b"v1".as_slice()), ("k2", b"v2".as_slice())] {
             owner_store
                 .put(k.to_string(), v.to_vec(), "text/plain".to_string(), peer(1))
@@ -4217,7 +4490,8 @@ mod tests {
         let topic = "store/ao-skiponly";
         let id = KvStoreId::for_topic_owner(topic, &owner);
 
-        let mut owner_store = KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly);
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::AppendOnly).expect("kv store");
         owner_store
             .put(
                 "k1".to_string(),
@@ -4307,7 +4581,8 @@ mod tests {
             "plain".to_string(),
             owner,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "k".to_string(),

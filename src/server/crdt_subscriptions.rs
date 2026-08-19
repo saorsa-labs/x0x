@@ -827,6 +827,27 @@ mod tests {
         assert_eq!(manifest_policy(&extra), None, "non-string fails closed");
     }
 
+    #[test]
+    fn rest_and_manifest_still_reject_encrypted() {
+        // WHY (#341 Phase A): `AccessPolicy::Encrypted` is reserved — the
+        // store layer refuses to construct it, and the daemon surfaces must
+        // keep refusing it too, so a restart can never resurrect a live
+        // plaintext-gossiping "encrypted" store from the manifest. The REST
+        // create route mirrors this: it accepts only "signed"/"append_only"
+        // (see routes/stores.rs). "encrypted" must resolve to None here —
+        // the caller skips rehydration loudly instead of guessing a policy.
+        let mut extra = serde_json::Map::new();
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("encrypted".into()),
+        );
+        assert_eq!(
+            manifest_policy(&extra),
+            None,
+            "encrypted policy must fail closed on manifest rehydration"
+        );
+    }
+
     fn entry(kind: &str, id: &str, role: &str) -> CrdtSubscriptionEntry {
         CrdtSubscriptionEntry {
             kind: kind.to_string(),

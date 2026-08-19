@@ -88,6 +88,21 @@ pub enum KvError {
     /// an idempotent no-op and never raises this error.)
     #[error("immutable key: {0} — append-only store; existing keys cannot be updated or deleted")]
     ImmutableKey(String),
+
+    /// Construction or local write on the reserved `Encrypted` policy.
+    ///
+    /// `AccessPolicy::Encrypted` names a group-scoped confidential store,
+    /// but the secure sync path (seal/open, group membership) is not wired
+    /// yet — a live replica would gossip plaintext deltas while authorizing
+    /// every writer. Until that lands (#341 Phase B), the policy is
+    /// unconstructible via ordinary constructors and fail-closed on any
+    /// replica that already carries it. Never mapped to `OwnerUnknown`:
+    /// this is a reserved-policy rejection, not a missing ownership anchor.
+    #[error("encrypted policy reserved: group_id={group_id:?} — AccessPolicy::Encrypted is not constructible until secure sync is wired")]
+    EncryptedPolicyReserved {
+        /// The group id the reserved policy carried.
+        group_id: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -131,6 +146,22 @@ mod tests {
         assert!(display.contains("immutable key"));
         assert!(display.contains("evt-0001"));
         assert!(display.contains("append-only"));
+    }
+
+    #[test]
+    fn test_error_display_encrypted_policy_reserved() {
+        // WHY: the reserved-policy rejection must be self-explanatory at the
+        // call site — the variant name alone is invisible to logs and API
+        // clients. The display carries the group id and the reason Encrypted
+        // refuses to construct.
+        let error = KvError::EncryptedPolicyReserved {
+            group_id: vec![1, 2, 3],
+        };
+        let display = format!("{error}");
+        assert!(display.contains("encrypted policy reserved"));
+        assert!(display.contains("[1, 2, 3]"));
+        assert!(display.contains("not constructible"));
+        assert!(display.contains("secure sync"));
     }
 
     #[test]

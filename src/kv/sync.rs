@@ -1290,6 +1290,19 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
     };
     let body: SnapshotBody = bincode::deserialize(body_bytes)?;
     let store = body.store;
+    // #341 Phase A: a snapshot written before the reservation guard can
+    // still carry the reserved Encrypted policy. The replica opens
+    // fail-closed (no authorized writer, no local writes, no delta
+    // application) — surface that loudly at open time, not only on first
+    // rejected use.
+    if let AccessPolicy::Encrypted { group_id } = store.policy() {
+        tracing::warn!(
+            target: "x0x::kv",
+            "opened snapshot of reserved encrypted store {} (group_id {}) — replica is fail-closed until secure sync is wired",
+            store.id(),
+            hex::encode(group_id)
+        );
+    }
     store.restore_seq_counter(body.seq_counter.max(store.current_version()));
     Ok(Some(store))
 }
@@ -1335,7 +1348,8 @@ mod tests {
             "log".to_string(),
             agent(1),
             AccessPolicy::AppendOnly,
-        );
+        )
+        .expect("kv store");
         store
             .put(
                 "k1".to_string(),
@@ -1394,6 +1408,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn snapshot_with_reserved_encrypted_policy_opens_fail_closed() {
+        // WHY (#341 Phase A): a snapshot written before the reservation
+        // guard can carry the reserved Encrypted policy. Restoring it must
+        // neither error (that would lose the data) nor silently downgrade
+        // to Signed (that would invent write authority): the replica
+        // restores as-is and the store's fail-closed arms apply.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let path = dir.path().join("kv").join("enc.bin");
+        let store = KvStore::new_encrypted_unchecked(
+            store_id(7),
+            "enc".to_string(),
+            agent(1),
+            vec![1, 2, 3],
+        );
+        let bytes = encode_snapshot(&store).expect("encode");
+        write_snapshot_atomic(&path, &bytes).expect("write");
+
+        let restored = load_snapshot(&path).expect("load").expect("present");
+        assert!(
+            matches!(restored.policy(), AccessPolicy::Encrypted { .. }),
+            "policy restores verbatim — never silently downgraded"
+        );
+        assert!(
+            !restored.is_authorized(&agent(1)),
+            "restored reserved replica is fail-closed, even for its owner"
+        );
+    }
+
     /// Construct an isolated network node (mirrors the helper in
     /// `src/gossip/pubsub.rs` tests). `PubSubManager` is fully constructable
     /// in tests, so `KvStoreSync` is testable end-to-end without a live mesh.
@@ -1410,7 +1453,8 @@ mod tests {
     async fn make_sync(topic: &str, policy: AccessPolicy) -> KvStoreSync {
         let node = make_node().await;
         let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
-        let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
+        let store =
+            KvStore::new(store_id(1), "Test".to_string(), agent(1), policy).expect("kv store");
         KvStoreSync::new(store, pubsub, topic.to_string(), peer(1), Some(agent(1)))
             .expect("kv sync")
     }
@@ -1423,7 +1467,8 @@ mod tests {
     ) -> (KvStoreSync, Arc<PubSubManager>) {
         let node = make_node().await;
         let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
-        let store = KvStore::new(store_id(1), "Test".to_string(), agent(1), policy);
+        let store =
+            KvStore::new(store_id(1), "Test".to_string(), agent(1), policy).expect("kv store");
         let sync = KvStoreSync::new(
             store,
             Arc::clone(&pubsub),
@@ -1438,7 +1483,8 @@ mod tests {
     #[tokio::test]
     async fn test_kv_store_sync_creation() {
         let owner = agent(1);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         let _store_for_sync = store;
     }
 
@@ -1453,7 +1499,8 @@ mod tests {
             "Test".to_string(),
             owner,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
         store.allow_writer(writer, &owner).expect("allow");
         let store_arc = Arc::new(RwLock::new(store));
 
@@ -1479,7 +1526,8 @@ mod tests {
     #[tokio::test]
     async fn test_concurrent_reads() {
         let owner = agent(1);
-        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed);
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         let store_arc = Arc::new(RwLock::new(store));
 
         let s1 = store_arc.read().await;
@@ -1625,17 +1673,21 @@ mod tests {
     async fn start_default_spawner_merges_remote_delta() {
         // End-to-end exercise of the delta-merge listener: a delta published
         // on the topic is received by the background loop spawned by start()
-        // and merged into the local store. We use an Encrypted policy so an
-        // unsigned (anonymous-sender) delta is accepted by the store's
-        // access control — matching what the wire delivers for an unsigned
-        // publish via a PubSubManager with no signing context.
-        let sync = make_sync(
-            "store/E",
-            AccessPolicy::Encrypted {
-                group_id: vec![1, 2, 3],
-            },
-        )
-        .await;
+        // and merged into the local store. The publish goes out through a
+        // SigningContext for the store owner so the delivered v2 message
+        // carries a verified sender — the only writer a Signed store accepts.
+        // (#341 Phase A: anonymous deltas apply nothing under every policy;
+        // the reserved Encrypted policy is no longer an unsigned-publish
+        // escape hatch.)
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let ctx = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(ctx)).expect("pubsub"));
+        let store = KvStore::new(store_id(1), "Test".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
+        let sync = KvStoreSync::new(store, pubsub, "store/E".to_string(), peer(1), Some(owner))
+            .expect("kv sync");
 
         sync.start().await.expect("start");
 
@@ -1915,7 +1967,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k_old".to_string(),
@@ -1981,7 +2034,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         let (pub_bytes, sec_bytes) = kp.to_bytes();
         let public_key =
             ant_quic::MlDsaPublicKey::from_bytes(&pub_bytes).expect("public key bytes");
@@ -2102,7 +2156,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k_old".to_string(),
@@ -2231,7 +2286,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::AppendOnly,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k1".to_string(),
@@ -2323,8 +2379,10 @@ mod tests {
             "alpha".to_string(),
             owner,
             AccessPolicy::Signed,
-        );
-        let mut b = KvStore::new(store_id(1), "beta".to_string(), owner, AccessPolicy::Signed);
+        )
+        .expect("kv store");
+        let mut b = KvStore::new(store_id(1), "beta".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         // Empty stores: same id ⇒ same digest; the name is not content.
         assert_eq!(a.served_digest(), b.served_digest());
         let c = KvStore::new(
@@ -2332,7 +2390,8 @@ mod tests {
             "alpha".to_string(),
             owner,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         assert_ne!(
             a.served_digest(),
             c.served_digest(),
@@ -2389,7 +2448,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k1".to_string(),
@@ -2529,7 +2589,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k_live".to_string(),
@@ -2724,7 +2785,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k1".to_string(),
@@ -2841,7 +2903,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k1".to_string(),
@@ -2897,7 +2960,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Signed,
-        );
+        )
+        .expect("kv store");
         owned
             .put(
                 "k".to_string(),
@@ -3005,7 +3069,8 @@ mod tests {
             "log".to_string(),
             owner_id,
             AccessPolicy::Allowlisted,
-        );
+        )
+        .expect("kv store");
         owned.allow_writer(writer, &owner_id).expect("allow writer");
         owned
             .put(
@@ -3122,7 +3187,8 @@ mod tests {
     #[test]
     fn pruned_key_is_accepted_when_re_served_with_fresh_tags() {
         let owner = agent(1);
-        let mut holder = KvStore::new(store_id(1), "log".to_string(), owner, AccessPolicy::Signed);
+        let mut holder = KvStore::new(store_id(1), "log".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         holder
             .put(
                 "k_live".to_string(),
