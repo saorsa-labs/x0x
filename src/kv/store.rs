@@ -1122,6 +1122,10 @@ impl KvStore {
     /// before the quota so a single oversized value still surfaces as
     /// [`KvError::ValueTooLarge`].
     ///
+    /// This gates only the INCOMING key: `put` additionally trims the
+    /// writer's live set down to the admitted subset (same predicate), so a
+    /// local put can evict the writer's existing lex-high keys.
+    ///
     /// # Errors
     ///
     /// As [`authorize_write`](Self::authorize_write), plus
@@ -1337,6 +1341,11 @@ impl KvStore {
     /// immutable: a re-put of byte-identical content (same value AND
     /// content type) is accepted as an idempotent no-op so retries are safe,
     /// and anything else returns [`KvError::ImmutableKey`].
+    ///
+    /// Under [`AccessPolicy::SelfKeyed`], the writer's live set is trimmed to
+    /// the admitted lowest-N subset after the entry lands — the same rule
+    /// the remote merge applies — so a local put can evict the writer's
+    /// lex-highest keys.
     pub fn put(
         &mut self,
         key: String,
@@ -1361,6 +1370,14 @@ impl KvStore {
             }
         }
 
+        // Captured before `key` is consumed below: the SelfKeyed live-set cap
+        // is enforced after the entry lands.
+        let self_keyed_writer = if matches!(self.policy, AccessPolicy::SelfKeyed) {
+            key_agent_prefix(&key)
+        } else {
+            None
+        };
+
         let seq = self.next_seq();
 
         // Add key to OR-Set
@@ -1374,6 +1391,14 @@ impl KvStore {
         } else {
             self.entries
                 .insert(key.clone(), KvEntry::new(key, value, content_type));
+        }
+
+        // SelfKeyed live-set cap (I7): the quota bounds the live set, not
+        // just the write. `authorize_put` gates only the incoming key, so
+        // without this the local replica would keep the writer's over-cap
+        // lex-high keys that every remote evicts at step 4.
+        if let Some(writer) = self_keyed_writer {
+            self.enforce_self_keyed_live_set(&writer);
         }
 
         self.version += 1;
@@ -1531,6 +1556,36 @@ impl KvStore {
         })
     }
 
+    /// Shared live-set enforcement (I7): evict `writer`'s live keys outside
+    /// `admitted`. Both the remote merge (step 4 of
+    /// [`merge_delta_self_keyed`](Self::merge_delta_self_keyed)) and the
+    /// local put path call this, so neither side can hold keys the other
+    /// drops.
+    fn evict_outside_admitted(&mut self, writer: &AgentId, admitted: &HashSet<&str>) {
+        let stale: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| key_agent_prefix(k) == Some(*writer) && !admitted.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for key in &stale {
+            let _ = self.keys.remove(key);
+            self.entries.remove(key);
+        }
+    }
+
+    /// Enforce the `SelfKeyed` live-set cap after a LOCAL put of a key bound
+    /// to `writer` — the same predicate as the remote merge's step 4,
+    /// recomputed over the post-put live set. [`authorize_put`](Self::authorize_put)
+    /// only gates the incoming key; without this the local replica could
+    /// hold 65 keys while every remote holds the admitted 64.
+    fn enforce_self_keyed_live_set(&mut self, writer: &AgentId) {
+        let candidates = self.self_keyed_candidates(writer, &HashMap::new());
+        let admitted = Self::self_keyed_admitted(&candidates);
+        self.evict_outside_admitted(writer, &admitted);
+    }
+
     /// `AccessPolicy::SelfKeyed` merge path (issue #340).
     ///
     /// Per-key authority instead of a whole-delta owner gate: the gossip
@@ -1625,18 +1680,10 @@ impl KvStore {
         // 4. Evict the writer's live keys outside the admitted set: the
         //    admitted set is a pure function of the candidate live set, so
         //    every replica converges to exactly that subset regardless of
-        //    delivery order (I7).
-        let stale: Vec<String> = self
-            .keys
-            .elements()
-            .into_iter()
-            .filter(|k| key_agent_prefix(k) == Some(*w) && !admitted.contains(k.as_str()))
-            .cloned()
-            .collect();
-        for key in stale {
-            let _ = self.keys.remove(&key);
-            self.entries.remove(&key);
-        }
+        //    delivery order (I7). Shared with the local put path
+        //    (`enforce_self_keyed_live_set`) so neither side can hold keys
+        //    the other drops.
+        self.evict_outside_admitted(w, &admitted);
         // The name is LWW metadata, not directory content — merge it like
         // every other policy so replicas converge on the creator's name.
         if let Some(name_register) = &delta.name_update {
@@ -5422,6 +5469,68 @@ mod tests {
                 "{label} replica must hold exactly the 64 lex-lowest keys"
             );
         }
+
+        // Local-put counterpart (I7): `authorize_put` only gates the incoming
+        // key, so `KvStore::put` must apply the same step-4 eviction or a
+        // writer filling 64 lex-high keys and then putting a lex-low key
+        // keeps 65 locally while every remote holds 64 — a local fork.
+        let high: Vec<String> = (0..MAX_SELFKEYED_KEYS_PER_AGENT)
+            .map(|i| hex_key(&w, Some(&format!("1{i:02}"))))
+            .collect();
+        let low = hex_key(&w, Some("050"));
+        let mut local = self_keyed_store();
+        for key in &high {
+            local
+                .authorize_put(&w, key, b"v")
+                .expect("lex-high key within the key cap");
+            local
+                .put(
+                    key.clone(),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        local
+            .authorize_put(&w, &low, b"v")
+            .expect("lex-low key sorts into the admitted set");
+        local
+            .put(
+                low.clone(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+
+        // Second replica fed the SAME 65 keys through merge_delta, in the
+        // opposite order (low first), must land on the identical 64.
+        let mut remote = self_keyed_store();
+        for (i, key) in std::iter::once(&low).chain(high.iter()).enumerate() {
+            let mut d = KvStoreDelta::new((i + 1) as u64);
+            d.added
+                .insert(key.clone(), (kv_entry(key, b"v"), (peer(1), i as u64 + 1)));
+            remote.merge_delta(&d, peer(1), Some(&w)).expect("merge");
+        }
+
+        let mut admitted: Vec<String> = high.clone();
+        admitted.push(low.clone());
+        admitted.sort();
+        admitted.truncate(MAX_SELFKEYED_KEYS_PER_AGENT); // the lex-highest is evicted
+        for (label, store) in [("local", &local), ("remote", &remote)] {
+            let mut live: Vec<String> = store.active_keys().into_iter().cloned().collect();
+            live.sort();
+            assert_eq!(
+                live, admitted,
+                "{label} replica must hold exactly the admitted 64 after the local/remote split"
+            );
+        }
+        assert!(local.get(&low).is_some(), "the new lex-low key stays");
+        assert!(
+            local.get(high.last().expect("64 high keys")).is_none(),
+            "the lex-highest key is evicted locally, not only on remotes"
+        );
     }
 
     #[test]
