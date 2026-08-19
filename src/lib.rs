@@ -1779,13 +1779,14 @@ async fn upsert_discovered_machine(
     let mut cache = cache.write().await;
     match cache.get_mut(&incoming.machine_id) {
         Some(existing) => {
-            // A signed announcement (`announced_at > 0`) may replace the
-            // advertised address set. A PeerConnected observation uses
-            // `announced_at: 0` and must only add/refresh that one addr —
-            // never last-write-wins wipe `reachable_via` / `relay_candidates`
-            // (issue #304 handler contract, issue #308).
-            let replace_announced_set =
-                incoming.announced_at > 0 && incoming.announced_at >= existing.announced_at;
+            // A *newer* signed announcement may replace the advertised
+            // address set. Same-timestamp replay must not clear ports added
+            // by a later PeerConnected observe — `announced_at` on the
+            // machine record is unchanged by an observation (`announced_at:
+            // 0`), so `>=` would treat a gossip replay as authority to wipe
+            // those observed ports (issue #308). Observations themselves
+            // never replace (`0 > existing` is false).
+            let replace_announced_set = incoming.announced_at > existing.announced_at;
             if replace_announced_set {
                 existing.addresses.clear();
             }
@@ -18259,6 +18260,84 @@ mod candidate_address_retention_tests {
             *entry.addresses.last().expect("non-empty"),
             observed,
             "just-observed inbound addr is MRU"
+        );
+    }
+
+    /// WHY: after an inbound observe, a gossip replay of the *same*
+    /// announcement (`announced_at` unchanged) must add/refresh advertised
+    /// addrs without clearing the observed port. `>=` would treat that
+    /// replay as a replace because the observe left `announced_at` on the
+    /// machine record as-is (issue #308 Senior should-fix).
+    #[tokio::test]
+    async fn same_timestamp_announcement_replay_does_not_wipe_observed_port() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x31u8; 32]);
+        let announced: std::net::SocketAddr = "198.51.100.8:5483".parse().unwrap();
+        let observed: std::net::SocketAddr = "192.168.1.80:5493".parse().unwrap();
+        let announced_at = 1_700_000_000;
+
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        upsert_discovered_machine(
+            &cache,
+            observation(machine_id, vec![observed], announced_at + 1),
+        )
+        .await;
+
+        // Replay the original announcement at the same timestamp.
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at + 2,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        let guard = cache.read().await;
+        let entry = guard.get(&machine_id).expect("entry must exist");
+        assert!(
+            entry.addresses.contains(&observed),
+            "same-timestamp announcement replay must not wipe the PeerConnected-observed port {observed}"
+        );
+        assert!(
+            entry.addresses.contains(&announced),
+            "replayed announcement addr must still be present"
+        );
+        assert_eq!(
+            entry.announced_at, announced_at,
+            "replay at the same timestamp leaves announced_at unchanged"
         );
     }
 
