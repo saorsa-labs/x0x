@@ -26728,6 +26728,7 @@ pub(in crate::server) mod tests {
                 .build()
                 .await?,
         );
+        agent.join_network().await.context("join network")?;
         let state = secure_endpoint_test_state_at(data_dir, agent).await?;
         Ok((state, dir))
     }
@@ -26785,24 +26786,26 @@ pub(in crate::server) mod tests {
     }
 
     async fn wait_connected(alice: &Agent, bob: &Agent) -> Result<()> {
-        let bob_network = bob.network().context("bob network")?;
-        let bob_addr = bound_loopback(bob_network.bound_addr().await.context("bob bound")?);
+        let bob_addr = bound_loopback(bob.bound_addr().await.context("bob bound")?);
         let alice_network = alice.network().context("alice network")?;
         alice_network
             .connect_addr(bob_addr)
             .await
             .context("alice connects to bob")?;
         let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let alice_peer = ant_quic::PeerId(alice.machine_id().0);
+        let bob_network = bob.network().context("bob network")?;
         let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
         while tokio::time::Instant::now() < deadline {
             let alice_ready = alice_network.is_connected(&bob_peer).await
                 && !alice.peers().await.unwrap_or_default().is_empty();
-            if alice_ready {
+            let bob_ready = bob_network.is_connected(&alice_peer).await;
+            if alice_ready && bob_ready {
                 return Ok(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
-        anyhow::bail!("alice did not mark bob connected with a gossip peer")
+        anyhow::bail!("pair did not become mutually connected gossip peers")
     }
 
     /// Why (#296): empty eager set with live peers is the black-hole —
@@ -26855,13 +26858,13 @@ pub(in crate::server) mod tests {
         let plane = format!("fanout-healthy-{}", rand::random::<u32>());
         let (alice_state, _alice_dir) = networked_test_state(&plane).await?;
         let (bob_state, _bob_dir) = networked_test_state(&plane).await?;
-        wait_connected(&alice_state.agent, &bob_state.agent).await?;
-
         let group_id = insert_local_public_group(alice_state.as_ref(), &"cc".repeat(16)).await;
         let topic = x0x::groups::public_topic_for(&group_id);
+        let mut alice_sub = alice_state.agent.subscribe(&topic).await?;
         let mut bob_sub = bob_state.agent.subscribe(&topic).await?;
-        // Give PlumTree a tick to put Alice in Bob's eager set and vice versa.
-        tokio::time::sleep(Duration::from_millis(750)).await;
+        wait_connected(&alice_state.agent, &bob_state.agent).await?;
+        // Eager-set refresh is a 1s tick (see tests/gossip_plane_isolation.rs).
+        tokio::time::sleep(Duration::from_millis(1500)).await;
 
         let before = alice_state
             .agent
@@ -26887,23 +26890,31 @@ pub(in crate::server) mod tests {
             "healthy fan_out must not increment zero-fanout"
         );
 
-        let received = tokio::time::timeout(Duration::from_secs(8), async {
+        tokio::time::timeout(Duration::from_secs(15), async {
             loop {
-                let Some(msg) = bob_sub.recv().await else {
-                    anyhow::bail!("bob subscription closed");
-                };
-                if let Ok(parsed) =
-                    serde_json::from_slice::<x0x::groups::GroupPublicMessage>(&msg.payload)
-                {
-                    if parsed.body == marker {
-                        return Ok(());
+                tokio::select! {
+                    maybe = bob_sub.recv() => {
+                        let Some(msg) = maybe else {
+                            anyhow::bail!("bob subscription closed");
+                        };
+                        if let Ok(parsed) =
+                            serde_json::from_slice::<x0x::groups::GroupPublicMessage>(&msg.payload)
+                        {
+                            if parsed.body == marker {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    maybe = alice_sub.recv() => {
+                        // Drain Alice's local echo so the publisher subscription
+                        // cannot back-pressure the shared topic.
+                        let _ = maybe;
                     }
                 }
             }
         })
         .await
         .context("bob did not receive the public message")??;
-        let _ = received;
 
         alice_state.agent.shutdown().await;
         bob_state.agent.shutdown().await;
