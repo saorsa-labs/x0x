@@ -453,10 +453,15 @@ pub(super) struct DaemonUpdateConfig {
     #[serde(default = "default_rollout_window_minutes")]
     pub(super) rollout_window_minutes: u64,
 
-    /// Exit cleanly for service manager restart instead of spawning.
-    /// Default: true — the daemon stops with exit code 0 so that systemd
-    /// (or any supervisor with Restart=always) picks up the new binary.
-    /// Set to false to use `exec()` in-place replacement instead.
+    /// Prefer exiting for a service manager restart instead of the
+    /// transactional handoff. Default: true — under real supervision
+    /// (`INVOCATION_ID`, parent comm `systemd`, or `X0X_SUPERVISED=1`) the
+    /// daemon stops with exit code 0 so systemd (or any supervisor with
+    /// Restart=always) picks up the new binary. Unsupervised daemons —
+    /// including every terminal/nohup launch — use the transactional handoff
+    /// regardless of this flag (#261), as does `false` explicitly: the restart
+    /// only commits after the replacement serves `/health`, else the backup
+    /// is restored and the previous binary respawned.
     #[serde(default = "default_true")]
     pub(super) stop_on_upgrade: bool,
 
@@ -797,6 +802,9 @@ pub(super) struct AppState {
     /// Per-WS-outbound-queue observability (drop / slow-consumer-close counters).
     pub(super) ws_outbound_stats: Arc<WsOutboundStats>,
     pub(super) api_address: SocketAddr,
+    /// Daemon data directory — where the upgrade handoff/intent file and
+    /// `UPGRADE_FAILED` artifact live (#261).
+    pub(super) data_dir: PathBuf,
     pub(super) start_time: Instant,
     pub(super) broadcast_tx: broadcast::Sender<SseEvent>,
     /// Active file transfers.

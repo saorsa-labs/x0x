@@ -20405,6 +20405,7 @@ pub(in crate::server) mod tests {
             ws_topics: RwLock::new(HashMap::new()),
             ws_outbound_stats: Arc::new(WsOutboundStats::default()),
             api_address: "127.0.0.1:0".parse().expect("valid test API address"),
+            data_dir: data_dir.to_path_buf(),
             start_time: Instant::now(),
             broadcast_tx,
             file_transfers: RwLock::new(HashMap::new()),
