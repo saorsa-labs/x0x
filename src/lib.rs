@@ -11789,7 +11789,15 @@ impl Agent {
         policy: kv::AccessPolicy,
         state_dir: Option<&std::path::Path>,
     ) -> error::Result<KvStoreHandle> {
-        let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
+        // SelfKeyed directories are owner-free: every joiner who knows the
+        // topic derives the same id (I2/I4). Owner-anchored policies keep
+        // the topic→owner binding.
+        let is_self_keyed = matches!(policy, kv::AccessPolicy::SelfKeyed);
+        let store_id = if is_self_keyed {
+            kv::KvStoreId::for_self_keyed_topic(topic)
+        } else {
+            kv::KvStoreId::for_topic_owner(topic, &self.agent_id())
+        };
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
             Some(Ok(Some(snap))) => {
@@ -11798,7 +11806,16 @@ impl Agent {
                         "kv snapshot store-id mismatch for topic {topic}"
                     )));
                 }
-                if snap.owner() != Some(&self.agent_id()) {
+                if is_self_keyed {
+                    // A SelfKeyed snapshot is owner-free for life: an owner
+                    // or a non-SelfKeyed policy on the same (domain-separated)
+                    // id means the snapshot is not this store — fail closed.
+                    if snap.owner().is_some() || *snap.policy() != kv::AccessPolicy::SelfKeyed {
+                        return Err(kv_storage_err(format!(
+                            "kv snapshot for topic {topic} is not an owner-free self_keyed store; refusing to load"
+                        )));
+                    }
+                } else if snap.owner() != Some(&self.agent_id()) {
                     return Err(kv_storage_err(format!(
                         "kv snapshot for topic {topic} is owned by a different agent"
                     )));
@@ -11824,14 +11841,18 @@ impl Agent {
                 snap
             }
             Some(Ok(None)) | None => {
-                kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy).map_err(
-                    |e| {
-                        // Encrypted is reserved (#341): the store layer has
-                        // already logged the WARN; surface its message intact
-                        // rather than a generic create failure.
-                        kv_storage_err(format!("kv store creation failed: {e}"))
-                    },
-                )?
+                if is_self_keyed {
+                    kv::KvStore::new_self_keyed(store_id, name.to_string())
+                } else {
+                    kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy).map_err(
+                        |e| {
+                            // Encrypted is reserved (#341): the store layer has
+                            // already logged the WARN; surface its message intact
+                            // rather than a generic create failure.
+                            kv_storage_err(format!("kv store creation failed: {e}"))
+                        },
+                    )?
+                }
             }
             Some(Err(e)) => {
                 // Corrupt snapshot: fail closed, loudly. Starting an empty
@@ -11846,15 +11867,21 @@ impl Agent {
 
         // The creator is the owner: capture signing material so each write
         // produces an owner-signed content checkpoint (cold-recovery provenance).
-        let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
+        // SelfKeyed stores have no owner and never produce checkpoints.
+        let owner_signing = if is_self_keyed {
+            None
+        } else {
+            let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
+            Some(std::sync::Arc::new(OwnerSigningMaterial {
+                public_key_bytes: pk_bytes,
+                secret_key_bytes: sk_bytes,
+            }))
+        };
         Ok(KvStoreHandle {
             sync,
             agent_id: self.agent_id(),
             peer_id,
-            owner_signing: Some(std::sync::Arc::new(OwnerSigningMaterial {
-                public_key_bytes: pk_bytes,
-                secret_key_bytes: sk_bytes,
-            })),
+            owner_signing,
         })
     }
 
@@ -11955,6 +11982,64 @@ impl Agent {
     ) -> error::Result<KvStoreHandle> {
         self.join_kv_store_inner(topic, owner, channel, Some(state_dir))
             .await
+    }
+
+    /// Join (or restore) an owner-free [`kv::AccessPolicy::SelfKeyed`]
+    /// directory store by topic alone (issue #340).
+    ///
+    /// Knowing only the topic is enough to create, join, write, and
+    /// rehydrate (I4): the store id is `KvStoreId::for_self_keyed_topic`
+    /// (domain-separated from the owner-anchored derivations, I2) and write
+    /// authority is the key-prefix binding, so there is no `expected_owner`
+    /// to supply. Deliberately NOT an overload of
+    /// [`join_kv_store_persistent`](Self::join_kv_store_persistent): a
+    /// missing owner on that path is a dead Signed replica by design, and
+    /// this path must not blur that fail-closed boundary.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the gossip runtime is not initialized, or
+    /// fail-closed snapshot errors (corrupt file, store-id mismatch, or a
+    /// snapshot that is not an owner-free self_keyed store).
+    pub async fn join_self_keyed_kv_store_persistent(
+        &self,
+        topic: &str,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        let store_id = kv::KvStoreId::for_self_keyed_topic(topic);
+        let persist_path = Some(kv_snapshot_path(state_dir, &store_id));
+        let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
+            Some(Ok(Some(snap))) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner().is_some() || *snap.policy() != kv::AccessPolicy::SelfKeyed {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is not an owner-free self_keyed store; refusing to load"
+                    )));
+                }
+                snap
+            }
+            Some(Ok(None)) | None => kv::KvStore::join_self_keyed(store_id, String::new()),
+            Some(Err(e)) => {
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
+
+        let (sync, peer_id) = self.spawn_kv_sync(store, topic, persist_path).await?;
+
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+            // No owner exists on a SelfKeyed store; nobody produces
+            // checkpoints.
+            owner_signing: None,
+        })
     }
 
     async fn join_kv_store_inner(
@@ -12148,13 +12233,33 @@ impl KvStoreHandle {
         Some(cp)
     }
 
-    /// Enforce the store's access policy for a local mutation.
+    /// Enforce the store's access policy for a local put of `key`.
     ///
-    /// Applies the same authorization rule as the inbound delta path
-    /// (`KvStore::merge_delta`), so a local write that peers would reject
-    /// never mutates this replica (no local fork).
-    fn check_local_write(store: &kv::KvStore, writer: &identity::AgentId) -> error::Result<()> {
-        store.authorize_local_write(writer).map_err(|e| match e {
+    /// Applies the same authorization and (for `SelfKeyed`) the same
+    /// lowest-N quota rule as the inbound delta path
+    /// (`KvStore::merge_delta`), so a local write that peers would drop or
+    /// evict never mutates this replica (no local fork).
+    fn check_local_put(
+        store: &kv::KvStore,
+        writer: &identity::AgentId,
+        key: &str,
+        value: &[u8],
+    ) -> error::Result<()> {
+        store
+            .authorize_put(writer, key, value)
+            .map_err(|e| match e {
+                kv::KvError::Unauthorized(msg) => error::IdentityError::Unauthorized(msg),
+                other => error::IdentityError::Unauthorized(other.to_string()),
+            })
+    }
+
+    /// Enforce the store's access policy for a local remove of `key`.
+    fn check_local_remove(
+        store: &kv::KvStore,
+        writer: &identity::AgentId,
+        key: &str,
+    ) -> error::Result<()> {
+        store.authorize_write(writer, key).map_err(|e| match e {
             kv::KvError::Unauthorized(msg) => error::IdentityError::Unauthorized(msg),
             other => error::IdentityError::Unauthorized(other.to_string()),
         })
@@ -12207,7 +12312,7 @@ impl KvStoreHandle {
         })?;
         let delta = {
             let mut store = self.sync.write().await;
-            Self::check_local_write(&store, &self.agent_id)?;
+            Self::check_local_put(&store, &self.agent_id, &key, &value)?;
             let version_before = store.current_version();
             store
                 .put(
@@ -12338,7 +12443,7 @@ impl KvStoreHandle {
         })?;
         let delta = {
             let mut store = self.sync.write().await;
-            Self::check_local_write(&store, &self.agent_id)?;
+            Self::check_local_remove(&store, &self.agent_id, key)?;
             store.remove(key).map_err(|e| match e {
                 // AppendOnly immutability violation — surfaced distinctly
                 // so the API layer can map it to HTTP 409 Conflict.
@@ -12464,7 +12569,7 @@ pub struct KvStoreOwnershipInfo {
     /// (read-only by design).
     pub owner: Option<String>,
     /// Access policy (`"signed"` / `"allowlisted"` / `"encrypted"` /
-    /// `"append_only"`).
+    /// `"append_only"` / `"self_keyed"`).
     pub policy: String,
     /// Store version (monotonic, bumped on every mutation).
     pub version: u64,
@@ -14256,6 +14361,122 @@ mod tests {
             "append_only requested over a Signed snapshot must fail closed"
         );
         agent3.shutdown().await;
+    }
+
+    /// SelfKeyed directories end-to-end at the handle layer (issue #340):
+    /// knowing only the topic is enough to create, write (own prefix only),
+    /// join, and rehydrate from the snapshot — no `expected_owner` exists to
+    /// supply (I4), `owner` stays `None` (I3), and the id is the
+    /// domain-separated topic derivation (I2).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn self_keyed_join_persistence_and_prefix_gating() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let creator_state = dir.path().join("kv-creator");
+        let joiner_state = dir.path().join("kv-joiner");
+        let build_agent = |prefix: &'static str| {
+            let base = dir.path().to_path_buf();
+            async move {
+                Agent::builder()
+                    .with_machine_key(base.join(format!("{prefix}.machine.key")))
+                    .with_agent_key_path(base.join(format!("{prefix}.agent.key")))
+                    .with_contact_store_path(base.join(format!("{prefix}.contacts.json")))
+                    .with_peer_cache_disabled()
+                    .with_network_config(loopback_network_config())
+                    .build()
+                    .await
+                    .expect("agent")
+            }
+        };
+
+        // Creator: owner-free store, id derived from the topic alone.
+        let creator = build_agent("creator").await;
+        let creator_id = creator.agent_id();
+        let creator_key = format!("{}/profile", hex::encode(creator_id.as_bytes()));
+        let store = creator
+            .create_kv_store_persistent(
+                "directory",
+                "sk-persist-topic",
+                kv::AccessPolicy::SelfKeyed,
+                &creator_state,
+            )
+            .await
+            .expect("create self_keyed store");
+        {
+            let s = store.sync.read().await;
+            assert_eq!(*s.policy(), kv::AccessPolicy::SelfKeyed);
+            assert_eq!(s.owner(), None, "owner stays None for life (I3)");
+            assert_eq!(
+                *s.id(),
+                kv::KvStoreId::for_self_keyed_topic("sk-persist-topic"),
+                "id is the domain-separated topic derivation (I2)"
+            );
+        }
+        store
+            .put(creator_key.clone(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect("own-prefix put");
+        // A foreign prefix through the handle: Unauthorized, never a silent
+        // local-only write.
+        let foreign_key = format!("{}/x", "0f".repeat(32));
+        let err = store
+            .put(foreign_key.clone(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("foreign prefix rejected");
+        assert!(matches!(err, error::IdentityError::Unauthorized(_)));
+
+        // A second agent joins knowing ONLY the topic — no owner anchor.
+        let joiner = build_agent("joiner").await;
+        let joiner_id = joiner.agent_id();
+        let joined = joiner
+            .join_self_keyed_kv_store_persistent("sk-persist-topic", &joiner_state)
+            .await
+            .expect("join by topic alone");
+        {
+            let s = joined.sync.read().await;
+            assert_eq!(*s.policy(), kv::AccessPolicy::SelfKeyed);
+            assert_eq!(s.owner(), None, "joined replica has no owner");
+        }
+        let joiner_key = format!("{}/card", hex::encode(joiner_id.as_bytes()));
+        joined
+            .put(joiner_key.clone(), b"j".to_vec(), "text/plain".to_string())
+            .await
+            .expect("joiner writes its own namespace");
+        let err = joined
+            .put(
+                creator_key.clone(),
+                b"hijack".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect_err("cannot write the creator's namespace");
+        assert!(matches!(err, error::IdentityError::Unauthorized(_)));
+        joined.cancel_sync();
+        joiner.shutdown().await;
+
+        // Restart the joiner: rehydrate requires no expected_owner and
+        // restores its own key from the snapshot.
+        let joiner2 = build_agent("joiner").await;
+        let restored = joiner2
+            .join_self_keyed_kv_store_persistent("sk-persist-topic", &joiner_state)
+            .await
+            .expect("rehydrate without an owner anchor");
+        {
+            let s = restored.sync.read().await;
+            assert_eq!(
+                *s.policy(),
+                kv::AccessPolicy::SelfKeyed,
+                "policy survives restart"
+            );
+            assert_eq!(s.owner(), None);
+            assert!(
+                s.get(&joiner_key).is_some(),
+                "the joiner's own key survives restart from its snapshot"
+            );
+        }
+        restored.cancel_sync();
+        joiner2.shutdown().await;
+        store.cancel_sync();
+        creator.shutdown().await;
     }
 
     /// Durability blockers (round-3 review): (1) the direct-delivery path

@@ -1188,8 +1188,10 @@ enum StoreSub {
         name: String,
         /// Gossip topic for sync.
         topic: String,
-        /// Access policy: "signed" (default) or "append_only" (existing keys
-        /// are immutable — no update, no delete, even by the owner).
+        /// Access policy: "signed" (default), "append_only" (existing keys
+        /// are immutable — no update, no delete, even by the owner), or
+        /// "self_keyed" (owner-free directory; writers are bound to their
+        /// AgentId key prefix).
         #[arg(long)]
         policy: Option<String>,
     },
