@@ -2392,6 +2392,7 @@ static DROP_INITIAL_VOLLEY_KINDS: std::sync::LazyLock<HashSet<&'static str>> =
             ("X0X_TEST_DROP_INITIAL_MEMBER_JOINED", "member_joined"),
             ("X0X_TEST_DROP_INITIAL_MEMBER_REMOVED", "member_removed"),
             ("X0X_TEST_DROP_INITIAL_GROUP_DELETED", "group_deleted"),
+            ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "member_banned"),
         ]
         .into_iter()
         .filter(|(var, _)| std::env::var(var).is_ok_and(|v| v == "1"))
@@ -12964,6 +12965,9 @@ pub(in crate::server) async fn ban_group_member(
         }
     };
     drop(groups);
+    // Roster snapshot for the #344 redelivery below: the persist consumes
+    // `next`, and the resend schedule must not read live group state.
+    let delivery_roster = next.clone();
     if !matches!(
         persist_named_group_info(&state, &id, next).await,
         Ok(AtomicWriteOutcome::Durable)
@@ -13035,13 +13039,25 @@ pub(in crate::server) async fn ban_group_member(
         group_id: event_group_id,
         revision,
         actor: caller_hex,
-        agent_id: agent_id_hex,
+        agent_id: agent_id_hex.clone(),
         secret_epoch: if is_encrypted { Some(new_epoch) } else { None },
         treekem_commit_b64: None,
         treekem_epoch: None,
         commit: Some(commit),
     };
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    }
+    // #344: a lost `MemberBanned` leaves the banned peer holding its roster
+    // entry and key material exactly like a lost removal — the banned member
+    // has no reason to poll for what it cannot see coming. Bounded resend.
+    spawn_group_control_event_redelivery(
+        &state,
+        &metadata_topic,
+        &delivery_roster,
+        &event,
+        std::slice::from_ref(&agent_id_hex),
+    );
     maybe_publish_group_card_after_state_change(&state, &id).await;
 
     (
@@ -13188,10 +13204,23 @@ async fn ban_treekem_group_member(
         treekem_epoch: Some(treekem_epoch),
         commit: Some(commit),
     };
-    publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    if !drop_initial_volley(&event) {
+        publish_named_group_metadata_event(&state, &metadata_topic, &event).await;
+    }
     remember_treekem_membership_event(&state, &event).await;
-    spawn_named_group_event_delivery_to_active_members(
+    if !drop_initial_volley(&event) {
+        spawn_named_group_event_delivery_to_active_members(
+            &state,
+            &next,
+            &event,
+            std::slice::from_ref(&agent_id_hex),
+        );
+    }
+    // #344: same at-most-once gap as a lost removal — the banned peer keeps
+    // its roster entry and TreeKEM key material until this event lands.
+    spawn_group_control_event_redelivery(
         &state,
+        &metadata_topic,
         &next,
         &event,
         std::slice::from_ref(&agent_id_hex),

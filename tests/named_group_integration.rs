@@ -2308,3 +2308,89 @@ async fn group_deleted_lost_initial_volley_recovers_via_bounded_resend() {
         "recipient TreeKEM snapshot must be wiped by a resent GroupDeleted"
     );
 }
+
+/// Why: a lost `MemberBanned` is the same security-adjacent gap as a lost
+/// removal (#344) — the banned peer keeps its roster entry and its TreeKEM
+/// key material, and unlike the removed member it was never sent a share of
+/// the post-ban epoch, so silence leaves it holding stale key material it
+/// should have been forced to surrender. The hop was a single best-effort
+/// volley (a gossip publish, plus DMs only on the TreeKEM path) with no
+/// recovery, and the banned member has nothing to poll.
+///
+/// `X0X_TEST_DROP_INITIAL_MEMBER_BANNED` drops alice's entire initial volley,
+/// so the bounded resend schedule is the only thing that can deliver the ban.
+/// If that schedule regresses, this test fails; a wider timeout cannot rescue
+/// it.
+#[tokio::test]
+#[ignore]
+async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
+    // Alice is the authority, so only her daemon drops the volley and only her
+    // schedule is compressed — bob must stay an ordinary recipient for this to
+    // prove delivery rather than symmetric breakage.
+    let pair = pair_with_alice_env(&[
+        ("X0X_TEST_DROP_INITIAL_MEMBER_BANNED", "1"),
+        (
+            "X0X_TEST_GROUP_REDELIVERY_SCHEDULE_MS",
+            FAST_REDELIVERY_SCHEDULE_MS,
+        ),
+    ])
+    .await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+
+    let (group_id, bob_group_id, bob_agent_id) =
+        converged_pair_group(alice, bob, "Lost MemberBanned").await;
+
+    let ban: Value = alice
+        .post(
+            &format!("/groups/{group_id}/ban/{bob_agent_id}"),
+            serde_json::json!({}),
+        )
+        .await
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(ban["ok"], true, "ban response: {ban:?}");
+
+    // Delivery proof: bob's own roster can only show him banned if the event
+    // reached and was applied by bob — alice's local state says nothing about
+    // bob's copy.
+    let ban_seen = wait_until(Duration::from_secs(30), || async {
+        let members: Value = bob
+            .get(&format!("/groups/{bob_group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        members["members"]
+            .as_array()
+            .map(|ms| {
+                ms.iter()
+                    .any(|m| m["agent_id"] == bob_agent_id && m["state"] == "banned")
+            })
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        ban_seen,
+        "bob never applied his own ban after alice's initial MemberBanned \
+         volley was dropped; the bounded resend schedule did not repair the hop \
+         (#344). A banned member that never learns it was banned keeps its \
+         roster entry and stale TreeKEM key material indefinitely."
+    );
+
+    // Terminalization must be real, not just a roster flag: applying your own
+    // ban tears down the local TreeKEM group and wipes its persistence.
+    assert!(
+        !tokio::fs::try_exists(
+            bob.data_dir()
+                .join("treekem")
+                .join(format!("{bob_group_id}.snap"))
+        )
+        .await
+        .unwrap_or(false),
+        "banned member's TreeKEM snapshot must be wiped by a resent MemberBanned"
+    );
+
+    let _ = alice.delete(&format!("/groups/{group_id}")).await;
+}
