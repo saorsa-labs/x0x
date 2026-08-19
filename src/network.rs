@@ -2303,6 +2303,12 @@ impl NetworkNode {
     /// Returns `NetworkError` if the peer is not cached or none of its cached
     /// addresses lead back to the expected peer.
     pub async fn connect_cached_peer(&self, peer_id: AntPeerId) -> NetworkResult<SocketAddr> {
+        // Issue #292 invariant C: the gate outranks the connected
+        // fast-path below — a suppressed peer refuses even while a
+        // transient transport winner exists, and never refreshes the
+        // tombstone doing so.
+        self.dial_gated(&peer_id, "cached_peer")?;
+
         if self.is_connected(&peer_id).await {
             let node_guard = self.node.read().await;
             if let Some(node) = node_guard.as_ref() {
@@ -2374,6 +2380,23 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
+        self.connect_addr_with_origin(addr, "manual").await
+    }
+
+    /// Address-only dial carrying the #292 refusal-log origin (eager-set,
+    /// announcement, bootstrap, manual). The peer id is learned only from
+    /// the answered handshake, so the suppression gate is the
+    /// post-handshake re-check (invariant C): no cache write, no
+    /// `PeerConnected`, no plane admission for a suppressed answered id.
+    pub(crate) async fn connect_addr_with_origin(
+        &self,
+        addr: SocketAddr,
+        origin: &'static str,
+    ) -> NetworkResult<AntPeerId> {
+        // Optional invariant-C skip: if this address already maps to a
+        // suppressed cache entry, refuse pre-socket so the handshake
+        // cannot write cache success (shared ant-quic BootstrapCache).
+        self.dial_gated_cached_addr(addr, origin).await?;
         let node = self.require_node().await?;
         let family = if addr.is_ipv4() { "v4" } else { "v6" };
         tracing::debug!(
@@ -2389,6 +2412,13 @@ impl NetworkNode {
 
         match result {
             Ok(peer_conn) => {
+                // Issue #292 invariant C: gate the ANSWERED id after the
+                // handshake and before any bookkeeping, admission, or event,
+                // so a tombstone that landed mid-dial never admits. The
+                // close is a plain transport disconnect (invariant F).
+                self.dial_gated_answered(&node, &peer_conn.peer_id, origin)
+                    .await?;
+
                 let rtt_ms = dur_ms as u32;
                 if let Some(ref cache) = self.bootstrap_cache {
                     cache
@@ -2457,12 +2487,19 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if connection fails.
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<(SocketAddr, AntPeerId)> {
+        // Issue #292 invariant C: refuse pre-socket when the id is known.
+        self.dial_gated(&peer_id, "peer")?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = node
             .connect_peer(peer_id)
             .await
             .map_err(|e| NetworkError::ConnectionFailed(e.to_string()))?;
+
+        // Issue #292 invariant C: a tombstone that landed mid-handshake
+        // must not admit — re-check the answered id before any bookkeeping.
+        self.dial_gated_answered(&node, &peer_conn.peer_id, "peer")
+            .await?;
 
         let addr = match peer_conn.remote_addr {
             TransportAddr::Udp(socket_addr) => socket_addr,
@@ -2525,6 +2562,8 @@ impl NetworkNode {
         peer_id: AntPeerId,
         addrs: Vec<SocketAddr>,
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
+        // Issue #292 invariant C: refuse pre-socket when the id is known.
+        self.dial_gated(&peer_id, "peer_with_addrs")?;
         let node = self.require_node().await?;
         let v4_count = addrs.iter().filter(|a| a.is_ipv4()).count();
         let v6_count = addrs.len() - v4_count;
@@ -2585,6 +2624,12 @@ impl NetworkNode {
                 ));
             }
         };
+
+        // Issue #292 invariant C: re-check the answered id after the
+        // handshake and before any bookkeeping so a tombstone that landed
+        // mid-dial never admits.
+        self.dial_gated_answered(&node, &peer_conn.peer_id, "peer_with_addrs")
+            .await?;
 
         // Identity gate — verify the responding peer is the one we requested
         // BEFORE running any cache bookkeeping or emitting PeerConnected.
@@ -2759,6 +2804,155 @@ impl NetworkNode {
         reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id)
     }
 
+    /// Gossip-plane admission verdict for a peer (issue #292, invariant A).
+    ///
+    /// This is the single predicate gossip-affecting consumers must consult;
+    /// [`Self::is_connected`] stays ant-quic transport truth for lifecycle
+    /// and transport-recovery callers (issue #241) and must never be used to
+    /// decide gossip eligibility.
+    ///
+    /// `Suppressed` outranks transport truth: a peer with a live
+    /// reconnect-suppression tombstone never reads `Admitted`, even while
+    /// ant-quic still reports a connection — the transient windows the
+    /// accept loop has not closed yet (#228/#292 accept-then-close) and an
+    /// in-flight dial answered mid-handshake.
+    pub async fn peer_admission(&self, peer_id: &AntPeerId) -> PeerAdmission {
+        if self.is_reconnect_suppressed(peer_id.0) {
+            return PeerAdmission::Suppressed;
+        }
+        if !self.is_connected(peer_id).await {
+            return PeerAdmission::NotConnected;
+        }
+        if self.plane_gate_allows(peer_id) {
+            PeerAdmission::Admitted
+        } else {
+            PeerAdmission::PlanePending
+        }
+    }
+
+    /// `true` iff `peer_id` is fully admitted to the gossip plane:
+    /// transport-connected, unsuppressed, and plane-allowed (issue #292).
+    ///
+    /// Gossip consumers (eager-set seeds, pubsub/CRDT fanout, membership
+    /// keepalives) must use this instead of raw [`Self::is_connected`].
+    pub async fn is_peer_admitted(&self, peer_id: &AntPeerId) -> bool {
+        self.peer_admission(peer_id).await == PeerAdmission::Admitted
+    }
+
+    /// `set_at` of the live suppression tombstone for `peer_id`, if any.
+    ///
+    /// Test observable for issue #292 invariant F: refused dials/accepts
+    /// must never refresh an existing tombstone.
+    #[cfg(test)]
+    pub(crate) fn reconnect_suppression_set_at(&self, peer_id: [u8; 32]) -> Option<Instant> {
+        let map = self
+            .reconnect_suppressions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = Instant::now();
+        map.get(&peer_id)
+            .filter(|s| s.is_live(now))
+            .map(|s| s.set_at)
+    }
+
+    /// Outbound dial choke point, pre-socket half (issue #292, invariant C).
+    ///
+    /// Every id-known outbound seam — [`Self::connect_peer`],
+    /// [`Self::connect_peer_with_addrs`], [`Self::connect_cached_peer`],
+    /// and `GossipTransport::dial` — must pass through here before opening
+    /// a socket. A suppressed peer refuses with no socket, no event, no
+    /// cache write, and no tombstone mutation (invariant F: a refused
+    /// attempt must not refresh the tombstone). Address-only seams have no
+    /// id pre-socket and use [`Self::dial_gated_answered`] after the
+    /// handshake answers the id.
+    async fn dial_gated_cached_addr(
+        &self,
+        addr: SocketAddr,
+        origin: &'static str,
+    ) -> NetworkResult<()> {
+        let Some(cache) = self.bootstrap_cache.as_ref() else {
+            return Ok(());
+        };
+        for peer in cache.all_peers().await {
+            if peer.addresses.contains(&addr)
+                && reconnect_suppression_is_live(
+                    self.reconnect_suppressions.as_ref(),
+                    peer.peer_id.0,
+                )
+            {
+                tracing::warn!(
+                    target: "x0x::connect",
+                    origin,
+                    %addr,
+                    peer_id_prefix = %hex_prefix(&peer.peer_id.0, 4),
+                    "dial refused: address maps to reconnect-suppressed peer (issue #292)"
+                );
+                return Err(NetworkError::ConnectionFailed(format!(
+                    "dial of reconnect-suppressed peer {:?} refused ({origin})",
+                    peer.peer_id
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    fn dial_gated(&self, peer_id: &AntPeerId, origin: &'static str) -> NetworkResult<()> {
+        if reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id.0) {
+            tracing::warn!(
+                target: "x0x::connect",
+                origin,
+                peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                "dial refused: peer is reconnect-suppressed (issue #292)"
+            );
+            return Err(NetworkError::ConnectionFailed(format!(
+                "dial of reconnect-suppressed peer {:?} refused ({origin})",
+                peer_id
+            )));
+        }
+        Ok(())
+    }
+
+    /// Outbound dial choke point, post-handshake half (issue #292,
+    /// invariant C).
+    ///
+    /// Re-checks the suppression tombstone against the id the handshake
+    /// *answered*, so a tombstone that landed mid-dial never admits. Used by
+    /// [`Self::connect_addr`] (address-only: no id is known pre-socket, so
+    /// this is the only gate) and re-run by the id-known seams after their
+    /// socket completes, before any cache write, `PeerConnected`, or plane
+    /// admission. The transient connection is closed with a plain transport
+    /// disconnect — never [`Self::disconnect_with_reason`], whose
+    /// `suppress_reconnect` would refresh the tombstone (invariant F).
+    async fn dial_gated_answered(
+        &self,
+        node: &Node,
+        answered: &AntPeerId,
+        origin: &'static str,
+    ) -> NetworkResult<()> {
+        if reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), answered.0) {
+            tracing::warn!(
+                target: "x0x::connect",
+                origin,
+                peer_id_prefix = %hex_prefix(&answered.0, 4),
+                "dial closed post-handshake: answered peer is reconnect-suppressed (issue #292)"
+            );
+            if let Err(e) = node.disconnect(answered).await {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    origin,
+                    peer_id_prefix = %hex_prefix(&answered.0, 4),
+                    error = %e,
+                    "close of suppressed answered dial failed"
+                );
+            }
+            return Err(NetworkError::ConnectionFailed(format!(
+                "dial answered reconnect-suppressed peer {:?}; closed ({origin})",
+                answered
+            )));
+        }
+        Ok(())
+    }
+
     /// Gossip-plane gate (issue #206).
     ///
     /// Returns `true` when gossip traffic with `peer` is plane-allowed:
@@ -2819,15 +3013,19 @@ impl NetworkNode {
     /// [`Self::connected_peers`] when seeding gossip peer sets (PlumTree
     /// eager sets, membership keepalives) so stale outer-table entries and
     /// cross-plane or not-yet-verified peers never enter the gossip plane.
+    ///
+    /// Issue #292, invariant A: eligibility is decided by
+    /// [`Self::peer_admission`], never raw transport truth — a
+    /// transport-connected peer with a live suppression tombstone is
+    /// excluded even inside the transient accept-to-close window.
     pub(crate) async fn gossip_plane_peers(&self) -> Vec<AntPeerId> {
-        let connected = self.send_ready_peers().await;
-        if self.config.network_id.is_none() {
-            return connected;
+        let mut admitted = Vec::new();
+        for peer in self.send_ready_peers().await {
+            if self.peer_admission(&peer).await == PeerAdmission::Admitted {
+                admitted.push(peer);
+            }
         }
-        connected
-            .into_iter()
-            .filter(|peer| self.plane_gate_allows(peer))
-            .collect()
+        admitted
     }
 
     /// Handle an inbound plane hello (issue #206).
@@ -3612,6 +3810,26 @@ impl NetworkNode {
                             continue;
                         }
 
+                        // Issue #292 invariant B: a suppressed peer's gossip
+                        // frames are not answered. The accept loop closes the
+                        // transient inbound, but a frame already delivered
+                        // inside the accept-to-close window must not reach
+                        // the gossip plane either. Checked BEFORE the plane
+                        // gate so a suppressed peer never seeds plane state.
+                        // (DM bytes (0x10/0x11) above stay out of #206/#292
+                        // gossip-plane scope.)
+                        if GossipStreamType::from_byte(type_byte).is_some()
+                            && plane_node.is_reconnect_suppressed(peer_id.0)
+                        {
+                            tracing::warn!(
+                                target: "x0x::connect",
+                                origin = "recv",
+                                peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+                                "dropping gossip frame from reconnect-suppressed peer (issue #292)"
+                            );
+                            continue;
+                        }
+
                         // Issue #206: gossip-plane gate. Peers that are not
                         // plane-cleared (hello outstanding, legacy grace not
                         // yet elapsed) may not carry gossip traffic in either
@@ -3758,14 +3976,20 @@ impl NetworkNode {
                         // success, emitting `PeerConnected`, touching the
                         // connection pool, or touching the tombstone itself
                         // (`Node::disconnect` maps to a plain transport close
-                        // and never mutates x0x suppressions).
+                        // and never mutates x0x suppressions). Issue #292
+                        // invariant D: this transient transport winner is
+                        // invisible to admission via `peer_admission`
+                        // (invariant A) and must never call
+                        // `suppress_reconnect` (invariant F).
                         if reconnect_suppression_is_live(
                             reconnect_suppressions.as_ref(),
                             peer_conn.peer_id.0,
                         ) {
                             tracing::warn!(
-                                "SECURITY: Rejecting inbound connection from reconnect-suppressed peer {:?}",
-                                peer_conn.peer_id
+                                target: "x0x::connect",
+                                origin = "accept",
+                                peer_id_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
+                                "accept closed: inbound connection from reconnect-suppressed peer (issue #292)"
                             );
                             if let Err(e) = node_ref.disconnect(&peer_conn.peer_id).await {
                                 debug!(
@@ -4021,6 +4245,12 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     async fn dial(&self, peer: GossipPeerId, addr: SocketAddr) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
 
+        // Issue #292 invariant C: the dial gate outranks the connected
+        // fast-path — a suppressed peer must not read as a successful
+        // gossip dial even while a transient transport connection exists.
+        self.dial_gated(&ant_peer, "eager_set")
+            .map_err(|e| anyhow::anyhow!("dial refused: {}", e))?;
+
         // Check if already connected
         if self.is_connected(&ant_peer).await {
             debug!("Already connected to peer {:?} at {}", peer, addr);
@@ -4029,7 +4259,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
         // Connect by address
         let connected_peer = self
-            .connect_addr(addr)
+            .connect_addr_with_origin(addr, "eager_set")
             .await
             .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
 
@@ -4057,8 +4287,10 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
     }
 
     async fn dial_bootstrap(&self, addr: SocketAddr) -> anyhow::Result<GossipPeerId> {
+        // Address-only: no id pre-socket, so the #292 suppression gate is
+        // connect_addr's post-handshake re-check of the answered id.
         let ant_peer_id = self
-            .connect_addr(addr)
+            .connect_addr_with_origin(addr, "bootstrap")
             .await
             .map_err(|e| anyhow::anyhow!("bootstrap dial failed: {}", e))?;
 
@@ -4101,6 +4333,21 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         data: bytes::Bytes,
     ) -> anyhow::Result<()> {
         let ant_peer = gossip_to_ant_peer_id(&peer);
+
+        // Issue #292 invariant B: no gossip stream is opened toward a
+        // reconnect-suppressed peer. Reported as success for the same
+        // reason as the plane-pending hold below — the peer is already
+        // excluded from `gossip_plane_peers`, so there is no overlay view
+        // to protect, and a suppressed peer must never receive gossip.
+        if self.is_reconnect_suppressed(ant_peer.0) {
+            debug!(
+                "[1/6 network] send: holding {:?} ({} bytes) — peer {:?} is reconnect-suppressed",
+                stream_type,
+                data.len(),
+                peer
+            );
+            return Ok(());
+        }
 
         // Issue #206: hold gossip sends to peers that have not cleared the
         // plane gate (hello outstanding / legacy grace). Reported as success
@@ -4280,6 +4527,27 @@ impl ReconnectSuppression {
             Some(ttl) => now.duration_since(self.set_at) < ttl,
         }
     }
+}
+
+/// Gossip-plane admission verdict for a peer (issue #292, invariant A).
+///
+/// Produced by [`NetworkNode::peer_admission`]. `Suppressed` outranks
+/// transport truth: a transient QUIC winner (accept-then-close window,
+/// in-flight dial answered mid-handshake) is `Suppressed`, never
+/// `Admitted`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PeerAdmission {
+    /// Transport-connected, unsuppressed, and plane-allowed: gossip may flow.
+    Admitted,
+    /// A live reconnect-suppression tombstone exists: no gossip, no dials,
+    /// no `PeerConnected` — even while a transient transport connection
+    /// exists.
+    Suppressed,
+    /// Connected and unsuppressed, but the plane is unresolved inside the
+    /// 10s plane-legacy grace (issue #206 fail-closed pending).
+    PlanePending,
+    /// No transport connection.
+    NotConnected,
 }
 
 /// Returns `true` iff a live suppression tombstone for `peer_id` exists in
