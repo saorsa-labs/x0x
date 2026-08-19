@@ -170,8 +170,12 @@ impl Direction {
 /// One durable (or replaceable) history row (ADR-0023 §3).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HistoryRecord {
-    /// BLAKE3 of `signed_artifact` when present, else of `payload`.
     /// Dedupe key across redundant delivery channels.
+    ///
+    /// BLAKE3 of `signed_artifact` when present; otherwise a producer-chosen
+    /// id (`compute_local_send_msg_id`, `compute_epoch_msg_id`, or BLAKE3 of
+    /// `payload`). Unsigned MLS rows use the epoch helper — not an ADR-0029
+    /// thread id.
     pub msg_id: [u8; 32],
     /// Conversation scope.
     pub scope: Scope,
@@ -257,17 +261,22 @@ impl HistoryRecord {
         *hasher.finalize().as_bytes()
     }
 
-    /// Dedupe id for an unsigned row salted by an epoch (MLS plaintext).
+    /// Dedupe id for an unsigned MLS-plaintext row salted by group and epoch.
     ///
-    /// `BLAKE3(salt-domain ‖ epoch ‖ payload)`: ciphertext replays within an
-    /// epoch still dedupe, while identical plaintext sent in different
-    /// epochs survives as distinct rows. Identical plaintext *within* one
-    /// epoch still collapses — per-message MLS identity is a future
-    /// wire-format change (ADR-0023 §3).
+    /// `BLAKE3("x0x-history-mls-epoch-v2" ‖ u32_le(len(stable_id)) ‖
+    /// stable_id ‖ u64_le(epoch) ‖ payload)`: identical plaintext in two
+    /// groups whose epochs coincide no longer collapses (#276). Ciphertext
+    /// replays within one group+epoch still dedupe. Epoch is a hash salt
+    /// only — it is not persisted, and this is a new domain rather than an
+    /// extension of v1.
     #[must_use]
-    pub fn compute_epoch_msg_id(epoch: u64, payload: &[u8]) -> [u8; 32] {
+    pub fn compute_epoch_msg_id(stable_id: &str, epoch: u64, payload: &[u8]) -> [u8; 32] {
         let mut hasher = blake3::Hasher::new();
-        hasher.update(b"x0x-history-mls-epoch-v1");
+        hasher.update(b"x0x-history-mls-epoch-v2");
+        let id_bytes = stable_id.as_bytes();
+        let id_len = u32::try_from(id_bytes.len()).unwrap_or(u32::MAX);
+        hasher.update(&id_len.to_le_bytes());
+        hasher.update(id_bytes);
         hasher.update(&epoch.to_le_bytes());
         hasher.update(payload);
         *hasher.finalize().as_bytes()
@@ -290,10 +299,16 @@ impl HistoryRecord {
         }
         // Artifact-less local sends carry a nonce-derived msg_id (see
         // `compute_local_send_msg_id`) that cannot be recomputed from the
-        // row alone; every other row must match the canonical computation.
-        let nonce_keyed_local_send =
-            self.provenance == Provenance::LocalSend && self.signed_artifact.is_none();
-        if !nonce_keyed_local_send {
+        // row alone. Unsigned MLS `LocalAppDecrypt` rows similarly carry an
+        // epoch+group-salted msg_id (`compute_epoch_msg_id`) that cannot be
+        // recomputed because epoch is not a stored column. Every other row
+        // must match the canonical computation.
+        let opaque_unsigned = self.signed_artifact.is_none()
+            && matches!(
+                self.provenance,
+                Provenance::LocalSend | Provenance::LocalAppDecrypt
+            );
+        if !opaque_unsigned {
             let expected = Self::compute_msg_id(self.signed_artifact.as_deref(), &self.payload);
             if expected != self.msg_id {
                 return Err(HistoryError::InvalidRecord(
@@ -308,5 +323,82 @@ impl HistoryRecord {
     #[must_use]
     pub fn is_text(&self) -> bool {
         self.content_type.starts_with("text/")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn epoch_msg_id_is_stable_for_the_same_triple() {
+        let a = HistoryRecord::compute_epoch_msg_id("group-a", 7, b"payload");
+        let b = HistoryRecord::compute_epoch_msg_id("group-a", 7, b"payload");
+        assert_eq!(
+            a, b,
+            "same group+epoch+payload must produce the same v2 msg_id"
+        );
+    }
+
+    #[test]
+    fn epoch_msg_id_differs_across_epochs() {
+        let a = HistoryRecord::compute_epoch_msg_id("group-a", 1, b"same-payload");
+        let b = HistoryRecord::compute_epoch_msg_id("group-a", 2, b"same-payload");
+        assert_ne!(
+            a, b,
+            "same group+payload in different epochs must be distinct ids"
+        );
+    }
+
+    #[test]
+    fn epoch_msg_id_differs_across_groups_and_payloads() {
+        let base = HistoryRecord::compute_epoch_msg_id("group-a", 3, b"payload");
+        let other_group = HistoryRecord::compute_epoch_msg_id("group-b", 3, b"payload");
+        let other_payload = HistoryRecord::compute_epoch_msg_id("group-a", 3, b"other");
+        assert_ne!(
+            base, other_group,
+            "same epoch+payload in different groups must be distinct ids"
+        );
+        assert_ne!(
+            base, other_payload,
+            "same group+epoch with a different payload must be distinct ids"
+        );
+    }
+
+    /// Without `u32_le(len(stable_id))`, these two encodings concatenate to
+    /// the same byte string after the domain:
+    /// ` "xy" ‖ u64_le(1) ‖ (u64_le(2) ‖ "hello") `
+    /// vs ` ("xy" ‖ u64_le(1)) ‖ u64_le(2) ‖ "hello" `.
+    /// The length prefix is what keeps them apart.
+    #[test]
+    fn epoch_msg_id_length_prefix_prevents_stable_id_glue() {
+        let mut glued_payload = Vec::new();
+        glued_payload.extend_from_slice(&2u64.to_le_bytes());
+        glued_payload.extend_from_slice(b"hello");
+
+        let epoch1 = 1u64.to_le_bytes();
+        let mut glued_id = String::from("xy");
+        glued_id.push_str(std::str::from_utf8(&epoch1).expect("le64(1) is valid UTF-8"));
+
+        let mut unprefixed_a = Vec::new();
+        unprefixed_a.extend_from_slice(b"xy");
+        unprefixed_a.extend_from_slice(&1u64.to_le_bytes());
+        unprefixed_a.extend_from_slice(&glued_payload);
+        let mut unprefixed_b = Vec::new();
+        unprefixed_b.extend_from_slice(glued_id.as_bytes());
+        unprefixed_b.extend_from_slice(&2u64.to_le_bytes());
+        unprefixed_b.extend_from_slice(b"hello");
+        assert_eq!(
+            unprefixed_a, unprefixed_b,
+            "precondition: the two triples are a glue pair without the length prefix"
+        );
+
+        let a = HistoryRecord::compute_epoch_msg_id("xy", 1, &glued_payload);
+        let b = HistoryRecord::compute_epoch_msg_id(&glued_id, 2, b"hello");
+        assert_ne!(
+            a, b,
+            "v2 length-prefix must keep glued stable_id encodings distinct"
+        );
     }
 }
