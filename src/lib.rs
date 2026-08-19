@@ -1713,11 +1713,55 @@ async fn upsert_discovered_agent(
 }
 
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
-    machine.addresses.sort_by_key(|addr| addr.to_string());
+    // Addresses stay in observation order (LRU at front, MRU at back).
+    // Sorting them would make eviction drop "first after sort" instead of
+    // the least-recently-seen address (issue #308).
     machine.agent_ids.sort_by_key(|id| id.0);
     machine.user_ids.sort_by_key(|id| id.0);
     machine.reachable_via.sort_by_key(|id| id.0);
     machine.relay_candidates.sort_by_key(|id| id.0);
+}
+
+/// Maximum cached dial addresses per machine.
+///
+/// Mobile / symmetric-NAT peers present a new source port on every reconnect.
+/// Without a cap, `upsert_discovered_machine` would accumulate them forever
+/// and the sequential reconnect loop would spend 5s per dead candidate
+/// (issue #308).
+const MAX_DISCOVERED_MACHINE_ADDRESSES: usize = 8;
+
+/// Per-candidate timeout for the proactive-reconnect sequential dial loop.
+const RECONNECT_CANDIDATE_DIAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Record `addr` as just-observed: move-to-end so `addresses` is LRU→MRU.
+///
+/// Drops the least-recently-seen address when over
+/// [`MAX_DISCOVERED_MACHINE_ADDRESSES`]. Undialable addresses (unspecified
+/// host or port 0) are ignored. Recency lives in vec order — the in-memory
+/// cache is the only reader, so no parallel `last_seen_by_addr` map is
+/// persisted.
+fn observe_discovered_machine_address(
+    addresses: &mut Vec<std::net::SocketAddr>,
+    addr: std::net::SocketAddr,
+) {
+    if !observed_address_is_dialable(&addr) {
+        return;
+    }
+    if let Some(idx) = addresses.iter().position(|existing| existing == &addr) {
+        addresses.remove(idx);
+    }
+    addresses.push(addr);
+    if addresses.len() > MAX_DISCOVERED_MACHINE_ADDRESSES {
+        let excess = addresses.len() - MAX_DISCOVERED_MACHINE_ADDRESSES;
+        addresses.drain(..excess);
+    }
+}
+
+/// Reconnect tries most-recently-observed addresses first.
+///
+/// `addresses` is LRU→MRU after [`observe_discovered_machine_address`].
+fn reconnect_candidate_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net::SocketAddr> {
+    addresses.iter().copied().rev().collect()
 }
 
 async fn upsert_discovered_machine(
@@ -1730,14 +1774,24 @@ async fn upsert_discovered_machine(
         return;
     }
 
+    let incoming_addrs = std::mem::take(&mut incoming.addresses);
     sort_discovered_machine(&mut incoming);
     let mut cache = cache.write().await;
     match cache.get_mut(&incoming.machine_id) {
         Some(existing) => {
-            for addr in incoming.addresses {
-                if !existing.addresses.contains(&addr) {
-                    existing.addresses.push(addr);
-                }
+            // A *newer* signed announcement may replace the advertised
+            // address set. Same-timestamp replay must not clear ports added
+            // by a later PeerConnected observe — `announced_at` on the
+            // machine record is unchanged by an observation (`announced_at:
+            // 0`), so `>=` would treat a gossip replay as authority to wipe
+            // those observed ports (issue #308). Observations themselves
+            // never replace (`0 > existing` is false).
+            let replace_announced_set = incoming.announced_at > existing.announced_at;
+            if replace_announced_set {
+                existing.addresses.clear();
+            }
+            for addr in incoming_addrs {
+                observe_discovered_machine_address(&mut existing.addresses, addr);
             }
             if incoming.announced_at >= existing.announced_at {
                 existing.announced_at = incoming.announced_at;
@@ -1772,6 +1826,9 @@ async fn upsert_discovered_machine(
             sort_discovered_machine(existing);
         }
         None => {
+            for addr in incoming_addrs {
+                observe_discovered_machine_address(&mut incoming.addresses, addr);
+            }
             cache.insert(incoming.machine_id, incoming);
         }
     }
@@ -10320,14 +10377,17 @@ fn schedule_reconnect(
             // when allow_local_scope is active (same-host scenario). A named
             // daemon that restarted on a different ephemeral port re-announces;
             // its new address is merged into the cache (upsert_discovered_
-            // machine is append-only) and picked up on this backoff tick. A
-            // one-time snapshot would pin the stale old port and never
-            // rediscover the peer (final review: named restart on a new port).
+            // machine is MRU-capped at MAX_DISCOVERED_MACHINE_ADDRESSES) and
+            // picked up on this backoff tick. A one-time snapshot would pin
+            // the stale old port and never rediscover the peer (final review:
+            // named restart on a new port). Candidates are tried MRU-first
+            // so a just-seen live addr is dialed before stale NAT mappings
+            // each burn RECONNECT_CANDIDATE_DIAL_TIMEOUT (issue #308).
             let candidate_addrs = {
                 let cache = machine_cache.read().await;
                 cache
                     .get(&machine_id)
-                    .map(|m| m.addresses.clone())
+                    .map(|m| reconnect_candidate_addrs(&m.addresses))
                     .unwrap_or_default()
             };
 
@@ -10357,7 +10417,7 @@ fn schedule_reconnect(
                     break 'attempts;
                 }
                 match tokio::time::timeout(
-                    std::time::Duration::from_secs(5),
+                    RECONNECT_CANDIDATE_DIAL_TIMEOUT,
                     network.connect_peer_with_addrs(peer_id, vec![*addr]),
                 )
                 .await
@@ -17656,11 +17716,13 @@ fn sort_discovered_machine_sorts_fields() {
     sort_discovered_machine(&mut machine);
     assert_eq!(
         machine.addresses[0],
-        "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap()
+        "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
+        "address order is observation/MRU, not lexicographic"
     );
     assert_eq!(
         machine.addresses[1],
-        "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap()
+        "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
+        "address order is observation/MRU, not lexicographic"
     );
     assert_eq!(machine.reachable_via[0], identity::MachineId([1u8; 32]));
     assert_eq!(machine.reachable_via[1], identity::MachineId([2u8; 32]));
@@ -17900,14 +17962,41 @@ mod fence_token_tests {
     }
 }
 
-/// Tests for issue #304: inbound peer address must appear in machine_discovery_cache
-/// so the proactive-reconnect candidate loop finds a non-empty candidate set.
+/// Tests for issue #304 (inbound peer address in machine_discovery_cache) and
+/// issue #308 (per-machine address cap, MRU recency, MRU-first reconnect).
 #[cfg(test)]
 mod candidate_address_retention_tests {
-    use super::{upsert_discovered_machine, DiscoveredMachine};
+    use super::{
+        reconnect_candidate_addrs, upsert_discovered_machine, DiscoveredMachine,
+        MAX_DISCOVERED_MACHINE_ADDRESSES, RECONNECT_CANDIDATE_DIAL_TIMEOUT,
+    };
     use crate::identity::MachineId;
     use std::sync::Arc;
     use tokio::sync::RwLock;
+
+    fn observation(
+        machine_id: MachineId,
+        addresses: Vec<std::net::SocketAddr>,
+        last_seen: u64,
+    ) -> DiscoveredMachine {
+        DiscoveredMachine {
+            machine_id,
+            addresses,
+            // PeerConnected observations use announced_at: 0 so they add/refresh
+            // one addr and never LWW-wipe reachable_via / relay_candidates.
+            announced_at: 0,
+            last_seen,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            agent_ids: Vec::new(),
+            user_ids: Vec::new(),
+        }
+    }
 
     /// Verify that upsert_discovered_machine with a connection-derived record
     /// correctly populates the cache so the reconnect path reads candidate_addrs > 0.
@@ -18013,6 +18102,21 @@ mod candidate_address_retention_tests {
             cache.read().await.is_empty(),
             "0.0.0.0:0 placeholder must not be inserted into machine_discovery_cache"
         );
+
+        // Defense in depth: upsert itself must refuse the placeholder even
+        // if a caller skips the PeerConnected predicate.
+        upsert_discovered_machine(&cache, observation(machine_id, vec![zero_addr], 1)).await;
+        let addrs = {
+            let guard = cache.read().await;
+            guard
+                .get(&machine_id)
+                .map(|m| m.addresses.clone())
+                .unwrap_or_default()
+        };
+        assert!(
+            addrs.is_empty(),
+            "upsert must never store an unspecified or port-0 address"
+        );
     }
 
     /// Verify address deduplication: calling upsert twice for the same machine
@@ -18057,15 +18161,260 @@ mod candidate_address_retention_tests {
             "upsert must deduplicate: same address inserted twice must produce one entry"
         );
     }
+
+    /// WHY: mobile / symmetric-NAT peers present a new source port on every
+    /// reconnect. Without a cap the list grows without bound and reconnect
+    /// pays 5s per dead candidate (issue #308). Newest observed wins; eviction
+    /// drops the least-recently-seen addr, not "first in the vec" after sort.
+    #[tokio::test]
+    async fn twenty_observed_ports_keep_the_eight_most_recent() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x08u8; 32]);
+        let mut observed = Vec::with_capacity(20);
+        for port in 1u16..=20 {
+            let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 1), port));
+            observed.push(addr);
+            upsert_discovered_machine(&cache, observation(machine_id, vec![addr], u64::from(port)))
+                .await;
+        }
+
+        let guard = cache.read().await;
+        let entry = guard.get(&machine_id).expect("entry must exist");
+        assert_eq!(
+            entry.addresses.len(),
+            MAX_DISCOVERED_MACHINE_ADDRESSES,
+            "20 distinct observed ports must evict down to the per-machine cap"
+        );
+        let expected = observed[observed.len() - MAX_DISCOVERED_MACHINE_ADDRESSES..].to_vec();
+        assert_eq!(
+            entry.addresses, expected,
+            "retained addresses must be the 8 most recently observed, in LRU→MRU order"
+        );
+        for stale in &observed[..observed.len() - MAX_DISCOVERED_MACHINE_ADDRESSES] {
+            assert!(
+                !entry.addresses.contains(stale),
+                "least-recently-seen {stale} must be evicted, not merely shifted"
+            );
+        }
+    }
+
+    /// WHY: a PeerConnected observation (announced_at: 0) must add/refresh
+    /// that one addr without last-write-wins wiping coordinator/relay hints
+    /// that a prior signed announcement installed (issue #304 / #308).
+    #[tokio::test]
+    async fn inbound_observe_does_not_wipe_announced_reachability_hints() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x30u8; 32]);
+        let announced: std::net::SocketAddr = "198.51.100.1:5483".parse().unwrap();
+        let observed: std::net::SocketAddr = "192.168.1.50:5493".parse().unwrap();
+        let coord = MachineId([0xAAu8; 32]);
+        let relay = MachineId([0xBBu8; 32]);
+
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at: 1_700_000_000,
+                last_seen: 1_700_000_000,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: vec![coord],
+                relay_candidates: vec![relay],
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        upsert_discovered_machine(
+            &cache,
+            observation(machine_id, vec![observed], 1_700_000_100),
+        )
+        .await;
+
+        let guard = cache.read().await;
+        let entry = guard.get(&machine_id).expect("entry must exist");
+        assert!(
+            entry.addresses.contains(&announced) && entry.addresses.contains(&observed),
+            "inbound observe must add the connection addr without dropping the announced set"
+        );
+        assert_eq!(
+            entry.reachable_via,
+            vec![coord],
+            "PeerConnected observation must not LWW-wipe reachable_via"
+        );
+        assert_eq!(
+            entry.relay_candidates,
+            vec![relay],
+            "PeerConnected observation must not LWW-wipe relay_candidates"
+        );
+        assert_eq!(
+            *entry.addresses.last().expect("non-empty"),
+            observed,
+            "just-observed inbound addr is MRU"
+        );
+    }
+
+    /// WHY: after an inbound observe, a gossip replay of the *same*
+    /// announcement (`announced_at` unchanged) must add/refresh advertised
+    /// addrs without clearing the observed port. `>=` would treat that
+    /// replay as a replace because the observe left `announced_at` on the
+    /// machine record as-is (issue #308 Senior should-fix).
+    #[tokio::test]
+    async fn same_timestamp_announcement_replay_does_not_wipe_observed_port() {
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x31u8; 32]);
+        let announced: std::net::SocketAddr = "198.51.100.8:5483".parse().unwrap();
+        let observed: std::net::SocketAddr = "192.168.1.80:5493".parse().unwrap();
+        let announced_at = 1_700_000_000;
+
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        upsert_discovered_machine(
+            &cache,
+            observation(machine_id, vec![observed], announced_at + 1),
+        )
+        .await;
+
+        // Replay the original announcement at the same timestamp.
+        upsert_discovered_machine(
+            &cache,
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at + 2,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
+        )
+        .await;
+
+        let guard = cache.read().await;
+        let entry = guard.get(&machine_id).expect("entry must exist");
+        assert!(
+            entry.addresses.contains(&observed),
+            "same-timestamp announcement replay must not wipe the PeerConnected-observed port {observed}"
+        );
+        assert!(
+            entry.addresses.contains(&announced),
+            "replayed announcement addr must still be present"
+        );
+        assert_eq!(
+            entry.announced_at, announced_at,
+            "replay at the same timestamp leaves announced_at unchanged"
+        );
+    }
+
+    /// WHY: reconnect tries each candidate sequentially with a 5s timeout.
+    /// If stale NAT mappings are tried first, 7 dead addrs cost ~35–40s
+    /// before the live MRU is reached. Eviction + MRU-first order makes the
+    /// just-seen live addr the first dial (issue #308). Concurrent racing of
+    /// the first 2–3 candidates is intentionally not added in v1.
+    #[tokio::test]
+    async fn reconnect_mru_live_addr_succeeds_within_one_dial_timeout() {
+        tokio::time::pause();
+
+        let cache: Arc<RwLock<std::collections::HashMap<MachineId, DiscoveredMachine>>> =
+            Arc::new(RwLock::new(std::collections::HashMap::new()));
+
+        let machine_id = MachineId([0x5Au8; 32]);
+        let mut dead = Vec::with_capacity(7);
+        for port in 1u16..=7 {
+            let addr = std::net::SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 10), port));
+            dead.push(addr);
+            upsert_discovered_machine(&cache, observation(machine_id, vec![addr], u64::from(port)))
+                .await;
+        }
+        let live = std::net::SocketAddr::from((std::net::Ipv4Addr::new(192, 0, 2, 10), 9));
+        upsert_discovered_machine(&cache, observation(machine_id, vec![live], 8)).await;
+
+        let candidate_addrs = {
+            let guard = cache.read().await;
+            let entry = guard.get(&machine_id).expect("entry must exist");
+            reconnect_candidate_addrs(&entry.addresses)
+        };
+
+        assert_eq!(
+            candidate_addrs.first().copied(),
+            Some(live),
+            "reconnect must try the most recently observed (live) addr first"
+        );
+        for addr in &dead {
+            assert!(
+                candidate_addrs.contains(addr),
+                "dead candidate {addr} should still be present under the cap"
+            );
+        }
+
+        let start = tokio::time::Instant::now();
+        let mut success_after = None;
+        for addr in &candidate_addrs {
+            let outcome = tokio::time::timeout(RECONNECT_CANDIDATE_DIAL_TIMEOUT, async {
+                if *addr == live {
+                    true
+                } else {
+                    std::future::pending::<bool>().await
+                }
+            })
+            .await;
+            if outcome == Ok(true) {
+                success_after = Some(start.elapsed());
+                break;
+            }
+        }
+
+        let elapsed = success_after.expect("live MRU addr must be reached");
+        assert!(
+            elapsed <= RECONNECT_CANDIDATE_DIAL_TIMEOUT,
+            "first successful dial took {elapsed:?}; MRU-first must succeed within \
+             one {RECONNECT_CANDIDATE_DIAL_TIMEOUT:?} timeout, not ~40s of dead candidates"
+        );
+    }
 }
 
 /// Handler-level test for issue #304: the actual PeerConnected event-handler
 /// path (not just the underlying upsert function) must record the inbound
 /// peer's observed address in `machine_discovery_cache`.
 ///
-/// The three tests in `candidate_address_retention_tests` verify the upsert
+/// The upsert tests in `candidate_address_retention_tests` verify the upsert
 /// function in isolation but never exercise the handler arm that calls it.
-/// If that arm is deleted from the handler, those three tests still pass.
+/// If that arm is deleted from the handler, those upsert tests still pass.
 /// This test fails instead: it drives a real PeerConnected event through the
 /// production handler and asserts the cache is populated.
 #[cfg(test)]
@@ -18081,7 +18430,7 @@ mod peer_connected_handler_integration_tests {
     /// REVERT GUARD: delete the `upsert_discovered_machine` call from the
     /// `PeerConnected` arm of `start_network_event_listener` and this test
     /// fails with "machine_discovery_cache entry not found for bob". The
-    /// three tests in `candidate_address_retention_tests` continue passing
+    /// upsert tests in `candidate_address_retention_tests` continue passing
     /// because they call the upsert function directly and never reach the
     /// handler.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
