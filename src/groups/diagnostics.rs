@@ -47,6 +47,12 @@ pub struct GroupCounters {
     /// `messages_dropped_write_policy_violation` (the receiver-side ingest
     /// canary) so that operators can distinguish the two failure modes.
     pub sends_rejected_write_policy: u64,
+    /// Public-message gossip topic publish completed while at least one
+    /// per-member unicast attempt was still in flight (issue #310). A zero
+    /// value after a multi-member send means fan-out regressed to
+    /// unicast-then-gossip sequence and the receiver will wait out the DM
+    /// retry budget (~24s) before the topic carry lands.
+    pub public_message_gossip_raced_unicast: u64,
     /// Public messages whose author signature failed to verify, or whose
     /// `author_agent_id` did not match the derived AgentId.
     pub messages_dropped_signature_failed: u64,
@@ -205,6 +211,18 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// Record that a public-message gossip publish *finished* while unicast
+    /// was still in flight. Increment only at that moment — a schedule-time
+    /// bump would fire before `publish` runs and would not mean what the
+    /// field comment says. A test that only checks eventual delivery cannot
+    /// tell a race from a 24s sequential fallback that later succeeded.
+    pub fn record_public_message_gossip_raced_unicast(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.public_message_gossip_raced_unicast =
+                c.public_message_gossip_raced_unicast.saturating_add(1);
+        });
+    }
+
     /// Record an `InvalidSignature` rejection.
     pub fn record_signature_failed(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
@@ -342,6 +360,9 @@ impl GroupsDiagnostics {
             dst.sends_rejected_write_policy = dst
                 .sends_rejected_write_policy
                 .saturating_add(src.sends_rejected_write_policy);
+            dst.public_message_gossip_raced_unicast = dst
+                .public_message_gossip_raced_unicast
+                .saturating_add(src.public_message_gossip_raced_unicast);
             dst.messages_dropped_signature_failed = dst
                 .messages_dropped_signature_failed
                 .saturating_add(src.messages_dropped_signature_failed);
@@ -535,6 +556,29 @@ mod tests {
         assert_eq!(
             g.counters.sends_rejected_write_policy, 1,
             "sender-side local rejection must be in sends_rejected_write_policy only"
+        );
+    }
+
+    /// Why: a sequential unicast-then-gossip fan-out can still deliver, so a
+    /// delivery assertion alone cannot catch issue #310. The raced counter is
+    /// the signal that topic publish finished while DM unicast was still
+    /// outstanding — if this method is wired to the wrong field, the
+    /// two-daemon <5s test would pass for the wrong reason.
+    #[test]
+    fn gossip_raced_unicast_counter_is_independent() {
+        let diag = GroupsDiagnostics::new();
+        diag.record_message_received("grp", 1);
+        diag.record_public_message_gossip_raced_unicast("grp");
+        diag.record_public_message_gossip_raced_unicast("grp");
+
+        let mut groups: HashMap<String, GroupInfo> = HashMap::new();
+        groups.insert("grp".into(), group("Grp", "grp"));
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
+        assert_eq!(g.counters.messages_received, 1);
+        assert_eq!(
+            g.counters.public_message_gossip_raced_unicast, 2,
+            "raced-unicast counter must not alias messages_received"
         );
     }
 

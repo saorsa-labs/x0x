@@ -35,7 +35,7 @@ use base64::Engine;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::path::{Path as FsPath, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 #[cfg(test)]
 use std::sync::Mutex as StdMutex;
@@ -9028,8 +9028,9 @@ pub(in crate::server) struct SendGroupMessageRequest {
 ///
 /// Branches on `policy.confidentiality`:
 ///
-/// - `SignedPublic` — builds a signed `GroupPublicMessage`, publishes
-///   to `x0x.groups.public.{group_id}`, and caches it locally.
+/// - `SignedPublic` — builds a signed `GroupPublicMessage`, caches it
+///   locally, returns 200 + `msg_id`, then fans out as a race: gossip
+///   topic publish and per-member direct DM start together (issue #310).
 ///   Write-access is enforced at endpoint time (same rules as
 ///   `x0x::groups::validate_public_message` applies at ingest).
 /// - `MlsEncrypted` — not supported on this endpoint yet; callers
@@ -9172,28 +9173,16 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
-    if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("publish failed: {e}"),
-        );
-    }
-    if let Err(e) = state
-        .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
-        .await
-    {
-        tracing::warn!(
-            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            group_id = %msg.group_id,
-            "E: global public-send fallback publish failed: {e}"
-        );
-    }
-    // Publish succeeded, so cache locally. The listener was started before the
-    // publish above to avoid first-message topic races.
+    // Persist first. HTTP 200 is a local-commit fact (issue #310 / same
+    // contract as today); fan-out is a race and must not delay this reply.
     cache_public_message(&state, msg.clone()).await;
-    spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
+    spawn_group_public_message_fanout_race(
+        Arc::clone(&state),
+        topic.clone(),
+        bytes,
+        direct_recipients,
+        msg.clone(),
+    );
 
     let msg_id = msg.msg_id();
     (
@@ -9505,6 +9494,43 @@ fn encode_group_public_message_direct_payload(
     Ok(payload)
 }
 
+/// First unicast attempt budget on the SignedPublic send path only (issue #310).
+/// Durable DMs and roster/control events keep the 8s named-group default —
+/// do not reuse this constant there.
+const GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET: Duration = Duration::from_secs(3);
+
+/// Test-only unicast fault injection for #310. Set
+/// `X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL=timeout` or `key_unavailable` on the
+/// sender daemon so a two-daemon test can prove gossip carry does not wait
+/// for the ~24s DM retry budget. Read once per process; unset is a no-op.
+enum GroupPublicUnicastInject {
+    None,
+    Timeout,
+    KeyUnavailable,
+}
+
+static GROUP_PUBLIC_UNICAST_INJECT: std::sync::LazyLock<GroupPublicUnicastInject> =
+    std::sync::LazyLock::new(
+        || match std::env::var("X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL") {
+            Ok(value) if value == "timeout" => GroupPublicUnicastInject::Timeout,
+            Ok(value) if value == "key_unavailable" => GroupPublicUnicastInject::KeyUnavailable,
+            _ => GroupPublicUnicastInject::None,
+        },
+    );
+
+/// Whether a failed public-message unicast should spend another attempt.
+///
+/// Reuses the #342 `DmError` failure class — do not invent a second enum.
+/// `RecipientKeyUnavailable` (and the sibling `RecipientKeyInvalid`) cannot
+/// be healed by waiting 8s+8s; an invalid recipient id is rejected before
+/// send and is therefore also non-retryable.
+fn group_public_unicast_is_retryable(err: &x0x::dm::DmError) -> bool {
+    !matches!(
+        err,
+        x0x::dm::DmError::RecipientKeyUnavailable(_) | x0x::dm::DmError::RecipientKeyInvalid(_)
+    )
+}
+
 fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     let mut config = named_group_direct_delivery_config();
     // User-visible community posts should use the receive-ACKed raw path when
@@ -9513,23 +9539,119 @@ fn group_public_message_direct_delivery_config() -> x0x::dm::DmSendConfig {
     // gossip overlay must not strand a post when the direct path is healthy.
     config.prefer_raw_quic_if_connected = true;
     config.require_gossip = false;
+    // Do not drop require_gossip_ack on this path to "make groups fast" —
+    // that flag is the durable-DM contract. Shorten THIS path's first-attempt
+    // budget instead (issue #310); product DMs keep the 8s default.
     config.require_gossip_ack = true;
+    config.raw_quic_receive_ack_timeout = Some(GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET);
+    config.timeout_per_attempt = GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET;
+    config.max_retries = 0;
     config
+}
+
+/// Fan-out a persisted public group message as a race: gossip topic publish
+/// starts immediately and does not wait for per-member unicast to finish or
+/// fail (issue #310). First success wins per recipient because
+/// [`cache_public_message`] no-ops on an already-cached signature.
+fn spawn_group_public_message_fanout_race(
+    state: Arc<AppState>,
+    topic: String,
+    bytes: Vec<u8>,
+    recipients: Vec<String>,
+    msg: x0x::groups::GroupPublicMessage,
+) {
+    let unicast_outstanding = Arc::new(AtomicUsize::new(recipients.len()));
+
+    let gossip_state = Arc::clone(&state);
+    let gossip_bytes = bytes;
+    let gossip_group = msg.group_id.clone();
+    let gossip_outstanding = Arc::clone(&unicast_outstanding);
+    tokio::spawn(async move {
+        tracing::info!(
+            target: "x0x::groups",
+            group_id = %LogHexId::group(&gossip_group),
+            "public group message gossip publish starting (raced with unicast)"
+        );
+        if let Err(e) = gossip_state
+            .agent
+            .publish(&topic, gossip_bytes.clone())
+            .await
+        {
+            tracing::warn!(
+                topic = %LogHexId::topic(&topic),
+                "E: public-send publish failed: {e}"
+            );
+        }
+        if let Err(e) = gossip_state
+            .agent
+            .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, gossip_bytes)
+            .await
+        {
+            tracing::warn!(
+                topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+                group_id = %gossip_group,
+                "E: global public-send fallback publish failed: {e}"
+            );
+        }
+        if gossip_outstanding.load(Ordering::Relaxed) > 0 {
+            gossip_state
+                .groups_diagnostics
+                .record_public_message_gossip_raced_unicast(&gossip_group);
+            tracing::info!(
+                target: "x0x::groups",
+                group_id = %LogHexId::group(&gossip_group),
+                "public group message gossip published before unicast returned"
+            );
+        }
+    });
+
+    for recipient in recipients {
+        spawn_group_public_message_delivery(
+            &state,
+            &recipient,
+            &msg,
+            Arc::clone(&unicast_outstanding),
+        );
+    }
 }
 
 fn spawn_group_public_message_delivery(
     state: &AppState,
     recipient_hex: &str,
     msg: &x0x::groups::GroupPublicMessage,
-    delay: Option<Duration>,
+    outstanding: Arc<AtomicUsize>,
 ) {
+    match *GROUP_PUBLIC_UNICAST_INJECT {
+        GroupPublicUnicastInject::Timeout => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(recipient_hex),
+                "X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL=timeout; hanging public-message unicast (test-only, #310)"
+            );
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_secs(24)).await;
+                outstanding.fetch_sub(1, Ordering::Relaxed);
+            });
+            return;
+        }
+        GroupPublicUnicastInject::KeyUnavailable => {
+            tracing::warn!(
+                recipient = %LogHexId::agent(recipient_hex),
+                "X0X_TEST_GROUP_PUBLIC_UNICAST_FAIL=key_unavailable; skipping unicast (test-only, #310)"
+            );
+            outstanding.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
+        GroupPublicUnicastInject::None => {}
+    }
+
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
-                recipient = %LogHexId::agent(&recipient_hex),
+                recipient = %LogHexId::agent(recipient_hex),
                 "cannot direct-deliver public group message: invalid recipient id: {e}"
             );
+            outstanding.fetch_sub(1, Ordering::Relaxed);
             return;
         }
     };
@@ -9537,6 +9659,7 @@ fn spawn_group_public_message_delivery(
         Ok(payload) => payload,
         Err(e) => {
             tracing::warn!("failed to serialize public group message for direct delivery: {e}");
+            outstanding.fetch_sub(1, Ordering::Relaxed);
             return;
         }
     };
@@ -9544,10 +9667,7 @@ fn spawn_group_public_message_delivery(
     let recipient_label = recipient_hex.to_string();
     let group_id = msg.group_id.clone();
     tokio::spawn(async move {
-        if let Some(delay) = delay {
-            tokio::time::sleep(delay).await;
-        }
-        if let Err(e) = agent
+        match agent
             .send_direct_with_config(
                 &recipient,
                 payload,
@@ -9555,29 +9675,24 @@ fn spawn_group_public_message_delivery(
             )
             .await
         {
-            tracing::warn!(
-                group_id = %LogHexId::group(&group_id),
-                recipient = %LogHexId::agent(&recipient_label),
-                "failed to direct-deliver public group message: {e}"
-            );
+            Ok(_) => {}
+            Err(e) if !group_public_unicast_is_retryable(&e) => {
+                tracing::info!(
+                    group_id = %LogHexId::group(&group_id),
+                    recipient = %LogHexId::agent(&recipient_label),
+                    "public group message unicast non-retryable ({e}); gossip race is the carry"
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(&group_id),
+                    recipient = %LogHexId::agent(&recipient_label),
+                    "failed to direct-deliver public group message: {e}"
+                );
+            }
         }
+        outstanding.fetch_sub(1, Ordering::Relaxed);
     });
-}
-
-fn spawn_group_public_message_delivery_to_active_members(
-    state: &AppState,
-    recipients: Vec<String>,
-    msg: &x0x::groups::GroupPublicMessage,
-) {
-    for recipient in recipients {
-        spawn_group_public_message_delivery(state, &recipient, msg, None);
-        spawn_group_public_message_delivery(
-            state,
-            &recipient,
-            msg,
-            Some(GROUP_BACKGROUND_PUBLISH_DELAY),
-        );
-    }
 }
 
 pub(in crate::server) async fn ingest_public_message(
@@ -25437,11 +25552,58 @@ pub(in crate::server) mod tests {
         assert!(config.prefer_raw_quic_if_connected);
         assert!(!config.require_gossip);
         assert!(!config.stop_fallback_on_raw_error);
+        // #310 shortens THIS path's first attempt only. Durable DMs and
+        // roster/control events still use the 8s named-group default —
+        // dropping require_gossip_ack here would be the wrong fix.
         assert!(config.require_gossip_ack);
         assert_eq!(
             config.raw_quic_receive_ack_timeout,
-            Some(Duration::from_secs(8))
+            Some(GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET)
         );
+        assert_eq!(
+            config.timeout_per_attempt,
+            GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET
+        );
+        assert_eq!(config.max_retries, 0);
+        assert!(
+            GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET >= Duration::from_secs(2)
+                && GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET <= Duration::from_secs(4),
+            "public-message unicast budget must stay in the 2–4s band, got {:?}",
+            GROUP_PUBLIC_UNICAST_ATTEMPT_BUDGET
+        );
+    }
+
+    #[test]
+    fn named_group_control_delivery_budget_is_unchanged_by_public_message_race() {
+        let config = named_group_direct_delivery_config();
+        assert_eq!(
+            config.raw_quic_receive_ack_timeout,
+            Some(Duration::from_secs(8)),
+            "roster/control events (#333 family) must keep the 8s budget"
+        );
+        assert_eq!(GROUP_BACKGROUND_PUBLISH_DELAY, Duration::from_secs(8));
+    }
+
+    #[test]
+    fn group_public_unicast_reuses_dm_error_failure_class_for_non_retryable() {
+        // Why: #310 must classify key-material misses as non-retryable so the
+        // 8s+8s delayed spawn is skipped. A second enum would drift from the
+        // #342 class that already names this failure.
+        assert!(!group_public_unicast_is_retryable(
+            &x0x::dm::DmError::RecipientKeyUnavailable("no advert".into())
+        ));
+        assert!(!group_public_unicast_is_retryable(
+            &x0x::dm::DmError::RecipientKeyInvalid("undecodable kem".into())
+        ));
+        assert!(group_public_unicast_is_retryable(
+            &x0x::dm::DmError::Timeout {
+                retries: 1,
+                elapsed: Duration::from_secs(24),
+            }
+        ));
+        assert!(group_public_unicast_is_retryable(
+            &x0x::dm::DmError::NoConnectivity("peer missing".into())
+        ));
     }
 
     #[test]
