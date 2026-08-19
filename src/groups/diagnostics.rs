@@ -211,11 +211,11 @@ impl GroupsDiagnostics {
         });
     }
 
-    /// Record that a public-message gossip publish finished while unicast was
-    /// still in flight. Why this is a separate counter: issue #310's invariant
-    /// is "topic publish starts without waiting for the DM retry budget", and
-    /// a test that only checks eventual delivery cannot tell a race from a
-    /// 24s sequential fallback that later succeeded.
+    /// Record that a public-message gossip publish *finished* while unicast
+    /// was still in flight. Increment only at that moment — a schedule-time
+    /// bump would fire before `publish` runs and would not mean what the
+    /// field comment says. A test that only checks eventual delivery cannot
+    /// tell a race from a 24s sequential fallback that later succeeded.
     pub fn record_public_message_gossip_raced_unicast(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
             c.public_message_gossip_raced_unicast =

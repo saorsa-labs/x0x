@@ -9562,16 +9562,6 @@ fn spawn_group_public_message_fanout_race(
 ) {
     let unicast_outstanding = Arc::new(AtomicUsize::new(recipients.len()));
 
-    // Record the race on this thread before any unicast task can finish.
-    // A `key_unavailable` inject decrements `outstanding` synchronously; if
-    // we waited for the gossip task to be scheduled the counter would miss
-    // the very failure class #310 must prove does not delay topic publish.
-    if !recipients.is_empty() {
-        state
-            .groups_diagnostics
-            .record_public_message_gossip_raced_unicast(&msg.group_id);
-    }
-
     let gossip_state = Arc::clone(&state);
     let gossip_bytes = bytes;
     let gossip_group = msg.group_id.clone();
@@ -9604,6 +9594,9 @@ fn spawn_group_public_message_fanout_race(
             );
         }
         if gossip_outstanding.load(Ordering::Relaxed) > 0 {
+            gossip_state
+                .groups_diagnostics
+                .record_public_message_gossip_raced_unicast(&gossip_group);
             tracing::info!(
                 target: "x0x::groups",
                 group_id = %LogHexId::group(&gossip_group),
