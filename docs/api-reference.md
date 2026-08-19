@@ -695,10 +695,15 @@ Two operator-visible consequences:
 - Both fields must be exactly 64 lowercase hex characters; 400 is returned
   otherwise.
 
-The response includes `"msg_id"` — the stable BLAKE3 identity of the message:
+The response includes `"msg_id"` — the stable BLAKE3 identity of the message —
+and `"fan_out"` — the eager-peer publish count at gossip `publish_local`
+(issue #296). `fan_out` is always present. `0` means no remote eager peer
+was offered the message (solo node, or every eligible peer cooled/excluded).
+HTTP 200 is preserved when the local ledger/cache write succeeded; delivery
+is a separate fact.
 
 ```json
-{ "ok": true, "msg_id": "<64-char hex>", "group_id": "...", "timestamp": ... }
+{ "ok": true, "msg_id": "<64-char hex>", "group_id": "...", "timestamp": ..., "fan_out": 1 }
 ```
 
 Every message item returned by `GET /groups/:id/messages` also includes

@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [v0.38.1] - 2026-08-18
 
+### Added
+
+- **Group send `fan_out` + zero-fanout diagnostics (#296).**
+  `POST /groups/:id/send` still returns HTTP 200 + `msg_id` when the local
+  ledger write succeeds. The response now always includes `fan_out` (eager-peer
+  publish count). `0` is the black-hole signal: the daemon increments
+  `gossip_publish_zero_fanout` (exposed on `GET /diagnostics/gossip`) and
+  `tracing::warn!`s once per `(group, 30s cooldown)` when peers exist but
+  all are cooled/excluded. Solo / `peer_count == 0` is expected and is not
+  warned. Members-only 403 already warns + counts; unverified
+  direct-delivered public messages now warn and use `record_signature_failed`.
+
 ### Changed
 
 - **ant-quic 0.27.38 → 0.27.39.** Dropping a QUIC send stream without an
