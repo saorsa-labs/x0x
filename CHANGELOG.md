@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Public group send no longer waits out the ~24s DM retry before gossip
+  carry (issue #310).** `POST /groups/:id/send` still persists locally and
+  returns 200 + `msg_id`. Fan-out is now a race: gossip topic publish
+  starts immediately and does not wait for per-member unicast to finish
+  or fail. `recipient key material unavailable` / invalid recipient id
+  reuse the #342 `DmError` class and skip the 8s+8s retry on this path
+  only. First unicast attempt is budgeted at 3s here; durable DMs and
+  roster/control events keep their 8s defaults. `require_gossip_ack` is
+  not dropped. No `fan_out` field (#296).
+
 ## [v0.38.1] - 2026-08-18
 
 ### Changed
