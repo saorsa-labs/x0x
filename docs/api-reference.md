@@ -438,7 +438,7 @@ Notable codes:
 | 409 | `recipient_ack_semantics_unavailable` | The send required ADR 0030 durable application-ACK semantics and the recipient advertises no current v2 capability. A peer you hold **any** contact card for lands here rather than on the 404 — including one whose advert has not converged yet, since that peer is known and may simply need upgrading. Returned after one forced targeted capability refresh, so it is fast and deterministic rather than a timeout. The caller retries, surfaces "peer needs upgrade", or resends with `require_durable_app_ack: false` — the daemon never downgrades silently. |
 | 409 | `idempotency_conflict` | The recipient already holds this `logical_id` bound to different bytes. **Retrying cannot succeed.** Either resend the original bytes under this id, or pick a new `logical_id`. |
 | 413 | `payload_too_large` | Payload exceeds the DM envelope cap. |
-| 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. |
+| 504 | `timeout` | No application ACK within the retry budget. The DM may or may not have arrived. On a durable send the body also includes `strict_gate_ms`, `publish_ms`, `ack_wait_ms`, `elapsed_ms`, and `budget_stage` so the stage that consumed the budget is named. These are diagnostics, not a latency SLA. |
 
 The two 409s prescribe opposite repairs and must not be conflated in client
 code: `recipient_ack_semantics_unavailable` means *retry later or tell the user
@@ -1160,7 +1160,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus snapshot (UPnP, NAT, relay, mDNS) |
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) |
-| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters and per-peer health |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters, per-peer health, and last durable-send stage timers (`last_durable_send`, `last_ack_publish_ms`) |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |

@@ -67,7 +67,7 @@
 //! ```
 
 use crate::connectivity::ObservedOrigin;
-use crate::dm::DmPath;
+use crate::dm::{DmPath, DurableSendStages};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::{AgentId, MachineId};
 use crate::trust::TrustDecision;
@@ -601,6 +601,12 @@ pub struct DmDiagnosticsSnapshot {
     pub per_peer: BTreeMap<String, DmPeerDiagnostics>,
     pub subscriber_count: usize,
     pub subscriber_capacity: usize,
+    /// #336 phase 1: last durable gossip-inbox send's named stage timers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_durable_send: Option<DurableSendStages>,
+    /// #336 phase 1: last durable (v2) ACK publish duration on this daemon.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_ack_publish_ms: Option<u64>,
 }
 
 /// Tracks connections and mappings for direct messaging.
@@ -650,6 +656,12 @@ pub struct DirectMessaging {
 
     /// Internal receiver (owned by the processing task).
     internal_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<DirectMessage>>>,
+
+    /// #336 phase 1: last durable send's named stage timers.
+    last_durable_send: Mutex<Option<DurableSendStages>>,
+
+    /// #336 phase 1: last durable ACK publish duration (receiver side).
+    last_ack_publish_ms: Mutex<Option<u64>>,
 }
 
 impl DirectMessaging {
@@ -684,6 +696,8 @@ impl DirectMessaging {
             raw_quic_ack_race_test_hook: Arc::new(Mutex::new(None)),
             internal_tx,
             internal_rx: Arc::new(tokio::sync::Mutex::new(internal_rx)),
+            last_durable_send: Mutex::new(None),
+            last_ack_publish_ms: Mutex::new(None),
         }
     }
 
@@ -990,6 +1004,26 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
+    /// #336 phase 1: remember the named stages of the last durable send.
+    pub(crate) fn record_durable_send_stages(&self, stages: DurableSendStages) {
+        match self.last_durable_send.lock() {
+            Ok(mut guard) => *guard = Some(stages),
+            Err(e) => {
+                tracing::error!("durable send stage diagnostics poisoned: {e}");
+            }
+        }
+    }
+
+    /// #336 phase 1: remember how long the last durable ACK publish took.
+    pub(crate) fn record_ack_publish_ms(&self, ack_publish_ms: u64) {
+        match self.last_ack_publish_ms.lock() {
+            Ok(mut guard) => *guard = Some(ack_publish_ms),
+            Err(e) => {
+                tracing::error!("durable ACK publish diagnostics poisoned: {e}");
+            }
+        }
+    }
+
     /// Snapshot direct-message diagnostics for API surfaces.
     #[must_use]
     pub fn diagnostics_snapshot(&self) -> DmDiagnosticsSnapshot {
@@ -1099,11 +1133,28 @@ impl DirectMessaging {
             }
         };
 
+        let last_durable_send = match self.last_durable_send.lock() {
+            Ok(guard) => *guard,
+            Err(e) => {
+                tracing::error!("durable send stage diagnostics poisoned: {e}");
+                None
+            }
+        };
+        let last_ack_publish_ms = match self.last_ack_publish_ms.lock() {
+            Ok(guard) => *guard,
+            Err(e) => {
+                tracing::error!("durable ACK publish diagnostics poisoned: {e}");
+                None
+            }
+        };
+
         DmDiagnosticsSnapshot {
             stats,
             per_peer,
             subscriber_count: self.subscriber_count(),
             subscriber_capacity: self.subscriber_capacity,
+            last_durable_send,
+            last_ack_publish_ms,
         }
     }
 
@@ -1432,6 +1483,26 @@ impl Default for DirectMessaging {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostics_snapshot_includes_last_durable_send_stages() {
+        let dm = DirectMessaging::new();
+        let stages = DurableSendStages {
+            strict_gate_ms: 10,
+            publish_ms: 20,
+            ack_wait_ms: 30,
+            elapsed_ms: 60,
+        };
+        dm.record_durable_send_stages(stages);
+        dm.record_ack_publish_ms(7);
+        let snap = dm.diagnostics_snapshot();
+        assert_eq!(snap.last_durable_send, Some(stages));
+        assert_eq!(snap.last_ack_publish_ms, Some(7));
+        assert_eq!(
+            snap.last_durable_send.expect("recorded").budget_stage(),
+            "ack_wait_ms"
+        );
+    }
 
     #[test]
     fn dm_payload_digest_is_stable_and_short() {

@@ -17,7 +17,7 @@ use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
 use bytes::Bytes;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, RwLock};
 use tokio::task::{JoinHandle, JoinSet};
 
@@ -523,7 +523,9 @@ async fn publish_durable_ack_job(
     // committed row; a second route costs one small publish and removes a
     // whole class of "committed but never acked" outcomes.
     let legacy = pubsub.publish(DM_BUS_TOPIC.to_string(), job.encoded);
+    let publish_started = Instant::now();
     let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+    dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
     if let Err(error) = result {
         dm.record_ack_publish_route_failed();
         tracing::warn!(

@@ -48,7 +48,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
 | GET | `/diagnostics/connectivity` | `x0x diagnostics connectivity` | ant-quic NodeStatus (UPnP / NAT / relay / mDNS) |
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters |
-| GET | `/diagnostics/dm` | `x0x diagnostics dm` | DM send/receive counters and per-peer health |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm` | DM send/receive counters, per-peer health, and last durable-send stage timers |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters and drop buckets |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote-exec counters, warnings, ACL summary |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe` | Active liveness + RTT probe (ant-quic) |

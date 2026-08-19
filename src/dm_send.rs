@@ -1,8 +1,9 @@
 //! Sender-side gossip DM path (phase 4 of `docs/design/dm-over-gossip.md`).
 
 use crate::dm::{
-    dm_inbox_topic, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt, DmSendConfig,
-    EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK, DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
+    dm_inbox_topic, millis_since, now_unix_ms, DmAckOutcome, DmError, DmPath, DmReceipt,
+    DmSendConfig, DurableSendStages, EnvelopeBuilder, InFlightAcks, DM_PROTOCOL_DURABLE_ACK,
+    DM_PROTOCOL_V1, MAX_PAYLOAD_BYTES,
 };
 use crate::dm_inbox::{DmInboxService, DM_BUS_TOPIC};
 use crate::error::IdentityError;
@@ -10,7 +11,7 @@ use crate::gossip::{PubSubManager, SigningContext};
 use crate::identity::{AgentId, MachineId, MachineKeypair};
 
 use bytes::Bytes;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use tokio::sync::broadcast::error::TryRecvError as BroadcastTryRecvError;
 use tokio::sync::oneshot::error::TryRecvError;
@@ -55,6 +56,80 @@ pub struct DmSendContext<'a> {
     pub machine_keypair: &'a MachineKeypair,
     /// Shared in-flight ACK registry.
     pub inflight: Arc<InFlightAcks>,
+    /// #336 phase 1: filled with inbox publish vs ACK-wait timings.
+    pub stages: &'a mut DurableSendStages,
+}
+
+/// #336 phase 1: partitions inbox publish vs ACK-wait so a cancelled
+/// per-attempt timeout still attributes the remainder to the stage that
+/// was running.
+struct StageTracker {
+    inner: Mutex<StageTrackerInner>,
+}
+
+struct StageTrackerInner {
+    current: u8,
+    started: Instant,
+    stages: DurableSendStages,
+}
+
+impl StageTracker {
+    const PUBLISH: u8 = 0;
+    const ACK_WAIT: u8 = 1;
+
+    fn new_publish() -> Arc<Self> {
+        Arc::new(Self {
+            inner: Mutex::new(StageTrackerInner {
+                current: Self::PUBLISH,
+                started: Instant::now(),
+                stages: DurableSendStages::default(),
+            }),
+        })
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, StageTrackerInner> {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn flush_locked(inner: &mut StageTrackerInner) {
+        let ms = millis_since(inner.started);
+        match inner.current {
+            Self::ACK_WAIT => {
+                inner.stages.ack_wait_ms = inner.stages.ack_wait_ms.saturating_add(ms);
+            }
+            _ => {
+                inner.stages.publish_ms = inner.stages.publish_ms.saturating_add(ms);
+            }
+        }
+        inner.started = Instant::now();
+    }
+
+    fn switch(&self, next: u8) {
+        let mut inner = self.lock();
+        Self::flush_locked(&mut inner);
+        inner.current = next;
+    }
+
+    fn take(&self) -> DurableSendStages {
+        let mut inner = self.lock();
+        Self::flush_locked(&mut inner);
+        inner.stages
+    }
+}
+
+/// Merges publish/ack-wait timings into the caller's stage bucket on every
+/// return — including `?` and timeout — so a 17s send still names a stage.
+struct PublishAckStagesGuard<'a> {
+    tracker: Arc<StageTracker>,
+    stages: &'a mut DurableSendStages,
+}
+
+impl Drop for PublishAckStagesGuard<'_> {
+    fn drop(&mut self) {
+        let taken = self.tracker.take();
+        self.stages.publish_ms = self.stages.publish_ms.saturating_add(taken.publish_ms);
+        self.stages.ack_wait_ms = self.stages.ack_wait_ms.saturating_add(taken.ack_wait_ms);
+    }
 }
 
 /// Publish a DM envelope on the recipient's gossip inbox topic and await its
@@ -80,6 +155,7 @@ pub async fn send_via_gossip(
         self_machine_id,
         machine_keypair,
         inflight,
+        stages,
     } = ctx;
     if payload.len() > MAX_PAYLOAD_BYTES {
         // 413-class rejection, not `EnvelopeConstruction`: the API layer must
@@ -95,6 +171,12 @@ pub async fn send_via_gossip(
             "recipient has no published KEM public key".to_string(),
         ));
     }
+
+    let tracker = StageTracker::new_publish();
+    let _stage_guard = PublishAckStagesGuard {
+        tracker: Arc::clone(&tracker),
+        stages,
+    };
 
     // A caller that owns a durable obligation supplies its own id so a retry
     // is the same logical request across restarts (ADR 0030 §5).
@@ -182,11 +264,13 @@ pub async fn send_via_gossip(
             }
         }
 
+        tracker.switch(StageTracker::PUBLISH);
         // The per-attempt budget covers both the local PlumTree publish and
         // the remote ACK wait.  Under PubSub back-pressure, `publish()` can be
         // the slow leg; bounding only the ACK wait let HTTP handlers exceed
         // their curl/user-visible deadline without returning a structured
         // `DmError::Timeout`.
+        let attempt_tracker = Arc::clone(&tracker);
         let attempt_result = tokio::time::timeout(config.timeout_per_attempt, async {
             let primary_publish = pubsub
                 .publish_topic_id(topic.clone(), topic_id, Bytes::from(wire.clone()))
@@ -215,6 +299,7 @@ pub async fn send_via_gossip(
                 return Ok(None);
             }
 
+            attempt_tracker.switch(StageTracker::ACK_WAIT);
             if primary_publish_ok {
                 if let Some(outcome) =
                     wait_for_ack_or_backoff(&mut rx, ACK_LEGACY_BUS_FALLBACK_DELAY).await?
@@ -232,6 +317,7 @@ pub async fn send_via_gossip(
                 primary_publish_ok,
                 bus_topic = DM_BUS_TOPIC,
             );
+            attempt_tracker.switch(StageTracker::PUBLISH);
             if let Err(e) = pubsub
                 .publish(DM_BUS_TOPIC.to_string(), Bytes::from(wire.clone()))
                 .await
@@ -250,6 +336,7 @@ pub async fn send_via_gossip(
                 }
             }
 
+            attempt_tracker.switch(StageTracker::ACK_WAIT);
             (&mut rx).await.map(Some).map_err(|_| {
                 DmError::PublishFailed("in-flight ACK registry replaced our waiter".to_string())
             })
@@ -293,6 +380,7 @@ pub async fn send_via_gossip(
             }
             Ok(Err(e)) => return Err(e),
             Err(_) => {
+                tracker.switch(StageTracker::ACK_WAIT);
                 if attempt < config.max_retries {
                     let delay = config.backoff.delay(config.timeout_per_attempt, attempt);
                     let wait_outcome = wait_for_ack_or_backoff_or_replaced(
@@ -910,5 +998,29 @@ mod tests {
     #[test]
     fn default_send_config_requires_gossip_ack() {
         assert!(DmSendConfig::default().require_gossip_ack);
+    }
+
+    /// #336 phase 1: a cancelled attempt must still attribute remaining
+    /// time to the stage that was running, so the three timers can sum to
+    /// wall time.
+    #[test]
+    fn stage_tracker_partitions_publish_and_ack_wait() {
+        let tracker = StageTracker::new_publish();
+        std::thread::sleep(Duration::from_millis(20));
+        tracker.switch(StageTracker::ACK_WAIT);
+        std::thread::sleep(Duration::from_millis(30));
+        let stages = tracker.take();
+        assert!(
+            stages.publish_ms >= 15,
+            "publish stage must capture its wall slice: {stages:?}"
+        );
+        assert!(
+            stages.ack_wait_ms >= 25,
+            "ack-wait stage must capture its wall slice: {stages:?}"
+        );
+        assert!(
+            stages.sum_ms() >= 40,
+            "named stages must cover the slept wall: {stages:?}"
+        );
     }
 }

@@ -87,3 +87,34 @@ points to a client that reads topic frames slowly but never fully stalls; invest
 client. Any non-zero `ws_slow_consumer_closes` indicates a client that stopped reading entirely.
 
 `GET /ws/sessions` (unchanged) lists active sessions and shared topic subscriptions.
+
+## Durable send stage timers (#336 phase 1)
+
+```bash
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/diagnostics/dm
+# {
+#   "ok": true,
+#   "stats": { ... },
+#   "last_durable_send": {
+#     "strict_gate_ms": 120,
+#     "publish_ms": 45,
+#     "ack_wait_ms": 180,
+#     "elapsed_ms": 345,
+#     "budget_stage": "ack_wait_ms"
+#   },
+#   "last_ack_publish_ms": 12
+# }
+```
+
+`last_durable_send` is the sender's last durable gossip-inbox send. The three
+named stages are a partition of `elapsed_ms` (daemon-side wall). `budget_stage`
+is the largest of the three, so a slow send names which stage consumed the
+budget. A send-timeout **504** from `POST /direct/send` exports the same
+fields on the error body; `error` remains `timeout` and `detail` stays the
+existing Display string.
+
+`last_ack_publish_ms` is the receiver's last durable (v2) ACK publish
+duration. Compare it with the sender's `ack_wait_ms` to see whether the ACK
+publish itself or the reverse path held the waiter.
+
+These fields are measurement only. They are not a latency SLA.
