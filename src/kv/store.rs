@@ -43,7 +43,7 @@ pub enum AccessPolicy {
     /// Reserved for group-scoped encrypted stores.
     ///
     /// The variant is **unconstructible** through ordinary constructors
-    /// ([`KvStore::new`](Self::new) returns
+    /// ([`KvStore::new`] returns
     /// [`KvError::EncryptedPolicyReserved`]) and **fail-closed** on any
     /// replica that already carries it: the sync path still publishes
     /// plaintext deltas and enforces no group membership, so until encrypted
@@ -1413,16 +1413,31 @@ impl KvStore {
     /// cold-recover a Signed store from a non-owner replica while the owner is
     /// offline.
     ///
-    /// Returns `false` otherwise (unanchored, bad sig/owner, stale seq,
-    /// cross-store, entry integrity failure, root mismatch / incremental
-    /// delta / tamper), in which case [`merge_delta`] falls through to the
-    /// normal sender-auth path. Never establishes ownership (anchor gate).
+    /// Returns `false` otherwise (unanchored, reserved Encrypted policy,
+    /// bad sig/owner, stale seq, cross-store, entry integrity failure,
+    /// root mismatch / incremental delta / tamper), in which case
+    /// [`merge_delta`] falls through to the normal sender-auth path. Never
+    /// establishes ownership (anchor gate).
     fn try_adopt_full_snapshot(
         &mut self,
         delta: &KvStoreDelta,
         peer_id: PeerId,
         cp: &OwnerCheckpoint,
     ) -> bool {
+        // 0. Reserved Encrypted policy is fail-closed (#341 Phase A, I1):
+        //    this path runs in merge_delta BEFORE the sender-auth check, so
+        //    without this gate a genuine owner checkpoint would apply its
+        //    plaintext entries and refresh the policy in step 10 — flipping
+        //    the replica Encrypted→Signed and re-opening every write path.
+        if let AccessPolicy::Encrypted { group_id } = &self.policy {
+            tracing::warn!(
+                target: "x0x::kv",
+                "rejected owner checkpoint for encrypted store {} (group_id {}) — secure sync is not wired",
+                self.id,
+                hex::encode(group_id)
+            );
+            return false;
+        }
         // 1. Anchor gate: never learn the owner from a relay.
         let Some(expected_owner) = self.owner else {
             tracing::warn!("rejected owner checkpoint for unanchored store {}", self.id);
@@ -2760,6 +2775,59 @@ mod tests {
 
         assert_eq!(dest.current_version(), v_before, "no state change at all");
         assert!(dest.is_empty(), "forced Encrypted replica stays empty");
+    }
+
+    #[test]
+    fn encrypted_replica_rejects_owner_checkpoint_adoption() {
+        // WHY (#341 Phase A, I1): checkpoint adoption runs in merge_delta
+        // BEFORE the sender-auth check, so `try_adopt_full_snapshot` is the
+        // one write path the is_authorized fail-closed arm never sees. A
+        // forced Encrypted replica (legacy/deserialized state) receiving a
+        // delta with a GENUINE owner checkpoint must not adopt: adoption
+        // would apply the plaintext entries and refresh the policy in
+        // step 10 — silently flipping Encrypted→Signed and re-opening
+        // every write path the reservation closed.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let topic = "store/enc-adopt";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        owner_store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut delta = owner_store.full_delta();
+        delta.owner_checkpoint = Some(cp);
+
+        let mut dest = KvStore::new_encrypted_unchecked(id, String::new(), owner, vec![1, 2, 3]);
+        let v_before = dest.current_version();
+        dest.merge_delta(&delta, peer(9), Some(&owner))
+            .expect("silent reject, not an error");
+        assert!(
+            dest.get("k").is_none(),
+            "owner checkpoint must not apply its plaintext entries"
+        );
+        assert!(dest.is_empty(), "forced Encrypted replica stays empty");
+        assert!(
+            matches!(dest.policy, AccessPolicy::Encrypted { .. }),
+            "policy must stay Encrypted, not flip to Signed"
+        );
+        assert!(
+            dest.latest_checkpoint.is_none(),
+            "checkpoint must not be cached"
+        );
+        assert_eq!(
+            dest.highest_checkpoint_seq, 0,
+            "high-water mark must stay untouched"
+        );
+        assert_eq!(dest.current_version(), v_before, "no state change at all");
     }
 
     #[test]
