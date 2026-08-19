@@ -17,8 +17,15 @@ use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
 use saorsa_gossip_types::{PeerHealthOracle, PeerId, TopicId, TopicPriority};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, RwLock};
+
+/// Rate-limit window for `fan_out == 0` warnings (issue #296).
+///
+/// Matches the X0X-0073 cooling floor so a send storm produces one warn
+/// per group per cooldown, not one warn per message.
+pub(crate) const ZERO_FANOUT_WARN_WINDOW: Duration = Duration::from_secs(30);
 
 /// Drop-detection counters for the pub/sub pipeline.
 ///
@@ -47,6 +54,9 @@ pub struct PubSubStats {
     /// message not delivered, but accounted for so decode→delivery deltas stay
     /// meaningful.
     pub subscriber_channel_closed: AtomicU64,
+    /// Local publishes that fanned out to zero eager peers (`fan_out == 0`).
+    /// Exposed as `gossip_publish_zero_fanout` at `GET /diagnostics/gossip`.
+    pub publish_zero_fanout: AtomicU64,
 }
 
 /// Snapshot of [`PubSubStats`] for JSON serialization.
@@ -60,6 +70,8 @@ pub struct PubSubStatsSnapshot {
     pub delivered_to_subscriber: u64,
     pub slow_subscriber_dropped: u64,
     pub subscriber_channel_closed: u64,
+    /// Local publishes whose eager-peer fan-out was zero.
+    pub publish_zero_fanout: u64,
     /// `incoming_total - incoming_decoded - incoming_decode_failed` — messages
     /// that entered the pipeline but did not reach a decision yet (usually 0,
     /// non-zero means a worker panicked or the decode task is blocked).
@@ -80,6 +92,7 @@ impl PubSubStats {
         let delivered_to_subscriber = self.delivered_to_subscriber.load(Ordering::Relaxed);
         let slow_subscriber_dropped = self.slow_subscriber_dropped.load(Ordering::Relaxed);
         let subscriber_channel_closed = self.subscriber_channel_closed.load(Ordering::Relaxed);
+        let publish_zero_fanout = self.publish_zero_fanout.load(Ordering::Relaxed);
         let in_flight_decode =
             incoming_total as i64 - incoming_decoded as i64 - incoming_decode_failed as i64;
         let decode_to_delivery_drops = incoming_decoded as i64
@@ -94,10 +107,53 @@ impl PubSubStats {
             delivered_to_subscriber,
             slow_subscriber_dropped,
             subscriber_channel_closed,
+            publish_zero_fanout,
             in_flight_decode,
             decode_to_delivery_drops,
         }
     }
+}
+
+/// Decide whether a zero-fanout publish should emit `tracing::warn!`.
+///
+/// Always increments `publish_zero_fanout` when `fan_out == 0`. Skips the
+/// warn when `peer_count == 0` (solo / first-node is expected). Otherwise
+/// rate-limits to once per `(group_id, window)`.
+#[must_use]
+pub(crate) fn observe_zero_fanout_publish(
+    stats: &PubSubStats,
+    last_warn_by_group: &mut HashMap<String, Instant>,
+    group_id: &str,
+    fan_out: u32,
+    peer_count: usize,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    if fan_out != 0 {
+        return false;
+    }
+    stats.publish_zero_fanout.fetch_add(1, Ordering::Relaxed);
+    if peer_count == 0 {
+        return false;
+    }
+    should_emit_zero_fanout_warn(last_warn_by_group, group_id, now, window)
+}
+
+/// True when this group has not warned inside `window`.
+#[must_use]
+pub(crate) fn should_emit_zero_fanout_warn(
+    last_warn_by_group: &mut HashMap<String, Instant>,
+    group_id: &str,
+    now: Instant,
+    window: Duration,
+) -> bool {
+    if let Some(prev) = last_warn_by_group.get(group_id) {
+        if now.duration_since(*prev) < window {
+            return false;
+        }
+    }
+    last_warn_by_group.insert(group_id.to_string(), now);
+    true
 }
 
 /// Domain separation prefix for signed message payloads.
@@ -273,6 +329,20 @@ pub struct PubSubManager {
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
     local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+    /// Last `fan_out == 0` warn per group, used to rate-limit issue #296.
+    zero_fanout_warns: Mutex<HashMap<String, Instant>>,
+    /// Test-only: report this fan-out after a successful publish so HTTP
+    /// tests can simulate an empty eager set without disabling cooling.
+    #[cfg(test)]
+    fanout_report_override: Mutex<Option<u32>>,
+}
+
+/// Outcome of a PlumTree (or local-topic) publish.
+struct PublishFanoutOutcome {
+    /// Eager-peer publish count at `publish_local`. `0` is the black-hole.
+    fan_out: u32,
+    /// Signed V2 envelope bytes when signing is enabled.
+    envelope: Option<Bytes>,
 }
 
 /// Topic-name prefix marking a topic as local-only (issue #89).
@@ -358,6 +428,9 @@ impl PubSubManager {
             revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
+            zero_fanout_warns: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            fanout_report_override: Mutex::new(None),
         })
     }
 
@@ -367,6 +440,45 @@ impl PubSubManager {
     /// drop signal the test harness uses to prove 100 % delivery under load.
     pub fn stats(&self) -> PubSubStatsSnapshot {
         self.stats.snapshot()
+    }
+
+    /// Record a `fan_out == 0` publish and return whether to `warn!`.
+    ///
+    /// Increments [`PubSubStats::publish_zero_fanout`]. Skips the warn when
+    /// `peer_count == 0` (solo / first-node). Otherwise rate-limits to once
+    /// per `(group_id, `[`ZERO_FANOUT_WARN_WINDOW`]`)`.
+    #[must_use]
+    pub fn observe_zero_fanout(&self, group_id: &str, fan_out: u32, peer_count: usize) -> bool {
+        let mut last = self
+            .zero_fanout_warns
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        observe_zero_fanout_publish(
+            &self.stats,
+            &mut last,
+            group_id,
+            fan_out,
+            peer_count,
+            Instant::now(),
+            ZERO_FANOUT_WARN_WINDOW,
+        )
+    }
+
+    /// Test hook: report `fan_out` instead of the PlumTree eager-peer count.
+    #[cfg(test)]
+    pub fn set_fanout_report_override(&self, fan_out: Option<u32>) {
+        *self
+            .fanout_report_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = fan_out;
+    }
+
+    #[cfg(test)]
+    fn apply_fanout_override(&self, fan_out: u32) -> u32 {
+        self.fanout_report_override
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or(fan_out)
     }
 
     /// Snapshot of low-level PlumTree PubSub stage timings.
@@ -557,8 +669,20 @@ impl PubSubManager {
     ///
     /// Returns an error if encoding or signing fails.
     pub async fn publish(&self, topic: String, payload: Bytes) -> NetworkResult<()> {
+        self.publish_with_fanout(topic, payload).await.map(|_| ())
+    }
+
+    /// Publish to a topic and return the eager-peer fan-out count.
+    ///
+    /// `0` means PlumTree handed the message to no remote eager peers
+    /// (solo node, or every eligible peer cooled/excluded). Local ledger
+    /// writes are a separate fact — this count is delivery opportunity.
+    pub async fn publish_with_fanout(&self, topic: String, payload: Bytes) -> NetworkResult<u32> {
         let topic_id = TopicId::from_entity(topic.as_bytes());
-        self.publish_topic_id(topic, topic_id, payload).await
+        Ok(self
+            .publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload)
+            .await?
+            .fan_out)
     }
 
     /// Publish to a topic and return the signed V2 envelope bytes when
@@ -604,11 +728,27 @@ impl PubSubManager {
         topic_id: TopicId,
         payload: Bytes,
     ) -> NetworkResult<Option<Bytes>> {
+        self.publish_topic_id_with_fanout_and_envelope(topic, topic_id, payload)
+            .await
+            .map(|outcome| outcome.envelope)
+    }
+
+    /// Publish and return both the signed envelope (when signing) and the
+    /// eager-peer fan-out count from PlumTree `publish_local`.
+    async fn publish_topic_id_with_fanout_and_envelope(
+        &self,
+        topic: String,
+        topic_id: TopicId,
+        payload: Bytes,
+    ) -> NetworkResult<PublishFanoutOutcome> {
         // `local:` topics fan out to same-daemon subscribers only — the
         // payload never reaches PlumTree or any remote peer (issue #89).
         if is_local_topic(&topic) {
             self.publish_local(topic, payload).await?;
-            return Ok(None);
+            return Ok(PublishFanoutOutcome {
+                fan_out: 0,
+                envelope: None,
+            });
         }
 
         let (encoded, envelope_bytes) = if let Some(ref ctx) = self.signing {
@@ -641,10 +781,17 @@ impl PubSubManager {
         self.register_dynamic_topic_priority(&topic, topic_id);
         self.initialize_topic_peers(topic_id).await;
 
-        match self.plumtree.publish(topic_id, encoded).await {
-            Ok(()) => {
+        match self.plumtree.publish_with_fanout(topic_id, encoded).await {
+            Ok(counts) => {
                 self.stats.publish_total.fetch_add(1, Ordering::Relaxed);
-                Ok(envelope_bytes)
+                let attempted = counts.map(|c| c.attempted).unwrap_or(0);
+                let fan_out = u32::try_from(attempted).unwrap_or(u32::MAX);
+                #[cfg(test)]
+                let fan_out = self.apply_fanout_override(fan_out);
+                Ok(PublishFanoutOutcome {
+                    fan_out,
+                    envelope: envelope_bytes,
+                })
             }
             Err(e) => {
                 self.stats.publish_failed.fetch_add(1, Ordering::Relaxed);
@@ -2193,6 +2340,96 @@ mod tests {
         assert_eq!(snap.delivered_to_subscriber, 0);
         assert_eq!(snap.slow_subscriber_dropped, 0);
         assert_eq!(snap.subscriber_channel_closed, 0);
+        assert_eq!(snap.publish_zero_fanout, 0);
+    }
+
+    /// Why (#296): `fan_out == 0` with no connected peers is the solo /
+    /// first-node case — count it, but do not warn.
+    #[test]
+    fn zero_fanout_solo_increments_counter_without_warn() {
+        let stats = PubSubStats::default();
+        let mut last = HashMap::new();
+        let now = Instant::now();
+        let warn = observe_zero_fanout_publish(
+            &stats,
+            &mut last,
+            "group-a",
+            0,
+            0,
+            now,
+            ZERO_FANOUT_WARN_WINDOW,
+        );
+        assert!(!warn, "peer_count == 0 must skip the warn");
+        assert_eq!(stats.snapshot().publish_zero_fanout, 1);
+    }
+
+    /// Why (#296): peers exist but eager fan-out is empty (all cooled) —
+    /// that is the black-hole. Count + warn once per group/window.
+    #[test]
+    fn zero_fanout_with_peers_warns_once_per_window() {
+        let stats = PubSubStats::default();
+        let mut last = HashMap::new();
+        let now = Instant::now();
+        let first = observe_zero_fanout_publish(
+            &stats,
+            &mut last,
+            "group-a",
+            0,
+            1,
+            now,
+            ZERO_FANOUT_WARN_WINDOW,
+        );
+        let second = observe_zero_fanout_publish(
+            &stats,
+            &mut last,
+            "group-a",
+            0,
+            1,
+            now + Duration::from_secs(1),
+            ZERO_FANOUT_WARN_WINDOW,
+        );
+        let other = observe_zero_fanout_publish(
+            &stats,
+            &mut last,
+            "group-b",
+            0,
+            2,
+            now,
+            ZERO_FANOUT_WARN_WINDOW,
+        );
+        assert!(first, "first zero-fanout with peers must warn");
+        assert!(!second, "same group inside the window must not warn again");
+        assert!(other, "a different group has its own warn window");
+        assert_eq!(stats.snapshot().publish_zero_fanout, 3);
+    }
+
+    /// Why (#296): healthy fan-out must not increment the black-hole counter.
+    #[test]
+    fn healthy_fanout_leaves_zero_fanout_counter_unchanged() {
+        let stats = PubSubStats::default();
+        let mut last = HashMap::new();
+        let warn = observe_zero_fanout_publish(
+            &stats,
+            &mut last,
+            "group-a",
+            1,
+            1,
+            Instant::now(),
+            ZERO_FANOUT_WARN_WINDOW,
+        );
+        assert!(!warn);
+        assert_eq!(stats.snapshot().publish_zero_fanout, 0);
+    }
+
+    #[tokio::test]
+    async fn publish_with_fanout_is_zero_when_eager_set_is_empty() {
+        let node = test_node().await;
+        let manager = PubSubManager::new(node, None).expect("manager");
+        let fan_out = manager
+            .publish_with_fanout("empty-eager".to_string(), Bytes::from("nobody"))
+            .await
+            .expect("publish");
+        assert_eq!(fan_out, 0, "solo node has no eager peers");
     }
 
     #[test]

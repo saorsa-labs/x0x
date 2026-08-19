@@ -2844,6 +2844,35 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
+    /// Record a `fan_out == 0` group publish and return whether to `warn!`.
+    ///
+    /// Increments `publish_zero_fanout` (surfaced as
+    /// `gossip_publish_zero_fanout` on `GET /diagnostics/gossip`). Skips the
+    /// warn when `peer_count == 0`. No-op when gossip is not initialized.
+    #[must_use]
+    pub(crate) fn observe_gossip_zero_fanout(
+        &self,
+        group_id: &str,
+        fan_out: u32,
+        peer_count: usize,
+    ) -> bool {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| {
+                rt.pubsub()
+                    .observe_zero_fanout(group_id, fan_out, peer_count)
+            })
+            .unwrap_or(false)
+    }
+
+    /// Test hook: report a forced eager-peer fan-out after the next publishes.
+    #[cfg(test)]
+    pub(crate) fn set_publish_fanout_override(&self, fan_out: Option<u32>) {
+        if let Some(rt) = &self.gossip_runtime {
+            rt.pubsub().set_fanout_report_override(fan_out);
+        }
+    }
+
     /// Snapshot of inbound gossip dispatcher counters.
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
@@ -8064,6 +8093,21 @@ impl Agent {
     /// - Gossip runtime is not initialized (configure agent with network first)
     /// - Message encoding or broadcast fails
     pub async fn publish(&self, topic: &str, payload: Vec<u8>) -> error::Result<()> {
+        self.publish_with_fanout(topic, payload).await.map(|_| ())
+    }
+
+    /// Publish a message to a topic and return the eager-peer fan-out count.
+    ///
+    /// `0` means no remote eager peer was offered the message (solo node,
+    /// or every eligible peer cooled/excluded). The local write is a
+    /// separate fact — callers that persist first must not treat this as
+    /// an HTTP failure.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if gossip is not initialized or encoding/broadcast
+    /// fails.
+    pub async fn publish_with_fanout(&self, topic: &str, payload: Vec<u8>) -> error::Result<u32> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
@@ -8071,7 +8115,7 @@ impl Agent {
         })?;
         runtime
             .pubsub()
-            .publish(topic.to_string(), bytes::Bytes::from(payload))
+            .publish_with_fanout(topic.to_string(), bytes::Bytes::from(payload))
             .await
             .map_err(|e| {
                 error::IdentityError::Storage(std::io::Error::other(format!(

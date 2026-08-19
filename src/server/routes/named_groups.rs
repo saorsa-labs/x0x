@@ -9172,13 +9172,17 @@ pub(in crate::server) async fn send_group_public_message(
             );
         }
     };
-    if let Err(e) = state.agent.publish(&topic, bytes.clone()).await {
-        tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
-        return api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            format!("publish failed: {e}"),
-        );
-    }
+    let fan_out = match state.agent.publish_with_fanout(&topic, bytes.clone()).await {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(topic = %LogHexId::topic(&topic), "E: public-send publish failed: {e}");
+            return api_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("publish failed: {e}"),
+            );
+        }
+    };
+    observe_group_send_fanout(&state, &msg.group_id, fan_out).await;
     if let Err(e) = state
         .agent
         .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
@@ -9191,22 +9195,66 @@ pub(in crate::server) async fn send_group_public_message(
         );
     }
     // Publish succeeded, so cache locally. The listener was started before the
-    // publish above to avoid first-message topic races.
+    // publish above to avoid first-message topic races. Delivery (fan_out) is
+    // a separate fact from this local write — HTTP 200 is preserved even
+    // when fan_out == 0 (issue #296).
     cache_public_message(&state, msg.clone()).await;
     spawn_group_public_message_delivery_to_active_members(&state, direct_recipients, &msg);
 
     let msg_id = msg.msg_id();
     (
         StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "group_id": msg.group_id,
-            "topic": topic,
-            "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
-            "timestamp": msg.timestamp,
-            "msg_id": msg_id,
-        })),
+        Json(group_public_send_ok_json(
+            &msg.group_id,
+            &topic,
+            msg.timestamp,
+            &msg_id,
+            fan_out,
+        )),
     )
+}
+
+/// Successful `POST /groups/:id/send` body. `fan_out` is always present.
+fn group_public_send_ok_json(
+    group_id: &str,
+    topic: &str,
+    timestamp: u64,
+    msg_id: &str,
+    fan_out: u32,
+) -> serde_json::Value {
+    serde_json::json!({
+        "ok": true,
+        "group_id": group_id,
+        "topic": topic,
+        "fallback_topic": GLOBAL_PUBLIC_MESSAGE_TOPIC,
+        "timestamp": timestamp,
+        "msg_id": msg_id,
+        "fan_out": fan_out,
+    })
+}
+
+/// Increment the zero-fanout counter and emit a rate-limited warn when
+/// peers exist but eager fan-out was empty. Solo (`peer_count == 0`) is
+/// expected and is not warned.
+async fn observe_group_send_fanout(state: &AppState, group_id: &str, fan_out: u32) {
+    if fan_out != 0 {
+        return;
+    }
+    let peer_count = match state.agent.peers().await {
+        Ok(peers) => peers.len(),
+        Err(_) => 0,
+    };
+    if state
+        .agent
+        .observe_gossip_zero_fanout(group_id, fan_out, peer_count)
+    {
+        tracing::warn!(
+            group_id = %group_id,
+            peer_count,
+            fan_out,
+            "gossip publish fan_out=0; peers exist but all eager peers are cooled or excluded"
+        );
+    }
 }
 
 /// Query parameters for [`get_group_public_messages`].
@@ -9653,6 +9701,23 @@ pub(in crate::server) async fn ingest_public_message(
             );
         }
     }
+}
+
+/// Direct-delivered public message whose transport signature failed.
+///
+/// Issue #296: this used to be a mute drop. Count it with the existing
+/// ingest signature-failed bucket and emit a warn so operators can see it.
+pub(in crate::server) fn reject_unverified_direct_public_message(
+    diagnostics: &x0x::groups::GroupsDiagnostics,
+    group_id: &str,
+    sender_hex: &str,
+) {
+    diagnostics.record_signature_failed(group_id);
+    tracing::warn!(
+        group_id = %group_id,
+        sender = %sender_hex,
+        "dropping direct-delivered public group message: transport signature verification failed"
+    );
 }
 
 pub(in crate::server) async fn spawn_global_public_message_listener(
@@ -25950,6 +26015,339 @@ pub(in crate::server) mod tests {
                 "HistoryRecord produced by record_group_public_history must pass validate()",
             );
         }
+    }
+
+    /// Why (#296): callers detect the gossip black-hole from `fan_out`.
+    /// A send body without the field must never be produced.
+    #[test]
+    fn group_send_ok_json_always_includes_fan_out() {
+        for fan_out in [0_u32, 1, 8] {
+            let body = group_public_send_ok_json("g1", "x0x.groups.public.g1", 1, "ab", fan_out);
+            assert!(
+                body.get("fan_out").is_some(),
+                "fan_out must always be present: {body}"
+            );
+            assert_eq!(body["fan_out"].as_u64(), Some(u64::from(fan_out)));
+            assert!(body.get("msg_id").is_some());
+        }
+    }
+
+    async fn insert_public_group(
+        state: &AppState,
+        creator: x0x::identity::AgentId,
+        mls_id: &str,
+    ) -> String {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "fanout".to_string(),
+            String::new(),
+            creator,
+            mls_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let id = info.mls_group_id.clone();
+        state.named_groups.write().await.insert(id.clone(), info);
+        id
+    }
+
+    async fn post_group_send(
+        state: Arc<AppState>,
+        group_id: &str,
+        body: &str,
+    ) -> Result<(StatusCode, serde_json::Value)> {
+        let req =
+            serde_json::from_value(serde_json::json!({ "body": body })).context("send request")?;
+        let response =
+            send_group_public_message(State(state), Path(group_id.to_string()), Json(req))
+                .await
+                .into_response();
+        response_json(response).await
+    }
+
+    /// Why (#296): members-only write still returns 403; the existing warn
+    /// + `sends_rejected_write_policy` counter stay the operator signal.
+    #[tokio::test]
+    async fn members_only_send_stays_403_and_counts() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let foreign = x0x::identity::AgentId([0x11; 32]);
+        let group_id = insert_public_group(state.as_ref(), foreign, &"11".repeat(16)).await;
+        let before = state
+            .groups_diagnostics
+            .snapshot(
+                &HashMap::new(),
+                &HashSet::new(),
+                &HashSet::new(),
+                &HashMap::new(),
+            )
+            .groups
+            .iter()
+            .find(|g| g.group_id == group_id)
+            .map(|g| g.counters.sends_rejected_write_policy)
+            .unwrap_or(0);
+
+        let (status, body) = post_group_send(Arc::clone(&state), &group_id, "nope").await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body={body}");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|e| e.contains("members-only")),
+            "expected members-only 403, got {body}"
+        );
+
+        let groups = state.named_groups.read().await.clone();
+        let snap = state.groups_diagnostics.snapshot(
+            &groups,
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let after = snap
+            .groups
+            .iter()
+            .find(|g| g.group_id == group_id)
+            .map(|g| g.counters.sends_rejected_write_policy)
+            .unwrap_or(0);
+        assert_eq!(
+            after,
+            before + 1,
+            "403 must increment sends_rejected_write_policy"
+        );
+        Ok(())
+    }
+
+    /// Why (#296): a mute drop on unverified direct public messages hid
+    /// signature failures. The existing signature-failed counter must move.
+    #[test]
+    fn unverified_direct_public_message_records_signature_failed() {
+        let diag = x0x::groups::GroupsDiagnostics::new();
+        reject_unverified_direct_public_message(&diag, "g-sig", "aa");
+        let snap = diag.snapshot(
+            &HashMap::new(),
+            &HashSet::new(),
+            &HashSet::new(),
+            &HashMap::new(),
+        );
+        let row = snap
+            .groups
+            .iter()
+            .find(|g| g.group_id == "g-sig")
+            .expect("counter row");
+        assert_eq!(row.counters.messages_dropped_signature_failed, 1);
+    }
+
+    fn isolated_loopback_config(plane: &str) -> x0x::network::NetworkConfig {
+        x0x::network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+            bootstrap_nodes: Vec::new(),
+            network_id: Some(plane.to_string()),
+            ..x0x::network::NetworkConfig::default()
+        }
+    }
+
+    fn bound_loopback(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+        if addr.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                addr.port(),
+            )
+        } else {
+            addr
+        }
+    }
+
+    async fn networked_test_state(plane: &str) -> Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate()?)
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(isolated_loopback_config(plane))
+                .build()
+                .await?,
+        );
+        let state = secure_endpoint_test_state_at(data_dir, agent).await?;
+        Ok((state, dir))
+    }
+
+    async fn insert_local_public_group(state: &AppState, mls_id: &str) -> String {
+        let info = x0x::groups::GroupInfo::with_policy(
+            "fanout".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            mls_id.to_string(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        let id = info.mls_group_id.clone();
+        state.named_groups.write().await.insert(id.clone(), info);
+        id
+    }
+
+    /// Why (#296): first-node / solo publish is expected to have fan_out 0
+    /// and must not warn. HTTP 200 + msg_id stay intact.
+    #[tokio::test]
+    async fn solo_send_is_200_with_zero_fanout_and_no_warn() -> Result<()> {
+        let plane = format!("fanout-solo-{}", rand::random::<u32>());
+        let (state, _dir) = networked_test_state(&plane).await?;
+        let group_id = insert_local_public_group(state.as_ref(), &"aa".repeat(16)).await;
+        let before = state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+
+        let (status, body) = post_group_send(Arc::clone(&state), &group_id, "hello solo").await?;
+        assert_eq!(status, StatusCode::OK, "solo send must stay 200: {body}");
+        assert!(body.get("msg_id").and_then(|v| v.as_str()).is_some());
+        assert_eq!(
+            body["fan_out"].as_u64(),
+            Some(0),
+            "solo fan_out must be 0: {body}"
+        );
+        let after = state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+        assert_eq!(
+            after,
+            before + 1,
+            "zero fan_out still increments the counter"
+        );
+        assert!(
+            state.agent.peers().await.unwrap_or_default().is_empty(),
+            "solo send must see peer_count == 0 so the warn is skipped"
+        );
+        state.agent.shutdown().await;
+        Ok(())
+    }
+
+    async fn wait_connected(alice: &Agent, bob: &Agent) -> Result<()> {
+        let bob_network = bob.network().context("bob network")?;
+        let bob_addr = bound_loopback(bob_network.bound_addr().await.context("bob bound")?);
+        let alice_network = alice.network().context("alice network")?;
+        alice_network
+            .connect_addr(bob_addr)
+            .await
+            .context("alice connects to bob")?;
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(8);
+        while tokio::time::Instant::now() < deadline {
+            let alice_ready = alice_network.is_connected(&bob_peer).await
+                && !alice.peers().await.unwrap_or_default().is_empty();
+            if alice_ready {
+                return Ok(());
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        anyhow::bail!("alice did not mark bob connected with a gossip peer")
+    }
+
+    /// Why (#296): empty eager set with live peers is the black-hole —
+    /// 200 + msg_id + fan_out 0, counter +1, warn (peers exist).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn cooled_eager_set_send_is_200_with_zero_fanout_and_warns() -> Result<()> {
+        let plane = format!("fanout-cooled-{}", rand::random::<u32>());
+        let (alice_state, _alice_dir) = networked_test_state(&plane).await?;
+        let (bob_state, _bob_dir) = networked_test_state(&plane).await?;
+        wait_connected(&alice_state.agent, &bob_state.agent).await?;
+        let peer_count = alice_state.agent.peers().await?.len();
+        assert!(
+            peer_count >= 1,
+            "test requires a live peer, got {peer_count}"
+        );
+
+        let group_id = insert_local_public_group(alice_state.as_ref(), &"bb".repeat(16)).await;
+        alice_state.agent.set_publish_fanout_override(Some(0));
+        let before = alice_state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+
+        let (status, body) =
+            post_group_send(Arc::clone(&alice_state), &group_id, "black hole").await?;
+        assert_eq!(status, StatusCode::OK, "cooled send must stay 200: {body}");
+        assert!(body.get("msg_id").and_then(|v| v.as_str()).is_some());
+        assert_eq!(
+            body["fan_out"].as_u64(),
+            Some(0),
+            "cooled fan_out must be 0: {body}"
+        );
+        let after = alice_state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+        assert_eq!(after, before + 1);
+        alice_state.agent.set_publish_fanout_override(None);
+        alice_state.agent.shutdown().await;
+        bob_state.agent.shutdown().await;
+        Ok(())
+    }
+
+    /// Why (#296): a healthy two-node mesh reports fan_out >= 1, leaves the
+    /// zero-fanout counter unchanged, and Bob receives the payload.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn healthy_two_node_send_fans_out_and_bob_receives() -> Result<()> {
+        let plane = format!("fanout-healthy-{}", rand::random::<u32>());
+        let (alice_state, _alice_dir) = networked_test_state(&plane).await?;
+        let (bob_state, _bob_dir) = networked_test_state(&plane).await?;
+        wait_connected(&alice_state.agent, &bob_state.agent).await?;
+
+        let group_id = insert_local_public_group(alice_state.as_ref(), &"cc".repeat(16)).await;
+        let topic = x0x::groups::public_topic_for(&group_id);
+        let mut bob_sub = bob_state.agent.subscribe(&topic).await?;
+        // Give PlumTree a tick to put Alice in Bob's eager set and vice versa.
+        tokio::time::sleep(Duration::from_millis(750)).await;
+
+        let before = alice_state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+        let marker = format!("healthy-{}", rand::random::<u32>());
+        let (status, body) = post_group_send(Arc::clone(&alice_state), &group_id, &marker).await?;
+        assert_eq!(status, StatusCode::OK, "healthy send must stay 200: {body}");
+        assert!(
+            body.get("fan_out").is_some(),
+            "fan_out must be present: {body}"
+        );
+        let fan_out = body["fan_out"].as_u64().unwrap_or(0);
+        assert!(fan_out >= 1, "healthy mesh must fan out to Bob: {body}");
+        let after = alice_state
+            .agent
+            .gossip_stats()
+            .map(|s| s.publish_zero_fanout)
+            .unwrap_or(0);
+        assert_eq!(
+            after, before,
+            "healthy fan_out must not increment zero-fanout"
+        );
+
+        let received = tokio::time::timeout(Duration::from_secs(8), async {
+            loop {
+                let Some(msg) = bob_sub.recv().await else {
+                    anyhow::bail!("bob subscription closed");
+                };
+                if let Ok(parsed) =
+                    serde_json::from_slice::<x0x::groups::GroupPublicMessage>(&msg.payload)
+                {
+                    if parsed.body == marker {
+                        return Ok(());
+                    }
+                }
+            }
+        })
+        .await
+        .context("bob did not receive the public message")??;
+        let _ = received;
+
+        alice_state.agent.shutdown().await;
+        bob_state.agent.shutdown().await;
+        Ok(())
     }
 
     /// Issue #205: minting a `private_secure` invite must strip per-member

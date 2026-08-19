@@ -581,6 +581,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                 Json(serde_json::json!({
                 "ok": true,
                 "stats": snap,
+                "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
