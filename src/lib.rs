@@ -7292,7 +7292,15 @@ impl Agent {
                             let addresses = auto_connect_addresses.clone();
                             tokio::spawn(async move {
                                 for addr in &addresses {
-                                    match net.connect_addr(*addr).await {
+                                    // #292: the spawned dial still passes
+                                    // through the dial gate — the cheap
+                                    // `announcement_should_auto_connect`
+                                    // check above can race a tombstone that
+                                    // lands after it.
+                                    match net
+                                        .connect_addr_with_origin(*addr, "announcement")
+                                        .await
+                                    {
                                         Ok(_) => {
                                             tracing::info!(
                                                 "Auto-connected to discovered agent at {addr}",
@@ -16162,6 +16170,462 @@ mod tests {
         assert!(
             alice_network.is_reconnect_suppressed(bob_id),
             "rejecting the inbound redial must not clear the tombstone"
+        );
+    }
+
+    /// Issue #292 (invariants C+F): after a PolicyRejection, every outbound
+    /// dial seam must refuse with no side effects — no `PeerConnected`, no
+    /// bootstrap-cache success, and no tombstone refresh (`set_at` stays
+    /// write-once). The id seams (`connect_peer`, `connect_peer_with_addrs`,
+    /// `connect_cached_peer`) refuse pre-socket; the address-only seam
+    /// (`connect_addr`) refuses post-handshake, which is also the
+    /// deterministic proof that a tombstone live at handshake-completion
+    /// time never admits — the same code path that guards a tombstone
+    /// landing mid-handshake. A gossip send toward the suppressed peer is
+    /// held (invariant B), never placed on the wire.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn suppressed_peer_outbound_dial_is_refused() {
+        use saorsa_gossip_transport::{GossipStreamType, GossipTransport as _};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob");
+        assert_eq!(connected.0, bob_id);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before rejection"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+        assert!(alice_network.is_reconnect_suppressed(bob_id));
+
+        // Baselines for the no-side-effect assertions.
+        let mut events = alice_network.subscribe();
+        let cache = alice_network.bootstrap_cache().expect("bootstrap cache");
+        // The original session's inbound accept can record_success after
+        // the PolicyRejection close (accept() already yielded). Wait until
+        // that bookkeeping is idle so it is not blamed on the refused seams.
+        let stabilize_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
+        let mut successes_before = cache
+            .get_peer(&bob_peer)
+            .await
+            .expect("bob cached from initial connect")
+            .stats
+            .success_count;
+        let mut last_change = tokio::time::Instant::now();
+        while tokio::time::Instant::now() < stabilize_deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            let now_count = cache
+                .get_peer(&bob_peer)
+                .await
+                .expect("bob cached")
+                .stats
+                .success_count;
+            if now_count != successes_before {
+                successes_before = now_count;
+                last_change = tokio::time::Instant::now();
+            } else if last_change.elapsed() >= std::time::Duration::from_millis(150) {
+                break;
+            }
+        }
+        let set_at_before = alice_network
+            .reconnect_suppression_set_at(bob_id)
+            .expect("permanent tombstone after PolicyRejection");
+        let bob_queue_before = bob_network
+            .gossip_recv_queue_depth(GossipStreamType::PubSub)
+            .0;
+
+        // Id seams refuse pre-socket — deterministic: the gate runs before
+        // any transport work, so the refusal itself must carry the
+        // suppression reason.
+        for (seam, err) in [
+            (
+                "connect_peer",
+                alice_network
+                    .connect_peer(bob_peer)
+                    .await
+                    .expect_err("connect_peer must refuse a suppressed peer"),
+            ),
+            (
+                "connect_peer_with_addrs",
+                alice_network
+                    .connect_peer_with_addrs(bob_peer, vec![bob_addr])
+                    .await
+                    .expect_err("connect_peer_with_addrs must refuse a suppressed peer"),
+            ),
+            (
+                "connect_cached_peer",
+                alice_network
+                    .connect_cached_peer(bob_peer)
+                    .await
+                    .expect_err("connect_cached_peer must refuse a suppressed peer"),
+            ),
+            (
+                "connect_addr",
+                alice_network
+                    .connect_addr(bob_addr)
+                    .await
+                    .expect_err("connect_addr must refuse a suppressed answered id"),
+            ),
+        ] {
+            assert!(
+                err.to_string().contains("reconnect-suppressed"),
+                "{seam}: refusal must come from the dial gate, got: {err}"
+            );
+        }
+
+        // No seam produced a PeerConnected for bob.
+        while let Ok(event) = events.try_recv() {
+            if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                assert_ne!(
+                    peer_id, bob_id,
+                    "refused dials must not surface a PeerConnected event"
+                );
+            }
+        }
+
+        // Admission stays Suppressed (invariant A), the tombstone was not
+        // refreshed (invariant F), and no cache success was recorded
+        // (invariant C).
+        assert_eq!(
+            alice_network.peer_admission(&bob_peer).await,
+            network::PeerAdmission::Suppressed,
+            "suppressed peer must never read Admitted"
+        );
+        assert_eq!(
+            alice_network
+                .reconnect_suppression_set_at(bob_id)
+                .expect("tombstone still live"),
+            set_at_before,
+            "refused dials must not refresh the tombstone (set_at write-once)"
+        );
+        let cached_after = cache.get_peer(&bob_peer).await.expect("bob still cached");
+        assert_eq!(
+            cached_after.stats.success_count, successes_before,
+            "refused dials must not record a cache success"
+        );
+
+        // Invariant B: gossip toward the suppressed peer is held — reported
+        // success like the plane-pending hold, but nothing reaches the wire,
+        // so bob's receive queue must not grow.
+        alice_network
+            .send_to_peer(
+                saorsa_gossip_types::PeerId::new(bob_id),
+                GossipStreamType::PubSub,
+                bytes::Bytes::from_static(b"#292 suppressed-send probe"),
+            )
+            .await
+            .expect("send toward a suppressed peer is held, not failed");
+        assert_eq!(
+            bob_network
+                .gossip_recv_queue_depth(GossipStreamType::PubSub)
+                .0,
+            bob_queue_before,
+            "held gossip must not be delivered to the suppressed peer"
+        );
+    }
+
+    /// Issue #292 (invariants B+D): an inbound redial of a suppressed peer
+    /// never admits. Across the accept-then-close window: zero
+    /// `PeerConnected`, `peer_admission == Suppressed` throughout, and a
+    /// gossip frame pushed on the transient connection is not delivered —
+    /// the receiver drops frames from suppressed peers. Deterministic
+    /// companion to `suppressed_peer_inbound_redial_is_rejected` (#228),
+    /// adding the admission-predicate and frame-delivery teeth.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn inbound_redial_of_suppressed_peer_emits_no_peer_connected() {
+        use saorsa_gossip_transport::{GossipStreamType, GossipTransport as _};
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let bob_id = bob.machine_id().0;
+
+        let connected = alice_network
+            .connect_addr(bob_addr)
+            .await
+            .expect("alice connects bob");
+        assert_eq!(connected.0, bob_id);
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await,
+            "bob connected before rejection"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+        assert!(alice_network.is_reconnect_suppressed(bob_id));
+
+        let mut events = alice_network.subscribe();
+        let depth_before = alice_network
+            .gossip_recv_queue_depth(GossipStreamType::PubSub)
+            .0;
+
+        // One explicit remote redial: bob dials alice back. The handshake
+        // completes on bob's side (alice is not suppressed on bob's side —
+        // the far side sees a Transport close, the #292 asymmetry), so
+        // alice's accept loop observes the transient winner and must close
+        // it without admitting.
+        let dialed = bob_network
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob redials alice after rejection");
+
+        // Push a gossip frame on the transient connection. The send may
+        // fail outright if alice's close already landed — either way the
+        // frame must never be delivered.
+        let _ = bob_network
+            .send_to_peer(
+                saorsa_gossip_types::PeerId::new(dialed.0),
+                GossipStreamType::PubSub,
+                bytes::Bytes::from_static(b"#292 transient-window frame"),
+            )
+            .await;
+
+        // Sample across the accept-then-close window (and past it, so bob's
+        // own proactive Transport redials of alice also hit the gate).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut transport_connected_samples = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            assert_eq!(
+                alice_network.peer_admission(&bob_peer).await,
+                network::PeerAdmission::Suppressed,
+                "admission must read Suppressed throughout the accept-to-close window"
+            );
+            assert_eq!(
+                alice_network
+                    .gossip_recv_queue_depth(GossipStreamType::PubSub)
+                    .0,
+                depth_before,
+                "a frame pushed on the transient connection must not be delivered"
+            );
+            if alice_network.is_connected(&bob_peer).await {
+                transport_connected_samples += 1;
+            }
+            while let Ok(event) = events.try_recv() {
+                if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                    assert_ne!(
+                        peer_id, bob_id,
+                        "inbound redial of a suppressed peer must never surface PeerConnected"
+                    );
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        // Raw transport truth is logged, not asserted: a transient winner
+        // inside the window is expected and invisible to admission (#292).
+        eprintln!(
+            "raw is_connected observations during the accept-to-close window: \
+             {transport_connected_samples}"
+        );
+        assert!(
+            alice_network.is_reconnect_suppressed(bob_id),
+            "refusing the inbound redial must not clear the tombstone"
+        );
+    }
+
+    /// Issue #292 (invariant A): a suppressed peer never appears in
+    /// `gossip_plane_peers` — even while ant-quic transiently reports it
+    /// transport-connected (the accept-to-close redial window) — while a
+    /// healthy peer stays admitted, guarding against over-suppression.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn gossip_plane_peers_excludes_suppressed_transport_connected_peer() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let alice = Agent::builder()
+            .with_machine_key(dir.path().join("alice-machine.key"))
+            .with_agent_key_path(dir.path().join("alice-agent.key"))
+            .with_contact_store_path(dir.path().join("alice-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("alice-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("alice");
+        let alice_network = alice.network().expect("alice network");
+        let alice_addr =
+            normalize_loopback_addr(alice_network.bound_addr().await.expect("alice bound"));
+
+        let bob = Agent::builder()
+            .with_machine_key(dir.path().join("bob-machine.key"))
+            .with_agent_key_path(dir.path().join("bob-agent.key"))
+            .with_contact_store_path(dir.path().join("bob-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("bob-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("bob");
+        let bob_network = bob.network().expect("bob network");
+        let bob_addr = normalize_loopback_addr(bob_network.bound_addr().await.expect("bob bound"));
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+
+        let carol = Agent::builder()
+            .with_machine_key(dir.path().join("carol-machine.key"))
+            .with_agent_key_path(dir.path().join("carol-agent.key"))
+            .with_contact_store_path(dir.path().join("carol-contacts.json"))
+            .with_peer_cache_dir(dir.path().join("carol-peers"))
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("carol");
+        let carol_network = carol.network().expect("carol network");
+        let carol_addr =
+            normalize_loopback_addr(carol_network.bound_addr().await.expect("carol bound"));
+        let carol_peer = ant_quic::PeerId(carol.machine_id().0);
+
+        for (addr, peer, name) in [
+            (bob_addr, bob_peer, "bob"),
+            (carol_addr, carol_peer, "carol"),
+        ] {
+            let connected = alice_network
+                .connect_addr(addr)
+                .await
+                .unwrap_or_else(|e| panic!("alice connects {name}: {e}"));
+            assert_eq!(connected.0, peer.0, "{name} identity");
+        }
+        let reg = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < reg {
+            if alice_network.is_connected(&bob_peer).await
+                && alice_network.is_connected(&carol_peer).await
+            {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(
+            alice_network.is_connected(&bob_peer).await
+                && alice_network.is_connected(&carol_peer).await,
+            "bob and carol connected before rejection"
+        );
+
+        // Baseline: both peers are gossip-plane carriers.
+        let plane = alice_network.gossip_plane_peers().await;
+        assert!(plane.contains(&bob_peer), "healthy bob is a gossip carrier");
+        assert!(
+            plane.contains(&carol_peer),
+            "healthy carol is a gossip carrier"
+        );
+
+        alice_network
+            .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
+            .await
+            .expect("policy reject");
+
+        // Excluded immediately, carol untouched (over-suppression guard).
+        let plane = alice_network.gossip_plane_peers().await;
+        assert!(
+            !plane.contains(&bob_peer),
+            "suppressed bob must leave gossip_plane_peers immediately"
+        );
+        assert_eq!(
+            alice_network.peer_admission(&bob_peer).await,
+            network::PeerAdmission::Suppressed
+        );
+        assert_eq!(
+            alice_network.peer_admission(&carol_peer).await,
+            network::PeerAdmission::Admitted,
+            "carol must stay admitted — suppression is per-peer"
+        );
+
+        // Drive the transient transport-connected window: bob redials, so
+        // ant-quic briefly holds a winner alice must not expose. Sample
+        // fast enough to catch the window when it opens; the exclusion
+        // assertions hold on every sample either way.
+        let _ = bob_network
+            .connect_addr(alice_addr)
+            .await
+            .expect("bob redials alice after rejection");
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
+        let mut transport_connected_samples = 0usize;
+        while tokio::time::Instant::now() < deadline {
+            if alice_network.is_connected(&bob_peer).await {
+                transport_connected_samples += 1;
+                let plane = alice_network.gossip_plane_peers().await;
+                assert!(
+                    !plane.contains(&bob_peer),
+                    "a transport-connected suppressed peer must never enter gossip_plane_peers"
+                );
+            }
+            let plane = alice_network.gossip_plane_peers().await;
+            assert!(
+                plane.contains(&carol_peer),
+                "carol must remain a gossip carrier throughout"
+            );
+            assert_eq!(
+                alice_network.peer_admission(&bob_peer).await,
+                network::PeerAdmission::Suppressed
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        eprintln!(
+            "raw is_connected observations during the redial window: \
+             {transport_connected_samples}"
         );
     }
 
