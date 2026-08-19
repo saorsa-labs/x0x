@@ -446,7 +446,7 @@ impl PubSubManager {
     ///
     /// Increments [`PubSubStats::publish_zero_fanout`]. Skips the warn when
     /// `peer_count == 0` (solo / first-node). Otherwise rate-limits to once
-    /// per `(group_id, `[`ZERO_FANOUT_WARN_WINDOW`]`)`.
+    /// per group per 30s cooldown window.
     #[must_use]
     pub fn observe_zero_fanout(&self, group_id: &str, fan_out: u32, peer_count: usize) -> bool {
         let mut last = self
