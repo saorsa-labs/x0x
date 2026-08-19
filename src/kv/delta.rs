@@ -136,10 +136,13 @@ impl DeltaCrdt for KvStore {
 
     fn merge(&mut self, delta: &Self::Delta) -> anyhow::Result<()> {
         let peer_id = PeerId::new([0u8; 32]);
-        // Anti-entropy merges don't carry writer identity. Signed/Allowlisted
-        // stores rely on the main sync path in KvStoreSync to provide the
-        // writer identity; Encrypted is currently a reserved policy shape, not
-        // transport confidentiality for KvStore deltas.
+        // Anti-entropy merges don't carry writer identity, and every policy
+        // now rejects an anonymous apply (#341 Phase A): Signed/Allowlisted/
+        // AppendOnly rely on the KvStoreSync path to thread the verified
+        // writer, and the reserved Encrypted policy applies nothing at all.
+        // This trait impl is therefore NOT an untrusted-apply path — it
+        // deliberately applies nothing and exists only so KvStore can plug
+        // into saorsa-gossip's delta-sync infrastructure.
         self.merge_delta(delta, peer_id, None)
             .map_err(|e| anyhow::anyhow!("KvStore delta merge failed: {e}"))
     }
@@ -205,7 +208,8 @@ mod tests {
         let id = store_id(1);
 
         // Allowlisted store so both agents can write
-        let mut store = KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Allowlisted);
+        let mut store = KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Allowlisted)
+            .expect("kv store");
         store.allow_writer(writer, &owner).expect("allow");
 
         let entry = KvEntry::new(
@@ -226,11 +230,13 @@ mod tests {
     fn test_merge_delta_with_name_update() {
         let owner = agent(1);
         let id = store_id(1);
-        let mut store = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed);
+        let mut store = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
 
         // A peer renames the store on top of the shared initial state; its
         // name register causally dominates ours, so the LWW merge adopts it.
-        let mut other = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed);
+        let mut other = KvStore::new(id, "Original".to_string(), owner, AccessPolicy::Signed)
+            .expect("kv store");
         other.update_name("Updated".to_string(), peer(1));
 
         let mut delta = KvStoreDelta::new(1);
@@ -244,26 +250,20 @@ mod tests {
 
     #[test]
     fn test_delta_crdt_trait() {
+        // #341 Phase A (I3): this test used to construct Encrypted stores so
+        // the writer-less `DeltaCrdt::merge` would apply. That crutch is
+        // gone: anonymous applies are rejected for EVERY policy now, and
+        // `DeltaCrdt::merge` is not a production untrusted-apply path. The
+        // trait's delta()/version() halves stay exercised; applying goes
+        // through `merge_delta` with a real writer, which is the path
+        // KvStoreSync uses.
         let owner = agent(1);
         let id = store_id(1);
 
-        // DeltaCrdt trait uses merge(None) — use Encrypted policy to allow it
-        let mut s1 = KvStore::new(
-            id,
-            "Store".to_string(),
-            owner,
-            AccessPolicy::Encrypted {
-                group_id: vec![1, 2, 3],
-            },
-        );
-        let mut s2 = KvStore::new(
-            id,
-            "Store".to_string(),
-            owner,
-            AccessPolicy::Encrypted {
-                group_id: vec![1, 2, 3],
-            },
-        );
+        let mut s1 =
+            KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed).expect("kv store");
+        let mut s2 =
+            KvStore::new(id, "Store".to_string(), owner, AccessPolicy::Signed).expect("kv store");
 
         s2.put(
             "key".to_string(),
@@ -274,9 +274,25 @@ mod tests {
         .expect("put");
 
         let delta = DeltaCrdt::delta(&s2, 0).expect("delta");
-        DeltaCrdt::merge(&mut s1, &delta).expect("merge");
 
+        // The writer-less trait merge applies nothing — fail closed, no
+        // Encrypted escape hatch.
+        DeltaCrdt::merge(&mut s1, &delta).expect("merge");
+        assert!(
+            s1.get("key").is_none(),
+            "anonymous DeltaCrdt::merge must not apply a delta"
+        );
+        assert_eq!(
+            DeltaCrdt::version(&s1),
+            0,
+            "a rejected anonymous merge must not bump the version"
+        );
+
+        // The writer-authenticated production path applies.
+        s1.merge_delta(&delta, peer(2), Some(&owner))
+            .expect("merge as owner");
         assert!(DeltaCrdt::version(&s1) > 0);
+        assert!(s1.get("key").is_some());
     }
 
     #[test]

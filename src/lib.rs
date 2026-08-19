@@ -11786,6 +11786,25 @@ impl Agent {
         policy: kv::AccessPolicy,
         state_dir: Option<&std::path::Path>,
     ) -> error::Result<KvStoreHandle> {
+        // #341 Phase A: the reserved Encrypted policy is unconstructible.
+        // Gate BEFORE any state is reserved or a snapshot is loaded, so no
+        // live replica that would accept anonymous plaintext writes under a
+        // confidentiality-promising name can be spawned through the Agent
+        // create paths either.
+        if let kv::AccessPolicy::Encrypted { group_id } = &policy {
+            tracing::warn!(
+                target: "x0x::kv",
+                group_id = %hex::encode(group_id),
+                topic = %topic,
+                "refused agent create of store with reserved Encrypted policy: no secure sync path is wired (issue #341 Phase A)"
+            );
+            return Err(error::IdentityError::Unauthorized(
+                kv::KvError::EncryptedPolicyReserved {
+                    group_id: group_id.clone(),
+                }
+                .to_string(),
+            ));
+        }
         let store_id = kv::KvStoreId::for_topic_owner(topic, &self.agent_id());
         let persist_path = state_dir.map(|d| kv_snapshot_path(d, &store_id));
         let store = match persist_path.as_deref().map(kv::sync::load_snapshot) {
@@ -11818,10 +11837,26 @@ impl Agent {
                         "kv store {topic}: snapshot policy is terminal append_only; ignoring requested policy {policy}"
                     );
                 }
+                if let kv::AccessPolicy::Encrypted { group_id } = snap.policy() {
+                    // #341 Phase A: a snapshot written before the
+                    // reservation guard may carry the reserved Encrypted
+                    // policy. Do not open it as a live (inert-but-publishing)
+                    // replica — fail closed, loudly, same as the constructor.
+                    tracing::warn!(
+                        target: "x0x::kv",
+                        group_id = %hex::encode(group_id),
+                        topic = %topic,
+                        "refused to open kv snapshot with reserved Encrypted policy: no secure sync path is wired (issue #341 Phase A)"
+                    );
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} carries the reserved encrypted policy; no secure sync path is wired yet (issue #341 Phase A) — remove the snapshot or wait for encrypted store support"
+                    )));
+                }
                 snap
             }
             Some(Ok(None)) | None => {
                 kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy)
+                    .map_err(|e| error::IdentityError::Unauthorized(e.to_string()))?
             }
             Some(Err(e)) => {
                 // Corrupt snapshot: fail closed, loudly. Starting an empty
@@ -14009,6 +14044,54 @@ mod tests {
         agent.shutdown().await;
         assert!(agent.heartbeat_handle.lock().await.is_none());
         assert!(dropped.load(std::sync::atomic::Ordering::Acquire));
+    }
+
+    /// #341 Phase A (I0): the Agent create paths must refuse the reserved
+    /// Encrypted policy exactly like `KvStore::new` does — a handle created
+    /// with it would gossip plaintext deltas under a confidentiality-
+    /// promising name. The reject must happen BEFORE any snapshot state is
+    /// consulted, so both the plain and persistent create paths fail the
+    /// same way.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn agent_create_kv_store_with_encrypted_policy_is_reserved() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let agent = Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_peer_cache_disabled()
+            .with_network_config(loopback_network_config())
+            .build()
+            .await
+            .expect("agent");
+
+        let policy = kv::AccessPolicy::Encrypted {
+            group_id: vec![4, 1],
+        };
+        let err = agent
+            .create_kv_store_with_policy("reserved", "reserved-topic", policy.clone())
+            .await
+            .expect_err("agent create must refuse the reserved Encrypted policy");
+        assert!(
+            format!("{err}").contains("encrypted policy is reserved"),
+            "error must name the reserved policy, got: {err}"
+        );
+
+        let err = agent
+            .create_kv_store_persistent(
+                "reserved",
+                "reserved-topic",
+                policy,
+                &dir.path().join("kv-stores"),
+            )
+            .await
+            .expect_err("persistent agent create must refuse it too");
+        assert!(
+            format!("{err}").contains("encrypted policy is reserved"),
+            "error must name the reserved policy, got: {err}"
+        );
+
+        agent.shutdown().await;
     }
 
     /// Issue #126 / WS1.5: the delta-merge + state-request subscription loops

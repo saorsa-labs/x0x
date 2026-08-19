@@ -6,6 +6,25 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **The reserved `Encrypted` KV-store policy now fails closed instead of
+  accepting every writer (issue #341, Phase A).** `AccessPolicy::Encrypted`
+  promised group confidentiality while the sync path gossips plaintext
+  deltas and the store layer authorized everyone — including anonymous
+  unsigned deltas. Phase A makes the name stop lying: `KvStore::new` and
+  the Agent/handle create paths return the new
+  `KvError::EncryptedPolicyReserved { group_id }` (WARN-logged at target
+  `x0x::kv`) instead of constructing a live replica; a replica that
+  reaches the policy anyway (e.g. a snapshot from an older binary)
+  authorizes nobody, refuses local writes with the same error, and merges
+  nothing — anonymous or attributed. The variant itself is untouched:
+  discriminant 2 is pinned, `Display` stays `"encrypted"`, and REST
+  `POST /stores` / manifest rehydration keep rejecting the string. In-tree
+  tests that used `Encrypted` as an anonymous-merge crutch
+  (`DeltaCrdt::merge(None)` and friends) now use real writers. **Phase A
+  only — no encryption yet**: `SecureContext`, the sealed wire format, and
+  `POST /groups/:id/stores` remain Phase B; do not close #341 until that
+  lands.
+
 - **Public group send no longer waits out the ~24s DM retry before gossip
   carry (issue #310).** `POST /groups/:id/send` still persists locally and
   returns 200 + `msg_id`. Fan-out is now a race: gossip topic publish

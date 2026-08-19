@@ -251,6 +251,21 @@ pub(in crate::server) async fn list_kv_stores(
     Json(serde_json::json!({ "ok": true, "stores": entries }))
 }
 
+/// Resolve a POST /stores policy string to an [`AccessPolicy`].
+///
+/// `None` (absent) and `"signed"` → Signed; `"append_only"` → AppendOnly.
+/// Anything else — including the reserved `"encrypted"` — returns `None` so
+/// the caller can 400: the flat `/stores` route must fail closed on policies
+/// it cannot create (encrypted group stores arrive with the Phase B
+/// `POST /groups/:id/stores` route, not here).
+fn parse_create_policy(policy: Option<&str>) -> Option<x0x::kv::AccessPolicy> {
+    match policy {
+        None | Some("signed") => Some(x0x::kv::AccessPolicy::Signed),
+        Some("append_only") => Some(x0x::kv::AccessPolicy::AppendOnly),
+        _ => None,
+    }
+}
+
 /// POST /stores
 pub(in crate::server) async fn create_kv_store(
     State(state): State<Arc<AppState>>,
@@ -258,14 +273,11 @@ pub(in crate::server) async fn create_kv_store(
 ) -> impl IntoResponse {
     let id = req.topic.clone();
     // Resolve the requested access policy before any state is reserved.
-    let policy = match req.policy.as_deref() {
-        None | Some("signed") => x0x::kv::AccessPolicy::Signed,
-        Some("append_only") => x0x::kv::AccessPolicy::AppendOnly,
-        Some(other) => {
-            return bad_request(format!(
-                "unsupported policy {other:?}: expected \"signed\" or \"append_only\""
-            ))
-        }
+    let Some(policy) = parse_create_policy(req.policy.as_deref()) else {
+        return bad_request(format!(
+            "unsupported policy {:?}: expected \"signed\" or \"append_only\"",
+            req.policy
+        ));
     };
     // Reserve the entire handle+manifest transaction for this (kind,id) so
     // a concurrent create/rehydrate for the same id cannot interleave handle
@@ -592,6 +604,35 @@ pub(in crate::server) async fn delete_kv_value(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn create_policy_parsing_rejects_encrypted_and_garbage() {
+        // WHY (#341 Phase A): the flat /stores route must keep failing
+        // closed on the reserved "encrypted" policy string — an "encrypted"
+        // store here would gossip plaintext deltas under a confidentiality-
+        // promising name. It stays rejected until Phase B wires the
+        // group-scoped POST /groups/:id/stores route.
+        assert!(matches!(
+            parse_create_policy(None),
+            Some(x0x::kv::AccessPolicy::Signed)
+        ));
+        assert!(matches!(
+            parse_create_policy(Some("signed")),
+            Some(x0x::kv::AccessPolicy::Signed)
+        ));
+        assert!(matches!(
+            parse_create_policy(Some("append_only")),
+            Some(x0x::kv::AccessPolicy::AppendOnly)
+        ));
+        assert!(
+            parse_create_policy(Some("encrypted")).is_none(),
+            "reserved \"encrypted\" policy must not be creatable via flat /stores"
+        );
+        assert!(
+            parse_create_policy(Some("allowlisted")).is_none(),
+            "garbage must fail closed, not silently become Signed"
+        );
+    }
 
     #[test]
     fn kv_store_delta_direct_payload_is_prefixed_json() {

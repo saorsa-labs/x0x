@@ -88,6 +88,24 @@ pub enum KvError {
     /// an idempotent no-op and never raises this error.)
     #[error("immutable key: {0} — append-only store; existing keys cannot be updated or deleted")]
     ImmutableKey(String),
+
+    /// Construction or write attempted on the reserved `Encrypted` policy
+    /// (issue #341, Phase A).
+    ///
+    /// `AccessPolicy::Encrypted` is a reserved discriminant: the KvStore sync
+    /// path still publishes plaintext deltas and does not enforce group
+    /// membership, so no live `Encrypted` replica may be constructed and any
+    /// replica that reaches the policy (e.g. deserialized from an older
+    /// snapshot) refuses every write and merge. Fail closed until the secure
+    /// sync path (Phase B) makes the policy constructible again.
+    #[error(
+        "encrypted policy is reserved (no secure sync path yet): group_id {}",
+        hex::encode(group_id)
+    )]
+    EncryptedPolicyReserved {
+        /// The MLS group id the policy wanted to bind.
+        group_id: Vec<u8>,
+    },
 }
 
 #[cfg(test)]
@@ -131,6 +149,19 @@ mod tests {
         assert!(display.contains("immutable key"));
         assert!(display.contains("evt-0001"));
         assert!(display.contains("append-only"));
+    }
+
+    #[test]
+    fn test_error_display_encrypted_policy_reserved() {
+        // WHY: the reserved-policy rejection is the Phase A guard for #341 —
+        // callers (and logs) must be able to tell it apart from a plain
+        // Unauthorized, and the group id must be visible in the message.
+        let error = KvError::EncryptedPolicyReserved {
+            group_id: vec![0xde, 0xad],
+        };
+        let display = format!("{error}");
+        assert!(display.contains("encrypted policy is reserved"));
+        assert!(display.contains("dead"));
     }
 
     #[test]

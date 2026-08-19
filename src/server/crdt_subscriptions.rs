@@ -823,6 +823,19 @@ mod tests {
             serde_json::Value::String("immutable".into()),
         );
         assert_eq!(manifest_policy(&extra), None, "garbage fails closed");
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("encrypted".into()),
+        );
+        // WHY (#341 Phase A): "encrypted" is a real policy variant but a
+        // RESERVED one — there is no create path for it, so a manifest can
+        // never legitimately carry it. It must fail closed like garbage,
+        // never silently rehydrate as Signed.
+        assert_eq!(
+            manifest_policy(&extra),
+            None,
+            "reserved encrypted policy fails closed on rehydration"
+        );
         extra.insert("policy".into(), serde_json::Value::Bool(true));
         assert_eq!(manifest_policy(&extra), None, "non-string fails closed");
     }
