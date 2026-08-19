@@ -177,6 +177,37 @@ fn warn_section_misplacements_emits_one_warn_per_finding() {
     );
 }
 
+/// Fleet case (issue #281): `data_dir` nested under `[gossip]` is the
+/// production misplacement that made two daemons on one box collide on the
+/// derived default `history.db`. `[gossip]` has no `data_dir` field, so
+/// serde drops it silently. The diagnostic must flag exactly that one
+/// finding — not reject, and not require a real `[gossip].data_dir`.
+fn data_dir_under_gossip() -> String {
+    r#"
+[gossip]
+data_dir = "/var/lib/x0x-443"
+"#
+    .to_string()
+}
+
+/// Prove the fleet case, not just the `[history]` fixture: a TOML with
+/// only `data_dir` under `[gossip]` yields exactly one
+/// `SectionMisplacement { key: data_dir, found_under: gossip }`.
+#[test]
+fn diagnose_section_placement_finds_data_dir_under_gossip() {
+    let parsed: toml::Table = toml::from_str(&data_dir_under_gossip()).expect("fixture parses");
+    let findings = diagnose_section_placement(&parsed);
+    assert_eq!(
+        findings,
+        vec![SectionMisplacement {
+            key: "data_dir".to_string(),
+            found_under: "gossip".to_string(),
+            expected_section: "top level".to_string(),
+        }],
+        "fleet case: data_dir under [gossip] is exactly one finding"
+    );
+}
+
 /// Clean fixture — a TOML with the correct section placement for every
 /// key (no root-owned keys under any sub-section) produces an empty
 /// findings vec, and `warn_section_misplacements` on that vec emits
