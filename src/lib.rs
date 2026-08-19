@@ -11739,7 +11739,10 @@ impl Agent {
     ///
     /// # Errors
     ///
-    /// Returns an error if the gossip runtime is not initialized.
+    /// - Returns an error if the gossip runtime is not initialized.
+    /// - [`kv::AccessPolicy::Encrypted`] is refused
+    ///   ([`kv::KvError::EncryptedPolicyReserved`] at the store layer):
+    ///   secure sync is not wired, so the policy stays reserved.
     pub async fn create_kv_store_with_policy(
         &self,
         name: &str,
@@ -11821,7 +11824,14 @@ impl Agent {
                 snap
             }
             Some(Ok(None)) | None => {
-                kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy)
+                kv::KvStore::new(store_id, name.to_string(), self.agent_id(), policy).map_err(
+                    |e| {
+                        // Encrypted is reserved (#341): the store layer has
+                        // already logged the WARN; surface its message intact
+                        // rather than a generic create failure.
+                        kv_storage_err(format!("kv store creation failed: {e}"))
+                    },
+                )?
             }
             Some(Err(e)) => {
                 // Corrupt snapshot: fail closed, loudly. Starting an empty

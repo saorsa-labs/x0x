@@ -41,6 +41,7 @@ fn make_store(id_byte: u8, name: &str, owner_byte: u8) -> KvStore {
         test_agent(owner_byte),
         AccessPolicy::Signed,
     )
+    .expect("kv store")
 }
 
 // ---------------------------------------------------------------------------
@@ -55,7 +56,8 @@ fn test_create_kv_store() {
         "My Store".to_string(),
         owner,
         AccessPolicy::Signed,
-    );
+    )
+    .expect("kv store");
 
     assert_eq!(store.name(), "My Store");
     assert_eq!(store.owner(), Some(&owner));
@@ -92,6 +94,7 @@ fn test_create_multiple_stores() {
                 owner,
                 AccessPolicy::Signed,
             )
+            .expect("kv store")
         })
         .collect();
 
@@ -549,23 +552,13 @@ async fn test_concurrent_writes_converge() {
     let peer_a = test_peer(1);
     let peer_b = test_peer(2);
 
-    // Use Encrypted policy so both peers can write without allowlist.
-    let mut store_a = KvStore::new(
-        store_id,
-        "Shared".to_string(),
-        owner,
-        AccessPolicy::Encrypted {
-            group_id: vec![1, 2, 3],
-        },
-    );
-    let mut store_b = KvStore::new(
-        store_id,
-        "Shared".to_string(),
-        owner,
-        AccessPolicy::Encrypted {
-            group_id: vec![1, 2, 3],
-        },
-    );
+    // Signed: both replicas share the same owner, so each side's writes are
+    // owner-written. (#341 Phase A: Encrypted is reserved — it is no longer
+    // a both-peers-can-write shortcut.)
+    let mut store_a = KvStore::new(store_id, "Shared".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
+    let mut store_b = KvStore::new(store_id, "Shared".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
 
     // Agent A writes keys.
     store_a
@@ -628,24 +621,14 @@ async fn test_concurrent_writes_same_key_lww() {
     let peer_a = test_peer(1);
     let peer_b = test_peer(2);
 
-    let mut store_a = KvStore::new(
-        store_id,
-        "Shared".to_string(),
-        owner,
-        AccessPolicy::Encrypted {
-            group_id: vec![1, 2, 3],
-        },
-    );
-    let mut store_b = KvStore::new(
-        store_id,
-        "Shared".to_string(),
-        owner,
-        AccessPolicy::Encrypted {
-            group_id: vec![1, 2, 3],
-        },
-    );
+    let mut store_a = KvStore::new(store_id, "Shared".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
+    let mut store_b = KvStore::new(store_id, "Shared".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
 
-    // Both write to the same key with controlled timestamps.
+    // Both write to the same key with controlled timestamps. The deltas are
+    // applied as owner-written merges (#341 Phase A: no policy accepts a
+    // writer-less merge anymore, so the LWW exercise threads the owner).
     let mut entry_a = KvEntry::new(
         "shared".to_string(),
         b"from-A".to_vec(),
@@ -664,8 +647,12 @@ async fn test_concurrent_writes_same_key_lww() {
     entry_b.updated_at = 200;
     let delta_b = KvStoreDelta::for_put("shared".to_string(), entry_b, (peer_b, 1), 1);
 
-    store_a.merge_delta(&delta_a, peer_a, None).expect("put A");
-    store_b.merge_delta(&delta_b, peer_b, None).expect("put B");
+    store_a
+        .merge_delta(&delta_a, peer_a, Some(&owner))
+        .expect("put A");
+    store_b
+        .merge_delta(&delta_b, peer_b, Some(&owner))
+        .expect("put B");
 
     // Merge both ways.
     store_a.merge(&store_b).expect("merge B->A");
@@ -687,10 +674,9 @@ async fn test_concurrent_writes_via_arc_rwlock() {
         store_id,
         "Concurrent".to_string(),
         owner,
-        AccessPolicy::Encrypted {
-            group_id: vec![7, 8, 9],
-        },
-    );
+        AccessPolicy::Signed,
+    )
+    .expect("kv store");
     let store_arc = Arc::new(RwLock::new(store));
 
     // Spawn multiple writers.
@@ -733,7 +719,8 @@ fn test_delta_roundtrip_put() {
     let owner = test_agent(1);
     let store_id = test_store_id(1);
 
-    let mut source = KvStore::new(store_id, "Source".to_string(), owner, AccessPolicy::Signed);
+    let mut source = KvStore::new(store_id, "Source".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
 
     source
         .put(
@@ -757,7 +744,8 @@ fn test_delta_roundtrip_put() {
     assert!(!delta.is_empty());
 
     // Apply delta to a fresh target store.
-    let mut target = KvStore::new(store_id, "Target".to_string(), owner, AccessPolicy::Signed);
+    let mut target = KvStore::new(store_id, "Target".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
 
     target
         .merge_delta(&delta, peer, Some(&owner))
@@ -770,6 +758,11 @@ fn test_delta_roundtrip_put() {
 
 #[test]
 fn test_delta_crdt_trait_integration() {
+    // #341 Phase A (I3): this test used to construct Encrypted stores so the
+    // writer-less DeltaCrdt::merge would apply content. No policy is an
+    // anonymous-merge escape hatch anymore: the trait merge must apply
+    // NOTHING unsigned, and real application goes through merge_delta with
+    // the verified writer (what KvStoreSync does).
     let peer = test_peer(1);
     let owner = test_agent(1);
     let store_id = test_store_id(1);
@@ -778,8 +771,9 @@ fn test_delta_crdt_trait_integration() {
         store_id,
         "DeltaCRDT".to_string(),
         owner,
-        AccessPolicy::Encrypted { group_id: vec![1] },
-    );
+        AccessPolicy::Signed,
+    )
+    .expect("kv store");
 
     assert_eq!(DeltaCrdt::version(&store), 0);
     assert!(DeltaCrdt::delta(&store, 0).is_none());
@@ -796,14 +790,17 @@ fn test_delta_crdt_trait_integration() {
     assert!(DeltaCrdt::version(&store) > 0);
     let delta = DeltaCrdt::delta(&store, 0).expect("delta should exist");
 
-    // Apply to fresh store.
-    let mut replica = KvStore::new(
-        store_id,
-        "Replica".to_string(),
-        owner,
-        AccessPolicy::Encrypted { group_id: vec![1] },
-    );
+    // Writer-less trait merge: Ok, but applies no content.
+    let mut replica = KvStore::new(store_id, "Replica".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
     DeltaCrdt::merge(&mut replica, &delta).expect("merge");
+    assert!(replica.get("x").is_none(), "unsigned merge applies nothing");
+    assert_eq!(DeltaCrdt::version(&replica), 0, "no state change");
+
+    // The same delta applies once the writer is supplied.
+    replica
+        .merge_delta(&delta, peer, Some(&owner))
+        .expect("owner merge");
     assert!(replica.get("x").is_some());
 }
 
@@ -899,7 +896,8 @@ fn test_signed_policy_rejects_non_owner_delta() {
     let peer = test_peer(99);
     let store_id = test_store_id(1);
 
-    let mut store = KvStore::new(store_id, "Signed".to_string(), owner, AccessPolicy::Signed);
+    let mut store = KvStore::new(store_id, "Signed".to_string(), owner, AccessPolicy::Signed)
+        .expect("kv store");
 
     let entry = KvEntry::new(
         "spam".to_string(),
@@ -930,7 +928,8 @@ fn test_allowlisted_policy_workflow() {
         "Team".to_string(),
         owner,
         AccessPolicy::Allowlisted,
-    );
+    )
+    .expect("kv store");
 
     // Initially only the owner is authorized.
     assert!(store.is_authorized(&owner));
@@ -972,10 +971,12 @@ fn test_merge_propagates_allowlist() {
     let writer = test_agent(2);
     let store_id = test_store_id(1);
 
-    let mut store_a = KvStore::new(store_id, "A".to_string(), owner, AccessPolicy::Allowlisted);
+    let mut store_a = KvStore::new(store_id, "A".to_string(), owner, AccessPolicy::Allowlisted)
+        .expect("kv store");
     store_a.allow_writer(writer, &owner).expect("allow");
 
-    let mut store_b = KvStore::new(store_id, "B".to_string(), owner, AccessPolicy::Allowlisted);
+    let mut store_b = KvStore::new(store_id, "B".to_string(), owner, AccessPolicy::Allowlisted)
+        .expect("kv store");
 
     // Merge A into B — allowlist should propagate.
     store_b.merge(&store_a).expect("merge");
@@ -993,7 +994,8 @@ fn test_full_delta_includes_allowlist() {
         "Delta".to_string(),
         owner,
         AccessPolicy::Allowlisted,
-    );
+    )
+    .expect("kv store");
     store.allow_writer(writer, &owner).expect("allow");
 
     let delta = store.full_delta();

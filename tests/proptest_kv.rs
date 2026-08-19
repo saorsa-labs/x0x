@@ -42,6 +42,7 @@ fn make_store(owner: AgentId, policy: AccessPolicy) -> KvStore {
         owner,
         policy,
     )
+    .expect("kv store")
 }
 
 proptest! {
