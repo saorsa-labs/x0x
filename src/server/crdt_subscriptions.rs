@@ -530,7 +530,8 @@ pub(super) async fn handle_reservation(state: &AppState, kind: &str, id: &str) -
 /// exactly 32 bytes — the caller treats that as migration-required.
 /// Resolve the persisted access policy from a manifest entry's `extra` map.
 ///
-/// - `"append_only"` → `AppendOnly`; `"signed"` → `Signed`.
+/// - `"append_only"` → `AppendOnly`; `"signed"` → `Signed`;
+///   `"self_keyed"` → `SelfKeyed`.
 /// - Absent key → `Signed` (legacy entries predate the policy field and were
 ///   all created Signed — this is a documented compatibility default, not a
 ///   downgrade).
@@ -547,6 +548,9 @@ fn manifest_policy(
         }
         Some(serde_json::Value::String(s)) if s == "append_only" => {
             Some(crate::kv::AccessPolicy::AppendOnly)
+        }
+        Some(serde_json::Value::String(s)) if s == "self_keyed" => {
+            Some(crate::kv::AccessPolicy::SelfKeyed)
         }
         Some(_) => None,
     }
@@ -683,43 +687,58 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             }
             let result = match entry.role.as_str() {
                 ROLE_JOINED => {
-                    // The owner anchor is REQUIRED: a join without it is a
-                    // dead replica, not a successful rehydration. A legacy
-                    // entry with no stored anchor, or a malformed one, is
-                    // migration-required — skip it loudly rather than
-                    // creating a read-only handle that can never accept
-                    // Signed state.
-                    let owner = match entry.extra.get("expected_owner").and_then(|v| v.as_str()) {
-                        Some(hex_str) => match parse_owner_hex(hex_str) {
-                            Some(id) => id,
+                    // The `self_keyed` directory policy is the one owner-free
+                    // join: knowing only the topic is enough (I4), so no
+                    // stored anchor is required — the persisted policy field
+                    // routes here.
+                    if manifest_policy(&entry.extra) == Some(crate::kv::AccessPolicy::SelfKeyed) {
+                        state
+                            .agent
+                            .join_self_keyed_kv_store_persistent(
+                                &entry.topic,
+                                &state.kv_store_state_dir,
+                            )
+                            .await
+                    } else {
+                        // The owner anchor is REQUIRED: a join without it is
+                        // a dead replica, not a successful rehydration. A
+                        // legacy entry with no stored anchor, or a malformed
+                        // one, is migration-required — skip it loudly rather
+                        // than creating a read-only handle that can never
+                        // accept Signed state.
+                        let owner = match entry.extra.get("expected_owner").and_then(|v| v.as_str())
+                        {
+                            Some(hex_str) => match parse_owner_hex(hex_str) {
+                                Some(id) => id,
+                                None => {
+                                    tracing::warn!(
+                                        id = %entry.id,
+                                        "stored expected_owner is malformed; \
+                                         skipping rehydration (migration_required)"
+                                    );
+                                    return RehydrateOutcome::Skipped;
+                                }
+                            },
                             None => {
                                 tracing::warn!(
                                     id = %entry.id,
-                                    "stored expected_owner is malformed; \
-                                     skipping rehydration (migration_required)"
+                                    "no stored expected_owner for joined store; \
+                                     skipping rehydration (migration_required). \
+                                     Re-join with an owner anchor to recover."
                                 );
                                 return RehydrateOutcome::Skipped;
                             }
-                        },
-                        None => {
-                            tracing::warn!(
-                                id = %entry.id,
-                                "no stored expected_owner for joined store; \
-                                 skipping rehydration (migration_required). \
-                                 Re-join with an owner anchor to recover."
-                            );
-                            return RehydrateOutcome::Skipped;
-                        }
-                    };
-                    state
-                        .agent
-                        .join_kv_store_persistent(
-                            &entry.topic,
-                            owner,
-                            crate::kv::store::AnchorChannel::Persistence,
-                            &state.kv_store_state_dir,
-                        )
-                        .await
+                        };
+                        state
+                            .agent
+                            .join_kv_store_persistent(
+                                &entry.topic,
+                                owner,
+                                crate::kv::store::AnchorChannel::Persistence,
+                                &state.kv_store_state_dir,
+                            )
+                            .await
+                    }
                 }
                 ROLE_CREATED => {
                     // Restore the persisted policy: an append-only store must
@@ -817,6 +836,15 @@ mod tests {
         assert_eq!(
             manifest_policy(&extra),
             Some(crate::kv::AccessPolicy::AppendOnly)
+        );
+        extra.insert(
+            "policy".into(),
+            serde_json::Value::String("self_keyed".into()),
+        );
+        assert_eq!(
+            manifest_policy(&extra),
+            Some(crate::kv::AccessPolicy::SelfKeyed),
+            "self_keyed must parse — otherwise a joined directory replica could never rehydrate"
         );
         extra.insert(
             "policy".into(),

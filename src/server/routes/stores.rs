@@ -175,8 +175,9 @@ pub(in crate::server) async fn apply_direct_kv_store_delta(
 /// Request body for POST /stores.
 ///
 /// `policy` selects the access policy: `"signed"` (default — owner-only
-/// writes) or `"append_only"` (owner-only writes AND existing keys are
-/// immutable, even to the owner).
+/// writes), `"append_only"` (owner-only writes AND existing keys are
+/// immutable, even to the owner), or `"self_keyed"` (owner-free open
+/// directory: any joiner writes only keys prefixed by its own AgentId).
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateStoreRequest {
     name: String,
@@ -195,10 +196,16 @@ pub(in crate::server) struct PutValueRequest {
 ///
 /// `expected_owner` is the optional hex-encoded AgentId of the authoritative
 /// owner, supplied out-of-band (the local user/operator is the trust root).
-/// Omitting it yields a permanently read-only replica (no permissive fallback).
+/// Omitting it yields a permanently read-only replica (no permissive
+/// fallback) — EXCEPT under `policy: "self_keyed"`, the owner-free directory
+/// policy, which requires joining WITHOUT an owner.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::server) struct JoinStoreRequest {
     expected_owner: Option<String>,
+    /// Optional policy discriminator for the join. `"self_keyed"` selects
+    /// the owner-free directory join (no `expected_owner` allowed); any
+    /// other value is ignored in favor of the owner-anchored path.
+    policy: Option<String>,
 }
 
 /// Response entry for GET /stores.
@@ -261,10 +268,11 @@ pub(in crate::server) async fn create_kv_store(
     let policy = match req.policy.as_deref() {
         None | Some("signed") => x0x::kv::AccessPolicy::Signed,
         Some("append_only") => x0x::kv::AccessPolicy::AppendOnly,
+        Some("self_keyed") => x0x::kv::AccessPolicy::SelfKeyed,
         Some(other) => {
             return bad_request(format!(
-                "unsupported policy {other:?}: expected \"signed\" or \"append_only\""
-            ))
+            "unsupported policy {other:?}: expected \"signed\", \"append_only\", or \"self_keyed\""
+        ))
         }
     };
     // Reserve the entire handle+manifest transaction for this (kind,id) so
@@ -281,6 +289,9 @@ pub(in crate::server) async fn create_kv_store(
         return api_error(StatusCode::CONFLICT, "store already exists");
     }
     let policy_str = policy.to_string();
+    // A self_keyed directory is owner-free for life: no expected_owner is
+    // recorded for it (I3/I4) — rehydrate derives everything from the topic.
+    let is_self_keyed = matches!(policy, x0x::kv::AccessPolicy::SelfKeyed);
     match state
         .agent
         .create_kv_store_persistent(&req.name, &req.topic, policy, &state.kv_store_state_dir)
@@ -292,12 +303,14 @@ pub(in crate::server) async fn create_kv_store(
             // Persist the registration so it survives a daemon restart
             // (rehydrated after join_network — see crdt_subscriptions).
             // Record the owner so a restarted creator re-anchors on itself.
-            let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
             let mut extra = serde_json::Map::new();
-            extra.insert(
-                "expected_owner".to_string(),
-                serde_json::Value::String(owner_hex),
-            );
+            if !is_self_keyed {
+                let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
+                extra.insert(
+                    "expected_owner".to_string(),
+                    serde_json::Value::String(owner_hex),
+                );
+            }
             // Persist the policy so a restarted creator rehydrates with the
             // same policy (an append-only store must never come back Signed).
             extra.insert("policy".to_string(), serde_json::Value::String(policy_str));
@@ -345,11 +358,25 @@ pub(in crate::server) async fn join_kv_store(
     Path(id): Path<String>,
     body: Option<Json<JoinStoreRequest>>,
 ) -> impl IntoResponse {
-    // The out-of-band owner anchor is REQUIRED: a replica with no anchor can
-    // never accept policy-restricted data, so an unanchored join is a dead
-    // replica, not a successful join. The local user/operator is the trust
-    // root for this param.
-    let owner: AgentId = match body.and_then(|Json(r)| r.expected_owner) {
+    let body = body.map(|Json(r)| r).unwrap_or_default();
+    // The `self_keyed` directory policy is the one owner-free join: knowing
+    // only the topic is enough (I4). An `expected_owner` anchor is not
+    // merely unnecessary there — it is contradictory (the store has no owner
+    // for life, I3), so supplying one is a 422 rather than a silent ignore.
+    if body.policy.as_deref() == Some("self_keyed") {
+        if body.expected_owner.is_some() {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                "owner_not_allowed: policy \"self_keyed\" stores have no owner — join without expected_owner",
+            );
+        }
+        return join_self_keyed_store(state, id).await;
+    }
+    // The out-of-band owner anchor is REQUIRED for every owner-anchored
+    // policy: a replica with no anchor can never accept policy-restricted
+    // data, so an unanchored join is a dead replica, not a successful join.
+    // The local user/operator is the trust root for this param.
+    let owner: AgentId = match body.expected_owner {
         Some(hex_owner) => match parse_agent_id_hex(&hex_owner) {
             Ok(agent) => agent,
             Err(e) => return bad_request(format!("invalid expected_owner: {e}")),
@@ -414,6 +441,70 @@ pub(in crate::server) async fn join_kv_store(
                 // its sync — the discarded handle's bootstrap requester is
                 // infinite while unconverged (issue #238) and would otherwise
                 // chatter until daemon shutdown.
+                tracing::error!("failed to persist kv store join {id}: {e}");
+                if let Some(h) = state.kv_stores.write().await.remove(&id) {
+                    h.cancel_sync();
+                }
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist subscription registration: {e}"),
+                );
+            }
+            let mut resp = serde_json::to_value(&info).unwrap_or_else(|_| serde_json::json!({}));
+            if let Some(obj) = resp.as_object_mut() {
+                obj.insert("ok".to_string(), serde_json::Value::Bool(true));
+                obj.insert("id".to_string(), serde_json::Value::String(id));
+            }
+            (StatusCode::OK, Json(resp))
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    }
+}
+
+/// Owner-free join for `self_keyed` directory stores (issue #340).
+///
+/// Shared tail of `POST /stores/:id/join` for the `policy: "self_keyed"`
+/// body: reserves the (kind,id), joins by topic alone, and persists a
+/// manifest entry whose `extra` records the policy but deliberately OMITS
+/// `expected_owner` (the store has none — rehydrate must not require one).
+async fn join_self_keyed_store(
+    state: Arc<AppState>,
+    id: String,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let reservation =
+        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_KV_STORE, &id)
+            .await;
+    let _guard = reservation.lock().await;
+    if state.kv_stores.read().await.contains_key(&id) {
+        return api_error(StatusCode::CONFLICT, "store already joined");
+    }
+    match state
+        .agent
+        .join_self_keyed_kv_store_persistent(&id, &state.kv_store_state_dir)
+        .await
+    {
+        Ok(handle) => {
+            let info = handle.ownership_info().await;
+            state.kv_stores.write().await.insert(id.clone(), handle);
+            let mut extra = serde_json::Map::new();
+            // No expected_owner: a self_keyed store is owner-free for life.
+            extra.insert(
+                "policy".to_string(),
+                serde_json::Value::String("self_keyed".to_string()),
+            );
+            if let Err(e) = crdt_subscriptions::record(
+                &state,
+                crdt_subscriptions::CrdtSubscriptionEntry {
+                    kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                    id: id.clone(),
+                    name: id.clone(),
+                    topic: id.clone(),
+                    role: crdt_subscriptions::ROLE_JOINED.to_string(),
+                    extra,
+                },
+            )
+            .await
+            {
                 tracing::error!("failed to persist kv store join {id}: {e}");
                 if let Some(h) = state.kv_stores.write().await.remove(&id) {
                     h.cancel_sync();

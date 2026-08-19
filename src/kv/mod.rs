@@ -32,6 +32,7 @@ pub use delta::KvStoreDelta;
 pub use entry::KvEntry;
 pub use error::{KvError, Result};
 pub use store::{
-    AccessPolicy, AnchorChannel, KvStore, KvStoreId, OwnershipSource, OwnershipStatus,
+    key_agent_prefix, AccessPolicy, AnchorChannel, KvStore, KvStoreId, OwnershipSource,
+    OwnershipStatus, MAX_SELFKEYED_BYTES_PER_AGENT, MAX_SELFKEYED_KEYS_PER_AGENT,
 };
 pub use sync::KvStoreSync;

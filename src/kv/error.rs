@@ -103,6 +103,29 @@ pub enum KvError {
         /// The group id the reserved policy carried.
         group_id: Vec<u8>,
     },
+
+    /// A `SelfKeyed` writer's per-agent quota would be exceeded (issue #340).
+    ///
+    /// The quota is a deterministic admission rule (lowest-N in lexicographic
+    /// key order), not spam resistance: it caps how much of a shared
+    /// directory topic one agent's namespace can occupy so every replica
+    /// admits the same subset. `keys`/`bytes` are the counts the writer's
+    /// candidate live set reached; `max_keys`/`max_bytes` are the protocol
+    /// constants. Raising them is a coordinated protocol change — divergent
+    /// constants would split-brain on which keys exist.
+    #[error("self_keyed quota exceeded for agent {agent:?}: candidates {keys} keys / {bytes} bytes exceed max {max_keys} keys / {max_bytes} bytes (lowest-N admission)")]
+    AgentQuotaExceeded {
+        /// The writer whose candidate live set exceeded the cap.
+        agent: AgentId,
+        /// Candidate live key count (existing survivors plus this write).
+        keys: usize,
+        /// Candidate live byte total (`Σ value.len()`).
+        bytes: u64,
+        /// Protocol constant `MAX_SELFKEYED_KEYS_PER_AGENT`.
+        max_keys: usize,
+        /// Protocol constant `MAX_SELFKEYED_BYTES_PER_AGENT`.
+        max_bytes: u64,
+    },
 }
 
 #[cfg(test)]

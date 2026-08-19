@@ -10,8 +10,10 @@ pub async fn list(client: &DaemonClient) -> Result<()> {
 
 /// `x0x store create` — POST /stores.
 ///
-/// `policy` is the optional access policy: `"signed"` (default) or
-/// `"append_only"` (existing keys immutable, even to the owner).
+/// `policy` is the optional access policy: `"signed"` (default),
+/// `"append_only"` (existing keys immutable, even to the owner), or
+/// `"self_keyed"` (owner-free directory: joiners write only keys prefixed
+/// by their own AgentId).
 pub async fn create(
     client: &DaemonClient,
     name: &str,

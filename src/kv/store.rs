@@ -19,6 +19,14 @@
 //!   immutable — no update, no delete, even by the owner. Use for
 //!   tamper-evident event logs where the author must not be able to rewrite
 //!   history retroactively.
+//! - **SelfKeyed**: No owner. Any agent may join knowing only the topic and
+//!   write exclusively under its own namespace: keys whose first 64
+//!   characters are the lowercase-hex `AgentId` (an optional `/suffix`
+//!   follows). Write authority is bound by the key prefix, not a store owner,
+//!   and each agent is capped by a deterministic per-agent quota
+//!   ([`MAX_SELFKEYED_KEYS_PER_AGENT`] keys / [`MAX_SELFKEYED_BYTES_PER_AGENT`]
+//!   bytes, admitted lowest-N in lexicographic order). Use for open
+//!   directories with many mutually-unknown publishers.
 
 use crate::identity::AgentId;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
@@ -83,12 +91,29 @@ pub enum AccessPolicy {
     /// numbers + previous-entry hashes, as x0x-symphony's tracker-integrity-v2
     /// does — see saorsa-labs/x0x-symphony#10); witnesses/transparency logs
     /// are out of scope here.
+    AppendOnly,
+
+    /// Owner-free open directory: any agent that knows the topic may join,
+    /// and each writer owns exactly the keys whose first 64 characters are
+    /// the lowercase-hex encoding of its `AgentId` (optionally followed by
+    /// `/suffix`). See [`key_agent_prefix`] for the grammar and the binding
+    /// invariant (I1: write/tombstone iff `key_agent_prefix(key) ==
+    /// Some(writer)`).
+    ///
+    /// The store has **no owner for its entire life** (`owner = None`;
+    /// `OwnerUnknown` never fires) — ownership paths (announces, allowlists,
+    /// owner-signed checkpoints) are no-ops. A hard per-agent quota
+    /// ([`MAX_SELFKEYED_KEYS_PER_AGENT`] / [`MAX_SELFKEYED_BYTES_PER_AGENT`])
+    /// admits writes deterministically (lowest-N lexicographic) so every
+    /// replica converges on the same subset. Raising those constants is a
+    /// coordinated protocol change; document next to the discriminant pin
+    /// (`access_policy_bincode_discriminants_are_pinned`).
     ///
     /// NOTE: this variant MUST stay last — bincode encodes enum variants
     /// positionally, and stores/checkpoints/deltas carrying `AccessPolicy`
     /// are bincode-serialized on disk and on the wire. Inserting a variant
     /// mid-enum would corrupt every existing store.
-    AppendOnly,
+    SelfKeyed,
 }
 
 impl std::fmt::Display for AccessPolicy {
@@ -98,8 +123,63 @@ impl std::fmt::Display for AccessPolicy {
             Self::Allowlisted => write!(f, "allowlisted"),
             Self::Encrypted { .. } => write!(f, "encrypted"),
             Self::AppendOnly => write!(f, "append_only"),
+            Self::SelfKeyed => write!(f, "self_keyed"),
         }
     }
+}
+
+/// Maximum number of active (OR-Set-live) keys one agent may hold in a
+/// [`AccessPolicy::SelfKeyed`] store (issue #340).
+///
+/// Protocol constant, NOT a create-time knob: every joiner must admit the
+/// same subset (lowest-N) or replicas split-brain on which keys exist.
+/// Raising it is a coordinated protocol change.
+pub const MAX_SELFKEYED_KEYS_PER_AGENT: usize = 64;
+
+/// Maximum total value bytes one agent may hold in a
+/// [`AccessPolicy::SelfKeyed`] store (issue #340).
+///
+/// Protocol constant, NOT a create-time knob — see
+/// [`MAX_SELFKEYED_KEYS_PER_AGENT`]. Tombstones do not count (they free
+/// budget); this is a deterministic admission bound, not spam resistance.
+pub const MAX_SELFKEYED_BYTES_PER_AGENT: u64 = 256 * 1024;
+
+/// Parse the writer-binding prefix of a `SelfKeyed` store key (issue #340).
+///
+/// Grammar: `key := lowercase_hex(AgentId, 64 chars) [ "/" suffix ]`.
+///
+/// - The first 64 characters must be lowercase hex (`0-9`, `a-f`) decoding to
+///   exactly the 32-byte `AgentId`.
+/// - If the key is longer than 64 characters, character 65 MUST be `/` — any
+///   other separator (`.` `:` `_` …) is rejected, so one agent's namespace is
+///   never a prefix of another's.
+/// - A bare 64-character key (no suffix) is valid: the agent's root record.
+///
+/// A key that fails this parse is writable by **no one**.
+#[must_use]
+pub fn key_agent_prefix(key: &str) -> Option<AgentId> {
+    let bytes = key.as_bytes();
+    if bytes.len() < 64 {
+        return None;
+    }
+    if bytes.len() > 64 && bytes[64] != b'/' {
+        return None;
+    }
+    let mut id = [0u8; 32];
+    for (i, &b) in bytes[..64].iter().enumerate() {
+        let v = match b {
+            b'0'..=b'9' => b - b'0',
+            b'a'..=b'f' => b - b'a' + 10,
+            // Uppercase and non-hex characters are rejected.
+            _ => return None,
+        };
+        if i % 2 == 0 {
+            id[i / 2] = v << 4;
+        } else {
+            id[i / 2] |= v;
+        }
+    }
+    Some(AgentId(id))
 }
 
 /// Unique identifier for a KvStore (32 bytes).
@@ -146,6 +226,22 @@ impl KvStoreId {
         hasher.update(b"x0x.store.v2");
         hasher.update(topic.as_bytes());
         hasher.update(owner.as_bytes());
+        Self(*hasher.finalize().as_bytes())
+    }
+
+    /// Derive an owner-free store ID for a [`AccessPolicy::SelfKeyed`]
+    /// directory topic (issue #340).
+    ///
+    /// Every joiner who knows only the topic computes the same id — there is
+    /// no owner to bind. The domain tag (`x0x.store.selfkeyed.v1`) is
+    /// distinct from both `x0x.store` and `x0x.store.v2`, so the same topic
+    /// string under `Signed` (via [`for_topic_owner`](Self::for_topic_owner))
+    /// never collides with its self-keyed directory.
+    #[must_use]
+    pub fn for_self_keyed_topic(topic: &str) -> Self {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"x0x.store.selfkeyed.v1");
+        hasher.update(topic.as_bytes());
         Self(*hasher.finalize().as_bytes())
     }
 }
@@ -760,6 +856,43 @@ impl KvStore {
         }
     }
 
+    /// Create a new owner-free [`AccessPolicy::SelfKeyed`] directory store.
+    ///
+    /// `owner` is `None` for life: write authority is the key-prefix binding
+    /// ([`key_agent_prefix`]), not an owner anchor, so `OwnerUnknown` never
+    /// fires on this store. Named separately from
+    /// [`new_replica`](Self::new_replica) so that path cannot drift into an
+    /// owner-free writable mode.
+    #[must_use]
+    pub fn new_self_keyed(id: KvStoreId, name: String) -> Self {
+        Self {
+            id,
+            keys: OrSet::new(),
+            entries: HashMap::new(),
+            name: LwwRegister::new(name),
+            policy: AccessPolicy::SelfKeyed,
+            owner: None,
+            anchor_channel: AnchorChannel::Persistence,
+            policy_version: 0,
+            ownership_conflict: None,
+            latest_checkpoint: None,
+            highest_checkpoint_seq: 0,
+            allowed_writers: HashSet::new(),
+            version: 0,
+            seq_counter: Arc::new(AtomicU64::new(0)),
+        }
+    }
+
+    /// Create a joined replica of an owner-free
+    /// [`AccessPolicy::SelfKeyed`] directory store.
+    ///
+    /// Same shape as [`new_self_keyed`](Self::new_self_keyed); named
+    /// separately so a future edit to one cannot silently change the other.
+    #[must_use]
+    pub fn join_self_keyed(id: KvStoreId, name: String) -> Self {
+        Self::new_self_keyed(id, name)
+    }
+
     /// Get the next monotonically-increasing sequence number.
     pub fn next_seq(&self) -> u64 {
         self.seq_counter.fetch_add(1, Ordering::Relaxed) + 1
@@ -905,7 +1038,112 @@ impl KvStore {
                 // (put/remove/merge_delta/checkpoint adoption).
                 self.owner.as_ref().is_some_and(|o| o == agent_id)
             }
+            AccessPolicy::SelfKeyed => {
+                // Fail-closed for the key-less store-wide predicate: a
+                // SelfKeyed store has no owner and authority is per key
+                // (I1/I3). Callers that forgot the key get `false`; the
+                // mutation paths use `authorize_write` / `is_authorized_for_key`.
+                false
+            }
         }
+    }
+
+    /// Check that `writer` may write `key` under this store's policy.
+    ///
+    /// This is the key-aware authority predicate for
+    /// [`AccessPolicy::SelfKeyed`] (I1: the key's agent prefix must equal
+    /// `writer`); the owner-anchored policies ignore the key and apply their
+    /// store-wide rule; the reserved [`AccessPolicy::Encrypted`] is
+    /// fail-closed (#341 Phase A / #358).
+    #[must_use]
+    pub fn is_authorized_for_key(&self, writer: &AgentId, key: &str) -> bool {
+        match &self.policy {
+            AccessPolicy::SelfKeyed => key_agent_prefix(key) == Some(*writer),
+            // Owner-anchored and reserved policies: key-independent.
+            _ => self.is_authorized(writer),
+        }
+    }
+
+    /// Enforce the store's access policy for a mutation of `key` by
+    /// `writer`.
+    ///
+    /// The key-aware successor of [`authorize_local_write`](Self::authorize_local_write)
+    /// and the local-write counterpart of the inbound check in
+    /// [`merge_delta`](Self::merge_delta): the same rule is applied before a
+    /// local put/remove mutates the replica, so an unauthorized local write
+    /// can never fork the replica away from what authorized peers accept.
+    ///
+    /// # Errors
+    ///
+    /// - [`KvError::OwnerUnknown`] if an owner-anchored policy
+    ///   (`Signed`/`Allowlisted`/`AppendOnly`) has no anchored owner.
+    ///   Never returned for `SelfKeyed` (I3: it has no owner for life).
+    /// - [`KvError::Unauthorized`] if `writer` is not authorized for `key`.
+    pub fn authorize_write(&self, writer: &AgentId, key: &str) -> Result<()> {
+        match &self.policy {
+            AccessPolicy::Encrypted { .. } => {
+                // Matches the inbound path: the reserved Encrypted policy is
+                // currently permissive at the store layer (#341).
+                Ok(())
+            }
+            AccessPolicy::SelfKeyed => {
+                if self.is_authorized_for_key(writer, key) {
+                    Ok(())
+                } else {
+                    Err(KvError::Unauthorized(format!(
+                        "self_keyed store: key {key:?} is not bound to writer {}",
+                        hex::encode(writer.as_bytes())
+                    )))
+                }
+            }
+            AccessPolicy::Signed | AccessPolicy::Allowlisted | AccessPolicy::AppendOnly => {
+                let Some(owner) = self.owner.as_ref() else {
+                    return Err(KvError::OwnerUnknown);
+                };
+                if !self.is_authorized_for_key(writer, key) {
+                    return Err(KvError::Unauthorized(format!(
+                        "store policy is {}; owner is {}",
+                        self.policy,
+                        hex::encode(owner.as_bytes())
+                    )));
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Enforce authority AND the `SelfKeyed` per-agent quota for a local put
+    /// of `value` under `key`.
+    ///
+    /// Applies the SAME deterministic lowest-N admission predicate as the
+    /// remote merge path (`merge_delta`), so a local write that peers would
+    /// drop never mutates this replica. Authority is checked first
+    /// (`Unauthorized` wins over the quota); `MAX_INLINE_SIZE` is checked
+    /// before the quota so a single oversized value still surfaces as
+    /// [`KvError::ValueTooLarge`].
+    ///
+    /// This gates only the INCOMING key: `put` additionally trims the
+    /// writer's live set down to the admitted subset (same predicate), so a
+    /// local put can evict the writer's existing lex-high keys.
+    ///
+    /// # Errors
+    ///
+    /// As [`authorize_write`](Self::authorize_write), plus
+    /// [`KvError::AgentQuotaExceeded`] when the put would fall outside the
+    /// writer's admitted lowest-N set, and [`KvError::ValueTooLarge`] for a
+    /// single value above the inline maximum.
+    pub fn authorize_put(&self, writer: &AgentId, key: &str, value: &[u8]) -> Result<()> {
+        self.authorize_write(writer, key)?;
+        if matches!(self.policy, AccessPolicy::SelfKeyed) {
+            if value.len() > crate::kv::entry::MAX_INLINE_SIZE {
+                return Err(KvError::ValueTooLarge {
+                    size: value.len(),
+                    max: crate::kv::entry::MAX_INLINE_SIZE,
+                });
+            }
+            self.check_self_keyed_admission(writer, key, value.len())?;
+        }
+        Ok(())
     }
 
     /// Check that `writer` may perform a local mutation on this store.
@@ -942,6 +1180,16 @@ impl KvStore {
             return Err(KvError::EncryptedPolicyReserved {
                 group_id: group_id.clone(),
             });
+        }
+        if matches!(self.policy, AccessPolicy::SelfKeyed) {
+            // Legacy key-less check: a SelfKeyed store cannot validate the
+            // prefix binding without a key. Fail closed WITHOUT OwnerUnknown
+            // (I3 — the store deliberately has no owner); the mutation paths
+            // use the key-aware `authorize_write` / `authorize_put`.
+            return Err(KvError::Unauthorized(
+                "self_keyed store: authorization is per key — use authorize_write(writer, key)"
+                    .to_string(),
+            ));
         }
         let Some(owner) = self.owner.as_ref() else {
             return Err(KvError::OwnerUnknown);
@@ -1093,6 +1341,11 @@ impl KvStore {
     /// immutable: a re-put of byte-identical content (same value AND
     /// content type) is accepted as an idempotent no-op so retries are safe,
     /// and anything else returns [`KvError::ImmutableKey`].
+    ///
+    /// Under [`AccessPolicy::SelfKeyed`], the writer's live set is trimmed to
+    /// the admitted lowest-N subset after the entry lands — the same rule
+    /// the remote merge applies — so a local put can evict the writer's
+    /// lex-highest keys.
     pub fn put(
         &mut self,
         key: String,
@@ -1117,6 +1370,14 @@ impl KvStore {
             }
         }
 
+        // Captured before `key` is consumed below: the SelfKeyed live-set cap
+        // is enforced after the entry lands.
+        let self_keyed_writer = if matches!(self.policy, AccessPolicy::SelfKeyed) {
+            key_agent_prefix(&key)
+        } else {
+            None
+        };
+
         let seq = self.next_seq();
 
         // Add key to OR-Set
@@ -1130,6 +1391,14 @@ impl KvStore {
         } else {
             self.entries
                 .insert(key.clone(), KvEntry::new(key, value, content_type));
+        }
+
+        // SelfKeyed live-set cap (I7): the quota bounds the live set, not
+        // just the write. `authorize_put` gates only the incoming key, so
+        // without this the local replica would keep the writer's over-cap
+        // lex-high keys that every remote evicts at step 4.
+        if let Some(writer) = self_keyed_writer {
+            self.enforce_self_keyed_live_set(&writer);
         }
 
         self.version += 1;
@@ -1209,6 +1478,221 @@ impl KvStore {
         self.version += 1;
     }
 
+    // -----------------------------------------------------------------
+    // SelfKeyed quota (issue #340) — deterministic lowest-N admission.
+    // -----------------------------------------------------------------
+
+    /// Candidate live `(key, value_len)` pairs for `writer`, overlaid with
+    /// pending puts (`key -> NEW value_len`; an update of a live key counts
+    /// the replacement value). Lexicographically sorted; foreign keys are
+    /// never included.
+    fn self_keyed_candidates(
+        &self,
+        writer: &AgentId,
+        puts: &HashMap<String, u64>,
+    ) -> Vec<(String, u64)> {
+        let mut lens: HashMap<String, u64> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| key_agent_prefix(k) == Some(*writer))
+            .map(|k| {
+                (
+                    k.clone(),
+                    self.entries.get(k).map_or(0u64, |e| e.value.len() as u64),
+                )
+            })
+            .collect();
+        for (key, len) in puts {
+            lens.insert(key.clone(), *len);
+        }
+        let mut candidates: Vec<(String, u64)> = lens.into_iter().collect();
+        candidates.sort_by(|a, b| a.0.cmp(&b.0));
+        candidates
+    }
+
+    /// Deterministic lowest-N admission (I7): admit candidates from the
+    /// lexicographic front until the key-count or byte-total cap would be
+    /// exceeded; everything from there on (the tail) is dropped. A pure
+    /// function of the candidate set, so any two replicas with the same live
+    /// set admit the same subset.
+    fn self_keyed_admitted(candidates: &[(String, u64)]) -> HashSet<&str> {
+        let mut admitted: HashSet<&str> = HashSet::new();
+        let mut bytes = 0u64;
+        for (key, len) in candidates {
+            if admitted.len() >= MAX_SELFKEYED_KEYS_PER_AGENT
+                || bytes.saturating_add(*len) > MAX_SELFKEYED_BYTES_PER_AGENT
+            {
+                break; // drop this candidate and the whole lexicographic tail
+            }
+            admitted.insert(key.as_str());
+            bytes = bytes.saturating_add(*len);
+        }
+        admitted
+    }
+
+    /// Local-put quota predicate — the SAME rule the remote merge applies,
+    /// so a local write that peers would drop never mutates this replica.
+    fn check_self_keyed_admission(
+        &self,
+        writer: &AgentId,
+        key: &str,
+        value_len: usize,
+    ) -> Result<()> {
+        let mut puts = HashMap::new();
+        puts.insert(key.to_string(), value_len as u64);
+        let candidates = self.self_keyed_candidates(writer, &puts);
+        let admitted = Self::self_keyed_admitted(&candidates);
+        if admitted.contains(key) {
+            return Ok(());
+        }
+        let bytes = candidates.iter().map(|(_, len)| len).sum();
+        Err(KvError::AgentQuotaExceeded {
+            agent: *writer,
+            keys: candidates.len(),
+            bytes,
+            max_keys: MAX_SELFKEYED_KEYS_PER_AGENT,
+            max_bytes: MAX_SELFKEYED_BYTES_PER_AGENT,
+        })
+    }
+
+    /// Shared live-set enforcement (I7): evict `writer`'s live keys outside
+    /// `admitted`. Both the remote merge (step 4 of
+    /// [`merge_delta_self_keyed`](Self::merge_delta_self_keyed)) and the
+    /// local put path call this, so neither side can hold keys the other
+    /// drops.
+    fn evict_outside_admitted(&mut self, writer: &AgentId, admitted: &HashSet<&str>) {
+        let stale: Vec<String> = self
+            .keys
+            .elements()
+            .into_iter()
+            .filter(|k| key_agent_prefix(k) == Some(*writer) && !admitted.contains(k.as_str()))
+            .cloned()
+            .collect();
+        for key in &stale {
+            let _ = self.keys.remove(key);
+            self.entries.remove(key);
+        }
+    }
+
+    /// Enforce the `SelfKeyed` live-set cap after a LOCAL put of a key bound
+    /// to `writer` — the same predicate as the remote merge's step 4,
+    /// recomputed over the post-put live set. [`authorize_put`](Self::authorize_put)
+    /// only gates the incoming key; without this the local replica could
+    /// hold 65 keys while every remote holds the admitted 64.
+    fn enforce_self_keyed_live_set(&mut self, writer: &AgentId) {
+        let candidates = self.self_keyed_candidates(writer, &HashMap::new());
+        let admitted = Self::self_keyed_admitted(&candidates);
+        self.evict_outside_admitted(writer, &admitted);
+    }
+
+    /// `AccessPolicy::SelfKeyed` merge path (issue #340).
+    ///
+    /// Per-key authority instead of a whole-delta owner gate: the gossip
+    /// envelope's verified `msg.sender` (passed as `writer`) is the only
+    /// identity, and a writer can only touch keys bound to its own prefix
+    /// (I1). Anonymous deltas apply NOTHING (I5). Encrypted is independently
+    /// fail-closed (#358); SelfKeyed does not share that path.
+    ///
+    /// Order: the writer's own tombstones first (they free quota budget),
+    /// then own adds/updates admitted by the deterministic lowest-N rule,
+    /// then eviction of the writer's live keys outside the admitted set (the
+    /// quota is a hard cap on the live set, so replicas fed in different
+    /// orders converge on the same subset — I7). Foreign keys in
+    /// `added`/`updated`/`removed` are skipped (I6). Allowlist mutations and
+    /// any carried owner checkpoint are ignored (I8 — this store has no
+    /// owner and never publishes or adopts checkpoints).
+    fn merge_delta_self_keyed(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+    ) -> Result<()> {
+        let Some(w) = writer else {
+            tracing::warn!("rejected anonymous self_keyed delta for store {}", self.id);
+            return Ok(()); // silent whole-delta reject — applies nothing
+        };
+        // Ambiguity gate (mirrors the sender-auth path): a delta carrying the
+        // same key in both `added` and `updated` is ambiguous by
+        // construction — drop the whole delta.
+        for key in delta.updated.keys() {
+            if delta.added.contains_key(key) {
+                tracing::warn!(
+                    "rejected ambiguous self_keyed delta for store {}: key {key:?} appears in both added and updated",
+                    self.id
+                );
+                return Ok(());
+            }
+        }
+        // 1. The writer's own tombstones first — a single delta can free
+        //    budget and spend it (apply-order guarantee).
+        for key in delta.removed.keys() {
+            if key_agent_prefix(key) != Some(*w) {
+                continue; // foreign tombstone: skipped (I6)
+            }
+            let _ = self.keys.remove(key);
+            self.entries.remove(key);
+        }
+        // 2. Collect the writer's otherwise-admissible puts (prefix-bound
+        //    keys only; foreign keys are skipped).
+        let mut puts: HashMap<String, u64> = HashMap::new();
+        for (key, (entry, _tag)) in &delta.added {
+            if key_agent_prefix(key) == Some(*w) {
+                puts.insert(key.clone(), entry.value.len() as u64);
+            }
+        }
+        for (key, entry) in &delta.updated {
+            if key_agent_prefix(key) == Some(*w) {
+                puts.insert(key.clone(), entry.value.len() as u64);
+            }
+        }
+        // 3. Deterministic lowest-N admission over survivors ∪ own puts.
+        //    `admitted` contains only the writer's own keys, so foreign puts
+        //    fail the membership check below and are skipped.
+        let candidates = self.self_keyed_candidates(w, &puts);
+        let admitted = Self::self_keyed_admitted(&candidates);
+        for (key, (entry, tag)) in &delta.added {
+            if !admitted.contains(key.as_str()) {
+                continue; // foreign key or over-quota tail: skipped
+            }
+            self.keys
+                .add(key.clone(), *tag)
+                .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
+            if let Some(existing) = self.entries.get_mut(key) {
+                existing.merge(entry);
+            } else {
+                self.entries.insert(key.clone(), entry.clone());
+            }
+        }
+        for (key, entry) in &delta.updated {
+            if !admitted.contains(key.as_str()) {
+                continue;
+            }
+            if let Some(existing) = self.entries.get_mut(key) {
+                existing.merge(entry);
+            } else {
+                self.keys
+                    .add(key.clone(), (peer_id, 0))
+                    .map_err(|e| KvError::Merge(format!("OR-Set add failed: {e}")))?;
+                self.entries.insert(key.clone(), entry.clone());
+            }
+        }
+        // 4. Evict the writer's live keys outside the admitted set: the
+        //    admitted set is a pure function of the candidate live set, so
+        //    every replica converges to exactly that subset regardless of
+        //    delivery order (I7). Shared with the local put path
+        //    (`enforce_self_keyed_live_set`) so neither side can hold keys
+        //    the other drops.
+        self.evict_outside_admitted(w, &admitted);
+        // The name is LWW metadata, not directory content — merge it like
+        // every other policy so replicas converge on the creator's name.
+        if let Some(name_register) = &delta.name_update {
+            self.name.merge(name_register);
+        }
+        self.version += 1;
+        Ok(())
+    }
+
     /// Merge a delta into this store.
     ///
     /// Enforces access control: if the store has a Signed or Allowlisted
@@ -1220,6 +1704,12 @@ impl KvStore {
         peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<()> {
+        // SelfKeyed directories take the per-key path: no owner gate, no
+        // checkpoint adoption — the store has no owner for life (I3/I8), so
+        // both owner-anchored blocks below would no-op anyway.
+        if matches!(self.policy, AccessPolicy::SelfKeyed) {
+            return self.merge_delta_self_keyed(delta, peer_id, writer);
+        }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
         // as owner-proven independent of the relayer. An incremental delta's
@@ -1824,7 +2314,15 @@ impl KvStore {
     /// declared digest (and its sender authorization) first — without that
     /// binding, any holder could truncate local state at will.
     pub(crate) fn prune_to_served_set(&mut self, delta: &KvStoreDelta) -> usize {
-        if matches!(self.policy, AccessPolicy::AppendOnly) {
+        if matches!(
+            self.policy,
+            AccessPolicy::AppendOnly | AccessPolicy::SelfKeyed
+        ) {
+            // SelfKeyed is prune-free for the same reason Allowlisted is:
+            // a peer's serve can legitimately omit co-writers' keys (the
+            // listener's sole-author gate already restricts pruning to
+            // Signed; this guard keeps any future caller from truncating a
+            // directory).
             return 0;
         }
         let stale: Vec<String> = self
@@ -4632,8 +5130,8 @@ mod tests {
         // WHY: AccessPolicy is bincode-encoded positionally in persisted
         // stores, checkpoints (wire + signing bytes), and deltas. If anyone
         // reorders or inserts a variant mid-enum, every existing store
-        // corrupts. This test pins the exact on-wire indices 0..=3.
-        let cases: [(AccessPolicy, u32); 4] = [
+        // corrupts. This test pins the exact on-wire indices 0..=4.
+        let cases: [(AccessPolicy, u32); 5] = [
             (AccessPolicy::Signed, 0),
             (AccessPolicy::Allowlisted, 1),
             (
@@ -4643,6 +5141,7 @@ mod tests {
                 2,
             ),
             (AccessPolicy::AppendOnly, 3),
+            (AccessPolicy::SelfKeyed, 4),
         ];
         for (policy, index) in cases {
             let bytes = bincode::serialize(&policy).expect("serialize");
@@ -4653,5 +5152,543 @@ mod tests {
                 "bincode discriminant for {policy} moved — this BREAKS every existing store/checkpoint"
             );
         }
+    }
+
+    // -----------------------------------------------------------------
+    // AccessPolicy::SelfKeyed (issue #340) — owner-free open directories.
+    // -----------------------------------------------------------------
+
+    fn hex_key(agent: &AgentId, suffix: Option<&str>) -> String {
+        match suffix {
+            Some(s) => format!("{}/{}", hex::encode(agent.as_bytes()), s),
+            None => hex::encode(agent.as_bytes()),
+        }
+    }
+
+    fn self_keyed_store() -> KvStore {
+        KvStore::new_self_keyed(store_id(9), "directory".to_string())
+    }
+
+    fn kv_entry(key: &str, val: &[u8]) -> KvEntry {
+        KvEntry::new(key.to_string(), val.to_vec(), "text/plain".to_string())
+    }
+
+    #[test]
+    fn key_agent_prefix_grammar() {
+        // WHY (I1): the key prefix IS the write-authority binding. If the
+        // grammar admitted ambiguous forms (uppercase, foreign separators,
+        // short prefixes), one agent's namespace could collide with or be a
+        // prefix of another's and the binding would be forgeable.
+        let w = AgentId([0xab; 32]); // hex form contains letters a-f
+        let hex_w = hex::encode(w.as_bytes());
+        assert_eq!(hex_w.len(), 64);
+        // Bare 64-hex key: the agent's root record.
+        assert_eq!(key_agent_prefix(&hex_w), Some(w));
+        // hex/suffix, including nested suffixes.
+        assert_eq!(key_agent_prefix(&format!("{hex_w}/profile")), Some(w));
+        assert_eq!(key_agent_prefix(&format!("{hex_w}/a/b")), Some(w));
+        // Uppercase hex rejected.
+        assert_eq!(key_agent_prefix(&hex_w.to_uppercase()), None);
+        // Length < 64 rejected.
+        assert_eq!(key_agent_prefix(&hex_w[..63]), None);
+        assert_eq!(key_agent_prefix(""), None);
+        // Length > 64 without the mandatory `/` at position 65 rejected.
+        assert_eq!(key_agent_prefix(&format!("{hex_w}x")), None);
+        // Any other separator rejected: one namespace is never a prefix of
+        // another's.
+        for sep in ['.', ':', '_', '-'] {
+            assert_eq!(
+                key_agent_prefix(&format!("{hex_w}{sep}x")),
+                None,
+                "separator {sep:?} must be rejected"
+            );
+        }
+        // Non-hex characters rejected.
+        let mut non_hex = hex_w.clone();
+        non_hex.replace_range(0..1, "z");
+        assert_eq!(key_agent_prefix(&non_hex), None);
+    }
+
+    #[test]
+    fn selfkeyed_local_put_requires_own_prefix() {
+        let me = agent(7);
+        let other = agent(9);
+        let mut store = self_keyed_store();
+
+        // Own prefixed key and bare own root record are both writable.
+        store
+            .authorize_put(&me, &hex_key(&me, Some("profile")), b"v")
+            .expect("own prefix writable");
+        store
+            .authorize_put(&me, &hex_key(&me, None), b"v")
+            .expect("bare own root record writable");
+
+        // Foreign prefix: Unauthorized — and never OwnerUnknown (I3: the
+        // store deliberately has no owner for life).
+        let err = store
+            .authorize_put(&me, &hex_key(&other, Some("x")), b"v")
+            .unwrap_err();
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+
+        // Malformed key: writable by no one.
+        let err = store
+            .authorize_put(&me, "not-a-bound-key", b"v")
+            .unwrap_err();
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+
+        // The legacy key-less predicate fails closed for SelfKeyed.
+        assert!(!store.is_authorized(&me));
+        assert!(!store.is_authorized_for_key(&me, "anything"));
+        assert!(store.is_authorized_for_key(&me, &hex_key(&me, None)));
+        let err = store.authorize_local_write(&me).unwrap_err();
+        assert!(
+            matches!(err, KvError::Unauthorized(_)),
+            "never OwnerUnknown: {err:?}"
+        );
+
+        // An authorized own-prefix put applies and reads back.
+        let key = hex_key(&me, Some("profile"));
+        store
+            .put(
+                key.clone(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        assert_eq!(store.get(&key).expect("entry").value, b"v");
+        assert_eq!(store.owner(), None, "owner stays None for life (I3)");
+        assert_eq!(*store.policy(), AccessPolicy::SelfKeyed);
+    }
+
+    #[test]
+    fn selfkeyed_anonymous_delta_rejected() {
+        // WHY (I5): a SelfKeyed directory binds writes to the verified
+        // envelope sender; an anonymous delta has no identity to bind, so it
+        // must apply NOTHING. Encrypted is independently fail-closed (#358).
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        let key = hex_key(&w, None);
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert(key.clone(), (kv_entry(&key, b"v"), (peer(1), 1)));
+        store
+            .merge_delta(&delta, peer(1), None)
+            .expect("silent whole-delta reject is not an error");
+        assert!(
+            store.get(&key).is_none(),
+            "anonymous self_keyed delta applies nothing (I5)"
+        );
+        assert_eq!(store.current_version(), 0, "no state change");
+        // Encrypted contrast omitted: #358 made Encrypted unconstructible
+        // and fail-closed. Do not reopen construction here.
+    }
+
+    #[test]
+    fn selfkeyed_merge_delta_applies_only_own_keys() {
+        // WHY (I6): the envelope's verified sender is the only identity; a
+        // writer cannot forge another agent's namespace, and keys outside
+        // its prefix are dropped rather than applied.
+        let w = agent(7);
+        let other = agent(9);
+        let mut store = self_keyed_store();
+        let own = hex_key(&w, Some("a"));
+        let foreign = hex_key(&other, Some("b"));
+        let mut delta = KvStoreDelta::new(1);
+        delta
+            .added
+            .insert(own.clone(), (kv_entry(&own, b"own"), (peer(1), 1)));
+        delta.added.insert(
+            foreign.clone(),
+            (kv_entry(&foreign, b"foreign"), (peer(2), 1)),
+        );
+        // Allowlist mutations in the delta are ignored (I8).
+        delta.allowlist_additions = Some(vec![other]);
+        store.merge_delta(&delta, peer(1), Some(&w)).expect("merge");
+        assert_eq!(store.get(&own).expect("own key applied").value, b"own");
+        assert!(store.get(&foreign).is_none(), "foreign keys dropped (I6)");
+        assert!(
+            store.allowed_writers().is_empty(),
+            "allowlist mutations are ignored"
+        );
+    }
+
+    #[test]
+    fn selfkeyed_foreign_tombstone_dropped() {
+        let w = agent(7);
+        let other = agent(9);
+        let mut store = self_keyed_store();
+        // Seed the other agent's key via its own legitimate delta.
+        let other_key = hex_key(&other, Some("k"));
+        let mut seed = KvStoreDelta::new(1);
+        seed.added.insert(
+            other_key.clone(),
+            (kv_entry(&other_key, b"v"), (peer(2), 1)),
+        );
+        store
+            .merge_delta(&seed, peer(2), Some(&other))
+            .expect("seed");
+        assert!(store.get(&other_key).is_some());
+
+        // w attempts to tombstone other's key remotely: skipped.
+        let mut delta = KvStoreDelta::new(2);
+        delta.removed.insert(other_key.clone(), HashSet::new());
+        store.merge_delta(&delta, peer(1), Some(&w)).expect("merge");
+        assert!(
+            store.get(&other_key).is_some(),
+            "remote tombstone of a foreign key is dropped (I1)"
+        );
+
+        // Local counterpart: authorize_write refuses the foreign key.
+        let err = store.authorize_write(&w, &other_key).unwrap_err();
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn selfkeyed_quota_enforced_local() {
+        // WHY (I7): the quota is a deterministic admission rule, and the
+        // local write path must use the SAME predicate as the remote merge
+        // or a local write could diverge from what peers keep.
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        for i in 0..MAX_SELFKEYED_KEYS_PER_AGENT {
+            let key = hex_key(&w, Some(&format!("{i:03}")));
+            store
+                .authorize_put(&w, &key, b"v")
+                .expect("within the key cap");
+            store
+                .put(key, b"v".to_vec(), "text/plain".to_string(), peer(1))
+                .expect("put");
+        }
+        // The 65th active key: AgentQuotaExceeded with key-count fields.
+        let err = store
+            .authorize_put(&w, &hex_key(&w, Some("065")), b"v")
+            .unwrap_err();
+        match &err {
+            KvError::AgentQuotaExceeded {
+                keys,
+                bytes,
+                max_keys,
+                max_bytes,
+                ..
+            } => {
+                assert_eq!(*keys, MAX_SELFKEYED_KEYS_PER_AGENT + 1);
+                assert_eq!(*bytes, (MAX_SELFKEYED_KEYS_PER_AGENT + 1) as u64);
+                assert_eq!(*max_keys, MAX_SELFKEYED_KEYS_PER_AGENT);
+                assert_eq!(*max_bytes, MAX_SELFKEYED_BYTES_PER_AGENT);
+            }
+            other => panic!("expected AgentQuotaExceeded, got {other:?}"),
+        }
+        // The quota is per agent: a different agent's first key is unaffected.
+        let other = agent(9);
+        store
+            .authorize_put(&other, &hex_key(&other, Some("a")), b"v")
+            .expect("other agent unaffected");
+
+        // Byte growth past 256 KiB trips the byte fields (4 max-size values
+        // hit the cap exactly; a 5th exceeds it).
+        let mut byte_store = self_keyed_store();
+        let v = vec![0u8; crate::kv::entry::MAX_INLINE_SIZE];
+        for i in 0..4 {
+            let key = hex_key(&w, Some(&format!("{i}")));
+            byte_store
+                .authorize_put(&w, &key, &v)
+                .expect("within the byte cap");
+            byte_store
+                .put(key, v.clone(), "text/plain".to_string(), peer(1))
+                .expect("put");
+        }
+        let err = byte_store
+            .authorize_put(&w, &hex_key(&w, Some("4")), b"x")
+            .unwrap_err();
+        match &err {
+            KvError::AgentQuotaExceeded { keys, bytes, .. } => {
+                assert_eq!(*keys, 5);
+                assert_eq!(*bytes, MAX_SELFKEYED_BYTES_PER_AGENT + 1);
+            }
+            other => panic!("expected AgentQuotaExceeded, got {other:?}"),
+        }
+
+        // MAX_INLINE_SIZE still wins on a single oversized value.
+        let err = store
+            .authorize_put(
+                &w,
+                &hex_key(&w, Some("big")),
+                &vec![0u8; crate::kv::entry::MAX_INLINE_SIZE + 1],
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, KvError::ValueTooLarge { .. }),
+            "inline cap precedes the quota: {err:?}"
+        );
+    }
+
+    #[test]
+    fn selfkeyed_quota_lowest_n_converges() {
+        // WHY (I7): "drop until under cap" is replica-order-dependent and
+        // would split the directory. Lowest-N in lexicographic order is a
+        // pure function of the live set, so two replicas fed the SAME 80
+        // keys in DIFFERENT delivery orders must end with exactly the same
+        // 64 lexicographically-lowest keys.
+        let w = agent(7);
+        let total = MAX_SELFKEYED_KEYS_PER_AGENT + 16; // 80
+        let keys: Vec<String> = (0..total)
+            .map(|i| hex_key(&w, Some(&format!("{i:03}"))))
+            .collect();
+        let deltas: Vec<KvStoreDelta> = keys
+            .iter()
+            .enumerate()
+            .map(|(i, k)| {
+                let mut d = KvStoreDelta::new((i + 1) as u64);
+                d.added
+                    .insert(k.clone(), (kv_entry(k, b"v"), (peer(1), i as u64 + 1)));
+                d
+            })
+            .collect();
+
+        let mut forward = self_keyed_store();
+        let mut reverse = self_keyed_store();
+        for d in &deltas {
+            forward
+                .merge_delta(d, peer(1), Some(&w))
+                .expect("forward merge");
+        }
+        for d in deltas.iter().rev() {
+            reverse
+                .merge_delta(d, peer(1), Some(&w))
+                .expect("reverse merge");
+        }
+
+        let expected: Vec<String> = keys[..MAX_SELFKEYED_KEYS_PER_AGENT].to_vec();
+        for (label, store) in [("forward", &forward), ("reverse", &reverse)] {
+            let mut live: Vec<String> = store.active_keys().into_iter().cloned().collect();
+            live.sort();
+            assert_eq!(
+                live, expected,
+                "{label} replica must hold exactly the 64 lex-lowest keys"
+            );
+        }
+
+        // Local-put counterpart (I7): `authorize_put` only gates the incoming
+        // key, so `KvStore::put` must apply the same step-4 eviction or a
+        // writer filling 64 lex-high keys and then putting a lex-low key
+        // keeps 65 locally while every remote holds 64 — a local fork.
+        let high: Vec<String> = (0..MAX_SELFKEYED_KEYS_PER_AGENT)
+            .map(|i| hex_key(&w, Some(&format!("1{i:02}"))))
+            .collect();
+        let low = hex_key(&w, Some("050"));
+        let mut local = self_keyed_store();
+        for key in &high {
+            local
+                .authorize_put(&w, key, b"v")
+                .expect("lex-high key within the key cap");
+            local
+                .put(
+                    key.clone(),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        local
+            .authorize_put(&w, &low, b"v")
+            .expect("lex-low key sorts into the admitted set");
+        local
+            .put(
+                low.clone(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+
+        // Second replica fed the SAME 65 keys through merge_delta, in the
+        // opposite order (low first), must land on the identical 64.
+        let mut remote = self_keyed_store();
+        for (i, key) in std::iter::once(&low).chain(high.iter()).enumerate() {
+            let mut d = KvStoreDelta::new((i + 1) as u64);
+            d.added
+                .insert(key.clone(), (kv_entry(key, b"v"), (peer(1), i as u64 + 1)));
+            remote.merge_delta(&d, peer(1), Some(&w)).expect("merge");
+        }
+
+        let mut admitted: Vec<String> = high.clone();
+        admitted.push(low.clone());
+        admitted.sort();
+        admitted.truncate(MAX_SELFKEYED_KEYS_PER_AGENT); // the lex-highest is evicted
+        for (label, store) in [("local", &local), ("remote", &remote)] {
+            let mut live: Vec<String> = store.active_keys().into_iter().cloned().collect();
+            live.sort();
+            assert_eq!(
+                live, admitted,
+                "{label} replica must hold exactly the admitted 64 after the local/remote split"
+            );
+        }
+        assert!(local.get(&low).is_some(), "the new lex-low key stays");
+        assert!(
+            local.get(high.last().expect("64 high keys")).is_none(),
+            "the lex-highest key is evicted locally, not only on remotes"
+        );
+    }
+
+    #[test]
+    fn selfkeyed_quota_freed_by_remove() {
+        // WHY: tombstones must free budget — and a single delta must be able
+        // to free and spend in one message (tombstones apply before puts).
+        let w = agent(7);
+        let mut store = self_keyed_store();
+        for i in 0..MAX_SELFKEYED_KEYS_PER_AGENT {
+            store
+                .put(
+                    hex_key(&w, Some(&format!("{i:03}"))),
+                    b"v".to_vec(),
+                    "text/plain".to_string(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        // At the cap: a 65th key is refused.
+        store
+            .authorize_put(&w, &hex_key(&w, Some("999")), b"v")
+            .unwrap_err();
+        // An own tombstone frees count and bytes.
+        store
+            .remove(&hex_key(&w, Some("000")))
+            .expect("own remove frees budget");
+        store
+            .authorize_put(&w, &hex_key(&w, Some("999")), b"v")
+            .expect("quota freed by own tombstone");
+
+        // Remote apply-order: bring a replica to the cap, then one delta
+        // tombstones a key AND adds a fresh key.
+        let mut replica = self_keyed_store();
+        for i in 0..MAX_SELFKEYED_KEYS_PER_AGENT {
+            let key = hex_key(&w, Some(&format!("{i:03}")));
+            let mut d = KvStoreDelta::new(i as u64 + 1);
+            d.added
+                .insert(key.clone(), (kv_entry(&key, b"v"), (peer(1), i as u64 + 1)));
+            replica
+                .merge_delta(&d, peer(1), Some(&w))
+                .expect("seed replica");
+        }
+        let mut d = KvStoreDelta::new(99);
+        d.removed.insert(hex_key(&w, Some("000")), HashSet::new());
+        d.added.insert(
+            hex_key(&w, Some("999")),
+            (kv_entry(&hex_key(&w, Some("999")), b"v"), (peer(1), 99)),
+        );
+        replica
+            .merge_delta(&d, peer(1), Some(&w))
+            .expect("tombstone frees budget within one delta");
+        assert!(replica.get(&hex_key(&w, Some("000"))).is_none());
+        assert!(replica.get(&hex_key(&w, Some("999"))).is_some());
+    }
+
+    #[test]
+    fn selfkeyed_store_id_deterministic_and_domain_separated() {
+        // WHY (I2): joiners know only the topic; the id must be derivable
+        // from the topic alone, identical on every peer, and never collide
+        // with an owner-anchored derivation of the same topic string.
+        let owner = agent(1);
+        let a = KvStoreId::for_self_keyed_topic("directory/topic");
+        let b = KvStoreId::for_self_keyed_topic("directory/topic");
+        assert_eq!(a, b, "same topic ⇒ same id on every peer (I2)");
+        assert_ne!(a, KvStoreId::for_self_keyed_topic("other"));
+        assert_ne!(
+            a,
+            KvStoreId::for_topic_owner("directory/topic", &owner),
+            "domain-separated from the owner-anchored derivation"
+        );
+        assert_ne!(
+            a,
+            KvStoreId::from_content("directory/topic", &owner),
+            "domain-separated from the legacy derivation"
+        );
+    }
+
+    #[test]
+    fn selfkeyed_no_owner_checkpoint_and_no_prune() {
+        // WHY (I8): the store has no owner, so no checkpoint can be adopted
+        // and no peer's full serve may truncate a co-writer's key — a serve
+        // can legitimately omit keys this replica holds from another writer.
+        let w1 = agent(7);
+        let w2 = agent(9);
+        let mut store = self_keyed_store();
+        for (writer, suffix) in [(&w1, "a"), (&w2, "b")] {
+            let key = hex_key(writer, Some(suffix));
+            let mut d = KvStoreDelta::new(1);
+            d.added
+                .insert(key.clone(), (kv_entry(&key, b"v"), (peer(1), 1)));
+            store.merge_delta(&d, peer(1), Some(writer)).expect("merge");
+            assert!(store.get(&key).is_some());
+        }
+        // A delta carrying an (unverifiable) owner checkpoint is ignored:
+        // no owner exists to verify against, nothing adopted.
+        let mut cp_delta = KvStoreDelta::new(2);
+        cp_delta.owner_checkpoint = Some(OwnerCheckpoint {
+            topic: "directory".to_string(),
+            store_id: store_id(9),
+            owner_pubkey: Vec::new(),
+            policy: AccessPolicy::Signed,
+            policy_version: 9,
+            checkpoint_seq: 9,
+            content_root: [0u8; 32],
+            timestamp: 0,
+            signature: Vec::new(),
+        });
+        store
+            .merge_delta(&cp_delta, peer(1), Some(&w1))
+            .expect("checkpoint ignored");
+        assert!(
+            store.latest_checkpoint.is_none(),
+            "no OwnerCheckpoint is ever adopted (I8)"
+        );
+        assert_eq!(store.highest_checkpoint_seq, 0);
+        assert_eq!(store.owner(), None);
+
+        // A digest-verified-style full serve from w1 must NOT truncate w2's
+        // key: prune_to_served_set is a no-op on SelfKeyed (mirrors the
+        // Allowlisted sole-author rule — a peer's serve can omit
+        // co-writers' keys).
+        let w1_key = hex_key(&w1, Some("a"));
+        let mut serve = KvStoreDelta::new(3);
+        serve
+            .added
+            .insert(w1_key.clone(), (kv_entry(&w1_key, b"v"), (peer(1), 2)));
+        assert_eq!(
+            store.prune_to_served_set(&serve),
+            0,
+            "prune is a no-op for self_keyed"
+        );
+        assert!(
+            store.get(&hex_key(&w2, Some("b"))).is_some(),
+            "a co-writer's key survives another writer's full serve"
+        );
+    }
+
+    #[test]
+    fn selfkeyed_owner_announce_and_allowlist_ignored() {
+        // WHY (I8): ownership and the allowlist are owner-anchored concepts;
+        // a SelfKeyed store has no owner for life, so every such path must
+        // fail closed without mutating policy, owner, or the allowlist.
+        let mut store = self_keyed_store();
+        let claimant = agent(7);
+        // A self-announced ownership claim is rejected — ownership is
+        // construction-only and this store deliberately has none.
+        let err = store
+            .learn_ownership(claimant, AccessPolicy::Signed, 99, &claimant)
+            .unwrap_err();
+        assert!(matches!(err, KvError::OwnerTokenInvalid(_)));
+        assert_eq!(store.owner(), None);
+        assert_eq!(*store.policy(), AccessPolicy::SelfKeyed, "policy immutable");
+
+        // Allowlist mutations are owner-only and this store has no owner.
+        let err = store.allow_writer(claimant, &claimant).unwrap_err();
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+        let err = store.deny_writer(&claimant, &claimant).unwrap_err();
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+        assert!(store.allowed_writers().is_empty());
     }
 }
