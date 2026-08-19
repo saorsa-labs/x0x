@@ -150,7 +150,9 @@ impl Store {
         conn.execute_batch(
             "PRAGMA auto_vacuum = INCREMENTAL;\n             PRAGMA locking_mode = EXCLUSIVE;\n             PRAGMA journal_mode = WAL;\n             PRAGMA synchronous = NORMAL;",
         )
-        .map_err(|e| HistoryError::Database(format!("pragma setup failed: {e}")))?;
+        .map_err(|e| {
+            HistoryError::Database(format!("pragma setup history db {}: {e}", path.display()))
+        })?;
         // Acquire the exclusive lock NOW so a second process fails at open,
         // not at first write.
         if let Err(e) = conn.execute_batch("BEGIN IMMEDIATE; COMMIT;") {
@@ -1258,6 +1260,30 @@ mod tests {
         assert!(
             msg.contains(&bad_path.display().to_string()),
             "history init error must name the resolved db path; got: {msg}"
+        );
+    }
+
+    /// Item (b) leftover (#281): pragma setup used to say only
+    /// `pragma setup failed: …`, which sent operators down a lock-contention
+    /// path when the real cause was the resolved db path. A non-SQLite file
+    /// at that path fails at the first PRAGMA (SQLite opens lazily), so the
+    /// error must name the path actually attempted — same wording style as
+    /// `open history db {path}: …`.
+    #[test]
+    fn pragma_setup_error_names_the_resolved_db_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("history.db");
+        std::fs::write(&path, b"not a sqlite database").unwrap();
+        let err = Store::open(&path).unwrap_err();
+        let msg = err.to_string();
+        let resolved = path.display().to_string();
+        assert!(
+            msg.contains(&resolved),
+            "pragma setup error must name the resolved db path; got: {msg}"
+        );
+        assert!(
+            msg.contains("pragma setup"),
+            "must be the pragma-setup path, not open/lock/create; got: {msg}"
         );
     }
 }
