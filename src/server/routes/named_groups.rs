@@ -9431,7 +9431,8 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
 /// Record MLS-group plaintext obtained via a local secure-surface call
 /// (ADR-0023 §3/§4): unsigned, `provenance = LocalAppDecrypt`, author
 /// unattributed — no per-message author signature exists on this plane.
-/// `msg_id = BLAKE3(plaintext)` dedupes replays of the same ciphertext.
+/// `msg_id` is the v2 group+epoch helper so identical plaintext in two
+/// groups whose epochs coincide does not collide (#276).
 fn record_mls_history(
     state: &AppState,
     stable_group_id: &str,
@@ -9451,12 +9452,16 @@ fn record_mls_history(
         "application/octet-stream"
     };
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
-    // Epoch-salted id: ciphertext replays within an epoch dedupe, identical
-    // plaintext across epochs survives. Identical plaintext *within* one
-    // epoch still collapses — per-message MLS identity is a future
-    // wire-format change (ADR-0023 §3).
+    // Group+epoch-salted id: ciphertext replays within one group+epoch
+    // dedupe; identical plaintext across groups or epochs survives.
+    // Identical plaintext *within* one group+epoch still collapses —
+    // per-message MLS identity is a future wire-format change (ADR-0023 §3).
     history.record(x0x::history::HistoryRecord {
-        msg_id: x0x::history::HistoryRecord::compute_epoch_msg_id(epoch, plaintext),
+        msg_id: x0x::history::HistoryRecord::compute_epoch_msg_id(
+            stable_group_id,
+            epoch,
+            plaintext,
+        ),
         scope: x0x::history::Scope::Group(stable_group_id.to_string()),
         author_agent: None,
         author_machine: None,

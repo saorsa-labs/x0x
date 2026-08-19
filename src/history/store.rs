@@ -1177,6 +1177,100 @@ mod tests {
         }
     }
 
+    fn mls_rec(stable_id: &str, epoch: u64, payload: &[u8]) -> HistoryRecord {
+        HistoryRecord {
+            msg_id: HistoryRecord::compute_epoch_msg_id(stable_id, epoch, payload),
+            scope: Scope::Group(stable_id.into()),
+            author_agent: None,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1_000,
+            seen_at_ms: 1_000,
+            direction: Direction::Inbound,
+            content_type: "text/plain".into(),
+            payload: payload.to_vec(),
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: Provenance::LocalAppDecrypt,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        }
+    }
+
+    /// #276: identical plaintext + coinciding MLS epochs in two groups
+    /// must not collide on the global UNIQUE(msg_id).
+    #[test]
+    fn epoch_msg_id_two_groups_same_payload_and_epoch_both_insert() {
+        let (store, _dir) = open();
+        let a = mls_rec("group-a", 3, b"identical-plaintext");
+        let b = mls_rec("group-b", 3, b"identical-plaintext");
+        assert_ne!(
+            a.msg_id, b.msg_id,
+            "v2 helper must mix stable_id so two groups cannot share an id"
+        );
+        assert_eq!(store.insert(&a).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(store.insert(&b).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(store.query(&HistoryQuery::default()).unwrap().len(), 2);
+    }
+
+    /// Same group+epoch+payload is a replay and must keep UNIQUE(msg_id).
+    #[test]
+    fn epoch_msg_id_same_triple_is_duplicate() {
+        let (store, _dir) = open();
+        let first = mls_rec("group-a", 3, b"plaintext");
+        let again = mls_rec("group-a", 3, b"plaintext");
+        assert_eq!(first.msg_id, again.msg_id);
+        assert_eq!(store.insert(&first).unwrap(), InsertOutcome::Inserted);
+        assert_eq!(store.insert(&again).unwrap(), InsertOutcome::Duplicate);
+        assert_eq!(store.query(&HistoryQuery::default()).unwrap().len(), 1);
+    }
+
+    /// I4: unsigned LocalAppDecrypt carries a v2 id that is not
+    /// BLAKE3(payload) and cannot be recomputed (epoch is not stored).
+    /// validate() must treat it as opaque, same as unsigned LocalSend.
+    #[test]
+    fn unsigned_local_app_decrypt_with_v2_id_validates_and_inserts() {
+        let (store, _dir) = open();
+        let r = mls_rec("group-a", 9, b"mls-plaintext");
+        assert_ne!(
+            r.msg_id,
+            HistoryRecord::compute_msg_id(None, &r.payload),
+            "v2 id must not collapse to BLAKE3(payload)"
+        );
+        r.validate()
+            .expect("unsigned LocalAppDecrypt with v2 id must be opaque to validate");
+        assert_eq!(store.insert(&r).unwrap(), InsertOutcome::Inserted);
+    }
+
+    /// A signed artifact whose msg_id does not match the artifact is still
+    /// rejected — I4 only skips the check when there is no artifact.
+    #[test]
+    fn artifact_msg_id_mismatch_is_still_rejected() {
+        let (store, _dir) = open();
+        let mut r = rec(b"payload", Scope::Group("g".into()));
+        r.signed_artifact = Some(b"signed-bytes".to_vec());
+        r.provenance = Provenance::VerifiedEnvelope;
+        r.msg_id = HistoryRecord::compute_epoch_msg_id("g", 1, b"payload");
+        let err = r
+            .validate()
+            .expect_err("mismatched artifact id must fail validate");
+        assert!(
+            err.to_string().contains("msg_id does not match"),
+            "validate must name the artifact mismatch; got: {err}"
+        );
+        let insert_err = store
+            .insert(&r)
+            .expect_err("insert must refuse artifact mismatch");
+        assert!(
+            insert_err.to_string().contains("msg_id does not match"),
+            "insert must surface the same mismatch; got: {insert_err}"
+        );
+    }
+
     /// ADR-0023 §3: rows re-verify offline from signed_artifact +
     /// author_pubkey. Store a real ML-DSA-65-signed artifact, reload it
     /// from SQLite, and re-run verification over the stored bytes.
