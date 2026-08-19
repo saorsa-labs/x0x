@@ -4543,8 +4543,8 @@ pub enum PeerAdmission {
     /// no `PeerConnected` — even while a transient transport connection
     /// exists.
     Suppressed,
-    /// Connected and unsuppressed, but the plane is unresolved inside
-    /// [`PLANE_LEGACY_GRACE`] (issue #206 fail-closed pending).
+    /// Connected and unsuppressed, but the plane is unresolved inside the
+    /// 10s plane-legacy grace (issue #206 fail-closed pending).
     PlanePending,
     /// No transport connection.
     NotConnected,
