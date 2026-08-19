@@ -181,6 +181,21 @@ impl TaskList {
         self.authorized_agents = None;
     }
 
+    /// Whether an envelope-verified writer may apply content fields
+    /// (add / metadata LWW / name / order / remove) during a delta merge.
+    ///
+    /// "Member may edit": open (any writer) when no authorized set is
+    /// configured; otherwise the writer must be a member. The payload
+    /// `PeerId` is never consulted here — it is an OR-Set uniqueness tag,
+    /// not an identity (issue #349, invariant I3).
+    #[must_use]
+    pub(crate) fn is_authorized_content_writer(&self, writer: &AgentId) -> bool {
+        match &self.authorized_agents {
+            None => true,
+            Some(members) => members.contains(writer),
+        }
+    }
+
     /// Get the current version counter.
     ///
     /// Incremented on every effective local snapshot change — local mutations
@@ -462,6 +477,30 @@ impl TaskList {
         let authorized = self.authorized_agents.clone();
         if let Some(existing) = self.task_data.get_mut(task_id) {
             existing.merge(scope, other)?;
+            if let Some(members) = &authorized {
+                let _dropped = existing.filter_unauthorized(members);
+            }
+        }
+        Ok(())
+    }
+
+    /// Checkbox-only variant of [`Self::delta_merge_task`] (issue #349,
+    /// Layer A): unions checkbox state + attestations into the EXISTING
+    /// local task, then applies the provenance and membership admission
+    /// gates, without merging any unauthenticated content field
+    /// (title/description/assignee/priority LWW). Does NOT bump version
+    /// (deferred to `commit_revision_if_changed`). No-op if the task does
+    /// not exist locally — a first-seen task is never created by this path.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(crate) fn delta_merge_checkbox_only(
+        &mut self,
+        task_id: &TaskId,
+        other: &TaskItem,
+    ) -> Result<()> {
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
+        if let Some(existing) = self.task_data.get_mut(task_id) {
+            existing.merge_checkbox_only(scope, other)?;
             if let Some(members) = &authorized {
                 let _dropped = existing.filter_unauthorized(members);
             }
@@ -1156,8 +1195,13 @@ mod tests {
             list_a.current_version(),
         );
 
-        // B applies the delta over the gossip path.
-        list_b.merge_delta(&delta, peer1).unwrap();
+        // B applies the delta over the gossip path. Writer=None is
+        // deliberate (issue #349, Layer A): the task already exists locally
+        // and the claim carries its own OpAttestation, so checkbox
+        // admission must still run and the claim must still advance the
+        // version — anonymous content fields are dropped, attested claims
+        // are not.
+        list_b.merge_delta(&delta, peer1, None).unwrap();
         assert!(
             list_b
                 .get_task(&task_id)

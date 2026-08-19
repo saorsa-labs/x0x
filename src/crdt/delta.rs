@@ -13,6 +13,7 @@
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
 use crate::crdt::{Result, TaskId, TaskItem, TaskList, TaskListId};
+use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -194,18 +195,39 @@ impl TaskList {
     /// - Ordering uses LWW semantics
     /// - Name uses LWW semantics
     ///
+    /// # Authorship gate (issue #349, Layer A)
+    ///
+    /// Unauthenticated content fields (added tasks, metadata LWW on
+    /// TaskItem, list name, ordering, removes) apply only when `writer` —
+    /// the V2-envelope-verified sender (`AgentId`) — is `Some` AND, when
+    /// the list has an authorized-member set, is a member of it. Otherwise
+    /// they are silently rejected (Ok, KV-style) so unsigned or
+    /// non-member deltas cannot attribute create/rename/reassign/reorder/
+    /// remove to anyone. Checkbox claim/complete admission is unaffected:
+    /// it is gated by `OpAttestation`, so an attested claim on a task the
+    /// receiver already holds still converges when content is dropped.
+    ///
     /// # Arguments
     ///
     /// * `delta` - The delta to merge
+    /// * `peer_id` - OR-Set uniqueness tag source for first-seen upserts.
+    ///   NOT an identity: never compared against `writer` (invariant I3).
+    /// * `writer` - Envelope-verified sender, if any (`None` for unsigned
+    ///   legacy v1 publishes).
     ///
     /// # Returns
     ///
-    /// Ok(()) if merge succeeded.
+    /// Ok(()) if merge succeeded (including silent content rejection).
     ///
     /// # Errors
     ///
     /// Returns an error if merge operations fail.
-    pub fn merge_delta(&mut self, delta: &TaskListDelta, peer_id: PeerId) -> Result<()> {
+    pub fn merge_delta(
+        &mut self,
+        delta: &TaskListDelta,
+        peer_id: PeerId,          // tag only, not identity
+        writer: Option<&AgentId>, // envelope-verified sender
+    ) -> Result<()> {
         // Capture the resolved observable fingerprint BEFORE applying the
         // delta so the local version advances exactly once iff this merge
         // effectively changes the local snapshot. (Remote claim/complete
@@ -222,20 +244,48 @@ impl TaskList {
         // resolution. Because this fingerprint wraps the entire merge body, it
         // is computed over post-gate (authenticated) state by construction.
         let before = self.state_fingerprint();
+
+        // Layer A authorship gate (issue #349, I2 + membership): decide ONCE
+        // whether unauthenticated content fields may apply. Identity is the
+        // envelope-verified `writer` (AgentId) only; `peer_id` and every
+        // UniqueTag in the delta are OR-Set tags, never authors (I3).
+        let content_allowed = match writer {
+            None => false,
+            Some(w) => self.is_authorized_content_writer(w),
+        };
+        if !content_allowed {
+            tracing::warn!(
+                ?writer,
+                list = ?self.id(),
+                "dropping unauthenticated content in task-list delta (issue #349)"
+            );
+        }
+
         for (task_id, (task, tag)) in &delta.added_tasks {
             // If task doesn't exist, add it (admit runs inside delta_upsert_task).
             // If it exists, merge + filter (admit + membership run inside
-            // delta_merge_task).
+            // delta_merge_task / delta_merge_checkbox_only).
             if self.get_task(task_id).is_none() {
-                self.delta_upsert_task(task.clone(), tag.0, tag.1)?;
-            } else {
+                if content_allowed {
+                    self.delta_upsert_task(task.clone(), tag.0, tag.1)?;
+                }
+                // A first-seen task from an unauthenticated add is NOT
+                // created: there is no local task to run checkbox admission
+                // against, and `created_by` is self-declared payload.
+            } else if content_allowed {
                 self.delta_merge_task(task_id, task)?;
+            } else {
+                // Existing task: checkbox + attestations still merge and run
+                // the admission gate even when content is dropped.
+                self.delta_merge_checkbox_only(task_id, task)?;
             }
         }
 
         // Apply removed tasks (no version bump; deferred to commit_revision).
-        for task_id in delta.removed_tasks.keys() {
-            self.delta_remove_task(task_id);
+        if content_allowed {
+            for task_id in delta.removed_tasks.keys() {
+                self.delta_remove_task(task_id);
+            }
         }
 
         // Apply task updates (upsert: merge if exists, insert if missing).
@@ -246,8 +296,12 @@ impl TaskList {
         // inside delta_upsert_task / merge.
         for (task_id, updated_task) in &delta.task_updates {
             if self.get_task(task_id).is_some() {
-                self.delta_merge_task(task_id, updated_task)?;
-            } else {
+                if content_allowed {
+                    self.delta_merge_task(task_id, updated_task)?;
+                } else {
+                    self.delta_merge_checkbox_only(task_id, updated_task)?;
+                }
+            } else if content_allowed {
                 // Task not yet known — insert it (admit runs inside).
                 self.delta_upsert_task(updated_task.clone(), peer_id, 0)?;
             }
@@ -256,13 +310,15 @@ impl TaskList {
         // Apply ordering update via LWW (vector-clock) merge. The merged
         // ordering may reference task IDs not yet present (out-of-order
         // delivery); tasks_ordered filters those at read time.
-        if let Some(order_register) = &delta.ordering_update {
-            self.delta_merge_ordering(order_register);
-        }
+        if content_allowed {
+            if let Some(order_register) = &delta.ordering_update {
+                self.delta_merge_ordering(order_register);
+            }
 
-        // Apply name update via LWW (vector-clock) merge.
-        if let Some(name_register) = &delta.name_update {
-            self.delta_merge_name(name_register);
+            // Apply name update via LWW (vector-clock) merge.
+            if let Some(name_register) = &delta.name_update {
+                self.delta_merge_name(name_register);
+            }
         }
 
         // Advance the local revision exactly once iff the resolved observable
@@ -280,10 +336,12 @@ impl DeltaCrdt for TaskList {
     type Delta = TaskListDelta;
 
     fn merge(&mut self, delta: &Self::Delta) -> anyhow::Result<()> {
-        // Use a default peer_id for the merge
-        // In a real implementation, the peer_id would come from the sync context
+        // No writer identity here — DeltaCrdt::merge is NOT a production
+        // untrusted-apply path (issue #349). Pass `None` so no unsigned
+        // content applies; the trusted gossip route is TaskListSync, which
+        // threads the envelope-verified sender into merge_delta.
         let peer_id = PeerId::new([0u8; 32]);
-        self.merge_delta(delta, peer_id)
+        self.merge_delta(delta, peer_id, None)
             .map_err(|e| anyhow::anyhow!("Failed to merge delta: {}", e))
     }
 
@@ -417,8 +475,9 @@ mod tests {
         // Generate a full-state delta from list2
         let delta = list2.full_delta();
 
-        // Merge delta into list1
-        let result = list1.merge_delta(&delta, peer1);
+        // Merge delta into list1 (envelope-verified writer; the payload tag
+        // PeerId stays tag-only).
+        let result = list1.merge_delta(&delta, peer1, Some(&agent(2)));
         assert!(result.is_ok());
 
         // list1 should now have the task
@@ -452,7 +511,9 @@ mod tests {
         // Fresh joiner with an empty list applies only the cold-start snapshot.
         let mut joiner = TaskList::new(id, String::new(), joiner_peer);
         let snapshot = holder.full_delta();
-        joiner.merge_delta(&snapshot, holder_peer).expect("merge");
+        joiner
+            .merge_delta(&snapshot, holder_peer, Some(&agent(1)))
+            .expect("merge");
 
         assert_eq!(joiner.task_count(), 3, "all tasks transferred");
         assert_eq!(joiner.name(), "Sprint Backlog", "name transferred");
@@ -463,6 +524,10 @@ mod tests {
 
     #[test]
     fn test_delta_crdt_trait_merge() {
+        // Layer A (issue #349): DeltaCrdt::merge carries no writer identity,
+        // so it is NOT an untrusted-apply path — it passes `None` and must
+        // apply no unsigned content. The task from list2's delta must NOT
+        // land, and the version must not advance on dropped content.
         let peer1 = peer(1);
         let peer2 = peer(2);
         let id = list_id(1);
@@ -479,12 +544,17 @@ mod tests {
         let result = DeltaCrdt::merge(&mut list1, &delta);
         assert!(result.is_ok());
 
-        // Version reflects all mutations from the merge: add_task + reorder + update_name
-        assert!(
-            DeltaCrdt::version(&list1) > 0,
-            "version should be bumped after merge"
+        // Unsigned content must not apply: no task, no version advance.
+        assert_eq!(
+            list1.task_count(),
+            0,
+            "unsigned content must not apply via DeltaCrdt::merge"
         );
-        assert_eq!(list1.task_count(), 1);
+        assert_eq!(
+            DeltaCrdt::version(&list1),
+            0,
+            "dropped content must not advance the version"
+        );
     }
 
     #[test]
@@ -522,7 +592,9 @@ mod tests {
         delta.ordering_update = Some(order_register);
 
         // Merge delta
-        list.merge_delta(&delta, peer).ok().unwrap();
+        list.merge_delta(&delta, peer, Some(&agent(1)))
+            .ok()
+            .unwrap();
 
         // Verify ordering changed
         let tasks = list.tasks_ordered();
@@ -551,7 +623,9 @@ mod tests {
 
         let mut delta = TaskListDelta::new(7);
         delta.name_update = Some(stale);
-        list.merge_delta(&delta, remote).ok().unwrap();
+        list.merge_delta(&delta, remote, Some(&agent(2)))
+            .ok()
+            .unwrap();
 
         assert_eq!(list.name(), "Newest", "stale name must not clobber newer");
     }
@@ -570,7 +644,9 @@ mod tests {
         delta.name_update = Some(other.name_register().clone());
 
         // Merge delta
-        list.merge_delta(&delta, peer).ok().unwrap();
+        list.merge_delta(&delta, peer, Some(&agent(1)))
+            .ok()
+            .unwrap();
 
         // Verify name changed
         assert_eq!(list.name(), "Updated");
@@ -603,7 +679,7 @@ mod tests {
         delta.ordering_update = Some(order_register);
 
         let v0 = list.version();
-        list.merge_delta(&delta, peer).unwrap();
+        list.merge_delta(&delta, peer, Some(&agent(1))).unwrap();
         let v1 = list.version();
         assert!(
             v1 > v0,
@@ -612,7 +688,7 @@ mod tests {
 
         // Second identical merge: the ordering is already resolved identically
         // ⇒ the fingerprint is unchanged ⇒ the version MUST NOT advance again.
-        list.merge_delta(&delta, peer).unwrap();
+        list.merge_delta(&delta, peer, Some(&agent(1))).unwrap();
         assert_eq!(
             list.version(),
             v1,
@@ -620,5 +696,225 @@ mod tests {
         );
         // The two real tasks are still present (no spurious removal).
         assert_eq!(list.task_count(), 2);
+    }
+
+    // ------------------------------------------------------------------
+    // Layer A authorship gate (issue #349)
+    // ------------------------------------------------------------------
+
+    fn signing_for(_n: u8) -> (AgentId, crate::gossip::SigningContext) {
+        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
+        (
+            kp.agent_id(),
+            crate::gossip::SigningContext::from_keypair(&kp),
+        )
+    }
+
+    /// Seed a receiver exactly like [`forged_content_delta_template`]'s base
+    /// so the delta's LWW registers causally dominate on merge.
+    fn seeded_receiver(id: TaskListId, members: Option<AgentId>) -> (TaskList, TaskId, TaskId) {
+        let mut list = TaskList::new(id, "Sprint".to_string(), peer(3));
+        if let Some(m) = members {
+            list.set_authorized_agents(HashSet::from([m]));
+        }
+        let t0 = make_task(1, peer(3));
+        let t0_id = *t0.id();
+        list.add_task(t0, peer(3), 1).expect("seed t0");
+        (list, t0_id, TaskId::from_bytes([2; 32]))
+    }
+
+    /// A delta whose every payload PeerId component equals the victim's
+    /// AgentId bytes: an attacker tries to borrow the victim's identity
+    /// through the OR-Set tag / LWW-clock namespace.
+    fn forged_content_delta(id: TaskListId, t0_id: TaskId) -> TaskListDelta {
+        let spoofed = PeerId::new(agent(1).0);
+        // Template constructed identically to seeded_receiver so registers
+        // cloned from it dominate the receiver's.
+        let mut template = TaskList::new(id, "Sprint".to_string(), peer(3));
+        template
+            .add_task(make_task(1, peer(3)), peer(3), 1)
+            .expect("seed t0");
+
+        // New task attributed to the victim (`created_by` = agent(1)).
+        let t1 = make_task(2, spoofed);
+        let t1_id = *t1.id();
+        let mut delta = TaskListDelta::new(5);
+        delta.added_tasks.insert(t1_id, (t1, (spoofed, 1)));
+
+        // Forged rename + reorder, clocked by the spoofed peer.
+        let mut name_reg = template.name_register().clone();
+        name_reg.set("Pwned".to_string(), spoofed);
+        delta.name_update = Some(name_reg);
+        let mut order_reg = template.ordering_register().clone();
+        order_reg.set(vec![t1_id, t0_id], spoofed);
+        delta.ordering_update = Some(order_reg);
+
+        // Forged remove of the existing task.
+        delta
+            .removed_tasks
+            .insert(t0_id, HashSet::from([(spoofed, 1)]));
+        delta
+    }
+
+    #[test]
+    fn merge_delta_spoofed_payload_peer_id_is_not_identity() {
+        // WHY (issue #349, invariant I3): the payload PeerId is an OR-Set
+        // uniqueness tag, never an author. A member (attacker) forging a
+        // delta whose payload PeerId EQUALS the victim's AgentId bytes must
+        // not borrow the victim's authority: content admission is gated by
+        // the envelope-verified writer (AgentId) against the
+        // authorized-agents set, never by comparing PeerId bytes to AgentId
+        // bytes.
+        let id = list_id(1);
+        let victim = agent(1);
+        let attacker = agent(99);
+        let spoofed = PeerId::new(victim.0); // same bytes — must NOT grant identity
+
+        let (mut list, t0_id, t1_id) = seeded_receiver(id, Some(victim));
+        let order_before: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
+        let delta = forged_content_delta(id, t0_id);
+
+        // The ATTACKER is the verified envelope sender: every content field
+        // must be silently dropped (Ok, no error — KV-style reject).
+        list.merge_delta(&delta, spoofed, Some(&attacker))
+            .expect("silent reject, not an error");
+        assert_eq!(list.task_count(), 1, "spoofed add must not create a task");
+        assert!(
+            list.get_task(&t1_id).is_none(),
+            "no task attributed to the victim"
+        );
+        assert!(
+            list.get_task(&t0_id).is_some(),
+            "spoofed remove must not delete"
+        );
+        assert_eq!(list.name(), "Sprint", "spoofed rename must not apply");
+        let order_after: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
+        assert_eq!(order_after, order_before, "spoofed reorder must not apply");
+
+        // The VICTIM as the verified writer, with a DIFFERENT payload
+        // PeerId: the same delta applies — proving the writer AgentId (not
+        // the payload PeerId) is the gate.
+        let (mut honest, t0_id, t1_id) = seeded_receiver(id, Some(victim));
+        honest
+            .merge_delta(&delta, peer(7), Some(&victim))
+            .expect("honest merge");
+        assert!(
+            honest.get_task(&t1_id).is_some(),
+            "victim's add applies regardless of payload PeerId"
+        );
+        assert!(
+            honest.get_task(&t0_id).is_none(),
+            "victim's remove applies regardless of payload PeerId"
+        );
+        assert_eq!(honest.name(), "Pwned", "victim's rename applies");
+    }
+
+    #[test]
+    fn merge_delta_anonymous_writer_drops_content_but_admits_attested_claim() {
+        // WHY (issue #349, I2): an unsigned (anonymous-sender) delta must
+        // not apply ANY unauthenticated content field — add, metadata LWW,
+        // name, order, remove — while checkbox admission (gated by
+        // OpAttestation, not by the envelope writer) still admits a validly
+        // attested claim on a task the receiver already holds.
+        let id = list_id(1);
+        let p = peer(4);
+        let (mut list, t0_id, t1_id) = seeded_receiver(id, None);
+        let order_before: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
+
+        // A source task carrying BOTH a validly-attested claim AND a forged
+        // title change (no content attestation exists — Layer B is HOLD).
+        let (claimer, signing) = signing_for(5);
+        let mut claimed = make_task(1, p);
+        claimed.claim(id, claimer, p, 42, &signing).expect("attest");
+        claimed.update_title("Forged title".to_string(), peer(9));
+
+        let mut delta = forged_content_delta(id, t0_id);
+        delta.task_updates.insert(t0_id, claimed);
+
+        list.merge_delta(&delta, peer(9), None)
+            .expect("silent reject, not an error");
+
+        // Content dropped: no new task, no remove, no rename, no reorder,
+        // no metadata LWW.
+        assert_eq!(
+            list.task_count(),
+            1,
+            "anonymous add must not create a task (I2)"
+        );
+        assert!(list.get_task(&t1_id).is_none(), "no first-seen insert");
+        assert!(list.get_task(&t0_id).is_some(), "anonymous remove dropped");
+        assert_eq!(list.name(), "Sprint", "anonymous rename dropped");
+        let order_after: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
+        assert_eq!(order_after, order_before, "anonymous reorder dropped");
+        assert_ne!(
+            list.get_task(&t0_id).expect("t0").title(),
+            "Forged title",
+            "anonymous metadata LWW dropped"
+        );
+
+        // Checkbox admission still ran for the existing task: the attested
+        // claim survives even though every content field was dropped.
+        assert!(
+            list.get_task(&t0_id)
+                .expect("t0")
+                .current_state()
+                .is_claimed(),
+            "attested claim must still be admitted with writer=None"
+        );
+    }
+
+    #[test]
+    fn merge_delta_honest_writer_content_applies() {
+        // WHY (issue #349): a verified envelope writer must keep today's
+        // apply path — add / name / order / remove all land when the list
+        // has no authorized set (Layer A needs no new attestations; Layer B
+        // is HOLD).
+        let id = list_id(1);
+        let (mut list, t0_id, t1_id) = seeded_receiver(id, None);
+        let delta = forged_content_delta(id, t0_id);
+
+        list.merge_delta(&delta, peer(7), Some(&agent(1)))
+            .expect("honest writer merge");
+
+        assert!(
+            list.get_task(&t1_id).is_some(),
+            "add applies for a verified writer"
+        );
+        assert!(
+            list.get_task(&t0_id).is_none(),
+            "remove applies for a verified writer"
+        );
+        assert_eq!(list.name(), "Pwned", "rename applies for a verified writer");
+        let order: Vec<_> = list.tasks_ordered().iter().map(|t| *t.id()).collect();
+        assert_eq!(order, vec![t1_id], "reorder applies for a verified writer");
+    }
+
+    #[test]
+    fn merge_delta_membership_gates_unauthorized_writer_content() {
+        // WHY (issue #349, I8): with an authorized-member set, content from
+        // a writer OUTSIDE the set is dropped — "member may edit" — while
+        // the same delta from a member applies.
+        let id = list_id(1);
+        let alice = agent(1);
+        let bob = agent(2);
+
+        let (mut list, t0_id, t1_id) = seeded_receiver(id, Some(alice));
+        let delta = forged_content_delta(id, t0_id);
+        list.merge_delta(&delta, peer(7), Some(&bob))
+            .expect("silent reject, not an error");
+        assert!(list.get_task(&t1_id).is_none(), "non-member add dropped");
+        assert!(list.get_task(&t0_id).is_some(), "non-member remove dropped");
+        assert_eq!(list.name(), "Sprint", "non-member rename dropped");
+
+        let (mut member_list, t0_id, t1_id) = seeded_receiver(id, Some(alice));
+        member_list
+            .merge_delta(&delta, peer(7), Some(&alice))
+            .expect("member merge");
+        assert!(member_list.get_task(&t1_id).is_some(), "member add applies");
+        assert!(
+            member_list.get_task(&t0_id).is_none(),
+            "member remove applies"
+        );
+        assert_eq!(member_list.name(), "Pwned", "member rename applies");
     }
 }
