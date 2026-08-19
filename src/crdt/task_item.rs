@@ -742,6 +742,51 @@ impl TaskItem {
         Ok(())
     }
 
+    /// Checkbox-only merge (issue #349, Layer A).
+    ///
+    /// Unions the checkbox OR-Set and the attestation map, then runs the
+    /// same provenance admission gate as [`Self::merge`] — WITHOUT merging
+    /// the title/description/assignee/priority LWW registers (their clocks
+    /// are never even considered). Used by the delta path when the
+    /// envelope-verified writer is absent or not an authorized member:
+    /// unauthenticated content fields must not land, while an attested
+    /// Claimed/Done on an existing task still converges (checkbox admission
+    /// is gated by `OpAttestation`, not by the envelope writer).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the tasks have different IDs or the checkbox
+    /// OR-Set merge fails.
+    pub fn merge_checkbox_only(&mut self, scope: TaskListId, other: &TaskItem) -> Result<()> {
+        if self.id != other.id {
+            return Err(CrdtError::Merge(format!(
+                "Cannot merge tasks with different IDs: {} != {}",
+                self.id, other.id
+            )));
+        }
+
+        self.checkbox
+            .merge_state(&other.checkbox)
+            .map_err(|e| CrdtError::Merge(format!("Failed to merge checkbox states: {}", e)))?;
+
+        for (state, att) in &other.attestations {
+            self.attestations
+                .entry(state.clone())
+                .or_insert_with(|| att.clone());
+        }
+
+        let dropped =
+            purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations);
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "purged unauthenticated task checkbox elements during checkbox-only merge"
+            );
+        }
+
+        Ok(())
+    }
+
     /// Fail-closed admission gate: purge every checkbox element and attestation
     /// entry whose attestation is missing or fails verification for `scope`.
     ///
@@ -1843,7 +1888,11 @@ mod tests {
         delta.added_tasks.insert(task_id, (forged, (peer(1), 1)));
 
         let mut receiver = crate::crdt::TaskList::new(id, "L".to_string(), peer(2));
-        receiver.merge_delta(&delta, peer(1)).unwrap();
+        // Layer A (issue #349): a writer is required for the first-seen add
+        // itself; the forged CLAIM inside it must still be purged.
+        receiver
+            .merge_delta(&delta, peer(1), Some(&agent(1)))
+            .unwrap();
 
         let t = receiver.get_task(&task_id).expect("task admitted");
         assert!(
@@ -1866,7 +1915,9 @@ mod tests {
         delta.task_updates.insert(task_id, forged);
 
         let mut receiver = crate::crdt::TaskList::new(id, "L".to_string(), peer(2));
-        receiver.merge_delta(&delta, peer(3)).unwrap();
+        receiver
+            .merge_delta(&delta, peer(3), Some(&agent(1)))
+            .unwrap();
 
         let t = receiver
             .get_task(&task_id)
@@ -1893,7 +1944,9 @@ mod tests {
         let snapshot = holder.full_delta();
 
         let mut joiner = crate::crdt::TaskList::new(id, String::new(), peer(2));
-        joiner.merge_delta(&snapshot, peer(1)).unwrap();
+        joiner
+            .merge_delta(&snapshot, peer(1), Some(&agent(1)))
+            .unwrap();
 
         let t = joiner.get_task(&task_id).expect("task transferred");
         assert!(
@@ -1924,7 +1977,9 @@ mod tests {
             delta.added_tasks.insert(task_id, (forged, (peer(1), 1)));
 
             let mut receiver = crate::crdt::TaskList::new(id, "L".to_string(), peer(2));
-            receiver.merge_delta(&delta, peer(1)).unwrap();
+            receiver
+                .merge_delta(&delta, peer(1), Some(&agent(1)))
+                .unwrap();
 
             let t = receiver
                 .get_task(&task_id)
@@ -1961,7 +2016,7 @@ mod tests {
         delta.added_tasks.insert(task_id, (task, (p, 1)));
 
         let mut receiver = crate::crdt::TaskList::new(id, "L".to_string(), peer(2));
-        receiver.merge_delta(&delta, p).unwrap();
+        receiver.merge_delta(&delta, p, Some(&agent(1))).unwrap();
 
         let t = receiver.get_task(&task_id).expect("valid task admitted");
         assert!(

@@ -154,6 +154,25 @@ async fn group_state(d: &AgentInstance, group_id: &str) -> Option<Value> {
     Some(resp.json().await.unwrap_or_default())
 }
 
+/// Wait (bounded) for a path to be removed. The withdrawn/banned state flag
+/// can become observable through the API before the TreeKEM snapshot file
+/// delete completes, so an immediate `try_exists` assert races on slower CI
+/// disks — a flake class seen twice on CI (2026-08-19, two different tests,
+/// same assertion shape). Bounded: a file that genuinely survives fails with
+/// the caller's message after the timeout.
+async fn wait_until_gone(path: &std::path::Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Ok(false) = tokio::fs::try_exists(path).await {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+}
+
 // ===========================================================================
 // 1. Create Named Group
 // ===========================================================================
@@ -1865,13 +1884,13 @@ async fn named_group_admin_delete_propagates_to_peer_after_creator_delete_409() 
         "deleter authoring must be rejected after withdrawal"
     );
     assert!(
-        !tokio::fs::try_exists(
-            bob.data_dir()
+        wait_until_gone(
+            &bob.data_dir()
                 .join("treekem")
-                .join(format!("{bob_group_id}.snap"))
+                .join(format!("{bob_group_id}.snap")),
+            Duration::from_secs(10)
         )
-        .await
-        .unwrap_or(false),
+        .await,
         "deleting admin TreeKEM snapshot should be wiped"
     );
 
@@ -1897,14 +1916,14 @@ async fn named_group_admin_delete_propagates_to_peer_after_creator_delete_409() 
         "recipient authoring must be rejected after withdrawal"
     );
     assert!(
-        !tokio::fs::try_exists(
-            alice
+        wait_until_gone(
+            &alice
                 .data_dir()
                 .join("treekem")
-                .join(format!("{group_id}.snap"))
+                .join(format!("{group_id}.snap")),
+            Duration::from_secs(10)
         )
-        .await
-        .unwrap_or(false),
+        .await,
         "recipient TreeKEM snapshot should be wiped after GroupDeleted"
     );
 }
@@ -2298,13 +2317,13 @@ async fn group_deleted_lost_initial_volley_recovers_via_bounded_resend() {
         "recipient authoring must be rejected after a resent GroupDeleted"
     );
     assert!(
-        !tokio::fs::try_exists(
-            bob.data_dir()
+        wait_until_gone(
+            &bob.data_dir()
                 .join("treekem")
-                .join(format!("{bob_group_id}.snap"))
+                .join(format!("{bob_group_id}.snap")),
+            Duration::from_secs(10)
         )
-        .await
-        .unwrap_or(false),
+        .await,
         "recipient TreeKEM snapshot must be wiped by a resent GroupDeleted"
     );
 }
@@ -2382,13 +2401,13 @@ async fn member_banned_lost_initial_volley_recovers_via_bounded_resend() {
     // Terminalization must be real, not just a roster flag: applying your own
     // ban tears down the local TreeKEM group and wipes its persistence.
     assert!(
-        !tokio::fs::try_exists(
-            bob.data_dir()
+        wait_until_gone(
+            &bob.data_dir()
                 .join("treekem")
-                .join(format!("{bob_group_id}.snap"))
+                .join(format!("{bob_group_id}.snap")),
+            Duration::from_secs(10)
         )
-        .await
-        .unwrap_or(false),
+        .await,
         "banned member's TreeKEM snapshot must be wiped by a resent MemberBanned"
     );
 

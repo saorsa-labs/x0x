@@ -97,12 +97,26 @@ fn wait_until_clock_after(timestamp: u64) {
 }
 
 fn anti_entropy_callback(
-    target: Arc<AntiEntropyManager<TaskList>>,
+    replica: Arc<RwLock<TaskList>>,
     sender: PeerId,
+    writer: AgentId,
 ) -> impl Fn(PeerId, TaskListDelta) -> AntiEntropyFuture + Send + Sync + 'static {
     move |_target_peer, delta| {
-        let target = Arc::clone(&target);
-        Box::pin(async move { target.apply_delta(sender, &delta, delta.version).await })
+        let replica = Arc::clone(&replica);
+        let writer = writer;
+        Box::pin(async move {
+            // #349 Layer A: the manager's `apply_delta` merges writer-less
+            // (`DeltaCrdt::merge` has no envelope channel), which fail-closes
+            // content. This in-memory channel stands in for the signed gossip
+            // envelope, so apply through TaskList's authorized seam with the
+            // keypair-derived writer that channel implies. Skipping the
+            // manager here is behavior-preserving: its `apply_delta` only
+            // merges writer-less plus a peer-registry `or_insert(0)` that
+            // `add_peer` already satisfied.
+            let mut list = replica.write().await;
+            list.merge_delta(&delta, sender, Some(&writer))?;
+            Ok(())
+        })
     }
 }
 
@@ -187,9 +201,12 @@ async fn test_anti_entropy_repairs_dropped_delta() -> Result<()> {
     }
 
     let delivered_delta = generated_delta(&replica_a, 0).await?;
-    anti_entropy_b
-        .apply_delta(peer_a, &delivered_delta, delivered_delta.version)
-        .await?;
+    // Authorized seam, same rationale as the callback below (#349 Layer A):
+    // the manager's writer-less apply_delta would silently drop this content.
+    {
+        let mut b = replica_b.write().await;
+        b.merge_delta(&delivered_delta, peer_a, Some(&agent_id(1)))?;
+    }
 
     {
         let mut a = replica_a.write().await;
@@ -211,12 +228,19 @@ async fn test_anti_entropy_repairs_dropped_delta() -> Result<()> {
     }
 
     anti_entropy_a
-        .start(anti_entropy_callback(Arc::clone(&anti_entropy_b), peer_a))
+        .start(anti_entropy_callback(
+            Arc::clone(&replica_b),
+            peer_a,
+            agent_id(1),
+        ))
         .await?;
     anti_entropy_b
-        .start(anti_entropy_callback(Arc::clone(&anti_entropy_a), peer_b))
+        .start(anti_entropy_callback(
+            Arc::clone(&replica_a),
+            peer_b,
+            agent_id(2),
+        ))
         .await?;
-
     let required_tasks = [task_id(1), task_id(2), task_id(3)];
     let converged = wait_for_convergence(&replica_a, &replica_b, &required_tasks).await;
 

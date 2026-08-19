@@ -16,6 +16,7 @@
 use crate::crdt::{Result, TaskList, TaskListDelta};
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
+use crate::identity::AgentId;
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
@@ -359,7 +360,11 @@ impl TaskListSync {
                 match decode_delta::<TaskListDelta>(&msg.payload) {
                     Ok((peer_id, delta)) => {
                         let mut list = task_list.write().await;
-                        if let Err(e) = list.merge_delta(&delta, peer_id) {
+                        // Layer A (issue #349): the V2-envelope-verified
+                        // sender is the writer identity; the payload
+                        // `peer_id` stays an OR-Set tag only (I3).
+                        let writer = msg.sender.as_ref();
+                        if let Err(e) = list.merge_delta(&delta, peer_id, writer) {
                             tracing::warn!("Failed to merge remote delta: {}", e);
                         } else if listener_bootstrap_active
                             .load(std::sync::atomic::Ordering::Relaxed)
@@ -723,8 +728,14 @@ impl TaskListSync {
     ///
     /// # Arguments
     ///
-    /// * `peer_id` - The peer who sent this delta
+    /// * `peer_id` - The peer who sent this delta (OR-Set tag source only,
+    ///   never an identity)
     /// * `delta` - The delta to apply
+    /// * `writer` - The envelope-verified sender, if any. Content fields
+    ///   (add/metadata/name/order/remove) apply only for a `Some` writer
+    ///   authorized by the list's member set; anonymous deltas fail closed
+    ///   (issue #349, Layer A). Attested checkbox operations on existing
+    ///   tasks still converge.
     ///
     /// # Returns
     ///
@@ -733,9 +744,14 @@ impl TaskListSync {
     /// # Errors
     ///
     /// Returns an error if the merge fails.
-    pub async fn apply_remote_delta(&self, peer_id: PeerId, delta: TaskListDelta) -> Result<()> {
+    pub async fn apply_remote_delta(
+        &self,
+        peer_id: PeerId,
+        delta: TaskListDelta,
+        writer: Option<&AgentId>,
+    ) -> Result<()> {
         let mut task_list = self.task_list.write().await;
-        task_list.merge_delta(&delta, peer_id)?;
+        task_list.merge_delta(&delta, peer_id, writer)?;
         Ok(())
     }
 
@@ -851,6 +867,17 @@ mod tests {
         TaskListSync::new(list, pubsub, topic.to_string(), peer(1)).expect("task list sync")
     }
 
+    /// Shared pubsub with a SIGNING context: local publishes carry a
+    /// V2-envelope-verified sender, so the delta-merge listener's Layer A
+    /// gate (issue #349) admits their content. The convergence tests below
+    /// need this — an unsigned pubsub would fail closed on every serve.
+    async fn signed_pubsub() -> Arc<PubSubManager> {
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
+        let signing = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub"))
+    }
+
     /// Build a `TaskListSync` that shares its pubsub with the caller (so the
     /// caller can subscribe before the sync publishes).
     async fn make_sync_with_pubsub(topic: &str) -> (TaskListSync, Arc<PubSubManager>) {
@@ -894,7 +921,7 @@ mod tests {
         // Apply delta directly (simulating what TaskListSync::apply_remote_delta does)
         {
             let mut list = task_list_arc.write().await;
-            let result = list.merge_delta(&delta, peer2);
+            let result = list.merge_delta(&delta, peer2, Some(&agent(2)));
             assert!(result.is_ok());
         }
 
@@ -995,7 +1022,10 @@ mod tests {
         let mut delta = TaskListDelta::new(1);
         delta.added_tasks.insert(task_id, (task, (remote, 1)));
 
-        sync.apply_remote_delta(remote, delta)
+        // Layer A (issue #349): the honest path needs an envelope-verified
+        // writer for content to apply.
+        let alice = agent(1);
+        sync.apply_remote_delta(remote, delta, Some(&alice))
             .await
             .expect("apply_remote_delta");
 
@@ -1064,7 +1094,7 @@ mod tests {
         // would still pass against a no-op `Ok(())` impl. The real
         // subscribe->merge behaviour is asserted end-to-end by
         // `start_default_spawner_merges_remote_delta`, which drives
-        // `start_with_spawner(tokio::spawn)` and verifies the task lands.
+        // `start_with_spawner(tokio::spawn)` and proves Layer A I2 (unsigned add does not land).
         let sync = make_sync("tasks/E").await;
         sync.start_with_spawner(|_fut| {
             // intentionally drop the future
@@ -1079,12 +1109,15 @@ mod tests {
 
     #[tokio::test]
     async fn start_default_spawner_merges_remote_delta() {
-        // End-to-end exercise of the delta-merge listener: a delta published
-        // on the topic is received by the background loop spawned by start()
-        // and merged into the local list. TaskList::merge_delta takes no
-        // writer identity, so an unsigned (anonymous-sender) publish — what
-        // the wire delivers via a PubSubManager with no signing context —
-        // merges without any access-control consideration.
+        // End-to-end exercise of the delta-merge listener through the Layer A
+        // gate (issue #349, I2): a delta published on the topic is received
+        // by the background loop spawned by start() and merged with the
+        // V2-envelope-verified sender as the writer. A PubSubManager with no
+        // signing context publishes UNSIGNED (anonymous-sender) messages, so
+        // the listener must fail closed on content: the delta's first-seen
+        // task add must NOT land, while an attested checkbox claim on a task
+        // the receiver already holds must still converge (checkbox admission
+        // is gated by OpAttestation, not by the envelope writer).
         let sync = make_sync("tasks/F").await;
 
         sync.start().await.expect("start");
@@ -1092,18 +1125,46 @@ mod tests {
         // Let the spawned subscribe-forwarder register before we publish.
         tokio::time::sleep(Duration::from_millis(100)).await;
 
+        // Seed an existing local task (local mutators are the trusted path —
+        // they are not the untrusted apply route this test exercises).
         let remote = peer(2);
-        let task = make_task(5, remote);
-        let task_id = *task.id();
+        let existing = make_task(5, remote);
+        let existing_id = *existing.id();
+        {
+            let mut list = sync.write().await;
+            list.add_task(existing, remote, 1).expect("seed local task");
+        }
+
+        // Unsigned delta: a first-seen add PLUS a validly-attested claim on
+        // the existing task. The claim is the positive evidence that the
+        // listener processed the message, so "add did not land" below is a
+        // real gate decision, not a dead listener.
+        let kp = crate::identity::AgentKeypair::generate().expect("agent keygen");
+        let signing = crate::gossip::SigningContext::from_keypair(&kp);
+        let claimer = kp.agent_id();
+        let mut claimed = make_task(5, remote);
+        claimed
+            .claim(list_id(1), claimer, remote, 1, &signing)
+            .expect("attest claim");
+
+        let new_task = make_task(6, remote);
+        let new_task_id = *new_task.id();
         let mut delta = TaskListDelta::new(1);
-        delta.added_tasks.insert(task_id, (task, (remote, 1)));
+        delta
+            .added_tasks
+            .insert(new_task_id, (new_task, (remote, 2)));
+        delta.task_updates.insert(existing_id, claimed);
         sync.publish_delta(remote, delta).await.expect("publish");
 
-        // The merge is asynchronous; poll the list until the task lands.
-        let landed = tokio::time::timeout(Duration::from_secs(2), async {
+        // The claim applies (checkbox path still runs for writer=None)…
+        let claim_applied = tokio::time::timeout(Duration::from_secs(2), async {
             loop {
-                let count = sync.read().await.task_count();
-                if count == 1 {
+                let claimed_landed = sync
+                    .read()
+                    .await
+                    .get_task(&existing_id)
+                    .is_some_and(|t| t.current_state().is_claimed());
+                if claimed_landed {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(25)).await;
@@ -1111,13 +1172,19 @@ mod tests {
         })
         .await;
         assert!(
-            landed.is_ok(),
-            "remote delta was not merged by start() loop"
+            claim_applied.is_ok(),
+            "unsigned publish must still reach checkbox admission"
         );
-        // Confirm it's the right task, not just any count bump.
+
+        // …but the unsigned content must NOT land (I2).
         assert!(
-            sync.read().await.get_task(&task_id).is_some(),
-            "merged task must be retrievable by id"
+            sync.read().await.get_task(&new_task_id).is_none(),
+            "unsigned (anonymous-sender) publish must not create a task (I2)"
+        );
+        assert_eq!(
+            sync.read().await.task_count(),
+            1,
+            "only the locally seeded task is present"
         );
     }
 
@@ -1216,8 +1283,10 @@ mod tests {
     /// still gets asked.
     #[tokio::test(start_paused = true)]
     async fn single_incremental_delta_does_not_stop_recovery() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Signed pubsub (Layer A, issue #349): the bait delta and the late
+        // holder's serves must carry an envelope-verified writer or the
+        // listener drops their content.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-238-bait";
 
         let joiner_list = TaskList::new(list_id(1), "Test List".to_string(), peer(2));
@@ -1285,8 +1354,9 @@ mod tests {
     /// moments.
     #[tokio::test(start_paused = true)]
     async fn requester_recovers_when_holder_returns_after_old_hard_cap() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Signed pubsub (Layer A, issue #349): the holder's serve must carry
+        // an envelope-verified writer or the listener drops its content.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-238-zombie";
 
         // Empty joiner: subscribes and starts requesting into the void.
@@ -1473,8 +1543,10 @@ mod tests {
     /// state arrives.
     #[tokio::test(start_paused = true)]
     async fn lost_full_delta_with_surviving_marker_keeps_requester_asking() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Signed pubsub (Layer A, issue #349): the holder's full serve must
+        // carry an envelope-verified writer or the listener drops its
+        // content.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-240-lost-broadcast";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -1515,7 +1587,7 @@ mod tests {
         joiner
             .write()
             .await
-            .merge_delta(&t2_only, peer(1))
+            .merge_delta(&t2_only, peer(1), Some(&agent(1)))
             .expect("seed t2");
 
         // The loss window: the marker survives, the full delta does not.
@@ -1621,7 +1693,8 @@ mod tests {
         };
         {
             let mut l = joiner.write().await;
-            l.merge_delta(&t1_only, peer(1)).expect("seed t1");
+            l.merge_delta(&t1_only, peer(1), Some(&agent(1)))
+                .expect("seed t1");
             l.add_task(make_task(9, peer(2)), peer(2), 1)
                 .expect("seed stale task");
         }
@@ -1711,8 +1784,11 @@ mod tests {
     /// v2 markers to make progress against old peers.
     #[tokio::test(start_paused = true)]
     async fn v1_marker_from_old_peer_still_converges() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Signed pubsub (Layer A, issue #349): the full delta on the main
+        // topic must carry an envelope-verified writer; the v1/v2 question
+        // this test exercises is the SIDE-topic marker format, which stays
+        // a raw v1 StateServed below.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-240-v1-compat";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -1776,8 +1852,10 @@ mod tests {
     /// latest-wins).
     #[tokio::test(start_paused = true)]
     async fn tampered_digest_is_rejected_and_does_not_wedge_recovery() {
-        let node = make_node().await;
-        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        // Signed pubsub (Layer A, issue #349): the genuine holder's serve
+        // must carry an envelope-verified writer; the tampered marker is
+        // still published as a raw side-topic payload.
+        let pubsub = signed_pubsub().await;
         let topic = "tasks-240-tampered";
         let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
 
@@ -1861,7 +1939,9 @@ mod tests {
         // The replica absorbs a first full serve (both tasks).
         let mut replica = TaskList::new(list_id(1), "List".to_string(), peer(2));
         let s1 = holder.full_delta();
-        replica.merge_delta(&s1, peer(1)).expect("serve 1");
+        replica
+            .merge_delta(&s1, peer(1), Some(&agent(1)))
+            .expect("serve 1");
         assert_eq!(replica.task_count(), 2);
 
         // The holder deletes the task; the next VERIFIED serve prunes it
@@ -1874,7 +1954,9 @@ mod tests {
             Some(holder.served_digest()),
             "the serve must carry the holder's declared digest"
         );
-        replica.merge_delta(&s2, peer(1)).expect("serve 2");
+        replica
+            .merge_delta(&s2, peer(1), Some(&agent(1)))
+            .expect("serve 2");
         assert_eq!(replica.prune_to_served_set(&s2), 1);
         assert!(replica.get_task(&doomed).is_none());
 
@@ -1885,7 +1967,9 @@ mod tests {
             .add_task(make_task(2, peer(1)), peer(1), 3)
             .expect("re-add");
         let s3 = holder.full_delta();
-        replica.merge_delta(&s3, peer(1)).expect("serve 3");
+        replica
+            .merge_delta(&s3, peer(1), Some(&agent(1)))
+            .expect("serve 3");
         assert!(
             replica.get_task(&doomed).is_some(),
             "a re-served task must be accepted after a prune"
