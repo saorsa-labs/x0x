@@ -9204,7 +9204,7 @@ pub(in crate::server) async fn send_group_public_message(
     observe_group_send_fanout(&state, &msg.group_id, fan_out).await;
     if let Err(e) = state
         .agent
-        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes)
+        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
         .await
     {
         tracing::warn!(
