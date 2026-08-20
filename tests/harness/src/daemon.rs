@@ -264,6 +264,11 @@ impl DaemonFixture {
         self.tempdir.path()
     }
 
+    /// PID of the daemon child process (black-hole / signal tests, #368).
+    pub fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
     /// Poll child process exit status.
     pub fn try_wait(&mut self) -> std::io::Result<Option<ExitStatus>> {
         self.process.try_wait()

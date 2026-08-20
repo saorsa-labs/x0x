@@ -32,6 +32,11 @@ impl AgentInstance {
         &self.data_dir
     }
 
+    /// PID of the daemon child process (black-hole / signal tests, #368).
+    pub fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
     pub fn directory_subscriptions_path(&self) -> PathBuf {
         self.data_dir.join("directory-subscriptions.json")
     }

@@ -2933,6 +2933,18 @@ impl Agent {
         self.network.as_ref().map(|net| net.recv_pump_diagnostics())
     }
 
+    /// Snapshot of the gossip send destructive-cooldown counters (#368).
+    ///
+    /// Returns `None` when this agent was built without a network node.
+    /// Exposed through `GET /diagnostics/gossip` → `send_cooldown` as the
+    /// proof metrics for the leak soak (see `network::send_cooldown`).
+    #[must_use]
+    pub fn send_cooldown_diagnostics(&self) -> Option<network::SendCooldownSnapshot> {
+        self.network
+            .as_ref()
+            .map(|net| net.send_cooldown_snapshot())
+    }
+
     /// Get the presence system wrapper, if configured.
     ///
     /// Returns `None` if this agent was built without a network config.

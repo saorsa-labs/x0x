@@ -23,6 +23,11 @@
 //! - `170.64.176.102` - Sydney, AU (DigitalOcean)
 
 use crate::error::{NetworkError, NetworkResult};
+
+mod send_cooldown;
+
+pub use self::send_cooldown::SendCooldownSnapshot;
+use self::send_cooldown::{SendCooldownTracker, SendOutcome, GOSSIP_SEND_TIMEOUT};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
@@ -1454,6 +1459,9 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
+    /// Destructive-cooldown state for gossip per-peer sends (#368): streaks,
+    /// timeout/close proof counters. Arc so the Clone derive shares state.
+    send_cooldown: Arc<SendCooldownTracker>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -1660,6 +1668,7 @@ impl NetworkNode {
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
+            send_cooldown: Arc::new(SendCooldownTracker::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -3294,6 +3303,16 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
+    /// Snapshot of the destructive-cooldown proof counters (#368).
+    ///
+    /// Exposed through `GET /diagnostics/gossip` → `send_cooldown`; the two
+    /// counters are the soak's success metrics (connections closed by
+    /// cooldown escalation, sends abandoned on transport timeout).
+    #[must_use]
+    pub fn send_cooldown_snapshot(&self) -> SendCooldownSnapshot {
+        self.send_cooldown.snapshot()
+    }
+
     /// Gracefully shut down the node: abort the background tasks, close all
     /// connections, and shut down the ant-quic node.
     ///
@@ -4372,16 +4391,62 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
         // per-peer sends in a small timeout; a multi-second liveness repair on
         // this path turns healthy gossip degradation into a timeout/log storm.
-        let node_guard = self.node.read().await;
-        let node = node_guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+        // #368: the transport owns the per-send timeout. It fires strictly
+        // before saorsa-gossip's adaptive outer timeout (see
+        // `GOSSIP_SEND_TIMEOUT`), so the in-flight send future is dropped at
+        // a known point instead of mid-`SendStream::write`, and consecutive
+        // timeouts escalate to a connection close (destructive cooldown)
+        // that frees both ends' pinned stream state. A timed-out send is
+        // reported as success for the same loss-tolerant-gossip reason as
+        // the held sends above: escalation, not the caller, owns the policy.
+        let send_outcome = {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
 
-        node.send(&ant_peer, &buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
-        drop(node_guard);
-        self.note_connection_pool_activity(ant_peer).await;
+            match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, node.send(&ant_peer, &buf)).await {
+                Ok(Ok(())) => SendOutcome::Sent,
+                Ok(Err(e)) => return Err(anyhow::anyhow!("send failed: {e}")),
+                Err(_elapsed) => SendOutcome::TimedOut,
+            }
+        };
+
+        match send_outcome {
+            SendOutcome::Sent => {
+                self.send_cooldown.note_success(ant_peer.0);
+                self.note_connection_pool_activity(ant_peer).await;
+            }
+            SendOutcome::TimedOut => {
+                let close = self.send_cooldown.note_timeout(ant_peer.0);
+                if close {
+                    // Destructive cooldown (#368): the peer stalled twice in
+                    // a row — close by peer-id (never by address; #305) with
+                    // a reconnect-eligible reason so the normal redial path
+                    // recovers it if it comes back. The close resets every
+                    // stream in both directions, freeing the sender-pinned
+                    // write buffers and the receiver's partial assembler
+                    // state.
+                    tracing::info!(
+                        peer_id = %ant_peer.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                        "destructive cooldown: closing connection after repeated gossip send timeouts"
+                    );
+                    if let Err(e) = self
+                        .disconnect_with_reason(&ant_peer, DisconnectReason::Transport)
+                        .await
+                    {
+                        tracing::debug!("cooldown close failed: {e}");
+                    }
+                    self.send_cooldown.note_closed(ant_peer.0);
+                } else {
+                    debug!(
+                        "[1/6 network] send to peer {:?} timed out after {:?} (throttled; \
+                         escalation pending a consecutive timeout)",
+                        peer, GOSSIP_SEND_TIMEOUT
+                    );
+                }
+            }
+        }
 
         debug!(
             "[1/6 network] send: {} bytes ({:?}) to peer {:?}",

@@ -1,0 +1,21 @@
+# cargo-deny configuration — supply-chain guard.
+# Run: `just deny`  (cargo deny check bans sources)
+# Advisories are covered by `just audit` (cargo audit); licenses not enforced here.
+
+[bans]
+multiple-versions = "allow"
+wildcards = "allow"
+deny = [
+    # Supply-chain guard (2026-08-20 arrayref/proc-macro1 incident, RUSTSEC-2026-0260)
+    { crate = "proc-macro1", reason = "typosquat of proc-macro2; malicious build.rs dropper" },
+    { crate = "arrayref@0.3.10", reason = "malicious release pulling proc-macro1" },
+    { crate = "internment@0.8.7", reason = "malicious release pulling proc-macro1" },
+    { crate = "append-only-vec@0.1.9", reason = "malicious release pulling proc-macro1" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+
+[sources.allow-org]
+github = ["saorsa-labs", "maidsafe", "dirvine", "Mesh-LLM", "tlongwell-block"]
