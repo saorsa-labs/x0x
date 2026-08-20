@@ -18,8 +18,10 @@
 //! drop = finish/truncate, not reset) needs an ant-quic API for a
 //! peer-addressable uni stream handle; that lands as the ant-quic follow-up.
 //! Until then the escalation close performs the reset for the whole
-//! connection, bounding the pinned residue to at most one stream per peer
-//! between the first timeout and the close.
+//! connection, bounding the pinned residue to one stream per peer per
+//! escalation window.
+
+use std::time::Instant;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -36,77 +38,115 @@ use std::time::Duration;
 /// bound). The unit test `gossip_send_timeout_stays_below_sg_floor` pins the
 /// relationship.
 ///
-/// A peer that cannot complete a send within this budget twice in a row (with
-/// no intervening success) is treated as stalled and disconnected — gossip is
-/// epidemic and loss-tolerant, so trading a reconnect for an unbounded send
-/// buffer is the correct side of the trade.
+/// A peer that cannot complete a send within this budget repeatedly (see
+/// [`N_CONSECUTIVE_TIMEOUTS_TO_CLOSE`]) is treated as stalled and
+/// disconnected — gossip is epidemic and loss-tolerant, so trading a
+/// reconnect for an unbounded send buffer is the correct side of the trade.
 pub(crate) const GOSSIP_SEND_TIMEOUT: Duration = Duration::from_millis(1_200);
 
 /// Consecutive send timeouts (with no intervening successful send to the same
 /// peer) before the connection is closed.
 ///
-/// 2 keeps the pinned-stream residue bounded to a single stream per stalled
-/// peer (first timeout throttles, second closes), while an isolated slow send
-/// followed by any success resets the streak.
-pub(crate) const COOLDOWN_CLOSE_CONSECUTIVE_TIMEOUTS: u32 = 2;
+/// 5 balances two failure modes (#368 vs the v0.36.2 lesson): closing too
+/// eagerly (e.g. 2 consecutive 1.2 s timeouts ≈ 2.4 s of stall) churns
+/// redials/hole-punches on healthy WAN peers that genuinely experience
+/// multi-second 100%-loss windows, while waiting too long re-pins the
+/// unbounded send buffers this escalation exists to free. Five consecutive
+/// misses with no success in between is a stalled peer, not a lossy-but-alive
+/// one; any successful send resets the streak.
+pub(crate) const N_CONSECUTIVE_TIMEOUTS_TO_CLOSE: u32 = 5;
 
-/// Per-peer consecutive-timeout streaks plus the two proof counters for the
-/// #368 soak (`GET /diagnostics/gossip` → `send_cooldown`).
+/// Minimum wall time between cooldown closes of the same peer (#368): a
+/// flapping peer must not loop close → redial → close, which would trade the
+/// buffer leak for a connection-churn storm.
+pub(crate) const COOLDOWN_CLOSE_RATE_LIMIT: Duration = Duration::from_secs(60);
+
+/// Per-peer consecutive-timeout streaks, close rate-limit bookkeeping, and
+/// the two proof counters for the #368 soak (`GET /diagnostics/gossip` →
+/// `send_cooldown`).
 #[derive(Debug, Default)]
 pub(crate) struct SendCooldownTracker {
     streaks: Mutex<HashMap<[u8; 32], u32>>,
+    last_close_at: Mutex<HashMap<[u8; 32], Instant>>,
+    /// Wall-time window for [`Self::note_timeout`]'s close rate limit.
+    /// Production uses [`COOLDOWN_CLOSE_RATE_LIMIT`]; tests inject a short
+    /// window so the limit is exercisable deterministically.
+    close_rate_limit: Option<Duration>,
     sends_timed_out: AtomicU64,
     conns_closed_by_cooldown: AtomicU64,
 }
 
 impl SendCooldownTracker {
-    /// Record a successful send: the peer's streak resets, so an isolated
-    /// timeout never escalates on its own.
-    pub(crate) fn note_success(&self, peer: [u8; 32]) {
-        match self.streaks.lock() {
-            Ok(mut guard) => {
-                guard.remove(&peer);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&peer);
-            }
+    /// Tracker with the production close rate limit.
+    pub(crate) fn new() -> Self {
+        Self {
+            close_rate_limit: Some(COOLDOWN_CLOSE_RATE_LIMIT),
+            ..Self::default()
         }
+    }
+
+    /// Test constructor with an explicit close rate-limit window.
+    #[cfg(test)]
+    pub(crate) fn with_close_rate_limit(close_rate_limit: Duration) -> Self {
+        Self {
+            close_rate_limit: Some(close_rate_limit),
+            ..Self::default()
+        }
+    }
+
+    fn lock_map<T, R>(
+        lock: &Mutex<HashMap<[u8; 32], T>>,
+        with: impl FnOnce(&mut HashMap<[u8; 32], T>) -> R,
+    ) -> R {
+        match lock.lock() {
+            Ok(mut guard) => with(&mut guard),
+            Err(poisoned) => with(&mut poisoned.into_inner()),
+        }
+    }
+
+    /// Record a successful send: the peer's streak resets, so isolated
+    /// timeouts never escalate on their own.
+    pub(crate) fn note_success(&self, peer: [u8; 32]) {
+        Self::lock_map(&self.streaks, |m| {
+            m.remove(&peer);
+        });
     }
 
     /// Record a timed-out send. Returns `true` when the escalation threshold
-    /// ([`COOLDOWN_CLOSE_CONSECUTIVE_TIMEOUTS`]) is met and the caller should
-    /// close the connection to this peer.
+    /// ([`N_CONSECUTIVE_TIMEOUTS_TO_CLOSE`]) is met AND the per-peer close
+    /// rate limit ([`COOLDOWN_CLOSE_RATE_LIMIT`]) allows another close — the
+    /// caller should then close the connection to this peer.
     pub(crate) fn note_timeout(&self, peer: [u8; 32]) -> bool {
         self.sends_timed_out.fetch_add(1, Ordering::Relaxed);
-        let streak = match self.streaks.lock() {
-            Ok(mut guard) => {
-                let entry = guard.entry(peer).or_insert(0);
-                *entry += 1;
-                *entry
-            }
-            Err(poisoned) => {
-                let mut guard = poisoned.into_inner();
-                let entry = guard.entry(peer).or_insert(0);
-                *entry += 1;
-                *entry
-            }
-        };
-        streak >= COOLDOWN_CLOSE_CONSECUTIVE_TIMEOUTS
+        let streak = Self::lock_map(&self.streaks, |m| {
+            let entry = m.entry(peer).or_insert(0);
+            *entry += 1;
+            *entry
+        });
+        if streak < N_CONSECUTIVE_TIMEOUTS_TO_CLOSE {
+            return false;
+        }
+        // Rate limit: within the window of a previous close, keep the streak
+        // accumulating but do not close again — a flapping peer must not
+        // loop close → redial → close.
+        Self::lock_map(&self.last_close_at, |m| {
+            m.get(&peer)
+                .is_none_or(|at| at.elapsed() >= self.close_rate_limit.unwrap_or_default())
+        })
     }
 
-    /// Record that the escalation close happened: bumps the proof counter and
-    /// clears the streak so the redialled connection starts clean.
+    /// Record that the escalation close happened: bumps the proof counter,
+    /// arms the per-peer rate limit, and clears the streak so the redialled
+    /// connection starts clean.
     pub(crate) fn note_closed(&self, peer: [u8; 32]) {
         self.conns_closed_by_cooldown
             .fetch_add(1, Ordering::Relaxed);
-        match self.streaks.lock() {
-            Ok(mut guard) => {
-                guard.remove(&peer);
-            }
-            Err(poisoned) => {
-                poisoned.into_inner().remove(&peer);
-            }
-        }
+        Self::lock_map(&self.streaks, |m| {
+            m.remove(&peer);
+        });
+        Self::lock_map(&self.last_close_at, |m| {
+            m.insert(peer, Instant::now());
+        });
     }
 
     /// Proof counters for `GET /diagnostics/gossip`.
@@ -169,31 +209,71 @@ mod tests {
         );
     }
 
-    /// Why (#368): the escalation state machine — first timeout throttles
-    /// only, the second consecutive timeout closes, and any intervening
-    /// success resets the streak so isolated slow sends never escalate.
+    /// Why (#368 + v0.36.2): the escalation state machine — the first
+    /// N-1 consecutive timeouts throttle only, the Nth closes, and any
+    /// intervening success resets the streak so a lossy-but-alive WAN peer
+    /// (multi-second 100%-loss windows are real) never escalates.
     #[test]
-    fn cooldown_state_machine_first_throttles_second_closes_success_resets() {
+    fn cooldown_state_machine_closes_on_nth_consecutive_timeout() {
         let tracker = SendCooldownTracker::default();
         let peer = [0x11; 32];
 
-        assert!(!tracker.note_timeout(peer), "first timeout must not close");
-        assert_eq!(tracker.streak(peer), 1);
+        for i in 1..N_CONSECUTIVE_TIMEOUTS_TO_CLOSE {
+            assert!(
+                !tracker.note_timeout(peer),
+                "timeout #{i} below the threshold must not close"
+            );
+            assert_eq!(tracker.streak(peer), i);
+        }
 
         assert!(
             tracker.note_timeout(peer),
-            "second consecutive timeout must close"
+            "timeout #{N_CONSECUTIVE_TIMEOUTS_TO_CLOSE} must close"
         );
-        assert_eq!(tracker.streak(peer), 2);
 
         tracker.note_closed(peer);
         assert_eq!(tracker.streak(peer), 0, "close clears the streak");
         assert_eq!(tracker.snapshot().conns_closed_by_cooldown, 1);
-        assert_eq!(tracker.snapshot().streams_reset_on_timeout, 2);
+        assert_eq!(
+            tracker.snapshot().streams_reset_on_timeout,
+            u64::from(N_CONSECUTIVE_TIMEOUTS_TO_CLOSE)
+        );
 
-        // After the close, a fresh timeout on the redialled conn starts a new
+        // After the close, fresh timeouts on the redialled conn start a new
         // streak instead of instantly closing again.
         assert!(!tracker.note_timeout(peer));
+    }
+
+    /// Why (#368): a flapping peer must not loop close → redial → close —
+    /// within the rate-limit window the tracker refuses a second close even
+    /// at threshold, and allows it again once the window elapses.
+    #[test]
+    fn cooldown_close_is_rate_limited_per_peer() {
+        let window = Duration::from_millis(80);
+        let tracker = SendCooldownTracker::with_close_rate_limit(window);
+        let peer = [0x55; 32];
+
+        for _ in 0..N_CONSECUTIVE_TIMEOUTS_TO_CLOSE - 1 {
+            assert!(!tracker.note_timeout(peer));
+        }
+        assert!(tracker.note_timeout(peer), "first close is allowed");
+        tracker.note_closed(peer);
+
+        // Streak rebuilds past the threshold while the window is fresh, but
+        // every close request is refused.
+        for i in 0..=N_CONSECUTIVE_TIMEOUTS_TO_CLOSE {
+            assert!(
+                !tracker.note_timeout(peer),
+                "close #{i} within the rate-limit window must be refused"
+            );
+        }
+
+        std::thread::sleep(window + Duration::from_millis(30));
+        assert!(
+            tracker.note_timeout(peer),
+            "close is allowed again once the window elapses"
+        );
+        assert_eq!(tracker.snapshot().conns_closed_by_cooldown, 1);
     }
 
     #[test]
@@ -221,11 +301,16 @@ mod tests {
         let stalled = [0x33; 32];
         let healthy = [0x44; 32];
 
-        assert!(!tracker.note_timeout(stalled));
-        assert!(!tracker.note_timeout(healthy));
+        for _ in 0..N_CONSECUTIVE_TIMEOUTS_TO_CLOSE - 1 {
+            assert!(!tracker.note_timeout(stalled));
+            assert!(!tracker.note_timeout(healthy), "healthy peer never closes");
+        }
+        // stalled reaches the threshold and closes; healthy sits at N-1
+        // untouched — the streaks are independent.
         assert!(
             tracker.note_timeout(stalled),
             "only the stalled peer's streak escalates"
         );
+        assert_eq!(tracker.streak(healthy), N_CONSECUTIVE_TIMEOUTS_TO_CLOSE - 1);
     }
 }

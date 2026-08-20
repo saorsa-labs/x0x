@@ -1667,8 +1667,8 @@ impl NetworkNode {
             recv_membership_rx: Arc::new(tokio::sync::Mutex::new(recv_membership_rx)),
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
+            send_cooldown: Arc::new(SendCooldownTracker::new()),
             recv_pump_diagnostics,
-            send_cooldown: Arc::new(SendCooldownTracker::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -4396,9 +4396,11 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // `GOSSIP_SEND_TIMEOUT`), so the in-flight send future is dropped at
         // a known point instead of mid-`SendStream::write`, and consecutive
         // timeouts escalate to a connection close (destructive cooldown)
-        // that frees both ends' pinned stream state. A timed-out send is
-        // reported as success for the same loss-tolerant-gossip reason as
-        // the held sends above: escalation, not the caller, owns the policy.
+        // that frees both ends' pinned stream state. A timed-out send
+        // returns Err: saorsa-gossip's admission gates and CriticalSendGate
+        // semantics depend on the failure signal (retry / fail-loud), and
+        // its WARN per failed send is truthful. The escalation bookkeeping
+        // (streaks, close, counters) stays transport-owned.
         let send_outcome = {
             let node_guard = self.node.read().await;
             let node = node_guard
@@ -4420,9 +4422,10 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             SendOutcome::TimedOut => {
                 let close = self.send_cooldown.note_timeout(ant_peer.0);
                 if close {
-                    // Destructive cooldown (#368): the peer stalled twice in
-                    // a row — close by peer-id (never by address; #305) with
-                    // a reconnect-eligible reason so the normal redial path
+                    // Destructive cooldown (#368): the peer missed
+                    // N_CONSECUTIVE_TIMEOUTS_TO_CLOSE sends in a row — close
+                    // by peer-id (never by address; #305) with a
+                    // reconnect-eligible reason so the normal redial path
                     // recovers it if it comes back. The close resets every
                     // stream in both directions, freeing the sender-pinned
                     // write buffers and the receiver's partial assembler
@@ -4440,11 +4443,14 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                     self.send_cooldown.note_closed(ant_peer.0);
                 } else {
                     debug!(
-                        "[1/6 network] send to peer {:?} timed out after {:?} (throttled; \
-                         escalation pending a consecutive timeout)",
+                        "[1/6 network] send to peer {:?} timed out after {:?} (streak \
+                         escalation pending)",
                         peer, GOSSIP_SEND_TIMEOUT
                     );
                 }
+                return Err(anyhow::anyhow!(
+                    "send timed out after {GOSSIP_SEND_TIMEOUT:?}"
+                ));
             }
         }
 
