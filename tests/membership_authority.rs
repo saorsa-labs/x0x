@@ -16,9 +16,9 @@
 use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     compute_policy_hash, compute_public_meta_hash, compute_roster_root, last_admin_precheck_error,
-    last_admin_self_leave_precheck_error, ActionKind, ApplyContext, ApplyError, GroupInfo,
-    GroupPolicyPreset, GroupRole, GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR,
-    LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+    leave_disposition, ActionKind, ApplyContext, ApplyError, GroupInfo, GroupPolicyPreset,
+    GroupRole, GroupStateCommit, LeaveDisposition, LAST_ADMIN_PRECHECK_ERROR,
+    LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR, PENDING_JOIN_BLOCKED_ERROR,
 };
 use x0x::identity::AgentKeypair;
 use x0x::mls::SecureGroupPlane;
@@ -138,22 +138,48 @@ fn rest_remove_member_semantics(
     Ok(commit)
 }
 
+/// Shipped REST outcome of DELETE /groups/:id (#369): a plain self-leave or
+/// the sole-member terminal deletion.
+#[derive(Debug, PartialEq, Eq)]
+enum SelfLeaveOutcome {
+    /// Plain self-leave: non-terminal MemberRemoved-style commit applied.
+    Left(GroupStateCommit),
+    /// Sole-member delete: terminal withdrawal commit applied, group
+    /// tombstoned.
+    Deleted(GroupStateCommit),
+}
+
 fn rest_self_leave_semantics(
     info: &mut GroupInfo,
     actor: &AgentKeypair,
-) -> Result<GroupStateCommit, RestError> {
+) -> Result<SelfLeaveOutcome, RestError> {
     let actor_hex = hex_id(actor);
-    if let Some(error) = last_admin_self_leave_precheck_error(info, &actor_hex) {
-        return Err(RestError::Conflict(error));
+    // Mirrors the shipped route: ONE disposition predicate decides leave vs
+    // delete vs the two 409s (PR #370 review item 4).
+    match leave_disposition(info, &actor_hex) {
+        LeaveDisposition::SoleMemberDelete => {
+            let commit = info
+                .seal_withdrawal(actor, 2_000)
+                .expect("sole-member withdrawal seals");
+            Ok(SelfLeaveOutcome::Deleted(commit))
+        }
+        LeaveDisposition::PendingJoinBlocked => {
+            Err(RestError::Conflict(PENDING_JOIN_BLOCKED_ERROR))
+        }
+        LeaveDisposition::LastAdminBlocked => {
+            Err(RestError::Conflict(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR))
+        }
+        LeaveDisposition::Proceed => {
+            let mut next = info.clone();
+            next.roster_revision = next.roster_revision.saturating_add(1);
+            next.remove_member(&actor_hex, Some(actor_hex.clone()));
+            let commit = next
+                .seal_commit(actor, 2_000)
+                .expect("non-last self-leave seals");
+            *info = next;
+            Ok(SelfLeaveOutcome::Left(commit))
+        }
     }
-    let mut next = info.clone();
-    next.roster_revision = next.roster_revision.saturating_add(1);
-    next.remove_member(&actor_hex, Some(actor_hex.clone()));
-    let commit = next
-        .seal_commit(actor, 2_000)
-        .expect("non-last self-leave seals");
-    *info = next;
-    Ok(commit)
 }
 
 fn rest_ban_member_semantics(
@@ -281,12 +307,14 @@ fn apply_group_deleted_event(
         .map_err(GroupDeletedEventApplyError::Commit)?;
     Ok(next)
 }
-
 fn assert_self_leave_converges(mut authority: GroupInfo, actor: &AgentKeypair) {
     let replica = authority.clone();
     let actor_hex = hex_id(actor);
 
-    let commit = rest_self_leave_semantics(&mut authority, actor).unwrap();
+    let commit = match rest_self_leave_semantics(&mut authority, actor).unwrap() {
+        SelfLeaveOutcome::Left(commit) => commit,
+        SelfLeaveOutcome::Deleted(_) => panic!("multi-member self-leave must not delete"),
+    };
 
     assert_eq!(commit.committed_by, actor_hex);
     assert!(
@@ -330,6 +358,45 @@ fn assert_self_leave_conflict_preserves(mut info: GroupInfo, actor: &AgentKeypai
     assert_eq!(info.roster_revision, before.roster_revision);
     assert_eq!(info.state_hash, before.state_hash);
     assert_eq!(info.caller_role(&actor_hex), before.caller_role(&actor_hex));
+}
+
+/// #369: the sole member's self-leave IS the terminal deletion — the commit
+/// is withdrawn, the authority state tombstones with GSS keys wiped, and the
+/// signed commit applies on a replica through the GroupDeleted path.
+fn assert_sole_member_self_leave_deletes(mut info: GroupInfo, actor: &AgentKeypair) {
+    let replica = info.clone();
+    let actor_hex = hex_id(actor);
+
+    let commit = match rest_self_leave_semantics(&mut info, actor).unwrap() {
+        SelfLeaveOutcome::Deleted(commit) => commit,
+        SelfLeaveOutcome::Left(_) => panic!("sole-member self-leave must delete"),
+    };
+
+    assert_eq!(commit.committed_by, actor_hex);
+    assert!(
+        commit.withdrawn,
+        "sole-member leave is the terminal withdrawal"
+    );
+    assert!(
+        info.withdrawn,
+        "sole-member leave must tombstone the authority state"
+    );
+    assert!(
+        info.shared_secret.is_none(),
+        "terminal withdrawal must wipe GSS key material"
+    );
+
+    let next = apply_group_deleted_event(
+        &replica,
+        replica.roster_revision.saturating_add(1),
+        &actor_hex,
+        &commit,
+    )
+    .expect("sole-member GroupDeleted applies on the replica");
+    assert!(
+        next.withdrawn,
+        "replica must terminalize from the sole-member delete commit"
+    );
 }
 
 fn assert_signed_role_update_applies(new_role: GroupRole) {
@@ -537,7 +604,9 @@ fn membership_authority_legacy_owner_self_leave_converges_when_admin_remains() {
 }
 
 #[test]
-fn membership_authority_non_creator_last_admin_self_leave_returns_409_and_does_not_mutate() {
+fn membership_authority_sole_member_after_removals_self_leave_deletes() {
+    // #369: the admin who removed the creator is now the sole member — their
+    // self-leave is the group's deletion, not a 409 over an empty remainder.
     let creator = AgentKeypair::generate().unwrap();
     let admin = AgentKeypair::generate().unwrap();
     let creator_hex = hex_id(&creator);
@@ -549,34 +618,81 @@ fn membership_authority_non_creator_last_admin_self_leave_returns_409_and_does_n
     assert_eq!(info.caller_role(&admin_hex), Some(GroupRole::Admin));
     assert_eq!(info.active_admin_count(), 1);
 
-    let before = info.clone();
-    assert_eq!(
-        rest_self_leave_semantics(&mut info, &admin).unwrap_err(),
-        RestError::Conflict(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
-    );
-
-    assert_eq!(info.members_v2, before.members_v2);
-    assert_eq!(info.roster_revision, before.roster_revision);
-    assert_eq!(info.state_hash, before.state_hash);
-    assert_eq!(info.caller_role(&admin_hex), Some(GroupRole::Admin));
+    assert_sole_member_self_leave_deletes(info, &admin);
 }
 
 #[test]
-fn membership_authority_creator_last_admin_self_leave_returns_409_and_does_not_mutate() {
+fn membership_authority_creator_sole_member_self_leave_deletes() {
+    // #369: the creator of a never-joined group must be able to dispose of
+    // it — the old 409 stranded every empty group.
     let creator = AgentKeypair::generate().unwrap();
     let info = admin_group(&creator, "T");
 
-    assert_self_leave_conflict_preserves(info, &creator);
+    assert_sole_member_self_leave_deletes(info, &creator);
 }
 
 #[test]
-fn membership_authority_legacy_owner_last_admin_self_leave_returns_409_and_does_not_mutate() {
+fn membership_authority_legacy_owner_sole_member_self_leave_deletes() {
     let owner = AgentKeypair::generate().unwrap();
     let mut info = admin_group(&owner, "T");
     info.set_member_role(&hex_id(&owner), GroupRole::Owner);
     info.recompute_state_hash();
 
-    assert_self_leave_conflict_preserves(info, &owner);
+    assert_sole_member_self_leave_deletes(info, &owner);
+}
+
+#[test]
+fn membership_authority_last_admin_self_leave_with_remaining_member_keeps_409() {
+    // #369 guard rail: with another ACTIVE member still in the roster, the
+    // last admin's self-leave keeps the exact ADR-0016 §3 409.
+    let creator = AgentKeypair::generate().unwrap();
+    let member = AgentKeypair::generate().unwrap();
+    let mut info = admin_group(&creator, "T");
+    info.add_member(
+        hex_id(&member),
+        GroupRole::Member,
+        Some(hex_id(&creator)),
+        None,
+    );
+    info.recompute_state_hash();
+
+    assert_self_leave_conflict_preserves(info, &creator);
+}
+
+#[test]
+fn membership_authority_sole_member_self_leave_with_pending_joiner_returns_409() {
+    // PR #370 review item 1: a pending joiner is a member-in-being; the sole
+    // active member's delete is refused until the request resolves.
+    let creator = AgentKeypair::generate().unwrap();
+    let joiner = AgentKeypair::generate().unwrap();
+    let creator_hex = hex_id(&creator);
+    let joiner_hex = hex_id(&joiner);
+    let mut info = admin_group(&creator, "T");
+    // PR #370 r2 blocker 1: pending is derived from join_requests — model a
+    // KEM-less request (no roster mirror) and a mirrored one.
+    info.join_requests.insert(
+        "req-pending".to_string(),
+        x0x::groups::JoinRequest::new("T".to_string(), joiner_hex.clone(), None, 1_000),
+    );
+    info.add_member(
+        joiner_hex.clone(),
+        GroupRole::Member,
+        Some(creator_hex.clone()),
+        None,
+    );
+    info.members_v2
+        .get_mut(&joiner_hex)
+        .expect("joiner entry")
+        .state = x0x::groups::GroupMemberState::Pending;
+    info.recompute_state_hash();
+
+    let before = info.clone();
+    assert_eq!(
+        rest_self_leave_semantics(&mut info, &creator).unwrap_err(),
+        RestError::Conflict(PENDING_JOIN_BLOCKED_ERROR)
+    );
+    assert_eq!(info.members_v2, before.members_v2);
+    assert!(!info.withdrawn);
 }
 
 #[test]

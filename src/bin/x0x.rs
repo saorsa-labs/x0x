@@ -959,7 +959,8 @@ enum GroupSub {
         /// Display name.
         name: String,
     },
-    /// Leave this member/daemon; the group continues (last admin is blocked).
+    /// Leave this group; if you are the only member this deletes the group
+    /// (last admin is blocked while other members remain).
     Leave {
         /// Group ID.
         group_id: String,

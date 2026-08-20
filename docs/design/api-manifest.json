@@ -655,7 +655,7 @@
     {
       "category": "named-groups",
       "cli_name": "group leave",
-      "description": "Leave a group",
+      "description": "Leave a group (sole-member leave deletes the group)",
       "method": "DELETE",
       "path": "/groups/:id"
     },

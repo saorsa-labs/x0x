@@ -995,13 +995,11 @@ impl Default for RecvPumpDiagnostics {
 }
 
 fn duration_to_u64_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis())
-        .ok()
-        .map_or(u64::MAX, |v| v)
+    u64::try_from(duration.as_millis()).ok().unwrap_or(u64::MAX)
 }
 
 fn usize_to_u64_saturating(value: usize) -> u64 {
-    u64::try_from(value).ok().map_or(u64::MAX, |v| v)
+    u64::try_from(value).ok().unwrap_or(u64::MAX)
 }
 
 /// Stream type byte for direct messages (distinct from gossip: 0, 1, 2).

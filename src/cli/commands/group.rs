@@ -144,7 +144,8 @@ pub async fn set_name(client: &DaemonClient, group_id: &str, name: &str) -> Resu
     Ok(())
 }
 
-/// `x0x group leave` — DELETE /groups/:id (self-removal; group continues).
+/// `x0x group leave` — DELETE /groups/:id (self-removal; sole-member leave
+/// deletes the group, otherwise last admin is blocked).
 pub async fn leave(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_delete(&format!("/groups/{group_id}")).await
 }

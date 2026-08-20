@@ -277,23 +277,92 @@ pub fn last_admin_precheck_error(
         .map(|_| LAST_ADMIN_PRECHECK_ERROR)
 }
 
-/// Return the ADR-0016 last-admin REST pre-check error for a proposed
-/// self-leave by `leaver_hex`.
+/// Exact REST error string for a sole-active-member self-leave that is
+/// blocked only by pending join requests (#369 / PR #370 review item 1).
+pub const PENDING_JOIN_BLOCKED_ERROR: &str = "resolve pending join requests before leaving";
+
+/// Routing decision for a `DELETE /groups/:id` self-leave (#369).
 ///
-/// This is the self-leave variant of [`last_admin_precheck_error`], with the
-/// separate §3 user-facing recovery hint. It deliberately evaluates the removal
-/// on a clone so rejected leaves cannot mutate live group state before the
-/// authoritative commit-time invariant rejects them.
+/// Computed once per leave attempt from the live roster; both the REST route
+/// and the TreeKEM leave helper consume this single predicate so the two
+/// paths cannot drift (PR #370 review item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LeaveDisposition {
+    /// An active admin remains post-removal: plain self-leave proceeds.
+    Proceed,
+    /// The post-removal roster would have zero active admins (ADR-0016 §3
+    /// 409; the invariant itself is untouched by #369).
+    LastAdminBlocked,
+    /// The leaver is the only active member but at least one join request is
+    /// still Pending (`join_requests` status — the authoritative view; the
+    /// roster's Pending entry is only a seeded mirror and KEM-less requests
+    /// have none). Deleting now would destroy the group under the joiners,
+    /// so the leave is refused until the requests are resolved
+    /// (approve/reject them, then the leave becomes a `SoleMemberDelete`).
+    PendingJoinBlocked,
+    /// The leaver is the only member-in-being (exactly one non-terminal
+    /// roster entry — Active or Pending) and no join request is pending: the
+    /// self-leave IS a group deletion and routes to the terminal withdrawal
+    /// flow.
+    SoleMemberDelete,
+}
+/// True when `agent_hex` is the only non-terminal (`Active` or `Pending`)
+/// roster entry — the sole member-in-being (#369).
+///
+/// Pending roster entries count: a seeded pending joiner is a member-in-being
+/// whose in-flight admission a sole-member delete would destroy from under
+/// them (PR #370 review item 1). Removed and Banned entries are retained for
+/// audit and never count. NOTE: the authoritative pending view for the leave
+/// routing is [`GroupInfo::has_pending_join_request`] (`join_requests`
+/// status), because KEM-less requests seed no roster entry and reject/cancel
+/// historical bugs could leave stale ones behind.
 #[must_use]
-pub fn last_admin_self_leave_precheck_error(
-    info: &GroupInfo,
-    leaver_hex: &str,
-) -> Option<&'static str> {
+pub fn sole_member_in_being(members: &BTreeMap<String, GroupMember>, agent_hex: &str) -> bool {
+    let mut non_terminal = 0;
+    let mut hit = false;
+    for m in members.values() {
+        if matches!(
+            m.state,
+            GroupMemberState::Active | GroupMemberState::Pending
+        ) {
+            non_terminal += 1;
+            hit = hit || m.agent_id == agent_hex;
+        }
+    }
+    non_terminal == 1 && hit
+}
+
+/// The single self-leave routing predicate (#369): classify `leaver_hex`'s
+/// DELETE against the live roster and join-request view.
+///
+/// Replaces the former `last_admin_self_leave_precheck_error` hand-synced
+/// pair: the last-admin evaluation still runs on a clone so rejected leaves
+/// cannot mutate live group state.
+#[must_use]
+pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition {
+    // Pending comes from join_requests (authoritative), NOT the roster's
+    // seeded Pending entries: reject/cancel clear the roster mirror, and a
+    // KEM-less request never seeds one at all (PR #370 r2 blocker 1).
+    let has_pending_request = info.has_pending_join_request();
+    if !has_pending_request && sole_member_in_being(&info.members_v2, leaver_hex) {
+        return LeaveDisposition::SoleMemberDelete;
+    }
     let mut proposed = info.clone();
     proposed.remove_member(leaver_hex, None);
-    state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
-        .err()
-        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+    if state_commit::enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn).is_ok()
+    {
+        return LeaveDisposition::Proceed;
+    }
+    // Blocked. When the leaver is the only ACTIVE member and a join request
+    // is still pending, the actionable recovery is resolving the request
+    // (approve it, or reject/cancel it so the delete unlocks), not promoting
+    // a member that does not exist.
+    let leaver_is_only_active =
+        info.has_active_member(leaver_hex) && info.active_member_count() == 1;
+    if leaver_is_only_active && has_pending_request {
+        return LeaveDisposition::PendingJoinBlocked;
+    }
+    LeaveDisposition::LastAdminBlocked
 }
 
 impl GroupInfo {
@@ -502,7 +571,13 @@ impl GroupInfo {
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
         if self.withdrawn {
             let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-            if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+            // #369: withdrawn commits are admin-authored, except by the sole
+            // member-in-being — their terminal exit IS the group's unanimous
+            // decision (see `seal_withdrawal`).
+            let authorized =
+                state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
+                    || sole_member_in_being(&self.members_v2, &signer_hex);
+            if !authorized {
                 return Err(state_commit::ApplyError::Unauthorized {
                     signer: signer_hex,
                     action: state_commit::ActionKind::AdminOrHigher.name(),
@@ -585,15 +660,24 @@ impl GroupInfo {
     /// clears local GSS key material; `GroupDeleted` carries the signed commit,
     /// not encrypted group content.
     ///
-    /// Withdrawal is admin-authored; authorization is checked before the local
-    /// state is marked withdrawn so rejected calls leave the group untouched.
+    /// Withdrawal is admin-authored; the sole member-in-being may also
+    /// withdraw — they are the entire group, so their terminal exit IS the
+    /// group's unanimous decision (#369 / PR #370 review item 3; a live
+    /// group's sole ACTIVE member is normally admin-or-higher by the
+    /// last-admin invariant, this covers legacy/invariant-violating rosters
+    /// whose only member is a plain Member). Authorization is checked before
+    /// the local state is marked withdrawn so rejected calls leave the group
+    /// untouched.
     pub fn seal_withdrawal(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-        if !state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex) {
+        let authorized =
+            state_commit::active_signer_is_admin_or_higher(&self.members_v2, &signer_hex)
+                || sole_member_in_being(&self.members_v2, &signer_hex);
+        if !authorized {
             return Err(state_commit::ApplyError::Unauthorized {
                 signer: signer_hex,
                 action: state_commit::ActionKind::AdminOrHigher.name(),
@@ -1037,6 +1121,36 @@ impl GroupInfo {
         self.has_active_member(agent_id_hex)
     }
 
+    /// True when at least one join request is still Pending.
+    ///
+    /// The authoritative pending view for the #369 leave routing: the
+    /// roster's Pending entries are only a seeded mirror — a KEM-less join
+    /// request seeds no roster entry, and reject/cancel clear the mirror via
+    /// [`Self::clear_pending_joiner`] (PR #370 r2 blocker 1).
+    #[must_use]
+    pub fn has_pending_join_request(&self) -> bool {
+        self.join_requests.values().any(JoinRequest::is_pending)
+    }
+
+    /// Clear the requester's Pending roster mirror when their join request
+    /// resolves as rejected or cancelled.
+    ///
+    /// Marks the entry Removed (audit-retained, `removed_by` set) only when
+    /// it is still Pending — an already-active member is never touched.
+    /// Returns whether a mirror was cleared. Without this, a stale Pending
+    /// entry would keep the sole admin's group undeletable forever (#369
+    /// re-created; PR #370 r2 blocker 1).
+    pub fn clear_pending_joiner(&mut self, requester_hex: &str, by: Option<String>) -> bool {
+        let is_pending_mirror = self
+            .members_v2
+            .get(requester_hex)
+            .is_some_and(|m| m.state == GroupMemberState::Pending);
+        if is_pending_mirror {
+            self.remove_member(requester_hex, by);
+        }
+        is_pending_mirror
+    }
+
     /// Returns the caller's effective role if they are an active member.
     #[must_use]
     pub fn caller_role(&self, agent_id_hex: &str) -> Option<GroupRole> {
@@ -1331,6 +1445,233 @@ mod tests {
         info.remove_member(&bob_hex, Some("alice".into()));
         assert!(!info.has_active_member(&bob_hex));
         assert_eq!(info.active_member_count(), 1);
+    }
+
+    #[test]
+    fn leave_disposition_sole_member_requires_the_leaver() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        // #369: creator-only roster — the creator's self-leave routes to
+        // deletion instead of the last-admin 409.
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::SoleMemberDelete
+        );
+        // A stranger is not the sole member even of a one-member roster:
+        // their "leave" of a healthy (admin-bearing) group proceeds.
+        assert_eq!(
+            leave_disposition(&info, &hex::encode([9u8; 32])),
+            LeaveDisposition::Proceed
+        );
+
+        let bob_hex = hex::encode([2u8; 32]);
+        info.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::LastAdminBlocked
+        );
+        assert_eq!(
+            leave_disposition(&info, &bob_hex),
+            LeaveDisposition::Proceed
+        );
+    }
+
+    #[test]
+    fn leave_disposition_ignores_retained_inactive_entries() {
+        // Roster soft-delete keeps Removed/Banned entries for audit; the
+        // routing decision must count only non-terminal entries, or a group
+        // whose other members all departed would look undeletable again
+        // (#369).
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        let bob_hex = hex::encode([2u8; 32]);
+        info.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        info.remove_member(&bob_hex, Some(creator_hex.clone()));
+        assert_eq!(
+            info.members_v2.len(),
+            2,
+            "removed entry is retained for audit"
+        );
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::SoleMemberDelete
+        );
+    }
+
+    #[test]
+    fn leave_disposition_routes_each_roster_shape() {
+        let creator_hex = hex::encode([1u8; 32]);
+        let bob_hex = hex::encode([2u8; 32]);
+
+        // Sole active member: the self-leave IS a deletion (#369).
+        let sole = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        assert_eq!(
+            leave_disposition(&sole, &creator_hex),
+            LeaveDisposition::SoleMemberDelete
+        );
+
+        // Two-member roster (creator Admin + bob Member): the MEMBER's leave
+        // proceeds (an admin remains), the sole ADMIN's leave is the
+        // ADR-0016 §3 409 — untouched by #369.
+        let mut pair = sole.clone();
+        pair.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        assert_eq!(
+            leave_disposition(&pair, &bob_hex),
+            LeaveDisposition::Proceed
+        );
+        assert_eq!(
+            leave_disposition(&pair, &creator_hex),
+            LeaveDisposition::LastAdminBlocked
+        );
+    }
+
+    #[test]
+    fn leave_disposition_pending_joiner_blocks_sole_member_delete() {
+        // PR #370 r2 blocker 1: pending is derived from join_requests (the
+        // authoritative view), never from the roster's seeded mirror — a
+        // KEM-less request seeds NO roster entry, and a stale mirror must
+        // not outlive its rejected/cancelled request.
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        let joiner_hex = hex::encode([3u8; 32]);
+
+        // (b) KEM-less pending request: no roster entry at all, yet the
+        // delete is still blocked — the joiner is real in join_requests.
+        info.join_requests.insert(
+            "req-1".to_string(),
+            JoinRequest::new("aa".repeat(16), joiner_hex.clone(), None, 1_000),
+        );
+        assert!(
+            !info.members_v2.contains_key(&joiner_hex),
+            "KEM-less request seeds no roster mirror"
+        );
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::PendingJoinBlocked
+        );
+
+        // Mirror-seeded request (roster Pending entry present too): same
+        // outcome.
+        info.add_member(
+            joiner_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        info.members_v2
+            .get_mut(&joiner_hex)
+            .expect("joiner entry")
+            .state = GroupMemberState::Pending;
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::PendingJoinBlocked
+        );
+
+        // Pending joiner + another ACTIVE member: the actionable fix is
+        // promoting an admin, not resolving the pending request.
+        let bob_hex = hex::encode([2u8; 32]);
+        let mut pair = info.clone();
+        pair.add_member(bob_hex, GroupRole::Member, Some(creator_hex.clone()), None);
+        assert_eq!(
+            leave_disposition(&pair, &creator_hex),
+            LeaveDisposition::LastAdminBlocked
+        );
+
+        // (a) Rejected request with its mirror cleared: the sole admin's
+        // leave becomes the deletion again instead of a permanent 409.
+        if let Some(req) = info.join_requests.get_mut("req-1") {
+            req.status = JoinRequestStatus::Rejected;
+        }
+        assert!(info.clear_pending_joiner(&joiner_hex, Some(creator_hex.clone())));
+        assert_eq!(
+            leave_disposition(&info, &creator_hex),
+            LeaveDisposition::SoleMemberDelete
+        );
+    }
+
+    #[test]
+    fn clear_pending_joiner_never_touches_active_members() {
+        // The mirror cleanup is keyed on the Pending state — resolving a
+        // request must never remove a member that was since admitted.
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        let bob_hex = hex::encode([2u8; 32]);
+        info.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+
+        assert!(
+            !info.clear_pending_joiner(&bob_hex, Some(creator_hex)),
+            "an active member is not a pending mirror"
+        );
+        assert!(
+            info.has_active_member(&bob_hex),
+            "active member must survive a stray cleanup call"
+        );
+    }
+
+    #[test]
+    fn seal_withdrawal_allows_sole_member_regardless_of_role() {
+        // PR #370 review item 3: a legacy roster whose only member is a plain
+        // Member must still be disposable — the sole member-in-being IS the
+        // entire group. A second member keeps the AdminOrHigher requirement.
+        let admin = crate::identity::AgentKeypair::generate().unwrap();
+        let mut info = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            admin.agent_id(),
+            "aa".repeat(16),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        let admin_hex = hex::encode(admin.agent_id().as_bytes());
+        info.set_member_role(&admin_hex, GroupRole::Member);
+        info.recompute_state_hash();
+
+        let commit = info.seal_withdrawal(&admin, 1_000).unwrap();
+        assert!(commit.withdrawn);
+        assert!(info.withdrawn);
+
+        let other = crate::identity::AgentKeypair::generate().unwrap();
+        let other_hex = hex::encode(other.agent_id().as_bytes());
+        let mut info = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            admin.agent_id(),
+            "aa".repeat(16),
+            GroupPolicyPreset::PublicRequestSecure.to_policy(),
+        );
+        info.set_member_role(&admin_hex, GroupRole::Member);
+        info.add_member(
+            other_hex.clone(),
+            GroupRole::Member,
+            Some(admin_hex.clone()),
+            None,
+        );
+        info.recompute_state_hash();
+        let err = info.seal_withdrawal(&other, 1_000).unwrap_err();
+        assert!(matches!(err, state_commit::ApplyError::Unauthorized { .. }));
+        assert!(
+            !info.withdrawn,
+            "rejected withdrawal leaves state untouched"
+        );
     }
 
     #[test]

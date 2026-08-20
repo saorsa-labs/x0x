@@ -719,7 +719,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Delete,
         path: "/groups/:id",
         cli_name: "group leave",
-        description: "Leave a group",
+        description: "Leave a group (sole-member leave deletes the group)",
         category: "named-groups",
     },
     // ── Phase D.3: state-commit chain ────────────────────────────────────

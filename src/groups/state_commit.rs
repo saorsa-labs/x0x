@@ -631,6 +631,7 @@ fn validate_live_to_withdrawn_authority(
     current_withdrawn: bool,
     commit: &GroupStateCommit,
     signer_role: Option<GroupRole>,
+    signer_is_sole_member: bool,
     action_kind: ActionKind,
     allow_live_withdrawal: bool,
 ) -> Result<(), ApplyError> {
@@ -644,6 +645,14 @@ fn validate_live_to_withdrawn_authority(
         ));
     }
 
+    // #369 / PR #370 review item 3: the sole member-in-being may terminalize
+    // the group regardless of role — their withdrawal IS the entire (one
+    // person) membership's unanimous decision. Any second member-in-being
+    // keeps the AdminOrHigher requirement below.
+    if signer_is_sole_member {
+        return Ok(());
+    }
+
     if action_kind == ActionKind::AdminOrHigher
         && signer_role.is_some_and(|role| role.at_least(GroupRole::Admin))
     {
@@ -652,6 +661,8 @@ fn validate_live_to_withdrawn_authority(
 
     Err(ApplyError::Unauthorized {
         signer: commit.committed_by.clone(),
+        // Names the requirement the signer failed (terminal withdrawals are
+        // admin-or-sole-member acts), not the caller's action kind.
         action: ActionKind::AdminOrHigher.name(),
     })
 }
@@ -718,6 +729,7 @@ fn validate_apply_with_terminal_mode(
 
     // 6. authority
     let signer_role = active_signer_role(ctx.members_v2, &commit.committed_by);
+    let signer_is_sole_member = super::sole_member_in_being(ctx.members_v2, &commit.committed_by);
 
     // A live -> withdrawn transition is a terminal admin act. Already-withdrawn
     // carry-forward commits are intentionally left to the ordinary action-kind
@@ -726,14 +738,22 @@ fn validate_apply_with_terminal_mode(
         ctx.current_withdrawn,
         commit,
         signer_role,
+        signer_is_sole_member,
         action_kind,
         allow_live_withdrawal,
     )?;
 
     let authorized = match action_kind {
-        ActionKind::AdminOrHigher => signer_role
-            .map(|r| r.at_least(GroupRole::Admin))
-            .unwrap_or(false),
+        ActionKind::AdminOrHigher => {
+            // #369: the sole member-in-being's terminal withdrawal is
+            // authorized regardless of role (see
+            // `validate_live_to_withdrawn_authority`); ordinary admin acts
+            // still require Admin-or-higher.
+            signer_role
+                .map(|r| r.at_least(GroupRole::Admin))
+                .unwrap_or(false)
+                || (allow_live_withdrawal && commit.withdrawn && signer_is_sole_member)
+        }
         ActionKind::MemberSelf => signer_role.is_some(),
         ActionKind::NonMemberRequest => signer_role.is_none(),
     };
@@ -1535,6 +1555,63 @@ mod tests {
 
         let err = validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::Unauthorized { .. }));
+    }
+
+    #[test]
+    fn validate_apply_terminal_allows_sole_member_in_being_non_admin() {
+        // #369 / PR #370 review item 3: the sole member-in-being's terminal
+        // withdrawal commits regardless of role — receivers with the same
+        // roster must apply the GroupDeleted, not reject it as non-admin.
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Member),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        assert!(validate_apply_terminal(&ctx, &commit, ActionKind::AdminOrHigher).is_ok());
+        // The carve-out is terminal-only: an ordinary (non-withdrawn)
+        // AdminOrHigher commit from the same sole Member is still refused.
+        let non_terminal = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            false,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let err = validate_apply(&ctx, &non_terminal, ActionKind::AdminOrHigher).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Unauthorized { .. }),
+            "sole-member authority must not leak into ordinary admin acts"
+        );
     }
 
     #[test]

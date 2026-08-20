@@ -162,13 +162,18 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | GET | `/groups` | `x0x group list` | List groups |
 | GET | `/groups/:id` | `x0x group info` | Group info |
 | PATCH | `/groups/:id` | `x0x group update` | Update name/description (admin+) |
-| DELETE | `/groups/:id` | `x0x group leave` | Leave group; last admin is blocked |
+| DELETE | `/groups/:id` | `x0x group leave` | Leave group; sole-member leave deletes the group (otherwise last admin is blocked) |
 | GET | `/groups/:id/members` | `x0x group members` | List members |
 | POST | `/groups/:id/members` | `x0x group add-member` | Add member (admin-authored) |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (admin-authored) |
 | POST | `/groups/:id/invite` | `x0x group invite` | Generate invite link |
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
+
+Deleted/withdrawn groups keep a withdrawn tombstone locally (anti-resurrection
+record). `GET /groups` hides withdrawn tombstones; `GET /groups/:id` still
+serves them with `"withdrawn": true`; `GET /groups/discover` deliberately
+still emits withdrawn cards so stale public listings are superseded.
 
 ## Named groups — public messaging (Phase E)
 

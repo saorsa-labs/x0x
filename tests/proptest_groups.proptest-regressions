@@ -1,0 +1,8 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc f28770f02e60f4b9e1e8c30ebb0a49e8cc1527f757162a6ee80780f93ea44435 # shrinks to signer_spec = None, action_kind = MemberSelf, event_kind = GroupDeleted, current_withdrawn = false, commit_withdrawn = true
+cc 7ac0617c1276cfd25b692356bfd37d6120b02ad5d92c8e11fba356752dcea326 # shrinks to signer_spec = None, action_kind = NonMemberRequest, event_kind = MemberAdded, current_withdrawn = false, commit_withdrawn = false, admin_present = false
