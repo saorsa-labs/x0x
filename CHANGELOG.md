@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.0] - 2026-08-20
+
+### Added
+
+- **KV `AccessPolicy::SelfKeyed` with lowest-N quota (issue #340).** A store
+  policy where each agent may write only keys prefixed by its own agent id,
+  bounded by a per-agent lowest-N key quota enforced at merge.
+
+### Dependencies
+
+- **ant-quic 0.27.39 → 0.27.41.** h2 0.4.16 (RUSTSEC-2026-0258); masque relay
+  send stream finished at frame boundary on clean half-close.
+- **saorsa-gossip 0.5.70 → 0.5.71 — ADR-012 payload-covering gossip message
+  signature.** `MessageHeader` v1→2 adds `payload_hash`; v2 receivers accept
+  v1 during the migration window, so the mixed fleet upgrades with no flag
+  day. This release is the fleet's first v2-capable daemon.
+
 ### Fixed
 
 - **Unsupervised self-update restart is now transactional (issue #261).**
@@ -36,6 +53,19 @@ All notable changes to this project will be documented in this file.
   only. First unicast attempt is budgeted at 3s here; durable DMs and
   roster/control events keep their 8s defaults. `require_gossip_ack` is
   not dropped. No `fan_out` field (#296).
+
+- **TaskList `merge_delta` now routes writes through the envelope writer
+  (issue #349 Layer A).**
+- **Peer admission: PolicyRejection tombstones now stay down across planes
+  (issue #292, phases A–D+F).** Closes the intermittent redial permit.
+- **Reserved `Encrypted` KV policy fails closed until #88 lands (issue #341
+  Phase A).**
+- **MLS epoch history `msg_id` is salted with a length-prefixed group scope
+  (issue #276).** Removes cross-group id collision potential.
+- **History db path is resolved and named at pragma setup (issue #281
+  leftover).**
+- **Machine discovery addresses capped at 8 MRU entries (issue #308).**
+- **`MemberBanned` gets bounded two-channel redelivery (issue #344).**
 
 ## [v0.38.1] - 2026-08-18
 
