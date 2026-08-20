@@ -6,10 +6,10 @@ use std::collections::BTreeMap;
 use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     card::AgentCard, compute_policy_hash, compute_public_meta_hash, compute_roster_root,
-    enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error,
-    last_admin_self_leave_precheck_error, ActionKind, ApplyContext, ApplyError,
-    GroupDiscoverability, GroupInfo, GroupMember, GroupMemberState, GroupPolicyPreset, GroupRole,
-    GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+    enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error, ActionKind,
+    ApplyContext, ApplyError, GroupDiscoverability, GroupInfo, GroupMember, GroupMemberState,
+    GroupPolicyPreset, GroupRole, GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR,
+    LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
 };
 use x0x::identity::{AgentId, AgentKeypair};
 
@@ -737,12 +737,26 @@ fn production_precheck_error_for_rest_zero_admin_attempt(
         }),
         LastAdminAction::SelfLeave { actor } => {
             let actor_hex = keypair_hex(keypairs, *actor);
-            last_admin_self_leave_precheck_error(info, &actor_hex)
+            plain_self_leave_invariant_blocked(info, &actor_hex)
         }
         LastAdminAction::AddMember { .. }
         | LastAdminAction::UpdatePolicy { .. }
         | LastAdminAction::Withdraw { .. } => None,
     }
+}
+
+/// Plain-self-leave invariant precheck for this property model. The shipped
+/// route now routes sole-member leaves to the deletion flow (#369), so the
+/// library's disposition helper no longer reports the sole-member shape as a
+/// plain-leave rejection; this local equivalent keeps the property's subject
+/// — "the precheck rejects exactly the mutations the seal chokepoint
+/// rejects" — focused on the plain-leave path it has always modeled.
+fn plain_self_leave_invariant_blocked(info: &GroupInfo, actor_hex: &str) -> Option<&'static str> {
+    let mut proposed = info.clone();
+    proposed.remove_member(actor_hex, None);
+    enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
+        .err()
+        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
 }
 
 fn apply_rest_action(
@@ -849,7 +863,7 @@ fn apply_rest_action(
                 return reject_without_mutation(info, &before);
             }
             let actor_hex = keypair_hex(keypairs, *actor);
-            if let Some(error) = last_admin_self_leave_precheck_error(info, &actor_hex) {
+            if let Some(error) = plain_self_leave_invariant_blocked(info, &actor_hex) {
                 assert_eq!(error, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR);
                 let mut next = info.clone();
                 mutate_self_leave(&mut next, keypairs, *actor);

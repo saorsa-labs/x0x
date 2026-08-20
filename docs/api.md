@@ -162,7 +162,7 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | GET | `/groups` | `x0x group list` | List groups |
 | GET | `/groups/:id` | `x0x group info` | Group info |
 | PATCH | `/groups/:id` | `x0x group update` | Update name/description (admin+) |
-| DELETE | `/groups/:id` | `x0x group leave` | Leave group; last admin is blocked |
+| DELETE | `/groups/:id` | `x0x group leave` | Leave group; sole-member leave deletes the group (otherwise last admin is blocked) |
 | GET | `/groups/:id/members` | `x0x group members` | List members |
 | POST | `/groups/:id/members` | `x0x group add-member` | Add member (admin-authored) |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member` | Remove member (admin-authored) |

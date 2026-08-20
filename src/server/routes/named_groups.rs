@@ -8551,6 +8551,9 @@ pub(in crate::server) async fn list_named_groups(
     let groups = state.named_groups.read().await;
     let entries: Vec<serde_json::Value> = groups
         .values()
+        // PR #370 review item 2: withdrawn tombstones are anti-resurrection
+        // records, not live groups — never list them.
+        .filter(|info| !info.withdrawn)
         .map(|info| {
             let member_count = named_group_member_values(info).len();
             serde_json::json!({
@@ -8588,6 +8591,9 @@ pub(in crate::server) async fn get_named_group(
             "created_at": info.created_at,
             "updated_at": info.updated_at,
             "chat_topic": info.general_chat_topic(),
+            // PR #370 review item 2: clients must be able to distinguish a
+            // retained withdrawn tombstone from a live group.
+            "withdrawn": info.withdrawn,
             "metadata_topic": info.metadata_topic,
             "policy": info.policy,
             "policy_revision": info.policy_revision,
@@ -11792,9 +11798,26 @@ async fn leave_treekem_group(
         TreeKemLeaveDisposition::ActiveMember => {}
     }
 
-    if let Some(error) = x0x::groups::last_admin_self_leave_precheck_error(&next, &local_agent_hex)
-    {
-        return api_error(StatusCode::CONFLICT, error);
+    // PR #370 review item 4: the route already resolved the leave disposition
+    // (including SoleMemberDelete) before the plane dispatch; this is
+    // defense-in-depth for any direct caller. SoleMemberDelete maps to the
+    // last-admin 409 here only because it is unreachable via the route — a
+    // conservative refusal rather than a deletion the caller did not route.
+    match x0x::groups::leave_disposition(&next, &local_agent_hex) {
+        x0x::groups::LeaveDisposition::Proceed => {}
+        x0x::groups::LeaveDisposition::PendingJoinBlocked => {
+            return api_error(
+                StatusCode::CONFLICT,
+                x0x::groups::PENDING_JOIN_BLOCKED_ERROR,
+            );
+        }
+        x0x::groups::LeaveDisposition::LastAdminBlocked
+        | x0x::groups::LeaveDisposition::SoleMemberDelete => {
+            return api_error(
+                StatusCode::CONFLICT,
+                x0x::groups::LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+            );
+        }
     }
 
     let delivery_roster = next.clone();
@@ -12249,7 +12272,9 @@ pub(in crate::server) async fn withdraw_group_state(
 ) -> impl IntoResponse {
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
-    match withdraw_named_group_terminal(&state, &id, "withdraw_delete", membership_guard).await {
+    match withdraw_named_group_terminal(&state, &id, "withdraw_delete", membership_guard, true)
+        .await
+    {
         Ok(commit) => (
             StatusCode::OK,
             Json(serde_json::json!({
@@ -12271,13 +12296,17 @@ pub(in crate::server) async fn withdraw_group_state(
 /// lock — see `AppState::group_membership_locks`); the guard is consumed so
 /// it can be released before the network publishes exactly where the original
 /// withdraw handler released it. `reason` names the routing path in wipe and
-/// prune logs. Returns the sealed terminal commit so each route can shape its
-/// own success body.
+/// prune logs. `require_admin` keeps the withdraw endpoint's AdminOrHigher
+/// gate; the sole-member leave routing passes `false` because the leaver IS
+/// the entire membership (PR #370 review item 3) — `seal_withdrawal` still
+/// authorizes them as the sole member-in-being. Returns the sealed terminal
+/// commit so each route can shape its own success body.
 async fn withdraw_named_group_terminal(
     state: &Arc<AppState>,
     id: &str,
     reason: &str,
     membership_guard: MutexGuard<'_, ()>,
+    require_admin: bool,
 ) -> Result<x0x::groups::GroupStateCommit, (StatusCode, Json<serde_json::Value>)> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let now_ms = std::time::SystemTime::now()
@@ -12291,7 +12320,9 @@ async fn withdraw_named_group_terminal(
         let Some(info) = groups.get(id) else {
             return Err(not_found("group not found"));
         };
-        require_admin_or_above(info, &local_hex)?;
+        if require_admin {
+            require_admin_or_above(info, &local_hex)?;
+        }
         if let Some(resp) = reject_withdrawn_group(info) {
             return Err(resp);
         }
@@ -12369,7 +12400,17 @@ async fn withdraw_named_group_terminal(
     // node's receive task (:2491-2496). The schedule also holds its own clones
     // of the topic, event and roster, so it never reads the group state this
     // handler has just torn down.
-    spawn_group_control_event_redelivery(state, &metadata_topic, &delivery_roster, &event, &[]);
+    //
+    // PR #370 review item 8: when the terminal roster holds no recipient beyond
+    // the deleter themselves (the sole-member delete), the bounded resend
+    // schedule would arm a 60s task whose four publishes can reach nobody —
+    // skip it. Any remaining active member keeps the schedule.
+    let has_remote_recipients = delivery_roster
+        .active_members()
+        .any(|m| m.agent_id != local_hex);
+    if has_remote_recipients {
+        spawn_group_control_event_redelivery(state, &metadata_topic, &delivery_roster, &event, &[]);
+    }
 
     Ok(commit)
 }
@@ -12398,31 +12439,46 @@ pub(in crate::server) async fn leave_group(
         return resp;
     }
 
-    // #369: a sole-member self-leave IS a group deletion. The last-admin
-    // self-leave precheck (below, and the TreeKEM helper's copy) evaluates the
-    // post-removal remainder — empty here — so routing a sole member through
-    // leave would 409 and strand an undisposable group. A live group's sole
-    // member is necessarily admin-or-higher (last-admin invariant), so this
-    // runs the same terminal withdrawal flow as POST /groups/:id/state/withdraw,
-    // with the same key wipe and GroupDeleted propagation. Checked before the
-    // plane dispatch so both GSS and TreeKEM sole-member groups delete.
-    if x0x::groups::is_sole_member(info, &local_agent_hex) {
-        let name = info.name.clone();
-        drop(groups);
-        return match withdraw_named_group_terminal(
-            &state,
-            &id,
-            "sole_member_leave_delete",
-            _membership_guard,
-        )
-        .await
-        {
-            Ok(_terminal_commit) => (
-                StatusCode::OK,
-                Json(serde_json::json!({ "ok": true, "deleted": name })),
-            ),
-            Err(resp) => resp,
-        };
+    // #369 / PR #370 review item 4: the ONE self-leave routing decision,
+    // computed before the plane dispatch so GSS and TreeKEM groups share it.
+    // SoleMemberDelete runs the same terminal withdrawal flow as
+    // POST /groups/:id/state/withdraw (key wipe, withdrawn tombstone,
+    // GroupDeleted propagation) with the admin gate waived — the leaver IS
+    // the entire membership. PendingJoinBlocked and LastAdminBlocked keep the
+    // ADR-0016 §3 409 shape with the actionable recovery hint.
+    match x0x::groups::leave_disposition(info, &local_agent_hex) {
+        x0x::groups::LeaveDisposition::SoleMemberDelete => {
+            let name = info.name.clone();
+            drop(groups);
+            return match withdraw_named_group_terminal(
+                &state,
+                &id,
+                "sole_member_leave_delete",
+                _membership_guard,
+                /* require_admin */ false,
+            )
+            .await
+            {
+                Ok(_terminal_commit) => (
+                    StatusCode::OK,
+                    Json(serde_json::json!({ "ok": true, "deleted": name })),
+                ),
+                Err(resp) => resp,
+            };
+        }
+        x0x::groups::LeaveDisposition::PendingJoinBlocked => {
+            return api_error(
+                StatusCode::CONFLICT,
+                x0x::groups::PENDING_JOIN_BLOCKED_ERROR,
+            );
+        }
+        x0x::groups::LeaveDisposition::LastAdminBlocked => {
+            return api_error(
+                StatusCode::CONFLICT,
+                x0x::groups::LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+            );
+        }
+        x0x::groups::LeaveDisposition::Proceed => {}
     }
 
     if info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
@@ -12434,9 +12490,6 @@ pub(in crate::server) async fn leave_group(
     let event_group_id = info.stable_group_id().to_string();
     if let Some(resp) = treekem_membership_unsupported(info) {
         return resp;
-    }
-    if let Some(error) = x0x::groups::last_admin_self_leave_precheck_error(info, &local_agent_hex) {
-        return api_error(StatusCode::CONFLICT, error);
     }
     let delivery_roster = info.clone();
     let mut next = info.clone();
@@ -22831,8 +22884,9 @@ pub(in crate::server) mod tests {
     }
 
     /// Why (#369): the sole member's self-leave is a group deletion, not a
-    /// 409. `last_admin_self_leave_precheck_error` evaluates the post-removal
-    /// remainder — empty for a sole member — so routing through plain leave
+    /// 409. The last-admin evaluation inside `leave_disposition` considers the
+    /// post-removal remainder — empty for a sole member — so routing through
+    /// plain leave
     /// would make an empty group undisposable. DELETE must run the terminal
     /// withdrawal flow (keyless withdrawn tombstone, `shared_secret` wiped)
     /// and answer `deleted`, never `left`, so clients can tell the outcomes
@@ -22932,6 +22986,159 @@ pub(in crate::server) mod tests {
         assert!(
             !stored.withdrawn,
             "rejected leave must not delete the live group"
+        );
+        Ok(())
+    }
+
+    /// Why (PR #370 review item 1): a pending joiner is a member-in-being —
+    /// the sole active member must not delete the group under them. The 409
+    /// names the actionable recovery (resolve the requests), distinct from
+    /// the last-admin hint.
+    #[tokio::test]
+    async fn sole_member_leave_with_pending_joiner_returns_409_pending() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let joiner_hex = "33".repeat(32);
+        let group_id = "sole-member-pending-409".to_string();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "pending".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.add_member(
+            joiner_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            Some(admin_hex),
+            None,
+        );
+        info.members_v2
+            .get_mut(&joiner_hex)
+            .expect("joiner entry")
+            .state = x0x::groups::GroupMemberState::Pending;
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
+        assert_eq!(
+            body["error"].as_str(),
+            Some(x0x::groups::PENDING_JOIN_BLOCKED_ERROR),
+            "pending-joiner blockage must name the actionable recovery"
+        );
+        let groups = state.named_groups.read().await;
+        let stored = groups.get(&group_id).expect("group retained after 409");
+        assert!(
+            !stored.withdrawn,
+            "pending-blocked leave must not delete the live group"
+        );
+        Ok(())
+    }
+
+    /// Why (PR #370 review item 3): the sole member IS the entire group, so a
+    /// legacy roster whose only active entry is a plain Member must still be
+    /// disposable — the terminal path waives the admin gate and
+    /// `seal_withdrawal` authorizes them as the sole member-in-being.
+    #[tokio::test]
+    async fn sole_non_admin_member_leave_deletes_group() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let group_id = "sole-non-admin-delete".to_string();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "legacy".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        info.set_member_role(&local_hex, x0x::groups::GroupRole::Member);
+        info.recompute_state_hash();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        let (status, body) = response_json(
+            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "sole non-admin member: {body}");
+        assert_eq!(body["deleted"].as_str(), Some("legacy"));
+        let groups = state.named_groups.read().await;
+        let tombstone = groups.get(&group_id).expect("terminal tombstone retained");
+        assert!(tombstone.withdrawn);
+        Ok(())
+    }
+
+    /// Why (PR #370 review item 2): a retained withdrawn tombstone is an
+    /// anti-resurrection record, not a live group — GET /groups must omit it
+    /// while GET /groups/:id still serves it with `withdrawn: true`.
+    #[tokio::test]
+    async fn withdrawn_tombstone_hidden_from_groups_listing() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let live_id = "listing-live".to_string();
+        let tombstone_id = "listing-tombstone".to_string();
+        let mut live = x0x::groups::GroupInfo::with_policy(
+            "live".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            live_id.clone(),
+            x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+        );
+        live.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+        live.recompute_state_hash();
+        let mut tombstone = live.clone();
+        tombstone.name = "gone".to_string();
+        tombstone.withdrawn = true;
+        let mut groups = state.named_groups.write().await;
+        groups.insert(live_id.clone(), live);
+        groups.insert(tombstone_id.clone(), tombstone);
+        drop(groups);
+
+        let (list_status, list_body) = response_json(
+            list_named_groups(State(Arc::clone(&state)))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(list_status, StatusCode::OK);
+        let listed: Vec<&str> = list_body["groups"]
+            .as_array()
+            .expect("groups array")
+            .iter()
+            .filter_map(|g| g["name"].as_str())
+            .collect();
+        assert!(listed.contains(&"live"), "live group listed: {listed:?}");
+        assert!(
+            !listed.contains(&"gone"),
+            "withdrawn tombstone must not appear in GET /groups: {listed:?}"
+        );
+
+        let (get_status, get_body) = response_json(
+            get_named_group(State(Arc::clone(&state)), Path(tombstone_id.clone()))
+                .await
+                .into_response(),
+        )
+        .await?;
+        assert_eq!(get_status, StatusCode::OK);
+        assert_eq!(
+            get_body["withdrawn"], true,
+            "tombstone detail must carry withdrawn:true: {get_body:?}"
         );
         Ok(())
     }

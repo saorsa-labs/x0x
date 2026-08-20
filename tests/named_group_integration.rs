@@ -694,6 +694,38 @@ async fn named_group_leave() {
         .json()
         .await
         .unwrap();
+
+    let list_r: Value = authed_client(&d)
+        .get(d.url("/groups"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let names: Vec<&str> = list_r["groups"]
+        .as_array()
+        .expect("groups array")
+        .iter()
+        .filter_map(|g| g["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"Leave Group"),
+        "withdrawn tombstone must not appear in GET /groups: {names:?}"
+    );
+
+    let detail_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{group_id}")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        detail_r["withdrawn"], true,
+        "tombstone detail must carry withdrawn:true: {detail_r:?}"
+    );
     assert_eq!(
         second_state_r["withdrawn"], true,
         "withdrawn state: {second_state_r:?}"

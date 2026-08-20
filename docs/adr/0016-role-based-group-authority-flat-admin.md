@@ -240,3 +240,36 @@ Phased; each phase independently shippable.
    surfaces in Phase 1 so none *requires* an owner to exist.
 2. **Fork-choice for equal-revision siblings** (Decision 7) — deliberately
    deferred; needs rollback machinery and its own ADR when prioritised.
+
+## Amendment — sole-member self-leave is a deletion (#369, 2026-08-20)
+
+Decision 3's last-admin invariant is unchanged: a live group with more than
+one member-in-being always keeps an active admin, and the last admin's
+self-leave still returns the §3 409. The carve-out: when the leaver is the
+group's **only member-in-being** (exactly one non-terminal roster entry —
+Active *or* Pending — and it is the leaver), the post-removal remainder is
+empty by definition, so the invariant can never be satisfied by waiting. The
+old behaviour told the user to "make another member an admin before leaving"
+when no other member exists — an empty group was permanently undisposable
+(#369). A sole-member `DELETE /groups/:id` now routes to the same terminal
+withdrawal flow as `POST /groups/:id/state/withdraw` (signed withdrawn
+commit, keyless tombstone, `GroupDeleted` propagation) and answers
+`{"ok":true,"deleted":...}` so clients can distinguish it from a plain
+`{"ok":true,"left":...}` leave. Two refinements ship with it:
+
+- **Pending joiners block the deletion** (they are members-in-being): the
+  sole *active* member with a pending join request gets a distinct 409
+  ("resolve pending join requests before leaving") rather than a deletion
+  that destroys the group under the joiner.
+- **Sole-member authority is rank-blind at the terminal only:** a legacy
+  roster whose only member is a plain `Member` may still withdraw
+  (`seal_withdrawal` / terminal apply authorize the sole member-in-being
+  regardless of role); the carve-out does not extend to any non-terminal
+  admin act.
+
+**Two-member race semantics (accepted by design):** two members leaving
+concurrently both observe a non-sole roster and take the plain-leave path;
+whoever's removal lands second-to-last leaves the other as sole member, whose
+leave *is* the deletion — "last one out turns off the lights". Clients
+discriminate via the `deleted` vs `left` response field; no force flag is
+added.
