@@ -7,6 +7,7 @@
 use std::net::{TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
+use std::sync::LazyLock;
 use std::time::Duration;
 use tokio::sync::OnceCell;
 
@@ -363,6 +364,22 @@ pub async fn pair() -> AgentPair {
     pair_with_extra_config("").await
 }
 
+/// Gossip plane shared by the [`solo`]/[`join_peer`] family for this test
+/// process (#337).
+///
+/// `pair*` and the trio each mint an id inside a single constructor call, but
+/// these are two independent entry points that must land on ONE plane:
+/// [`join_peer`] bootstraps to a [`solo`] anchor and then asserts the two
+/// peered, and it cannot read the anchor's plane. Nextest runs every test in its
+/// own process, so a process-scoped id is per-test in practice — the daemons of
+/// one test share a plane while other tests and ambient daemons stay out.
+/// Mirrors `daemon.rs`'s `process_gossip_plane_id`.
+fn solo_plane_id() -> &'static str {
+    static PLANE_ID: LazyLock<String> =
+        LazyLock::new(|| format!("x0x-test-{}", rand::random::<u32>()));
+    PLANE_ID.as_str()
+}
+
 /// Start a single daemon with no bootstrap peers. Returns the instance
 /// and its UDP bind port so a later daemon can bootstrap to it — the
 /// staggered-start primitive for cold-late-join tests (issue #96), where
@@ -372,7 +389,15 @@ pub async fn solo() -> (AgentInstance, u16) {
     let suffix = rand::random::<u16>();
     let api = allocate_unused_tcp_port();
     let bind = allocate_unused_udp_port();
-    let instance = start_instance(&binary, &format!("solo-{suffix}"), api, bind, "", "").await;
+    let instance = start_instance(
+        &binary,
+        &format!("solo-{suffix}"),
+        api,
+        bind,
+        "",
+        &with_private_plane(solo_plane_id(), ""),
+    )
+    .await;
     (instance, bind)
 }
 
@@ -390,7 +415,7 @@ pub async fn join_peer(anchor: &AgentInstance, anchor_bind: u16) -> AgentInstanc
         api,
         bind,
         &format!("bootstrap_peers = [\"127.0.0.1:{anchor_bind}\"]"),
-        "",
+        &with_private_plane(solo_plane_id(), ""),
     )
     .await;
     tokio::time::sleep(MESH_SETTLE_TIME).await;
