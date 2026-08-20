@@ -101,8 +101,8 @@ fn first_diff(a: &str, b: &str) -> String {
             let b_end = (i + ctx).min(b.len());
             return format!(
                 "offset {i}\n  committed: …{}…\n  expected:  …{}…",
-                &a[start..a_end].escape_debug(),
-                &b[start..b_end].escape_debug(),
+                a[start..a_end].escape_debug(),
+                b[start..b_end].escape_debug(),
             );
         }
     }

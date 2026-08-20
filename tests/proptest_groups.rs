@@ -6,12 +6,21 @@ use std::collections::BTreeMap;
 use x0x::groups::state_commit::{validate_apply, validate_apply_terminal};
 use x0x::groups::{
     card::AgentCard, compute_policy_hash, compute_public_meta_hash, compute_roster_root,
-    enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error, ActionKind,
-    ApplyContext, ApplyError, GroupDiscoverability, GroupInfo, GroupMember, GroupMemberState,
-    GroupPolicyPreset, GroupRole, GroupStateCommit, LAST_ADMIN_PRECHECK_ERROR,
-    LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+    enforce_last_admin_invariant, invite::SignedInvite, last_admin_precheck_error,
+    leave_disposition, ActionKind, ApplyContext, ApplyError, GroupDiscoverability, GroupInfo,
+    GroupMember, GroupMemberState, GroupPolicyPreset, GroupRole, GroupStateCommit,
+    LeaveDisposition, LAST_ADMIN_PRECHECK_ERROR, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+    PENDING_JOIN_BLOCKED_ERROR,
 };
 use x0x::identity::{AgentId, AgentKeypair};
+
+/// PR #370 r2 item 8: counts SelfLeave steps the shipped `leave_disposition`
+/// classified as `SoleMemberDelete` (the deletion route). The sequence model
+/// deliberately does not model tombstones, so those steps are recorded and
+/// skipped; the sequences property asserts the counter was hit at least once
+/// so the branch can never silently stop being exercised.
+static SOLE_MEMBER_DELETE_STEPS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 const LAST_ADMIN_SEQUENCE_AGENT_SLOTS: usize = 5;
 const LAST_ADMIN_SEQUENCE_CASES: u32 = 128;
@@ -589,6 +598,7 @@ fn withdrawal_case_group(
     keypairs: &[AgentKeypair],
     signer_spec: Option<&RosterMemberSpec>,
     current_withdrawn: bool,
+    admin_present: bool,
 ) -> GroupInfo {
     let mut info = GroupInfo::with_policy(
         "withdrawal-authority-proptest".to_string(),
@@ -599,12 +609,18 @@ fn withdrawal_case_group(
     );
     info.members_v2.clear();
 
-    let admin_hex = keypair_hex(keypairs, 0);
-    let admin_spec = member_spec(GroupRole::Admin, GroupMemberState::Active);
-    info.members_v2.insert(
-        admin_hex.clone(),
-        member_from_spec(admin_hex, &admin_spec, None),
-    );
+    // PR #370 r2 item 8: `admin_present = false` generates sole-member (or,
+    // with `signer_spec = None`, empty) rosters so the sole-member-in-being
+    // carve-out in terminal withdrawal authority is actually exercised and
+    // can fail this property if it breaks.
+    if admin_present {
+        let admin_hex = keypair_hex(keypairs, 0);
+        let admin_spec = member_spec(GroupRole::Admin, GroupMemberState::Active);
+        info.members_v2.insert(
+            admin_hex.clone(),
+            member_from_spec(admin_hex, &admin_spec, None),
+        );
+    }
 
     if let Some(spec) = signer_spec {
         let signer_hex = keypair_hex(keypairs, 1);
@@ -619,6 +635,23 @@ fn withdrawal_case_group(
     info.withdrawn = current_withdrawn;
     info.recompute_state_hash();
     info
+}
+
+/// Oracle for the shipped `sole_member_in_being` over this fixture: the
+/// signer is the only non-terminal roster entry. With the admin slot always
+/// non-terminal, that is exactly `!admin_present` plus a signer entry in a
+/// non-terminal state.
+fn signer_is_sole_member_in_being(
+    signer_spec: Option<&RosterMemberSpec>,
+    admin_present: bool,
+) -> bool {
+    !admin_present
+        && signer_spec.is_some_and(|spec| {
+            matches!(
+                spec.state,
+                GroupMemberState::Active | GroupMemberState::Pending
+            )
+        })
 }
 
 fn signer_active_role_from_spec(signer_spec: Option<&RosterMemberSpec>) -> Option<GroupRole> {
@@ -650,6 +683,7 @@ fn expected_withdrawn_apply_authorized(
     current_withdrawn: bool,
     commit_withdrawn: bool,
     signer_spec: Option<&RosterMemberSpec>,
+    admin_present: bool,
     action_kind: ActionKind,
     event_kind: MetadataEventKind,
 ) -> bool {
@@ -657,9 +691,29 @@ fn expected_withdrawn_apply_authorized(
         return false;
     }
     if !current_withdrawn && commit_withdrawn {
-        return event_kind.allows_live_withdrawal()
-            && action_kind == ActionKind::AdminOrHigher
-            && signer_is_active_admin(signer_spec);
+        if !event_kind.allows_live_withdrawal() {
+            return false;
+        }
+        // #369 carve-out: the sole member-in-being may terminalize the group
+        // regardless of role. The general action-kind arm afterwards still
+        // requires an ACTIVE roster entry for MemberSelf (a Pending-only
+        // sole signer passes just AdminOrHigher), and NonMemberRequest
+        // always fails for a roster member.
+        if signer_is_sole_member_in_being(signer_spec, admin_present) {
+            return match action_kind {
+                ActionKind::AdminOrHigher => true,
+                ActionKind::MemberSelf => signer_active_role_from_spec(signer_spec).is_some(),
+                ActionKind::NonMemberRequest => false,
+            };
+        }
+        return action_kind == ActionKind::AdminOrHigher && signer_is_active_admin(signer_spec);
+    }
+    // The only reachable case here is a live group with a non-withdrawn
+    // commit: the post state must still satisfy the last-admin invariant —
+    // an admin-less roster (e.g. the empty `admin_present = false` fixture)
+    // cannot accept one.
+    if !current_withdrawn && !(admin_present || signer_is_active_admin(signer_spec)) {
+        return false;
     }
     normal_action_authorized_by_spec(signer_spec, action_kind)
 }
@@ -737,26 +791,24 @@ fn production_precheck_error_for_rest_zero_admin_attempt(
         }),
         LastAdminAction::SelfLeave { actor } => {
             let actor_hex = keypair_hex(keypairs, *actor);
-            plain_self_leave_invariant_blocked(info, &actor_hex)
+            // PR #370 r2 item 8: the shipped predicate decides. The plain
+            // 409 strings model what the ROUTE answers for each blocked
+            // plain leave; SoleMemberDelete is the deletion route (the
+            // sequence model skips it — see apply_rest_action).
+            match leave_disposition(info, &actor_hex) {
+                LeaveDisposition::Proceed => None,
+                LeaveDisposition::LastAdminBlocked => Some(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR),
+                LeaveDisposition::PendingJoinBlocked => Some(PENDING_JOIN_BLOCKED_ERROR),
+                LeaveDisposition::SoleMemberDelete => {
+                    SOLE_MEMBER_DELETE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Some(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+                }
+            }
         }
         LastAdminAction::AddMember { .. }
         | LastAdminAction::UpdatePolicy { .. }
         | LastAdminAction::Withdraw { .. } => None,
     }
-}
-
-/// Plain-self-leave invariant precheck for this property model. The shipped
-/// route now routes sole-member leaves to the deletion flow (#369), so the
-/// library's disposition helper no longer reports the sole-member shape as a
-/// plain-leave rejection; this local equivalent keeps the property's subject
-/// — "the precheck rejects exactly the mutations the seal chokepoint
-/// rejects" — focused on the plain-leave path it has always modeled.
-fn plain_self_leave_invariant_blocked(info: &GroupInfo, actor_hex: &str) -> Option<&'static str> {
-    let mut proposed = info.clone();
-    proposed.remove_member(actor_hex, None);
-    enforce_last_admin_invariant(&proposed.members_v2, proposed.withdrawn)
-        .err()
-        .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
 }
 
 fn apply_rest_action(
@@ -863,21 +915,39 @@ fn apply_rest_action(
                 return reject_without_mutation(info, &before);
             }
             let actor_hex = keypair_hex(keypairs, *actor);
-            if let Some(error) = plain_self_leave_invariant_blocked(info, &actor_hex) {
-                assert_eq!(error, LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR);
-                let mut next = info.clone();
-                mutate_self_leave(&mut next, keypairs, *actor);
-                return reject_last_admin_precheck_and_seal_chokepoint(
-                    info,
-                    next,
-                    &keypairs[*actor],
-                    now_ms,
-                    &before,
-                );
+            // PR #370 r2 item 8: route every outcome through the shipped
+            // predicate. SoleMemberDelete is the deletion route — the
+            // sequence model does not model tombstones, so it records the
+            // hit and skips the step as a no-op (matching the gossip twin,
+            // whose member-self commit is also refused by the seal
+            // chokepoint on a zero-admin remainder).
+            match leave_disposition(info, &actor_hex) {
+                LeaveDisposition::SoleMemberDelete => {
+                    SOLE_MEMBER_DELETE_STEPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    reject_without_mutation(info, &before)
+                }
+                LeaveDisposition::LastAdminBlocked => {
+                    let mut next = info.clone();
+                    mutate_self_leave(&mut next, keypairs, *actor);
+                    reject_last_admin_precheck_and_seal_chokepoint(
+                        info,
+                        next,
+                        &keypairs[*actor],
+                        now_ms,
+                        &before,
+                    )
+                }
+                LeaveDisposition::PendingJoinBlocked => {
+                    // Unreachable here (roster specs never carry join
+                    // requests), but the route answers 409 — model refuses.
+                    reject_without_mutation(info, &before)
+                }
+                LeaveDisposition::Proceed => {
+                    let mut next = info.clone();
+                    mutate_self_leave(&mut next, keypairs, *actor);
+                    seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
+                }
             }
-            let mut next = info.clone();
-            mutate_self_leave(&mut next, keypairs, *actor);
-            seal_rest_state(info, next, &keypairs[*actor], now_ms, &before)
         }
         LastAdminAction::UpdatePolicy { actor, preset } => {
             if !slot_is_active_admin(info, keypairs, *actor) {
@@ -1287,6 +1357,7 @@ proptest! {
         event_kind in arb_metadata_event_kind(),
         current_withdrawn in any::<bool>(),
         commit_withdrawn in any::<bool>(),
+        admin_present in any::<bool>(),
     ) {
         let keypairs = sequence_keypairs();
         let signer = &keypairs[1];
@@ -1294,6 +1365,7 @@ proptest! {
             &keypairs,
             signer_spec.as_ref(),
             current_withdrawn,
+            admin_present,
         );
         let before = state_snapshot(&apply_group);
         let commit = craft_withdrawn_flag_commit(
@@ -1309,6 +1381,7 @@ proptest! {
             current_withdrawn,
             commit_withdrawn,
             signer_spec.as_ref(),
+            admin_present,
             action_kind,
             event_kind,
         );
@@ -1338,12 +1411,15 @@ proptest! {
             &keypairs,
             signer_spec.as_ref(),
             current_withdrawn,
+            admin_present,
         );
         let before_snapshot = state_snapshot(&seal_group);
         let before_revision = seal_group.state_revision;
         let before_state_hash = seal_group.state_hash.clone();
         let seal_result = seal_group.seal_withdrawal(signer, 12_000);
-        let expected_seal_ok = signer_is_active_admin(signer_spec.as_ref());
+        // #369: the sole member-in-being may withdraw regardless of role.
+        let expected_seal_ok = signer_is_active_admin(signer_spec.as_ref())
+            || signer_is_sole_member_in_being(signer_spec.as_ref(), admin_present);
         prop_assert_eq!(seal_result.is_ok(), expected_seal_ok);
         if let Ok(commit) = seal_result {
             prop_assert!(commit.withdrawn);
@@ -1431,6 +1507,7 @@ proptest! {
         prop_assert_eq!(independent_active_admin_count(&group), 1);
         let expected_precheck_error = match action {
             LastAdminAction::SelfLeave { .. } => LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
+            // (SoleMemberDelete counter asserted after the match below.)
             _ => LAST_ADMIN_PRECHECK_ERROR,
         };
         prop_assert_eq!(
@@ -1537,4 +1614,35 @@ fn last_admin_deterministic_sequence_covers_accepted_mutations_on_rest_and_gossi
     gossip_stats.assert_all_semantically_valid_actions_accepted("gossip");
     assert!(rest_group.withdrawn);
     assert!(gossip_group.withdrawn);
+}
+
+/// PR #370 r2 item 8: deterministic coverage for the shipped predicate's
+/// `SoleMemberDelete` branch. The sequence model records-and-skips that
+/// branch (no tombstone model), so this pins (a) the disposition itself on a
+/// true sole-member roster, (b) the precheck/apply arms' behaviour, and
+/// (c) that the branch was actually reached via the counter.
+#[test]
+fn sole_admin_self_leave_routes_to_deletion_disposition() {
+    let initial = vec![member_spec(GroupRole::Admin, GroupMemberState::Active)];
+    let keypairs = sequence_keypairs();
+    let mut group = group_from_initial_specs(&keypairs, &initial);
+    let before = state_snapshot(&group);
+    let action = LastAdminAction::SelfLeave { actor: 0 };
+    let actor_hex = keypair_hex(&keypairs, 0);
+
+    assert_eq!(
+        leave_disposition(&group, &actor_hex),
+        LeaveDisposition::SoleMemberDelete
+    );
+    assert_eq!(
+        production_precheck_error_for_rest_zero_admin_attempt(&group, &keypairs, &action),
+        Some(LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
+    );
+    let outcome = apply_rest_action(&mut group, &keypairs, &action, 9_000);
+    assert_eq!(outcome, SequenceOutcome::Rejected);
+    assert_eq!(state_snapshot(&group), before);
+    assert!(
+        SOLE_MEMBER_DELETE_STEPS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
+        "sole-member SelfLeave must reach the SoleMemberDelete branch"
+    );
 }

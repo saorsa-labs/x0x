@@ -2394,10 +2394,9 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                 AdmissionState::New
             };
 
-        let is_new_request;
         let admission_first_seen_ms;
 
-        match admission_state {
+        let is_new_request = match admission_state {
             AdmissionState::Complete => {
                 // If this exact pair is completing a journaled
                 // admission, first re-establish directory
@@ -2483,7 +2482,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                         }
                     }
                 }
-                is_new_request = true;
+                true
             }
             AdmissionState::Repair(stored_first_seen_ms) => {
                 // Watson item 5: for repair, also write the marker
@@ -2533,7 +2532,7 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                         break 'admission true;
                     }
                 }
-                is_new_request = false;
+                false
             }
             AdmissionState::PubsubFirst => {
                 // Compatibility path: the durable request has the
@@ -2604,9 +2603,9 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
                         break 'admission true;
                     }
                 }
-                is_new_request = false;
+                false
             }
-        }
+        };
 
         // Now apply the request (only for New; Repair skips apply).
         let group_snapshot = if is_new_request {

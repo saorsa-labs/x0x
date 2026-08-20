@@ -257,8 +257,11 @@ commit, keyless tombstone, `GroupDeleted` propagation) and answers
 `{"ok":true,"deleted":...}` so clients can distinguish it from a plain
 `{"ok":true,"left":...}` leave. Two refinements ship with it:
 
-- **Pending joiners block the deletion** (they are members-in-being): the
-  sole *active* member with a pending join request gets a distinct 409
+- **Pending joiners block the deletion:** pending is derived from
+  `join_requests` status (the authoritative view), not the roster's seeded
+  Pending mirror — a KEM-less request seeds no roster entry yet its joiner
+  is real, and reject/cancel clear the mirror when the request resolves. The
+  sole active member with a still-pending request gets a distinct 409
   ("resolve pending join requests before leaving") rather than a deletion
   that destroys the group under the joiner.
 - **Sole-member authority is rank-blind at the terminal only:** a legacy
@@ -267,9 +270,12 @@ commit, keyless tombstone, `GroupDeleted` propagation) and answers
   regardless of role); the carve-out does not extend to any non-terminal
   admin act.
 
-**Two-member race semantics (accepted by design):** two members leaving
-concurrently both observe a non-sole roster and take the plain-leave path;
-whoever's removal lands second-to-last leaves the other as sole member, whose
-leave *is* the deletion — "last one out turns off the lights". Clients
-discriminate via the `deleted` vs `left` response field; no force flag is
-added.
+**Two-member race (pre-existing, unfixed):** each daemon evaluates
+`leave_disposition` once, on its own roster snapshot. When the last two
+members leave concurrently, both observe a non-sole roster, both take the
+plain-leave path, and both remove their local record — the group can end up
+live with zero members and no anti-resurrection tombstone. The second leave
+does **not** convert into a deletion. This race predates #369 (the old path
+merely 409'd one of the two leavers); it is tracked in issue #372 and is
+accepted here rather than fixed. Clients discriminate a completed outcome via
+the `deleted` vs `left` response field; no force flag is added.

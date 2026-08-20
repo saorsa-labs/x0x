@@ -582,7 +582,10 @@ on leave. Exception (#369): when the leaver is the group's only remaining
 member, the self-leave IS a deletion — it runs the same terminal withdrawal as
 `x0x group delete` below (withdrawn tombstone, key wipe, `GroupDeleted`
 propagation) and answers `{"ok":true,"deleted":"<name>"}` instead of
-`{"ok":true,"left":...}` so clients can tell the two outcomes apart.
+`{"ok":true,"left":...}` so clients can tell the two outcomes apart. Tombstone
+visibility: `GET /groups` hides withdrawn records; `GET /groups/:id` serves
+them with `"withdrawn": true`; `GET /groups/discover` deliberately still
+emits withdrawn cards so stale public discovery listings are superseded.
 
 `x0x group delete` (`POST /groups/:id/state/withdraw`) is admin-only and
 irreversible: **group over for everyone, permanently**. It seals the unchanged

@@ -271,19 +271,15 @@ impl GossipDispatchStats {
 }
 
 fn duration_ms(duration: Duration) -> u64 {
-    u64::try_from(duration.as_millis())
-        .ok()
-        .map_or(u64::MAX, |ms| ms)
+    u64::try_from(duration.as_millis()).ok().unwrap_or(u64::MAX)
 }
 
 fn duration_ns(duration: Duration) -> u64 {
-    u64::try_from(duration.as_nanos())
-        .ok()
-        .map_or(u64::MAX, |ns| ns)
+    u64::try_from(duration.as_nanos()).ok().unwrap_or(u64::MAX)
 }
 
 fn usize_to_u64(value: usize) -> u64 {
-    u64::try_from(value).ok().map_or(u64::MAX, |v| v)
+    u64::try_from(value).ok().unwrap_or(u64::MAX)
 }
 
 /// The gossip runtime that manages all gossip components.

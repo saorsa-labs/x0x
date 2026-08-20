@@ -170,6 +170,11 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 | POST | `/groups/join` | `x0x group join` | Join from invite |
 | PUT | `/groups/:id/display-name` | `x0x group set-name` | Set display name |
 
+Deleted/withdrawn groups keep a withdrawn tombstone locally (anti-resurrection
+record). `GET /groups` hides withdrawn tombstones; `GET /groups/:id` still
+serves them with `"withdrawn": true`; `GET /groups/discover` deliberately
+still emits withdrawn cards so stale public listings are superseded.
+
 ## Named groups — public messaging (Phase E)
 
 | Method | Path | CLI | Description |

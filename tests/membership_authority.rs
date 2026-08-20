@@ -668,6 +668,12 @@ fn membership_authority_sole_member_self_leave_with_pending_joiner_returns_409()
     let creator_hex = hex_id(&creator);
     let joiner_hex = hex_id(&joiner);
     let mut info = admin_group(&creator, "T");
+    // PR #370 r2 blocker 1: pending is derived from join_requests — model a
+    // KEM-less request (no roster mirror) and a mirrored one.
+    info.join_requests.insert(
+        "req-pending".to_string(),
+        x0x::groups::JoinRequest::new("T".to_string(), joiner_hex.clone(), None, 1_000),
+    );
     info.add_member(
         joiner_hex.clone(),
         GroupRole::Member,

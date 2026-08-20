@@ -7421,10 +7421,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
+                    let requester_hex = next
+                        .join_requests
+                        .get(request_id.as_str())
+                        .map(|req| req.requester_agent_id.clone());
                     if let Some(req) = next.join_requests.get_mut(&request_id) {
                         req.status = x0x::groups::JoinRequestStatus::Rejected;
                         req.reviewed_by = Some(actor.clone());
                         req.reviewed_at = Some(commit.committed_at);
+                    }
+                    // PR #370 r2 blocker 1: keep the roster mirror in step
+                    // with the resolved request (gossip-apply side).
+                    if let Some(requester_hex) = requester_hex {
+                        next.clear_pending_joiner(&requester_hex, Some(actor.clone()));
                     }
                 },
             ) else {
@@ -7466,6 +7475,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     if let Some(req) = next.join_requests.get_mut(&request_id) {
                         req.status = x0x::groups::JoinRequestStatus::Cancelled;
                     }
+                    // PR #370 r2 blocker 1: keep the roster mirror in step
+                    // with the resolved request (gossip-apply side).
+                    next.clear_pending_joiner(requester_agent_id.as_str(), None);
                 },
             ) else {
                 return ApplyMetadataResult::REJECTED;
@@ -11798,26 +11810,23 @@ async fn leave_treekem_group(
         TreeKemLeaveDisposition::ActiveMember => {}
     }
 
-    // PR #370 review item 4: the route already resolved the leave disposition
-    // (including SoleMemberDelete) before the plane dispatch; this is
-    // defense-in-depth for any direct caller. SoleMemberDelete maps to the
-    // last-admin 409 here only because it is unreachable via the route — a
-    // conservative refusal rather than a deletion the caller did not route.
-    match x0x::groups::leave_disposition(&next, &local_agent_hex) {
-        x0x::groups::LeaveDisposition::Proceed => {}
-        x0x::groups::LeaveDisposition::PendingJoinBlocked => {
-            return api_error(
-                StatusCode::CONFLICT,
-                x0x::groups::PENDING_JOIN_BLOCKED_ERROR,
-            );
-        }
-        x0x::groups::LeaveDisposition::LastAdminBlocked
-        | x0x::groups::LeaveDisposition::SoleMemberDelete => {
-            return api_error(
-                StatusCode::CONFLICT,
-                x0x::groups::LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR,
-            );
-        }
+    // PR #370 r2 item 5: the route already resolved the leave disposition —
+    // including SoleMemberDelete and both 409s — before the plane dispatch,
+    // so only Proceed can reach here. A non-Proceed outcome means a direct
+    // caller bypassed the route's routing; fail with a distinct internal
+    // error instead of re-emitting a user-facing recovery hint (never the
+    // "promote another admin" text from this unreachable arm).
+    let disposition_check = x0x::groups::leave_disposition(&next, &local_agent_hex);
+    debug_assert!(
+        matches!(disposition_check, x0x::groups::LeaveDisposition::Proceed),
+        "leave_treekem_group reached with non-Proceed disposition {disposition_check:?}"
+    );
+    if !matches!(disposition_check, x0x::groups::LeaveDisposition::Proceed) {
+        return api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "internal leave-disposition mismatch: the leave route must resolve the \
+             disposition before the plane dispatch",
+        );
     }
 
     let delivery_roster = next.clone();
@@ -12401,16 +12410,14 @@ async fn withdraw_named_group_terminal(
     // of the topic, event and roster, so it never reads the group state this
     // handler has just torn down.
     //
-    // PR #370 review item 8: when the terminal roster holds no recipient beyond
-    // the deleter themselves (the sole-member delete), the bounded resend
-    // schedule would arm a 60s task whose four publishes can reach nobody —
-    // skip it. Any remaining active member keeps the schedule.
-    let has_remote_recipients = delivery_roster
-        .active_members()
-        .any(|m| m.agent_id != local_hex);
-    if has_remote_recipients {
-        spawn_group_control_event_redelivery(state, &metadata_topic, &delivery_roster, &event, &[]);
-    }
+    // PR #370 r2 blocker 2: arm the #333 bounded resend schedule
+    // UNCONDITIONALLY. Its per-round metadata-topic republish is the only
+    // repair for pending listeners and members whose MemberRemoved was lost
+    // — gating it on the direct-recipient set drops that repair for
+    // sole-member deletes AND for the shared POST /state/withdraw route.
+    // (Round-1 item 8 was wrong; perf of the empty direct loop is a
+    // follow-up, not a gate.)
+    spawn_group_control_event_redelivery(state, &metadata_topic, &delivery_roster, &event, &[]);
 
     Ok(commit)
 }
@@ -14675,6 +14682,10 @@ pub(in crate::server) async fn reject_join_request(
         req.reviewed_by = Some(caller_hex.clone());
         req.reviewed_at = Some(now_ms);
         let requester_hex = req.requester_agent_id.clone();
+        // PR #370 r2 blocker 1: the Pending roster mirror must not outlive
+        // the request, or a sole admin who rejected the only request is
+        // 409'd forever (#369 re-created).
+        next.clear_pending_joiner(&requester_hex, Some(caller_hex.clone()));
         let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
@@ -14751,6 +14762,8 @@ pub(in crate::server) async fn cancel_join_request(
         }
         req.status = x0x::groups::JoinRequestStatus::Cancelled;
         let requester_hex = req.requester_agent_id.clone();
+        // PR #370 r2 blocker 1: same mirror cleanup on self-cancellation.
+        next.clear_pending_joiner(&requester_hex, Some(caller_hex.clone()));
         let commit = match next.seal_commit(signing_kp, now_ms) {
             Ok(c) => c,
             Err(e) => {
@@ -22997,7 +23010,6 @@ pub(in crate::server) mod tests {
     #[tokio::test]
     async fn sole_member_leave_with_pending_joiner_returns_409_pending() -> Result<()> {
         let (state, _dir) = secure_endpoint_test_state().await?;
-        let admin_hex = hex::encode(state.agent.agent_id().as_bytes());
         let joiner_hex = "33".repeat(32);
         let group_id = "sole-member-pending-409".to_string();
         let mut info = x0x::groups::GroupInfo::with_policy(
@@ -23008,16 +23020,16 @@ pub(in crate::server) mod tests {
             x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
         );
         info.secure_plane = x0x::mls::SecureGroupPlane::Gss;
-        info.add_member(
-            joiner_hex.clone(),
-            x0x::groups::GroupRole::Member,
-            Some(admin_hex),
-            None,
+        // PR #370 r2 blocker 1: KEM-less pending request — a join_requests
+        // entry with NO roster mirror must still block the deletion.
+        info.join_requests.insert(
+            "req-pending".to_string(),
+            x0x::groups::JoinRequest::new(group_id.clone(), joiner_hex.clone(), None, 1_000),
         );
-        info.members_v2
-            .get_mut(&joiner_hex)
-            .expect("joiner entry")
-            .state = x0x::groups::GroupMemberState::Pending;
+        assert!(
+            !info.members_v2.contains_key(&joiner_hex),
+            "KEM-less request seeds no roster mirror"
+        );
         info.recompute_state_hash();
         state
             .named_groups

@@ -4997,10 +4997,12 @@ async function setSpaceDisplayName(gid){
 }
 
 async function leaveSpace(gid){
-  await api('/groups/'+gid,{method:'DELETE'});
+  const r=await api('/groups/'+gid,{method:'DELETE'});
   delete savedInvites[gid];
   hideDetail();
-  toast('Left space','info');
+  // #369: a sole-member leave IS a deletion — say so instead of "Left space".
+  const deleted=r&&typeof r==='object'&&r.deleted!==undefined;
+  toast(deleted?'Space deleted':'Left space','info');
   await pollGroups();
   navigate('home');
 }

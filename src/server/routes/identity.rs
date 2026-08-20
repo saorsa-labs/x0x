@@ -481,7 +481,7 @@ pub(in crate::server) async fn get_agent_card(
 
     // Include stores
     let stores = state.kv_stores.read().await;
-    for (topic, _) in stores.iter() {
+    for topic in stores.keys() {
         card.stores.push(x0x::groups::card::CardStore {
             name: topic.clone(),
             topic: topic.clone(),
@@ -544,7 +544,7 @@ pub(in crate::server) async fn get_a2a_agent_card(
     // Public stores become A2A skills.
     {
         let stores = state.kv_stores.read().await;
-        for (topic, _) in stores.iter() {
+        for topic in stores.keys() {
             card.stores.push(x0x::groups::card::CardStore {
                 name: topic.clone(),
                 topic: topic.clone(),
