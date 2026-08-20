@@ -1,7 +1,6 @@
 //! Binary upgrade application: download, verify SHA-256, extract, and atomically
 //! replace the running binary with rollback on failure.
 
-use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 
 use tracing::{debug, info, warn};
@@ -9,6 +8,7 @@ use tracing::{debug, info, warn};
 use sha2::{Digest, Sha256};
 
 use super::manifest::{current_platform_target, ReleaseManifest};
+use super::restart;
 use super::signature::{verify_bytes_signature_with_key, RELEASE_SIGNING_KEY};
 use super::{UpgradeError, UpgradeResult, Upgrader};
 
@@ -17,8 +17,8 @@ use super::{UpgradeError, UpgradeResult, Upgrader};
 /// otherwise left a ~50 MB archive + extracted binary behind on every attempt).
 ///
 /// The success path explicitly removes the temp dir *before* triggering the
-/// restart, because the restart `exec()`s (Unix) or `exit()`s without unwinding,
-/// so this guard would not otherwise run there.
+/// restart, because the restart may `_exit` without unwinding, so this guard
+/// would not otherwise run there.
 struct TempDirGuard {
     path: PathBuf,
 }
@@ -37,6 +37,23 @@ impl Drop for TempDirGuard {
     }
 }
 
+/// Context the restart planner needs from the running daemon: where the
+/// handoff file lives, which API address the replacement must serve, and how
+/// to trigger a bounded graceful shutdown before the old process exits.
+///
+/// `Default` (no data dir, no address, no shutdown hook) is only useful for
+/// tests and non-daemon callers — every daemon apply path supplies all three.
+#[derive(Clone, Default)]
+pub struct RestartContext {
+    /// Daemon data directory (`upgrade-handoff.json` / `UPGRADE_FAILED`).
+    pub data_dir: Option<PathBuf>,
+    /// Pre-upgrade API address the replacement must serve `/health` on.
+    pub api_addr: Option<std::net::SocketAddr>,
+    /// Triggers the daemon's graceful shutdown (cancellation). Called inside
+    /// the handoff's 5s bounded cancel window.
+    pub shutdown: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+}
+
 /// Auto-apply upgrader that handles the full download → verify → extract → replace → restart flow.
 pub struct AutoApplyUpgrader {
     /// Which binary to extract from the archive (e.g. "x0xd", "x0x").
@@ -45,6 +62,8 @@ pub struct AutoApplyUpgrader {
     stop_on_upgrade: bool,
     /// Whether a successful apply should immediately restart/exec.
     restart_on_success: bool,
+    /// Data directory / API address / shutdown hook for the restart planner.
+    restart_context: RestartContext,
 }
 
 impl AutoApplyUpgrader {
@@ -53,11 +72,19 @@ impl AutoApplyUpgrader {
             binary_name: binary_name.to_string(),
             stop_on_upgrade: false,
             restart_on_success: true,
+            restart_context: RestartContext::default(),
         }
     }
 
     pub fn with_stop_on_upgrade(mut self, stop: bool) -> Self {
         self.stop_on_upgrade = stop;
+        self
+    }
+
+    /// Supply the daemon-side restart context (data dir, pre-upgrade API
+    /// address, graceful-shutdown hook) used by the transactional handoff.
+    pub fn with_restart_context(mut self, context: RestartContext) -> Self {
+        self.restart_context = context;
         self
     }
 
@@ -70,14 +97,27 @@ impl AutoApplyUpgrader {
         self
     }
 
-    /// Restart the current binary using the configured restart mode.
+    /// Restart the current binary using the planned restart mode.
     ///
-    /// On Unix this may replace the current process with `exec()` and will not
-    /// return if the exec succeeds.
-    pub fn restart_current_binary(&self) -> Result<(), UpgradeError> {
+    /// Unsupervised (the default for a terminal-launched daemon) this runs the
+    /// transactional handoff and never returns. Supervised it exits for the
+    /// supervisor and never returns. Returns `Err` only when the handoff could
+    /// not even be started (helper spawn failure) — the old process keeps
+    /// running in that case.
+    pub fn restart_current_binary(&self, target_version: &str) -> Result<(), UpgradeError> {
         let target_path = current_binary_path()?;
-        self.trigger_restart(&target_path);
-        Ok(())
+        self.trigger_restart(&target_path, target_version)
+    }
+
+    /// Classify the restart mode for the current environment (I0).
+    pub fn restart_mode(&self) -> restart::RestartMode {
+        self.restart_mode_with(&restart::SupervisionSignals::sample())
+    }
+
+    /// Classification with injected signals — the single planner every apply
+    /// caller routes through (startup check, gossip, fallback poll, HTTP).
+    pub fn restart_mode_with(&self, signals: &restart::SupervisionSignals) -> restart::RestartMode {
+        restart::plan_restart_mode(self.stop_on_upgrade, signals)
     }
 
     /// Apply an upgrade from a `ReleaseManifest`.
@@ -215,60 +255,84 @@ impl AutoApplyUpgrader {
                 target_version
             );
             if self.restart_on_success {
-                self.trigger_restart(&target_path);
+                if let Err(e) = self.trigger_restart(&target_path, &target_version.to_string()) {
+                    warn!(
+                        error = %e,
+                        "Restart after successful upgrade did not start: {e}; \
+                         old process keeps serving"
+                    );
+                }
             }
         }
 
         Ok(result)
     }
 
-    /// Trigger a restart after successful upgrade.
-    fn trigger_restart(&self, binary_path: &Path) {
-        if self.stop_on_upgrade {
-            // Service manager mode: exit with code 0, let systemd restart
-            let exit_code = if cfg!(windows) { 100 } else { 0 };
-            info!(
-                exit_code = exit_code,
-                "Exiting with code {} for service manager restart", exit_code
-            );
-            std::process::exit(exit_code);
-        } else {
-            // Standalone mode: spawn new process with same args, exit old
-            let args: Vec<OsString> = std::env::args_os().skip(1).collect();
-            let args_display: Vec<String> = args
-                .iter()
-                .map(|a| a.to_string_lossy().to_string())
-                .collect();
-            info!(
-                binary_path = %binary_path.display(),
-                args = %args_display.join(" "),
-                "Spawning new process: {} {}",
-                binary_path.display(),
-                args_display.join(" ")
-            );
+    /// Trigger a restart after successful upgrade (#261).
+    ///
+    /// Classification first (I0): `SupervisedExit` only when `stop_on_upgrade`
+    /// is true AND a real supervision signal is present (`INVOCATION_ID`,
+    /// parent comm `systemd`, `X0X_SUPERVISED=1`). Everything else — including
+    /// unsupervised runs with the default `stop_on_upgrade = true` — goes
+    /// through the transactional handoff, which proves `/health` on the new
+    /// binary or restores the backup. The old `exec()` path is gone: it could
+    /// not roll back.
+    fn trigger_restart(
+        &self,
+        binary_path: &Path,
+        target_version: &str,
+    ) -> Result<(), UpgradeError> {
+        let mode = self.restart_mode();
+        info!(
+            mode = ?mode,
+            stop_on_upgrade = self.stop_on_upgrade,
+            "Restart planned after successful upgrade"
+        );
 
-            #[cfg(unix)]
-            {
-                use std::os::unix::process::CommandExt;
-                let error = std::process::Command::new(binary_path)
-                    .args(&args)
-                    .arg("--skip-update-check")
-                    .exec();
-                // exec() only returns on error
-                warn!(error = %error, "exec failed: {error}");
-            }
+        let backup_path = restart::UpgradeHandoff::backup_path_for(binary_path);
+        let handoff = restart::UpgradeHandoff::capture(
+            binary_path,
+            &backup_path,
+            target_version,
+            self.restart_context
+                .api_addr
+                .unwrap_or_else(|| std::net::SocketAddr::from(([127, 0, 0, 1], 0))),
+            mode,
+        );
+        let handoff_path = match self.restart_context.data_dir.as_deref() {
+            Some(data_dir) => data_dir.join(restart::HANDOFF_FILE_NAME),
+            // Non-daemon caller with no data dir: keep the intent record next
+            // to the binary rather than losing it entirely.
+            None => binary_path
+                .parent()
+                .unwrap_or_else(|| Path::new("."))
+                .join(restart::HANDOFF_FILE_NAME),
+        };
 
-            #[cfg(not(unix))]
-            {
-                match std::process::Command::new(binary_path)
-                    .args(&args)
-                    .arg("--skip-update-check")
-                    .spawn()
-                {
-                    Ok(_) => std::process::exit(0),
-                    Err(e) => warn!(error = %e, "Failed to spawn new process: {e}"),
+        match mode {
+            restart::RestartMode::SupervisedExit => {
+                // I3: write the intent file BEFORE exiting so a supervisor
+                // crash loop is diagnosable. Best-effort — the exit contract
+                // with Restart=always units must not depend on disk health.
+                if let Err(e) = handoff.write(&handoff_path) {
+                    warn!(
+                        handoff = %handoff_path.display(),
+                        error = %e,
+                        "Failed to write upgrade intent file before supervised exit"
+                    );
                 }
+                let exit_code = if cfg!(windows) { 100 } else { 0 };
+                info!(
+                    exit_code = exit_code,
+                    "Exiting with code {} for service manager restart", exit_code
+                );
+                std::process::exit(exit_code);
             }
+            restart::RestartMode::TransactionalHandoff => restart::begin_transactional_handoff(
+                handoff,
+                &handoff_path,
+                self.restart_context.shutdown.as_deref(),
+            ),
         }
     }
 }
@@ -601,12 +665,57 @@ mod tests {
         assert_eq!(upgrader.binary_name, "x0xd");
         assert!(!upgrader.stop_on_upgrade);
         assert!(upgrader.restart_on_success);
+        assert!(upgrader.restart_context.data_dir.is_none());
     }
 
     #[test]
     fn auto_apply_upgrader_with_stop_on_upgrade() {
         let upgrader = AutoApplyUpgrader::new("x0x").with_stop_on_upgrade(true);
         assert!(upgrader.stop_on_upgrade);
+    }
+
+    #[test]
+    fn auto_apply_upgrader_with_restart_context() {
+        let context = RestartContext {
+            data_dir: Some(PathBuf::from("/var/lib/x0x")),
+            api_addr: Some("127.0.0.1:12700".parse().unwrap()),
+            shutdown: None,
+        };
+        let upgrader = AutoApplyUpgrader::new("x0xd").with_restart_context(context);
+        assert_eq!(
+            upgrader.restart_context.data_dir.as_deref(),
+            Some(Path::new("/var/lib/x0x"))
+        );
+        assert_eq!(
+            upgrader.restart_context.api_addr,
+            Some("127.0.0.1:12700".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn upgrader_restart_mode_routes_through_the_single_planner() {
+        // Whatever flags/context an apply caller sets, the mode decision must
+        // come from plan_restart_mode — there is no second ad-hoc exit path.
+        for stop in [true, false] {
+            let upgrader = AutoApplyUpgrader::new("x0xd").with_stop_on_upgrade(stop);
+            for signals in [
+                restart::SupervisionSignals::default(),
+                restart::SupervisionSignals {
+                    invocation_id: true,
+                    ..Default::default()
+                },
+                restart::SupervisionSignals {
+                    parent_comm: Some("systemd".to_string()),
+                    ..Default::default()
+                },
+            ] {
+                assert_eq!(
+                    upgrader.restart_mode_with(&signals),
+                    restart::plan_restart_mode(stop, &signals),
+                    "stop={stop}, signals={signals:?}"
+                );
+            }
+        }
     }
 
     #[test]

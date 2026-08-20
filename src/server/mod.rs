@@ -36,20 +36,21 @@ use routes::{
     broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
     connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
     create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
-    create_mls_group, create_mls_welcome, create_named_group, create_task_list, delete_contact,
-    delete_discovery_subscription, delete_kv_value, delete_machine, direct_connections,
-    direct_message_send_config, direct_send, discover_groups, discover_groups_nearby,
-    discovered_agent, discovered_agents, discovered_machine, discovered_machines, dm_diagnostics,
-    ensure_named_group_listeners, evaluate_trust, exec_cancel, exec_diagnostics, exec_run,
-    exec_sessions, file_accept_handler, file_reject_handler, file_send_handler,
-    file_transfer_status_handler, file_transfers_handler, find_agent, forward_add, forward_list,
-    forward_remove, get_a2a_agent_card, get_agent_card, get_constitution, get_constitution_json,
-    get_group_card, get_group_public_messages, get_group_state, get_group_state_commits,
-    get_kv_value, get_mls_group, get_named_group, get_named_group_members, gossip_diagnostics,
-    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
-    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    health, history_diagnostics, history_list, history_message, history_purge, history_search,
-    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    create_mls_group, create_mls_welcome, create_named_group, create_task_list,
+    daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
+    delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
+    discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
+    discovered_machines, dm_diagnostics, ensure_named_group_listeners, evaluate_trust, exec_cancel,
+    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
+    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
+    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
+    get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
+    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
+    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
+    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
+    history_list, history_message, history_purge, history_search, history_stats,
+    identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
@@ -162,7 +163,7 @@ pub async fn run_update_check_and_report(
     skip_update_check: bool,
 ) -> anyhow::Result<()> {
     if config.update.enabled && !skip_update_check {
-        match run_startup_update_check(config, None).await {
+        match run_startup_update_check(config, None, false).await {
             Ok(Some(version)) => println!("x0xd updated to {version}"),
             Ok(None) => println!("x0xd is up to date ({})", x0x::VERSION),
             Err(e) => return Err(e).context("self-update check failed"),
@@ -238,7 +239,7 @@ pub async fn serve_with_options(
     // Gated on `self_update_enabled` so embedders never download/install a new
     // binary in-process; the daemon binary sets it to `config.update.enabled`.
     if self_update_enabled && config.update.enabled {
-        if let Err(e) = run_startup_update_check(&config, None).await {
+        if let Err(e) = run_startup_update_check(&config, None, true).await {
             tracing::warn!(error = %e, "Startup update check failed: {e}");
         }
     }
@@ -651,6 +652,7 @@ pub async fn serve_with_options(
         ws_topics: RwLock::new(HashMap::new()),
         ws_outbound_stats: Arc::new(WsOutboundStats::default()),
         api_address: actual_api_addr,
+        data_dir: config.data_dir.clone(),
         start_time: Instant::now(),
         broadcast_tx,
         file_transfers: RwLock::new(HashMap::new()),
@@ -937,6 +939,10 @@ pub async fn serve_with_options(
         let data_dir = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_gossip = Arc::clone(&self_published_release_manifests);
+        // #261: the listener's restart planner needs the bound API address
+        // (health commit) and the graceful-shutdown hook (bounded cancel).
+        let gossip_api_addr = state.api_address;
+        let gossip_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         bg_tasks.push(tokio::spawn(async move {
             run_gossip_update_listener(
                 agent_for_gossip,
@@ -944,6 +950,8 @@ pub async fn serve_with_options(
                 data_dir,
                 upgrade_apply_lock,
                 self_published_for_gossip,
+                gossip_api_addr,
+                gossip_shutdown,
             )
             .await;
         }));
@@ -984,6 +992,8 @@ pub async fn serve_with_options(
         let data_dir_for_poll = config.data_dir.clone();
         let upgrade_apply_lock = Arc::clone(&state.upgrade_apply_lock);
         let self_published_for_poll = Arc::clone(&self_published_release_manifests);
+        let poll_api_addr = state.api_address;
+        let poll_shutdown = daemon_shutdown_hook(&state.shutdown_notify, &state.shutdown_tx);
         bg_tasks.push(tokio::spawn(async move {
             run_fallback_github_poll(
                 agent_for_poll,
@@ -991,6 +1001,8 @@ pub async fn serve_with_options(
                 data_dir_for_poll,
                 upgrade_apply_lock,
                 self_published_for_poll,
+                poll_api_addr,
+                poll_shutdown,
             )
             .await;
         }));

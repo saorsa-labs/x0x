@@ -13,10 +13,12 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
+use x0x::upgrade::apply::{AutoApplyUpgrader, RestartContext};
 use x0x::upgrade::manifest::{decode_signed_manifest, is_newer, ReleaseManifest, RELEASE_TOPIC};
 use x0x::upgrade::monitor::UpgradeMonitor;
 use x0x::upgrade::signature::verify_manifest_signature;
@@ -100,10 +102,72 @@ fn decide_release_manifest_rebroadcast(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Restart plumbing (#261): every apply caller builds the same planner context
+// ---------------------------------------------------------------------------
+
+/// The graceful-shutdown trigger handed to the transactional handoff: flip the
+/// shutdown watch (SSE/WS loops + axum graceful shutdown) and poke the
+/// supervisor's mpsc. Bounded by the handoff's 5s cancel window, never waited
+/// on unbounded.
+pub(in crate::server) fn daemon_shutdown_hook(
+    shutdown_notify: &watch::Sender<bool>,
+    shutdown_tx: &mpsc::Sender<()>,
+) -> Arc<dyn Fn() + Send + Sync> {
+    let notify = shutdown_notify.clone();
+    let tx = shutdown_tx.clone();
+    Arc::new(move || {
+        let _ = notify.send(true);
+        let _ = tx.try_send(());
+    })
+}
+
+/// Startup-check context: the API listener is not bound yet (the check runs
+/// before `serve_with_options` binds), so the configured address is recorded —
+/// including a port-0 ephemeral bind, which the helper resolves via
+/// `<data_dir>/api.port`. No shutdown hook is needed: nothing is bound.
+fn startup_restart_context(config: &DaemonConfig) -> RestartContext {
+    RestartContext {
+        data_dir: Some(config.data_dir.clone()),
+        api_addr: Some(config.api_address),
+        shutdown: None,
+    }
+}
+
+/// Background-listener context (gossip + fallback poll): the running daemon's
+/// bound address and shutdown hook.
+fn listener_restart_context(
+    data_dir: &std::path::Path,
+    api_addr: SocketAddr,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
+) -> RestartContext {
+    RestartContext {
+        data_dir: Some(data_dir.to_path_buf()),
+        api_addr: Some(api_addr),
+        shutdown: Some(shutdown),
+    }
+}
+
+/// The deferred HTTP restart uses the same planner as every other apply path —
+/// there is no second ad-hoc exit in the HTTP handler (#261 test 6).
+fn deferred_restart_upgrader(stop_on_upgrade: bool, context: RestartContext) -> AutoApplyUpgrader {
+    AutoApplyUpgrader::new("x0xd")
+        .with_stop_on_upgrade(stop_on_upgrade)
+        .with_restart_context(context)
+}
+
 /// Startup GitHub check. Returns Some(version) if an update was applied.
+///
+/// `trigger_restart` distinguishes the two callers: the daemon's startup
+/// check (inside `serve_with_options`) hands the restart to the #261 planner
+/// because a daemon process must come back up; the CLI `--check-updates`
+/// print-and-exit mode passes `false` — there is no daemon to keep alive, and
+/// a handoff respawn of `x0xd --check-updates` could never serve `/health`,
+/// so it would spuriously roll a good update back.
 pub(in crate::server) async fn run_startup_update_check(
     config: &DaemonConfig,
     agent: Option<&Arc<Agent>>,
+    trigger_restart: bool,
 ) -> Result<Option<String>> {
     let monitor = UpgradeMonitor::new(&config.update.repo, "x0xd", x0x::VERSION)
         .map_err(|e| anyhow::anyhow!(e))?
@@ -136,7 +200,9 @@ pub(in crate::server) async fn run_startup_update_check(
     }
 
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-        .with_stop_on_upgrade(config.update.stop_on_upgrade);
+        .with_stop_on_upgrade(config.update.stop_on_upgrade)
+        .with_restart_on_success(trigger_restart)
+        .with_restart_context(startup_restart_context(config));
 
     match upgrader
         .apply_upgrade_from_manifest(&verified.manifest)
@@ -213,6 +279,8 @@ pub(in crate::server) async fn run_gossip_update_listener(
     data_dir: PathBuf,
     upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    api_addr: SocketAddr,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
 ) {
     let mut release_sub = match agent.subscribe(RELEASE_TOPIC).await {
         Ok(sub) => sub,
@@ -377,7 +445,12 @@ pub(in crate::server) async fn run_gossip_update_listener(
 
         let _upgrade_guard = upgrade_apply_lock.lock().await;
         let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-            .with_stop_on_upgrade(config.stop_on_upgrade);
+            .with_stop_on_upgrade(config.stop_on_upgrade)
+            .with_restart_context(listener_restart_context(
+                &data_dir,
+                api_addr,
+                Arc::clone(&shutdown),
+            ));
         match upgrader.apply_upgrade_from_manifest(&manifest).await {
             Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
                 tracing::info!(%version, "Successfully upgraded to version {version}");
@@ -407,6 +480,8 @@ pub(in crate::server) async fn run_fallback_github_poll(
     data_dir: PathBuf,
     upgrade_apply_lock: Arc<Mutex<()>>,
     self_published_release_manifests: Arc<Mutex<SelfPublishedReleaseManifests>>,
+    api_addr: SocketAddr,
+    shutdown: Arc<dyn Fn() + Send + Sync>,
 ) {
     let interval = Duration::from_secs(config.fallback_check_interval_minutes * 60);
     let mut ticker = tokio::time::interval(interval);
@@ -489,7 +564,12 @@ pub(in crate::server) async fn run_fallback_github_poll(
 
                 let _upgrade_guard = upgrade_apply_lock.lock().await;
                 let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-                    .with_stop_on_upgrade(config.stop_on_upgrade);
+                    .with_stop_on_upgrade(config.stop_on_upgrade)
+                    .with_restart_context(listener_restart_context(
+                        &data_dir,
+                        api_addr,
+                        Arc::clone(&shutdown),
+                    ));
                 match upgrader
                     .apply_upgrade_from_manifest(&verified.manifest)
                     .await
@@ -761,16 +841,25 @@ pub(in crate::server) async fn apply_upgrade(
     };
 
     let stop_on_upgrade = state.update_config.stop_on_upgrade;
+    let restart_context = RestartContext {
+        data_dir: Some(state.data_dir.clone()),
+        api_addr: Some(state.api_address),
+        shutdown: Some(daemon_shutdown_hook(
+            &state.shutdown_notify,
+            &state.shutdown_tx,
+        )),
+    };
     let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
         .with_stop_on_upgrade(stop_on_upgrade)
-        .with_restart_on_success(false);
+        .with_restart_on_success(false)
+        .with_restart_context(restart_context.clone());
 
     match upgrader
         .apply_upgrade_from_manifest(&release.manifest)
         .await
     {
         Ok(x0x::upgrade::UpgradeResult::Success { version }) => {
-            schedule_restart_after_response(stop_on_upgrade);
+            schedule_restart_after_response(stop_on_upgrade, restart_context, version.clone());
             (
                 StatusCode::OK,
                 Json(serde_json::json!({
@@ -813,12 +902,17 @@ pub(in crate::server) async fn apply_upgrade(
     }
 }
 
-fn schedule_restart_after_response(stop_on_upgrade: bool) {
+fn schedule_restart_after_response(
+    stop_on_upgrade: bool,
+    restart_context: RestartContext,
+    target_version: String,
+) {
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(750)).await;
-        let upgrader = x0x::upgrade::apply::AutoApplyUpgrader::new("x0xd")
-            .with_stop_on_upgrade(stop_on_upgrade);
-        if let Err(e) = upgrader.restart_current_binary() {
+        // Same planner as every other apply path (#261): unsupervised daemons
+        // get the transactional handoff here too — never a bare exit(0).
+        let upgrader = deferred_restart_upgrader(stop_on_upgrade, restart_context);
+        if let Err(e) = upgrader.restart_current_binary(&target_version) {
             tracing::error!(error = %e, "failed to restart after manual upgrade apply");
         }
     });
@@ -831,6 +925,7 @@ fn schedule_restart_after_response(stop_on_upgrade: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::upgrade::restart;
     use x0x::upgrade::manifest::{PlatformAsset, SCHEMA_VERSION};
 
     fn manifest_with_version(version: &str) -> ReleaseManifest {
@@ -922,5 +1017,81 @@ mod tests {
             after_ttl,
         );
         assert_eq!(decision_after_ttl, ReleaseRebroadcastDecision::Rebroadcast);
+    }
+
+    fn daemon_restart_context() -> RestartContext {
+        RestartContext {
+            data_dir: Some(PathBuf::from("/var/lib/x0x")),
+            api_addr: Some("127.0.0.1:12700".parse().unwrap()),
+            shutdown: Some(Arc::new(|| {})),
+        }
+    }
+
+    #[test]
+    fn http_deferred_restart_uses_the_shared_planner_not_an_ad_hoc_exit() {
+        // #261 test 6: schedule_restart_after_response builds its upgrader via
+        // deferred_restart_upgrader, whose only mode decision is
+        // AutoApplyUpgrader::restart_mode_with — i.e. the same
+        // plan_restart_mode every other apply caller uses. There is no second
+        // exit path in the HTTP handler.
+        let ctx = daemon_restart_context();
+        for stop_on_upgrade in [true, false] {
+            let upgrader = deferred_restart_upgrader(stop_on_upgrade, ctx.clone());
+            for signals in [
+                // The #261 incident: config default stop_on_upgrade=true,
+                // parent = shell, no INVOCATION_ID, no X0X_SUPERVISED — with
+                // and without a TTY on stdin.
+                restart::SupervisionSignals {
+                    invocation_id: false,
+                    x0x_supervised: false,
+                    parent_comm: Some("bash".to_string()),
+                    stdin_is_tty: true,
+                },
+                restart::SupervisionSignals {
+                    invocation_id: false,
+                    x0x_supervised: false,
+                    parent_comm: Some("zsh".to_string()),
+                    stdin_is_tty: false,
+                },
+                // Fleet contract: systemd-owned.
+                restart::SupervisionSignals {
+                    invocation_id: true,
+                    x0x_supervised: false,
+                    parent_comm: Some("systemd".to_string()),
+                    stdin_is_tty: false,
+                },
+            ] {
+                assert_eq!(
+                    upgrader.restart_mode_with(&signals),
+                    restart::plan_restart_mode(stop_on_upgrade, &signals),
+                    "stop={stop_on_upgrade}, signals={signals:?}"
+                );
+            }
+        }
+
+        // Pin the incident itself through the HTTP construction: unsupervised
+        // + default stop_on_upgrade=true must be a handoff, not exit(0).
+        let terminal_launched = restart::SupervisionSignals {
+            invocation_id: false,
+            x0x_supervised: false,
+            parent_comm: Some("zsh".to_string()),
+            stdin_is_tty: true,
+        };
+        let upgrader = deferred_restart_upgrader(true, ctx);
+        assert_eq!(
+            upgrader.restart_mode_with(&terminal_launched),
+            restart::RestartMode::TransactionalHandoff
+        );
+        // And the fleet contract: systemd + stop_on_upgrade=true still exits.
+        let systemd = restart::SupervisionSignals {
+            invocation_id: true,
+            x0x_supervised: false,
+            parent_comm: Some("systemd".to_string()),
+            stdin_is_tty: false,
+        };
+        assert_eq!(
+            upgrader.restart_mode_with(&systemd),
+            restart::RestartMode::SupervisedExit
+        );
     }
 }

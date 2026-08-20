@@ -116,6 +116,7 @@ pub(super) use tasks::{
 };
 pub(super) use trust::evaluate_trust;
 pub(super) use upgrade::{
-    apply_upgrade, broadcast_current_manifest, check_upgrade, run_fallback_github_poll,
-    run_gossip_update_listener, run_startup_update_check, SelfPublishedReleaseManifests,
+    apply_upgrade, broadcast_current_manifest, check_upgrade, daemon_shutdown_hook,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    SelfPublishedReleaseManifests,
 };

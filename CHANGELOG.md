@@ -6,6 +6,27 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
+- **Unsupervised self-update restart is now transactional (issue #261).**
+  After a successful binary swap, a daemon with no supervisor (macOS terminal
+  launch, nohup, background — the live incident class) no longer silently
+  `exit(0)`s and leaves the machine DOWN. Restart mode is classified before
+  anything destructive runs: `SupervisedExit` (exit 0 / 100 for the
+  supervisor) only when `stop_on_upgrade = true` **and** a real supervision
+  signal exists (`INVOCATION_ID` set, parent comm `systemd`, or
+  `X0X_SUPERVISED=1`); not-a-TTY and launchd ancestry are explicitly NOT
+  supervision. Everything else runs a transactional handoff: the old daemon
+  writes `data_dir/upgrade-handoff.json`, spawns a detached
+  `x0xd --upgrade-handoff` helper, cancels gracefully within a 5s bound, and
+  exits; the helper waits out the old pid/port, spawns the new binary, and
+  commits the restart only once `GET /health` answers 200 on the pre-upgrade
+  API address (30s bound) — otherwise it restores `x0xd.backup` over the
+  target and respawns the previous binary. If no respawn succeeds it leaves a
+  loud `data_dir/UPGRADE_FAILED` artifact and exits nonzero. The old unix
+  `exec()` path (`stop_on_upgrade = false`) is gone — it could not roll back —
+  and the `[update] stop_on_upgrade` config default is unchanged. The startup
+  sweep now age-gates `*.x0xold-*` sidelined binaries like temp dirs so an
+  in-flight handoff never loses its rollback bytes.
+
 - **Public group send no longer waits out the ~24s DM retry before gossip
   carry (issue #310).** `POST /groups/:id/send` still persists locally and
   returns 200 + `msg_id`. Fan-out is now a race: gossip topic publish

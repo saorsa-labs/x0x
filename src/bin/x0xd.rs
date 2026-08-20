@@ -107,6 +107,19 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    // Private handoff-helper mode (#261): `x0xd --upgrade-handoff <file>` is
+    // spawned detached by a daemon that just swapped its binary. It must run
+    // BEFORE any config load, logging init, or daemon startup: the helper
+    // joins no gossip, binds nothing, and takes no instance lock — it only
+    // shepherds the swap-to-restart transaction (see src/upgrade/restart.rs).
+    if let Some(idx) = args.iter().position(|a| a == "--upgrade-handoff") {
+        let path = args
+            .get(idx + 1)
+            .context("--upgrade-handoff requires a path argument")?;
+        let exit_code = x0x::upgrade::restart::run_upgrade_handoff(Path::new(path));
+        std::process::exit(exit_code);
+    }
+
     let config_path = if let Some(idx) = args.iter().position(|a| a == "--config") {
         Some(
             args.get(idx + 1)

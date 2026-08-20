@@ -8,6 +8,7 @@
 pub mod apply;
 pub mod manifest;
 pub mod monitor;
+pub mod restart;
 pub mod rollout;
 pub mod signature;
 
@@ -226,9 +227,9 @@ fn sideline_path_for(target: &Path) -> PathBuf {
 ///
 /// Temp dirs younger than `dir_min_age` are left untouched so a concurrent
 /// in-flight apply (this process's, or a co-located instance's) is never
-/// disturbed. Sidelined binaries are always best-effort removed — the process
-/// that locked one has, by definition, exited before this runs (a delete of a
-/// still-locked file simply fails and is retried on a future launch).
+/// disturbed. Sidelined binaries are age-gated the same way (issue #261 I4b):
+/// a handoff still in flight — including a manual relaunch of a crashing new
+/// binary — must not lose its rollback bytes to the startup sweep.
 ///
 /// Returns the number of entries removed. All removal is best-effort.
 pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duration) -> usize {
@@ -240,6 +241,14 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
         }
     };
     let now = std::time::SystemTime::now();
+    let entry_is_aged = |entry: &std::fs::DirEntry| {
+        entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .ok()
+            .and_then(|modified| now.duration_since(modified).ok())
+            .is_none_or(|age| age >= dir_min_age)
+    };
     let mut removed = 0;
     for entry in entries.flatten() {
         let file_name = entry.file_name();
@@ -247,17 +256,14 @@ pub fn sweep_stale_upgrade_artifacts(dir: &Path, dir_min_age: std::time::Duratio
         let path = entry.path();
         if name.starts_with(".x0x-upgrade-") {
             // Age-gate temp dirs so an in-flight apply is never deleted.
-            let old_enough = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .ok()
-                .and_then(|modified| now.duration_since(modified).ok())
-                .is_none_or(|age| age >= dir_min_age);
-            if old_enough && std::fs::remove_dir_all(&path).is_ok() {
+            if entry_is_aged(&entry) && std::fs::remove_dir_all(&path).is_ok() {
                 info!(path = %path.display(), "Removed stale upgrade temp dir");
                 removed += 1;
             }
-        } else if name.contains(".x0xold-") && std::fs::remove_file(&path).is_ok() {
+        } else if name.contains(".x0xold-")
+            && entry_is_aged(&entry)
+            && std::fs::remove_file(&path).is_ok()
+        {
             info!(path = %path.display(), "Removed sidelined binary from prior upgrade");
             removed += 1;
         }
@@ -488,19 +494,46 @@ mod tests {
         fs::create_dir_all(&fresh_temp).unwrap();
         let sidelined = dir.path().join("x0xd.exe.x0xold-789");
         fs::write(&sidelined, b"old").unwrap();
+        // #261 I4b: a sideline younger than the age gate is an in-flight
+        // handoff's rollback bytes and must survive the same way a fresh
+        // temp dir does.
+        let in_flight_sideline = dir.path().join("x0xd.exe.x0xold-111");
+        fs::write(&in_flight_sideline, b"in-flight").unwrap();
+        age_file(&sidelined, std::time::Duration::from_secs(7200));
         let backup = dir.path().join("x0xd.exe.backup");
         fs::write(&backup, b"backup").unwrap();
 
         let removed =
             sweep_stale_upgrade_artifacts(dir.path(), std::time::Duration::from_secs(3600));
 
-        assert_eq!(removed, 1, "only the sidelined binary should be removed");
+        assert_eq!(
+            removed, 1,
+            "only the aged sidelined binary should be removed"
+        );
         assert!(
             fresh_temp.exists(),
             "fresh temp dir must survive the age gate"
         );
-        assert!(!sidelined.exists(), "sidelined binary must be reclaimed");
+        assert!(
+            !sidelined.exists(),
+            "aged sidelined binary must be reclaimed"
+        );
+        assert!(
+            in_flight_sideline.exists(),
+            "in-flight handoff sideline must survive the age gate"
+        );
         assert!(backup.exists(), "unrelated .backup file must be left alone");
+    }
+
+    /// Backdate a file's mtime so the sweep's age gate sees it as old.
+    fn age_file(path: &Path, age: std::time::Duration) {
+        let file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.set_modified(
+            std::time::SystemTime::now()
+                .checked_sub(age)
+                .expect("age must not overflow the clock"),
+        )
+        .unwrap();
     }
 
     #[test]
