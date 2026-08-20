@@ -712,7 +712,7 @@ fn expected_withdrawn_apply_authorized(
     // commit: the post state must still satisfy the last-admin invariant —
     // an admin-less roster (e.g. the empty `admin_present = false` fixture)
     // cannot accept one.
-    if !current_withdrawn && !(admin_present || signer_is_active_admin(signer_spec)) {
+    if !current_withdrawn && !admin_present && !signer_is_active_admin(signer_spec) {
         return false;
     }
     normal_action_authorized_by_spec(signer_spec, action_kind)
