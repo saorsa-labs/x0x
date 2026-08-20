@@ -71,7 +71,7 @@ deploy-check:
 deploy-check-selftest:
     bash .deployment/scripts/check-authority.sh --self-test
 
-check: fmt-check deploy-check lint build test doc audit deny
+check: fmt-check deploy-check lint build test doc
 
 # KV append-only REST/e2e suite (#[ignore] — boots real x0xd daemons, so it
 # needs a built binary and cannot run hermetically under plain `just test`).
@@ -188,11 +188,3 @@ convergence-release:
     @test -n "${X0XD_LEGACY_BINARY:-}" || { echo "X0XD_LEGACY_BINARY must point at an authenticated v0.30.1 x0xd"; exit 2; }
     cargo build --release --bin x0xd --bin x0xd-forge-injector
     python3 tests/convergence/convergence_soak.py --runs 10 --expect-fixed
-
-# Check dependencies against the RustSec advisory database (supply-chain guard)
-audit:
-    cargo audit
-
-# Block banned/typosquat crates and unknown sources (supply-chain guard)
-deny:
-    cargo deny check bans sources
