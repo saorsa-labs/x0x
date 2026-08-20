@@ -5644,6 +5644,7 @@ mod pressure_tests {
                     kind,
                     hop: 0,
                     ttl: 10,
+                    payload_hash: None,
                 },
                 payload: None,
                 signature: Vec::new(),

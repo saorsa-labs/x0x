@@ -46,6 +46,7 @@ fn build_eager_wire(
         kind: MessageKind::Eager,
         hop: 0,
         ttl: 10,
+        payload_hash: None,
     };
     let header_bytes = postcard::to_stdvec(&header).expect("bench header serializes");
     let signature = signing_key.sign(&header_bytes).expect("bench header signs");
