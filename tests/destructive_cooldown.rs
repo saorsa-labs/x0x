@@ -36,15 +36,6 @@ fn kill_signal(pid: u32, signal: &str) {
     assert!(status.success(), "kill -{signal} {pid} failed");
 }
 
-fn process_alive(pid: u32) -> bool {
-    Command::new("kill")
-        .arg("-0")
-        .arg(pid.to_string())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
 async fn publish_burst(alice: &AgentInstance, topic: &str, bytes: usize, rounds: usize) {
     // ~64 KiB base64 payloads: large enough that a stalled peer's QUIC
     // flow-control window saturates within a few rounds.
@@ -153,8 +144,8 @@ async fn blackholed_peer_connection_closed_by_cooldown_and_redials_after_resume(
 #[tokio::test]
 #[ignore]
 async fn sigterm_exits_within_deadline_under_gossip_load() {
-    let pair = pair().await;
-    let alice = &pair.alice;
+    let mut pair = pair().await;
+    let alice = &mut pair.alice;
     let bob = &pair.bob;
 
     // Generate gossip traffic both directions so publish/IHAVE state exists
@@ -166,9 +157,25 @@ async fn sigterm_exits_within_deadline_under_gossip_load() {
     kill_signal(alice.pid(), "TERM");
 
     // x0xd's watchdog deadline is 5s; allow margin for graceful teardown
-    // work ahead of it plus scheduling.
+    // work ahead of it plus scheduling. Poll via try_wait (reaps the child;
+    // kill -0 would keep succeeding on a zombie).
     let exit_deadline = Duration::from_secs(10);
-    let exited = wait_until(exit_deadline, || async { !process_alive(alice.pid()) }).await;
+    let deadline = tokio::time::Instant::now() + exit_deadline;
+    let mut exited = false;
+    loop {
+        match alice.try_wait() {
+            Ok(Some(_)) => {
+                exited = true;
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => panic!("try_wait on alice: {e}"),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
     assert!(
         exited,
         "alice did not exit within {exit_deadline:?} of SIGTERM (at least {:?} elapsed)",
