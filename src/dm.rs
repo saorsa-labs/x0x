@@ -526,6 +526,74 @@ where
 
 // ─── Error model ───────────────────────────────────────────────────────────
 
+/// Issue #336 phase 1: named stages of a durable gossip-inbox send.
+///
+/// These three timers are a partition of daemon-side wall time for one
+/// durable send. A slow first send must name which stage consumed the
+/// budget (`budget_stage`); warming or cutting a stage is a later phase.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DurableSendStages {
+    /// Advert lookup + optional forced targeted capability refresh
+    /// (ADR 0030 §2 strict gate).
+    pub strict_gate_ms: u64,
+    /// Inbox / topic fan-out (`publish_topic_id` + optional legacy-bus hedge)
+    /// plus the short setup that prepares that publish.
+    pub publish_ms: u64,
+    /// Sender ACK waiter after publish-complete, including inter-attempt
+    /// backoff that is still waiting for the receiver's ACK.
+    pub ack_wait_ms: u64,
+    /// Independent daemon-side wall from send start to return. The three
+    /// named stages must sum to this (millisecond truncation slack).
+    pub elapsed_ms: u64,
+}
+
+impl DurableSendStages {
+    /// Sum of the three named stages.
+    #[must_use]
+    pub fn sum_ms(&self) -> u64 {
+        self.strict_gate_ms
+            .saturating_add(self.publish_ms)
+            .saturating_add(self.ack_wait_ms)
+    }
+
+    /// Which of the three stages consumed the most time.
+    ///
+    /// Ties break in declaration order so a 17s send still names exactly
+    /// one stage. This is a diagnostic label, not an SLA.
+    #[must_use]
+    pub fn budget_stage(&self) -> &'static str {
+        let max = self
+            .strict_gate_ms
+            .max(self.publish_ms)
+            .max(self.ack_wait_ms);
+        if self.strict_gate_ms >= max {
+            "strict_gate_ms"
+        } else if self.publish_ms >= max {
+            "publish_ms"
+        } else {
+            "ack_wait_ms"
+        }
+    }
+
+    /// JSON object exported on a send-timeout 504 and on `/diagnostics/dm`.
+    #[must_use]
+    pub fn to_export_json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "strict_gate_ms": self.strict_gate_ms,
+            "publish_ms": self.publish_ms,
+            "ack_wait_ms": self.ack_wait_ms,
+            "elapsed_ms": self.elapsed_ms,
+            "budget_stage": self.budget_stage(),
+        })
+    }
+}
+
+/// Elapsed milliseconds since `start`, saturating at `u64::MAX`.
+#[must_use]
+pub(crate) fn millis_since(start: Instant) -> u64 {
+    u64::try_from(start.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Errors surfaced by the gossip DM path. See design doc §"Error model".
 #[derive(Debug, thiserror::Error)]
 pub enum DmError {
@@ -2554,5 +2622,47 @@ mod tests {
             DmEnvelope::from_wire_bytes(&wire).expect("new receivers must decode old envelopes");
         assert_eq!(decoded.origin_attestation, None);
         assert_eq!(decoded.request_id, [9u8; 16]);
+    }
+
+    /// #336 phase 1: a 17s send must name which of the three stages ate the
+    /// budget. The numbers here are a fixture, not an SLA.
+    #[test]
+    fn a_seventeen_second_send_names_which_stage_ate_the_budget() {
+        let stages = DurableSendStages {
+            strict_gate_ms: 12_400,
+            publish_ms: 800,
+            ack_wait_ms: 3_800,
+            elapsed_ms: 17_000,
+        };
+        assert_eq!(stages.sum_ms(), 17_000);
+        assert_eq!(stages.budget_stage(), "strict_gate_ms");
+        assert_eq!(stages.sum_ms(), stages.elapsed_ms);
+
+        let publish_bound = DurableSendStages {
+            strict_gate_ms: 200,
+            publish_ms: 16_000,
+            ack_wait_ms: 800,
+            elapsed_ms: 17_000,
+        };
+        assert_eq!(publish_bound.budget_stage(), "publish_ms");
+
+        let ack_bound = DurableSendStages {
+            strict_gate_ms: 200,
+            publish_ms: 300,
+            ack_wait_ms: 16_500,
+            elapsed_ms: 17_000,
+        };
+        assert_eq!(ack_bound.budget_stage(), "ack_wait_ms");
+    }
+
+    /// #336 phase 1: attaching stage timers must not change the Timeout
+    /// Display string that clients already parse from `detail`.
+    #[test]
+    fn timeout_display_omits_stage_timers() {
+        let err = DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(16),
+        };
+        assert_eq!(err.to_string(), "timed out after 1 retries over 16s");
     }
 }

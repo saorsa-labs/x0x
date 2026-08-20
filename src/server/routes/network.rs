@@ -679,18 +679,24 @@ pub(in crate::server) async fn dm_diagnostics(
         per_peer,
         subscriber_count,
         subscriber_capacity,
+        last_durable_send,
+        last_ack_publish_ms,
     } = state.agent.direct_messaging().diagnostics_snapshot();
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "stats": stats,
-            "per_peer": per_peer,
-            "subscriber_count": subscriber_count,
-            "subscriber_capacity": subscriber_capacity,
-            "capability_store_entries": state.agent.capability_store().len(),
-        })),
-    )
+    let mut body = serde_json::json!({
+        "ok": true,
+        "stats": stats,
+        "per_peer": per_peer,
+        "subscriber_count": subscriber_count,
+        "subscriber_capacity": subscriber_capacity,
+        "capability_store_entries": state.agent.capability_store().len(),
+    });
+    if let Some(stages) = last_durable_send {
+        body["last_durable_send"] = stages.to_export_json();
+    }
+    if let Some(ack_publish_ms) = last_ack_publish_ms {
+        body["last_ack_publish_ms"] = serde_json::json!(ack_publish_ms);
+    }
+    (StatusCode::OK, Json(body))
 }
 
 /// Parse a hex `peer_id` path segment into an ant-quic `PeerId` (32 bytes).

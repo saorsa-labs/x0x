@@ -21,6 +21,21 @@ All notable changes to this project will be documented in this file.
   v1 during the migration window, so the mixed fleet upgrades with no flag
   day. This release is the fleet's first v2-capable daemon.
 
+### Added
+
+- **Durable send stage timers (#336 phase 1).** A durable gossip-inbox send
+  now records three named spans — `strict_gate_ms` (advert / capability
+  store), `publish_ms` (inbox / topic fan-out), and `ack_wait_ms` (sender
+  waiter vs receiver ACK publish-complete) — plus an independent
+  `elapsed_ms` wall. They are a partition of daemon-side send time, so a
+  slow first send can name which stage consumed the budget
+  (`budget_stage`). Exported on the existing send-timeout **504** body
+  (`error`/`detail` unchanged) and on `GET /diagnostics/dm` as
+  `last_durable_send`. The receiver also exports `last_ack_publish_ms` for
+  the durable ACK publish. Measurement only: no latency cut, no ACK-
+  semantics or HTTP-status change, no client-timeout or daemon-budget
+  change.
+
 ### Fixed
 
 - **Unsupervised self-update restart is now transactional (issue #261).**

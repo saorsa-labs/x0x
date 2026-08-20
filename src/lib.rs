@@ -4649,6 +4649,8 @@ impl Agent {
             return Ok(receipt);
         }
 
+        let send_started = std::time::Instant::now();
+        let mut stages = dm::DurableSendStages::default();
         let mut advert_binding = self.capability_store.lookup_binding(to);
         // ADR 0030 §2: one forced targeted refresh before refusing. A daemon
         // whose advert we simply have not heard yet must not be reported as
@@ -4759,15 +4761,24 @@ impl Agent {
             // every product send is strict now, so every unknown-recipient
             // send reaches this gate.
             if !recipient_is_known {
+                stages.strict_gate_ms = dm::millis_since(send_started);
+                stages.elapsed_ms = stages.strict_gate_ms;
+                self.direct_messaging.record_durable_send_stages(stages);
                 return Err(dm::DmError::RecipientKeyUnavailable(format!(
                     "recipient {} has no known DM capability advert",
                     hex::encode(to.as_bytes())
                 )));
             }
+            stages.strict_gate_ms = dm::millis_since(send_started);
+            stages.elapsed_ms = stages.strict_gate_ms;
+            self.direct_messaging.record_durable_send_stages(stages);
             return Err(dm::DmError::AckSemanticsUnavailable(format!(
                 "recipient {} has no current v2 durable-ACK capability advert",
                 hex::encode(to.as_bytes())
             )));
+        }
+        if config.require_durable_app_ack {
+            stages.strict_gate_ms = dm::millis_since(send_started);
         }
 
         // X0X-0070b: seed the relay fallback. Only retain the payload + KEM
@@ -4887,6 +4898,7 @@ impl Agent {
                             self_machine_id: self.identity.machine_id(),
                             machine_keypair: self.identity.machine_keypair(),
                             inflight: std::sync::Arc::clone(&self.dm_inflight_acks),
+                            stages: &mut stages,
                         },
                         *to,
                         cap_machine,
@@ -4921,6 +4933,19 @@ impl Agent {
                     .map_err(Self::map_raw_quic_dm_error),
             }
         };
+
+        if config.require_durable_app_ack {
+            stages.elapsed_ms = dm::millis_since(send_started);
+            // Fold the post-gate setup slice (KEM check, raw-QUIC skip) into
+            // publish_ms so the three named stages remain a partition of wall
+            // time. That slice is inbox-path preparation, not ACK wait.
+            if stages.elapsed_ms > stages.sum_ms() {
+                stages.publish_ms = stages
+                    .publish_ms
+                    .saturating_add(stages.elapsed_ms.saturating_sub(stages.sum_ms()));
+            }
+            self.direct_messaging.record_durable_send_stages(stages);
+        }
 
         match result {
             Ok(receipt) => {

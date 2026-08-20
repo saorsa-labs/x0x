@@ -498,14 +498,16 @@ pub(in crate::server) async fn direct_send(
                 }
             };
             tracing::error!("direct_send failed ({err_kind}): {e}");
-            (
-                status,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": err_kind,
-                    "detail": e.to_string(),
-                })),
-            )
+            let timeout_stages = matches!(e, x0x::dm::DmError::Timeout { .. })
+                .then(|| {
+                    state
+                        .agent
+                        .direct_messaging()
+                        .diagnostics_snapshot()
+                        .last_durable_send
+                })
+                .flatten();
+            (status, Json(dm_error_body(err_kind, &e, timeout_stages)))
         }
     }
 }
@@ -545,6 +547,29 @@ pub(in crate::server) async fn direct_connections(
 // socket can modify any group. This is acceptable because x0xd listens on
 // localhost only, so all callers are implicitly the local agent.
 // ---------------------------------------------------------------------------
+
+/// Build the `/direct/send` error JSON. Timeout 504s also export the #336
+/// phase-1 stage timers so a slow send names which of the three stages
+/// consumed the budget. Status and `error`/`detail` stay unchanged.
+fn dm_error_body(
+    err_kind: &str,
+    e: &x0x::dm::DmError,
+    timeout_stages: Option<x0x::dm::DurableSendStages>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "ok": false,
+        "error": err_kind,
+        "detail": e.to_string(),
+    });
+    if let Some(stages) = timeout_stages {
+        body["strict_gate_ms"] = serde_json::json!(stages.strict_gate_ms);
+        body["publish_ms"] = serde_json::json!(stages.publish_ms);
+        body["ack_wait_ms"] = serde_json::json!(stages.ack_wait_ms);
+        body["elapsed_ms"] = serde_json::json!(stages.elapsed_ms);
+        body["budget_stage"] = serde_json::json!(stages.budget_stage());
+    }
+    body
+}
 
 #[cfg(test)]
 mod tests {
@@ -784,6 +809,42 @@ mod tests {
             "logical_id": &"a".repeat(128)
         }))
         .is_ok());
+    }
+
+    /// #336 phase 1: a timeout 504 must keep status/`error`/`detail` and
+    /// name which of the three stages ate the budget.
+    #[test]
+    fn timeout_504_body_exports_stage_timers_without_changing_detail() {
+        let stages = x0x::dm::DurableSendStages {
+            strict_gate_ms: 12_000,
+            publish_ms: 500,
+            ack_wait_ms: 4_500,
+            elapsed_ms: 17_000,
+        };
+        let err = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(16),
+        };
+        let body = dm_error_body("timeout", &err, Some(stages));
+        assert_eq!(body["ok"], false);
+        assert_eq!(body["error"], "timeout");
+        assert_eq!(
+            body["detail"], "timed out after 1 retries over 16s",
+            "detail must stay the existing Display contract"
+        );
+        assert_eq!(body["strict_gate_ms"], 12_000);
+        assert_eq!(body["publish_ms"], 500);
+        assert_eq!(body["ack_wait_ms"], 4_500);
+        assert_eq!(body["elapsed_ms"], 17_000);
+        assert_eq!(body["budget_stage"], "strict_gate_ms");
+
+        let bare = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(16),
+        };
+        let bare_body = dm_error_body("timeout", &bare, None);
+        assert!(bare_body.get("strict_gate_ms").is_none());
+        assert_eq!(bare_body["error"], "timeout");
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────
