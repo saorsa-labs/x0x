@@ -554,7 +554,7 @@ helper API.
 | POST | `/groups/:id/secure/decrypt` | `x0x group secure-decrypt <group_id>` | Decrypt content with the group's shared secret (member-only, epoch must match) |
 | POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
 | POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
-| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. The last admin is blocked; promote another admin first or use `x0x group delete` |
+| DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
 
 ### Roles
 
@@ -578,7 +578,11 @@ and non-assignable.
 `x0x group leave` (`DELETE /groups/:id`) is self-removal: **I'm out; the
 group lives on**. Any rank may leave, but the last admin receives `409` and must
 promote another admin first (or delete instead). Local secure material is wiped
-on leave.
+on leave. Exception (#369): when the leaver is the group's only remaining
+member, the self-leave IS a deletion — it runs the same terminal withdrawal as
+`x0x group delete` below (withdrawn tombstone, key wipe, `GroupDeleted`
+propagation) and answers `{"ok":true,"deleted":"<name>"}` instead of
+`{"ok":true,"left":...}` so clients can tell the two outcomes apart.
 
 `x0x group delete` (`POST /groups/:id/state/withdraw`) is admin-only and
 irreversible: **group over for everyone, permanently**. It seals the unchanged

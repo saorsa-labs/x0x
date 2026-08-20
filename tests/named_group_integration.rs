@@ -456,10 +456,10 @@ async fn named_group_generate_invite() {
 // ===========================================================================
 
 /// Since both alice and bob share a single daemon in this test suite,
-/// we test the join flow by: (a) creating a group, (b) proving sole-admin
-/// self-leave is rejected, (c) installing a backup admin, (d) generating an
-/// invite, (e) leaving as a non-sole-admin, and (f) joining back via the invite.
-/// This exercises the full invite/join codepath on a single daemon.
+/// we test the join flow by: (a) creating a group, (b) installing a backup
+/// admin, (c) generating an invite, (d) leaving as a non-sole-member, and
+/// (e) joining back via the invite. This exercises the full invite/join
+/// codepath on a single daemon.
 #[tokio::test]
 #[ignore]
 async fn named_group_join_via_invite() {
@@ -488,25 +488,6 @@ async fn named_group_join_via_invite() {
     assert!(
         !group_id.is_empty(),
         "create public_open group: {create_r:?}"
-    );
-
-    // DELETE is pure self-leave; while Alice is the only admin it must be
-    // rejected rather than implicitly ending the group.
-    let sole_admin_leave = authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
-    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
-    assert_eq!(
-        sole_admin_leave_r["ok"], false,
-        "sole-admin leave response: {sole_admin_leave_r:?}"
-    );
-    assert_eq!(
-        sole_admin_leave_r["error"].as_str(),
-        Some("a group must always have at least one admin; make another member an admin before leaving"),
-        "sole-admin leave response: {sole_admin_leave_r:?}"
     );
 
     let backup_admin = fake_agent_id(0x44);
@@ -663,46 +644,24 @@ async fn named_group_leave() {
     let d = daemon().await;
     let (group_id, _) = create_group(&d, "Leave Group", "", None).await;
 
-    // DELETE is pure self-leave. A sole-admin self-leave is rejected rather
-    // than implicitly ending the group.
+    // #369: a sole-member self-leave IS a group deletion — the last-admin
+    // precheck's empty remainder must not strand an undisposable group.
     let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    assert_eq!(leave_resp.status(), StatusCode::OK);
     let r: Value = leave_resp.json().await.unwrap();
-
-    assert_eq!(r["ok"], false, "sole-admin leave response: {r:?}");
-    assert_eq!(
-        r["error"].as_str(),
-        Some("a group must always have at least one admin; make another member an admin before leaving"),
-        "sole-admin leave response: {r:?}"
+    assert_eq!(r["ok"], true, "sole-member delete response: {r:?}");
+    assert_eq!(r["deleted"].as_str(), Some("Leave Group"));
+    assert!(
+        r.get("left").is_none(),
+        "delete must not answer as a plain leave: {r:?}"
     );
 
-    // Verify the live group remains accessible after the rejected self-leave.
-    let info_r = authed_client(&d)
-        .get(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(info_r.status(), StatusCode::OK);
-    let info: Value = info_r.json().await.unwrap();
-    assert_eq!(info["ok"], true, "group after rejected leave: {info:?}");
-    assert_eq!(info["name"], "Leave Group");
-
-    // Ending the group is explicit delete/withdraw and retains a withdrawn tombstone.
-    let delete_r: Value = authed_client(&d)
-        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(delete_r["ok"], true, "delete response: {delete_r:?}");
-
+    // The sole-member delete retains a withdrawn tombstone, exactly like the
+    // explicit withdraw endpoint.
     let state_r: Value = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}/state")))
         .send()
@@ -712,6 +671,33 @@ async fn named_group_leave() {
         .await
         .unwrap();
     assert_eq!(state_r["withdrawn"], true, "withdrawn state: {state_r:?}");
+
+    // The explicit delete/withdraw endpoint keeps its own contract on a live
+    // sole-member group.
+    let (second_id, _) = create_group(&d, "Withdraw Group", "", None).await;
+    let delete_r: Value = authed_client(&d)
+        .post(d.url(&format!("/groups/{second_id}/state/withdraw")))
+        .json(&serde_json::json!({}))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(delete_r["ok"], true, "delete response: {delete_r:?}");
+
+    let second_state_r: Value = authed_client(&d)
+        .get(d.url(&format!("/groups/{second_id}/state")))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        second_state_r["withdrawn"], true,
+        "withdrawn state: {second_state_r:?}"
+    );
 }
 
 // ===========================================================================
@@ -748,26 +734,6 @@ async fn named_group_rejoin_after_leave() {
     assert!(
         !group_id.is_empty(),
         "create public_open group: {create_r:?}"
-    );
-
-    // DELETE is pure self-leave. A sole-admin self-leave is rejected before the
-    // roster changes, so make that behavior explicit before setting up the
-    // non-sole-admin leave path exercised by the rejoin flow.
-    let sole_admin_leave = authed_client(&d)
-        .delete(d.url(&format!("/groups/{group_id}")))
-        .send()
-        .await
-        .unwrap();
-    assert_eq!(sole_admin_leave.status(), StatusCode::CONFLICT);
-    let sole_admin_leave_r: Value = sole_admin_leave.json().await.unwrap();
-    assert_eq!(
-        sole_admin_leave_r["ok"], false,
-        "sole-admin leave response: {sole_admin_leave_r:?}"
-    );
-    assert_eq!(
-        sole_admin_leave_r["error"].as_str(),
-        Some("a group must always have at least one admin; make another member an admin before leaving"),
-        "sole-admin leave response: {sole_admin_leave_r:?}"
     );
 
     let backup_admin = fake_agent_id(0x43);
@@ -1239,36 +1205,27 @@ async fn named_group_full_lifecycle() {
     let has_final = members.iter().any(|m| m["display_name"] == "Final Name");
     assert!(has_final, "'Final Name' not in members: {members:?}");
 
-    // Step 7: DELETE is now pure self-leave; sole-admin leave is rejected.
+    // Step 7: sole-member DELETE is a deletion (#369) — the creator is the
+    // only member, so the self-leave routes to the terminal withdrawal flow
+    // instead of 409ing on the empty post-removal remainder.
     let leave_resp = authed_client(&d)
         .delete(d.url(&format!("/groups/{group_id}")))
         .send()
         .await
         .unwrap();
-    assert_eq!(leave_resp.status(), StatusCode::CONFLICT);
+    assert_eq!(leave_resp.status(), StatusCode::OK);
     let leave_r: Value = leave_resp.json().await.unwrap();
     assert_eq!(
-        leave_r["ok"], false,
-        "sole-admin leave response: {leave_r:?}"
+        leave_r["ok"], true,
+        "sole-member delete response: {leave_r:?}"
     );
-    assert_eq!(
-        leave_r["error"].as_str(),
-        Some("a group must always have at least one admin; make another member an admin before leaving"),
-        "sole-admin leave response: {leave_r:?}"
+    assert_eq!(leave_r["deleted"].as_str(), Some("Lifecycle Group"));
+    assert!(
+        leave_r.get("left").is_none(),
+        "delete must not answer as a plain leave: {leave_r:?}"
     );
 
-    // Step 8: Explicit delete/withdraw succeeds and retains a terminality marker.
-    let delete_r: Value = authed_client(&d)
-        .post(d.url(&format!("/groups/{group_id}/state/withdraw")))
-        .json(&serde_json::json!({}))
-        .send()
-        .await
-        .unwrap()
-        .json()
-        .await
-        .unwrap();
-    assert_eq!(delete_r["ok"], true, "delete response: {delete_r:?}");
-
+    // Step 8: the deletion retains a withdrawn terminality marker.
     let marker_resp = authed_client(&d)
         .get(d.url(&format!("/groups/{group_id}")))
         .send()
@@ -1925,6 +1882,108 @@ async fn named_group_admin_delete_propagates_to_peer_after_creator_delete_409() 
         )
         .await,
         "recipient TreeKEM snapshot should be wiped after GroupDeleted"
+    );
+}
+
+/// Why (#369): once the second member has left, the creator is the sole
+/// member and `DELETE /groups/:id` must dispose of the group — it used to
+/// 409 on the last-admin precheck's empty remainder, stranding an empty,
+/// undisposable group. The delete is the terminal `GroupDeleted` withdrawal:
+/// the creator keeps only a withdrawn tombstone with TreeKEM key material
+/// wiped. The ex-member already tore down all local state at their own leave
+/// (roster record, snapshot, card cache), so the property that matters on
+/// their daemon is negative: nothing may resurrect the group afterwards —
+/// not the delete's gossip volley, stale discovery cards, nor directory
+/// gossip. Their own snapshot must stay wiped.
+#[tokio::test]
+#[ignore]
+async fn sole_member_delete_after_ex_member_leave_disposes_group() {
+    let pair = pair().await;
+    let alice = &pair.alice;
+    let bob = &pair.bob;
+    let (group_id, bob_group_id, bob_agent_id) =
+        converged_pair_group(alice, bob, "Sole Member Delete").await;
+
+    // The second member leaves first — a plain self-leave answered `left`
+    // (two active members, so this is NOT the sole-member delete path).
+    let bob_leave_resp = bob.delete(&format!("/groups/{bob_group_id}")).await;
+    assert_eq!(bob_leave_resp.status(), StatusCode::OK);
+    let bob_leave: Value = bob_leave_resp.json().await.unwrap();
+    assert_eq!(bob_leave["ok"], true, "ex-member leave: {bob_leave:?}");
+    assert_eq!(bob_leave["left"].as_str(), Some("Sole Member Delete"));
+    assert!(
+        bob_leave.get("deleted").is_none(),
+        "two-member leave must not answer as a delete: {bob_leave:?}"
+    );
+
+    // Alice must apply the self-leave before DELETE, or her roster would not
+    // be sole-member yet and DELETE would 409 as a plain last-admin leave.
+    let bob_gone = wait_until(Duration::from_secs(30), || async {
+        let info: Value = alice
+            .get(&format!("/groups/{group_id}/members"))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        info["members"]
+            .as_array()
+            .map(|members| !members.iter().any(|m| m["agent_id"] == bob_agent_id))
+            .unwrap_or(false)
+    })
+    .await;
+    assert!(
+        bob_gone,
+        "alice never applied bob's self-leave before the delete"
+    );
+
+    // Sole-member DELETE disposes of the group instead of 409ing.
+    let delete_resp = alice.delete(&format!("/groups/{group_id}")).await;
+    assert_eq!(delete_resp.status(), StatusCode::OK);
+    let delete_body: Value = delete_resp.json().await.unwrap();
+    assert_eq!(delete_body["ok"], true, "creator delete: {delete_body:?}");
+    assert_eq!(delete_body["deleted"].as_str(), Some("Sole Member Delete"));
+
+    // Creator keeps only a withdrawn tombstone; key material is wiped.
+    let alice_state = group_state(alice, &group_id)
+        .await
+        .expect("deleting creator should retain terminal state");
+    assert_eq!(
+        alice_state["withdrawn"], true,
+        "alice state: {alice_state:?}"
+    );
+    assert!(
+        wait_until_gone(
+            &alice
+                .data_dir()
+                .join("treekem")
+                .join(format!("{group_id}.snap")),
+            Duration::from_secs(10)
+        )
+        .await,
+        "creator TreeKEM snapshot should be wiped by sole-member delete"
+    );
+
+    // Ex-member: poll for the BAD outcome (resurrection) across a full
+    // settle window; it must never happen, and their snapshot stays wiped.
+    let bob_resurrected = wait_until(Duration::from_secs(10), || async {
+        bob.get(&format!("/groups/{bob_group_id}")).await.status() == StatusCode::OK
+    })
+    .await;
+    assert!(
+        !bob_resurrected,
+        "ex-member resurrected the deleted group from cache or discovery"
+    );
+    let bob_still_gone = bob.get(&format!("/groups/{bob_group_id}")).await;
+    assert_eq!(bob_still_gone.status(), StatusCode::NOT_FOUND);
+    assert!(
+        wait_until_gone(
+            &bob.data_dir()
+                .join("treekem")
+                .join(format!("{bob_group_id}.snap")),
+            Duration::from_secs(10)
+        )
+        .await,
+        "ex-member TreeKEM snapshot must stay wiped after the delete"
     );
 }
 

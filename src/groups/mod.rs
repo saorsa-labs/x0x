@@ -296,6 +296,21 @@ pub fn last_admin_self_leave_precheck_error(
         .map(|_| LAST_ADMIN_SELF_LEAVE_PRECHECK_ERROR)
 }
 
+/// True when `agent_hex` is the only active member of the roster (#369).
+///
+/// A live group always keeps at least one active admin
+/// ([`state_commit::enforce_last_admin_invariant`]), so the sole member is
+/// necessarily admin-or-higher. Their self-leave would otherwise strand an
+/// undisposable group: [`last_admin_self_leave_precheck_error`] evaluates the
+/// post-removal remainder — empty here — and rejects the group's only exit.
+/// The REST leave route therefore routes this case to the group-deletion flow
+/// instead. Removed, banned, and pending roster entries are retained for
+/// audit and do not count; only [`GroupMemberState::Active`] does.
+#[must_use]
+pub fn is_sole_member(info: &GroupInfo, agent_hex: &str) -> bool {
+    info.has_active_member(agent_hex) && info.active_member_count() == 1
+}
+
 impl GroupInfo {
     /// Create a new `GroupInfo` with the given policy (defaults to `private_secure`).
     #[must_use]
@@ -1331,6 +1346,50 @@ mod tests {
         info.remove_member(&bob_hex, Some("alice".into()));
         assert!(!info.has_active_member(&bob_hex));
         assert_eq!(info.active_member_count(), 1);
+    }
+
+    #[test]
+    fn is_sole_member_true_only_for_the_last_active_member() {
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        // #369: creator-only roster — the self-leave that must route to
+        // deletion instead of the last-admin 409.
+        assert!(is_sole_member(&info, &creator_hex));
+        // A stranger is not the sole member even of a one-member roster.
+        assert!(!is_sole_member(&info, &hex::encode([9u8; 32])));
+
+        let bob_hex = hex::encode([2u8; 32]);
+        info.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        assert!(!is_sole_member(&info, &creator_hex));
+        assert!(!is_sole_member(&info, &bob_hex));
+    }
+
+    #[test]
+    fn is_sole_member_ignores_retained_inactive_entries() {
+        // Roster soft-delete keeps Removed entries for audit; the routing
+        // decision must count only active members, or a group whose other
+        // members all departed would look undeletable again (#369).
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aa".repeat(16));
+        let creator_hex = hex::encode([1u8; 32]);
+        let bob_hex = hex::encode([2u8; 32]);
+        info.add_member(
+            bob_hex.clone(),
+            GroupRole::Member,
+            Some(creator_hex.clone()),
+            None,
+        );
+        info.remove_member(&bob_hex, Some(creator_hex.clone()));
+        assert_eq!(
+            info.members_v2.len(),
+            2,
+            "removed entry is retained for audit"
+        );
+        assert!(is_sole_member(&info, &creator_hex));
     }
 
     #[test]
