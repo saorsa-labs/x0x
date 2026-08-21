@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Inbound accept no longer emits `PeerConnected` after a suppression
+  tombstone lands (issue #292 invariant D).** `accept()` can yield before
+  `PolicyRejection` and then await cache bookkeeping; the admit path now
+  re-checks the tombstone before `record_success` and holds the suppression
+  map across the `PeerConnected` emit and pool `note_activity` so a
+  concurrent reject cannot sneak into that window. The refuse path still
+  uses a plain transport close (no `suppress_reconnect`, invariant F).
+  `is_connected` stays transport-only.
+
 ## [v0.39.1] - 2026-08-21
 
 ### Fixed
