@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.1] - 2026-08-21
+
+### Fixed
+
+- **Named-group sole-member NonMemberRequest can no longer withdraw (#377 / #369 follow-on).** `validate_live_to_withdrawn_authority` now rejects `NonMemberRequest` before the sole-member carve-out, so a Pending sole signer cannot live→withdraw. Sole-member self-leave / SoleMemberDelete (#369 / #370) is unchanged.
+- **Sole-member self-leave deletes the group (#370 / #369).** A sole remaining active member can dispose of an empty group via DELETE /groups/:id; last-admin 409 for multi-member groups unchanged.
+
+### Tests
+
+- **Live-withdrawal proptest accepts `action_kind` unauthorized (#375).** Test-shape only; product error stays `NonMemberRequest`.
+- **Hermetic gossip-plane isolation extended to solo/join_peer (#365 / #337).** Per-run test isolation; no product change.
+
 ## [v0.39.0] - 2026-08-20
 
 ### Added
