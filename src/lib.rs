@@ -2942,18 +2942,12 @@ impl Agent {
     /// per-peer connection-entry multiplicity — the divergence between
     /// `active_connections` and the x0x peer count is the zombie/duplicate
     /// connection signal.
-    #[must_use]
-    pub fn transport_diagnostics(&self) -> Option<network::TransportDiagnosticsSnapshot> {
-        self.network
-            .as_ref()
-            .map(|net| net.transport_diagnostics_blocking())
+    pub async fn transport_diagnostics(&self) -> Option<network::TransportDiagnosticsSnapshot> {
+        match self.network.as_ref() {
+            Some(net) => Some(net.transport_diagnostics().await),
+            None => None,
+        }
     }
-
-    /// Get the presence system wrapper, if configured.
-    ///
-    /// Returns `None` if this agent was built without a network config.
-    /// The presence wrapper provides beacon broadcasting, FOAF discovery,
-    /// and online/offline event subscriptions.
     #[must_use]
     pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
         self.presence.as_ref()

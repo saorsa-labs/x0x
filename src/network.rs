@@ -3368,28 +3368,21 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
-    /// Transport-layer diagnostics for the #368 connection-zombie hunt
-    /// (blocking variant: ant-quic exposes async `stats()`/`connected_peers()`
-    /// behind the node; spawn_blocking keeps the API handler responsive).
+    /// Transport-layer diagnostics for the #368 connection-zombie hunt.
     ///
     /// Divergence between `active_connections` and the x0x-visible peer
     /// count is the zombie/duplicate-connection signal: ant-quic connection
     /// objects that x0x's peer map no longer tracks (simultaneous-open
     /// races, redials that replace but do not close) — each pinning its
     /// send-window and receive-assembler quota.
-    pub fn transport_diagnostics_blocking(&self) -> TransportDiagnosticsSnapshot {
-        let node = self.node.blocking_read().as_ref().cloned();
+    pub async fn transport_diagnostics(&self) -> TransportDiagnosticsSnapshot {
+        let node = self.node.read().await.as_ref().cloned();
         let Some(node) = node else {
             return TransportDiagnosticsSnapshot::default();
         };
-        let endpoint = node.inner_endpoint().clone();
-        // ant-quic's accessors are async; this method runs on a request
-        // handler thread, so drive them on the shared runtime handle from
-        // block_in_place (never called from within the node's own tasks).
-        let (stats, conns) = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(async { (endpoint.stats().await, endpoint.connected_peers().await) })
-        });
+        let endpoint = node.inner_endpoint();
+        let stats = endpoint.stats().await;
+        let conns = endpoint.connected_peers().await;
         TransportDiagnosticsSnapshot::from_parts(&stats, &conns)
     }
 

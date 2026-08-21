@@ -609,7 +609,7 @@ pub(in crate::server) async fn gossip_diagnostics(
 pub(in crate::server) async fn transport_diagnostics(
     State(state): State<Arc<AppState>>,
 ) -> impl IntoResponse {
-    match state.agent.transport_diagnostics() {
+    match state.agent.transport_diagnostics().await {
         Some(snap) => (
             StatusCode::OK,
             Json(serde_json::json!({ "ok": true, "transport": snap })),
@@ -630,7 +630,6 @@ pub(in crate::server) async fn transport_diagnostics(
 ///
 /// `messages_dropped_write_policy_violation` is the receiver-side canary
 /// for the join-roster-propagation regression: a non-zero value on the
-/// owner side means joiners' messages are reaching the listener but
 /// `members_v2` is stale.
 ///
 /// `sends_rejected_write_policy` is tracked separately and counts this
