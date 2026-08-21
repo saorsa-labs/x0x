@@ -3979,22 +3979,21 @@ impl NetworkNode {
                         // invisible to admission via `peer_admission`
                         // (invariant A) and must never call
                         // `suppress_reconnect` (invariant F).
+                        //
+                        // The gate is not a single check at `accept()`
+                        // return. Cache bookkeeping awaits below, and a
+                        // concurrent `PolicyRejection` can set the
+                        // tombstone in that window (the original session's
+                        // inbound accept yielding before the close). Every
+                        // admission side-effect re-checks; `PeerConnected`
+                        // is emitted while still holding the suppression
+                        // map so the tombstone cannot land between the
+                        // final check and the event.
                         if reconnect_suppression_is_live(
                             reconnect_suppressions.as_ref(),
                             peer_conn.peer_id.0,
                         ) {
-                            tracing::warn!(
-                                target: "x0x::connect",
-                                origin = "accept",
-                                peer_id_prefix = %hex_prefix(&peer_conn.peer_id.0, 4),
-                                "accept closed: inbound connection from reconnect-suppressed peer (issue #292)"
-                            );
-                            if let Err(e) = node_ref.disconnect(&peer_conn.peer_id).await {
-                                debug!(
-                                    "disconnect of suppressed inbound peer {:?} failed: {}",
-                                    peer_conn.peer_id, e
-                                );
-                            }
+                            close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
                             continue;
                         }
 
@@ -4008,17 +4007,36 @@ impl NetworkNode {
                             _ => None,
                         };
                         if let (Some(ref cache), Some(addr)) = (&bootstrap_cache, addr) {
+                            if reconnect_suppression_is_live(
+                                reconnect_suppressions.as_ref(),
+                                peer_conn.peer_id.0,
+                            ) {
+                                close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                                continue;
+                            }
                             cache
                                 .add_from_connection(peer_conn.peer_id, vec![addr], None)
                                 .await;
+                            if reconnect_suppression_is_live(
+                                reconnect_suppressions.as_ref(),
+                                peer_conn.peer_id.0,
+                            ) {
+                                close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                                continue;
+                            }
                             cache.record_success(&peer_conn.peer_id, 0).await;
                         }
                         let addr =
                             addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-                        let _ = event_sender.send(NetworkEvent::PeerConnected {
-                            peer_id: peer_conn.peer_id.0,
-                            address: addr,
-                        });
+                        if !try_admit_inbound_peer_connected(
+                            reconnect_suppressions.as_ref(),
+                            &event_sender,
+                            peer_conn.peer_id.0,
+                            addr,
+                        ) {
+                            close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
+                            continue;
+                        }
                         let evicted = connection_pool.note_activity(peer_conn.peer_id);
                         if !evicted.is_empty() {
                             disconnect_pool_candidates(
@@ -4562,12 +4580,68 @@ fn reconnect_suppression_is_live(
         Ok(m) => m,
         Err(poisoned) => poisoned.into_inner(),
     };
+    reconnect_suppression_is_live_locked(&mut map, peer_id)
+}
+
+fn reconnect_suppression_is_live_locked(
+    map: &mut HashMap<[u8; 32], ReconnectSuppression>,
+    peer_id: [u8; 32],
+) -> bool {
     let now = Instant::now();
     let live = map.get(&peer_id).is_some_and(|s| s.is_live(now));
     if !live {
         map.remove(&peer_id);
     }
     live
+}
+
+/// Plain transport close for an inbound peer that lost the #292 D gate.
+///
+/// Never calls [`NetworkNode::suppress_reconnect`]: a refused accept must
+/// not refresh an existing tombstone (invariant F).
+async fn close_suppressed_inbound(node: &Node, peer_id: &AntPeerId) {
+    tracing::warn!(
+        target: "x0x::connect",
+        origin = "accept",
+        peer_id_prefix = %hex_prefix(&peer_id.0, 4),
+        "accept closed: inbound connection from reconnect-suppressed peer (issue #292)"
+    );
+    if let Err(e) = node.disconnect(peer_id).await {
+        debug!(
+            "disconnect of suppressed inbound peer {:?} failed: {}",
+            peer_id, e
+        );
+    }
+}
+
+/// Emit inbound [`NetworkEvent::PeerConnected`] only if `peer_id` is not
+/// suppressed, holding the suppression map across the check and the send.
+///
+/// A concurrent `PolicyRejection` takes the same mutex in
+/// [`NetworkNode::suppress_reconnect`]. Holding it here means the tombstone
+/// cannot land between the liveness check and the event — the accept-then-
+/// cache window that leaked admission on issue #292 invariant D.
+///
+/// Returns `true` when the event was emitted (caller may touch the
+/// connection pool). Returns `false` when a live tombstone exists: caller
+/// must close with [`close_suppressed_inbound`] and skip every other
+/// admission side-effect.
+#[must_use]
+fn try_admit_inbound_peer_connected(
+    map: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
+    event_sender: &broadcast::Sender<NetworkEvent>,
+    peer_id: [u8; 32],
+    address: SocketAddr,
+) -> bool {
+    let mut map = match map.lock() {
+        Ok(m) => m,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    if reconnect_suppression_is_live_locked(&mut map, peer_id) {
+        return false;
+    }
+    let _ = event_sender.send(NetworkEvent::PeerConnected { peer_id, address });
+    true
 }
 
 /// Events emitted by the network node.
@@ -4645,6 +4719,58 @@ mod tests {
         };
 
         assert_eq!(send_ready_peer_ids([connection]), vec![constrained]);
+    }
+
+    /// Issue #292 invariant D: a PolicyRejection tombstone present at the
+    /// inbound admit seam must not surface `PeerConnected`. This is the
+    /// atomic check+emit helper the accept loop uses after cache awaits —
+    /// the window that leaked admission when `accept()` had already
+    /// yielded before the tombstone landed.
+    #[test]
+    fn inbound_admit_emits_no_peer_connected_when_policy_rejection_tombstone_is_live() {
+        let map = Mutex::new(HashMap::from([(
+            [1u8; 32],
+            ReconnectSuppression {
+                reason: DisconnectReason::PolicyRejection,
+                set_at: Instant::now(),
+            },
+        )]));
+        let (tx, mut rx) = broadcast::channel(16);
+        let addr = "127.0.0.1:1".parse().unwrap();
+
+        assert!(
+            !try_admit_inbound_peer_connected(&map, &tx, [1u8; 32], addr),
+            "a live PolicyRejection tombstone must refuse inbound admit"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "refusing inbound admit must not emit PeerConnected"
+        );
+        assert!(
+            reconnect_suppression_is_live(&map, [1u8; 32]),
+            "the refuse path must not clear or refresh the tombstone"
+        );
+    }
+
+    /// Companion to the refuse test: an unsuppressed inbound peer still
+    /// admits. Guards against the helper becoming a permanent no-op.
+    #[test]
+    fn inbound_admit_emits_peer_connected_when_peer_is_unsuppressed() {
+        let map = Mutex::new(HashMap::new());
+        let (tx, mut rx) = broadcast::channel(16);
+        let addr = "127.0.0.1:2".parse().unwrap();
+
+        assert!(
+            try_admit_inbound_peer_connected(&map, &tx, [2u8; 32], addr),
+            "an unsuppressed inbound peer must admit"
+        );
+        match rx.try_recv() {
+            Ok(NetworkEvent::PeerConnected { peer_id, address }) => {
+                assert_eq!(peer_id, [2u8; 32], "emitted peer id");
+                assert_eq!(address, addr, "emitted address");
+            }
+            other => panic!("expected PeerConnected, got {other:?}"),
+        }
     }
 
     #[tokio::test]
