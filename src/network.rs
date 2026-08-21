@@ -766,6 +766,18 @@ pub struct TransportDiagnosticsSnapshot {
     pub peer_activity_count: u64,
     /// Connected-peers map entries.
     pub connected_peers_map_len: u64,
+    /// Proto-level buffered bytes summed over every live + draining
+    /// connection (#368 gate 5). `send_unacked`+`recv_buffered` tracking
+    /// RSS growth = quinn buffers on live/draining connections (fix:
+    /// reader/recv-pump back-pressure, drain speed, windows); flat+tiny =
+    /// residue outside quinn.
+    pub send_unacked_bytes: u64,
+    /// Receive-side assembler backlog summed over open recv streams.
+    pub recv_buffered_bytes: u64,
+    /// Open receive streams currently holding unread buffered bytes.
+    pub recv_streams_with_unread: u64,
+    /// Live + draining proto connections counted by the totals above.
+    pub connections_counted: u64,
 }
 
 /// One x0x-visible connection entry for
@@ -809,6 +821,10 @@ impl TransportDiagnosticsSnapshot {
             reader_handle_count: 0,
             peer_activity_count: 0,
             connected_peers_map_len: 0,
+            send_unacked_bytes: 0,
+            recv_buffered_bytes: 0,
+            recv_streams_with_unread: 0,
+            connections_counted: 0,
         }
     }
 }
@@ -3428,6 +3444,13 @@ impl NetworkNode {
             u64::try_from(endpoint.peer_activity_count().await).unwrap_or(u64::MAX);
         snap.connected_peers_map_len =
             u64::try_from(endpoint.connected_peers_map_len().await).unwrap_or(u64::MAX);
+        // #368 gate 5: buffered-bytes totals over live + draining conns.
+        let (send_unacked, recv_buffered, streams_unread, conns_counted) =
+            endpoint.buffered_bytes_totals();
+        snap.send_unacked_bytes = send_unacked;
+        snap.recv_buffered_bytes = recv_buffered;
+        snap.recv_streams_with_unread = u64::try_from(streams_unread).unwrap_or(u64::MAX);
+        snap.connections_counted = u64::try_from(conns_counted).unwrap_or(u64::MAX);
         snap
     }
 
