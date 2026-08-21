@@ -584,7 +584,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
-                "send_cooldown": state.agent.send_cooldown_diagnostics(),
+                "send_gate": state.agent.send_gate_diagnostics(),
                 "discovery_cache_entries": {
                     "agents": agents,
                     "machines": machines,

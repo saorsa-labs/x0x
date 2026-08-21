@@ -24,10 +24,9 @@
 
 use crate::error::{NetworkError, NetworkResult};
 
-mod send_cooldown;
-
-pub use self::send_cooldown::SendCooldownSnapshot;
-use self::send_cooldown::{SendCooldownTracker, SendOutcome, GOSSIP_SEND_TIMEOUT};
+mod send_gate;
+pub use self::send_gate::SendGateSnapshot;
+use self::send_gate::{PeerSendGate, MAX_INFLIGHT_SENDS_PER_PEER};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
@@ -1459,9 +1458,10 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
-    /// Destructive-cooldown state for gossip per-peer sends (#368): streaks,
-    /// timeout/close proof counters. Arc so the Clone derive shares state.
-    send_cooldown: Arc<SendCooldownTracker>,
+    /// Per-peer in-flight send gates (#368 v2): bounded concurrent stream
+    /// opens per peer, dead-peer escalation state, proof counters. Arc so
+    /// the Clone derive shares state.
+    send_gate: Arc<PeerSendGate>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -1667,7 +1667,7 @@ impl NetworkNode {
             recv_membership_rx: Arc::new(tokio::sync::Mutex::new(recv_membership_rx)),
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
-            send_cooldown: Arc::new(SendCooldownTracker::new()),
+            send_gate: Arc::new(PeerSendGate::new()),
             recv_pump_diagnostics,
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -3303,14 +3303,14 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
-    /// Snapshot of the destructive-cooldown proof counters (#368).
+    /// Snapshot of the per-peer send-gate proof counters (#368 v2).
     ///
-    /// Exposed through `GET /diagnostics/gossip` → `send_cooldown`; the two
-    /// counters are the soak's success metrics (connections closed by
-    /// cooldown escalation, sends abandoned on transport timeout).
+    /// Exposed through `GET /diagnostics/gossip` → `send_gate`: sends
+    /// rejected at the in-flight cap, peers currently saturated, and
+    /// dead-peer closes (the soak gate asserts these stay rare).
     #[must_use]
-    pub fn send_cooldown_snapshot(&self) -> SendCooldownSnapshot {
-        self.send_cooldown.snapshot()
+    pub fn send_gate_snapshot(&self) -> SendGateSnapshot {
+        self.send_gate.snapshot()
     }
 
     /// Gracefully shut down the node: abort the background tasks, close all
@@ -4386,73 +4386,51 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         buf.push(stream_type.to_byte());
         buf.extend_from_slice(&data);
 
+        // #368 v2: bound the streams a stalled peer can pin by capping
+        // concurrent in-flight sends per peer — a saturated peer's send is
+        // rejected WITHOUT opening a stream, and saorsa-gossip applies its
+        // own cooldown/backoff to the error. No fixed transport timeout
+        // (the v1 lesson: undercutting sg's ADAPTIVE timeout manufactures
+        // false stalls); the send future runs under sg's outer timeout, and
+        // the permit lives inside this future so completion OR sg dropping
+        // it mid-write releases the slot. A connection close exists only
+        // for a genuinely dead peer: continuously saturated past
+        // DEAD_PEER_SATURATION_WINDOW with no completed send, rate-limited
+        // per peer — it must stay rare.
+        let _permit = self.send_gate.acquire(ant_peer.0).map_err(|()| {
+            anyhow::anyhow!("peer saturated: {MAX_INFLIGHT_SENDS_PER_PEER} sends already in flight")
+        })?;
+        if self.send_gate.should_close_dead_peer(ant_peer.0) {
+            tracing::info!(
+                peer_id = %ant_peer.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
+                "dead peer: continuously saturated past the window — closing connection"
+            );
+            if let Err(e) = self
+                .disconnect_with_reason(&ant_peer, DisconnectReason::Transport)
+                .await
+            {
+                tracing::debug!("dead-peer close failed: {e}");
+            }
+            self.send_gate.note_closed(ant_peer.0);
+        }
+
         // Send via ant-quic Node
         //
         // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
         // per-peer sends in a small timeout; a multi-second liveness repair on
         // this path turns healthy gossip degradation into a timeout/log storm.
-        // #368: the transport owns the per-send timeout. It fires strictly
-        // before saorsa-gossip's adaptive outer timeout (see
-        // `GOSSIP_SEND_TIMEOUT`), so the in-flight send future is dropped at
-        // a known point instead of mid-`SendStream::write`, and consecutive
-        // timeouts escalate to a connection close (destructive cooldown)
-        // that frees both ends' pinned stream state. A timed-out send
-        // returns Err: saorsa-gossip's admission gates and CriticalSendGate
-        // semantics depend on the failure signal (retry / fail-loud), and
-        // its WARN per failed send is truthful. The escalation bookkeeping
-        // (streaks, close, counters) stays transport-owned.
-        let send_outcome = {
+        {
             let node_guard = self.node.read().await;
             let node = node_guard
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
 
-            match tokio::time::timeout(GOSSIP_SEND_TIMEOUT, node.send(&ant_peer, &buf)).await {
-                Ok(Ok(())) => SendOutcome::Sent,
-                Ok(Err(e)) => return Err(anyhow::anyhow!("send failed: {e}")),
-                Err(_elapsed) => SendOutcome::TimedOut,
-            }
-        };
-
-        match send_outcome {
-            SendOutcome::Sent => {
-                self.send_cooldown.note_success(ant_peer.0);
-                self.note_connection_pool_activity(ant_peer).await;
-            }
-            SendOutcome::TimedOut => {
-                let close = self.send_cooldown.note_timeout(ant_peer.0);
-                if close {
-                    // Destructive cooldown (#368): the peer missed
-                    // N_CONSECUTIVE_TIMEOUTS_TO_CLOSE sends in a row — close
-                    // by peer-id (never by address; #305) with a
-                    // reconnect-eligible reason so the normal redial path
-                    // recovers it if it comes back. The close resets every
-                    // stream in both directions, freeing the sender-pinned
-                    // write buffers and the receiver's partial assembler
-                    // state.
-                    tracing::info!(
-                        peer_id = %ant_peer.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                        "destructive cooldown: closing connection after repeated gossip send timeouts"
-                    );
-                    if let Err(e) = self
-                        .disconnect_with_reason(&ant_peer, DisconnectReason::Transport)
-                        .await
-                    {
-                        tracing::debug!("cooldown close failed: {e}");
-                    }
-                    self.send_cooldown.note_closed(ant_peer.0);
-                } else {
-                    debug!(
-                        "[1/6 network] send to peer {:?} timed out after {:?} (streak \
-                         escalation pending)",
-                        peer, GOSSIP_SEND_TIMEOUT
-                    );
-                }
-                return Err(anyhow::anyhow!(
-                    "send timed out after {GOSSIP_SEND_TIMEOUT:?}"
-                ));
-            }
+            node.send(&ant_peer, &buf)
+                .await
+                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
         }
+        self.send_gate.note_completed(ant_peer.0);
+        self.note_connection_pool_activity(ant_peer).await;
 
         debug!(
             "[1/6 network] send: {} bytes ({:?}) to peer {:?}",

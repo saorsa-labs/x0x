@@ -2933,16 +2933,14 @@ impl Agent {
         self.network.as_ref().map(|net| net.recv_pump_diagnostics())
     }
 
-    /// Snapshot of the gossip send destructive-cooldown counters (#368).
+    /// Snapshot of the per-peer send-gate proof counters (#368 v2).
     ///
     /// Returns `None` when this agent was built without a network node.
-    /// Exposed through `GET /diagnostics/gossip` → `send_cooldown` as the
-    /// proof metrics for the leak soak (see `network::send_cooldown`).
+    /// Exposed through `GET /diagnostics/gossip` → `send_gate` as the
+    /// proof metrics for the leak soak (see `network::send_gate`).
     #[must_use]
-    pub fn send_cooldown_diagnostics(&self) -> Option<network::SendCooldownSnapshot> {
-        self.network
-            .as_ref()
-            .map(|net| net.send_cooldown_snapshot())
+    pub fn send_gate_diagnostics(&self) -> Option<network::SendGateSnapshot> {
+        self.network.as_ref().map(|net| net.send_gate_snapshot())
     }
 
     /// Get the presence system wrapper, if configured.

@@ -24,9 +24,10 @@ use serde_json::Value;
 #[path = "harness/src/cluster.rs"]
 mod cluster;
 
-use cluster::{pair, AgentInstance};
+use cluster::{join_peer, pair, solo, AgentInstance};
 
 const COOLDOWN_WINDOW: Duration = Duration::from_secs(60);
+const PROBE_TOPIC: &str = "x0x.368.blackhole.probe";
 
 fn kill_signal(pid: u32, signal: &str) {
     let status = Command::new("kill")
@@ -38,9 +39,17 @@ fn kill_signal(pid: u32, signal: &str) {
 
 async fn publish_burst(alice: &AgentInstance, topic: &str, bytes: usize, rounds: usize) {
     // ~64 KiB base64 payloads: large enough that a stalled peer's QUIC
-    // flow-control window saturates within a few rounds.
-    let payload_b64 = base64::engine::general_purpose::STANDARD.encode(vec![0x5a_u8; bytes]);
-    for _ in 0..rounds {
+    // flow-control window saturates within a few rounds. Each publish is
+    // UNIQUE (salted) — plumtree dedupes byte-identical messages before
+    // fan-out, so a constant payload would never exercise the transport.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static SALT: AtomicU64 = AtomicU64::new(0);
+    for r in 0..rounds {
+        let salt = SALT.fetch_add(1, Ordering::Relaxed);
+        let mut raw = vec![0x5a_u8; bytes];
+        raw[..8].copy_from_slice(&salt.to_be_bytes());
+        raw[8..12].copy_from_slice(&(r as u32).to_be_bytes());
+        let payload_b64 = base64::engine::general_purpose::STANDARD.encode(raw);
         let resp: Value = alice
             .post(
                 "/publish",
@@ -54,19 +63,20 @@ async fn publish_burst(alice: &AgentInstance, topic: &str, bytes: usize, rounds:
     }
 }
 
-/// (conns_closed_by_cooldown, streams_reset_on_timeout) — the #368 soak
-/// proof counters from GET /diagnostics/gossip.
-async fn cooldown_counters(alice: &AgentInstance) -> (u64, u64) {
+/// (sends_rejected_saturated, peers_saturated_now, conns_closed_dead_peer)
+/// — the #368 v2 proof counters from GET /diagnostics/gossip.
+async fn gate_counters(alice: &AgentInstance) -> (u64, u64, u64) {
     let body: Value = alice
         .get("/diagnostics/gossip")
         .await
         .json()
         .await
         .unwrap_or_default();
-    let c = &body["send_cooldown"];
+    let g = &body["send_gate"];
     (
-        c["conns_closed_by_cooldown"].as_u64().unwrap_or(0),
-        c["streams_reset_on_timeout"].as_u64().unwrap_or(0),
+        g["sends_rejected_saturated"].as_u64().unwrap_or(0),
+        g["peers_saturated_now"].as_u64().unwrap_or(0),
+        g["conns_closed_dead_peer"].as_u64().unwrap_or(0),
     )
 }
 
@@ -75,17 +85,25 @@ async fn peer_count(alice: &AgentInstance) -> usize {
     body["peers"].as_array().map(Vec::len).unwrap_or(0)
 }
 
-/// Why (#368): a peer that stops draining (NAT-stalled in production,
-/// SIGSTOP here) pins unbounded send buffers on every retry. The destructive
-/// cooldown must close that peer's connection within the escalation window,
-/// prove it via `conns_closed_by_cooldown`, keep the survivor healthy, and
-/// redial once the peer resumes.
+/// Why (#368 v2 + field finding): against saorsa-gossip 0.5.71 the
+/// in-flight gate cannot engage — sg serializes per-peer sends (its
+/// admission gate holds "never more than one Critical send per peer at
+/// once", and bulk lanes behave the same in practice), so K=8 concurrent
+/// permits are never exhausted (measured: 17 sg-side per-peer timeouts,
+/// zero gate rejections, saturation never >1). This test pins what IS
+/// observable and must hold regardless: sends to a frozen peer fail at
+/// sg's adaptive timeout (real stalls, unlike v1's fixed timeout), the
+/// daemon does NOT close the peer inside the window, health stays ok, and
+/// the peer recovers after resume. The leak's true vector is CUMULATIVE
+/// sg-abandoned streams (one pinned stream per timeout), not concurrent
+/// in-flight ones — design escalation filed with the reviewer.
 #[tokio::test]
 #[ignore]
-async fn blackholed_peer_connection_closed_by_cooldown_and_redials_after_resume() {
-    let pair = pair().await;
-    let alice = &pair.alice;
-    let bob = &pair.bob;
+async fn blackholed_peer_no_churn_and_recovers_after_resume() {
+    let (alice_anchor, anchor_port) = solo().await;
+    let bob_joined = join_peer(&alice_anchor, anchor_port).await;
+    let alice = &alice_anchor;
+    let bob = &bob_joined;
 
     let baseline_peers = peer_count(alice).await;
     assert!(
@@ -93,75 +111,63 @@ async fn blackholed_peer_connection_closed_by_cooldown_and_redials_after_resume(
         "alice must see bob before the black-hole"
     );
 
-    // Black-hole bob: process frozen — the kernel stops reading the socket
-    // and ACKing, so alice's QUIC stream writes stall on flow control.
+    for daemon in [alice, bob] {
+        let resp: Value = daemon
+            .post("/subscribe", serde_json::json!({ "topic": PROBE_TOPIC }))
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        assert_eq!(resp["ok"], true, "subscribe: {resp:?}");
+    }
+    // Let bob's graft reach alice so eager-push actually targets him.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+
     kill_signal(bob.pid(), "STOP");
 
-    // A fully-frozen peer (no ACKs at all) is removed by either of two
-    // legitimate mechanisms, and which one wins is a race: (a) the
-    // destructive cooldown — five consecutive transport timeouts escalate to
-    // a close; (b) ant-quic's own liveness/idle detection drops the dead
-    // connection first, after which saorsa-gossip stops routing sends to it
-    // (observed: one transport timeout, then the peer set empties). Both
-    // leave the operator-visible contract intact: the stalled peer's
-    // connection is GONE and its pinned buffers were freed by the close. The
-    // escalation mechanism itself is pinned by the unit tests; here we
-    // assert the close happened by SOME path, prove the counters when the
-    // escalation is the one that fired, and prove recovery.
-    let deadline = Instant::now() + COOLDOWN_WINDOW;
-    let mut gone = false;
-    let mut closed = 0;
+    // sg's adaptive per-peer timeout does the stalling (its floor is 1.5 s —
+    // real stalls, not v1's false ones). The whole phase stays under the
+    // 60 s dead-peer window, so our escalation MUST NOT fire.
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut saw_peer_timeouts = false;
     while Instant::now() < deadline {
-        publish_burst(alice, "x0x.368.blackhole.probe", 64 * 1024, 4).await;
-        let (conns_closed, timed_out) = cooldown_counters(alice).await;
-        if conns_closed >= 1 {
-            closed = conns_closed;
-            // N_CONSECUTIVE_TIMEOUTS_TO_CLOSE is 5; whenever the escalation
-            // fires, the counter must show at least that many abandoned
-            // sends behind it.
-            assert!(
-                timed_out >= 5,
-                "escalation requires ≥5 consecutive timed-out sends: {timed_out}"
-            );
+        publish_burst(alice, PROBE_TOPIC, 256 * 1024, 8).await;
+        let body: Value = alice
+            .get("/diagnostics/gossip")
+            .await
+            .json()
+            .await
+            .unwrap_or_default();
+        if body["pubsub_stages"]["republish_per_peer_timeout"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1
+        {
+            saw_peer_timeouts = true;
+            let g = gate_counters(alice).await;
+            assert_eq!(g.2, 0, "dead-peer close fired inside the window: {g:?}");
         }
-        if closed >= 1 || peer_count(alice).await == 0 {
-            gone = true;
+        if saw_peer_timeouts {
             break;
         }
-        tokio::time::sleep(Duration::from_millis(500)).await;
+        tokio::time::sleep(Duration::from_millis(300)).await;
     }
-    let (final_closed, final_timed_out) = cooldown_counters(alice).await;
-    let diag: Value = alice
-        .get("/diagnostics/gossip")
-        .await
-        .json()
-        .await
-        .unwrap_or_default();
     assert!(
-        gone,
-        "black-holed peer neither cooldown-closed nor liveness-dropped within \
-         {COOLDOWN_WINDOW:?}; closed={final_closed} timed_out={final_timed_out} \
-         peers={} diag={diag}",
-        peer_count(alice).await
+        saw_peer_timeouts,
+        "frozen peer never stalled an sg send — test setup broken"
     );
 
-    // Survivor stays healthy.
     let health: Value = alice.get("/health").await.json().await.unwrap_or_default();
-    assert_eq!(health["ok"], true, "alice health after cooldown close");
+    assert_eq!(health["ok"], true, "alice health while peer stalled");
 
-    // Resume bob: the normal redial path must reconnect the pair.
+    // Resume bob: the pair recovers (redial first if ant-quic liveness had
+    // dropped the frozen connection) and sends complete again.
     kill_signal(bob.pid(), "CONT");
-    let reconnected = wait_until(COOLDOWN_WINDOW, || async {
-        peer_count(alice).await >= baseline_peers
-    })
-    .await;
-    assert!(
-        reconnected,
-        "alice never redialled bob after resume (baseline {baseline_peers})"
-    );
-
-    // And a publish round-trips again.
-    publish_burst(alice, "x0x.368.blackhole.resume", 1024, 1).await;
+    let recovered = wait_until(COOLDOWN_WINDOW, || async { peer_count(alice).await >= 1 }).await;
+    assert!(recovered, "alice never saw a peer again after resume");
+    publish_burst(alice, PROBE_TOPIC, 1024, 1).await;
+    let g = gate_counters(alice).await;
+    assert_eq!(g.2, 0, "no dead-peer close across the whole test: {g:?}");
 }
 
 /// Why (#371/#368): SIGTERM must terminate the daemon within the shutdown
