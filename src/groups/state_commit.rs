@@ -645,6 +645,17 @@ fn validate_live_to_withdrawn_authority(
         ));
     }
 
+    // NonMemberRequest is never withdrawal authority. Without this gate a
+    // Pending sole member-in-being (`active_signer_role` is `None`) would
+    // pass the sole-member carve-out below and then satisfy the ordinary
+    // `NonMemberRequest => signer_role.is_none()` arm, withdrawing the group.
+    if action_kind == ActionKind::NonMemberRequest {
+        return Err(ApplyError::Unauthorized {
+            signer: commit.committed_by.clone(),
+            action: ActionKind::NonMemberRequest.name(),
+        });
+    }
+
     // #369 / PR #370 review item 3: the sole member-in-being may terminalize
     // the group regardless of role — their withdrawal IS the entire (one
     // person) membership's unanimous decision. Any second member-in-being
@@ -1611,6 +1622,166 @@ mod tests {
         assert!(
             matches!(err, ApplyError::Unauthorized { .. }),
             "sole-member authority must not leak into ordinary admin acts"
+        );
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_nmr_withdrawal_from_sole_pending_member() {
+        // The #369 follow-on hole: a sole Pending member-in-being has
+        // `active_signer_role == None`, so the #370 carve-out used to
+        // authorize their NonMemberRequest live withdrawal (the #375
+        // shrink: a Pending sole Owner withdrew the whole group).
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        let mut pending_owner = make_owner(&signer_hex);
+        pending_owner.state = GroupMemberState::Pending;
+        members.insert(signer_hex.clone(), pending_owner);
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::NonMemberRequest).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ApplyError::Unauthorized { action, .. }
+                    if action == ActionKind::NonMemberRequest.name()
+            ),
+            "a pending sole member's NonMemberRequest must not withdraw the group: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_nmr_withdrawal_from_sole_active_member() {
+        // NMR is never a withdraw kind for ANY rostered sole member-in-being
+        // (the apply oracle's `NonMemberRequest => false` arm). An Active
+        // sole Member was already rejected at the ordinary arm; the explicit
+        // gate keeps it rejected before the carve-out.
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            signer_hex.clone(),
+            make_member(&signer_hex, GroupRole::Member),
+        );
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::NonMemberRequest).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Unauthorized { .. }),
+            "an active sole member's NonMemberRequest must not withdraw the group: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_apply_allows_nmr_non_terminal_from_sole_pending_member() {
+        // Closing the hole must not ban NMR outright: a sole Pending
+        // signer's ordinary (non-withdrawn) join-request commits keep
+        // passing `NonMemberRequest => signer_role.is_none()`.
+        let kp = AgentKeypair::generate().unwrap();
+        let signer_hex = hex::encode(kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        let mut pending_owner = make_owner(&signer_hex);
+        pending_owner.state = GroupMemberState::Pending;
+        members.insert(signer_hex.clone(), pending_owner);
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            false,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        validate_apply(&ctx, &commit, ActionKind::NonMemberRequest).unwrap();
+    }
+
+    #[test]
+    fn validate_apply_terminal_rejects_nmr_withdrawal_from_outsider() {
+        // The sole-member carve-out does not apply to signers outside the
+        // roster: their NonMemberRequest withdrawal is refused outright.
+        let kp = AgentKeypair::generate().unwrap();
+        let admin_hex = "ff".repeat(32);
+        let mut members = BTreeMap::new();
+        members.insert(admin_hex.clone(), make_member(&admin_hex, GroupRole::Admin));
+
+        let commit = GroupStateCommit::sign(
+            "g1".into(),
+            2,
+            Some("current".into()),
+            "r".into(),
+            "p".into(),
+            "m".into(),
+            None,
+            true,
+            0,
+            &kp,
+        )
+        .unwrap();
+        let ctx = ApplyContext {
+            current_state_hash: "current",
+            current_revision: 1,
+            current_withdrawn: false,
+            members_v2: &members,
+            group_id: "g1",
+        };
+
+        let err = validate_apply_terminal(&ctx, &commit, ActionKind::NonMemberRequest).unwrap_err();
+        assert!(
+            matches!(err, ApplyError::Unauthorized { .. }),
+            "an outsider's NonMemberRequest must not withdraw the group: {err}"
         );
     }
 
