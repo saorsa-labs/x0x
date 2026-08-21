@@ -24,6 +24,10 @@
 
 use crate::error::{NetworkError, NetworkResult};
 
+mod churn;
+use self::churn::ChurnCounters;
+pub use self::churn::ChurnSnapshot;
+
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
@@ -748,6 +752,9 @@ pub struct TransportDiagnosticsSnapshot {
     pub total_bootstrap_nodes: u64,
     /// Average NAT coordination time, milliseconds.
     pub average_coordination_time_ms: u64,
+    /// Connection-churn counters (#368 gate 2): dial direction,
+    /// redials-of-connected, generation replace/close lifecycle.
+    pub churn: Option<ChurnSnapshot>,
 }
 
 /// One x0x-visible connection entry for
@@ -786,6 +793,7 @@ impl TransportDiagnosticsSnapshot {
                 stats.average_coordination_time.as_millis(),
             )
             .unwrap_or(u64::MAX),
+            churn: None,
         }
     }
 }
@@ -1528,6 +1536,9 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
+    /// Connection-churn observation counters (#368 gate 2). Arc so the
+    /// Clone derive shares state; fed by the spawn_observer task.
+    churn: Arc<ChurnCounters>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -1734,6 +1745,7 @@ impl NetworkNode {
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
+            churn: Arc::new(ChurnCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -1766,6 +1778,13 @@ impl NetworkNode {
                     .into_inner()
                     .extend([receiver, accept, eviction, plane_gatekeeper])
             }
+        }
+
+        // #368 gate 2: pure-observation churn counters over ant-quic's
+        // event streams (connect direction, redials-of-connected,
+        // generation replace/close lifecycle). Zero behaviour change.
+        if let Some(node) = network_node.node.read().await.as_ref() {
+            Arc::clone(&network_node.churn).spawn_observer(node);
         }
 
         Ok(network_node)
@@ -3383,7 +3402,9 @@ impl NetworkNode {
         let endpoint = node.inner_endpoint();
         let stats = endpoint.stats().await;
         let conns = endpoint.connected_peers().await;
-        TransportDiagnosticsSnapshot::from_parts(&stats, &conns)
+        let mut snap = TransportDiagnosticsSnapshot::from_parts(&stats, &conns);
+        snap.churn = Some(self.churn.snapshot());
+        snap
     }
 
     /// Gracefully shut down the node: abort the background tasks, close all
