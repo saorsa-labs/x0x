@@ -1395,12 +1395,23 @@ proptest! {
             }
             if !current_withdrawn && commit_withdrawn {
                 if event_kind.allows_live_withdrawal() {
-                    let rejected_by_withdrawal_authority = matches!(
-                        result,
-                        Err(ApplyError::Unauthorized { action, .. })
-                            if action == ActionKind::AdminOrHigher.name()
+                    // Product names the action actually applied for
+                    // NonMemberRequest (including signer_spec = None →
+                    // "non-member-request"). Other rejected live
+                    // withdrawals stay Unauthorized without hardcoding
+                    // AdminOrHigher as the only accepted action name.
+                    let rejected_by_withdrawal_authority = match &result {
+                        Err(ApplyError::Unauthorized { action, .. }) => {
+                            action_kind != ActionKind::NonMemberRequest
+                                || *action == action_kind.name()
+                        }
+                        _ => false,
+                    };
+                    prop_assert!(
+                        rejected_by_withdrawal_authority,
+                        "rejected live withdrawal must be Unauthorized {{ action: {} }}; got {result:?}",
+                        action_kind.name()
                     );
-                    prop_assert!(rejected_by_withdrawal_authority);
                 } else {
                     prop_assert!(matches!(result, Err(ApplyError::Invariant(_))));
                 }
@@ -1644,5 +1655,54 @@ fn sole_admin_self_leave_routes_to_deletion_disposition() {
     assert!(
         SOLE_MEMBER_DELETE_STEPS.load(std::sync::atomic::Ordering::Relaxed) >= 1,
         "sole-member SelfLeave must reach the SoleMemberDelete branch"
+    );
+}
+
+/// Sole Owner/Active applying a live-withdrawal `GroupDeleted` commit as
+/// `NonMemberRequest` is rejected (`expected_ok = false`). Product names
+/// the action under test (`"non-member-request"`), not hardcoded
+/// `AdminOrHigher`.
+#[test]
+fn sole_owner_nonmember_request_live_withdrawal_is_unauthorized_for_action_kind() {
+    let keypairs = sequence_keypairs();
+    let signer = &keypairs[1];
+    let signer_spec = Some(member_spec(GroupRole::Owner, GroupMemberState::Active));
+    let action_kind = ActionKind::NonMemberRequest;
+    let event_kind = MetadataEventKind::GroupDeleted;
+    let current_withdrawn = false;
+    let commit_withdrawn = true;
+    let admin_present = false;
+
+    let mut apply_group = withdrawal_case_group(
+        &keypairs,
+        signer_spec.as_ref(),
+        current_withdrawn,
+        admin_present,
+    );
+    let before = state_snapshot(&apply_group);
+    let commit = craft_withdrawn_flag_commit(&apply_group, signer, commit_withdrawn, 11_000)
+        .expect("sign withdrawal flag commit");
+    let result = apply_withdrawn_flag_commit(&mut apply_group, &commit, action_kind, event_kind);
+    let expected_ok = expected_withdrawn_apply_authorized(
+        current_withdrawn,
+        commit_withdrawn,
+        signer_spec.as_ref(),
+        admin_present,
+        action_kind,
+        event_kind,
+    );
+
+    assert!(
+        !expected_ok,
+        "oracle must reject NonMemberRequest on a sole-member live withdrawal"
+    );
+    assert_eq!(state_snapshot(&apply_group), before);
+    assert!(
+        matches!(
+            result,
+            Err(ApplyError::Unauthorized { action, .. })
+                if action == ActionKind::NonMemberRequest.name()
+        ),
+        "product must name the action under test; got {result:?}"
     );
 }
