@@ -237,6 +237,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/transport",
+        cli_name: "diagnostics transport",
+        description: "Transport connection accounting (zombie-connection hunt, #368)",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/dm",
         cli_name: "diagnostics dm",
         description: "Direct-message send/receive counters and per-peer health",

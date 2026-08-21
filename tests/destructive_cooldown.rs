@@ -63,23 +63,6 @@ async fn publish_burst(alice: &AgentInstance, topic: &str, bytes: usize, rounds:
     }
 }
 
-/// (sends_rejected_saturated, peers_saturated_now, conns_closed_dead_peer)
-/// — the #368 v2 proof counters from GET /diagnostics/gossip.
-async fn gate_counters(alice: &AgentInstance) -> (u64, u64, u64) {
-    let body: Value = alice
-        .get("/diagnostics/gossip")
-        .await
-        .json()
-        .await
-        .unwrap_or_default();
-    let g = &body["send_gate"];
-    (
-        g["sends_rejected_saturated"].as_u64().unwrap_or(0),
-        g["peers_saturated_now"].as_u64().unwrap_or(0),
-        g["conns_closed_dead_peer"].as_u64().unwrap_or(0),
-    )
-}
-
 async fn peer_count(alice: &AgentInstance) -> usize {
     let body: Value = alice.get("/peers").await.json().await.unwrap_or_default();
     body["peers"].as_array().map(Vec::len).unwrap_or(0)
@@ -144,8 +127,6 @@ async fn blackholed_peer_no_churn_and_recovers_after_resume() {
             >= 1
         {
             saw_peer_timeouts = true;
-            let g = gate_counters(alice).await;
-            assert_eq!(g.2, 0, "dead-peer close fired inside the window: {g:?}");
         }
         if saw_peer_timeouts {
             break;
@@ -166,8 +147,6 @@ async fn blackholed_peer_no_churn_and_recovers_after_resume() {
     let recovered = wait_until(COOLDOWN_WINDOW, || async { peer_count(alice).await >= 1 }).await;
     assert!(recovered, "alice never saw a peer again after resume");
     publish_burst(alice, PROBE_TOPIC, 1024, 1).await;
-    let g = gate_counters(alice).await;
-    assert_eq!(g.2, 0, "no dead-peer close across the whole test: {g:?}");
 }
 
 /// Why (#371/#368): SIGTERM must terminate the daemon within the shutdown

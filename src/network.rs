@@ -24,9 +24,6 @@
 
 use crate::error::{NetworkError, NetworkResult};
 
-mod send_gate;
-pub use self::send_gate::SendGateSnapshot;
-use self::send_gate::{PeerSendGate, MAX_INFLIGHT_SENDS_PER_PEER};
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
@@ -719,6 +716,79 @@ pub struct RecvPumpPeerSnapshot {
     pub bulk_dropped_full: u64,
 }
 
+/// Transport-layer diagnostics snapshot for the #368 connection-zombie hunt.
+///
+/// The load-bearing signal is `active_connections` (ant-quic's live QUIC
+/// connection objects) versus `x0x_visible_peers` (peers x0x's map still
+/// tracks): the gap is zombie/duplicate connections that nothing reaps,
+/// each pinning its 16 MiB receive-window quota and send-window state.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TransportDiagnosticsSnapshot {
+    /// Live ant-quic connection objects (includes any x0x has lost track of).
+    pub active_connections: u64,
+    /// Distinct peers x0x still tracks as connected.
+    pub x0x_visible_peers: u64,
+    /// Per-peer connection entries as x0x/ant-quic track them
+    /// (peer id hex, remote address) — same peer appearing under multiple
+    /// addresses is the duplicate/replacement signature.
+    pub peer_entries: Vec<TransportPeerEntry>,
+    /// Cumulative successful connection establishments.
+    pub successful_connections: u64,
+    /// Cumulative failed connection establishments.
+    pub failed_connections: u64,
+    /// Cumulative NAT traversal attempts / successes.
+    pub nat_traversal_attempts: u64,
+    pub nat_traversal_successes: u64,
+    /// Cumulative direct (no relay/coordinator) connections.
+    pub direct_connections: u64,
+    /// Cumulative relayed connections.
+    pub relayed_connections: u64,
+    /// Bootstrap nodes currently connected / configured.
+    pub connected_bootstrap_nodes: u64,
+    pub total_bootstrap_nodes: u64,
+    /// Average NAT coordination time, milliseconds.
+    pub average_coordination_time_ms: u64,
+}
+
+/// One x0x-visible connection entry for
+/// [`TransportDiagnosticsSnapshot::peer_entries`].
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportPeerEntry {
+    /// Peer id as hex.
+    pub peer_id: String,
+    /// Remote transport address (`ip:port`, or a scheme-prefixed constrained
+    /// transport).
+    pub remote_addr: String,
+}
+
+impl TransportDiagnosticsSnapshot {
+    fn from_parts(stats: &ant_quic::EndpointStats, conns: &[ant_quic::PeerConnection]) -> Self {
+        Self {
+            active_connections: u64::try_from(stats.active_connections).unwrap_or(u64::MAX),
+            x0x_visible_peers: u64::try_from(conns.len()).unwrap_or(u64::MAX),
+            peer_entries: conns
+                .iter()
+                .map(|c| TransportPeerEntry {
+                    peer_id: hex::encode(c.peer_id.0),
+                    remote_addr: c.remote_addr.to_string(),
+                })
+                .collect(),
+            successful_connections: stats.successful_connections,
+            failed_connections: stats.failed_connections,
+            nat_traversal_attempts: stats.nat_traversal_attempts,
+            nat_traversal_successes: stats.nat_traversal_successes,
+            direct_connections: stats.direct_connections,
+            relayed_connections: stats.relayed_connections,
+            connected_bootstrap_nodes: u64::try_from(stats.connected_bootstrap_nodes)
+                .unwrap_or(u64::MAX),
+            total_bootstrap_nodes: u64::try_from(stats.total_bootstrap_nodes).unwrap_or(u64::MAX),
+            average_coordination_time_ms: u64::try_from(
+                stats.average_coordination_time.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+        }
+    }
+}
 /// Snapshot of ant-quic → gossip receive-pump diagnostics.
 #[derive(Debug, Clone, Serialize)]
 pub struct RecvPumpDiagnosticsSnapshot {
@@ -1458,10 +1528,6 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
-    /// Per-peer in-flight send gates (#368 v2): bounded concurrent stream
-    /// opens per peer, dead-peer escalation state, proof counters. Arc so
-    /// the Clone derive shares state.
-    send_gate: Arc<PeerSendGate>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -1667,7 +1733,6 @@ impl NetworkNode {
             recv_membership_rx: Arc::new(tokio::sync::Mutex::new(recv_membership_rx)),
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
-            send_gate: Arc::new(PeerSendGate::new()),
             recv_pump_diagnostics,
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
@@ -3303,14 +3368,29 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
-    /// Snapshot of the per-peer send-gate proof counters (#368 v2).
+    /// Transport-layer diagnostics for the #368 connection-zombie hunt
+    /// (blocking variant: ant-quic exposes async `stats()`/`connected_peers()`
+    /// behind the node; spawn_blocking keeps the API handler responsive).
     ///
-    /// Exposed through `GET /diagnostics/gossip` → `send_gate`: sends
-    /// rejected at the in-flight cap, peers currently saturated, and
-    /// dead-peer closes (the soak gate asserts these stay rare).
-    #[must_use]
-    pub fn send_gate_snapshot(&self) -> SendGateSnapshot {
-        self.send_gate.snapshot()
+    /// Divergence between `active_connections` and the x0x-visible peer
+    /// count is the zombie/duplicate-connection signal: ant-quic connection
+    /// objects that x0x's peer map no longer tracks (simultaneous-open
+    /// races, redials that replace but do not close) — each pinning its
+    /// send-window and receive-assembler quota.
+    pub fn transport_diagnostics_blocking(&self) -> TransportDiagnosticsSnapshot {
+        let node = self.node.blocking_read().as_ref().cloned();
+        let Some(node) = node else {
+            return TransportDiagnosticsSnapshot::default();
+        };
+        let endpoint = node.inner_endpoint().clone();
+        // ant-quic's accessors are async; this method runs on a request
+        // handler thread, so drive them on the shared runtime handle from
+        // block_in_place (never called from within the node's own tasks).
+        let (stats, conns) = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current()
+                .block_on(async { (endpoint.stats().await, endpoint.connected_peers().await) })
+        });
+        TransportDiagnosticsSnapshot::from_parts(&stats, &conns)
     }
 
     /// Gracefully shut down the node: abort the background tasks, close all
@@ -4386,34 +4466,6 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         buf.push(stream_type.to_byte());
         buf.extend_from_slice(&data);
 
-        // #368 v2: bound the streams a stalled peer can pin by capping
-        // concurrent in-flight sends per peer — a saturated peer's send is
-        // rejected WITHOUT opening a stream, and saorsa-gossip applies its
-        // own cooldown/backoff to the error. No fixed transport timeout
-        // (the v1 lesson: undercutting sg's ADAPTIVE timeout manufactures
-        // false stalls); the send future runs under sg's outer timeout, and
-        // the permit lives inside this future so completion OR sg dropping
-        // it mid-write releases the slot. A connection close exists only
-        // for a genuinely dead peer: continuously saturated past
-        // DEAD_PEER_SATURATION_WINDOW with no completed send, rate-limited
-        // per peer — it must stay rare.
-        let _permit = self.send_gate.acquire(ant_peer.0).map_err(|()| {
-            anyhow::anyhow!("peer saturated: {MAX_INFLIGHT_SENDS_PER_PEER} sends already in flight")
-        })?;
-        if self.send_gate.should_close_dead_peer(ant_peer.0) {
-            tracing::info!(
-                peer_id = %ant_peer.0.iter().map(|b| format!("{b:02x}")).collect::<String>(),
-                "dead peer: continuously saturated past the window — closing connection"
-            );
-            if let Err(e) = self
-                .disconnect_with_reason(&ant_peer, DisconnectReason::Transport)
-                .await
-            {
-                tracing::debug!("dead-peer close failed: {e}");
-            }
-            self.send_gate.note_closed(ant_peer.0);
-        }
-
         // Send via ant-quic Node
         //
         // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
@@ -4429,7 +4481,6 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
                 .await
                 .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
         }
-        self.send_gate.note_completed(ant_peer.0);
         self.note_connection_pool_activity(ant_peer).await;
 
         debug!(

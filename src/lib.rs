@@ -2933,14 +2933,20 @@ impl Agent {
         self.network.as_ref().map(|net| net.recv_pump_diagnostics())
     }
 
-    /// Snapshot of the per-peer send-gate proof counters (#368 v2).
+    /// Transport-layer diagnostics for the #368 connection-zombie hunt.
     ///
     /// Returns `None` when this agent was built without a network node.
-    /// Exposed through `GET /diagnostics/gossip` → `send_gate` as the
-    /// proof metrics for the leak soak (see `network::send_gate`).
+    /// Exposed through `GET /diagnostics/transport`: ant-quic
+    /// `EndpointStats` (active/successful/failed connections, NAT-traversal
+    /// and relay counters) plus x0x's own connected-peer view and the
+    /// per-peer connection-entry multiplicity — the divergence between
+    /// `active_connections` and the x0x peer count is the zombie/duplicate
+    /// connection signal.
     #[must_use]
-    pub fn send_gate_diagnostics(&self) -> Option<network::SendGateSnapshot> {
-        self.network.as_ref().map(|net| net.send_gate_snapshot())
+    pub fn transport_diagnostics(&self) -> Option<network::TransportDiagnosticsSnapshot> {
+        self.network
+            .as_ref()
+            .map(|net| net.transport_diagnostics_blocking())
     }
 
     /// Get the presence system wrapper, if configured.

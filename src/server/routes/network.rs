@@ -584,7 +584,6 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
                 "recv_pump": state.agent.recv_pump_diagnostics(),
-                "send_gate": state.agent.send_gate_diagnostics(),
                 "discovery_cache_entries": {
                     "agents": agents,
                     "machines": machines,
@@ -596,6 +595,28 @@ pub(in crate::server) async fn gossip_diagnostics(
         None => api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "gossip runtime not initialized",
+        ),
+    }
+}
+
+/// GET /diagnostics/transport — transport-layer connection accounting (#368).
+///
+/// ant-quic `EndpointStats` (active/successful/failed connections, NAT
+/// traversal and relay counters) plus x0x's own connected-peer view and the
+/// per-peer connection entries. The divergence between `active_connections`
+/// and `x0x_visible_peers` is the zombie/duplicate-connection signal under
+/// investigation for the desktop memory leak.
+pub(in crate::server) async fn transport_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.agent.transport_diagnostics() {
+        Some(snap) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "transport": snap })),
+        ),
+        None => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "network node not initialized",
         ),
     }
 }
