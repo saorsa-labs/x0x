@@ -755,6 +755,17 @@ pub struct TransportDiagnosticsSnapshot {
     /// Connection-churn counters (#368 gate 2): dial direction,
     /// redials-of-connected, generation replace/close lifecycle.
     pub churn: Option<ChurnSnapshot>,
+    /// Proto-level open connection count including draining/retained
+    /// generations (ant-quic 0.27.42 `quic_open_connections`). Climbing
+    /// here while `active_connections` stays flat = proto Connections
+    /// retained per generation by a held handle — the #368 gate-4 signal.
+    pub quic_open_connections: u64,
+    /// Per-peer reader-task handles currently tracked (summed over peers).
+    pub reader_handle_count: u64,
+    /// Per-peer activity records.
+    pub peer_activity_count: u64,
+    /// Connected-peers map entries.
+    pub connected_peers_map_len: u64,
 }
 
 /// One x0x-visible connection entry for
@@ -794,6 +805,10 @@ impl TransportDiagnosticsSnapshot {
             )
             .unwrap_or(u64::MAX),
             churn: None,
+            quic_open_connections: 0,
+            reader_handle_count: 0,
+            peer_activity_count: 0,
+            connected_peers_map_len: 0,
         }
     }
 }
@@ -3404,6 +3419,15 @@ impl NetworkNode {
         let conns = endpoint.connected_peers().await;
         let mut snap = TransportDiagnosticsSnapshot::from_parts(&stats, &conns);
         snap.churn = Some(self.churn.snapshot());
+        // #368 gate 4: proto-level retention surfaces (ant-quic 0.27.42).
+        snap.quic_open_connections =
+            u64::try_from(endpoint.quic_open_connections()).unwrap_or(u64::MAX);
+        snap.reader_handle_count =
+            u64::try_from(endpoint.reader_handle_count().await).unwrap_or(u64::MAX);
+        snap.peer_activity_count =
+            u64::try_from(endpoint.peer_activity_count().await).unwrap_or(u64::MAX);
+        snap.connected_peers_map_len =
+            u64::try_from(endpoint.connected_peers_map_len().await).unwrap_or(u64::MAX);
         snap
     }
 
