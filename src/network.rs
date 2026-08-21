@@ -778,6 +778,10 @@ pub struct TransportDiagnosticsSnapshot {
     pub recv_streams_with_unread: u64,
     /// Live + draining proto connections counted by the totals above.
     pub connections_counted: u64,
+    /// #368 fix signature (ant-quic 0.27.44): connections closed by the
+    /// readerless-orphan invariant/janitor. > 0 under churn = the fix is
+    /// catching orphans instead of letting them pin datagrams.
+    pub orphan_connections_closed: u64,
 }
 
 /// One x0x-visible connection entry for
@@ -825,6 +829,7 @@ impl TransportDiagnosticsSnapshot {
             recv_buffered_bytes: 0,
             recv_streams_with_unread: 0,
             connections_counted: 0,
+            orphan_connections_closed: 0,
         }
     }
 }
@@ -3451,6 +3456,7 @@ impl NetworkNode {
         snap.recv_buffered_bytes = recv_buffered;
         snap.recv_streams_with_unread = u64::try_from(streams_unread).unwrap_or(u64::MAX);
         snap.connections_counted = u64::try_from(conns_counted).unwrap_or(u64::MAX);
+        snap.orphan_connections_closed = endpoint.orphan_connections_closed();
         snap
     }
 
