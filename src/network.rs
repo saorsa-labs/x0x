@@ -3986,9 +3986,9 @@ impl NetworkNode {
                         // tombstone in that window (the original session's
                         // inbound accept yielding before the close). Every
                         // admission side-effect re-checks; `PeerConnected`
-                        // is emitted while still holding the suppression
-                        // map so the tombstone cannot land between the
-                        // final check and the event.
+                        // and pool `note_activity` run while still holding
+                        // the suppression map so the tombstone cannot land
+                        // between the final check and either side-effect.
                         if reconnect_suppression_is_live(
                             reconnect_suppressions.as_ref(),
                             peer_conn.peer_id.0,
@@ -4028,16 +4028,16 @@ impl NetworkNode {
                         }
                         let addr =
                             addr.unwrap_or_else(|| std::net::SocketAddr::from(([0, 0, 0, 0], 0)));
-                        if !try_admit_inbound_peer_connected(
+                        let Some(evicted) = try_admit_inbound_peer(
                             reconnect_suppressions.as_ref(),
                             &event_sender,
+                            connection_pool.as_ref(),
                             peer_conn.peer_id.0,
                             addr,
-                        ) {
+                        ) else {
                             close_suppressed_inbound(node_ref, &peer_conn.peer_id).await;
                             continue;
-                        }
-                        let evicted = connection_pool.note_activity(peer_conn.peer_id);
+                        };
                         if !evicted.is_empty() {
                             disconnect_pool_candidates(
                                 node_ref,
@@ -4614,34 +4614,37 @@ async fn close_suppressed_inbound(node: &Node, peer_id: &AntPeerId) {
     }
 }
 
-/// Emit inbound [`NetworkEvent::PeerConnected`] only if `peer_id` is not
-/// suppressed, holding the suppression map across the check and the send.
+/// Admit an inbound peer only if `peer_id` is not suppressed, holding the
+/// suppression map across the liveness check, [`NetworkEvent::PeerConnected`],
+/// and connection-pool `note_activity`.
 ///
 /// A concurrent `PolicyRejection` takes the same mutex in
 /// [`NetworkNode::suppress_reconnect`]. Holding it here means the tombstone
-/// cannot land between the liveness check and the event — the accept-then-
-/// cache window that leaked admission on issue #292 invariant D.
+/// cannot land between the check and either admission side-effect — the
+/// accept-then-cache window that leaked `PeerConnected` on issue #292
+/// invariant D, and the post-emit pool update that could otherwise
+/// reinsert a just-rejected peer or LRU-evict an unrelated one.
 ///
-/// Returns `true` when the event was emitted (caller may touch the
-/// connection pool). Returns `false` when a live tombstone exists: caller
-/// must close with [`close_suppressed_inbound`] and skip every other
-/// admission side-effect.
+/// Returns `Some(evicted)` when admitted (caller disconnects LRU victims).
+/// Returns `None` when a live tombstone exists: caller must close with
+/// [`close_suppressed_inbound`] and skip every other admission side-effect.
 #[must_use]
-fn try_admit_inbound_peer_connected(
+fn try_admit_inbound_peer(
     map: &Mutex<HashMap<[u8; 32], ReconnectSuppression>>,
     event_sender: &broadcast::Sender<NetworkEvent>,
+    connection_pool: &ConnectionPool,
     peer_id: [u8; 32],
     address: SocketAddr,
-) -> bool {
+) -> Option<Vec<AntPeerId>> {
     let mut map = match map.lock() {
         Ok(m) => m,
         Err(poisoned) => poisoned.into_inner(),
     };
     if reconnect_suppression_is_live_locked(&mut map, peer_id) {
-        return false;
+        return None;
     }
     let _ = event_sender.send(NetworkEvent::PeerConnected { peer_id, address });
-    true
+    Some(connection_pool.note_activity(ant_quic::PeerId(peer_id)))
 }
 
 /// Events emitted by the network node.
@@ -4736,15 +4739,21 @@ mod tests {
             },
         )]));
         let (tx, mut rx) = broadcast::channel(16);
+        let pool = ConnectionPool::new(8, Duration::from_secs(300));
         let addr = "127.0.0.1:1".parse().unwrap();
 
         assert!(
-            !try_admit_inbound_peer_connected(&map, &tx, [1u8; 32], addr),
+            try_admit_inbound_peer(&map, &tx, &pool, [1u8; 32], addr).is_none(),
             "a live PolicyRejection tombstone must refuse inbound admit"
         );
         assert!(
             rx.try_recv().is_err(),
             "refusing inbound admit must not emit PeerConnected"
+        );
+        assert_eq!(
+            pool.snapshot().active_count,
+            0,
+            "refusing inbound admit must not record pool activity"
         );
         assert!(
             reconnect_suppression_is_live(&map, [1u8; 32]),
@@ -4758,11 +4767,14 @@ mod tests {
     fn inbound_admit_emits_peer_connected_when_peer_is_unsuppressed() {
         let map = Mutex::new(HashMap::new());
         let (tx, mut rx) = broadcast::channel(16);
+        let pool = ConnectionPool::new(8, Duration::from_secs(300));
         let addr = "127.0.0.1:2".parse().unwrap();
 
+        let evicted = try_admit_inbound_peer(&map, &tx, &pool, [2u8; 32], addr)
+            .expect("an unsuppressed inbound peer must admit");
         assert!(
-            try_admit_inbound_peer_connected(&map, &tx, [2u8; 32], addr),
-            "an unsuppressed inbound peer must admit"
+            evicted.is_empty(),
+            "a single admit under cap must not LRU-evict"
         );
         match rx.try_recv() {
             Ok(NetworkEvent::PeerConnected { peer_id, address }) => {
@@ -4771,6 +4783,11 @@ mod tests {
             }
             other => panic!("expected PeerConnected, got {other:?}"),
         }
+        assert_eq!(
+            pool.snapshot().active_count,
+            1,
+            "an admitted inbound peer must enter the connection pool"
+        );
     }
 
     #[tokio::test]
