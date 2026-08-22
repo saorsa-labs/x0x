@@ -4,8 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.2] - 2026-08-22
+
 ### Fixed
 
+- **Desktop/NAT'd daemons no longer leak ~1 GB/h of RSS (issue #368; ant-quic
+  0.27.44).** An ant-quic connection left open with no reader task retained every
+  inbound stream chunk in its receive assembler — pinning whole datagrams, up to
+  the 16 MiB window per connection, for as long as the remote kept the connection
+  alive. Orphans were created on reader exit in the `Closing`/`Closed` lifecycle
+  arms and by re-promoting readerless superseded survivors; connection churn
+  (NAT'd peers redialling, peers dying without close) manufactured them, which is
+  why desktops bled ~1 GB/h while public VPS nodes trickled ~50 MB/h on the same
+  code. ant-quic 0.27.44 enforces "no reader ⇒ close" at promotion and reader
+  exit, with a 5 s janitor backstop. Proven with an identical LAN-churn run before
+  and after: the pinned-datagram heap signature (1.25 KB + 48 B classes climbing
+  1:1) is gone and unread streams drain. This was also the terminal cause of the
+  studio "UDP black-hole" (#312). Residual reader-throughput sawtooth tracked in #378.
 - **Inbound accept no longer emits `PeerConnected` after a suppression
   tombstone lands (issue #292 invariant D).** `accept()` can yield before
   `PolicyRejection` and then await cache bookkeeping; the admit path now
@@ -14,6 +29,21 @@ All notable changes to this project will be documented in this file.
   concurrent reject cannot sneak into that window. The refuse path still
   uses a plain transport close (no `suppress_reconnect`, invariant F).
   `is_connected` stays transport-only.
+
+### Added
+
+- **`GET /diagnostics/transport` and `x0x diagnostics transport` (#373).**
+  ant-quic connection accounting: active vs proto-open connections, successful /
+  failed / inbound / outbound / replaced generations, buffered send/receive bytes,
+  unread streams, and `orphan_connections_closed` — the #368 janitor signature.
+- **Shutdown watchdog (#371 interim).** `x0xd` force-exits 5 s after SIGTERM if the
+  runtime does not wind down (the saorsa-gossip IHAVE flusher has no shutdown
+  handle — saorsa-gossip #42 tracks the proper fix).
+
+### Dependencies
+
+- **ant-quic 0.27.41 → 0.27.44.** 0.27.42/0.27.43 add `#[doc(hidden)]`
+  connection-accounting and buffered-bytes accessors; 0.27.44 is the #368 fix.
 
 ## [v0.39.1] - 2026-08-21
 
