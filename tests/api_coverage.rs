@@ -90,6 +90,11 @@ const COVERED: &[CoveredEndpoint] = &[
         "/diagnostics/gossip",
         "/diagnostics/gossip endpoint proves"
     ),
+    covered!(
+        Get,
+        "/diagnostics/transport",
+        daemon_api_diagnostics_transport
+    ),
     covered!(Get, "/diagnostics/dm", daemon_api_diagnostics_dm),
     covered!(
         Get,

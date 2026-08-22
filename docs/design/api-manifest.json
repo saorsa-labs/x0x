@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 148,
+  "endpoint_count": 149,
   "endpoints": [
     {
       "category": "status",
@@ -182,6 +182,13 @@
       "description": "PubSub drop-detection counters (publish/deliver deltas)",
       "method": "GET",
       "path": "/diagnostics/gossip"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics transport",
+      "description": "Transport connection accounting (zombie-connection hunt, #368)",
+      "method": "GET",
+      "path": "/diagnostics/transport"
     },
     {
       "category": "network",

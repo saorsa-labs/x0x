@@ -599,6 +599,28 @@ pub(in crate::server) async fn gossip_diagnostics(
     }
 }
 
+/// GET /diagnostics/transport — transport-layer connection accounting (#368).
+///
+/// ant-quic `EndpointStats` (active/successful/failed connections, NAT
+/// traversal and relay counters) plus x0x's own connected-peer view and the
+/// per-peer connection entries. The divergence between `active_connections`
+/// and `x0x_visible_peers` is the zombie/duplicate-connection signal under
+/// investigation for the desktop memory leak.
+pub(in crate::server) async fn transport_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    match state.agent.transport_diagnostics().await {
+        Some(snap) => (
+            StatusCode::OK,
+            Json(serde_json::json!({ "ok": true, "transport": snap })),
+        ),
+        None => api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "network node not initialized",
+        ),
+    }
+}
+
 /// GET /diagnostics/groups — per-group ingest diagnostics.
 ///
 /// Mirrors `/diagnostics/dm` and `/diagnostics/exec`. For each
@@ -608,7 +630,6 @@ pub(in crate::server) async fn gossip_diagnostics(
 ///
 /// `messages_dropped_write_policy_violation` is the receiver-side canary
 /// for the join-roster-propagation regression: a non-zero value on the
-/// owner side means joiners' messages are reaching the listener but
 /// `members_v2` is stale.
 ///
 /// `sends_rejected_write_policy` is tracked separately and counts this

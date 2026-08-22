@@ -23,6 +23,11 @@
 //! - `170.64.176.102` - Sydney, AU (DigitalOcean)
 
 use crate::error::{NetworkError, NetworkResult};
+
+mod churn;
+use self::churn::ChurnCounters;
+pub use self::churn::ChurnSnapshot;
+
 use ant_quic::{bootstrap_cache::PeerCapabilities, Node, NodeConfig, TransportAddr};
 use bytes::Bytes;
 use saorsa_gossip_transport::GossipStreamType;
@@ -715,6 +720,119 @@ pub struct RecvPumpPeerSnapshot {
     pub bulk_dropped_full: u64,
 }
 
+/// Transport-layer diagnostics snapshot for the #368 connection-zombie hunt.
+///
+/// The load-bearing signal is `active_connections` (ant-quic's live QUIC
+/// connection objects) versus `x0x_visible_peers` (peers x0x's map still
+/// tracks): the gap is zombie/duplicate connections that nothing reaps,
+/// each pinning its 16 MiB receive-window quota and send-window state.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TransportDiagnosticsSnapshot {
+    /// Live ant-quic connection objects (includes any x0x has lost track of).
+    pub active_connections: u64,
+    /// Distinct peers x0x still tracks as connected.
+    pub x0x_visible_peers: u64,
+    /// Per-peer connection entries as x0x/ant-quic track them
+    /// (peer id hex, remote address) — same peer appearing under multiple
+    /// addresses is the duplicate/replacement signature.
+    pub peer_entries: Vec<TransportPeerEntry>,
+    /// Cumulative successful connection establishments.
+    pub successful_connections: u64,
+    /// Cumulative failed connection establishments.
+    pub failed_connections: u64,
+    /// Cumulative NAT traversal attempts / successes.
+    pub nat_traversal_attempts: u64,
+    pub nat_traversal_successes: u64,
+    /// Cumulative direct (no relay/coordinator) connections.
+    pub direct_connections: u64,
+    /// Cumulative relayed connections.
+    pub relayed_connections: u64,
+    /// Bootstrap nodes currently connected / configured.
+    pub connected_bootstrap_nodes: u64,
+    pub total_bootstrap_nodes: u64,
+    /// Average NAT coordination time, milliseconds.
+    pub average_coordination_time_ms: u64,
+    /// Connection-churn counters (#368 gate 2): dial direction,
+    /// redials-of-connected, generation replace/close lifecycle.
+    pub churn: Option<ChurnSnapshot>,
+    /// Proto-level open connection count including draining/retained
+    /// generations (ant-quic 0.27.42 `quic_open_connections`). Climbing
+    /// here while `active_connections` stays flat = proto Connections
+    /// retained per generation by a held handle — the #368 gate-4 signal.
+    pub quic_open_connections: u64,
+    /// Per-peer reader-task handles currently tracked (summed over peers).
+    pub reader_handle_count: u64,
+    /// Per-peer activity records.
+    pub peer_activity_count: u64,
+    /// Connected-peers map entries.
+    pub connected_peers_map_len: u64,
+    /// Proto-level buffered bytes summed over every live + draining
+    /// connection (#368 gate 5). `send_unacked`+`recv_buffered` tracking
+    /// RSS growth = quinn buffers on live/draining connections (fix:
+    /// reader/recv-pump back-pressure, drain speed, windows); flat+tiny =
+    /// residue outside quinn.
+    pub send_unacked_bytes: u64,
+    /// Receive-side assembler backlog summed over open recv streams.
+    pub recv_buffered_bytes: u64,
+    /// Open receive streams currently holding unread buffered bytes.
+    pub recv_streams_with_unread: u64,
+    /// Live + draining proto connections counted by the totals above.
+    pub connections_counted: u64,
+    /// #368 fix signature (ant-quic 0.27.44): connections closed by the
+    /// readerless-orphan invariant/janitor. > 0 under churn = the fix is
+    /// catching orphans instead of letting them pin datagrams.
+    pub orphan_connections_closed: u64,
+}
+
+/// One x0x-visible connection entry for
+/// [`TransportDiagnosticsSnapshot::peer_entries`].
+#[derive(Debug, Clone, Serialize)]
+pub struct TransportPeerEntry {
+    /// Peer id as hex.
+    pub peer_id: String,
+    /// Remote transport address (`ip:port`, or a scheme-prefixed constrained
+    /// transport).
+    pub remote_addr: String,
+}
+
+impl TransportDiagnosticsSnapshot {
+    fn from_parts(stats: &ant_quic::EndpointStats, conns: &[ant_quic::PeerConnection]) -> Self {
+        Self {
+            active_connections: u64::try_from(stats.active_connections).unwrap_or(u64::MAX),
+            x0x_visible_peers: u64::try_from(conns.len()).unwrap_or(u64::MAX),
+            peer_entries: conns
+                .iter()
+                .map(|c| TransportPeerEntry {
+                    peer_id: hex::encode(c.peer_id.0),
+                    remote_addr: c.remote_addr.to_string(),
+                })
+                .collect(),
+            successful_connections: stats.successful_connections,
+            failed_connections: stats.failed_connections,
+            nat_traversal_attempts: stats.nat_traversal_attempts,
+            nat_traversal_successes: stats.nat_traversal_successes,
+            direct_connections: stats.direct_connections,
+            relayed_connections: stats.relayed_connections,
+            connected_bootstrap_nodes: u64::try_from(stats.connected_bootstrap_nodes)
+                .unwrap_or(u64::MAX),
+            total_bootstrap_nodes: u64::try_from(stats.total_bootstrap_nodes).unwrap_or(u64::MAX),
+            average_coordination_time_ms: u64::try_from(
+                stats.average_coordination_time.as_millis(),
+            )
+            .unwrap_or(u64::MAX),
+            churn: None,
+            quic_open_connections: 0,
+            reader_handle_count: 0,
+            peer_activity_count: 0,
+            connected_peers_map_len: 0,
+            send_unacked_bytes: 0,
+            recv_buffered_bytes: 0,
+            recv_streams_with_unread: 0,
+            connections_counted: 0,
+            orphan_connections_closed: 0,
+        }
+    }
+}
 /// Snapshot of ant-quic → gossip receive-pump diagnostics.
 #[derive(Debug, Clone, Serialize)]
 pub struct RecvPumpDiagnosticsSnapshot {
@@ -1454,6 +1572,9 @@ pub struct NetworkNode {
     recv_bulk_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<GossipPayload>>>,
     /// Diagnostics for the ant-quic → gossip receive pump.
     recv_pump_diagnostics: Arc<RecvPumpDiagnostics>,
+    /// Connection-churn observation counters (#368 gate 2). Arc so the
+    /// Clone derive shares state; fed by the spawn_observer task.
+    churn: Arc<ChurnCounters>,
     /// Receiver channel for direct messages (separate from gossip).
     direct_tx: mpsc::Sender<(AntPeerId, Bytes)>,
     direct_rx: Arc<tokio::sync::Mutex<mpsc::Receiver<(AntPeerId, Bytes)>>>,
@@ -1660,6 +1781,7 @@ impl NetworkNode {
             recv_bulk_tx,
             recv_bulk_rx: Arc::new(tokio::sync::Mutex::new(recv_bulk_rx)),
             recv_pump_diagnostics,
+            churn: Arc::new(ChurnCounters::default()),
             direct_tx,
             direct_rx: Arc::new(tokio::sync::Mutex::new(direct_rx)),
             relayed_dm_tx,
@@ -1692,6 +1814,13 @@ impl NetworkNode {
                     .into_inner()
                     .extend([receiver, accept, eviction, plane_gatekeeper])
             }
+        }
+
+        // #368 gate 2: pure-observation churn counters over ant-quic's
+        // event streams (connect direction, redials-of-connected,
+        // generation replace/close lifecycle). Zero behaviour change.
+        if let Some(node) = network_node.node.read().await.as_ref() {
+            Arc::clone(&network_node.churn).spawn_observer(node);
         }
 
         Ok(network_node)
@@ -3294,6 +3423,43 @@ impl NetworkNode {
         self.recv_pump_diagnostics.snapshot()
     }
 
+    /// Transport-layer diagnostics for the #368 connection-zombie hunt.
+    ///
+    /// Divergence between `active_connections` and the x0x-visible peer
+    /// count is the zombie/duplicate-connection signal: ant-quic connection
+    /// objects that x0x's peer map no longer tracks (simultaneous-open
+    /// races, redials that replace but do not close) — each pinning its
+    /// send-window and receive-assembler quota.
+    pub async fn transport_diagnostics(&self) -> TransportDiagnosticsSnapshot {
+        let node = self.node.read().await.as_ref().cloned();
+        let Some(node) = node else {
+            return TransportDiagnosticsSnapshot::default();
+        };
+        let endpoint = node.inner_endpoint();
+        let stats = endpoint.stats().await;
+        let conns = endpoint.connected_peers().await;
+        let mut snap = TransportDiagnosticsSnapshot::from_parts(&stats, &conns);
+        snap.churn = Some(self.churn.snapshot());
+        // #368 gate 4: proto-level retention surfaces (ant-quic 0.27.42).
+        snap.quic_open_connections =
+            u64::try_from(endpoint.quic_open_connections()).unwrap_or(u64::MAX);
+        snap.reader_handle_count =
+            u64::try_from(endpoint.reader_handle_count().await).unwrap_or(u64::MAX);
+        snap.peer_activity_count =
+            u64::try_from(endpoint.peer_activity_count().await).unwrap_or(u64::MAX);
+        snap.connected_peers_map_len =
+            u64::try_from(endpoint.connected_peers_map_len().await).unwrap_or(u64::MAX);
+        // #368 gate 5: buffered-bytes totals over live + draining conns.
+        let (send_unacked, recv_buffered, streams_unread, conns_counted) =
+            endpoint.buffered_bytes_totals();
+        snap.send_unacked_bytes = send_unacked;
+        snap.recv_buffered_bytes = recv_buffered;
+        snap.recv_streams_with_unread = u64::try_from(streams_unread).unwrap_or(u64::MAX);
+        snap.connections_counted = u64::try_from(conns_counted).unwrap_or(u64::MAX);
+        snap.orphan_connections_closed = endpoint.orphan_connections_closed();
+        snap
+    }
+
     /// Gracefully shut down the node: abort the background tasks, close all
     /// connections, and shut down the ant-quic node.
     ///
@@ -4390,15 +4556,16 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // Do not run `ensure_peer_send_ready` here. Saorsa-gossip wraps
         // per-peer sends in a small timeout; a multi-second liveness repair on
         // this path turns healthy gossip degradation into a timeout/log storm.
-        let node_guard = self.node.read().await;
-        let node = node_guard
-            .as_ref()
-            .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
+        {
+            let node_guard = self.node.read().await;
+            let node = node_guard
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("node not initialized"))?;
 
-        node.send(&ant_peer, &buf)
-            .await
-            .map_err(|e| anyhow::anyhow!("send failed: {}", e))?;
-        drop(node_guard);
+            node.send(&ant_peer, &buf)
+                .await
+                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+        }
         self.note_connection_pool_activity(ant_peer).await;
 
         debug!(

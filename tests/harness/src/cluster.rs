@@ -32,6 +32,18 @@ impl AgentInstance {
         &self.data_dir
     }
 
+    /// PID of the daemon child process (black-hole / signal tests, #368).
+    pub fn pid(&self) -> u32 {
+        self.process.id()
+    }
+
+    /// Poll the daemon's exit status. Reaps the child when it has exited,
+    /// so callers must NOT use `kill -0` style liveness checks on the PID
+    /// (an unreaped child stays a zombie and `kill -0` keeps succeeding).
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.process.try_wait()
+    }
+
     pub fn directory_subscriptions_path(&self) -> PathBuf {
         self.data_dir.join("directory-subscriptions.json")
     }

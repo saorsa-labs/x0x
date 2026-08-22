@@ -2933,11 +2933,21 @@ impl Agent {
         self.network.as_ref().map(|net| net.recv_pump_diagnostics())
     }
 
-    /// Get the presence system wrapper, if configured.
+    /// Transport-layer diagnostics for the #368 connection-zombie hunt.
     ///
-    /// Returns `None` if this agent was built without a network config.
-    /// The presence wrapper provides beacon broadcasting, FOAF discovery,
-    /// and online/offline event subscriptions.
+    /// Returns `None` when this agent was built without a network node.
+    /// Exposed through `GET /diagnostics/transport`: ant-quic
+    /// `EndpointStats` (active/successful/failed connections, NAT-traversal
+    /// and relay counters) plus x0x's own connected-peer view and the
+    /// per-peer connection-entry multiplicity — the divergence between
+    /// `active_connections` and the x0x peer count is the zombie/duplicate
+    /// connection signal.
+    pub async fn transport_diagnostics(&self) -> Option<network::TransportDiagnosticsSnapshot> {
+        match self.network.as_ref() {
+            Some(net) => Some(net.transport_diagnostics().await),
+            None => None,
+        }
+    }
     #[must_use]
     pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
         self.presence.as_ref()

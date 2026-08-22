@@ -358,6 +358,26 @@ async fn main() -> anyhow::Result<()> {
             }
         });
     }
+
+    // #368/#371: bounded shutdown. saorsa-gossip 0.5.71's IHAVE flusher is a
+    // detached loop with no shutdown handle; once the node is torn down its
+    // sends fail ("node not initialized") but the flusher keeps iterating —
+    // observed as a 100%-CPU, allocation-growing livelock that prevented
+    // SIGTERM exit for 13+ minutes. Graceful teardown still gets its window
+    // (peer-cache flush, connection closes); past the deadline the daemon
+    // exits so the operator-visible contract holds: x0xd terminates within
+    // SHUTDOWN_EXIT_DEADLINE of the first shutdown signal. The in-crate
+    // flusher fix (select on a shutdown token) lands with saorsa-gossip.
+    const SHUTDOWN_EXIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(5);
+    {
+        let cancel = handle.cancellation_token();
+        tokio::spawn(async move {
+            cancel.cancelled().await;
+            tokio::time::sleep(SHUTDOWN_EXIT_DEADLINE).await;
+            eprintln!("x0xd: graceful shutdown exceeded {SHUTDOWN_EXIT_DEADLINE:?}; forcing exit");
+            std::process::exit(0);
+        });
+    }
     handle.wait().await
 }
 

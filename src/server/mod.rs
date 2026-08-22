@@ -69,12 +69,12 @@ use routes::{
     send_group_public_message, set_group_display_name, shutdown_handler,
     spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
-    store_named_group_info, streams_diagnostics, subscribe, unban_group_member, unpin_machine,
-    unsubscribe, update_contact, update_group_policy, update_member_role, update_named_group,
-    update_task, withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
-    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
-    PublicGroupBootstrap, SelfPublishedReleaseManifests, TreeKemCatchupRequest,
-    TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
+    unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
+    update_member_role, update_named_group, update_task, withdraw_group_state, AtomicWriteOutcome,
+    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
+    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
+    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
@@ -1585,6 +1585,7 @@ pub async fn serve_with_options(
         .route("/history/stats", get(history_stats))
         .route("/diagnostics/ack", get(ack_diagnostics))
         .route("/diagnostics/gossip", get(gossip_diagnostics))
+        .route("/diagnostics/transport", get(transport_diagnostics))
         .route("/diagnostics/dm", get(dm_diagnostics))
         .route("/diagnostics/groups", get(groups_diagnostics))
         .route("/diagnostics/exec", get(exec_diagnostics))
