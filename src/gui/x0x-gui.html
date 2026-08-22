@@ -3059,6 +3059,16 @@ function renderNetwork(){
     </div>
     <div id="g-note" style="margin-top:var(--sp2);color:var(--tx2);font-size:11px"></div>
   </div>
+  <div class="card mb2" id="n-transport-card" style="font-size:12px">
+    <div class="grid g2" style="gap:var(--sp3)">
+      <div><span class="k">QUIC open</span>: <span id="t-open" class="v">—</span></div>
+      <div><span class="k">Active conns</span>: <span id="t-active" class="v">—</span></div>
+      <div><span class="k">x0x peers</span>: <span id="t-x0x" class="v">—</span></div>
+      <div><span class="k">Orphan closes</span>: <span id="t-orphan" class="v">—</span></div>
+      <div><span class="k">Send unacked (B)</span>: <span id="t-sunack" class="v">—</span></div>
+      <div><span class="k">Recv buffered (B)</span>: <span id="t-rbuf" class="v">—</span></div>
+    </div>
+  </div>
   <h3>Subsystem Diagnostics</h3>
   <div class="grid g2 mb2" style="gap:var(--sp3)">
     <div class="card">
@@ -3292,6 +3302,17 @@ async function pollNetworkView(){
     if(el)el.textContent='Cached peers: '+(c.cached_peers||0);
   }
   // Gossip pipeline drop-detection counters (release 0.18.0+).
+  const gt=await api('/diagnostics/transport');
+  if(gt&&gt.ok){
+    const t=gt.transport||{};
+    const sg=id=>document.getElementById(id);
+    if(sg('t-open'))sg('t-open').textContent=t.quic_open_connections??'—';
+    if(sg('t-active'))sg('t-active').textContent=t.active_connections??'—';
+    if(sg('t-x0x'))sg('t-x0x').textContent=t.x0x_visible_peers??'—';
+    if(sg('t-orphan'))sg('t-orphan').textContent=t.orphan_connections_closed??'—';
+    if(sg('t-sunack'))sg('t-sunack').textContent=t.send_unacked_bytes??'—';
+    if(sg('t-rbuf'))sg('t-rbuf').textContent=t.recv_buffered_bytes??'—';
+  }
   const gg=await api('/diagnostics/gossip');
   if(gg&&gg.ok&&gg.stats){
     const s=gg.stats;

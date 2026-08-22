@@ -50,6 +50,7 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters |
 | GET | `/diagnostics/dm` | `x0x diagnostics dm` | DM send/receive counters, per-peer health, and last durable-send stage timers |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters and drop buckets |
+| GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting: active conns, x0x peers, churn lifecycle, orphan closes, buffered bytes (#368) |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote-exec counters, warnings, ACL summary |
 | POST | `/peers/:peer_id/probe` | `x0x peer probe` | Active liveness + RTT probe (ant-quic) |
 | GET | `/peers/:peer_id/health` | `x0x peer health` | Connection health snapshot |
