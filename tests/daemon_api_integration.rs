@@ -2357,6 +2357,32 @@ async fn daemon_api_diagnostics_connectivity() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_diagnostics_transport() {
+    // #368: transport connection accounting — endpoint stats, x0x peer
+    // view, churn lifecycle counters, proto retention surfaces.
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/transport"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    let t = &r["transport"];
+    assert!(t["active_connections"].is_u64());
+    assert!(t["x0x_visible_peers"].is_u64());
+    assert!(t["quic_open_connections"].is_u64());
+    assert!(t["connections_counted"].is_u64());
+    assert!(t["orphan_connections_closed"].is_u64());
+    assert!(t["peer_entries"].is_array());
+    assert!(t["churn"].is_object());
+    assert!(t["churn"]["generations_closed"].is_u64());
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_ack() {
     let d = daemon().await;
     let r: Value = ca(&d)
