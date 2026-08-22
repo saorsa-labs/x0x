@@ -130,6 +130,11 @@ pub async fn diagnostics_groups(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/groups").await
 }
 
+/// `x0x diagnostics transport` — GET /diagnostics/transport (#368).
+pub async fn diagnostics_transport(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/transport").await
+}
+
 /// `x0x diagnostics ws` — GET /diagnostics/ws
 ///
 /// WebSocket outbound-queue health: capacity and drop/slow-consumer-close

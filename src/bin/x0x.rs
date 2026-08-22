@@ -462,6 +462,9 @@ enum DiagnosticsSub {
     Ws,
     /// Print durable-history writer/reaper counters (ADR-0023).
     History,
+    /// Print transport connection accounting: endpoint stats, x0x peer
+    /// view, churn lifecycle counters, and proto-retention surfaces (#368).
+    Transport,
 }
 
 /// History sub-actions (`x0x history …`, ADR-0023).
@@ -1524,6 +1527,7 @@ async fn run(
             DiagnosticsSub::Connect => commands::network::diagnostics_connect(&client).await,
             DiagnosticsSub::Ws => commands::network::diagnostics_ws(&client).await,
             DiagnosticsSub::History => commands::history::diagnostics(&client).await,
+            DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
         },
         Commands::History { sub } => match sub {
             HistorySub::List {
