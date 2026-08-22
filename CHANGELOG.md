@@ -4,6 +4,26 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.3] - 2026-08-22
+
+### Added
+
+- **GUI: transport connection-accounting card** on the embedded dashboard
+  (QUIC open / active connections / x0x peers / orphan closes / send-unacked /
+  recv-buffered bytes), fed live from `GET /diagnostics/transport` (#368, #381).
+
+### Docs
+
+- `docs/api.md` and `docs/api-reference.md` now list `GET /diagnostics/transport`,
+  closing the registry↔docs parity gap left by v0.39.2 (#381).
+
+### Known issues
+
+- Durable (ADR-0030 default) direct sends can fail with `504 budget_stage=publish_ms`
+  or a false `409 recipient_ack_semantics_unavailable` between directly connected
+  desktops when the gossip plane is in a GRAFT/PRUNE storm; `--no-durable-ack`
+  (raw QUIC) is unaffected. Tracked in #380.
+
 ## [v0.39.2] - 2026-08-22
 
 ### Fixed
