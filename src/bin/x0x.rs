@@ -450,6 +450,8 @@ enum DiagnosticsSub {
     Ack,
     /// Print PubSub drop-detection counters (publish/deliver deltas).
     Gossip,
+    /// Print transport connection accounting (open/active/orphaned connections, #368).
+    Transport,
     /// Print direct-message counters, fan-out health, and per-peer state.
     Dm,
     /// Print per-group ingest counters and drop-reason buckets.
@@ -1518,6 +1520,7 @@ async fn run(
             }
             DiagnosticsSub::Ack => commands::network::diagnostics_ack(&client).await,
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
+            DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,

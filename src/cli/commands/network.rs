@@ -104,6 +104,15 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/gossip").await
 }
 
+/// `x0x diagnostics transport` — GET /diagnostics/transport
+///
+/// Prints ant-quic connection accounting: active vs proto-open connections,
+/// buffered bytes, unread streams, and `orphan_connections_closed` (the
+/// readerless-connection janitor signature from issue #368).
+pub async fn diagnostics_transport(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/transport").await
+}
+
 /// `x0x diagnostics dm` — GET /diagnostics/dm
 ///
 /// Prints direct-message send/receive counters, subscriber fan-out health, and
