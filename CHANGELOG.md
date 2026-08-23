@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.4] - 2026-08-23
+
 ### Fixed
 
 - **tests/e2e_full_audit.sh modernised to the current API contract** (#383):
