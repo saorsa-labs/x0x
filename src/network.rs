@@ -1408,6 +1408,88 @@ enum ForwardGossipOutcome {
     Shed,
 }
 
+/// #378 fix D: byte-capped spill forwarder for DM-class events.
+///
+/// The single global `spawn_receiver` task must never `send().await` a full
+/// bounded channel — that head-of-line stalls ingest for every class at once
+/// (the measured failure: a slow DM consumer froze PubSub/membership drain,
+/// which backed up ant-quic's `data_tx`, which stalled every per-connection
+/// reader). DMs are lossless (ADR 0030 durable retries make drops recoverable
+/// but expensive), so instead of dropping on full we spill into an unbounded
+/// queue drained by a dedicated task that alone absorbs the bounded channel's
+/// backpressure. The spill is byte-capped: beyond `max_bytes` the *incoming*
+/// message is dropped with a loud rate-limited warning and a counter — at that
+/// point the consumer has been wedged long enough that unbounded queueing
+/// would only convert an incident into an OOM.
+struct DmSpillForwarder<T> {
+    tx: mpsc::UnboundedSender<(usize, T)>,
+    queued_bytes: Arc<std::sync::atomic::AtomicUsize>,
+    dropped_over_cap: Arc<std::sync::atomic::AtomicU64>,
+    max_bytes: usize,
+    name: &'static str,
+}
+
+impl<T: Send + 'static> DmSpillForwarder<T> {
+    fn spawn(out: mpsc::Sender<T>, name: &'static str, max_bytes: usize) -> Self {
+        let (tx, mut rx) = mpsc::unbounded_channel::<(usize, T)>();
+        let queued_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let dropped_over_cap = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let queued_for_task = Arc::clone(&queued_bytes);
+        tokio::spawn(async move {
+            while let Some((size, event)) = rx.recv().await {
+                queued_for_task.fetch_sub(size, std::sync::atomic::Ordering::Relaxed);
+                // Blocking here is the point: only this task waits on the
+                // bounded consumer channel; the global receive pump never does.
+                if out.send(event).await.is_err() {
+                    debug!("DM spill forwarder: downstream channel closed, exiting");
+                    break;
+                }
+            }
+        });
+        Self {
+            tx,
+            queued_bytes,
+            dropped_over_cap,
+            max_bytes,
+            name,
+        }
+    }
+
+    /// Non-blocking enqueue. Returns `false` only when the downstream task is
+    /// gone (channel closed) — the caller treats that like the old fatal path.
+    fn forward(&self, event: T, size: usize) -> bool {
+        let queued = self.queued_bytes.load(std::sync::atomic::Ordering::Relaxed);
+        if queued.saturating_add(size) > self.max_bytes {
+            let dropped = self
+                .dropped_over_cap
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                + 1;
+            if channel_drop_warn_limiter().should_emit(
+                channel_pressure_key(self.name, None),
+                Instant::now(),
+                CHANNEL_PRESSURE_INFO_INTERVAL,
+            ) {
+                warn!(
+                    channel = self.name,
+                    queued_bytes = queued,
+                    max_bytes = self.max_bytes,
+                    dropped_over_cap = dropped,
+                    "[1/6 network] DM spill queue over byte cap; dropping incoming \
+                     message (durable senders retry; rate-limited)"
+                );
+            }
+            return true;
+        }
+        self.queued_bytes
+            .fetch_add(size, std::sync::atomic::Ordering::Relaxed);
+        self.tx.send((size, event)).is_ok()
+    }
+}
+
+/// Byte cap for each DM spill queue (#378 fix D). Sized to absorb a full
+/// 16 MiB direct-message plus sustained burst without risking process memory.
+const DM_SPILL_MAX_BYTES: usize = 64 * 1024 * 1024;
+
 async fn forward_gossip_payload(
     tx: &mpsc::Sender<GossipPayload>,
     peer_id: AntPeerId,
@@ -1425,6 +1507,12 @@ async fn forward_gossip_payload(
         enqueued_at: Instant::now(),
     };
 
+    // #378 fix D: NO gossip class may block the single global receive pump.
+    // PubSub keeps its shed-priority policy; Membership/Bulk (SWIM, anti-entropy
+    // — epidemic protocols that retransmit) fall through to the same try_send
+    // tail below, recording `dropped_full` instead of stalling every other
+    // class behind one full channel. Direct/relayed DM never reach this
+    // function (they have a lossless spill forwarder in `spawn_receiver`).
     if stream_type == GossipStreamType::PubSub {
         // ADR 0010: under near-overload (>90% full, available < max/10), proactively shed
         // recoverable control frames (IHAVE/IWANT/AntiEntropy) so the last
@@ -1489,14 +1577,39 @@ async fn forward_gossip_payload(
         };
     }
 
-    match tx.send(message).await {
+    match tx.try_send(message) {
         Ok(()) => {
             diagnostics.record_enqueued(stream_type, channel_depth(tx), max);
             Ok(ForwardGossipOutcome::Enqueued)
         }
-        Err(e) => {
+        Err(mpsc::error::TrySendError::Full(_message)) => {
+            // A full Membership/Bulk channel previously blocked the global
+            // receive pump here (`send().await`), head-of-line stalling DM and
+            // PubSub ingest for the whole process (#378 fix D). SWIM and
+            // anti-entropy are retransmitting epidemic protocols: dropping
+            // under sustained overload is recoverable; stalling ingest is not.
+            let depth = channel_depth(tx);
+            diagnostics.record_dropped_full(peer_id, stream_type, depth, max);
+            if channel_drop_warn_limiter().should_emit(
+                channel_pressure_key(channel_name, Some(stream_type)),
+                Instant::now(),
+                CHANNEL_PRESSURE_INFO_INTERVAL,
+            ) {
+                warn!(
+                    peer = %crate::logging::LogTransportPeerId::from(&peer_id),
+                    stream = ?stream_type,
+                    channel = channel_name,
+                    depth,
+                    max,
+                    "[1/6 network] dropping gossip frame because receive forward channel is full \
+                     (rate-limited; see recv_pump.*.dropped_full; protocol retransmits)"
+                );
+            }
+            Ok(ForwardGossipOutcome::DroppedFull)
+        }
+        Err(mpsc::error::TrySendError::Closed(message)) => {
             diagnostics.record_dropped_closed(stream_type, channel_depth(tx), max);
-            Err(e)
+            Err(mpsc::error::SendError(message))
         }
     }
 }
@@ -1694,10 +1807,15 @@ impl NetworkNode {
             // The X0X-0063 soak that justified 50_000 measured data_tx slot
             // saturation (~67 events/s × ≤2.5 s hold ≈ hundreds concurrent),
             // which bounds *our outbound* sends against the PEER's limit —
-            // not what we must advertise inbound. 4_096 keeps >4× headroom
-            // over that observed concurrency at 1/12 the per-connection
-            // memory (~130 KB).
-            .max_concurrent_uni_streams(4_096);
+            // not what we must advertise inbound. #378 fix B: the advertised
+            // stream budget is the receiver's ingest-backpressure valve
+            // (quinn#1061) — 4_096 let a sender pile thousands of unread
+            // streams into the assembler behind a blocked reader
+            // (recv_streams_with_unread 3,546 measured = one saturated
+            // budget). 256 still gives ~4× headroom over the X0X-0063
+            // observed concurrency (~hundreds in flight) while capping the
+            // unread pileup and its flow-control dead weight at ~1/16th.
+            .max_concurrent_uni_streams(256);
 
         if let Some(bind_addr) = config.bind_addr {
             builder = builder.bind_addr(bind_addr);
@@ -3808,8 +3926,15 @@ impl NetworkNode {
         let recv_membership_tx = self.recv_membership_tx.clone();
         let recv_bulk_tx = self.recv_bulk_tx.clone();
         let recv_pump_diagnostics = Arc::clone(&self.recv_pump_diagnostics);
-        let direct_tx = self.direct_tx.clone();
-        let relayed_dm_tx = self.relayed_dm_tx.clone();
+        // #378 fix D: DM classes go through lossless spill forwarders so the
+        // global pump never blocks on their bounded consumer channels.
+        let direct_spill =
+            DmSpillForwarder::spawn(self.direct_tx.clone(), "direct_tx", DM_SPILL_MAX_BYTES);
+        let relayed_spill = DmSpillForwarder::spawn(
+            self.relayed_dm_tx.clone(),
+            "relayed_dm_tx",
+            DM_SPILL_MAX_BYTES,
+        );
         // Clone of the node for the plane-hello arm + plane gate (issue
         // #206). The task is aborted before `shutdown` drops the ant-quic
         // node, so the clone cannot outlive the transport.
@@ -3868,9 +3993,9 @@ impl NetworkNode {
                                 payload.len(),
                                 peer_id
                             );
-                            warn_forward_channel_pressure(&direct_tx, peer_id, None, "direct_tx");
-                            if let Err(e) = direct_tx.send((peer_id, payload)).await {
-                                error!("Failed to forward direct message: {}", e);
+                            let size = payload.len();
+                            if !direct_spill.forward((peer_id, payload), size) {
+                                error!("Failed to forward direct message: spill forwarder closed");
                                 break;
                             }
                             continue;
@@ -3934,17 +4059,11 @@ impl NetworkNode {
                                 peer_id,
                                 hex_prefix(&relay_sender_agent_id, 4),
                             );
-                            warn_forward_channel_pressure(
-                                &relayed_dm_tx,
-                                peer_id,
-                                None,
-                                "relayed_dm_tx",
-                            );
-                            if let Err(e) = relayed_dm_tx
-                                .send((peer_id, relay_sender_agent_id, relayed))
-                                .await
+                            let size = data.len();
+                            if !relayed_spill
+                                .forward((peer_id, relay_sender_agent_id, relayed), size)
                             {
-                                error!("Failed to forward RelayedDm: {}", e);
+                                error!("Failed to forward RelayedDm: spill forwarder closed");
                                 break;
                             }
                             continue;
@@ -5916,7 +6035,7 @@ mod pressure_tests {
     }
 
     #[tokio::test]
-    async fn recv_pump_membership_full_blocks_instead_of_dropping() {
+    async fn recv_pump_membership_full_sheds_instead_of_blocking() {
         // ADR 0009 §2: Membership and Bulk keep blocking sends. Lock that
         // policy in: a full Membership channel must not return DroppedFull;
         // it must await for capacity. We assert the await side by timing out
@@ -5945,27 +6064,29 @@ mod pressure_tests {
             "recv_membership_tx",
             &diagnostics,
         );
-        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), pending).await;
-        assert!(
-            blocked.is_err(),
-            "Membership send must await capacity, not return DroppedFull"
-        );
-
-        // Drain to release the second send and confirm it then completes
-        // (i.e. the await was the right behaviour, not a deadlock).
+        // ADR 0033 (amends ADR 0009 §2): the receive pump must NEVER await a
+        // full class channel — the old await here head-of-line stalled every
+        // transport consumer (#378). A full membership channel sheds with a
+        // visible counter; SWIM retransmission recovers the frame.
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+            .await
+            .expect("Membership forward must return immediately (ADR 0033)")
+            .expect("channel open");
+        assert_eq!(outcome, ForwardGossipOutcome::DroppedFull);
         rx.recv().await.expect("first message");
         let snapshot = diagnostics.snapshot();
         assert_eq!(snapshot.membership.produced_total, 2);
         assert_eq!(snapshot.membership.enqueued_total, 1);
         assert_eq!(
-            snapshot.membership.dropped_full, 0,
-            "Membership must never increment dropped_full per ADR 0009"
+            snapshot.membership.dropped_full, 1,
+            "shed must be visible in dropped_full (ADR 0033)"
         );
     }
 
     #[tokio::test]
-    async fn recv_pump_bulk_full_blocks_instead_of_dropping() {
-        // ADR 0009 §2: Bulk follows Membership policy.
+    async fn recv_pump_bulk_full_sheds_instead_of_blocking() {
+        // ADR 0033 (amends ADR 0009 §2): Bulk follows Membership policy —
+        // shed with a counter, never stall the pump.
         let (tx, mut rx) = mpsc::channel(1);
         let diagnostics = RecvPumpDiagnostics::new();
         let peer = ant_quic::PeerId([10; 32]);
@@ -5989,14 +6110,59 @@ mod pressure_tests {
             "recv_bulk_tx",
             &diagnostics,
         );
-        let blocked = tokio::time::timeout(std::time::Duration::from_millis(100), pending).await;
-        assert!(
-            blocked.is_err(),
-            "Bulk send must await capacity, not return DroppedFull"
-        );
+        let outcome = tokio::time::timeout(std::time::Duration::from_millis(100), pending)
+            .await
+            .expect("Bulk forward must return immediately (ADR 0033)")
+            .expect("channel open");
+        assert_eq!(outcome, ForwardGossipOutcome::DroppedFull);
         rx.recv().await.expect("first message");
         let snapshot = diagnostics.snapshot();
-        assert_eq!(snapshot.bulk.dropped_full, 0);
+        assert_eq!(snapshot.bulk.dropped_full, 1);
+    }
+
+    /// ADR 0033: the DM spill forwarder absorbs bounded-channel backpressure
+    /// on its own task — enqueue never blocks the caller — and delivers once
+    /// the consumer drains (lossless below the byte cap).
+    #[tokio::test]
+    async fn dm_spill_forwarder_never_blocks_and_is_lossless_below_cap() {
+        let (out_tx, mut out_rx) = mpsc::channel::<(AntPeerId, Bytes)>(1);
+        let spill = DmSpillForwarder::spawn(out_tx, "test_direct", 1024 * 1024);
+        let peer = ant_quic::PeerId([7u8; 32]);
+        for i in 0u8..3 {
+            let start = std::time::Instant::now();
+            assert!(spill.forward((peer, Bytes::from(vec![i; 16])), 16));
+            assert!(
+                start.elapsed() < std::time::Duration::from_millis(50),
+                "forward() must not block on consumer capacity"
+            );
+        }
+        for i in 0u8..3 {
+            let (_, payload) =
+                tokio::time::timeout(std::time::Duration::from_secs(2), out_rx.recv())
+                    .await
+                    .expect("spill task must deliver")
+                    .expect("channel open");
+            assert_eq!(payload[0], i);
+        }
+    }
+
+    /// ADR 0033: beyond the byte cap the incoming message is dropped (counted)
+    /// instead of growing the queue without bound — a wedged consumer must not
+    /// become an OOM.
+    #[tokio::test]
+    async fn dm_spill_forwarder_drops_over_byte_cap() {
+        let (out_tx, _out_rx) = mpsc::channel::<(AntPeerId, Bytes)>(1);
+        let spill = DmSpillForwarder::spawn(out_tx, "test_cap", 32);
+        let peer = ant_quic::PeerId([9u8; 32]);
+        assert!(spill.forward((peer, Bytes::from(vec![0u8; 24])), 24));
+        assert!(spill.forward((peer, Bytes::from(vec![1u8; 24])), 24));
+        assert_eq!(
+            spill
+                .dropped_over_cap
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "over-cap drop must be counted"
+        );
     }
 
     #[tokio::test]

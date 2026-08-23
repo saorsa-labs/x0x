@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Receive pump never blocks (ADR 0033, amends ADR 0009; issue #378 fix D).** The single
+  global `spawn_receiver` no longer `send().await`s any bounded class channel: Membership/Bulk
+  shed with `recv_pump.*.dropped_full` counters (SWIM/anti-entropy retransmit), and direct/relayed
+  DMs go through a lossless 64 MiB byte-capped spill forwarder whose dedicated task alone absorbs
+  consumer backpressure. Previously one slow consumer stalled ant-quic's shared `data_tx` and with
+  it every per-connection reader — the x0x-side sustaining input of the #378 assembler pileup.
+- **Advertised inbound uni-stream budget 4,096 → 256 (issue #378 fix B).** The stream budget is
+  the receiver's ingest-backpressure valve (quinn#1061); 4,096 let senders pile thousands of
+  unread streams into the assembler behind a blocked reader (3,546 measured). 256 keeps ~4×
+  headroom over observed concurrency while capping the unread pileup at ~1/16th.
+
 ### Changed
 
 - **saorsa-gossip 0.5.72 → 0.5.73**: adopts the x0x #380 round-2 fix — a
