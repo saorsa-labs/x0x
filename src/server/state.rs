@@ -389,6 +389,20 @@ pub struct DaemonConfig {
     /// process will exit without anything to restart it.
     #[serde(default)]
     pub zero_peer_restart_secs: Option<u64>,
+
+    /// API-unserved watchdog (issue #384, TOML: `[api_watchdog]`).
+    ///
+    /// Probes the daemon's own `GET /health` over loopback on a dedicated
+    /// OS thread (immune to a wedged async runtime) every
+    /// `probe_interval_secs`; after `miss_threshold` consecutive unserved
+    /// probes past `startup_grace_secs` it logs the runtime state reachable
+    /// without tokio (PubSub dispatcher counters, platform thread list) and,
+    /// when `abort_on_stall` resolves true, aborts so a supervisor restarts
+    /// the daemon with a core/backtrace. Enabled by default; abort defaults
+    /// to on only for supervised runs (`INVOCATION_ID`, parent `systemd`,
+    /// `X0X_SUPERVISED=1`) and off for terminal-launched daemons.
+    #[serde(default)]
+    pub api_watchdog: super::ApiWatchdogConfig,
 }
 
 /// Default QUIC port: 5483 (LIVE on a phone keypad).
@@ -610,6 +624,7 @@ impl Default for DaemonConfig {
             forward: x0x::forward::ForwardConfig::default(),
             network_id: None,
             zero_peer_restart_secs: None,
+            api_watchdog: super::ApiWatchdogConfig::default(),
         }
     }
 }
@@ -1191,5 +1206,26 @@ mod tests {
         let config: DaemonConfig =
             toml::from_str("zero_peer_restart_secs = 900").expect("opt-in parses");
         assert_eq!(config.zero_peer_restart_secs, Some(900));
+    }
+
+    #[test]
+    fn api_watchdog_defaults_on_with_auto_abort() {
+        // Issue #384: the watchdog is cheap enough to default on everywhere;
+        // only the ABORT defaults to supervision-detected (None), so an
+        // unsupervised terminal daemon can never abort itself by accident.
+        let config: DaemonConfig = toml::from_str("").expect("empty config parses");
+        assert!(config.api_watchdog.enabled);
+        assert_eq!(config.api_watchdog.abort_on_stall, None);
+        assert_eq!(DaemonConfig::default().api_watchdog, config.api_watchdog);
+
+        let config: DaemonConfig = toml::from_str(
+            "[api_watchdog]
+probe_interval_secs = 5
+abort_on_stall = true
+",
+        )
+        .expect("section parses");
+        assert_eq!(config.api_watchdog.probe_interval_secs, 5);
+        assert_eq!(config.api_watchdog.abort_on_stall, Some(true));
     }
 }
