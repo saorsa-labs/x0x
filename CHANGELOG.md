@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.5] - 2026-08-24
+
 ### Changed
 
 - **ant-quic 0.27.44 → 0.27.45 (#378 fixes A+C).** Stream-scoped read errors no longer kill a
