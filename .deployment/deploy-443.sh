@@ -20,7 +20,7 @@
 # The 443 config is generated FROM the production instance's live config
 # (resolved from the manifest as input_instances[0]'s config.destination) so it
 # can never drift from the running :5483 config: only bind_address, data_dir,
-# machine_key_path and api_address are overridden.
+# identity_dir and api_address are overridden.
 #
 # Usage:
 #   ./deploy-443.sh <node|all>        # deploy
@@ -159,7 +159,8 @@ if ! grep -Eq '^[[:space:]]*bind_address[[:space:]]*=' "$LIVE"; then
   echo "FATAL: $LIVE has no bind_address line — refusing to clone"; exit 1
 fi
 
-# Generate the 443 config: copy the live one, override exactly 4 keys.
+# Generate the 443 config: copy the live one, override exactly 4 keys
+# (bind_address, data_dir, identity_dir, api_address).
 #
 # These four keys are TOP-LEVEL `DaemonConfig` fields (src/server/state.rs:200).
 # TOML scoping makes placement load-bearing: a key written after a `[section]`
@@ -192,7 +193,10 @@ override() { # key value(quoted-literal-to-write)
 cp "$LIVE" "$TMP"
 override bind_address '"[::]:443"'
 override data_dir "\"$DATA_DIR/data\""
-override machine_key_path "\"$DATA_DIR/machine.key\""
+# Issue #385: the identity knob is `identity_dir` (top-level `DaemonConfig`).
+# `machine_key_path` is NOT a field — it was silently ignored and every :443
+# daemon fell back to the prod daemon's ~/.x0x keys, sharing one identity.
+override identity_dir "\"$DATA_DIR/identity\""
 # Distinct REST API port: x0xd binds api_address with `?` (fatal on conflict),
 # and prod x0xd.service already holds 127.0.0.1:12600. The :443 listener needs
 # its own port or it cannot start alongside the :5483 instance.
@@ -208,7 +212,7 @@ echo "-------------------------------------"
 # first section header; every override must appear before it, exactly once.
 first_section=$(grep -nE '^[[:space:]]*\[' "$TMP" | head -1 | cut -d: -f1)
 : "${first_section:=999999}"
-for k in bind_address data_dir machine_key_path api_address; do
+for k in bind_address data_dir identity_dir api_address; do
   hits=$(grep -cE "^[[:space:]]*${k}[[:space:]]*=" "$TMP" || true)
   line=$(grep -nE "^[[:space:]]*${k}[[:space:]]*=" "$TMP" | head -1 | cut -d: -f1)
   if [ "$hits" != "1" ] || [ -z "$line" ] || [ "$line" -ge "$first_section" ]; then

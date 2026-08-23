@@ -162,9 +162,14 @@ vps_ssh() {
     $SSH "root@$ip" "$@" 2>/dev/null
 }
 
+# SSE listeners must outlive the whole send phase. Each vps_post is a fresh SSH
+# handshake (3-5 s from a laptop to APAC) plus a durable send (0.2-6 s under
+# gossip pressure), so 30 sequential pairs take 150-300 s; the old fixed
+# `-m 180` killed the capture before the later senders' messages arrived and
+# reported them as lost deliveries (x0x #385 investigation, 2026-08-23).
 start_remote_direct_listener() {
     local ip="$1" token="$2" outfile="$3"
-    vps_ssh "$ip" "rm -f '$outfile'; nohup sh -c \"curl -sN -m 180 -H 'Authorization: Bearer $token' 'http://127.0.0.1:${X0X_API_PORT}/direct/events' > '$outfile'\" >/dev/null 2>&1 & echo \$!"
+    vps_ssh "$ip" "rm -f '$outfile'; nohup sh -c \"curl -sN -m ${SSE_LISTEN_SECS:-900} -H 'Authorization: Bearer $token' 'http://127.0.0.1:${X0X_API_PORT}/direct/events' > '$outfile'\" >/dev/null 2>&1 & echo \$!"
 }
 
 stop_remote_pid() {

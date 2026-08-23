@@ -22,6 +22,8 @@
 //! scalar without registering it here degrades gracefully: that key simply
 //! would not be diagnosed if misplaced — it never causes a spurious warning.
 
+use super::DaemonConfig;
+
 /// The TOML section a root-owned key belongs to (always the file root).
 const ROOT_SECTION: &str = "top level";
 
@@ -127,12 +129,87 @@ pub fn warn_section_misplacements(findings: &[SectionMisplacement]) {
     }
 }
 
+/// Parse a daemon config and return every key the schema dropped, at any
+/// depth, as dotted paths (e.g. `machine_key_path`, `gossip.machine_key_path`).
+///
+/// `DaemonConfig` deliberately carries no `deny_unknown_fields` (rejecting
+/// would brick a drifted live config on upgrade — 0.35.1 ruling), so without
+/// this the only evidence of a misspelt or non-existent key is the daemon
+/// quietly using a default. Issue #385: `.deployment/deploy-443.sh` wrote
+/// `machine_key_path`, a field that has never existed, and every bootstrap
+/// host's `:443` daemon fell back to the prod daemon's `~/.x0x` keys — two
+/// transports advertising one identity, unnoticed for months.
+///
+/// # Errors
+/// Returns the TOML/serde error when the document does not parse into
+/// `DaemonConfig` at all.
+pub fn parse_with_ignored_keys(
+    content: &str,
+) -> Result<(DaemonConfig, Vec<String>), toml::de::Error> {
+    let mut ignored = Vec::new();
+    let config: DaemonConfig =
+        serde_ignored::deserialize(toml::Deserializer::new(content), |path| {
+            ignored.push(path.to_string());
+        })?;
+    Ok((config, ignored))
+}
+
+/// Emit a `tracing::warn!` per ignored key from [`parse_with_ignored_keys`].
+pub fn warn_ignored_keys(ignored: &[String]) {
+    for key in ignored {
+        tracing::warn!(
+            "config key `{key}` is not a recognised setting and is ignored — \
+             check its name and section against `DaemonConfig` (src/server/state.rs)"
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn root(src: &str) -> toml::Table {
         toml::from_str(src).expect("test fixture must parse")
+    }
+
+    #[test]
+    fn ignored_keys_are_reported_with_their_path() {
+        // Issue #385: `machine_key_path` is not a field at any level. Both the
+        // top-level and the `[gossip]`-scoped form (what the live :443 configs
+        // actually carried) must be named, so the operator learns the key did
+        // nothing rather than the daemon quietly using `~/.x0x`.
+        let src = "bind_address = '[::]:443'
+machine_key_path = '/var/lib/x0x-443/machine.key'
+
+[gossip]
+machine_key_path = '/x'
+";
+        let (config, ignored) = parse_with_ignored_keys(src).expect("parses");
+        assert_eq!(config.bind_address.port(), 443);
+        assert_eq!(
+            ignored,
+            vec![
+                "machine_key_path".to_string(),
+                "gossip.machine_key_path".to_string()
+            ],
+            "every dropped key must be reported with its dotted path"
+        );
+    }
+
+    #[test]
+    fn recognised_keys_are_not_reported() {
+        let src = "bind_address = '[::]:443'
+identity_dir = '/var/lib/x0x-443/identity'
+
+[update]
+enabled = false
+";
+        let (config, ignored) = parse_with_ignored_keys(src).expect("parses");
+        assert_eq!(
+            config.identity_dir.as_deref(),
+            Some(std::path::Path::new("/var/lib/x0x-443/identity"))
+        );
+        assert!(ignored.is_empty(), "got spurious ignored keys: {ignored:?}");
     }
 
     #[test]
