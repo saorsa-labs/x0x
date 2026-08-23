@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ### Changed
 
+- **saorsa-gossip 0.5.72 → 0.5.73**: adopts the x0x #380 round-2 fix — a
+  failed per-peer outbound-budget `try_acquire` (local sender saturation)
+  no longer feeds peer cooling/demotion; counters and shedding are
+  unchanged, and cooling now applies only to send timeouts / IO errors on
+  an acquired send. Together with 0.5.72's not-connected eviction this
+  removes both self-sustaining inputs of the GRAFT/PRUNE storm.
+
+### Changed
+
 - **saorsa-gossip 0.5.71 → 0.5.72**: adopts the x0x #380 eviction fix — a
   definitive transport "peer not connected" failure now removes the peer
   from the topic's eager/lazy mesh sets instead of feeding per-peer cooling
