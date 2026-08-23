@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **tests/e2e_full_audit.sh modernised to the current API contract** (#383):
+  request helpers now capture HTTP status + body (4xx contract breaks print
+  the daemon's error instead of a generic `curl_fail`); `/health` version is
+  asserted against the binary under test (0.17 pin dropped); `/gui` checks
+  authenticate and assert the 401 boundary; task PATCH body is
+  `{action, fence_token?}`; `POST /stores/:id/join` sends `expected_owner`;
+  TreeKEM direct-add asserts the documented 400 and the invite/approve flows;
+  SSE captures send the bearer header (query tokens are session-only);
+  `ws_probe.mjs` exchanges the durable token for a session before
+  connecting; WS/GUI probes SKIP explicitly when websocat/playwright are
+  absent; new coverage for `/history/*`, `/peers/:id/health|probe`,
+  `/peers/events`, `/machines/*`, `/streams`, `/users/:id/*`,
+  `/identity/revocations`, and a flagged `AUDIT_DESTRUCTIVE=1` section.
+  Suite vs shipped 0.39.3: 289 PASS / 0 FAIL / 8 SKIP.
+
 ### Added
 
 - **API-unserved watchdog** (`[api_watchdog]` config, on by default): a

@@ -75,8 +75,28 @@ function b64(s) {
   return Buffer.from(s, 'utf8').toString('base64');
 }
 
+// #383: browser-style WS clients cannot set Authorization headers, and the
+// daemon never accepts the durable API token in a URL (#127/WS1.6). Exchange
+// the durable bearer for a short-lived session token first (POST
+// /auth/session), then connect with ?token=<session>.
+const sessionCache = new Map();
+async function sessionToken(baseUrl, token) {
+  const key = `${baseUrl}|${token}`;
+  if (sessionCache.has(key)) return sessionCache.get(key);
+  const resp = await fetch(`${baseUrl.replace(/\/$/, '')}/auth/session`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  if (!resp.ok) throw new Error(`session exchange failed: HTTP ${resp.status}`);
+  const body = await resp.json();
+  if (!body.session_token) throw new Error('session exchange returned no session_token');
+  sessionCache.set(key, body.session_token);
+  return body.session_token;
+}
+
 async function connect(path, baseUrl, token) {
-  const ws = new WebSocket(toWsUrl(baseUrl, path, token));
+  const session = await sessionToken(baseUrl, token);
+  const ws = new WebSocket(toWsUrl(baseUrl, path, session));
   await waitForOpen(ws, 7000);
   const connected = await recvJson(ws, 7000, (frame) => frame?.type === 'connected');
   return { ws, connected };

@@ -122,6 +122,14 @@ def extract_test_endpoints(filepath):
         (r'\bhttp_status\b\s+["\']?(' + P + r')', 'GET'),
         (r'\bhttp_del\b\s+["\']?(' + P + r')', 'DELETE'),
         (r'\bws_connect\b\s+["\']?(' + P + r')', 'GET'),
+        # full_audit unified helper (#383): req METHOD "$AA/path" token [body]
+        (r'\breq\s+GET\s+["\']?\$\{?[A-Z][A-Z0-9_]*\}?(' + P + r')', 'GET'),
+        (r'\breq\s+POST\s+["\']?\$\{?[A-Z][A-Z0-9_]*\}?(' + P + r')', 'POST'),
+        (r'\breq\s+PUT\s+["\']?\$\{?[A-Z][A-Z0-9_]*\}?(' + P + r')', 'PUT'),
+        (r'\breq\s+PATCH\s+["\']?\$\{?[A-Z][A-Z0-9_]*\}?(' + P + r')', 'PATCH'),
+        (r'\breq\s+DELETE\s+["\']?\$\{?[A-Z][A-Z0-9_]*\}?(' + P + r')', 'DELETE'),
+        # websocat upgrade probes (#383)
+        (r'websocat[^\n]*?(/ws/[a-z]+)', 'GET'),
         # comprehensive/full/live/stress helpers: A/B/C = GET, Ap/Bp/Cp = POST, Apu/Bpu = PUT, Apa/Bpa = PATCH, Ad/Bd = DELETE
         (r'\bA\b\s+["\']?(' + P + r')', 'GET'),
         (r'\bB\b\s+["\']?(' + P + r')', 'GET'),
