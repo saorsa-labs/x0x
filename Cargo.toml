@@ -78,6 +78,7 @@ which = "7"
 termimad = "0.30"
 terminal_size = "0.4"
 dhat = { version = "0.3", optional = true }
+serde_ignored = "0.1"
 # jemalloc for the daemon binary — glibc malloc holds pages after free,
 # producing the 50 MB+ heap-to-RSS amplification observed during the
 # 2026-04-25 soak. tikv-jemallocator is the maintained fork. We configure

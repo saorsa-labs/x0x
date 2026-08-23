@@ -541,8 +541,11 @@ async fn load_config(path: &str) -> Result<DaemonConfig> {
     let content = tokio::fs::read_to_string(path)
         .await
         .with_context(|| format!("failed to read config file: {path}"))?;
-    let config: DaemonConfig =
-        toml::from_str(&content).with_context(|| format!("failed to parse config file: {path}"))?;
+    // Issue #385: name every key the schema drops (any depth) instead of
+    // letting it vanish into a default. Warn-only (0.35.1 ruling).
+    let (config, ignored_keys) = x0x::server::config::parse_with_ignored_keys(&content)
+        .with_context(|| format!("failed to parse config file: {path}"))?;
+    x0x::server::config::warn_ignored_keys(&ignored_keys);
     // Warn loudly — but do not reject (0.35.1 cleanup ruling) — about a
     // top-level key an operator placed under a sub-section, where serde
     // silently drops it (e.g. `data_dir` under `[history]`, which owns

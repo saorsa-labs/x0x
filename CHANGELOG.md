@@ -15,6 +15,20 @@ All notable changes to this project will be documented in this file.
   the daemon with a core/backtrace (#384). Unsupervised runs log only;
   `abort_on_stall` overrides the auto detection.
 
+### Fixed
+
+- **Every bootstrap host's `:443` daemon shared the prod daemon's identity (issue #385).**
+  `.deployment/deploy-443.sh` wrote `machine_key_path`, which is not a `DaemonConfig`
+  field, so it was silently ignored and `x0xd-443` fell back to `~/.x0x/{machine,agent}.key`
+  — two transports advertising one `machine_id`/`agent_id` on all six hosts. DMs, exec and
+  file offers addressed to a bootstrap agent landed in whichever instance won, which
+  `tests/e2e_vps.sh` reported as lost deliveries (17/30). The script now sets the real
+  knob, top-level `identity_dir`; recorded in ADR-0032 (amends ADR-0011).
+- **Unknown config keys are now named at startup.** `x0xd` deserialises its config through
+  `serde_ignored` and logs `config key \`…\` is not a recognised setting and is ignored` for
+  every dropped key at any depth (e.g. `gossip.machine_key_path`). Still warn-only per the
+  0.35.1 ruling — a drifted live config must not brick on upgrade.
+
 ## [v0.39.3] - 2026-08-22
 
 ### Added
