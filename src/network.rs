@@ -4564,7 +4564,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
 
             node.send(&ant_peer, &buf)
                 .await
-                .map_err(|e| anyhow::anyhow!("send failed: {e}"))?;
+                .map_err(|e| map_gossip_send_error(e, peer))?;
         }
         self.note_connection_pool_activity(ant_peer).await;
 
@@ -4853,6 +4853,74 @@ pub enum NetworkEvent {
         /// The error message.
         error: String,
     },
+}
+
+/// Map an ant-quic send error onto the gossip-transport error contract.
+///
+/// `EndpointError::PeerNotFound` is definitive: the peer has no live
+/// transport connection (connection-generation replacement, retirement, or
+/// never-connected) — the exact stale-snapshot condition of x0x #380. It
+/// maps to sg's structured `GossipTransportError::PeerNotConnected` variant
+/// so PubSub (sg 0.5.72) evicts the peer from the topic mesh instead of
+/// cooling it. sg's sentinel-text fallback would classify the old anyhow
+/// wrap too, but the variant is the contract and keeps classification
+/// independent of error-rendering details. Every other error happened on a
+/// live connection and keeps the historical wrap (and cooling behaviour).
+fn map_gossip_send_error(e: ant_quic::NodeError, peer: GossipPeerId) -> anyhow::Error {
+    match e {
+        ant_quic::NodeError::Endpoint(ant_quic::EndpointError::PeerNotFound(_)) => {
+            saorsa_gossip_transport::GossipTransportError::PeerNotConnected { peer_id: peer }.into()
+        }
+        e => anyhow::anyhow!("send failed: {e}"),
+    }
+}
+
+#[cfg(test)]
+mod map_gossip_send_error_tests {
+    use super::*;
+
+    /// x0x #380: PeerNotFound must land as the structured variant — sg 0.5.72
+    /// evicts (not cools) on it, and the eviction path must not depend on
+    /// error-message text.
+    #[test]
+    fn peer_not_found_maps_to_peer_not_connected_variant() {
+        let peer: GossipPeerId = saorsa_gossip_types::PeerId::new([7; 32]);
+        let err = map_gossip_send_error(
+            ant_quic::NodeError::Endpoint(ant_quic::EndpointError::PeerNotFound(ant_quic::PeerId(
+                [7; 32],
+            ))),
+            peer,
+        );
+        let transport_error = err
+            .downcast_ref::<saorsa_gossip_transport::GossipTransportError>()
+            .expect("PeerNotFound must map to the structured transport variant");
+        assert!(transport_error.is_peer_not_connected());
+        match transport_error {
+            saorsa_gossip_transport::GossipTransportError::PeerNotConnected { peer_id } => {
+                assert_eq!(*peer_id, peer);
+            }
+            other => panic!("expected PeerNotConnected, got {other:?}"),
+        }
+    }
+
+    /// Errors on a live connection keep the anyhow wrap and must NOT
+    /// classify as not-connected: sg cools them as before (#380 requires
+    /// eviction to mask only truly-unconnected peers).
+    #[test]
+    fn live_connection_error_keeps_anyhow_wrap() {
+        let peer: GossipPeerId = saorsa_gossip_types::PeerId::new([8; 32]);
+        let err = map_gossip_send_error(
+            ant_quic::NodeError::Endpoint(ant_quic::EndpointError::Connection(
+                "reset by peer".to_string(),
+            )),
+            peer,
+        );
+        assert!(
+            err.downcast_ref::<saorsa_gossip_transport::GossipTransportError>()
+                .is_none(),
+            "live-connection errors must keep the anyhow wrap"
+        );
+    }
 }
 
 #[cfg(test)]

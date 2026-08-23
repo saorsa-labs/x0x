@@ -4,6 +4,23 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **saorsa-gossip 0.5.71 → 0.5.72**: adopts the x0x #380 eviction fix — a
+  definitive transport "peer not connected" failure now removes the peer
+  from the topic's eager/lazy mesh sets instead of feeding per-peer cooling
+  (which collapsed eager sets into the GRAFT/PRUNE storm). `/diagnostics/gossip`
+  now carries `peers_evicted_not_connected` automatically.
+
+### Changed (internal)
+
+- `src/network.rs` `send_to_peer`: ant-quic's `NodeError::Endpoint(
+  EndpointError::PeerNotFound)` now maps to sg's structured
+  `GossipTransportError::PeerNotConnected { peer_id }` instead of an
+  anyhow string wrap, so sg classifies the eviction via the variant rather
+  than the sentinel-text fallback. Live-connection errors keep the
+  historical wrap and cooling behaviour (#380).
+
 ## [v0.39.4] - 2026-08-23
 
 ### Fixed
