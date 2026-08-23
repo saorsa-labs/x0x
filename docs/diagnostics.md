@@ -118,3 +118,40 @@ duration. Compare it with the sender's `ack_wait_ms` to see whether the ACK
 publish itself or the reverse path held the waiter.
 
 These fields are measurement only. They are not a latency SLA.
+
+## API-unserved watchdog (#384)
+
+The daemon arms a self-probe watchdog at startup: a dedicated OS thread
+(outside the async runtime, so it survives a wedged runtime) issues a bare
+`GET /health HTTP/1.0` over loopback every `probe_interval_secs` (default
+10). If the probe is unserved — TCP accepted but HTTP never answered — for
+`miss_threshold` consecutive probes (default 3) past `startup_grace_secs`
+(default 90), the watchdog logs an `ERROR` with everything reachable without
+tokio (PubSub dispatcher counters, the platform thread list, agent/machine
+IDs) and then, when `abort_on_stall` resolves true, calls
+`std::process::abort()` so a supervisor restarts the daemon and a core
+dump/backtrace exists.
+
+```toml
+# x0xd.toml — all keys optional; section shows the defaults
+[api_watchdog]
+enabled = true            # master switch (default true)
+probe_interval_secs = 10  # /health self-probe cadence
+probe_timeout_secs = 3    # per-probe connect+read timeout
+miss_threshold = 3        # consecutive misses (past grace) to trip
+startup_grace_secs = 90   # failures before this never count
+abort_on_stall = true     # default: auto — see below
+```
+
+`abort_on_stall` defaults to **auto**: resolved at arm time from the same
+supervision detection the upgrade path uses — `true` when the daemon runs
+under a supervisor (`INVOCATION_ID` set, parent process `systemd`, or
+`X0X_SUPERVISED=1`), `false` for terminal-launched daemons. A supervised
+`Restart=always` unit therefore self-heals the #384 wedge shape (process
+"active", `/health` accepts TCP and never answers, gossip producer 0/s);
+an unsupervised daemon only logs. The watchdog disarms itself the moment
+shutdown begins, and one probe success resets the miss count.
+
+Every missed probe also emits a `WARN` (`x0x::api_watchdog` target) with the
+miss count and probe outcome, so a developing wedge is visible in the
+journal before the trip fires.

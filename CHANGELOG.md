@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **API-unserved watchdog** (`[api_watchdog]` config, on by default): a
+  dedicated OS thread self-probes `GET /health` over loopback; after 3
+  consecutive unserved probes (30 s at defaults, past a 90 s startup grace)
+  it ERROR-logs the runtime state reachable without tokio (PubSub
+  dispatcher counters, thread list) and — for supervised runs (systemd /
+  `X0X_SUPERVISED=1`, auto-detected) — aborts so the supervisor restarts
+  the daemon with a core/backtrace (#384). Unsupervised runs log only;
+  `abort_on_stall` overrides the auto detection.
+
 ## [v0.39.3] - 2026-08-22
 
 ### Added

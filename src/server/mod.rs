@@ -9,6 +9,8 @@
 // crate to itself so those paths resolve unchanged inside the library.
 use crate as x0x;
 
+mod api_watchdog;
+pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
 pub mod config;
 mod crdt_subscriptions;
@@ -552,6 +554,22 @@ pub async fn serve_with_options(
                 }
             }
         });
+    }
+
+    // API-unserved watchdog (issue #384): a dedicated OS thread probing the
+    // daemon's own /health over loopback, so a wedged async runtime (TCP
+    // accepted, HTTP never answered) is detected and — under a supervisor —
+    // aborted for restart with a core dump. Runs on std::thread
+    // deliberately: a tokio task cannot report on a runtime that stopped
+    // polling it. Never fires inside the startup grace or after shutdown
+    // begins (the shutdown watch disarms it).
+    if config.api_watchdog.enabled {
+        api_watchdog::spawn_api_watchdog(
+            &config.api_watchdog,
+            actual_api_addr,
+            Arc::clone(&agent),
+            shutdown_notify.subscribe(),
+        );
     }
 
     // Tailnet streams + forwarder (#131 × #132): install the loaded connect
