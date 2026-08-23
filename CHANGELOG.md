@@ -4,6 +4,13 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **ant-quic 0.27.44 → 0.27.45 (#378 fixes A+C).** Stream-scoped read errors no longer kill a
+  connection's reader (ant-quic#259: skip + `stream_read_errors_survived` counter), and uni
+  streams are read concurrently under a 64-permit per-connection budget with a 60 s per-stream
+  deadline (ant-quic#260) — removes the reader head-of-line blocking behind one stalled sender.
+
 ### Fixed
 
 - **Receive pump never blocks (ADR 0033, amends ADR 0009; issue #378 fix D).** The single
