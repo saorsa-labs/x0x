@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Discovery-cache hygiene: dead peers no longer live forever (issue #398).** Two causes fixed:
+  (1) the machine/user announcement re-broadcast arms are retired (the identity arm already was)
+  — every node re-publishing received announcements as fresh messages defeated PlumTree dedupe
+  and kept dead peers' announcements echoing around the mesh; (2) receipt handlers no longer
+  refresh `last_seen` from announcements whose signed `announced_at` is older than the discovery
+  TTL, so echoes from not-yet-upgraded nodes cannot resurrect reaped entries. Stale entries
+  (e.g. a retired machine identity) previously burned auto-connect dial time indefinitely.
+
 ### Changed
 
 - **ant-quic 0.27.45 → 0.27.46 (#398/#262).** Connection-local NAT candidates are now seeded at

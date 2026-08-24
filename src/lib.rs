@@ -780,9 +780,6 @@ pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
 /// [`Agent::presence`] and [`Agent::discovered_agents`].
 pub const IDENTITY_TTL_SECS: u64 = 900;
 
-const DISCOVERY_REBROADCAST_STATE_CAP: usize = 1024;
-const DISCOVERY_REBROADCAST_STATE_TTL: std::time::Duration = std::time::Duration::from_secs(3600);
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IdentityAnnouncementSource {
     LocallyAuthored,
@@ -809,28 +806,6 @@ const DISCOVERY_CACHE_REAPER_INTERVAL_SECS: u64 = 120;
 
 fn discovery_record_is_live(_announced_at: u64, last_seen: u64, cutoff: u64) -> bool {
     last_seen >= cutoff
-}
-
-fn should_rebroadcast_discovery_once<K>(
-    state: &mut std::collections::HashMap<K, std::time::Instant>,
-    key: K,
-    now: std::time::Instant,
-) -> bool
-where
-    K: Eq + std::hash::Hash,
-{
-    match state.entry(key) {
-        std::collections::hash_map::Entry::Occupied(_) => false,
-        std::collections::hash_map::Entry::Vacant(entry) => {
-            entry.insert(now);
-            if state.len() > DISCOVERY_REBROADCAST_STATE_CAP {
-                if let Some(cutoff) = now.checked_sub(DISCOVERY_REBROADCAST_STATE_TTL) {
-                    state.retain(|_, seen_at| *seen_at >= cutoff);
-                }
-            }
-            true
-        }
-    }
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -1025,6 +1000,16 @@ const IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS: u64 = dm::CLOCK_SKEW_TOLERANCE_MS /
 
 fn identity_announcement_timestamp_is_acceptable(announced_at: u64, now: u64) -> bool {
     announced_at <= now.saturating_add(IDENTITY_ANNOUNCEMENT_CLOCK_SKEW_SECS)
+}
+
+/// #398 cache hygiene: an announcement whose signed `announced_at` is older
+/// than the discovery TTL must not refresh a cache entry. Dead peers'
+/// announcements can keep echoing around the mesh (relays and older builds
+/// re-circulate them), and stamping `last_seen` at receipt time kept dead
+/// machines alive past the reaper cutoff indefinitely — burning dial time on
+/// unreachable targets (e.g. studio1's retired pre-#385 identity).
+fn announcement_is_fresh_enough_for_cache(announced_at: u64, now: u64, ttl_secs: u64) -> bool {
+    announced_at.saturating_add(ttl_secs) >= now
 }
 
 /// True only when the pubsub envelope proves the announcement arrived directly
@@ -6697,8 +6682,8 @@ impl Agent {
             .as_ref()
             .is_some_and(|network| allow_local_discovery_addresses(network.config()));
         let own_agent_id = self.agent_id();
-        let own_machine_id = self.machine_id();
         let own_user_id = self.user_id();
+        let cache_freshness_ttl_secs = self.identity_ttl_secs;
         let rebroadcast_pubsub = std::sync::Arc::clone(runtime.pubsub());
         let token = self.shutdown_token.clone();
         // Subscribe to revocation records so they are applied on receipt.
@@ -6727,20 +6712,12 @@ impl Agent {
             let mut auto_connect_attempts =
                 std::collections::HashMap::<identity::AgentId, std::time::Instant>::new();
 
-            let mut machine_rebroadcast_state: std::collections::HashMap<
-                (identity::MachineId, u64),
-                std::time::Instant,
-            > = std::collections::HashMap::new();
             let mut seen_identity_payloads: std::collections::HashMap<
                 blake3::Hash,
                 std::time::Instant,
             > = std::collections::HashMap::new();
             let mut seen_machine_payloads: std::collections::HashMap<
                 blake3::Hash,
-                std::time::Instant,
-            > = std::collections::HashMap::new();
-            let mut user_rebroadcast_state: std::collections::HashMap<
-                (identity::UserId, u64),
                 std::time::Instant,
             > = std::collections::HashMap::new();
             const VERIFIED_PAYLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(60);
@@ -6836,15 +6813,28 @@ impl Agent {
                             allow_local_scope,
                         );
                         let filtered_addr_count = discovery_addresses.len();
-                        upsert_discovered_machine(
-                            &machine_cache,
-                            DiscoveredMachine::from_machine_announcement(
-                                &announcement,
-                                discovery_addresses,
-                                now,
-                            ),
-                        )
-                        .await;
+                        if announcement_is_fresh_enough_for_cache(
+                            announcement.announced_at,
+                            now,
+                            cache_freshness_ttl_secs,
+                        ) {
+                            upsert_discovered_machine(
+                                &machine_cache,
+                                DiscoveredMachine::from_machine_announcement(
+                                    &announcement,
+                                    discovery_addresses,
+                                    now,
+                                ),
+                            )
+                            .await;
+                        } else {
+                            tracing::debug!(
+                                target: "x0x::discovery",
+                                machine_prefix = %network::hex_prefix(&announcement.machine_id.0, 4),
+                                announced_at = announcement.announced_at,
+                                "ignoring stale machine announcement for cache (#398)"
+                            );
+                        }
                         tracing::debug!(
                             target: "x0x::discovery",
                             announcement_kind = "machine_received",
@@ -6858,26 +6848,15 @@ impl Agent {
                             "cached verified machine announcement"
                         );
 
-                        if announcement.machine_id != own_machine_id {
-                            let key = (announcement.machine_id, announcement.announced_at);
-                            if should_rebroadcast_discovery_once(
-                                &mut machine_rebroadcast_state,
-                                key,
-                                std::time::Instant::now(),
-                            ) {
-                                let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
-                                tokio::spawn(async move {
-                                    if let Err(e) = pubsub
-                                        .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), raw_payload)
-                                        .await
-                                    {
-                                        tracing::debug!(
-                                            "machine announcement re-broadcast failed: {e}"
-                                        );
-                                    }
-                                });
-                            }
-                        }
+                        // #398 cache hygiene: do NOT re-publish received
+                        // machine announcements. PlumTree already floods each
+                        // publish; an application re-publish gets a fresh
+                        // message id, defeats dedupe, and keeps dead machines'
+                        // announcements echoing around the mesh — which
+                        // refreshed their `last_seen` past the reaper TTL
+                        // forever. Same rationale as the identity arm
+                        // (`should_publish_identity_on_legacy`).
+                        let _ = &raw_payload;
                         continue;
                     }
                     DiscoveryMessage::User(msg) => {
@@ -6925,28 +6904,10 @@ impl Agent {
                             agent_count = announcement.agent_certificates.len(),
                             "cached verified user announcement"
                         );
-                        // Rebroadcast non-self announcements once, matching
-                        // identity / machine announcements.
-                        if Some(announcement.user_id) != own_user_id {
-                            let key = (announcement.user_id, announcement.announced_at);
-                            if should_rebroadcast_discovery_once(
-                                &mut user_rebroadcast_state,
-                                key,
-                                std::time::Instant::now(),
-                            ) {
-                                let pubsub = std::sync::Arc::clone(&rebroadcast_pubsub);
-                                tokio::spawn(async move {
-                                    if let Err(e) = pubsub
-                                        .publish(USER_ANNOUNCE_TOPIC.to_string(), raw_payload)
-                                        .await
-                                    {
-                                        tracing::debug!(
-                                            "user announcement re-broadcast failed: {e}"
-                                        );
-                                    }
-                                });
-                            }
-                        }
+                        // #398 cache hygiene: no application re-publish —
+                        // see the machine arm above.
+                        let _ = &raw_payload;
+                        let _ = own_user_id;
                         continue;
                     }
                     DiscoveryMessage::Identity(msg) => msg,
@@ -7242,8 +7203,21 @@ impl Agent {
                     now,
                 )
                 .await;
-                upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                upsert_discovered_agent(&cache, discovered_agent).await;
+                if announcement_is_fresh_enough_for_cache(
+                    announcement.announced_at,
+                    now,
+                    cache_freshness_ttl_secs,
+                ) {
+                    upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
+                    upsert_discovered_agent(&cache, discovered_agent).await;
+                } else {
+                    tracing::debug!(
+                        target: "x0x::discovery",
+                        agent_prefix = %network::hex_prefix(&announcement.agent_id.0, 4),
+                        announced_at = announcement.announced_at,
+                        "ignoring stale identity announcement for cache (#398)"
+                    );
+                }
                 tracing::debug!(
                     target: "x0x::discovery",
                     announcement_kind = "received",
@@ -13189,28 +13163,6 @@ mod tests {
             1,
         )
         .is_none());
-    }
-
-    #[test]
-    fn non_identity_discovery_rebroadcast_is_one_shot_per_announcement_key() {
-        let now = std::time::Instant::now();
-        let mut state = std::collections::HashMap::new();
-
-        assert!(should_rebroadcast_discovery_once(
-            &mut state,
-            (7_u8, 42_u64),
-            now
-        ));
-        assert!(!should_rebroadcast_discovery_once(
-            &mut state,
-            (7_u8, 42_u64),
-            now + std::time::Duration::from_secs(20),
-        ));
-        assert!(should_rebroadcast_discovery_once(
-            &mut state,
-            (7_u8, 43_u64),
-            now + std::time::Duration::from_secs(20),
-        ));
     }
 
     #[test]
@@ -19269,6 +19221,25 @@ mod peer_connected_handler_integration_tests {
             !bob_entry.addresses.is_empty(),
             "machine_discovery_cache entry for bob must carry at least one address \
              so the proactive-reconnect candidate loop finds a non-empty dial set"
+        );
+    }
+    /// #398: a stale announcement (signed announced_at older than the TTL)
+    /// must not refresh discovery caches — echoes of dead peers' announcements
+    /// otherwise keep them alive past the reaper forever.
+    #[test]
+    fn stale_announcements_cannot_refresh_discovery_caches() {
+        let now = 10_000u64;
+        let ttl = 900u64;
+        assert!(announcement_is_fresh_enough_for_cache(now, now, ttl));
+        assert!(announcement_is_fresh_enough_for_cache(now - ttl, now, ttl));
+        assert!(!announcement_is_fresh_enough_for_cache(
+            now - ttl - 1,
+            now,
+            ttl
+        ));
+        assert!(
+            announcement_is_fresh_enough_for_cache(0, 100, 900),
+            "young network"
         );
     }
 }
