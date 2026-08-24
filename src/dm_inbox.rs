@@ -631,7 +631,9 @@ where
         primary = &mut primary => {
             match join_ack_route(primary) {
                 Ok(()) => {
-                    let _ = legacy;
+                    // Dropping JoinHandle does not abort; the sibling keeps
+                    // publishing until it succeeds or hits its own timeout.
+                    std::mem::drop(legacy);
                     Ok(())
                 }
                 Err(_) => join_ack_route(legacy.await),
@@ -640,7 +642,7 @@ where
         legacy_result = &mut legacy => {
             match join_ack_route(legacy_result) {
                 Ok(()) => {
-                    let _ = primary;
+                    std::mem::drop(primary);
                     Ok(())
                 }
                 Err(_) => join_ack_route(primary.await),
