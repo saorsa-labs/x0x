@@ -513,16 +513,28 @@ async fn publish_durable_ack_job(
     job: AckPublishJob,
 ) {
     let topic = DmInboxService::inbox_topic_name(&job.recipient);
-    let primary = pubsub.publish_topic_id(
-        topic,
-        dm_inbox_topic(&job.recipient),
-        Bytes::clone(&job.encoded),
-    );
+    let topic_id = dm_inbox_topic(&job.recipient);
+    let encoded_primary = Bytes::clone(&job.encoded);
+    let encoded_legacy = job.encoded;
+    let primary_pubsub = Arc::clone(&pubsub);
+    let legacy_pubsub = Arc::clone(&pubsub);
+    // Owned clones so each route can be spawned independently. First-success
+    // must detach the sibling, not cancel it — otherwise a healthy second
+    // publish is dropped before it delivers.
+    let primary = async move {
+        primary_pubsub
+            .publish_topic_id(topic, topic_id, encoded_primary)
+            .await
+    };
     // The durable path always hedges onto the compatibility bus, even when the
     // payload did not arrive there. A v2 sender has already been promised a
     // committed row; a second route costs one small publish and removes a
     // whole class of "committed but never acked" outcomes.
-    let legacy = pubsub.publish(DM_BUS_TOPIC.to_string(), job.encoded);
+    let legacy = async move {
+        legacy_pubsub
+            .publish(DM_BUS_TOPIC.to_string(), encoded_legacy)
+            .await
+    };
     let publish_started = Instant::now();
     let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
     dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
@@ -587,36 +599,62 @@ async fn publish_durable_ack_routes<Primary, Legacy>(
     legacy: Legacy,
 ) -> NetworkResult<()>
 where
-    Primary: std::future::Future<Output = NetworkResult<()>>,
-    Legacy: std::future::Future<Output = NetworkResult<()>>,
+    Primary: std::future::Future<Output = NetworkResult<()>> + Send + 'static,
+    Legacy: std::future::Future<Output = NetworkResult<()>> + Send + 'static,
 {
     // First-success hedge (#380 Phase C / deferred #338): Ok when either
-    // route completes successfully and the sibling is cancelled. A targeted
-    // inbox publish can remain pending under per-topic fan-out after the
-    // compatibility-bus hedge has already delivered. Requiring both
-    // (`join!` + `and`) spent the sender's remaining ACK budget on the
-    // wedged sibling — the locked 504 `budget_stage=ack_wait_ms` (publish
-    // returned; application ACK missed budget). Each route still has its
-    // own deadline so both-hang still fails instead of pinning the worker.
-    // History commit stays awaited before this job is scheduled (#338);
-    // the queue is still non-blocking try_send (#335).
-    let primary = publish_ack_route_with_timeout("targeted", route_timeout, primary);
-    let legacy = publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy);
-    tokio::pin!(primary);
-    tokio::pin!(legacy);
+    // route completes successfully. A targeted inbox publish can remain
+    // pending under per-topic fan-out after the compatibility-bus hedge
+    // has already delivered. Requiring both (`join!` + `and`) spent the
+    // sender's remaining ACK budget on the wedged sibling — the locked
+    // 504 `budget_stage=ack_wait_ms` (publish returned; application ACK
+    // missed budget).
+    //
+    // The sibling is *detached*, not cancelled. `select!` drop-on-win
+    // aborted a healthy second publish before it delivered: the ACK then
+    // landed on only one route, so a sender (or test) watching the other
+    // never saw it. Each route still has its own deadline so a hang
+    // cannot pin the worker, and both-hang still fails. History commit
+    // stays awaited before this job is scheduled (#338); the queue is
+    // still non-blocking try_send (#335).
+    let mut primary = tokio::spawn(publish_ack_route_with_timeout(
+        "targeted",
+        route_timeout,
+        primary,
+    ));
+    let mut legacy = tokio::spawn(publish_ack_route_with_timeout(
+        "legacy-bus",
+        route_timeout,
+        legacy,
+    ));
     tokio::select! {
         primary = &mut primary => {
-            if primary.is_ok() {
-                return Ok(());
+            match join_ack_route(primary) {
+                Ok(()) => {
+                    let _ = legacy;
+                    Ok(())
+                }
+                Err(_) => join_ack_route(legacy.await),
             }
-            legacy.await
         }
-        legacy = &mut legacy => {
-            if legacy.is_ok() {
-                return Ok(());
+        legacy_result = &mut legacy => {
+            match join_ack_route(legacy_result) {
+                Ok(()) => {
+                    let _ = primary;
+                    Ok(())
+                }
+                Err(_) => join_ack_route(primary.await),
             }
-            primary.await
         }
+    }
+}
+
+fn join_ack_route(result: Result<NetworkResult<()>, tokio::task::JoinError>) -> NetworkResult<()> {
+    match result {
+        Ok(result) => result,
+        Err(error) => Err(NetworkError::BroadcastError(format!(
+            "ACK route task failed: {error}"
+        ))),
     }
 }
 
@@ -2793,11 +2831,13 @@ mod tests {
     }
 
     /// First-success hedge (#380 Phase C): one healthy route must win
-    /// immediately and cancel the hanging sibling. The previous `join!` +
-    /// `and` waited out the hanging route's 22s deadline even after the ACK
-    /// had already left — that is the locked 504 `ack_wait_ms` failure.
+    /// immediately. The previous `join!` + `and` waited out the hanging
+    /// route's 22s deadline even after the ACK had already left — that is
+    /// the locked 504 `ack_wait_ms` failure. The sibling is detached so a
+    /// merely-slow healthy publish still delivers; cancelling it on win
+    /// dropped the ACK on the route the sender was watching.
     #[tokio::test(start_paused = true)]
-    async fn first_successful_ack_route_cancels_the_hanging_sibling() {
+    async fn first_successful_ack_route_does_not_wait_for_the_hanging_sibling() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hanging = HangingAckRoute {
             cancelled: Arc::clone(&cancelled),
@@ -2816,15 +2856,15 @@ mod tests {
             "first-success must not wait out the hanging sibling's deadline"
         );
         assert!(
-            cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            "the hanging sibling must be cancelled when the other route succeeds"
+            !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the hanging sibling is detached (own timeout), not cancelled on win"
         );
     }
 
     /// Same race with the targeted route hanging and the bus winning, so the
     /// hedge is not accidentally order-dependent on `select!` arm layout.
     #[tokio::test(start_paused = true)]
-    async fn first_successful_legacy_ack_route_cancels_the_hanging_targeted_route() {
+    async fn first_successful_legacy_ack_route_does_not_wait_for_the_hanging_targeted_route() {
         let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let hanging = HangingAckRoute {
             cancelled: Arc::clone(&cancelled),
@@ -2836,9 +2876,35 @@ mod tests {
             "a healthy compatibility-bus hedge must win while targeted hangs: {result:?}"
         );
         assert!(
-            cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            "the hanging targeted route must be cancelled"
+            !cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the hanging targeted route is detached, not cancelled on win"
         );
+    }
+
+    /// Both-healthy is the case `select!` drop-on-win got wrong: the ACK
+    /// must leave on *both* routes, not only the first to report Ok.
+    #[tokio::test]
+    async fn first_success_still_completes_the_healthy_sibling() {
+        let sibling_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = Arc::clone(&sibling_done);
+        let primary = async { Ok(()) };
+        let legacy = async move {
+            tokio::task::yield_now().await;
+            flag.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        };
+        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+        assert!(
+            result.is_ok(),
+            "first-success must return Ok without waiting on sibling: {result:?}"
+        );
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !sibling_done.load(std::sync::atomic::Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a healthy sibling must still publish after first-success returns");
     }
 
     /// Both routes failing is still an error; the caller records
