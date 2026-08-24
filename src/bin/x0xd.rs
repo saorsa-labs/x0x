@@ -95,6 +95,9 @@ async fn main() -> anyhow::Result<()> {
         println!(
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
+        println!(
+            "    --relay                         Opt in to Full gossip participation (pass-through)"
+        );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
         println!("    --connect-acl <PATH>            Override default connect ACL path");
@@ -177,6 +180,7 @@ async fn main() -> anyhow::Result<()> {
     // overrides the daemon config's `port_mapping_enabled` field.
     let cli_no_port_mapping = args.contains(&"--no-port-mapping".to_string());
     let cli_disable_peer_cache = args.contains(&"--disable-peer-cache".to_string());
+    let cli_relay = args.contains(&"--relay".to_string());
 
     // Parse --api-port for overriding the API server port
     let api_port_override = if let Some(idx) = args.iter().position(|a| a == "--api-port") {
@@ -324,6 +328,7 @@ async fn main() -> anyhow::Result<()> {
         skip_update_check,
         cli_no_port_mapping,
         cli_disable_peer_cache,
+        cli_relay,
         instance_name: instance_name.map(InstanceName::into_string),
         exec_policy,
         connect_policy,

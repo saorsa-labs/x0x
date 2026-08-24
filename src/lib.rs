@@ -2924,6 +2924,18 @@ impl Agent {
         self.gossip_runtime.as_ref().map(|rt| rt.pubsub().stats())
     }
 
+    /// Leaf vs Full participation snapshot (issue #380).
+    ///
+    /// Returns `None` when the agent has no gossip runtime. Exposed through
+    /// `GET /diagnostics/gossip` so operators can see whether this process
+    /// runs the pass-through topic-peer refresh.
+    #[must_use]
+    pub fn gossip_participation(&self) -> Option<gossip::ParticipationSnapshot> {
+        self.gossip_runtime
+            .as_ref()
+            .map(|rt| rt.pubsub().participation_snapshot())
+    }
+
     /// Snapshot of inbound gossip dispatcher counters.
     ///
     /// Returns `None` when the agent has no gossip runtime. Exposed through
