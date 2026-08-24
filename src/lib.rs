@@ -1591,15 +1591,53 @@ struct AnnouncementAssistSnapshot {
 
 impl AnnouncementAssistSnapshot {
     fn from_node_status(status: &ant_quic::NodeStatus) -> Self {
+        // #398 announcement honesty: relay/coordinator capability is only
+        // advertised when OTHER nodes could plausibly reach us to use it.
+        // `relay_service_enabled` merely says the local MASQUE server /
+        // coordination logic is running — every default daemon has that —
+        // so gating on it alone made every NATed desktop advertise
+        // is_coordinator=true / is_relay=true, and coordinator/relay
+        // selection then picked nodes that cannot serve third parties.
+        //
+        // A node is plausibly publicly reachable when either:
+        // (a) inbound direct reachability was PEER-VERIFIED at global scope
+        //     (`direct_reachability_scope == Some(Global)` — an OBSERVED
+        //     reflexive address alone is NOT proof; it sets
+        //     has_global_address, which we deliberately do not trust), or
+        // (b) a router port mapping is active (UPnP/IGD listener-bound
+        //     external address), or
+        // (c) the operator explicitly opted in via X0X_RELAY_OPT_IN=1 /
+        //     --relay (the escape hatch for nodes that know better than we
+        //     do, e.g. a manually port-forwarded box).
+        let plausibly_public = status
+            .direct_reachability_scope
+            .is_some_and(|scope| matches!(scope, ant_quic::ReachabilityScope::Global))
+            || status.port_mapping_active
+            || relay_opt_in_explicit();
         Self {
             nat_type: Some(status.nat_type.to_string()),
             can_receive_direct: Some(status.can_receive_direct),
-            relay_capable: Some(status.relay_service_enabled),
-            coordinator_capable: Some(status.coordinator_service_enabled),
+            relay_capable: Some(status.relay_service_enabled && plausibly_public),
+            coordinator_capable: Some(status.coordinator_service_enabled && plausibly_public),
             relay_active: Some(status.is_relaying),
             coordinator_active: Some(status.is_coordinating),
         }
     }
+}
+
+/// #398: explicit operator opt-in for announcing relay/coordinator
+/// capability without verified public reachability (manually
+/// port-forwarded hosts, hosts behind an operator-trusted edge). Checked
+/// once per process; absent by default.
+fn relay_opt_in_explicit() -> bool {
+    static OPT_IN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *OPT_IN.get_or_init(|| {
+        // Command line: --relay / --relay-opt-in flag present.
+        let argv_opt_in = std::env::args().any(|arg| arg == "--relay" || arg == "--relay-opt-in");
+        // Environment: X0X_RELAY_OPT_IN=1.
+        let env_opt_in = std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
+        argv_opt_in || env_opt_in
+    })
 }
 
 struct IdentityAnnouncementBuildOptions<'a> {
@@ -13020,6 +13058,96 @@ fn spawn_relay_dm_listener(
 
 #[cfg(test)]
 mod tests {
+    mod announcement_role_honesty {
+        use super::*;
+
+        /// #398: a NATed desktop's DEFAULT announcement must not claim
+        /// relay/coordinator capability. `relay_service_enabled` is true on
+        /// every default daemon (the local MASQUE server always runs), so
+        /// gating on it alone advertised is_coordinator/is_relay = true for
+        /// nodes that cannot serve third parties — coordinator/relay
+        /// selection then picked NATed desktops. An OBSERVED reflexive
+        /// address alone (`has_global_address = true`, scope LocalNetwork)
+        /// must NOT flip the flags.
+        #[test]
+        fn nat_default_daemon_does_not_advertise_relay_or_coordinator() {
+            let status = ant_quic::NodeStatus {
+                // OBSERVED_ADDRESS reflexive candidate exists — address
+                // property, NOT verified inbound reachability.
+                has_global_address: true,
+                // No peer-verified inbound evidence at global scope.
+                direct_reachability_scope: Some(ant_quic::ReachabilityScope::LocalNetwork),
+                can_receive_direct: false,
+                port_mapping_active: false,
+                // Services running (they always are).
+                relay_service_enabled: true,
+                coordinator_service_enabled: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(
+                snapshot.relay_capable,
+                Some(false),
+                "NATed default must not advertise relay capability"
+            );
+            assert_eq!(
+                snapshot.coordinator_capable,
+                Some(false),
+                "NATed default must not advertise coordinator capability"
+            );
+        }
+
+        /// #398: peer-verified inbound reachability at GLOBAL scope is the
+        /// primary honest signal — a public node (VPS) may advertise both.
+        #[test]
+        fn globally_verified_node_advertises_capabilities() {
+            let status = ant_quic::NodeStatus {
+                direct_reachability_scope: Some(ant_quic::ReachabilityScope::Global),
+                can_receive_direct: true,
+                relay_service_enabled: true,
+                coordinator_service_enabled: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(snapshot.relay_capable, Some(true));
+            assert_eq!(snapshot.coordinator_capable, Some(true));
+        }
+
+        /// #398: an active router port mapping (UPnP listener-bound
+        /// external address) is plausibly publicly reachable — may
+        /// advertise even without peer-verified scope.
+        #[test]
+        fn port_mapped_node_advertises_capabilities() {
+            let status = ant_quic::NodeStatus {
+                direct_reachability_scope: None,
+                can_receive_direct: false,
+                port_mapping_active: true,
+                relay_service_enabled: true,
+                coordinator_service_enabled: true,
+                ..ant_quic::NodeStatus::default()
+            };
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(snapshot.relay_capable, Some(true));
+            assert_eq!(snapshot.coordinator_capable, Some(true));
+        }
+
+        /// #398: capability still requires the service — reachability
+        /// alone is not enough when the service is off.
+        #[test]
+        fn reachable_node_without_service_advertises_nothing() {
+            let status = ant_quic::NodeStatus {
+                direct_reachability_scope: Some(ant_quic::ReachabilityScope::Global),
+                can_receive_direct: true,
+                relay_service_enabled: false,
+                coordinator_service_enabled: false,
+                ..ant_quic::NodeStatus::default()
+            };
+            let snapshot = AnnouncementAssistSnapshot::from_node_status(&status);
+            assert_eq!(snapshot.relay_capable, Some(false));
+            assert_eq!(snapshot.coordinator_capable, Some(false));
+        }
+    }
+
     use super::*;
 
     fn sa(s: &str) -> std::net::SocketAddr {
@@ -17537,9 +17665,17 @@ mod tests {
 
     #[test]
     fn announcement_assist_snapshot_uses_capabilities_not_activity() {
+        // #398: this test's original fixture (services on, everything else
+        // defaulted) now honestly yields relay/coordinator = Some(false):
+        // capability requires PLAUSIBLY-PUBLIC reachability in addition to
+        // the service, and the default NodeStatus has neither peer-verified
+        // global scope nor a port mapping. The reachability signal is added
+        // to the fixture so the capability-vs-activity distinction (the
+        // point of this test) stays under test.
         let status = ant_quic::NodeStatus {
             nat_type: ant_quic::NatType::FullCone,
             can_receive_direct: true,
+            direct_reachability_scope: Some(ant_quic::ReachabilityScope::Global),
             relay_service_enabled: true,
             coordinator_service_enabled: true,
             is_relaying: false,
