@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.6] - 2026-08-24
+
+### Changed
+
+- **ant-quic 0.27.45 -> 0.27.47 (#398).** Capability honesty (inbound accepts no longer grant
+  relay/coordinator capability) and MASQUE relay engagement (custom strategy authoritative; the
+  punch stage reserves a relay budget slice so the last line always runs; first runtime relay
+  e2e proof). Completes the 100%-connectable fix set with #399/#400/#401.
+
 ### Fixed
 
 - **Discovery-cache hygiene: dead peers no longer live forever (issue #398).** Two causes fixed:
