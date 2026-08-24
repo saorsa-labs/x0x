@@ -4,6 +4,14 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **ant-quic 0.27.45 → 0.27.46 (#398/#262).** Connection-local NAT candidates are now seeded at
+  traversal start (candidate pairs / path migration reachable for the first time) and traversal
+  counters are honest (attempts on session start; successes per TraversalMethod; new
+  holepunched_connections). Together with #399's dial-by-PeerId this makes the
+  direct→hole-punch→relay ladder reachable end-to-end.
+
 ### Fixed
 
 - **NAT traversal was unreachable: hot connect paths dialled by address, discarding known
