@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`holepunched_connections` surfaced on `GET /diagnostics/transport` (#398).** ant-quic
+  0.27.47'''s honest-counter scheme counts coordinated hole-punch outcomes separately from the
+  aggregate `nat_traversal_successes`; the hand-mapped transport snapshot now passes it through.
+
 ### Fixed
 
 - **Announcement role honesty (#398 follow-up b).** x0x's machine/identity

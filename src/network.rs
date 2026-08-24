@@ -743,6 +743,11 @@ pub struct TransportDiagnosticsSnapshot {
     /// Cumulative NAT traversal attempts / successes.
     pub nat_traversal_attempts: u64,
     pub nat_traversal_successes: u64,
+    /// Connections established via coordinated hole-punch (ant-quic 0.27.47
+    /// honest-counter scheme, #398): unlike `nat_traversal_successes` this
+    /// counts only TraversalMethod::HolePunch/PortPrediction outcomes.
+    #[serde(default)]
+    pub holepunched_connections: u64,
     /// Cumulative direct (no relay/coordinator) connections.
     pub direct_connections: u64,
     /// Cumulative relayed connections.
@@ -811,6 +816,7 @@ impl TransportDiagnosticsSnapshot {
             failed_connections: stats.failed_connections,
             nat_traversal_attempts: stats.nat_traversal_attempts,
             nat_traversal_successes: stats.nat_traversal_successes,
+            holepunched_connections: stats.holepunched_connections,
             direct_connections: stats.direct_connections,
             relayed_connections: stats.relayed_connections,
             connected_bootstrap_nodes: u64::try_from(stats.connected_bootstrap_nodes)
