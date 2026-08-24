@@ -7325,30 +7325,40 @@ impl Agent {
                                 .insert(announcement.agent_id, std::time::Instant::now());
                             let net = std::sync::Arc::clone(net);
                             let addresses = auto_connect_addresses.clone();
+                            let target_machine = announcement.machine_id;
                             tokio::spawn(async move {
-                                for addr in &addresses {
-                                    // #292: the spawned dial still passes
-                                    // through the dial gate — the cheap
-                                    // `announcement_should_auto_connect`
-                                    // check above can race a tombstone that
-                                    // lands after it.
-                                    match net
-                                        .connect_addr_with_origin(*addr, "announcement")
-                                        .await
-                                    {
-                                        Ok(_) => {
-                                            tracing::info!(
-                                                "Auto-connected to discovered agent at {addr}",
-                                            );
-                                            return;
-                                        }
-                                        Err(e) => {
-                                            tracing::debug!("Auto-connect to {addr} failed: {e}",);
-                                        }
+                                // #398: dial by PeerId, not by address. The
+                                // announcement carries the target's machine id
+                                // (= ant-quic PeerId); an address-only dial
+                                // skips ant-quic's HolePunching and Relay
+                                // stages entirely ("hole-punch requires the
+                                // target's PeerId"), which left NATed
+                                // desktop↔desktop pairs permanently
+                                // unreachable while this loop re-dialled their
+                                // private addresses forever. `connect_peer_with_addrs`
+                                // still passes the #292 dial gate and errors
+                                // on identity mismatch.
+                                match net
+                                    .connect_peer_with_addrs(
+                                        ant_quic::PeerId(target_machine.0),
+                                        addresses.clone(),
+                                    )
+                                    .await
+                                {
+                                    Ok((addr, _)) => {
+                                        tracing::info!(
+                                            "Auto-connected to discovered agent at {addr}",
+                                        );
+                                        return;
+                                    }
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "Auto-connect via peer-authenticated dial failed: {e}",
+                                        );
                                     }
                                 }
                                 tracing::debug!(
-                                    "Auto-connect exhausted all {} addresses for discovered agent",
+                                    "Auto-connect failed across all {} candidate addresses",
                                     addresses.len(),
                                 );
                             });

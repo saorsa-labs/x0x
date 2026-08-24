@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **NAT traversal was unreachable: hot connect paths dialled by address, discarding known
+  PeerIds (issue #398).** ant-quic's direct→hole-punch→MASQUE-relay ladder only engages on
+  peer-authenticated dials; announcement auto-connect, eager-set reconnect and both send-path
+  reconnect branches dialled bare addresses, so NATed desktop↔desktop pairs never punched,
+  never relayed (`nat_traversal_attempts` was 0 on every desktop) and the auto-connect loop
+  re-dialled remote private addresses forever. All four sites now use
+  `connect_peer_with_addrs(peer_id, addrs)`; bootstrap dials (no prior PeerId) are unchanged.
+
 ## [v0.39.5] - 2026-08-24
 
 ### Changed

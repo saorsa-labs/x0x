@@ -2316,11 +2316,17 @@ impl NetworkNode {
                     });
                 };
 
-                match tokio::time::timeout(PRE_SEND_RECONNECT_TIMEOUT, self.connect_addr(addr))
-                    .await
+                // #398: peer-authenticated dial so a NATed peer can be
+                // re-reached via the punch/relay ladder instead of a doomed
+                // direct dial to a stale address.
+                match tokio::time::timeout(
+                    PRE_SEND_RECONNECT_TIMEOUT,
+                    self.connect_peer_with_addrs(*peer_id, vec![addr]),
+                )
+                .await
                 {
-                    Ok(Ok(connected_peer)) if connected_peer == *peer_id => Ok(()),
-                    Ok(Ok(connected_peer)) => Err(NetworkError::ConnectionFailed(format!(
+                    Ok(Ok((_, connected_peer))) if connected_peer == *peer_id => Ok(()),
+                    Ok(Ok((_, connected_peer))) => Err(NetworkError::ConnectionFailed(format!(
                         "peer refresh at {addr} connected to unexpected peer {:?}",
                         connected_peer
                     ))),
@@ -2339,11 +2345,15 @@ impl NetworkNode {
                     return Err(cache_err);
                 };
 
-                match tokio::time::timeout(PRE_SEND_RECONNECT_TIMEOUT, self.connect_addr(addr))
-                    .await
+                // #398: peer-authenticated dial (see branch above).
+                match tokio::time::timeout(
+                    PRE_SEND_RECONNECT_TIMEOUT,
+                    self.connect_peer_with_addrs(*peer_id, vec![addr]),
+                )
+                .await
                 {
-                    Ok(Ok(connected_peer)) if connected_peer == *peer_id => Ok(()),
-                    Ok(Ok(connected_peer)) => Err(NetworkError::ConnectionFailed(format!(
+                    Ok(Ok((_, connected_peer))) if connected_peer == *peer_id => Ok(()),
+                    Ok(Ok((_, connected_peer))) => Err(NetworkError::ConnectionFailed(format!(
                         "peer refresh at {addr} connected to unexpected peer {:?}",
                         connected_peer
                     ))),
@@ -4558,13 +4568,18 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
             return Ok(());
         }
 
-        // Connect by address
-        let connected_peer = self
-            .connect_addr_with_origin(addr, "eager_set")
+        // #398: peer-authenticated dial. Dialling by bare address skipped
+        // ant-quic's HolePunching/Relay stages (they require the target's
+        // PeerId), so an eager-set peer behind a NAT could never be
+        // re-reached. `connect_peer_with_addrs` runs the full
+        // direct→punch→relay ladder and errors on identity mismatch.
+        let (_, connected_peer) = self
+            .connect_peer_with_addrs(ant_peer, vec![addr])
             .await
             .map_err(|e| anyhow::anyhow!("dial failed: {}", e))?;
 
-        // Verify we connected to the expected peer
+        // Defence in depth: connect_peer_with_addrs already refuses a
+        // mismatched identity; keep the check as an invariant guard.
         if connected_peer != ant_peer {
             warn!(
                 "SECURITY: Peer mismatch - expected {:?}, got {:?}",
