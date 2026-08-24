@@ -4,6 +4,24 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Announcement role honesty (#398 follow-up b).** x0x's machine/identity
+  announcements advertised `is_coordinator: true, is_relay: true` for every
+  node — `relay_service_enabled`/`coordinator_service_enabled` are true on all
+  default daemons (the local MASQUE server always runs), so NATed desktops
+  with zero third-party reachability claimed both roles, and coordinator/relay
+  selection then picked nodes that cannot serve anyone. The flags are now
+  gated on plausibly-public reachability AND the service:
+  peer-verified inbound at global scope (`direct_reachability_scope == Global`
+  — an OBSERVED reflexive address alone is NOT proof), or an active router
+  port mapping (UPnP listener-bound), or explicit operator opt-in
+  (`--relay`/`--relay-opt-in` flag or `X0X_RELAY_OPT_IN=1` — the escape hatch
+  for manually port-forwarded hosts). A NATed default daemon now announces
+  false for both.
+
+## [Unreleased]
+
 ## [v0.39.6] - 2026-08-24
 
 ### Changed
