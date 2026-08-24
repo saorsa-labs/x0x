@@ -536,9 +536,49 @@ async fn publish_durable_ack_job(
             protocol_version = job.protocol_version,
             hedged = true,
             %error,
-            "one or more durable ACK routes failed; another hedge may still have delivered"
+            "both durable ACK routes failed; ACK never left this recipient"
         );
     }
+}
+
+/// Pre-warm PlumTree membership for the reverse-ACK topics used by a
+/// durable send to `peer`.
+///
+/// Joins (1) this agent's inbox (where ACKs land), (2) the peer's inbox,
+/// and (3) the compatibility bus. C2 refreshes those topic ids on the
+/// subscribed path. C4 also pre-subscribes the peer inbox so the first
+/// durable POST is not a cold `publish_topic_id` join. Does not walk
+/// pass-through topics (Leaf-safe; C0/#395 hygiene).
+pub(crate) async fn warm_reverse_ack_topics(
+    pubsub: &PubSubManager,
+    self_agent: &AgentId,
+    peer: &AgentId,
+) {
+    if !should_warm_reverse_ack(true, self_agent, peer) {
+        return;
+    }
+    let self_name = DmInboxService::inbox_topic_name(self_agent);
+    let peer_name = DmInboxService::inbox_topic_name(peer);
+    pubsub
+        .ensure_subscribed_topic_id(self_name, dm_inbox_topic(self_agent))
+        .await;
+    // C4: peer inbox must be subscribed, not merely initialized, before
+    // the first durable publish_topic_id.
+    pubsub
+        .ensure_subscribed_topic_id(peer_name, dm_inbox_topic(peer))
+        .await;
+    pubsub
+        .ensure_subscribed_topic_id(
+            DM_BUS_TOPIC.to_string(),
+            saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
+        )
+        .await;
+}
+
+/// Reverse-ACK pre-warm is for a Trusted *other* peer. Self and untrusted
+/// peers must not join extra inbox topics on connect.
+pub(crate) fn should_warm_reverse_ack(trusted: bool, self_agent: &AgentId, peer: &AgentId) -> bool {
+    trusted && self_agent != peer
 }
 
 async fn publish_durable_ack_routes<Primary, Legacy>(
@@ -550,21 +590,34 @@ where
     Primary: std::future::Future<Output = NetworkResult<()>>,
     Legacy: std::future::Future<Output = NetworkResult<()>>,
 {
-    // A targeted inbox publish can deliver remotely yet remain pending under
-    // per-topic fan-out backpressure. Poll the compatibility-bus hedge at the
-    // same time so a durable recipient does not commit and dispatch the DM
-    // while the sender exhausts its complete ACK budget waiting on the reverse
-    // targeted topic. Each independently-polled route has an explicit
-    // deadline: the successful hedge can reach the sender immediately, while
-    // a wedged sibling is cancelled at the deadline instead of pinning this
-    // serial inbox loop and blocking later DMs/ACKs forever. These futures
-    // are owned by a bounded background worker, so neither healthy congestion
-    // nor the full route deadline blocks subscription processing.
-    let (primary, legacy) = tokio::join!(
-        publish_ack_route_with_timeout("targeted", route_timeout, primary),
-        publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
-    );
-    primary.and(legacy)
+    // First-success hedge (#380 Phase C / deferred #338): Ok when either
+    // route completes successfully and the sibling is cancelled. A targeted
+    // inbox publish can remain pending under per-topic fan-out after the
+    // compatibility-bus hedge has already delivered. Requiring both
+    // (`join!` + `and`) spent the sender's remaining ACK budget on the
+    // wedged sibling — the locked 504 `budget_stage=ack_wait_ms` (publish
+    // returned; application ACK missed budget). Each route still has its
+    // own deadline so both-hang still fails instead of pinning the worker.
+    // History commit stays awaited before this job is scheduled (#338);
+    // the queue is still non-blocking try_send (#335).
+    let primary = publish_ack_route_with_timeout("targeted", route_timeout, primary);
+    let legacy = publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy);
+    tokio::pin!(primary);
+    tokio::pin!(legacy);
+    tokio::select! {
+        primary = &mut primary => {
+            if primary.is_ok() {
+                return Ok(());
+            }
+            legacy.await
+        }
+        legacy = &mut legacy => {
+            if legacy.is_ok() {
+                return Ok(());
+            }
+            primary.await
+        }
+    }
 }
 
 async fn publish_ack_route_with_timeout<Route>(
@@ -2714,29 +2767,227 @@ mod tests {
         );
     }
 
-    /// Both routes are polled concurrently and each carries its own deadline,
-    /// so one wedged route cannot consume the sender's whole ACK budget. If
-    /// these were awaited in sequence, a stuck targeted publish would hide a
-    /// healthy compatibility-bus hedge behind it — the exact "committed but
-    /// never acked" outcome the hedge exists to remove.
+    /// A route future that never completes and records being dropped.
+    /// Drop must fire even if `select!` never polls this arm — an unstarted
+    /// `async` block would not construct a guard inside its body.
+    struct HangingAckRoute {
+        cancelled: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl std::future::Future for HangingAckRoute {
+        type Output = NetworkResult<()>;
+
+        fn poll(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<Self::Output> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl Drop for HangingAckRoute {
+        fn drop(&mut self) {
+            self.cancelled
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    /// First-success hedge (#380 Phase C): one healthy route must win
+    /// immediately and cancel the hanging sibling. The previous `join!` +
+    /// `and` waited out the hanging route's 22s deadline even after the ACK
+    /// had already left — that is the locked 504 `ack_wait_ms` failure.
     #[tokio::test(start_paused = true)]
-    async fn a_wedged_ack_route_is_cancelled_at_its_deadline_not_awaited_forever() {
-        let healthy = async { Ok(()) };
-        let wedged = async {
-            tokio::time::sleep(Duration::from_secs(3600)).await;
-            Ok(())
+    async fn first_successful_ack_route_cancels_the_hanging_sibling() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hanging = HangingAckRoute {
+            cancelled: Arc::clone(&cancelled),
         };
+        let healthy = async { Ok(()) };
         let started = tokio::time::Instant::now();
-        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, healthy, wedged).await;
+        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, healthy, hanging).await;
 
         assert!(
-            matches!(result, Err(NetworkError::BroadcastError(_))),
-            "a route that never completes must fail at its deadline: {result:?}"
+            result.is_ok(),
+            "one successful route must win the hedge under the attempt budget: {result:?}"
         );
         assert_eq!(
             started.elapsed(),
-            DURABLE_ACK_ROUTE_TIMEOUT,
-            "the deadline, not the wedged route, must bound the wait"
+            Duration::ZERO,
+            "first-success must not wait out the hanging sibling's deadline"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the hanging sibling must be cancelled when the other route succeeds"
+        );
+    }
+
+    /// Same race with the targeted route hanging and the bus winning, so the
+    /// hedge is not accidentally order-dependent on `select!` arm layout.
+    #[tokio::test(start_paused = true)]
+    async fn first_successful_legacy_ack_route_cancels_the_hanging_targeted_route() {
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hanging = HangingAckRoute {
+            cancelled: Arc::clone(&cancelled),
+        };
+        let healthy = async { Ok(()) };
+        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, hanging, healthy).await;
+        assert!(
+            result.is_ok(),
+            "a healthy compatibility-bus hedge must win while targeted hangs: {result:?}"
+        );
+        assert!(
+            cancelled.load(std::sync::atomic::Ordering::SeqCst),
+            "the hanging targeted route must be cancelled"
+        );
+    }
+
+    /// Both routes failing is still an error; the caller records
+    /// `ack_publish_route_failed` so gates can tell ACK never left.
+    #[tokio::test]
+    async fn both_failed_ack_routes_are_an_error() {
+        let primary = async { Err(NetworkError::BroadcastError("targeted".into())) };
+        let legacy = async { Err(NetworkError::BroadcastError("legacy-bus".into())) };
+        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+        assert!(
+            matches!(result, Err(NetworkError::BroadcastError(_))),
+            "both-fail must remain Err + ack_publish_route_failed at the caller: {result:?}"
+        );
+    }
+
+    #[test]
+    fn reverse_ack_prewarm_is_only_for_a_trusted_other_peer() {
+        let self_id = AgentId([1; 32]);
+        let peer = AgentId([2; 32]);
+        assert!(
+            should_warm_reverse_ack(true, &self_id, &peer),
+            "a Trusted other peer is the Direct-connect pre-warm case"
+        );
+        assert!(
+            !should_warm_reverse_ack(false, &self_id, &peer),
+            "untrusted peers must not join extra inbox topics on connect"
+        );
+        assert!(
+            !should_warm_reverse_ack(true, &self_id, &self_id),
+            "self-connect must not pre-warm"
+        );
+    }
+
+    /// Invariant: first durable send to a Direct-connected peer must not be
+    /// the event that joins self inbox, peer inbox, or the compatibility bus.
+    /// Warm uses the real inbox `TopicId`s (Leaf-safe subscribed path), not
+    /// the name-derived ids `refresh_topic_peers` would invent.
+    #[tokio::test]
+    async fn reverse_ack_prewarm_joins_inbox_and_bus_before_any_publish() {
+        let node = Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub = PubSubManager::new(node, None).expect("pubsub");
+        let self_id = AgentId([0xA1; 32]);
+        let peer = AgentId([0xB2; 32]);
+        let self_inbox = dm_inbox_topic(&self_id);
+        let peer_inbox = dm_inbox_topic(&peer);
+        let bus = saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes());
+        let name_derived = saorsa_gossip_types::TopicId::from_entity(
+            DmInboxService::inbox_topic_name(&self_id).as_bytes(),
+        );
+        assert_ne!(
+            self_inbox, name_derived,
+            "inbox TopicId is domain-separated; a name-derived id is the pass-through trap"
+        );
+
+        let before = pubsub.plumtree_topic_ids().await;
+        assert!(
+            !before.contains(&self_inbox)
+                && !before.contains(&peer_inbox)
+                && !before.contains(&bus),
+            "pre-warm must be what joins these topics, not PubSubManager construction"
+        );
+
+        warm_reverse_ack_topics(&pubsub, &self_id, &peer).await;
+
+        let warmed = pubsub.plumtree_topic_ids().await;
+        assert!(
+            warmed.contains(&self_inbox),
+            "self inbox (where ACKs land) must be joined before first durable POST: {warmed:?}"
+        );
+        assert!(
+            warmed.contains(&peer_inbox),
+            "peer inbox must be joined before first durable POST: {warmed:?}"
+        );
+        assert!(
+            warmed.contains(&bus),
+            "compatibility bus must be joined before first durable POST: {warmed:?}"
+        );
+        assert!(
+            !warmed.contains(&name_derived),
+            "must not create a name-derived pass-through topic id (Leaf hygiene)"
+        );
+
+        pubsub
+            .publish_topic_id(
+                DmInboxService::inbox_topic_name(&peer),
+                peer_inbox,
+                Bytes::from_static(b"not-the-join"),
+            )
+            .await
+            .expect("publish after pre-warm");
+        let after_publish = pubsub.plumtree_topic_ids().await;
+        assert!(
+            after_publish.contains(&peer_inbox),
+            "publish must reuse the pre-warmed peer inbox membership"
+        );
+    }
+
+    /// C4: Direct-connect pre-warm must pre-subscribe the peer inbox so the
+    /// first durable POST is not the cold `publish_topic_id` that joins it.
+    #[tokio::test]
+    async fn reverse_ack_prewarm_presubscribes_peer_inbox_before_first_publish() {
+        let node = Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub = PubSubManager::new(node, None).expect("pubsub");
+        let self_id = AgentId([0xC3; 32]);
+        let peer = AgentId([0xD4; 32]);
+        let peer_name = DmInboxService::inbox_topic_name(&peer);
+        let peer_inbox = dm_inbox_topic(&peer);
+
+        assert!(
+            !pubsub.is_topic_subscribed(&peer_name).await,
+            "peer inbox must be unsubscribed before Direct-connect pre-warm"
+        );
+
+        warm_reverse_ack_topics(&pubsub, &self_id, &peer).await;
+
+        assert!(
+            pubsub.is_topic_subscribed(&peer_name).await,
+            "C4: peer inbox must be subscribed before the first durable POST"
+        );
+        assert!(
+            pubsub.plumtree_topic_ids().await.contains(&peer_inbox),
+            "C4 pre-subscribe must join the real inbox TopicId, not wait for publish"
+        );
+
+        let subscribed_before_publish = pubsub.subscription_count().await;
+        pubsub
+            .publish_topic_id(
+                peer_name.clone(),
+                peer_inbox,
+                Bytes::from_static(b"first-durable-must-not-join"),
+            )
+            .await
+            .expect("publish after C4 pre-subscribe");
+        assert_eq!(
+            pubsub.subscription_count().await,
+            subscribed_before_publish,
+            "first publish_topic_id must not be the subscribe/join event"
+        );
+        assert!(
+            pubsub.is_topic_subscribed(&peer_name).await,
+            "peer inbox membership hold must survive the first durable publish"
         );
     }
 

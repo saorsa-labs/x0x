@@ -117,7 +117,18 @@ existing Display string.
 duration. Compare it with the sender's `ack_wait_ms` to see whether the ACK
 publish itself or the reverse path held the waiter.
 
-These fields are measurement only. They are not a latency SLA.
+`stats.ack_publish_route_failed` increments when the ACK never left this
+recipient: both first-success hedge routes failed, or the bounded publisher
+could not schedule the job (full queue / stopped worker). Read the pair as:
+
+| `last_ack_publish_ms` | `ack_publish_route_failed` | Meaning |
+|---|---|---|
+| absent | unchanged | ACK was never scheduled (no durable v2 ACK publish on this daemon yet) |
+| present | incremented | ACK publish was attempted and both routes failed |
+| present | unchanged | ACK was handed to PlumTree; a sender 504 is a reverse-path / waiter miss |
+
+These fields are measurement only. They are not a latency SLA. HTTP status
+codes and sender 504 stage timer field names are unchanged.
 
 ## API-unserved watchdog (#384)
 

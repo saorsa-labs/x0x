@@ -563,10 +563,13 @@ pub struct DmDiagnosticsStats {
     /// the primary per-group/store pubsub path still delivers.
     #[serde(default)]
     pub incoming_typed_route_dropped: u64,
-    /// ACK publish operations where at least one required route returned an
-    /// explicit error or exceeded its deadline. Zero-fanout `Ok` results are
-    /// not counted here. The hedged sibling route may still have delivered
-    /// the ACK, so this reads as route health, not senders left waiting.
+    /// ACK publish operations where every required route failed (first-success
+    /// hedge: both targeted inbox and compatibility-bus returned an error or
+    /// exceeded their deadline) or the ACK job could not be scheduled
+    /// (queue full / worker stopped). `last_ack_publish_ms` staying `None`
+    /// plus an increment here means the ACK never left; a duration without
+    /// an increment means it was handed to PlumTree. Zero-fanout `Ok`
+    /// results are not counted.
     #[serde(default)]
     pub ack_publish_route_failed: u64,
     pub incoming_delivered_to_subscribe: u64,
@@ -994,10 +997,9 @@ impl DirectMessaging {
             .fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Record an ACK publication in which a route returned an explicit error
-    /// or timed out. The durable path publishes in a bounded background
-    /// worker, so this counter is the externally visible signal of ACK route
-    /// trouble — the hedged sibling route may still have delivered the ACK.
+    /// Record an ACK publication in which every required route failed, or
+    /// the job could not be scheduled. After the first-success hedge this
+    /// is "ACK never left", not "one hedge was slow".
     pub(crate) fn record_ack_publish_route_failed(&self) {
         self.diagnostics
             .ack_publish_route_failed
@@ -1498,9 +1500,19 @@ mod tests {
         let snap = dm.diagnostics_snapshot();
         assert_eq!(snap.last_durable_send, Some(stages));
         assert_eq!(snap.last_ack_publish_ms, Some(7));
+        assert_eq!(snap.stats.ack_publish_route_failed, 0);
         assert_eq!(
             snap.last_durable_send.expect("recorded").budget_stage(),
             "ack_wait_ms"
+        );
+
+        dm.record_ack_publish_route_failed();
+        let failed = dm.diagnostics_snapshot();
+        assert_eq!(failed.stats.ack_publish_route_failed, 1);
+        assert_eq!(
+            failed.last_ack_publish_ms,
+            Some(7),
+            "route-failed must not clear last_ack_publish_ms; gates compare the two"
         );
     }
 

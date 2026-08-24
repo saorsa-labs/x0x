@@ -1168,7 +1168,7 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/ack` | `x0x diagnostics ack` | ACK-v2 per-stage latency buckets and outcome counters |
 | GET | `/diagnostics/gossip` | `x0x diagnostics gossip` | PubSub drop-detection counters (publish/deliver deltas) |
 | GET | `/diagnostics/transport` | `x0x diagnostics transport` | Transport connection accounting (zombie-connection hunt, #368) |
-| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters, per-peer health, and last durable-send stage timers (`last_durable_send`, `last_ack_publish_ms`) |
+| GET | `/diagnostics/dm` | `x0x diagnostics dm` | Direct-message send/receive counters, per-peer health, last durable-send stage timers (`last_durable_send`), receiver ACK publish duration (`last_ack_publish_ms`), and `stats.ack_publish_route_failed` |
 | GET | `/diagnostics/groups` | `x0x diagnostics groups` | Per-group ingest counters, listener state, and drop buckets |
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |

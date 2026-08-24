@@ -127,6 +127,20 @@ pub enum ConnectOutcome {
     NotFound,
 }
 
+impl ConnectOutcome {
+    /// A live path that can carry a durable send and its reverse ACK.
+    ///
+    /// Direct, coordinated hole-punch, and already-connected reuse are all
+    /// live. Unreachable / not-found are not.
+    #[must_use]
+    pub fn is_live_path(&self) -> bool {
+        matches!(
+            self,
+            Self::Direct(_) | Self::Coordinated(_) | Self::AlreadyConnected
+        )
+    }
+}
+
 impl std::fmt::Display for ConnectOutcome {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -616,6 +630,16 @@ mod tests {
         let a = addr();
         assert_eq!(ConnectOutcome::Direct(a), ConnectOutcome::Direct(a));
         assert_ne!(ConnectOutcome::Direct(a), ConnectOutcome::Unreachable);
+    }
+
+    #[test]
+    fn connect_outcome_live_path_is_direct_coordinated_or_already_connected() {
+        let a = addr();
+        assert!(ConnectOutcome::Direct(a).is_live_path());
+        assert!(ConnectOutcome::Coordinated(a).is_live_path());
+        assert!(ConnectOutcome::AlreadyConnected.is_live_path());
+        assert!(!ConnectOutcome::Unreachable.is_live_path());
+        assert!(!ConnectOutcome::NotFound.is_live_path());
     }
 
     #[test]
