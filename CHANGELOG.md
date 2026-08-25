@@ -14,6 +14,16 @@ All notable changes to this project will be documented in this file.
   `GET /diagnostics/gossip` now reports `participation.mode` and
   `passthrough_refresh_runs`. Durable DM path selection is unchanged.
 
+- **Leaf C0: refuse GRAFT/eager on unsubscribed topics (issue #380).**
+  `passthrough_refresh_runs=0` is not enough — inbound EAGER/IHAVE/IWANT still
+  created pass-through PlumTree state and local GRAFT. Leaf
+  `handle_incoming` now drops those frames (and anti-entropy) unless the
+  topic id is locally subscribed. Full is unchanged. `participation.relay_bytes`
+  is redefined as **non-subscribed forward**; subscribed epidemic is
+  `epidemic_forward_bytes`. Soak gate: ≥90% drop vs the ~1500 KB/s Phase B
+  baseline (`docs/380-c0-soak-gate.md`). Adopt saorsa-gossip 0.5.74 for
+  per-topic outbound meters. C0 is blocking for #380; not sufficient alone
+  to close durable.
 ### Fixed
 
 - **(#396 rework)** C1 (first-success ACK hedge) was removed before merge:

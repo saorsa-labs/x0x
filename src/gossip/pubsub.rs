@@ -8,15 +8,20 @@
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
-use super::participation::{ParticipationMode, ParticipationSnapshot};
+use super::participation::{
+    classify_outbound_relay_json, leaf_refuses_unsubscribed_passthrough, ParticipationMode,
+    ParticipationSnapshot, RELAY_BYTES_SEMANTICS,
+};
 use crate::contacts::{ContactStore, TrustLevel};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
 use crate::network::NetworkNode;
 use bytes::Bytes;
 use saorsa_gossip_pubsub::{PlumtreePubSub, PubSub};
-use saorsa_gossip_types::{PeerHealthOracle, PeerId, TopicId, TopicPriority};
-use std::collections::HashMap;
+use saorsa_gossip_types::{
+    MessageHeader, MessageKind, PeerHealthOracle, PeerId, TopicId, TopicPriority,
+};
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::sync::{mpsc, RwLock};
@@ -192,10 +197,17 @@ pub struct PubSubMessage {
 pub struct Subscription {
     /// The topic this subscription is for.
     topic: String,
+    /// Transport id recorded at subscribe time (DM inboxes use a
+    /// domain-separated id, not `TopicId::from_entity(name)`).
+    topic_id: Option<TopicId>,
     /// Channel receiver for messages on this topic.
     receiver: mpsc::Receiver<PubSubMessage>,
     /// Reference to per-topic subscriber counts for cleanup on drop.
     topic_ref_counts: Arc<RwLock<HashMap<String, usize>>>,
+    /// Name → transport id, dropped with the last local subscriber.
+    topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
+    /// Live subscribed transport ids used by the Leaf C0 refuse gate.
+    subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
 }
 
 impl Subscription {
@@ -218,7 +230,10 @@ impl Subscription {
 impl Drop for Subscription {
     fn drop(&mut self) {
         let topic = self.topic.clone();
+        let topic_id = self.topic_id;
         let topic_ref_counts = self.topic_ref_counts.clone();
+        let topic_id_by_name = self.topic_id_by_name.clone();
+        let subscribed_topic_ids = self.subscribed_topic_ids.clone();
 
         // Spawn a task to decrement the refcount for this topic.
         // This avoids blocking on synchronous locks in drop.
@@ -229,6 +244,16 @@ impl Drop for Subscription {
                     *count -= 1;
                 } else {
                     counts.remove(&topic);
+                    topic_id_by_name
+                        .write()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .remove(&topic);
+                    if let Some(topic_id) = topic_id {
+                        subscribed_topic_ids
+                            .write()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .remove(&topic_id);
+                    }
                 }
             }
         });
@@ -285,6 +310,14 @@ pub struct PubSubManager {
     participation_reason: String,
     /// Times the Full pass-through loop actually ran.
     passthrough_refresh_runs: AtomicU64,
+    /// Name → actual PlumTree topic id (DM inboxes are not `from_entity(name)`).
+    topic_id_by_name: Arc<std::sync::RwLock<HashMap<String, TopicId>>>,
+    /// Live subscribed transport ids for the Leaf C0 refuse gate.
+    subscribed_topic_ids: Arc<std::sync::RwLock<HashSet<TopicId>>>,
+    /// Inbound unsubscribed pass-through frames this Leaf refused.
+    unsubscribed_refused_frames: AtomicU64,
+    unsubscribed_refused_bytes: AtomicU64,
+    unsubscribed_refused_graft_equiv: AtomicU64,
     /// Test-only: topic ids last passed to `set_topic_peers`.
     #[cfg(test)]
     refreshed_topic_ids: std::sync::Mutex<Vec<TopicId>>,
@@ -306,6 +339,15 @@ pub const LOCAL_TOPIC_PREFIX: &str = "local:";
 #[must_use]
 pub fn is_local_topic(topic: &str) -> bool {
     topic.starts_with(LOCAL_TOPIC_PREFIX)
+}
+
+/// Peek the PlumTree header of a serialized `GossipMessage` without verifying
+/// the signature. Used by the Leaf C0 refuse gate so unsubscribed frames
+/// never reach `handle_message`.
+fn peek_pubsub_header(frame: &[u8]) -> Option<MessageHeader> {
+    postcard::take_from_bytes::<MessageHeader>(frame)
+        .ok()
+        .map(|(header, _rest)| header)
 }
 
 impl std::fmt::Debug for PubSubManager {
@@ -394,6 +436,11 @@ impl PubSubManager {
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
+            topic_id_by_name: Arc::new(std::sync::RwLock::new(HashMap::new())),
+            subscribed_topic_ids: Arc::new(std::sync::RwLock::new(HashSet::new())),
+            unsubscribed_refused_frames: AtomicU64::new(0),
+            unsubscribed_refused_bytes: AtomicU64::new(0),
+            unsubscribed_refused_graft_equiv: AtomicU64::new(0),
             #[cfg(test)]
             refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
             #[cfg(test)]
@@ -405,12 +452,42 @@ impl PubSubManager {
     #[must_use]
     pub fn participation_snapshot(&self) -> ParticipationSnapshot {
         let runs = self.passthrough_refresh_runs.load(Ordering::Relaxed);
+        let metering = self.relay_metering();
         ParticipationSnapshot {
             mode: self.participation,
             reason: self.participation_reason.clone(),
             passthrough_refresh_runs: runs,
             passthrough_refresh_ran: runs > 0,
+            unsubscribed_refused_frames: self.unsubscribed_refused_frames.load(Ordering::Relaxed),
+            unsubscribed_refused_bytes: self.unsubscribed_refused_bytes.load(Ordering::Relaxed),
+            unsubscribed_refused_graft_equiv: self
+                .unsubscribed_refused_graft_equiv
+                .load(Ordering::Relaxed),
+            relay_bytes: metering.relay_bytes,
+            relay_msgs: metering.relay_msgs,
+            epidemic_forward_bytes: metering.epidemic_forward_bytes,
+            epidemic_forward_msgs: metering.epidemic_forward_msgs,
+            relay_bytes_semantics: RELAY_BYTES_SEMANTICS,
         }
+    }
+
+    fn subscribed_topic_keys(&self) -> HashSet<String> {
+        self.subscribed_topic_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    fn relay_metering(&self) -> super::participation::RelayMetering {
+        let stages = serde_json::to_value(self.plumtree.stage_stats()).unwrap_or_default();
+        classify_outbound_relay_json(
+            stages
+                .get("outbound_by_topic")
+                .unwrap_or(&serde_json::Value::Null),
+            &self.subscribed_topic_keys(),
+        )
     }
 
     /// Snapshot of drop-detection counters for the gossip pipeline.
@@ -487,8 +564,11 @@ impl PubSubManager {
             }
             return Subscription {
                 topic,
+                topic_id: None,
                 receiver: rx,
                 topic_ref_counts: Arc::clone(&self.topic_ref_counts),
+                topic_id_by_name: Arc::clone(&self.topic_id_by_name),
+                subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
             };
         }
 
@@ -506,6 +586,29 @@ impl PubSubManager {
         {
             let mut counts = self.topic_ref_counts.write().await;
             *counts.entry(topic.clone()).or_insert(0) += 1;
+        }
+        self.topic_id_by_name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(topic.clone(), topic_id);
+        self.subscribed_topic_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(topic_id);
+        // ADR-0034 / #397 (Leaf C0): a Leaf node REFUSES inbound frames —
+        // including anti-entropy — for unsubscribed topics, so a topic that
+        // was unsubscribed for a while has no passively-repaired state to
+        // rejoin. Trigger an explicit anti-entropy round on (re)subscribe so
+        // catch-up is a property of the subscribe path itself, not a hope
+        // that background repair happens to run. Best-effort: failure only
+        // delays convergence to the next periodic round.
+        {
+            let plumtree = Arc::clone(&self.plumtree);
+            tokio::spawn(async move {
+                if let Err(e) = plumtree.trigger_anti_entropy(topic_id).await {
+                    tracing::debug!("subscribe-time anti-entropy trigger failed: {e}");
+                }
+            });
         }
 
         let sub_topic = topic.clone();
@@ -595,8 +698,11 @@ impl PubSubManager {
 
         Subscription {
             topic,
+            topic_id: Some(topic_id),
             receiver: rx,
             topic_ref_counts: self.topic_ref_counts.clone(),
+            topic_id_by_name: Arc::clone(&self.topic_id_by_name),
+            subscribed_topic_ids: Arc::clone(&self.subscribed_topic_ids),
         }
     }
 
@@ -752,15 +858,52 @@ impl PubSubManager {
 
     /// Handle an incoming message from a peer.
     ///
-    /// This delegates to the PlumTree implementation for protocol-level
-    /// processing (EAGER/IHAVE/IWANT/AntiEntropy).
+    /// Leaf (#380 C0): refuse GRAFT-equivalent / eager / IHAVE / IWANT /
+    /// anti-entropy frames for topics this node does not subscribe to, so
+    /// PlumTree never creates pass-through state or eager-forwards them.
+    /// Full nodes keep today's `handle_message` behaviour.
     pub async fn handle_incoming(&self, peer: PeerId, data: Bytes) {
+        if self.refuse_leaf_unsubscribed_passthrough(&data) {
+            return;
+        }
         if let Err(e) = self.plumtree.handle_message(peer, data).await {
             tracing::warn!(
                 "Failed to handle PlumTree pubsub message from {}: {e}",
                 crate::logging::LogPeerId::from(peer)
             );
         }
+    }
+
+    fn refuse_leaf_unsubscribed_passthrough(&self, data: &[u8]) -> bool {
+        let Some(header) = peek_pubsub_header(data) else {
+            return false;
+        };
+        let subscribed = self
+            .subscribed_topic_ids
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .contains(&header.topic);
+        if !leaf_refuses_unsubscribed_passthrough(self.participation, subscribed, header.kind) {
+            return false;
+        }
+        self.unsubscribed_refused_frames
+            .fetch_add(1, Ordering::Relaxed);
+        self.unsubscribed_refused_bytes
+            .fetch_add(data.len() as u64, Ordering::Relaxed);
+        if matches!(
+            header.kind,
+            MessageKind::Eager | MessageKind::IHave | MessageKind::IWant
+        ) {
+            self.unsubscribed_refused_graft_equiv
+                .fetch_add(1, Ordering::Relaxed);
+        }
+        tracing::debug!(
+            topic = %header.topic,
+            kind = ?header.kind,
+            bytes = data.len(),
+            "Leaf refused unsubscribed PlumTree pass-through frame (#380 C0)"
+        );
+        true
     }
 
     /// Get the number of active subscriptions (topics with at least one subscriber).
@@ -775,7 +918,16 @@ impl PubSubManager {
             self.local_topics.write().await.remove(topic);
             return;
         }
-        let topic_id = TopicId::from_entity(topic.as_bytes());
+        let stored_id = self
+            .topic_id_by_name
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(topic);
+        let topic_id = stored_id.unwrap_or_else(|| TopicId::from_entity(topic.as_bytes()));
+        self.subscribed_topic_ids
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&topic_id);
         if let Err(e) = self.plumtree.unsubscribe(topic_id).await {
             tracing::debug!("PlumTree unsubscribe failed for topic '{topic}': {e}");
         }
@@ -2289,6 +2441,128 @@ mod tests {
         assert_eq!(snap.mode, ParticipationMode::Full);
         assert!(snap.passthrough_refresh_ran);
         assert_eq!(snap.passthrough_refresh_runs, 1);
+    }
+
+    fn passthrough_frame(kind: MessageKind, topic: TopicId) -> Bytes {
+        let msg = saorsa_gossip_pubsub::GossipMessage {
+            header: MessageHeader {
+                version: 1,
+                topic,
+                msg_id: [0u8; 32],
+                kind,
+                hop: 0,
+                ttl: 10,
+                payload_hash: None,
+            },
+            payload: None,
+            signature: Vec::new(),
+            public_key: Vec::new(),
+        };
+        postcard::to_stdvec(&msg)
+            .expect("passthrough frame serializes")
+            .into()
+    }
+
+    #[tokio::test]
+    async fn leaf_refuses_graft_and_eager_for_unsubscribed_topic_ids() {
+        // Why (#380 C0): inbound EAGER/IHAVE/IWANT create pass-through
+        // PlumTree state and local GRAFT even when refresh is skipped.
+        let node = test_node().await;
+        let manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Leaf,
+            "default_leaf",
+        )
+        .expect("manager");
+        let subscribed = "x0x/caps/v1";
+        let passthrough = "x0x.groups.public.v1";
+        let _sub = manager.subscribe(subscribed.to_string()).await;
+        let peer = PeerId::new([7; 32]);
+        let passthrough_id = TopicId::from_entity(passthrough.as_bytes());
+
+        for kind in [MessageKind::Eager, MessageKind::IHave, MessageKind::IWant] {
+            manager
+                .handle_incoming(peer, passthrough_frame(kind, passthrough_id))
+                .await;
+        }
+
+        let snap = manager.participation_snapshot();
+        assert_eq!(snap.unsubscribed_refused_frames, 3);
+        assert_eq!(snap.unsubscribed_refused_graft_equiv, 3);
+        assert!(
+            snap.unsubscribed_refused_bytes > 0,
+            "refused frames must count inbound bytes"
+        );
+        let known = manager.plumtree.all_topic_ids().await;
+        assert!(
+            !known.contains(&passthrough_id),
+            "Leaf must not let unsubscribed GRAFT/eager reach PlumTree"
+        );
+        assert_eq!(
+            snap.relay_bytes_semantics, RELAY_BYTES_SEMANTICS,
+            "relay_bytes means non-subscribed forward"
+        );
+    }
+
+    #[tokio::test]
+    async fn leaf_still_accepts_subscribed_topic_passthrough_frames() {
+        let node = test_node().await;
+        let manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Leaf,
+            "default_leaf",
+        )
+        .expect("manager");
+        let subscribed = "x0x/dm/v1/inbox/self";
+        let mut sub = manager.subscribe(subscribed.to_string()).await;
+        let peer = PeerId::new([3; 32]);
+        let subscribed_id = TopicId::from_entity(subscribed.as_bytes());
+
+        manager
+            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, subscribed_id))
+            .await;
+
+        let snap = manager.participation_snapshot();
+        assert_eq!(
+            snap.unsubscribed_refused_frames, 0,
+            "subscribed topics must still reach PlumTree on Leaf"
+        );
+        manager
+            .publish(subscribed.to_string(), Bytes::from("still-works"))
+            .await
+            .expect("leaf subscribed publish");
+        let msg = sub.recv().await.expect("leaf subscribed delivery");
+        assert_eq!(msg.payload, Bytes::from("still-works"));
+    }
+
+    #[tokio::test]
+    async fn full_still_accepts_unsubscribed_passthrough_frames() {
+        let node = test_node().await;
+        let manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Full,
+            "operator_relay",
+        )
+        .expect("manager");
+        let passthrough = "x0x.groups.public.v1";
+        let peer = PeerId::new([9; 32]);
+        let passthrough_id = TopicId::from_entity(passthrough.as_bytes());
+
+        manager
+            .handle_incoming(peer, passthrough_frame(MessageKind::Eager, passthrough_id))
+            .await;
+
+        let snap = manager.participation_snapshot();
+        assert_eq!(
+            snap.unsubscribed_refused_frames, 0,
+            "Full must keep today's unsubscribed pass-through"
+        );
     }
 
     #[tokio::test]
