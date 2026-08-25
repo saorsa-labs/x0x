@@ -351,8 +351,21 @@ pub async fn serve_with_options(
         history_config.db_path = Some(config.data_dir.join("history.db"));
     }
     let exe = std::env::current_exe().ok();
+    // ADR-0034: `--relay` is ONE operator concept — "be a relay node". Any of
+    // the three sources (CLI flag, `X0X_RELAY_OPT_IN=1`, TOML `gossip.relay`)
+    // selects BOTH Full gossip participation here AND relay/coordinator
+    // capability advertisement (#406's `relay_opt_in_explicit`, which reads
+    // the flag/env itself). Normalise the env var so the announcement side's
+    // process-wide check observes TOML/CLI opt-in too.
+    let operator_relay = cli_relay
+        || config.gossip.relay
+        || std::env::var_os("X0X_RELAY_OPT_IN").is_some_and(|v| v == "1");
+    if operator_relay {
+        // Safe: single-threaded startup path, before any Agent tasks spawn.
+        std::env::set_var("X0X_RELAY_OPT_IN", "1");
+    }
     let participation = x0x::gossip::resolve_participation(x0x::gossip::ParticipationInputs {
-        operator_relay: cli_relay || config.gossip.relay,
+        operator_relay,
         bind_addr: bind_address,
         local_addrs: &[],
         current_exe: exe.as_deref(),
@@ -360,7 +373,7 @@ pub async fn serve_with_options(
     tracing::info!(
         mode = %participation.mode,
         reason = participation.reason,
-        operator_relay = cli_relay || config.gossip.relay,
+        operator_relay,
         bind_addr = %bind_address,
         "resolved gossip participation mode"
     );

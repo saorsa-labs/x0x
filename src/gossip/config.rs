@@ -226,4 +226,21 @@ mod tests {
         assert_eq!(cfg.resolved_participation(), ParticipationMode::Full);
         assert_eq!(cfg.resolved_participation_reason(), "operator_relay");
     }
+    /// ADR-0034: `gossip.relay = true` (TOML) must resolve Full — one operator
+    /// concept across CLI/env/TOML; the server startup normalises the env var
+    /// so the announcement side (#406) observes the same opt-in.
+    #[test]
+    fn toml_relay_resolves_full_participation() {
+        let mut c = GossipConfig::default();
+        assert_eq!(
+            c.resolved_participation(),
+            super::super::ParticipationMode::Leaf
+        );
+        c.relay = true;
+        assert_eq!(
+            c.resolved_participation(),
+            super::super::ParticipationMode::Full
+        );
+        assert_eq!(c.resolved_participation_reason(), "operator_relay");
+    }
 }

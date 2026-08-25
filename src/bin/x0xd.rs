@@ -96,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
             "    --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)"
         );
         println!(
-            "    --relay                         Opt in to Full gossip participation (pass-through)"
+            "    --relay                         Be a relay node: Full participation + capability advertisement (ADR-0034)"
         );
         println!("    --disable-peer-cache            Do not load or save cached peers");
         println!("    --exec-acl <PATH>               Override default exec ACL path");
