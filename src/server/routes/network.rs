@@ -715,9 +715,10 @@ pub(in crate::server) async fn dm_diagnostics(
     if let Some(stages) = last_durable_send {
         body["last_durable_send"] = stages.to_export_json();
     }
-    if let Some(ack_publish_ms) = last_ack_publish_ms {
-        body["last_ack_publish_ms"] = serde_json::json!(ack_publish_ms);
-    }
+    // C5c: Tester captures these on every durable result (504 and 200).
+    // Always present so absence is not confused with "ACK never scheduled".
+    body["last_ack_publish_ms"] = serde_json::json!(last_ack_publish_ms);
+    body["ack_publish_route_failed"] = serde_json::json!(stats.ack_publish_route_failed);
     (StatusCode::OK, Json(body))
 }
 

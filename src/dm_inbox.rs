@@ -13,9 +13,12 @@ use crate::error::{NetworkError, NetworkResult};
 use crate::gossip::{PubSubManager, PubSubMessage, SigningContext, Subscription};
 use crate::groups::kem_envelope::AgentKemKeypair;
 use crate::identity::{AgentId, MachineId, MachineKeypair};
+use crate::network::NetworkNode;
 use crate::revocation::RevocationSet;
 use crate::trust::{TrustContext, TrustDecision, TrustEvaluator};
+use async_trait::async_trait;
 use bytes::Bytes;
+use saorsa_gossip_types::TopicId;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::sync::{mpsc, oneshot, RwLock};
@@ -31,6 +34,55 @@ const DURABLE_ACK_ROUTE_TIMEOUT: Duration = Duration::from_secs(22);
 const DURABLE_ACK_QUEUE_CAPACITY: usize = 256;
 /// Bound the number of ACK jobs simultaneously holding pubsub fan-out work.
 const DURABLE_ACK_MAX_CONCURRENT: usize = 32;
+
+/// Outcome of the C5 live Direct/typed ACK hedge.
+///
+/// Direct send-ok is never a sender receipt. The waiter completes only when
+/// the same v2 envelope arrives and matches `acks_request_id`. Missing Direct
+/// is fail-open so the inbox + compatibility-bus gossip hedges still count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirectAckHedgeOutcome {
+    Sent,
+    SkippedNoDirect,
+    Failed,
+}
+
+/// Send the already-committed v2 ACK envelope on a live Direct/typed path.
+///
+/// Implementations must not treat a successful send as waiter completion and
+/// must not fail the durable ACK when no Direct connection exists.
+#[async_trait]
+pub(crate) trait DirectAckHedge: Send + Sync {
+    async fn hedge(&self, recipient: AgentId, encoded: Bytes) -> DirectAckHedgeOutcome;
+}
+
+/// Production C5 hedge: send the same v2 ACK envelope on live Direct/typed.
+pub(crate) struct LiveDirectAckHedge {
+    pub network: Arc<NetworkNode>,
+    pub dm: Arc<DirectMessaging>,
+    pub sender_agent_id: AgentId,
+}
+
+#[async_trait]
+impl DirectAckHedge for LiveDirectAckHedge {
+    async fn hedge(&self, recipient: AgentId, encoded: Bytes) -> DirectAckHedgeOutcome {
+        let Some(machine) = self.dm.get_machine_id(&recipient).await else {
+            return DirectAckHedgeOutcome::SkippedNoDirect;
+        };
+        let peer = ant_quic::PeerId(machine.0);
+        if !self.network.is_connected(&peer).await {
+            return DirectAckHedgeOutcome::SkippedNoDirect;
+        }
+        match self
+            .network
+            .send_direct(&peer, self.sender_agent_id.as_bytes(), encoded.as_ref())
+            .await
+        {
+            Ok(()) => DirectAckHedgeOutcome::Sent,
+            Err(_) => DirectAckHedgeOutcome::Failed,
+        }
+    }
+}
 
 /// How long the durable path waits for a typed-route handler to report
 /// completion before withholding the ACK (ADR 0030 §7).
@@ -292,6 +344,7 @@ pub struct DmTypedPayload {
 pub struct DmInboxService {
     handles: Vec<JoinHandle<()>>,
     topic: String,
+    pipeline: InboxPipeline,
 }
 
 /// One durable (v2) ACK envelope awaiting publication on both routes.
@@ -330,6 +383,17 @@ impl AckPublisherHandle {
 pub const DM_BUS_TOPIC: &str = "x0x/dm/v1/bus";
 const DM_INBOX_TOPIC_NAME_PREFIX: &str = "x0x/dm/v1/inbox/";
 
+/// Topic ids that may receive one Full/bootstrap eager prefer (C5b).
+///
+/// C0 stays: this list is inbox + compatibility bus only. Unsubscribed
+/// pass-through / GRAFT piggyback is not re-enabled here.
+pub(crate) fn ack_publish_eager_topics(recipient: &AgentId) -> [TopicId; 2] {
+    [
+        dm_inbox_topic(recipient),
+        TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
+    ]
+}
+
 impl DmInboxService {
     /// Human-readable name for the agent's raw derived DM inbox topic.
     #[must_use]
@@ -357,13 +421,51 @@ impl DmInboxService {
         authenticated_machine_bindings: AuthenticatedMachineBindings,
         history: Option<crate::history::HistoryHandle>,
     ) -> NetworkResult<Self> {
+        Self::spawn_with_hedge(
+            pubsub,
+            signing,
+            self_agent_id,
+            self_machine_id,
+            machine_keypair,
+            kem_keypair,
+            dm,
+            contacts,
+            inflight,
+            cache,
+            config,
+            revocation_set,
+            authenticated_machine_bindings,
+            history,
+            None,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn spawn_with_hedge(
+        pubsub: Arc<PubSubManager>,
+        signing: Arc<SigningContext>,
+        self_agent_id: AgentId,
+        self_machine_id: MachineId,
+        machine_keypair: Arc<MachineKeypair>,
+        kem_keypair: Arc<AgentKemKeypair>,
+        dm: Arc<DirectMessaging>,
+        contacts: Arc<RwLock<ContactStore>>,
+        inflight: Arc<InFlightAcks>,
+        cache: Arc<RecentDeliveryCache>,
+        config: DmInboxConfig,
+        revocation_set: Arc<RwLock<RevocationSet>>,
+        authenticated_machine_bindings: AuthenticatedMachineBindings,
+        history: Option<crate::history::HistoryHandle>,
+        direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    ) -> NetworkResult<Self> {
         let topic = Self::inbox_topic_name(&self_agent_id);
         let subscription = pubsub
             .subscribe_topic_id(topic.clone(), dm_inbox_topic(&self_agent_id))
             .await;
         let legacy_subscription = pubsub.subscribe(DM_BUS_TOPIC.to_string()).await;
         let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm), direct_hedge);
 
         let pipeline = InboxPipeline {
             pubsub: Arc::clone(&pubsub),
@@ -390,7 +492,7 @@ impl DmInboxService {
             DM_BUS_TOPIC.to_string(),
             true,
             legacy_subscription,
-            pipeline,
+            pipeline.clone(),
         );
 
         Ok(Self {
@@ -398,7 +500,24 @@ impl DmInboxService {
             // route publications. A graceful channel close drains them.
             handles: vec![primary_handle, legacy_handle, ack_worker],
             topic,
+            pipeline,
         })
+    }
+
+    /// Ingest a Direct/typed payload if it is the same v2 ACK envelope.
+    ///
+    /// Returns `true` when the bytes decoded as an ACK (whether or not a
+    /// waiter was still registered). Direct send-ok is not a receipt; this
+    /// is the request_id path the sender waiter actually completes on.
+    pub async fn try_ingest_direct_ack(
+        &self,
+        sender: AgentId,
+        sender_public_key: Vec<u8>,
+        payload: Bytes,
+    ) -> bool {
+        self.pipeline
+            .ingest_direct_ack_envelope(sender, sender_public_key, payload)
+            .await
     }
 
     #[must_use]
@@ -437,13 +556,15 @@ fn spawn_subscription_loop(
 fn spawn_durable_ack_publisher(
     pubsub: Arc<PubSubManager>,
     dm: Arc<DirectMessaging>,
+    direct_hedge: Option<Arc<dyn DirectAckHedge>>,
 ) -> (AckPublisherHandle, JoinHandle<()>) {
     let (sender, receiver) = mpsc::channel(DURABLE_ACK_QUEUE_CAPACITY);
     let worker = spawn_ack_publish_worker(receiver, move |job| {
         let pubsub = Arc::clone(&pubsub);
         let dm = Arc::clone(&dm);
+        let direct_hedge = direct_hedge.clone();
         async move {
-            publish_durable_ack_job(pubsub, dm, job).await;
+            publish_durable_ack_job(pubsub, dm, direct_hedge, job).await;
         }
     });
     (AckPublisherHandle { sender }, worker)
@@ -510,12 +631,19 @@ fn log_ack_publish_join_result(result: Result<(), tokio::task::JoinError>) {
 async fn publish_durable_ack_job(
     pubsub: Arc<PubSubManager>,
     dm: Arc<DirectMessaging>,
+    direct_hedge: Option<Arc<dyn DirectAckHedge>>,
     job: AckPublishJob,
 ) {
+    // C5b: prefer one Full/bootstrap eager on inbox+bus only. Does not
+    // re-enable unsubscribed pass-through / GRAFT piggyback (C0).
+    pubsub
+        .prefer_one_full_bootstrap_eager(&ack_publish_eager_topics(&job.recipient))
+        .await;
+
     let topic = DmInboxService::inbox_topic_name(&job.recipient);
     let topic_id = dm_inbox_topic(&job.recipient);
     let encoded_primary = Bytes::clone(&job.encoded);
-    let encoded_legacy = job.encoded;
+    let encoded_legacy = Bytes::clone(&job.encoded);
     let primary_pubsub = Arc::clone(&pubsub);
     let legacy_pubsub = Arc::clone(&pubsub);
     // Owned clones so each route can be spawned independently. First-success
@@ -535,10 +663,18 @@ async fn publish_durable_ack_job(
             .publish(DM_BUS_TOPIC.to_string(), encoded_legacy)
             .await
     };
+    // C5: same v2 ACK envelope on live Direct/typed as a third hedge.
+    // Detached from gossip: missing Direct is fail-open, and Direct send-ok
+    // is not a sender receipt. Do not abort sibling gossip routes.
+    let direct =
+        hedge_direct_ack_fail_open(direct_hedge, job.recipient, Bytes::clone(&job.encoded));
     let publish_started = Instant::now();
-    let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
+    let (gossip, direct_outcome) = tokio::join!(
+        publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy),
+        publish_ack_route_with_timeout("direct-typed", DURABLE_ACK_ROUTE_TIMEOUT, direct),
+    );
     dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
-    if let Err(error) = result {
+    if let Err(error) = gossip {
         dm.record_ack_publish_route_failed();
         tracing::warn!(
             target: "dm.trace",
@@ -550,6 +686,48 @@ async fn publish_durable_ack_job(
             %error,
             "both durable ACK routes failed; ACK never left this recipient"
         );
+    } else if let Err(error) = direct_outcome {
+        // Gossip landed; Direct failed after a live connection existed.
+        // Count it for Tester visibility, but do not fail the ACK.
+        dm.record_ack_publish_route_failed();
+        tracing::debug!(
+            target: "dm.trace",
+            stage = "ack_publish_direct_hedge_failed",
+            acked_request_id = %hex::encode(job.acked_request_id),
+            recipient = %hex::encode(job.recipient.as_bytes()),
+            protocol_version = job.protocol_version,
+            %error,
+            "Direct/typed ACK hedge failed; gossip hedges still count"
+        );
+    }
+}
+
+async fn hedge_direct_ack_fail_open(
+    direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    recipient: AgentId,
+    encoded: Bytes,
+) -> NetworkResult<()> {
+    let Some(hedge) = direct_hedge else {
+        return Ok(());
+    };
+    match hedge.hedge(recipient, encoded).await {
+        DirectAckHedgeOutcome::Sent | DirectAckHedgeOutcome::SkippedNoDirect => Ok(()),
+        DirectAckHedgeOutcome::Failed => Err(NetworkError::ConnectionFailed(
+            "direct ACK hedge failed".to_string(),
+        )),
+    }
+}
+
+/// Choose Direct/typed hedge outcome without treating send-ok as a receipt.
+#[cfg(test)]
+pub(crate) fn direct_ack_hedge_outcome(
+    connected: bool,
+    send_ok: Option<bool>,
+) -> DirectAckHedgeOutcome {
+    match (connected, send_ok) {
+        (false, _) => DirectAckHedgeOutcome::SkippedNoDirect,
+        (true, Some(true)) => DirectAckHedgeOutcome::Sent,
+        (true, _) => DirectAckHedgeOutcome::Failed,
     }
 }
 
@@ -664,6 +842,41 @@ struct InboxPipeline {
     history: Option<crate::history::HistoryHandle>,
     /// Bounded background publisher for durable (v2) ACK envelopes.
     ack_publisher: AckPublisherHandle,
+}
+
+impl InboxPipeline {
+    /// Ingest a Direct/typed payload only when it is an ACK envelope.
+    ///
+    /// Reuses the gossip ACK path so the waiter still keys on
+    /// `acks_request_id`. Returns `true` iff the payload decoded as an ACK
+    /// (callers must not fan it out as a user DM).
+    async fn ingest_direct_ack_envelope(
+        &self,
+        sender: AgentId,
+        sender_public_key: Vec<u8>,
+        payload: Bytes,
+    ) -> bool {
+        let Ok(envelope) = DmEnvelope::from_wire_bytes(&payload) else {
+            return false;
+        };
+        if !matches!(envelope.body, DmBody::Ack(_)) {
+            return false;
+        }
+        if envelope.sender_agent_id != *sender.as_bytes() {
+            return false;
+        }
+        let message = PubSubMessage {
+            topic: String::from("direct-typed-ack-hedge"),
+            payload,
+            sender: Some(sender),
+            sender_public_key: Some(sender_public_key),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        self.handle_incoming(message, false).await;
+        true
+    }
 }
 
 /// Re-ACK semantics for a logical request that already completed.
@@ -1976,6 +2189,15 @@ mod tests {
         authenticated_machine: Option<MachineId>,
         revoked_machine: Option<&MachineKeypair>,
     ) -> InboxHarness {
+        make_inbox_harness_with_hedge(sender, authenticated_machine, revoked_machine, None).await
+    }
+
+    async fn make_inbox_harness_with_hedge(
+        sender: &AgentKeypair,
+        authenticated_machine: Option<MachineId>,
+        revoked_machine: Option<&MachineKeypair>,
+        direct_hedge: Option<Arc<dyn DirectAckHedge>>,
+    ) -> InboxHarness {
         let tempdir = tempfile::tempdir().expect("tempdir");
         let mut contacts = ContactStore::new(tempdir.path().join("contacts.json"));
         contacts.set_trust(&sender.agent_id(), TrustLevel::Trusted);
@@ -2020,7 +2242,7 @@ mod tests {
         }
 
         let (ack_publisher, ack_worker) =
-            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm));
+            spawn_durable_ack_publisher(Arc::clone(&pubsub), Arc::clone(&dm), direct_hedge);
         let pipeline = InboxPipeline {
             pubsub,
             signing: Arc::new(SigningContext::from_keypair(&recipient)),
@@ -3041,6 +3263,232 @@ mod tests {
             .expect("bus payload decodes as a DM envelope");
         assert_eq!(envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
         assert_eq!(envelope.recipient_agent_id, *sender.agent_id().as_bytes());
+    }
+
+    struct RecordingDirectHedge {
+        tx: mpsc::UnboundedSender<(AgentId, Bytes)>,
+        outcome: DirectAckHedgeOutcome,
+    }
+
+    #[async_trait]
+    impl DirectAckHedge for RecordingDirectHedge {
+        async fn hedge(&self, recipient: AgentId, encoded: Bytes) -> DirectAckHedgeOutcome {
+            let _ = self.tx.send((recipient, encoded));
+            self.outcome
+        }
+    }
+
+    /// C5: after history commit the same v2 ACK envelope is handed to a live
+    /// Direct/typed hedge. This is not prefer_raw_quic on the durable SEND
+    /// path — the payload remains the gossip_inbox ACK envelope.
+    #[tokio::test]
+    async fn durable_ack_is_hedged_on_direct_typed_after_history_commit() {
+        let sender = test_keypair();
+        let machine = MachineId([0xC5; 32]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hedge = Arc::new(RecordingDirectHedge {
+            tx,
+            outcome: DirectAckHedgeOutcome::Sent,
+        });
+        let mut harness =
+            make_inbox_harness_with_hedge(&sender, Some(machine), None, Some(hedge)).await;
+        let _service = attach_history(&mut harness);
+        let history = harness.pipeline.history.clone().expect("history handle");
+
+        let message = durable_payload_message(&harness, &sender, machine, 0xC5, b"c5 hedge");
+        harness.pipeline.handle_incoming(message, false).await;
+
+        let rows = committed_rows(&history, &sender, 0xC5);
+        assert_eq!(
+            rows.len(),
+            1,
+            "Direct hedge must run only after the durable row exists"
+        );
+
+        let (recipient, encoded) = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("C5 Direct hedge must fire after commit")
+            .expect("hedge channel stays open");
+        assert_eq!(recipient, sender.agent_id());
+        let envelope =
+            DmEnvelope::from_wire_bytes(&encoded).expect("Direct hedge carries the ACK envelope");
+        assert_eq!(envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
+        match envelope.body {
+            DmBody::Ack(ack) => assert_eq!(ack.acks_request_id, [0xC5; 16]),
+            other => panic!("Direct hedge must carry the ACK envelope, got {other:?}"),
+        }
+    }
+
+    /// C5 fail-open: missing Direct must not fail the ACK. Gossip hedges
+    /// still publish the same envelope.
+    #[tokio::test]
+    async fn durable_ack_fail_opens_when_direct_is_missing() {
+        let sender = test_keypair();
+        let machine = MachineId([0xC6; 32]);
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let hedge = Arc::new(RecordingDirectHedge {
+            tx,
+            outcome: DirectAckHedgeOutcome::SkippedNoDirect,
+        });
+        let mut harness =
+            make_inbox_harness_with_hedge(&sender, Some(machine), None, Some(hedge)).await;
+        let _service = attach_history(&mut harness);
+        let mut bus = harness
+            .pipeline
+            .pubsub
+            .subscribe(DM_BUS_TOPIC.to_string())
+            .await;
+
+        harness
+            .pipeline
+            .publish_ack_for_protocol(
+                sender.agent_id(),
+                [0xC6; 16],
+                DmAckOutcome::Accepted,
+                DM_PROTOCOL_DURABLE_ACK,
+                false,
+            )
+            .await
+            .expect("missing Direct must not fail the ACK schedule");
+
+        let _ = tokio::time::timeout(Duration::from_secs(5), rx.recv())
+            .await
+            .expect("fail-open hedge is still invoked")
+            .expect("hedge channel stays open");
+        let message = tokio::time::timeout(Duration::from_secs(5), bus.recv())
+            .await
+            .expect("gossip compatibility-bus hedge must still deliver")
+            .expect("bus subscription stays open");
+        let envelope = DmEnvelope::from_wire_bytes(&message.payload).expect("bus ACK decodes");
+        assert_eq!(envelope.protocol_version, DM_PROTOCOL_DURABLE_ACK);
+    }
+
+    /// C5: the sender waiter completes on the envelope request_id only.
+    /// Direct send-ok is not a receipt.
+    #[tokio::test]
+    async fn waiter_completes_on_envelope_request_id_not_direct_send_ok() {
+        let inflight = InFlightAcks::new();
+        let request_id = [0xC7; 16];
+        let ack_sender = AgentId([0x11; 32]);
+        let ack_machine = MachineId([0x22; 32]);
+        let mut rx = inflight.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            ack_sender,
+            Some(ack_machine),
+        );
+
+        assert_eq!(
+            direct_ack_hedge_outcome(true, Some(true)),
+            DirectAckHedgeOutcome::Sent,
+            "a live Direct send-ok is only a hedge, not a receipt"
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut rx)
+                .await
+                .is_err(),
+            "Direct send-ok must not complete the waiter"
+        );
+
+        assert!(
+            inflight.resolve_for_protocol(
+                &request_id,
+                DM_PROTOCOL_DURABLE_ACK,
+                ack_sender,
+                ack_machine,
+                DmAckOutcome::Accepted,
+            ),
+            "the waiter is keyed on the ACK envelope request_id"
+        );
+        assert_eq!(
+            rx.await.expect("oneshot"),
+            DmAckOutcome::Accepted,
+            "only the matching request_id envelope completes the waiter"
+        );
+    }
+
+    /// C5 receive path: ingesting the same ACK envelope via Direct/typed
+    /// completes the waiter. Fan-out as a user DM must not happen.
+    #[tokio::test]
+    async fn direct_typed_ack_envelope_completes_waiter_on_request_id() {
+        let sender = test_keypair();
+        let machine_kp = MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let mut harness = make_inbox_harness(&sender, Some(machine), None).await;
+        let request_id = [0xC8; 16];
+        let waiter = harness.pipeline.inflight.register_for_protocol(
+            request_id,
+            DM_PROTOCOL_DURABLE_ACK,
+            sender.agent_id(),
+            Some(machine),
+        );
+
+        let created = now_unix_ms();
+        let mut envelope = DmEnvelope {
+            protocol_version: DM_PROTOCOL_DURABLE_ACK,
+            request_id: [0xC8; 16],
+            sender_agent_id: *sender.agent_id().as_bytes(),
+            sender_machine_id: *machine.as_bytes(),
+            recipient_agent_id: *harness.recipient_agent_id.as_bytes(),
+            created_at_unix_ms: created,
+            expires_at_unix_ms: created + ACK_ENVELOPE_LIFETIME_MS,
+            body: EnvelopeBuilder::build_ack_body(request_id, DmAckOutcome::Accepted),
+            signature: Vec::new(),
+            origin_attestation: None,
+        };
+        sign_envelope(&mut envelope, &sender);
+        let mut attestation = DmOriginAttestation::for_envelope(
+            &envelope,
+            machine_kp.public_key().as_bytes().to_vec(),
+        );
+        attestation.sign(&machine_kp).expect("attest ACK");
+        envelope.origin_attestation = Some(attestation);
+        let encoded = Bytes::from(envelope.to_wire_bytes().expect("encode ACK"));
+
+        assert!(
+            harness
+                .pipeline
+                .ingest_direct_ack_envelope(
+                    sender.agent_id(),
+                    sender.public_key().as_bytes().to_vec(),
+                    encoded,
+                )
+                .await,
+            "the Direct/typed payload is the ACK envelope"
+        );
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), waiter)
+                .await
+                .expect("waiter must complete from the Direct-ingested envelope")
+                .expect("oneshot"),
+            DmAckOutcome::Accepted
+        );
+        assert_no_delivery(&mut harness.receiver).await;
+    }
+
+    #[test]
+    fn ack_publish_eager_topics_are_inbox_and_bus_only() {
+        let recipient = AgentId([0xC5; 32]);
+        let topics = ack_publish_eager_topics(&recipient);
+        assert_eq!(topics[0], dm_inbox_topic(&recipient));
+        assert_eq!(topics[1], TopicId::from_entity(DM_BUS_TOPIC.as_bytes()));
+        assert_eq!(
+            topics.len(),
+            2,
+            "C5b must not prefer eager on any topic except inbox+bus"
+        );
+    }
+
+    #[test]
+    fn missing_direct_is_skipped_not_failed() {
+        assert_eq!(
+            direct_ack_hedge_outcome(false, None),
+            DirectAckHedgeOutcome::SkippedNoDirect
+        );
+        assert_eq!(
+            direct_ack_hedge_outcome(false, Some(true)),
+            DirectAckHedgeOutcome::SkippedNoDirect
+        );
     }
 
     /// The two pre-existing variants must keep their postcard discriminants,

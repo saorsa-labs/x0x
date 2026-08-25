@@ -420,16 +420,20 @@ pub(in crate::server) async fn direct_send(
             } else {
                 None
             };
-            (
-                StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "path": path_str,
-                    "retries_used": receipt.retries_used,
-                    "request_id": hex::encode(receipt.request_id),
-                    "require_ack": ack_result,
-                })),
-            )
+            let snap = state.agent.direct_messaging().diagnostics_snapshot();
+            let mut body = serde_json::json!({
+                "ok": true,
+                "path": path_str,
+                "retries_used": receipt.retries_used,
+                "request_id": hex::encode(receipt.request_id),
+                "require_ack": ack_result,
+            });
+            attach_recipient_ack_diagnostics(
+                &mut body,
+                snap.last_ack_publish_ms,
+                snap.stats.ack_publish_route_failed,
+            );
+            (StatusCode::OK, Json(body))
         }
         Err(e) => {
             let (status, err_kind) = match &e {
@@ -498,16 +502,19 @@ pub(in crate::server) async fn direct_send(
                 }
             };
             tracing::error!("direct_send failed ({err_kind}): {e}");
+            let snap = state.agent.direct_messaging().diagnostics_snapshot();
             let timeout_stages = matches!(e, x0x::dm::DmError::Timeout { .. })
-                .then(|| {
-                    state
-                        .agent
-                        .direct_messaging()
-                        .diagnostics_snapshot()
-                        .last_durable_send
-                })
+                .then_some(snap.last_durable_send)
                 .flatten();
-            (status, Json(dm_error_body(err_kind, &e, timeout_stages)))
+            let mut body = dm_error_body(err_kind, &e, timeout_stages);
+            if matches!(e, x0x::dm::DmError::Timeout { .. }) {
+                attach_recipient_ack_diagnostics(
+                    &mut body,
+                    snap.last_ack_publish_ms,
+                    snap.stats.ack_publish_route_failed,
+                );
+            }
+            (status, Json(body))
         }
     }
 }
@@ -569,6 +576,18 @@ fn dm_error_body(
         body["budget_stage"] = serde_json::json!(stages.budget_stage());
     }
     body
+}
+
+/// C5c: recipient ACK-publish diagnostics the Tester captures on every
+/// durable 200 and 504. `last_ack_publish_ms` is null until a v2 ACK has
+/// been published on this daemon.
+fn attach_recipient_ack_diagnostics(
+    body: &mut serde_json::Value,
+    last_ack_publish_ms: Option<u64>,
+    ack_publish_route_failed: u64,
+) {
+    body["last_ack_publish_ms"] = serde_json::json!(last_ack_publish_ms);
+    body["ack_publish_route_failed"] = serde_json::json!(ack_publish_route_failed);
 }
 
 #[cfg(test)]
@@ -825,7 +844,7 @@ mod tests {
             retries: 1,
             elapsed: Duration::from_secs(16),
         };
-        let body = dm_error_body("timeout", &err, Some(stages));
+        let mut body = dm_error_body("timeout", &err, Some(stages));
         assert_eq!(body["ok"], false);
         assert_eq!(body["error"], "timeout");
         assert_eq!(
@@ -837,6 +856,9 @@ mod tests {
         assert_eq!(body["ack_wait_ms"], 4_500);
         assert_eq!(body["elapsed_ms"], 17_000);
         assert_eq!(body["budget_stage"], "strict_gate_ms");
+        attach_recipient_ack_diagnostics(&mut body, Some(12), 3);
+        assert_eq!(body["last_ack_publish_ms"], 12);
+        assert_eq!(body["ack_publish_route_failed"], 3);
 
         let bare = x0x::dm::DmError::Timeout {
             retries: 1,
@@ -845,6 +867,24 @@ mod tests {
         let bare_body = dm_error_body("timeout", &bare, None);
         assert!(bare_body.get("strict_gate_ms").is_none());
         assert_eq!(bare_body["error"], "timeout");
+    }
+
+    #[test]
+    fn c5c_ack_diagnostics_are_present_on_200_and_504_bodies() {
+        let mut ok = serde_json::json!({ "ok": true, "path": "gossip_inbox" });
+        attach_recipient_ack_diagnostics(&mut ok, None, 0);
+        assert_eq!(ok["last_ack_publish_ms"], serde_json::Value::Null);
+        assert_eq!(ok["ack_publish_route_failed"], 0);
+
+        let err = x0x::dm::DmError::Timeout {
+            retries: 1,
+            elapsed: Duration::from_secs(16),
+        };
+        let mut timeout = dm_error_body("timeout", &err, None);
+        attach_recipient_ack_diagnostics(&mut timeout, Some(7), 1);
+        assert_eq!(timeout["last_ack_publish_ms"], 7);
+        assert_eq!(timeout["ack_publish_route_failed"], 1);
+        assert_eq!(timeout["error"], "timeout");
     }
 
     // ── ADR-0016 R2: REST pre-check (exact §3 string + status code) ─────

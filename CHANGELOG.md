@@ -4,6 +4,28 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **C5 Direct/typed ACK hedge after durable commit (#380, PR #408).** The
+  signed v2 ACK envelope is additionally sent on a live Direct/typed path as
+  a third hedge beside the inbox + compatibility-bus gossip routes.
+  Fail-open when no Direct exists; Direct send-ok is never a sender receipt —
+  the waiter completes only on the envelope's `request_id`. Sibling gossip
+  routes are not aborted. **The direct-ingest path now verifies the
+  envelope's ML-DSA signature** (same assurance as the gossip route) —
+  transport-level peer auth alone was too weak to justify `verified: true`:
+  without the check, a compromised direct path could replay-fabricate ACK
+  envelopes bound to any `request_id`. Duplicate arrivals across the three
+  routes are idempotent by construction (the `InFlightAck` entry is consumed
+  on first resolution; ADR-0030 §1 binding) and now regression-tested.
+- **C5b: one Full/bootstrap eager preference for ACK topics only.** The
+  durable ACK inbox + `x0x/dm/v1/bus` topics prefer one connected
+  coordinator/relay/pinned-bootstrap peer at the front of their eager set;
+  Leaf C0 pass-through refusal on other topics is unchanged.
+- **C5c: recipient ACK diagnostics** — `last_ack_publish_ms` (null until a
+  v2 ACK has been published) and `ack_publish_route_failed` always present
+  on `GET /diagnostics/dm` and durable `POST /direct/send` 200/504 bodies.
+
 ### Changed
 
 - **Leaf participation is the desktop default (issue #380).** Ordinary client

@@ -115,7 +115,10 @@ existing Display string.
 
 `last_ack_publish_ms` is the receiver's last durable (v2) ACK publish
 duration. Compare it with the sender's `ack_wait_ms` to see whether the ACK
-publish itself or the reverse path held the waiter.
+publish itself or the reverse path held the waiter. The field is always
+present (`null` until a v2 ACK has been published). `ack_publish_route_failed`
+is the same counter as `stats.ack_publish_route_failed` and is also present
+at the top level so a Tester can capture both keys on every durable 200/504.
 
 `stats.ack_publish_route_failed` increments when the ACK never left this
 recipient: both first-success hedge routes failed, or the bounded publisher
