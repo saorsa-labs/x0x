@@ -589,6 +589,21 @@ impl PubSubManager {
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .insert(topic_id);
+        // ADR-0034 / #397 (Leaf C0): a Leaf node REFUSES inbound frames —
+        // including anti-entropy — for unsubscribed topics, so a topic that
+        // was unsubscribed for a while has no passively-repaired state to
+        // rejoin. Trigger an explicit anti-entropy round on (re)subscribe so
+        // catch-up is a property of the subscribe path itself, not a hope
+        // that background repair happens to run. Best-effort: failure only
+        // delays convergence to the next periodic round.
+        {
+            let plumtree = Arc::clone(&self.plumtree);
+            tokio::spawn(async move {
+                if let Err(e) = plumtree.trigger_anti_entropy(topic_id).await {
+                    tracing::debug!("subscribe-time anti-entropy trigger failed: {e}");
+                }
+            });
+        }
 
         let sub_topic = topic.clone();
         let stats = Arc::clone(&self.stats);

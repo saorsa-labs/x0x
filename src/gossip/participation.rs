@@ -459,4 +459,45 @@ mod tests {
         assert_eq!(metering.epidemic_forward_msgs, 3);
         assert_eq!(metering.relay_bytes_semantics, RELAY_BYTES_SEMANTICS);
     }
+    /// #397 review condition: the unsubscribe→resubscribe cycle. While
+    /// unsubscribed a Leaf refuses every pass-through frame (including
+    /// anti-entropy — that is the point), so rejoin correctness depends on
+    /// the subscribe path triggering its own catch-up (subscribe_topic_id
+    /// fires trigger_anti_entropy). This test pins the predicate half: the
+    /// refusal must flip off the moment the topic is subscribed again.
+    #[test]
+    fn refusal_flips_across_unsubscribe_resubscribe_cycle() {
+        use saorsa_gossip_types::MessageKind;
+        for kind in [
+            MessageKind::Eager,
+            MessageKind::IHave,
+            MessageKind::IWant,
+            MessageKind::AntiEntropy,
+        ] {
+            // subscribed: accepted
+            assert!(!leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                true,
+                kind
+            ));
+            // unsubscribed: refused on Leaf...
+            assert!(leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                false,
+                kind
+            ));
+            // ...but never on Full
+            assert!(!leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Full,
+                false,
+                kind
+            ));
+            // resubscribed: accepted again
+            assert!(!leaf_refuses_unsubscribed_passthrough(
+                ParticipationMode::Leaf,
+                true,
+                kind
+            ));
+        }
+    }
 }
