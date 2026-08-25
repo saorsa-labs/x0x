@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.7] - 2026-08-25
+
 ### Added
 
 - **`holepunched_connections` surfaced on `GET /diagnostics/transport` (#398).** ant-quic
