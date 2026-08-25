@@ -274,6 +274,11 @@ pub struct PubSubManager {
     /// are same-daemon IPC: delivered only to local subscribers, never
     /// handed to PlumTree, never gossipped to remote peers.
     local_topics: Arc<RwLock<HashMap<String, Vec<mpsc::Sender<PubSubMessage>>>>>,
+    /// Long-lived membership holds so Direct-connect pre-subscribe of a
+    /// peer inbox (#380 C4) stays on the subscribed-topic path. The owned
+    /// task drains the receiver so a quiet hold cannot fill the channel
+    /// and drop the PlumTree registration.
+    membership_holds: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
     /// Issue #380: Leaf skips pass-through eager-set refresh.
     participation: ParticipationMode,
     /// Why this process selected Leaf or Full (diagnostics / startup log).
@@ -385,6 +390,7 @@ impl PubSubManager {
             revocation_set: std::sync::OnceLock::new(),
             stats: Arc::new(PubSubStats::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
+            membership_holds: Arc::new(RwLock::new(HashMap::new())),
             participation: ParticipationMode::Leaf,
             participation_reason: "default_leaf".to_string(),
             passthrough_refresh_runs: AtomicU64::new(0),
@@ -890,6 +896,91 @@ impl PubSubManager {
             .map(|peer| PeerId::new(peer.0))
             .collect();
         self.plumtree.initialize_topic_peers(topic, peers).await;
+    }
+
+    /// Refresh PlumTree eager-set peers for one topic id via the
+    /// subscribed-topic path (`initialize_topic_peers` + `set_topic_peers`).
+    ///
+    /// Leaf-safe: does not walk unsubscribed pass-through topics and does
+    /// not change [`Self::refresh_topic_peers`]. Used to pre-warm reverse
+    /// ACK topics so the first durable send is not the join event (#380 C2).
+    pub(crate) async fn refresh_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
+        self.register_dynamic_topic_priority(topic, topic_id);
+        self.initialize_topic_peers(topic_id).await;
+        let peers: Vec<PeerId> = self
+            .network
+            .gossip_plane_peers()
+            .await
+            .into_iter()
+            .map(|peer| PeerId::new(peer.0))
+            .collect();
+        self.plumtree.set_topic_peers(topic_id, peers).await;
+    }
+
+    /// Pre-subscribe a topic id (C4) so the first later `publish_topic_id`
+    /// is not the PlumTree join. Idempotent. Leaf-safe: uses
+    /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
+    /// pass-through topics.
+    ///
+    /// #396 race fix: the original check-then-insert ran the refcount READ,
+    /// the subscribe, and the holds INSERT under separate lock acquisitions.
+    /// Two concurrent warmers (outbound `maybe_warm_reverse_ack_topics` on
+    /// Direct connect vs inbound `PeerConnected`) could both observe "no
+    /// refcount", both `subscribe_topic_id`, and both spawn a permanent
+    /// drain hold — a leaked duplicate subscription plus a duplicate drain
+    /// task per topic, forever. The refcount write inside
+    /// `subscribe_topic_id` is the linearization point: we take the holds
+    /// WRITE lock FIRST and re-check the refcount while holding it, so
+    /// exactly one warmer ever creates a hold per topic; the loser sees the
+    /// winner's refcount and only refreshes. (The write guard is held
+    /// across `subscribe_topic_id`'s awaits — acceptable because warmers
+    /// target three topics, the map is tiny, and readers
+    /// (`shutdown`/drop-abort) tolerate brief writer hold.)
+    pub(crate) async fn ensure_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
+        // Serialize hold creation per manager: the guard is released on
+        // return, and the double-check below makes duplicate concurrent
+        // calls converge to one hold.
+        let mut holds = self.membership_holds.write().await;
+        if self.topic_ref_counts.read().await.contains_key(topic) {
+            drop(holds);
+            self.refresh_subscribed_topic_id(topic, topic_id).await;
+            return;
+        }
+        // Re-check under the same guard ordering used by the fast path:
+        // another warmer may have inserted between our lock acquisition
+        // and here is impossible (we hold the write lock), but the
+        // refcount read above may have raced the winner's subscribe —
+        // the definitive check is the holds map itself.
+        if holds.contains_key(topic) {
+            drop(holds);
+            self.refresh_subscribed_topic_id(topic, topic_id).await;
+            return;
+        }
+        let mut sub = self.subscribe_topic_id(topic.to_string(), topic_id).await;
+        let hold = tokio::spawn(async move { while sub.recv().await.is_some() {} });
+        holds.insert(topic.to_string(), hold);
+        drop(holds);
+        self.refresh_subscribed_topic_id(topic, topic_id).await;
+    }
+
+    /// Topic ids currently known to PlumTree. Test helper for proving a
+    /// warm joined the real inbox ids, not name-derived pass-through ids.
+    #[cfg(test)]
+    pub(crate) async fn plumtree_topic_ids(&self) -> Vec<TopicId> {
+        self.plumtree.all_topic_ids().await
+    }
+
+    /// Whether `topic` currently has a local subscriber (C4 pre-join).
+    #[cfg(test)]
+    pub(crate) async fn is_topic_subscribed(&self, topic: &str) -> bool {
+        self.topic_ref_counts.read().await.contains_key(topic)
+    }
+
+    /// Number of live membership-hold drain tasks (C4). Test helper for the
+    /// #396 concurrent-warmer race: exactly one hold may exist per topic.
+    #[cfg(test)]
+    pub(crate) async fn membership_hold_count(&self) -> usize {
+        self.membership_holds.read().await.len()
     }
 }
 

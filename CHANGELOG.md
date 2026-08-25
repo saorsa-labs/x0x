@@ -14,6 +14,33 @@ All notable changes to this project will be documented in this file.
   `GET /diagnostics/gossip` now reports `participation.mode` and
   `passthrough_refresh_runs`. Durable DM path selection is unchanged.
 
+### Fixed
+
+- **(#396 rework)** C1 (first-success ACK hedge) was removed before merge:
+  the joint review decided the post-commit Direct/typed hedge (#408 C5)
+  supersedes it — both changed sibling semantics in the same
+  `publish_durable_ack_routes` plumbing, and only one policy may stand.
+  The gossip routes keep main's `join!`-both semantics unchanged.
+- **Pre-warm reverse-ACK PlumTree membership on a live Direct path
+  (#380 Phase C C2+C4).** After Direct / Coordinated / AlreadyConnected to a
+  Trusted peer (and on inbound `PeerConnected`), the self inbox, peer inbox,
+  and `x0x/dm/v1/bus` topic ids are joined via the subscribed-topic refresh
+  path. C4 also pre-subscribes the peer inbox so the first durable POST is
+  not a cold `publish_topic_id` join. Leaf `refresh_topic_peers`
+  pass-through is untouched (C0 is a separate #395 follow-up). The C4
+  membership-hold creation is linearized under the holds write guard:
+  the original check-then-insert raced concurrent warmers (outbound
+  Direct connect vs inbound `PeerConnected`) into duplicate permanent
+  subscriptions; a concurrent-warmer regression test pins one hold per
+  topic.
+
+### Changed
+
+- **`GET /diagnostics/dm` ACK-route reading (#380 Phase C).**
+  `last_ack_publish_ms` and `stats.ack_publish_route_failed` now distinguish
+  ACK never scheduled / both routes failed / ACK handed to PlumTree. Sender
+  504 stage timer field names and HTTP status codes are unchanged.
+
 ## [v0.39.7] - 2026-08-25
 
 ### Added
