@@ -3205,6 +3205,23 @@ impl Agent {
         Ok(())
     }
 
+    /// When a live Direct path exists to a Trusted peer, join reverse-ACK
+    /// topics before the caller can POST the first durable send (#380 C2).
+    async fn maybe_warm_reverse_ack_topics(&self, peer: &identity::AgentId) {
+        let trusted = {
+            let contacts = self.contact_store.read().await;
+            contacts.is_trusted(peer)
+        };
+        if !crate::dm_inbox::should_warm_reverse_ack(trusted, &self.agent_id(), peer) {
+            return;
+        }
+        let Some(runtime) = self.gossip_runtime.as_ref() else {
+            return;
+        };
+        crate::dm_inbox::warm_reverse_ack_topics(runtime.pubsub().as_ref(), &self.agent_id(), peer)
+            .await;
+    }
+
     /// Attempt to connect to an agent by its identity.
     ///
     /// Looks up the agent in the discovery cache, then tries to establish
@@ -3223,6 +3240,17 @@ impl Agent {
     /// Returns an error only for internal failures (e.g. network not started).
     /// Connectivity failures are reported as `ConnectOutcome::Unreachable`.
     pub async fn connect_to_agent(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self.connect_to_agent_inner(agent_id).await?;
+        if outcome.is_live_path() {
+            self.maybe_warm_reverse_ack_topics(agent_id).await;
+        }
+        Ok(outcome)
+    }
+
+    async fn connect_to_agent_inner(
         &self,
         agent_id: &identity::AgentId,
     ) -> error::Result<connectivity::ConnectOutcome> {
@@ -3857,6 +3885,26 @@ impl Agent {
     /// Returns an error only for internal failures. Connectivity failures are
     /// reported as [`connectivity::ConnectOutcome::Unreachable`].
     pub async fn connect_to_machine(
+        &self,
+        machine_id: &identity::MachineId,
+    ) -> error::Result<connectivity::ConnectOutcome> {
+        let outcome = self.connect_to_machine_inner(machine_id).await?;
+        if outcome.is_live_path() {
+            let agent_ids = {
+                let cache = self.machine_discovery_cache.read().await;
+                cache
+                    .get(machine_id)
+                    .map(|machine| machine.agent_ids.clone())
+                    .unwrap_or_default()
+            };
+            for agent_id in agent_ids {
+                self.maybe_warm_reverse_ack_topics(&agent_id).await;
+            }
+        }
+        Ok(outcome)
+    }
+
+    async fn connect_to_machine_inner(
         &self,
         machine_id: &identity::MachineId,
     ) -> error::Result<connectivity::ConnectOutcome> {
@@ -8973,6 +9021,9 @@ impl Agent {
         };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let dm = std::sync::Arc::clone(&self.direct_messaging);
+        let contact_store = std::sync::Arc::clone(&self.contact_store);
+        let gossip_runtime = self.gossip_runtime.clone();
+        let self_agent_id = self.agent_id();
 
         let lifecycle_network = std::sync::Arc::clone(&network);
         let lifecycle_dm = std::sync::Arc::clone(&dm);
@@ -9020,6 +9071,26 @@ impl Agent {
                         };
                         if let Some(agent_id) = agent_id {
                             dm.mark_connected(agent_id, machine_id).await;
+                            // Inbound / equivalent live Direct path: warm
+                            // reverse-ACK topics before the first durable POST.
+                            let trusted = {
+                                let contacts = contact_store.read().await;
+                                contacts.is_trusted(&agent_id)
+                            };
+                            if let Some(runtime) = gossip_runtime.as_ref() {
+                                if crate::dm_inbox::should_warm_reverse_ack(
+                                    trusted,
+                                    &self_agent_id,
+                                    &agent_id,
+                                ) {
+                                    crate::dm_inbox::warm_reverse_ack_topics(
+                                        runtime.pubsub().as_ref(),
+                                        &self_agent_id,
+                                        &agent_id,
+                                    )
+                                    .await;
+                                }
+                            }
                         }
                         // Cancel any pending proactive reconnect for this peer
                         // — the connection is back, no need to keep trying.
