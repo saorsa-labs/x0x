@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- **Leaf participation is the desktop default (issue #380).** Ordinary client
+  daemons no longer run the PlumTree pass-through `set_topic_peers` loop for
+  topics they do not subscribe to. Bootstrap / dual-listen `:443` / managed
+  `/opt/x0x/x0xd*` processes, and operator opt-in (`--relay` or
+  `gossip.relay = true`), stay Full and keep today's relay behaviour.
+  `GET /diagnostics/gossip` now reports `participation.mode` and
+  `passthrough_refresh_runs`. Durable DM path selection is unchanged.
+
 ## [v0.39.7] - 2026-08-25
 
 ### Added

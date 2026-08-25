@@ -4,11 +4,16 @@
 //! enabling pub/sub messaging and HyParView membership management.
 
 pub mod config;
+pub mod participation;
 pub mod pubsub;
 pub mod runtime;
 pub(crate) mod wire;
 
 pub use config::GossipConfig;
+pub use participation::{
+    resolve_participation, ParticipationInputs, ParticipationMode, ParticipationSelection,
+    ParticipationSnapshot,
+};
 pub use pubsub::{
     PubSubManager, PubSubMessage, PubSubStats, PubSubStatsSnapshot, SigningContext, Subscription,
 };

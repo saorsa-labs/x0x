@@ -218,6 +218,7 @@ x0xd [OPTIONS]
   --name <NAME>                   Instance name for multi-instance support
   --api-port <PORT>               Override API server port (otherwise ephemeral for named instances)
   --no-hard-coded-bootstrap       Skip embedded bootstrap peers (config peers kept)
+  --relay                         Be a relay node: Full gossip participation AND relay/coordinator advertisement (ADR-0034; also X0X_RELAY_OPT_IN=1 or gossip.relay=true)
   --exec-acl <PATH>               Override default exec ACL path
   --check                         Check configuration and exit
   --check-updates                 Check for updates and exit
