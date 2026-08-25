@@ -1069,6 +1069,25 @@ impl PubSubManager {
         self.plumtree.set_topic_peers(topic_id, peers).await;
     }
 
+    /// C5b: prefer one connected Full/bootstrap peer at the front of the
+    /// eager set for the given topics (durable ACK inbox + bus only).
+    ///
+    /// Does not walk unsubscribed pass-through topics and does not re-enable
+    /// GRAFT piggyback on topics the node is not subscribed to (C0).
+    pub async fn prefer_one_full_bootstrap_eager(&self, topic_ids: &[TopicId]) {
+        if topic_ids.is_empty() {
+            return;
+        }
+        let plane: Vec<[u8; 32]> = self
+            .network
+            .gossip_plane_peers()
+            .await
+            .into_iter()
+            .map(|peer| peer.0)
+            .collect();
+        self.apply_preferred_eager_peer(plane, topic_ids).await;
+    }
+
     /// Pre-subscribe a topic id (C4) so the first later `publish_topic_id`
     /// is not the PlumTree join. Idempotent. Leaf-safe: uses
     /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
@@ -1134,6 +1153,66 @@ impl PubSubManager {
     pub(crate) async fn membership_hold_count(&self) -> usize {
         self.membership_holds.read().await.len()
     }
+
+    /// C5b continuation: pick the preferred eager peer and apply it to the
+    /// ACK topics only (called by [`Self::prefer_one_full_bootstrap_eager`]).
+    async fn apply_preferred_eager_peer(&self, plane: Vec<[u8; 32]>, topic_ids: &[TopicId]) {
+        let mut coordinators = Vec::new();
+        let mut relays = Vec::new();
+        if let Some(cache) = self.network.bootstrap_cache() {
+            coordinators = cache
+                .select_coordinators(6)
+                .await
+                .into_iter()
+                .map(|peer| peer.peer_id.0)
+                .collect();
+            relays = cache
+                .select_relay_peers(6)
+                .await
+                .into_iter()
+                .map(|peer| peer.peer_id.0)
+                .collect();
+        }
+        let Some(preferred) = select_one_full_bootstrap_eager_peer(
+            &plane,
+            &coordinators,
+            &relays,
+            &self.network.config().pinned_bootstrap_peers,
+        ) else {
+            return;
+        };
+
+        let mut peers = vec![PeerId::new(preferred)];
+        for id in plane {
+            if id != preferred {
+                peers.push(PeerId::new(id));
+            }
+        }
+        for topic_id in topic_ids {
+            self.plumtree
+                .set_topic_peers(*topic_id, peers.clone())
+                .await;
+        }
+    }
+}
+
+/// Pick at most one connected Full/bootstrap peer for ACK-topic eager.
+///
+/// Order: coordinators, then relays, then pinned bootstrap IDs. Returns
+/// `None` when the plane has no such peer so callers leave membership alone.
+pub(crate) fn select_one_full_bootstrap_eager_peer(
+    plane: &[[u8; 32]],
+    coordinators: &[[u8; 32]],
+    relays: &[[u8; 32]],
+    pinned: &std::collections::HashSet<[u8; 32]>,
+) -> Option<[u8; 32]> {
+    let connected: std::collections::HashSet<[u8; 32]> = plane.iter().copied().collect();
+    coordinators
+        .iter()
+        .find(|id| connected.contains(*id))
+        .copied()
+        .or_else(|| relays.iter().find(|id| connected.contains(*id)).copied())
+        .or_else(|| plane.iter().copied().find(|id| pinned.contains(id)))
 }
 
 /// Decode and filter a delivered payload before exposing it to x0x subscribers.
@@ -2804,5 +2883,31 @@ mod tests {
             .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
         let snap = stats.snapshot();
         assert_eq!(snap.decode_to_delivery_drops, 2);
+    }
+
+    #[test]
+    fn c5b_prefers_one_connected_coordinator_over_relays() {
+        let plane = [[1; 32], [2; 32], [3; 32]];
+        let coordinators = [[9; 32], [2; 32]];
+        let relays = [[1; 32]];
+        let pinned = std::collections::HashSet::new();
+        assert_eq!(
+            select_one_full_bootstrap_eager_peer(&plane, &coordinators, &relays, &pinned),
+            Some([2; 32]),
+            "C5b must prefer one Full/bootstrap coordinator already on the plane"
+        );
+    }
+
+    #[test]
+    fn c5b_skips_eager_prefer_when_no_full_bootstrap_is_connected() {
+        let plane = [[1; 32], [2; 32]];
+        let coordinators = [[9; 32]];
+        let relays = [[8; 32]];
+        let pinned = std::collections::HashSet::new();
+        assert_eq!(
+            select_one_full_bootstrap_eager_peer(&plane, &coordinators, &relays, &pinned),
+            None,
+            "no Full/bootstrap on the plane must leave topic membership unchanged"
+        );
     }
 }

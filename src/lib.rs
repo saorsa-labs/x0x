@@ -322,7 +322,7 @@ pub struct Agent {
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// Handle for the running DM inbox service.
-    dm_inbox_service: tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>,
+    dm_inbox_service: std::sync::Arc<tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
     /// and never await while holding it — write lock is taken only when
     /// applying a new revocation (rare) and when persisting to disk.
@@ -8028,7 +8028,14 @@ impl Agent {
                 },
             )?,
         );
-        let service = dm_inbox::DmInboxService::spawn(
+        let direct_hedge = self.network.as_ref().map(|network| {
+            std::sync::Arc::new(dm_inbox::LiveDirectAckHedge {
+                network: std::sync::Arc::clone(network),
+                dm: std::sync::Arc::clone(&self.direct_messaging),
+                sender_agent_id: self.identity.agent_id(),
+            }) as std::sync::Arc<dyn dm_inbox::DirectAckHedge>
+        });
+        let service = dm_inbox::DmInboxService::spawn_with_hedge(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
@@ -8043,6 +8050,7 @@ impl Agent {
             std::sync::Arc::clone(&self.revocation_set),
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
             self.history_handle.clone(),
+            direct_hedge,
         )
         .await
         .map_err(|e| {
@@ -9279,6 +9287,7 @@ impl Agent {
         let history_handle = self.history_handle.clone();
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
+        let dm_inbox_service = std::sync::Arc::clone(&self.dm_inbox_service);
 
         self.spawn_tracked(async move {
             tracing::info!(target: "x0x::direct", stage = "listener", "direct message listener started");
@@ -9419,6 +9428,34 @@ impl Agent {
                         "direct message from sender with expired cert dropped (runtime expiry gate, issue #191)"
                     );
                     continue;
+                }
+
+                // C5: the same v2 ACK envelope may arrive on live Direct/typed.
+                // Complete the waiter on request_id only; never fan an ACK out
+                // as a user DM. Direct send-ok is not a sender receipt.
+                if let Ok(envelope) = dm::DmEnvelope::from_wire_bytes(&data) {
+                    if matches!(envelope.body, dm::DmBody::Ack(_)) {
+                        let sender_public_key = {
+                            let cache = discovery_cache.read().await;
+                            cache
+                                .get(&sender)
+                                .map(|entry| entry.agent_public_key.clone())
+                                .filter(|key| !key.is_empty())
+                        };
+                        if let Some(sender_public_key) = sender_public_key {
+                            let inbox = dm_inbox_service.lock().await;
+                            if let Some(service) = inbox.as_ref() {
+                                let _ = service
+                                    .try_ingest_direct_ack(
+                                        sender,
+                                        sender_public_key,
+                                        bytes::Bytes::from(data.clone()),
+                                    )
+                                    .await;
+                            }
+                        }
+                        continue;
+                    }
                 }
 
                 // Register and mark the sender as connected for future reverse direct sends.
@@ -11386,7 +11423,7 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
-            dm_inbox_service: tokio::sync::Mutex::new(None),
+            dm_inbox_service: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             revocation_set,
             identity_dir: self.identity_dir,
             shutdown_token: tokio_util::sync::CancellationToken::new(),
