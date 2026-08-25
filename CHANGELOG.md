@@ -6,21 +6,23 @@ All notable changes to this project will be documented in this file.
 
 ### Fixed
 
-- **Durable ACK first-success hedge (#380 Phase C, deferred #338).**
-  `publish_durable_ack_routes` races the targeted inbox and compatibility-bus
-  publishes and returns `Ok` when either succeeds, cancelling the sibling.
-  The previous `join!` + `and` required both 22s-budgeted routes to finish,
-  which is the locked 504 `budget_stage=ack_wait_ms` (publish returned;
-  application ACK missed budget). History commit is still awaited before the
-  job is scheduled; the queue remains non-blocking `try_send`.
-
+- **(#396 rework)** C1 (first-success ACK hedge) was removed before merge:
+  the joint review decided the post-commit Direct/typed hedge (#408 C5)
+  supersedes it — both changed sibling semantics in the same
+  `publish_durable_ack_routes` plumbing, and only one policy may stand.
+  The gossip routes keep main's `join!`-both semantics unchanged.
 - **Pre-warm reverse-ACK PlumTree membership on a live Direct path
   (#380 Phase C C2+C4).** After Direct / Coordinated / AlreadyConnected to a
   Trusted peer (and on inbound `PeerConnected`), the self inbox, peer inbox,
   and `x0x/dm/v1/bus` topic ids are joined via the subscribed-topic refresh
   path. C4 also pre-subscribes the peer inbox so the first durable POST is
   not a cold `publish_topic_id` join. Leaf `refresh_topic_peers`
-  pass-through is untouched (C0 is a separate #395 follow-up).
+  pass-through is untouched (C0 is a separate #395 follow-up). The C4
+  membership-hold creation is linearized under the holds write guard:
+  the original check-then-insert raced concurrent warmers (outbound
+  Direct connect vs inbound `PeerConnected`) into duplicate permanent
+  subscriptions; a concurrent-warmer regression test pins one hold per
+  topic.
 
 ### Changed
 

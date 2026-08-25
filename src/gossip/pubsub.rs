@@ -835,18 +835,46 @@ impl PubSubManager {
     /// is not the PlumTree join. Idempotent. Leaf-safe: uses
     /// [`Self::subscribe_topic_id`] (subscribed path) and does not walk
     /// pass-through topics.
-    pub(crate) async fn ensure_subscribed_topic_id(&self, topic: String, topic_id: TopicId) {
-        if self.topic_ref_counts.read().await.contains_key(&topic) {
-            self.refresh_subscribed_topic_id(&topic, topic_id).await;
+    ///
+    /// #396 race fix: the original check-then-insert ran the refcount READ,
+    /// the subscribe, and the holds INSERT under separate lock acquisitions.
+    /// Two concurrent warmers (outbound `maybe_warm_reverse_ack_topics` on
+    /// Direct connect vs inbound `PeerConnected`) could both observe "no
+    /// refcount", both `subscribe_topic_id`, and both spawn a permanent
+    /// drain hold — a leaked duplicate subscription plus a duplicate drain
+    /// task per topic, forever. The refcount write inside
+    /// `subscribe_topic_id` is the linearization point: we take the holds
+    /// WRITE lock FIRST and re-check the refcount while holding it, so
+    /// exactly one warmer ever creates a hold per topic; the loser sees the
+    /// winner's refcount and only refreshes. (The write guard is held
+    /// across `subscribe_topic_id`'s awaits — acceptable because warmers
+    /// target three topics, the map is tiny, and readers
+    /// (`shutdown`/drop-abort) tolerate brief writer hold.)
+    pub(crate) async fn ensure_subscribed_topic_id(&self, topic: &str, topic_id: TopicId) {
+        // Serialize hold creation per manager: the guard is released on
+        // return, and the double-check below makes duplicate concurrent
+        // calls converge to one hold.
+        let mut holds = self.membership_holds.write().await;
+        if self.topic_ref_counts.read().await.contains_key(topic) {
+            drop(holds);
+            self.refresh_subscribed_topic_id(topic, topic_id).await;
             return;
         }
-        let mut sub = self.subscribe_topic_id(topic.clone(), topic_id).await;
+        // Re-check under the same guard ordering used by the fast path:
+        // another warmer may have inserted between our lock acquisition
+        // and here is impossible (we hold the write lock), but the
+        // refcount read above may have raced the winner's subscribe —
+        // the definitive check is the holds map itself.
+        if holds.contains_key(topic) {
+            drop(holds);
+            self.refresh_subscribed_topic_id(topic, topic_id).await;
+            return;
+        }
+        let mut sub = self.subscribe_topic_id(topic.to_string(), topic_id).await;
         let hold = tokio::spawn(async move { while sub.recv().await.is_some() {} });
-        self.membership_holds
-            .write()
-            .await
-            .insert(topic.clone(), hold);
-        self.refresh_subscribed_topic_id(&topic, topic_id).await;
+        holds.insert(topic.to_string(), hold);
+        drop(holds);
+        self.refresh_subscribed_topic_id(topic, topic_id).await;
     }
 
     /// Topic ids currently known to PlumTree. Test helper for proving a
@@ -860,6 +888,13 @@ impl PubSubManager {
     #[cfg(test)]
     pub(crate) async fn is_topic_subscribed(&self, topic: &str) -> bool {
         self.topic_ref_counts.read().await.contains_key(topic)
+    }
+
+    /// Number of live membership-hold drain tasks (C4). Test helper for the
+    /// #396 concurrent-warmer race: exactly one hold may exist per topic.
+    #[cfg(test)]
+    pub(crate) async fn membership_hold_count(&self) -> usize {
+        self.membership_holds.read().await.len()
     }
 }
 

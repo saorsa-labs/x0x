@@ -569,19 +569,23 @@ pub(crate) async fn warm_reverse_ack_topics(
     if !should_warm_reverse_ack(true, self_agent, peer) {
         return;
     }
-    let self_name = DmInboxService::inbox_topic_name(self_agent);
-    let peer_name = DmInboxService::inbox_topic_name(peer);
     pubsub
-        .ensure_subscribed_topic_id(self_name, dm_inbox_topic(self_agent))
+        .ensure_subscribed_topic_id(
+            &DmInboxService::inbox_topic_name(self_agent),
+            dm_inbox_topic(self_agent),
+        )
         .await;
     // C4: peer inbox must be subscribed, not merely initialized, before
     // the first durable publish_topic_id.
     pubsub
-        .ensure_subscribed_topic_id(peer_name, dm_inbox_topic(peer))
+        .ensure_subscribed_topic_id(
+            &DmInboxService::inbox_topic_name(peer),
+            dm_inbox_topic(peer),
+        )
         .await;
     pubsub
         .ensure_subscribed_topic_id(
-            DM_BUS_TOPIC.to_string(),
+            DM_BUS_TOPIC,
             saorsa_gossip_types::TopicId::from_entity(DM_BUS_TOPIC.as_bytes()),
         )
         .await;
@@ -599,65 +603,23 @@ async fn publish_durable_ack_routes<Primary, Legacy>(
     legacy: Legacy,
 ) -> NetworkResult<()>
 where
-    Primary: std::future::Future<Output = NetworkResult<()>> + Send + 'static,
-    Legacy: std::future::Future<Output = NetworkResult<()>> + Send + 'static,
+    Primary: std::future::Future<Output = NetworkResult<()>>,
+    Legacy: std::future::Future<Output = NetworkResult<()>>,
 {
-    // First-success hedge (#380 Phase C / deferred #338): Ok when either
-    // route completes successfully. A targeted inbox publish can remain
-    // pending under per-topic fan-out after the compatibility-bus hedge
-    // has already delivered. Requiring both (`join!` + `and`) spent the
-    // sender's remaining ACK budget on the wedged sibling — the locked
-    // 504 `budget_stage=ack_wait_ms` (publish returned; application ACK
-    // missed budget).
-    //
-    // The sibling is *detached*, not cancelled. `select!` drop-on-win
-    // aborted a healthy second publish before it delivered: the ACK then
-    // landed on only one route, so a sender (or test) watching the other
-    // never saw it. Each route still has its own deadline so a hang
-    // cannot pin the worker, and both-hang still fails. History commit
-    // stays awaited before this job is scheduled (#338); the queue is
-    // still non-blocking try_send (#335).
-    let mut primary = tokio::spawn(publish_ack_route_with_timeout(
-        "targeted",
-        route_timeout,
-        primary,
-    ));
-    let mut legacy = tokio::spawn(publish_ack_route_with_timeout(
-        "legacy-bus",
-        route_timeout,
-        legacy,
-    ));
-    tokio::select! {
-        primary = &mut primary => {
-            match join_ack_route(primary) {
-                Ok(()) => {
-                    // Dropping JoinHandle does not abort; the sibling keeps
-                    // publishing until it succeeds or hits its own timeout.
-                    std::mem::drop(legacy);
-                    Ok(())
-                }
-                Err(_) => join_ack_route(legacy.await),
-            }
-        }
-        legacy_result = &mut legacy => {
-            match join_ack_route(legacy_result) {
-                Ok(()) => {
-                    std::mem::drop(primary);
-                    Ok(())
-                }
-                Err(_) => join_ack_route(primary.await),
-            }
-        }
-    }
-}
-
-fn join_ack_route(result: Result<NetworkResult<()>, tokio::task::JoinError>) -> NetworkResult<()> {
-    match result {
-        Ok(result) => result,
-        Err(error) => Err(NetworkError::BroadcastError(format!(
-            "ACK route task failed: {error}"
-        ))),
-    }
+    // #396 rework: C1 (first-success hedge) was removed — the joint review
+    // decided the post-commit Direct/typed hedge (C5, PR #408) supersedes
+    // it. This restores main's join!-both semantics unchanged: a targeted
+    // inbox publish can deliver remotely yet remain pending under
+    // per-topic fan-out backpressure, so both routes are polled with their
+    // own deadlines and BOTH must succeed (a wedged sibling fails at its
+    // deadline instead of pinning this serial inbox loop). The residual
+    // 504 `budget_stage=ack_wait_ms` pressure is addressed by C2/C4
+    // pre-warm (below) plus the C5 direct hedge in #408.
+    let (primary, legacy) = tokio::join!(
+        publish_ack_route_with_timeout("targeted", route_timeout, primary),
+        publish_ack_route_with_timeout("legacy-bus", route_timeout, legacy),
+    );
+    primary.and(legacy)
 }
 
 async fn publish_ack_route_with_timeout<Route>(
@@ -2807,108 +2769,6 @@ mod tests {
         );
     }
 
-    /// A route future that never completes and records being dropped.
-    /// Drop must fire even if `select!` never polls this arm — an unstarted
-    /// `async` block would not construct a guard inside its body.
-    struct HangingAckRoute {
-        cancelled: Arc<std::sync::atomic::AtomicBool>,
-    }
-
-    impl std::future::Future for HangingAckRoute {
-        type Output = NetworkResult<()>;
-
-        fn poll(
-            self: std::pin::Pin<&mut Self>,
-            _cx: &mut std::task::Context<'_>,
-        ) -> std::task::Poll<Self::Output> {
-            std::task::Poll::Pending
-        }
-    }
-
-    impl Drop for HangingAckRoute {
-        fn drop(&mut self) {
-            self.cancelled
-                .store(true, std::sync::atomic::Ordering::SeqCst);
-        }
-    }
-
-    /// First-success hedge (#380 Phase C): one healthy route must win
-    /// immediately. The previous `join!` + `and` waited out the hanging
-    /// route's 22s deadline even after the ACK had already left — that is
-    /// the locked 504 `ack_wait_ms` failure. The sibling is detached so a
-    /// merely-slow healthy publish still delivers; cancelling it on win
-    /// dropped the ACK on the route the sender was watching.
-    #[tokio::test(start_paused = true)]
-    async fn first_successful_ack_route_does_not_wait_for_the_hanging_sibling() {
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hanging = HangingAckRoute {
-            cancelled: Arc::clone(&cancelled),
-        };
-        let healthy = async { Ok(()) };
-        let started = tokio::time::Instant::now();
-        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, healthy, hanging).await;
-
-        assert!(
-            result.is_ok(),
-            "one successful route must win the hedge under the attempt budget: {result:?}"
-        );
-        assert_eq!(
-            started.elapsed(),
-            Duration::ZERO,
-            "first-success must not wait out the hanging sibling's deadline"
-        );
-        assert!(
-            !cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            "the hanging sibling is detached (own timeout), not cancelled on win"
-        );
-    }
-
-    /// Same race with the targeted route hanging and the bus winning, so the
-    /// hedge is not accidentally order-dependent on `select!` arm layout.
-    #[tokio::test(start_paused = true)]
-    async fn first_successful_legacy_ack_route_does_not_wait_for_the_hanging_targeted_route() {
-        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let hanging = HangingAckRoute {
-            cancelled: Arc::clone(&cancelled),
-        };
-        let healthy = async { Ok(()) };
-        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, hanging, healthy).await;
-        assert!(
-            result.is_ok(),
-            "a healthy compatibility-bus hedge must win while targeted hangs: {result:?}"
-        );
-        assert!(
-            !cancelled.load(std::sync::atomic::Ordering::SeqCst),
-            "the hanging targeted route is detached, not cancelled on win"
-        );
-    }
-
-    /// Both-healthy is the case `select!` drop-on-win got wrong: the ACK
-    /// must leave on *both* routes, not only the first to report Ok.
-    #[tokio::test]
-    async fn first_success_still_completes_the_healthy_sibling() {
-        let sibling_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
-        let flag = Arc::clone(&sibling_done);
-        let primary = async { Ok(()) };
-        let legacy = async move {
-            tokio::task::yield_now().await;
-            flag.store(true, std::sync::atomic::Ordering::SeqCst);
-            Ok(())
-        };
-        let result = publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy).await;
-        assert!(
-            result.is_ok(),
-            "first-success must return Ok without waiting on sibling: {result:?}"
-        );
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while !sibling_done.load(std::sync::atomic::Ordering::SeqCst) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .expect("a healthy sibling must still publish after first-success returns");
-    }
-
     /// Both routes failing is still an error; the caller records
     /// `ack_publish_route_failed` so gates can tell ACK never left.
     #[tokio::test]
@@ -3005,6 +2865,53 @@ mod tests {
         assert!(
             after_publish.contains(&peer_inbox),
             "publish must reuse the pre-warmed peer inbox membership"
+        );
+    }
+
+    /// #396 race regression: concurrent warmers (outbound Direct connect vs
+    /// inbound PeerConnected) must converge to exactly ONE membership hold
+    /// per topic. The original check-then-insert read the refcount, then
+    /// subscribed, then inserted the hold under three separate lock
+    /// acquisitions — both warmers observed "not subscribed", both spawned
+    /// permanent drain holds, leaking a duplicate subscription per topic
+    /// forever. The fix linearizes creation under the holds write guard.
+    #[tokio::test]
+    async fn concurrent_reverse_ack_warmers_create_a_single_membership_hold() {
+        let node = Arc::new(
+            NetworkNode::new(NetworkConfig::default(), None, None)
+                .await
+                .expect("network node"),
+        );
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let peer = AgentId([0xC4; 32]);
+        let peer_inbox_topic_id = dm_inbox_topic(&peer);
+        let peer_inbox_name = DmInboxService::inbox_topic_name(&peer);
+
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let mut warmers = Vec::new();
+        for _ in 0..2 {
+            let pubsub = Arc::clone(&pubsub);
+            let barrier = Arc::clone(&barrier);
+            let name = peer_inbox_name.clone();
+            warmers.push(tokio::spawn(async move {
+                barrier.wait().await;
+                pubsub
+                    .ensure_subscribed_topic_id(&name, peer_inbox_topic_id)
+                    .await;
+            }));
+        }
+        for warmer in warmers {
+            warmer.await.expect("concurrent warmers must not panic");
+        }
+
+        let holds = pubsub.membership_hold_count().await;
+        assert_eq!(
+            holds, 1,
+            "two concurrent warmers for one topic must create exactly one hold, got {holds}"
+        );
+        assert!(
+            pubsub.is_topic_subscribed(&peer_inbox_name).await,
+            "the winning warmer's subscription must be live"
         );
     }
 
