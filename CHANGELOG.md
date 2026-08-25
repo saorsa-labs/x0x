@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.8] - 2026-08-25
+
 ### Fixed
 
 - **C5 Direct/typed ACK hedge after durable commit (#380, PR #408).** The
