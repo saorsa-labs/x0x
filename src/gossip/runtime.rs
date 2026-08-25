@@ -866,10 +866,12 @@ impl GossipRuntime {
         // never engage in production — they silently fall through to
         // the legacy/Alive path.
         let oracle: Arc<dyn saorsa_gossip_types::PeerHealthOracle> = membership.swim_arc();
-        let pubsub = Arc::new(PubSubManager::new_with_oracle(
+        let pubsub = Arc::new(PubSubManager::new_with_participation(
             Arc::clone(&network),
             signing,
             Some(oracle),
+            config.resolved_participation(),
+            config.resolved_participation_reason().to_string(),
         )?);
         let dispatch_workers = config.dispatch_workers;
 

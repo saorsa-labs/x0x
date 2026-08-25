@@ -8,6 +8,7 @@
 //! - **V1** (legacy): `[topic_len: u16_be | topic | payload]` — unsigned
 //! - **V2** (signed): `[0x02 | agent_id | pubkey | signature | topic | payload]`
 
+use super::participation::{ParticipationMode, ParticipationSnapshot};
 use crate::contacts::{ContactStore, TrustLevel};
 use crate::error::{NetworkError, NetworkResult};
 use crate::identity::AgentId;
@@ -278,6 +279,18 @@ pub struct PubSubManager {
     /// task drains the receiver so a quiet hold cannot fill the channel
     /// and drop the PlumTree registration.
     membership_holds: Arc<RwLock<HashMap<String, tokio::task::JoinHandle<()>>>>,
+    /// Issue #380: Leaf skips pass-through eager-set refresh.
+    participation: ParticipationMode,
+    /// Why this process selected Leaf or Full (diagnostics / startup log).
+    participation_reason: String,
+    /// Times the Full pass-through loop actually ran.
+    passthrough_refresh_runs: AtomicU64,
+    /// Test-only: topic ids last passed to `set_topic_peers`.
+    #[cfg(test)]
+    refreshed_topic_ids: std::sync::Mutex<Vec<TopicId>>,
+    /// Test-only: inject PlumTree-known topics without a live mesh.
+    #[cfg(test)]
+    known_topic_override: std::sync::Mutex<Option<Vec<TopicId>>>,
 }
 
 /// Topic-name prefix marking a topic as local-only (issue #89).
@@ -324,6 +337,20 @@ impl PubSubManager {
         Self::new_with_oracle(network, signing, None)
     }
 
+    /// Same as [`Self::new_with_oracle`] with an explicit participation mode.
+    pub fn new_with_participation(
+        network: Arc<NetworkNode>,
+        signing: Option<Arc<SigningContext>>,
+        oracle: Option<Arc<dyn PeerHealthOracle>>,
+        participation: ParticipationMode,
+        participation_reason: impl Into<String>,
+    ) -> NetworkResult<Self> {
+        let mut manager = Self::new_with_oracle(network, signing, oracle)?;
+        manager.participation = participation;
+        manager.participation_reason = participation_reason.into();
+        Ok(manager)
+    }
+
     /// Construct a [`PubSubManager`] with an explicit SWIM peer-health
     /// oracle. X0X-0073b cooling-decision branches (Suspect grace, Dead
     /// escalation) and X0X-0074 admission Suspect/Dead drops require the
@@ -364,7 +391,26 @@ impl PubSubManager {
             stats: Arc::new(PubSubStats::default()),
             local_topics: Arc::new(RwLock::new(HashMap::new())),
             membership_holds: Arc::new(RwLock::new(HashMap::new())),
+            participation: ParticipationMode::Leaf,
+            participation_reason: "default_leaf".to_string(),
+            passthrough_refresh_runs: AtomicU64::new(0),
+            #[cfg(test)]
+            refreshed_topic_ids: std::sync::Mutex::new(Vec::new()),
+            #[cfg(test)]
+            known_topic_override: std::sync::Mutex::new(None),
         })
+    }
+
+    /// Snapshot of Leaf vs Full participation for `GET /diagnostics/gossip`.
+    #[must_use]
+    pub fn participation_snapshot(&self) -> ParticipationSnapshot {
+        let runs = self.passthrough_refresh_runs.load(Ordering::Relaxed);
+        ParticipationSnapshot {
+            mode: self.participation,
+            reason: self.participation_reason.clone(),
+            passthrough_refresh_runs: runs,
+            passthrough_refresh_ran: runs > 0,
+        }
     }
 
     /// Snapshot of drop-detection counters for the gossip pipeline.
@@ -762,23 +808,63 @@ impl PubSubManager {
         }
         for topic in &subscribed {
             let topic_id = TopicId::from_entity(topic.as_bytes());
-            self.plumtree.set_topic_peers(topic_id, peers.clone()).await;
+            self.apply_topic_peers(topic_id, peers.clone()).await;
         }
 
-        // Also refresh pass-through topics (known to PlumTree but without local
-        // subscribers). Without this, nodes that relay gossip messages for topics
-        // they don't subscribe to would have empty eager sets and drop messages
-        // instead of forwarding them.
-        let all_plumtree_topics = self.plumtree.all_topic_ids().await;
+        // Full (bootstrap / relay / `--relay`): also refresh pass-through
+        // topics (known to PlumTree but without local subscribers) so this
+        // node forwards. Leaf (ordinary desktop): skip — unsubscribed topics
+        // must not expand eager sets here (issue #380).
+        if !self.participation.forwards_passthrough() {
+            return;
+        }
+        self.passthrough_refresh_runs
+            .fetch_add(1, Ordering::Relaxed);
+
+        let all_plumtree_topics = self.known_plumtree_topics().await;
         let subscribed_ids: std::collections::HashSet<TopicId> = subscribed
             .iter()
             .map(|t| TopicId::from_entity(t.as_bytes()))
             .collect();
         for topic_id in all_plumtree_topics {
             if !subscribed_ids.contains(&topic_id) {
-                self.plumtree.set_topic_peers(topic_id, peers.clone()).await;
+                self.apply_topic_peers(topic_id, peers.clone()).await;
             }
         }
+    }
+
+    async fn apply_topic_peers(&self, topic_id: TopicId, peers: Vec<PeerId>) {
+        #[cfg(test)]
+        self.refreshed_topic_ids
+            .lock()
+            .expect("refresh log")
+            .push(topic_id);
+        self.plumtree.set_topic_peers(topic_id, peers).await;
+    }
+
+    async fn known_plumtree_topics(&self) -> Vec<TopicId> {
+        #[cfg(test)]
+        {
+            if let Some(topics) = self
+                .known_topic_override
+                .lock()
+                .expect("topic override")
+                .clone()
+            {
+                return topics;
+            }
+        }
+        self.plumtree.all_topic_ids().await
+    }
+
+    #[cfg(test)]
+    fn take_refreshed_topic_ids(&self) -> Vec<TopicId> {
+        std::mem::take(&mut *self.refreshed_topic_ids.lock().expect("refresh log"))
+    }
+
+    #[cfg(test)]
+    fn set_known_plumtree_topics_for_test(&self, topics: Vec<TopicId>) {
+        *self.known_topic_override.lock().expect("topic override") = Some(topics);
     }
 
     /// X0X-0074: classify a dynamic topic name and register it with the
@@ -2125,6 +2211,84 @@ mod tests {
         assert_eq!(manager.subscription_count().await, 2);
         manager.unsubscribe("t1").await;
         assert_eq!(manager.subscription_count().await, 1);
+    }
+
+    #[tokio::test]
+    async fn leaf_refresh_topic_peers_skips_unsubscribed_passthrough_topics() {
+        // Why (#380): a desktop Leaf must not call set_topic_peers for
+        // topics it does not subscribe to — that is the pass-through loop
+        // that saturates residential uplinks.
+        let node = test_node().await;
+        let manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Leaf,
+            "default_leaf",
+        )
+        .expect("manager");
+        let subscribed = "x0x/dm/v1/inbox/self";
+        let passthrough = "x0x.groups.public.v1";
+        let _sub = manager.subscribe(subscribed.to_string()).await;
+        manager.set_known_plumtree_topics_for_test(vec![
+            TopicId::from_entity(subscribed.as_bytes()),
+            TopicId::from_entity(passthrough.as_bytes()),
+        ]);
+
+        manager.refresh_topic_peers().await;
+
+        let refreshed = manager.take_refreshed_topic_ids();
+        let passthrough_id = TopicId::from_entity(passthrough.as_bytes());
+        assert!(
+            !refreshed.contains(&passthrough_id),
+            "Leaf must not call set_topic_peers for unsubscribed topic ids"
+        );
+        assert!(
+            refreshed.contains(&TopicId::from_entity(subscribed.as_bytes())),
+            "Leaf still refreshes topics it actually subscribes to"
+        );
+        let snap = manager.participation_snapshot();
+        assert_eq!(snap.mode, ParticipationMode::Leaf);
+        assert!(!snap.passthrough_refresh_ran);
+        assert_eq!(snap.passthrough_refresh_runs, 0);
+    }
+
+    #[tokio::test]
+    async fn full_refresh_topic_peers_still_feeds_passthrough_topics() {
+        // Why (#380): backbone Full keeps today's relay loop so unsubscribed
+        // PlumTree topics still get a plane peer list.
+        let node = test_node().await;
+        let manager = PubSubManager::new_with_participation(
+            node,
+            None,
+            None,
+            ParticipationMode::Full,
+            "operator_relay",
+        )
+        .expect("manager");
+        let subscribed = "x0x/caps/v1";
+        let passthrough = "x0x.groups.public.v1";
+        let _sub = manager.subscribe(subscribed.to_string()).await;
+        manager.set_known_plumtree_topics_for_test(vec![
+            TopicId::from_entity(subscribed.as_bytes()),
+            TopicId::from_entity(passthrough.as_bytes()),
+        ]);
+
+        manager.refresh_topic_peers().await;
+
+        let refreshed = manager.take_refreshed_topic_ids();
+        assert!(
+            refreshed.contains(&TopicId::from_entity(subscribed.as_bytes())),
+            "Full still refreshes subscribed topics"
+        );
+        assert!(
+            refreshed.contains(&TopicId::from_entity(passthrough.as_bytes())),
+            "Full must still call set_topic_peers for pass-through topic ids"
+        );
+        let snap = manager.participation_snapshot();
+        assert_eq!(snap.mode, ParticipationMode::Full);
+        assert!(snap.passthrough_refresh_ran);
+        assert_eq!(snap.passthrough_refresh_runs, 1);
     }
 
     #[tokio::test]

@@ -1,5 +1,6 @@
 //! Configuration for the gossip overlay network.
 
+use super::participation::ParticipationMode;
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the gossip overlay network.
@@ -39,6 +40,24 @@ pub struct GossipConfig {
     /// the active worker target up to 32 during overload or restart bursts.
     #[serde(default = "default_dispatch_workers")]
     pub dispatch_workers: usize,
+
+    /// Operator opt-in to Full (pass-through relay) participation.
+    ///
+    /// TOML: `gossip.relay = true`. The `--relay` CLI flag sets the same
+    /// intent. Seed / dual-listen / managed-binary detection still
+    /// fail-closes to Full when this is false (issue #380).
+    #[serde(default)]
+    pub relay: bool,
+
+    /// Process-resolved participation mode. Not a TOML key — the daemon
+    /// writes this after [`super::resolve_participation`].
+    #[serde(skip)]
+    pub participation: ParticipationMode,
+
+    /// Why [`Self::participation`] was selected (`dual_listen`, `seed_addr`,
+    /// `managed_binary`, `operator_relay`, `default_leaf`).
+    #[serde(skip)]
+    pub participation_reason: String,
 }
 
 const MAX_DISPATCH_WORKERS: usize = 32;
@@ -71,11 +90,40 @@ impl Default for GossipConfig {
             arwl: 6,
             prwl: 3,
             dispatch_workers: default_dispatch_workers(),
+            relay: false,
+            participation: ParticipationMode::Leaf,
+            participation_reason: String::new(),
         }
     }
 }
 
 impl GossipConfig {
+    /// Effective mode: operator `relay` or a resolved Full both select Full.
+    #[must_use]
+    pub fn resolved_participation(&self) -> ParticipationMode {
+        if self.relay || self.participation.forwards_passthrough() {
+            ParticipationMode::Full
+        } else {
+            ParticipationMode::Leaf
+        }
+    }
+
+    /// Reason string for diagnostics; defaults when the daemon has not
+    /// filled [`Self::participation_reason`].
+    #[must_use]
+    pub fn resolved_participation_reason(&self) -> &str {
+        if !self.participation_reason.is_empty() {
+            return self.participation_reason.as_str();
+        }
+        if self.relay {
+            "operator_relay"
+        } else if self.participation.forwards_passthrough() {
+            "full"
+        } else {
+            "default_leaf"
+        }
+    }
+
     /// Validate configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
         if self.active_view_size == 0 {
@@ -154,6 +202,8 @@ mod tests {
         assert_eq!(cfg.passive_view_size, defaults.passive_view_size);
         assert_eq!(cfg.arwl, defaults.arwl);
         assert_eq!(cfg.prwl, defaults.prwl);
+        assert!(!cfg.relay);
+        assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
     }
 
     #[test]
@@ -165,5 +215,32 @@ mod tests {
         assert_eq!(cfg.arwl, defaults.arwl);
         assert_eq!(cfg.prwl, defaults.prwl);
         assert_eq!(cfg.dispatch_workers, defaults.dispatch_workers);
+        assert!(!cfg.relay);
+        assert_eq!(cfg.resolved_participation(), ParticipationMode::Leaf);
+    }
+
+    #[test]
+    fn relay_toml_opts_in_to_full() {
+        let cfg: GossipConfig = toml::from_str("relay = true").expect("relay TOML");
+        assert!(cfg.relay);
+        assert_eq!(cfg.resolved_participation(), ParticipationMode::Full);
+        assert_eq!(cfg.resolved_participation_reason(), "operator_relay");
+    }
+    /// ADR-0034: `gossip.relay = true` (TOML) must resolve Full — one operator
+    /// concept across CLI/env/TOML; the server startup normalises the env var
+    /// so the announcement side (#406) observes the same opt-in.
+    #[test]
+    fn toml_relay_resolves_full_participation() {
+        let mut c = GossipConfig::default();
+        assert_eq!(
+            c.resolved_participation(),
+            super::super::ParticipationMode::Leaf
+        );
+        c.relay = true;
+        assert_eq!(
+            c.resolved_participation(),
+            super::super::ParticipationMode::Full
+        );
+        assert_eq!(c.resolved_participation_reason(), "operator_relay");
     }
 }

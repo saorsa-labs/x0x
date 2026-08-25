@@ -103,6 +103,8 @@ pub struct ServeOptions {
     pub skip_update_check: bool,
     /// Disable ant-quic UPnP IGD port mapping for this invocation.
     pub cli_no_port_mapping: bool,
+    /// Operator opt-in to Full gossip participation (`--relay`).
+    pub cli_relay: bool,
     /// Do not load or save the cached peer set.
     pub cli_disable_peer_cache: bool,
     /// Active instance name (`--name`), if any.
