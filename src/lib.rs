@@ -332,6 +332,11 @@ pub struct Agent {
     /// Handle for the running capability advert service.
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
+    /// L3 fetch-on-miss cache for announce cert blobs (see `announce_blob`).
+    pub(crate) announce_blob_cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    /// This daemon's live `(user_id, agent_certificate)` pair, served to
+    /// blob fetchers by the responder task.
+    pub(crate) own_cert_pair: announce_blob::SharedCertPair,
     /// Handle for the running DM inbox service.
     dm_inbox_service: std::sync::Arc<tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
@@ -6962,6 +6967,11 @@ impl Agent {
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let identity_dir_for_listener = self.identity_dir.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
+        // L3 fetch-on-miss: the listener resolves V3 cert digests from the
+        // blob cache (hit) or fires a background fetch (miss) — never
+        // blocking the discovery pipeline.
+        let announce_blob_cache = std::sync::Arc::clone(&self.announce_blob_cache);
+        let blob_pubsub = std::sync::Arc::clone(runtime.pubsub());
 
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
@@ -7320,7 +7330,37 @@ impl Agent {
                         }
                         remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
                     }
-                    v3.into_announcement()
+                    // L3 fetch-on-miss: resolve the cert digest into the
+                    // pair. Hit → merge the cached (verified) pair into the
+                    // converted announcement so the shared pipeline upserts
+                    // the full entry now. Miss → fire the non-blocking
+                    // fetch; this beat carries no pair (the existing merge
+                    // never erases a previously-known cert) and the next
+                    // beat hits the filled cache. Anonymous digests never
+                    // fetch — `(None, None)` is a well-known constant.
+                    let cert_digest = v3.cert_digest;
+                    let payload_version = v3.payload_version;
+                    let mut converted = v3.into_announcement();
+                    if announce_blob::fetch_warranted(&cert_digest) {
+                        match announce_blob_cache.get(&cert_digest).await {
+                            Some(blob) => {
+                                converted.user_id = blob.user_id;
+                                converted.agent_certificate = blob.agent_certificate.clone();
+                            }
+                            None => {
+                                announce_blob_cache
+                                    .ensure_blob(
+                                        &blob_pubsub,
+                                        &cert_digest,
+                                        payload_version,
+                                        &converted.agent_id,
+                                        &converted.machine_id,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    converted
                 } else {
                     let announcement = match deserialize_identity_announcement(&raw_payload) {
                         Ok(a) => a,
@@ -8188,6 +8228,22 @@ impl Agent {
         }
         *guard = Some(service);
         tracing::info!("Capability advert service started");
+
+        // L3: serve cert-blob fetches for peers that see our V3 announce
+        // digest but lack the cached pair. Same lifecycle as the caps
+        // service; the handle is detached (task ends with the pubsub).
+        if self.shutdown_token.is_cancelled() {
+            return Ok(());
+        }
+        if let Err(e) = announce_blob::spawn_blob_responder(
+            std::sync::Arc::clone(runtime.pubsub()),
+            std::sync::Arc::clone(&self.announce_blob_cache),
+            std::sync::Arc::clone(&self.own_cert_pair),
+        )
+        .await
+        {
+            tracing::warn!("announce blob responder spawn failed: {e}");
+        }
         Ok(())
     }
 
@@ -11604,6 +11660,10 @@ impl AgentBuilder {
 
         // Load the revocation set from disk so enforcement takes effect
         // immediately on restart, even before the next gossip heartbeat.
+        // L3: capture the identity's cert pair before it moves into the
+        // struct — the blob responder serves this pair to fetchers.
+        let own_pair_user = identity.user_id();
+        let own_pair_cert = identity.agent_certificate().cloned();
         Ok(Agent {
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
@@ -11647,6 +11707,13 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
+            announce_blob_cache: std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(
+                self.identity_dir
+                    .clone()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+                    .map(|dir| dir.join("announce-blob-cache.bin")),
+            )),
+            own_cert_pair: announce_blob::shared_cert_pair(own_pair_user, own_pair_cert),
             dm_inbox_service: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             revocation_set,
             identity_dir: self.identity_dir,
