@@ -75,6 +75,7 @@ pub mod storage;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
 pub mod announce_v3;
 
