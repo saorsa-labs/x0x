@@ -1706,3 +1706,60 @@ fn sole_owner_nonmember_request_live_withdrawal_is_unauthorized_for_action_kind(
         "product must name the action under test; got {result:?}"
     );
 }
+
+/// Product currently admits (`Ok(())` + withdrawn) a sole Pending owner
+/// applying a live-withdrawal `GroupDeleted` commit as `NonMemberRequest`.
+/// QA classified this as a groups product admit, not an error-shape gap.
+/// This unit expects reject. Do not change product on this PR.
+///
+/// #375 already pins the Owner/Active neighbor
+/// (`sole_owner_nonmember_request_live_withdrawal_is_unauthorized_for_action_kind`).
+/// This is the Owner/Pending tuple. Oracle
+/// (`expected_withdrawn_apply_authorized`) already returns false;
+/// `apply_withdrawn_flag_commit` currently accepts.
+#[test]
+fn sole_pending_owner_nonmember_request_live_withdrawal_must_reject() {
+    let keypairs = sequence_keypairs();
+    let signer = &keypairs[1];
+    let signer_spec = Some(member_spec(GroupRole::Owner, GroupMemberState::Pending));
+    let action_kind = ActionKind::NonMemberRequest;
+    let event_kind = MetadataEventKind::GroupDeleted;
+    let current_withdrawn = false;
+    let commit_withdrawn = true;
+    let admin_present = false;
+
+    let mut apply_group = withdrawal_case_group(
+        &keypairs,
+        signer_spec.as_ref(),
+        current_withdrawn,
+        admin_present,
+    );
+    let before = state_snapshot(&apply_group);
+    let commit = craft_withdrawn_flag_commit(&apply_group, signer, commit_withdrawn, 11_000)
+        .expect("sign withdrawal flag commit");
+    let result = apply_withdrawn_flag_commit(&mut apply_group, &commit, action_kind, event_kind);
+    let expected_ok = expected_withdrawn_apply_authorized(
+        current_withdrawn,
+        commit_withdrawn,
+        signer_spec.as_ref(),
+        admin_present,
+        action_kind,
+        event_kind,
+    );
+
+    assert!(
+        !expected_ok,
+        "oracle must reject NonMemberRequest on a sole-member live withdrawal"
+    );
+    assert_eq!(
+        state_snapshot(&apply_group),
+        before,
+        "product must not admit / withdraw; result={result:?} withdrawn_after={}",
+        apply_group.withdrawn
+    );
+    assert!(
+        result.is_err(),
+        "product must reject; got {result:?} withdrawn_after={}",
+        apply_group.withdrawn
+    );
+}
