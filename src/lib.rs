@@ -75,6 +75,10 @@ pub mod storage;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+pub mod announce_blob;
+/// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
+pub mod announce_v3;
+
 /// Bootstrap node discovery and connection.
 ///
 /// This module handles initial connection to bootstrap nodes with
@@ -2471,6 +2475,45 @@ impl HeartbeatContext {
                     )))
                 })?;
         }
+        // L3: publish the slim self-verifying V3 alongside V2 on the same
+        // topic. Old nodes drop the unknown X0A3 magic; new nodes prefer it
+        // (and fetch the cert blob by digest only when they need it). The
+        // payload_version tracks the (user_id, cert) pair: 0 = anonymous,
+        // announced_at otherwise (any change to the pair changes the digest,
+        // and a consent flip bumps the version past every cached value).
+        let v3_payload_version = if announcement.user_id.is_some() {
+            announcement.announced_at
+        } else {
+            0
+        };
+        match announce_v3::IdentityAnnouncementV3::build_from_v2(
+            &announcement,
+            self.identity.machine_keypair().secret_key(),
+            v3_payload_version,
+        )
+        .and_then(|v3| {
+            announce_v3::serialize_v3(&v3).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "heartbeat: failed to serialize v3 announcement: {e}"
+                ))
+            })
+        }) {
+            Ok(v3_encoded) => {
+                if let Err(e) = self
+                    .runtime
+                    .pubsub()
+                    .publish(
+                        IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                        bytes::Bytes::from(v3_encoded),
+                    )
+                    .await
+                {
+                    tracing::debug!("heartbeat: v3 publish failed: {e}");
+                }
+            }
+            Err(e) => tracing::debug!("heartbeat: v3 build failed: {e}"),
+        }
+
         let now = Agent::unix_timestamp_secs();
         upsert_discovered_machine(
             &self.machine_cache,
@@ -7190,21 +7233,51 @@ impl Agent {
                 let raw_payload = msg.payload.clone();
                 let already_verified =
                     has_recent_verified_payload(&seen_identity_payloads, &raw_payload);
-                let announcement = match deserialize_identity_announcement(&raw_payload) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        tracing::debug!("Ignoring invalid identity announcement payload: {}", e);
-                        continue;
+                // L3: a V3 payload (X0A3 magic) is verified under V3 rules,
+                // then converted into the V2 in-memory shape for the shared
+                // pipeline below. The converted value must NOT be re-verified
+                // with `IdentityAnnouncement::verify` (its signature covers the
+                // V3 canonical bytes), so both formats verify inside this
+                // decode step and downstream code never calls verify again.
+                // The cert/user pair is absent from a V3 beat: the digest blob
+                // is fetched on demand (announce_blob module) and the cache
+                // merge never erases an existing cert with an absent one.
+                let announcement = if announce_v3::is_v3_payload(&raw_payload) {
+                    let v3 = match announce_v3::deserialize_v3(&raw_payload) {
+                        Ok(v3) => v3,
+                        Err(e) => {
+                            tracing::debug!("Ignoring invalid v3 identity announcement: {}", e);
+                            continue;
+                        }
+                    };
+                    if !already_verified {
+                        if let Err(e) = v3.verify() {
+                            tracing::warn!("Ignoring unverifiable v3 identity announcement: {}", e);
+                            continue;
+                        }
+                        remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
                     }
+                    v3.into_announcement()
+                } else {
+                    let announcement = match deserialize_identity_announcement(&raw_payload) {
+                        Ok(a) => a,
+                        Err(e) => {
+                            tracing::debug!(
+                                "Ignoring invalid identity announcement payload: {}",
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    if !already_verified {
+                        if let Err(e) = announcement.verify() {
+                            tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
+                            continue;
+                        }
+                        remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
+                    }
+                    announcement
                 };
-
-                if !already_verified {
-                    if let Err(e) = announcement.verify() {
-                        tracing::warn!("Ignoring unverifiable identity announcement: {}", e);
-                        continue;
-                    }
-                    remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
-                }
 
                 let now = Agent::unix_timestamp_secs();
                 if !identity_announcement_timestamp_is_acceptable(announcement.announced_at, now) {
