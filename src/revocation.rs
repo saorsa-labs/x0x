@@ -299,6 +299,11 @@ pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
+    /// Monotonic change counter — incremented on every insert or expiry.
+    /// Publishers compare this to decide whether the set changed since
+    /// their last full broadcast (the on-change piggyback gate), avoiding
+    /// a full `all_records` comparison per heartbeat.
+    change_generation: u64,
 }
 
 impl RevocationSet {
@@ -374,6 +379,49 @@ impl RevocationSet {
     /// checks — it is module-private and reachable ONLY through
     /// [`verify_and_insert`](Self::verify_and_insert), which is the sole path a
     /// record can enter the set. Returns `true` if new.
+    /// Monotonic generation counter — changes on every insert or expiry.
+    /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
+    /// the publish (except the periodic fallback).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.change_generation
+    }
+
+    /// Drop records older than `ttl_secs`. Returns the number expired.
+    ///
+    /// A revocation older than the TTL with no renewal is already moot:
+    /// revocations target currently-known agents, and a record that old
+    /// means nobody has seen the agent (or the issuer) for months. The
+    /// 2026-07 stale testnet records (2 records, 19 KB each heartbeat) are
+    /// the motivating case — they cost 222 KB/s fleet-wide on a topic
+    /// that should be silent.
+    pub fn expire_records_older_than(&mut self, ttl_secs: u64, now_unix: u64) -> usize {
+        let cutoff = now_unix.saturating_sub(ttl_secs);
+        let expired: Vec<[u8; 32]> = self
+            .records_by_hash
+            .iter()
+            .filter(|(_, persisted)| persisted.record.revoked_at < cutoff)
+            .map(|(hash, _)| *hash)
+            .collect();
+        if expired.is_empty() {
+            return 0;
+        }
+        for hash in &expired {
+            if let Some(persisted) = self.records_by_hash.remove(hash) {
+                match &persisted.record.subject {
+                    RevokedSubject::Agent(id) => {
+                        self.revoked_agents.remove(id);
+                    }
+                    RevokedSubject::Machine(id) => {
+                        self.revoked_machines.remove(id);
+                    }
+                }
+            }
+        }
+        self.change_generation = self.change_generation.saturating_add(1);
+        expired.len()
+    }
+
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
         let hash = persisted.record.record_hash();
         if self.records_by_hash.contains_key(&hash) {
@@ -388,6 +436,7 @@ impl RevocationSet {
             }
         }
         self.records_by_hash.insert(hash, persisted);
+        self.change_generation = self.change_generation.saturating_add(1);
         true
     }
 
@@ -461,6 +510,84 @@ impl RevocationSet {
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    mod revocation_cadence {
+        use super::super::*;
+        use crate::identity::AgentKeypair;
+
+        /// Build a self-signed revocation record for an agent at the given
+        /// timestamp. Self-revocations require no subject certificate.
+        fn self_revocation(agent_kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
+            RevocationRecord::sign(
+                RevokedSubject::Agent(agent_kp.agent_id()),
+                agent_kp.public_key(),
+                agent_kp.secret_key(),
+                revoked_at,
+                None,
+            )
+            .expect("self-revocation signs")
+        }
+
+        /// #380 cadence: the TTL expiry kills the 2 stale July testnet
+        /// records that cost 222 KB/s fleet-wide on the revocation topic.
+        #[test]
+        fn ttl_expires_stale_records_and_unrevokes_subject() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
+
+            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
+            set.verify_and_insert(stale, None)
+                .expect("stale record verifies");
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+
+            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(expired, 1, "the 91-day-old record must expire");
+            assert!(
+                !set.is_agent_revoked(&kp.agent_id()),
+                "the expired subject is no longer revoked"
+            );
+            assert!(set.all_records().is_empty());
+        }
+
+        /// #380 cadence: fresh records survive the TTL.
+        #[test]
+        fn ttl_keeps_fresh_records() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
+
+            let fresh = self_revocation(&kp, now - 24 * 3600);
+            set.verify_and_insert(fresh, None).expect("fresh verifies");
+
+            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(expired, 0);
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+        }
+
+        /// #380 cadence: the change generation advances on insert AND on
+        /// expiry — the on-change piggyback key.
+        #[test]
+        fn generation_advances_on_insert_and_expiry() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
+            let gen0 = set.generation();
+
+            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
+            set.verify_and_insert(stale, None).expect("verifies");
+            let gen1 = set.generation();
+            assert!(gen1 > gen0, "insert must advance the generation");
+
+            set.expire_records_older_than(90 * 24 * 3600, now);
+            let gen2 = set.generation();
+            assert!(gen2 > gen1, "expiry must advance the generation");
+
+            // No-op: neither insert nor expiry fires.
+            set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(set.generation(), gen2, "no-change must not advance");
+        }
+    }
 
     use super::*;
     use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};

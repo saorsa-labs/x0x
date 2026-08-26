@@ -164,9 +164,11 @@ fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
 
 #[test]
 fn test_default_heartbeat_and_ttl_constants() {
-    // Heartbeats are anti-entropy and remain well inside the 900 s TTL, while
-    // avoiding sustained PubSub pressure from repeated signed announcements.
-    assert_eq!(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS, 300);
+    // Heartbeats are anti-entropy and must remain inside the 900 s TTL so
+    // peers on the previous default TTL never age out a live identity between
+    // beats; 600 s halves idle broadcast load (2026-08-26 measurement) while
+    // keeping that margin.
+    assert_eq!(x0x::IDENTITY_HEARTBEAT_INTERVAL_SECS, 600);
     assert_eq!(x0x::IDENTITY_TTL_SECS, 900);
 }
 

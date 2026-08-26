@@ -768,11 +768,16 @@ fn local_direct_probe_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net:
 /// Default interval between identity heartbeat re-announcements (seconds).
 ///
 /// Heartbeats are anti-entropy, not a hot-path delivery mechanism. Keep the
-/// default at five minutes so bootstrap meshes do not spend their PubSub budget
-/// on repeated signed identity/machine announcements. PlumTree forwards each
-/// locally authored announcement across the topic mesh; receivers must not
-/// re-publish the same payload as a new application message.
-pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
+/// default at ten minutes so meshes do not spend their PubSub budget on
+/// repeated signed identity/machine announcements: idle-network cost scales
+/// linearly with (network size x announce size x cadence), and a 2026-08-26
+/// live measurement showed announce beats dominating desktop uplink. The
+/// interval MUST stay below [`IDENTITY_TTL_SECS`] with margin so peers still
+/// running the previous default TTL never see a fresh announcement age out
+/// between beats. PlumTree forwards each locally authored announcement across
+/// the topic mesh; receivers must not re-publish the same payload as a new
+/// application message.
+pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 600;
 
 /// Default TTL for discovered agent cache entries (seconds).
 ///
@@ -2204,9 +2209,14 @@ struct HeartbeatContext {
     /// erase a consented disclosure.
     user_identity_consented: std::sync::Arc<std::sync::atomic::AtomicBool>,
     allow_local_discovery_addrs: bool,
-    /// Local revocation set — piggybacked on each heartbeat for partition-
-    /// tolerant eventual propagation.
+    /// Local revocation set — piggybacked on heartbeats for partition-
+    /// tolerant eventual propagation (on-change + periodic fallback).
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+    /// Last `change_generation` the piggyback broadcast saw. Unchanged set
+    /// ⇒ skip the publish (except the periodic fallback below).
+    last_revocation_generation: std::sync::atomic::AtomicU64,
+    /// Heartbeat tick counter for the periodic revocation fallback.
+    heartbeat_tick: std::sync::atomic::AtomicU64,
 }
 
 impl HeartbeatContext {
@@ -2492,26 +2502,80 @@ impl HeartbeatContext {
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
 
-        // Piggyback the local revocation set on each heartbeat for partition-
-        // tolerant eventual convergence.  A node that was offline when a
-        // revocation was originally published will learn it from the next
-        // heartbeat it receives from any peer that already holds it.
-        let records = self.revocation_set.read().await.all_records();
-        if !records.is_empty() {
-            match bincode::serialize(&records) {
-                Ok(bytes) => {
-                    if let Err(e) = self
-                        .runtime
-                        .pubsub()
-                        .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
-                        .await
-                    {
-                        tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
+        // Revocation re-broadcast: ON-CHANGE with a periodic fallback,
+        // not every heartbeat. The every-beat full-set publish cost 222
+        // KB/s fleet-wide (2 stale July test records × 19 KB × every node
+        // × every 300 s) on a topic that should be near-silent. Now:
+        //
+        // 1. TTL expiry first — records older than 90 days are dropped
+        //    (they target agents nobody has seen for months; the 2 stale
+        //    July testnet records die here).
+        // 2. Publish the full set only when the change_generation advanced
+        //    since our last broadcast (a record was inserted or expired).
+        // 3. Every 12th heartbeat (300 s × 12 = 1 h), republish regardless
+        //    — the partition-tolerance fallback for nodes that joined or
+        //    recovered mid-partition.
+        //
+        // Wire format unchanged: the message is still bincode
+        // Vec<RevocationRecord> on x0x.revocation.v1; old nodes that
+        // receive it process it identically.
+        {
+            const REVOCATION_RECORD_TTL_SECS: u64 = 90 * 24 * 3600;
+            const REVOCATION_FALLBACK_TICKS: u64 = 12;
+
+            let expired = {
+                let mut set = self.revocation_set.write().await;
+                set.expire_records_older_than(
+                    REVOCATION_RECORD_TTL_SECS,
+                    Agent::unix_timestamp_secs(),
+                )
+            };
+            if expired > 0 {
+                tracing::info!(
+                    expired,
+                    "revocation TTL: expired {expired} record(s) older than 90 days"
+                );
+            }
+
+            let tick = self
+                .heartbeat_tick
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let current_gen = self.revocation_set.read().await.generation();
+            let last_gen = self
+                .last_revocation_generation
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let changed = current_gen != last_gen;
+            let is_fallback = tick.is_multiple_of(REVOCATION_FALLBACK_TICKS);
+
+            if !changed && !is_fallback {
+                return Ok(());
+            }
+
+            let records = self.revocation_set.read().await.all_records();
+            if !records.is_empty() {
+                match bincode::serialize(&records) {
+                    Ok(bytes) => {
+                        if let Err(e) = self
+                            .runtime
+                            .pubsub()
+                            .publish(REVOCATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                            .await
+                        {
+                            tracing::debug!("heartbeat: revocation re-broadcast failed: {e}");
+                        } else {
+                            self.last_revocation_generation
+                                .store(current_gen, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                    Err(e) => {
+                        tracing::debug!("heartbeat: failed to serialize revocation set: {e}");
                     }
                 }
-                Err(e) => {
-                    tracing::debug!("heartbeat: failed to serialize revocation set: {e}");
-                }
+            } else if changed {
+                // Set became empty (all records expired) — advance the
+                // generation tracker so we don't re-enter on every tick.
+                self.last_revocation_generation
+                    .store(current_gen, std::sync::atomic::Ordering::Relaxed);
             }
         }
 
@@ -7901,6 +7965,8 @@ impl Agent {
                 user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
                 allow_local_discovery_addrs: allow_local_discovery_addresses(network.config()),
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
+                last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+                heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -9919,6 +9985,8 @@ impl Agent {
             user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
             allow_local_discovery_addrs,
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
+            last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
+            heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
