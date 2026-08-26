@@ -49,8 +49,11 @@ pub const DM_CAPABILITY_TARGETED_RESPONSE_TOPIC: &str = "x0x/caps/v1/response/ta
 /// Domain-separation prefix for the advert signature bytes.
 const ADVERT_SIGN_DOMAIN: &[u8] = b"x0x-caps-v1";
 
-/// Cadence at which agents republish their advert.
-pub const ADVERT_PUBLISH_INTERVAL_SECS: u64 = 300;
+/// Cadence at which agents republish their advert. Kept in step with
+/// `IDENTITY_HEARTBEAT_INTERVAL_SECS` (10 min): idle-network broadcast cost
+/// scales linearly with cadence, and the 900 s cache TTL still tolerates a
+/// missed window only for sub-TTL intervals, so this must stay < 900 s.
+pub const ADVERT_PUBLISH_INTERVAL_SECS: u64 = 600;
 
 /// How long a cached advert remains usable before it's considered stale.
 /// Must be > `ADVERT_PUBLISH_INTERVAL_SECS` so that a single missed

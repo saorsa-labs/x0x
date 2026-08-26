@@ -768,11 +768,16 @@ fn local_direct_probe_addrs(addresses: &[std::net::SocketAddr]) -> Vec<std::net:
 /// Default interval between identity heartbeat re-announcements (seconds).
 ///
 /// Heartbeats are anti-entropy, not a hot-path delivery mechanism. Keep the
-/// default at five minutes so bootstrap meshes do not spend their PubSub budget
-/// on repeated signed identity/machine announcements. PlumTree forwards each
-/// locally authored announcement across the topic mesh; receivers must not
-/// re-publish the same payload as a new application message.
-pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 300;
+/// default at ten minutes so meshes do not spend their PubSub budget on
+/// repeated signed identity/machine announcements: idle-network cost scales
+/// linearly with (network size x announce size x cadence), and a 2026-08-26
+/// live measurement showed announce beats dominating desktop uplink. The
+/// interval MUST stay below [`IDENTITY_TTL_SECS`] with margin so peers still
+/// running the previous default TTL never see a fresh announcement age out
+/// between beats. PlumTree forwards each locally authored announcement across
+/// the topic mesh; receivers must not re-publish the same payload as a new
+/// application message.
+pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 600;
 
 /// Default TTL for discovered agent cache entries (seconds).
 ///

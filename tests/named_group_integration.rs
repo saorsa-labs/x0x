@@ -2344,7 +2344,7 @@ async fn member_removed_lost_initial_volley_recovers_via_bounded_resend() {
 
 /// Why: a lost `GroupDeleted` leaves the recipient holding a live group and its
 /// TreeKEM snapshot forever. The withdrawn discovery card cannot wipe keyed
-/// local state, and the 300s card republish filters Hidden groups out, so the
+/// local state, and the periodic card republish (600s default) filters Hidden groups out, so the
 /// signed event is the only thing that terminalizes the peer's copy.
 ///
 /// `X0X_TEST_DROP_INITIAL_GROUP_DELETED` drops alice's initial volley, leaving

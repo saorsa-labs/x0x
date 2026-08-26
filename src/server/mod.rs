@@ -857,7 +857,9 @@ pub async fn serve_with_options(
             .map(|(id, _)| id.clone())
             .collect()
     };
-    let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(300);
+    // Default matches IDENTITY_HEARTBEAT_INTERVAL_SECS: group cards are
+    // discovery anti-entropy, and idle broadcast cost scales with cadence.
+    let republish_interval_secs = config.group_card_republish_interval_secs.unwrap_or(600);
     if republish_interval_secs > 0 {
         let state_for_republish = Arc::clone(&state);
         bg_tasks.push(tokio::spawn(async move {
