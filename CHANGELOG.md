@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.39.9] - 2026-08-26
+
 ### Fixed
 
 - **Leaf↔reverse-ACK interaction: a durable DM receiver can ALWAYS return the ACK (#380).**
