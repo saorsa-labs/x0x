@@ -62,9 +62,9 @@ use routes::{
     network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
     presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
     publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, remove_mls_member, remove_named_group_member,
-    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    reject_join_request, reject_unverified_direct_public_message, remove_mls_member,
+    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
     save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
@@ -1333,6 +1333,14 @@ pub async fn serve_with_options(
                     continue;
                 };
                 let group_id = msg.group_id.clone();
+                if !typed.verified {
+                    reject_unverified_direct_public_message(
+                        &public_dm_state.groups_diagnostics,
+                        &group_id,
+                        &hex::encode(typed.sender.as_bytes()),
+                    );
+                    continue;
+                }
                 tracing::debug!(
                     group_id = %group_id,
                     sender = %hex::encode(typed.sender.as_bytes()),
