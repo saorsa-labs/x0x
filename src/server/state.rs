@@ -292,6 +292,13 @@ pub struct DaemonConfig {
     #[serde(default = "default_heartbeat_interval")]
     pub(super) heartbeat_interval_secs: u64,
 
+    /// Re-enable the legacy V2 announce set (V2 identity + machine
+    /// announcements + periodic caps advert) alongside V3. Default false
+    /// since the L3 retirement flip; escape hatch for debugging or isolated
+    /// pre-V3 networks.
+    #[serde(default)]
+    pub(super) legacy_announce: bool,
+
     /// How long before a discovered agent entry is considered stale (seconds).
     #[serde(default = "default_identity_ttl")]
     pub(super) identity_ttl_secs: u64,
@@ -611,6 +618,7 @@ impl Default for DaemonConfig {
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
+            legacy_announce: false,
             identity_ttl_secs: default_identity_ttl(),
             user_key_path: None,
             rendezvous_enabled: default_rendezvous_enabled(),

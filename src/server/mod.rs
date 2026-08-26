@@ -388,6 +388,7 @@ pub async fn serve_with_options(
         .with_contact_store_path(&contacts_path)
         .with_history(history_config)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
+        .with_legacy_announce(config.legacy_announce)
         .with_identity_ttl(config.identity_ttl_secs);
 
     if let Some(secs) = config.presence_beacon_interval_secs {
