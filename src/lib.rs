@@ -7343,9 +7343,27 @@ impl Agent {
                     let mut converted = v3.into_announcement();
                     if announce_blob::fetch_warranted(&cert_digest) {
                         match announce_blob_cache.get(&cert_digest).await {
-                            Some(blob) => {
+                            // SECURITY: the digest is attacker-choosable — any
+                            // agent can copy another agent's digest into its
+                            // own (validly signed) V3. The cached pair was
+                            // verified against the agent that FIRST triggered
+                            // the fetch, so re-check the certificate's own
+                            // agent binding against THIS announcement before
+                            // merging; a mismatch is treated as anonymous.
+                            Some(blob)
+                                if blob.agent_certificate.as_ref().is_some_and(|cert| {
+                                    cert.agent_id()
+                                        .is_ok_and(|id| id == converted.agent_id)
+                                }) =>
+                            {
                                 converted.user_id = blob.user_id;
                                 converted.agent_certificate = blob.agent_certificate.clone();
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    agent = %hex::encode(converted.agent_id.as_bytes()),
+                                    "v3 announce claims a cert digest whose certificate binds a different agent; ignoring pair"
+                                );
                             }
                             None => {
                                 announce_blob_cache

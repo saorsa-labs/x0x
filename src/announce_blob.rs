@@ -703,6 +703,33 @@ pub async fn spawn_blob_responder(
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    /// SECURITY (digest-spoof attribution): an attacker can put a VICTIM's
+    /// cert digest inside their own validly-signed V3 announce. The receiver
+    /// hit-path must refuse to merge a cached pair whose certificate binds a
+    /// different agent — otherwise the attacker's cache entry inherits the
+    /// victim's user attribution. This pins the binding predicate the
+    /// discovery arm uses before merging.
+    #[test]
+    fn cached_pair_never_merges_into_a_different_agents_announcement() {
+        let victim_user = crate::identity::UserKeypair::generate().unwrap();
+        let victim_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let attacker_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&victim_user, &victim_agent)
+            .expect("cert issues");
+        let merge_allowed = |cert: &crate::identity::AgentCertificate,
+                             claimed: &crate::identity::AgentId| {
+            cert.agent_id().is_ok_and(|id| id == *claimed)
+        };
+        assert!(
+            merge_allowed(&cert, &victim_agent.agent_id()),
+            "victim's own announcement must merge its pair"
+        );
+        assert!(
+            !merge_allowed(&cert, &attacker_agent.agent_id()),
+            "attacker claiming the victim's digest must NOT inherit the pair"
+        );
+    }
+
     use super::*;
     use crate::identity::{AgentCertificate, AgentKeypair, UserKeypair};
 
