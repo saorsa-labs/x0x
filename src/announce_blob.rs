@@ -53,7 +53,7 @@ pub(crate) const ANNOUNCE_BLOB_REQUEST_DOMAIN: &[u8] = b"x0x/announce/v3/blob-re
 #[allow(dead_code)]
 pub(crate) const ANNOUNCE_BLOB_TOPIC: &str = "x0x/announce/v3/blob";
 
-/// Domain prefix for blob responses on [`ANNOUNCE_BLOB_TOPIC`] — lets the
+/// Domain prefix for blob responses on `ANNOUNCE_BLOB_TOPIC` — lets the
 /// fetcher distinguish a response from a concurrent request (both ride the
 /// same topic).
 pub(crate) const ANNOUNCE_BLOB_RESPONSE_DOMAIN: &[u8] = b"x0x/announce/v3/blob-response-v1\0";
@@ -400,7 +400,7 @@ impl AnnounceBlobCache {
 /// invariant.
 ///
 /// Routes (mirroring `publish_targeted_capability_request`):
-/// - targeted: the domain-prefixed request on [`ANNOUNCE_BLOB_TOPIC`];
+/// - targeted: the domain-prefixed request on `ANNOUNCE_BLOB_TOPIC`;
 /// - warm: the same domain-prefixed bytes on the steady identity announce
 ///   topic, so a responder that only watches the announce topic still
 ///   serves. The domain prefix keeps pre-L3 subscribers from mistaking it
@@ -615,7 +615,7 @@ fn decode_blob_request_from(encoded: &[u8]) -> Option<AnnounceBlobRequest> {
 /// Spawn the blob responder: subscribes the targeted (`ANNOUNCE_BLOB_TOPIC`)
 /// and warm (identity announce topic) carriers, answers every verified
 /// domain-prefixed request with [`AnnounceBlobCache::serve_request`]'s pair
-/// bytes under [`ANNOUNCE_BLOB_RESPONSE_DOMAIN`]. Mirrors the caps
+/// bytes under `ANNOUNCE_BLOB_RESPONSE_DOMAIN`. Mirrors the caps
 /// warm-targeted-request responder (`dm_capability_service.rs`), including
 /// the 1-response-per-second coalescing window so a burst of requests
 /// cannot turn into a blob storm.
