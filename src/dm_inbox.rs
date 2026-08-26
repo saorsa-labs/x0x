@@ -666,55 +666,90 @@ async fn publish_durable_ack_job(
     // C5: same v2 ACK envelope on live Direct/typed as a third hedge.
     // Detached from gossip: missing Direct is fail-open, and Direct send-ok
     // is not a sender receipt. Do not abort sibling gossip routes.
-    let direct =
-        hedge_direct_ack_fail_open(direct_hedge, job.recipient, Bytes::clone(&job.encoded));
+    // `direct_hedge_was_sent` distinguishes Sent from SkippedNoDirect for
+    // the (c) outcome counters.
+    let direct_hedge_was_sent = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let direct = {
+        let sent_flag = Arc::clone(&direct_hedge_was_sent);
+        let hedge = direct_hedge.clone();
+        let recipient = job.recipient;
+        let encoded = Bytes::clone(&job.encoded);
+        async move {
+            let Some(hedge) = hedge else {
+                return Ok(());
+            };
+            match hedge.hedge(recipient, encoded).await {
+                DirectAckHedgeOutcome::Sent => {
+                    sent_flag.store(true, std::sync::atomic::Ordering::Relaxed);
+                    Ok(())
+                }
+                DirectAckHedgeOutcome::SkippedNoDirect => Ok(()),
+                DirectAckHedgeOutcome::Failed => Err(NetworkError::ConnectionFailed(
+                    "direct ACK hedge failed".to_string(),
+                )),
+            }
+        }
+    };
     let publish_started = Instant::now();
     let (gossip, direct_outcome) = tokio::join!(
         publish_durable_ack_routes(DURABLE_ACK_ROUTE_TIMEOUT, primary, legacy),
         publish_ack_route_with_timeout("direct-typed", DURABLE_ACK_ROUTE_TIMEOUT, direct),
     );
     dm.record_ack_publish_ms(crate::dm::millis_since(publish_started));
-    if let Err(error) = gossip {
-        dm.record_ack_publish_route_failed();
-        tracing::warn!(
-            target: "dm.trace",
-            stage = "ack_publish_route_failed",
-            acked_request_id = %hex::encode(job.acked_request_id),
-            recipient = %hex::encode(job.recipient.as_bytes()),
-            protocol_version = job.protocol_version,
-            hedged = true,
-            %error,
-            "both durable ACK routes failed; ACK never left this recipient"
-        );
-    } else if let Err(error) = direct_outcome {
-        // Gossip landed; Direct failed after a live connection existed.
-        // Count it for Tester visibility, but do not fail the ACK.
-        dm.record_ack_publish_route_failed();
-        tracing::debug!(
-            target: "dm.trace",
-            stage = "ack_publish_direct_hedge_failed",
-            acked_request_id = %hex::encode(job.acked_request_id),
-            recipient = %hex::encode(job.recipient.as_bytes()),
-            protocol_version = job.protocol_version,
-            %error,
-            "Direct/typed ACK hedge failed; gossip hedges still count"
-        );
-    }
-}
-
-async fn hedge_direct_ack_fail_open(
-    direct_hedge: Option<Arc<dyn DirectAckHedge>>,
-    recipient: AgentId,
-    encoded: Bytes,
-) -> NetworkResult<()> {
-    let Some(hedge) = direct_hedge else {
-        return Ok(());
-    };
-    match hedge.hedge(recipient, encoded).await {
-        DirectAckHedgeOutcome::Sent | DirectAckHedgeOutcome::SkippedNoDirect => Ok(()),
-        DirectAckHedgeOutcome::Failed => Err(NetworkError::ConnectionFailed(
-            "direct ACK hedge failed".to_string(),
-        )),
+    // #380 leaf-reverse-ACK fix (c): count gossip and Direct hedge outcomes
+    // SEPARATELY so /diagnostics/dm distinguishes "gossip routes dead,
+    // Direct saved it" from "all dead". The old code incremented the same
+    // ack_publish_route_failed counter for gossip failure AND direct
+    // failure, and warned "ACK never left" even when Direct had Sent —
+    // the 3/3 fleet reading was ambiguous.
+    let direct_sent = matches!(direct_outcome, Ok(()))
+        && direct_hedge_was_sent.load(std::sync::atomic::Ordering::Relaxed);
+    match (gossip, direct_outcome) {
+        (Ok(()), _) => {
+            dm.record_ack_gossip_route_succeeded();
+            if direct_sent {
+                dm.record_ack_direct_hedge(crate::direct::AckDirectHedgeOutcomeRecord::Sent);
+            }
+        }
+        (Err(error), Ok(())) => {
+            // Gossip failed but the Direct hedge fired — the ACK still had a
+            // route. Count the gossip failure for visibility; Direct carries
+            // the receipt.
+            dm.record_ack_gossip_route_failed();
+            if direct_sent {
+                dm.record_ack_direct_hedge(
+                    crate::direct::AckDirectHedgeOutcomeRecord::SavedFailure,
+                );
+            } else {
+                dm.record_ack_direct_hedge(
+                    crate::direct::AckDirectHedgeOutcomeRecord::SkippedOrNoDirect,
+                );
+            }
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "ack_gossip_routes_failed_direct_hedge",
+                acked_request_id = %hex::encode(job.acked_request_id),
+                recipient = %hex::encode(job.recipient.as_bytes()),
+                direct_sent,
+                %error,
+                "gossip ACK routes failed; Direct hedge state recorded separately"
+            );
+        }
+        (Err(error), Err(direct_error)) => {
+            // All routes dead — the ACK genuinely never left.
+            dm.record_ack_gossip_route_failed();
+            dm.record_ack_direct_hedge(crate::direct::AckDirectHedgeOutcomeRecord::Failed);
+            tracing::warn!(
+                target: "dm.trace",
+                stage = "ack_publish_all_routes_failed",
+                acked_request_id = %hex::encode(job.acked_request_id),
+                recipient = %hex::encode(job.recipient.as_bytes()),
+                protocol_version = job.protocol_version,
+                gossip_error = %error,
+                direct_error = %direct_error,
+                "both gossip routes AND the Direct hedge failed; ACK never left this recipient"
+            );
+        }
     }
 }
 
@@ -1384,6 +1419,46 @@ impl InboxPipeline {
         // which can only happen against a peer that believed a false v2
         // capability advert (this daemon advertises v2 iff history is on).
         if envelope.protocol_version >= DM_PROTOCOL_DURABLE_ACK {
+            // #380 leaf-reverse-ACK fix (a): a signature-verified durable
+            // envelope just arrived — this is the authoritative moment the
+            // receiver owes a reverse route. On a Leaf receiver, the
+            // sender's inbox topic is not in the subscribed set (C2/C4
+            // pre-warm only fires on connect events with a resolvable
+            // agent_id and a trusted contact — neither is guaranteed on a
+            // fresh daemon or a first-ever message). Without a subscription
+            // the targeted-inbox ACK publish finds zero peers and fails;
+            // the compat bus has the same zero-peer problem in Leaf mode.
+            // Subscribe the SENDER's inbox topic right now so the ACK that
+            // follows has a gossip route. No trust gate and no
+            // commit-success gate: the sender just delivered a
+            // signature-verified envelope addressed to us — we owe them the
+            // receipt, and the route must exist even if the commit below
+            // withholds (the sender will retry).
+            {
+                let sender_agent = AgentId(envelope.sender_agent_id);
+                crate::dm_inbox::warm_reverse_ack_topics(
+                    self.pubsub.as_ref(),
+                    &self.self_agent_id,
+                    &sender_agent,
+                )
+                .await;
+            }
+
+            // #380 leaf-reverse-ACK fix (b): register the sender's
+            // agent→machine mapping from the verified envelope itself. The
+            // C5 Direct hedge's `get_machine_id` lookup was SkippedNoDirect
+            // whenever the connected_agents map lacked the entry — which
+            // happens on inbound connections where the PeerConnected
+            // handler could not resolve the agent_id from the machine_id
+            // (fresh cache, no DM history yet). The envelope carries both
+            // identities and just passed signature verification; this is
+            // the strongest binding evidence we will get.
+            {
+                let sender_agent = AgentId(envelope.sender_agent_id);
+                let sender_machine = MachineId(envelope.sender_machine_id);
+                self.dm.mark_connected(sender_agent, sender_machine).await;
+            }
+
             let _decision = self
                 .handle_payload_durable(
                     envelope,
@@ -3404,6 +3479,88 @@ mod tests {
             rx.await.expect("oneshot"),
             DmAckOutcome::Accepted,
             "only the matching request_id envelope completes the waiter"
+        );
+    }
+
+    /// #380 leaf-reverse-ACK: the failing fleet case, end-to-end at the
+    /// PubSubManager level. A Leaf receiver with ZERO prior subscription
+    /// state (no C2/C4 connect-event warm) receives a durable DM. The fix
+    /// pre-subscribes the sender's inbox topic ON RECEIPT (the authoritative
+    /// moment), so the ACK publish that follows has a gossip route. Also
+    /// verifies the agent→machine registration for the C5 Direct hedge.
+    #[tokio::test]
+    async fn leaf_receiver_of_durable_dm_pre_subscribes_sender_inbox_on_receipt() {
+        let sender = test_keypair();
+        let machine_kp = MachineKeypair::generate().expect("machine");
+        let machine = machine_kp.machine_id();
+        let harness = make_inbox_harness(&sender, Some(machine), None).await;
+
+        // Zero prior subscription state: prove the sender's inbox topic is
+        // NOT in PlumTree before the DM arrives (the leaf fleet condition).
+        let sender_inbox_topic_id = dm_inbox_topic(&sender.agent_id());
+        let sender_inbox_name = DmInboxService::inbox_topic_name(&sender.agent_id());
+        let before = harness.pipeline.pubsub.plumtree_topic_ids().await;
+        assert!(
+            !before.contains(&sender_inbox_topic_id),
+            "precondition: sender inbox topic NOT subscribed (the leaf zero-state case)"
+        );
+
+        // Build a real durable v2 envelope using the production builder.
+        let request_id = [0xE1; 16];
+        let created = now_unix_ms();
+        let envelope = EnvelopeBuilder::build_payload_envelope_with_version(
+            DM_PROTOCOL_DURABLE_ACK,
+            request_id,
+            &sender.agent_id(),
+            &machine,
+            &machine_kp,
+            &harness.recipient_agent_id,
+            &harness.recipient_kem.public_bytes,
+            created,
+            created + ACK_ENVELOPE_LIFETIME_MS,
+            b"leaf-reverse-ack-proof".to_vec(),
+            |bytes| {
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(sender.secret_key(), bytes)
+                    .map(|sig| sig.as_bytes().to_vec())
+                    .map_err(|e| e.to_string())
+            },
+        )
+        .expect("build durable envelope");
+        let encoded = Bytes::from(envelope.to_wire_bytes().expect("encode"));
+
+        let msg = PubSubMessage {
+            topic: sender_inbox_name.clone(),
+            payload: encoded,
+            sender: Some(sender.agent_id()),
+            sender_public_key: Some(sender.public_key().as_bytes().to_vec()),
+            verified: true,
+            trust_level: None,
+            raw_envelope: None,
+        };
+        harness.pipeline.handle_incoming(msg, false).await;
+
+        // The fix: the sender's inbox topic is now subscribed (the receipt
+        // is the trigger), so the ACK publish has peers.
+        let after = harness.pipeline.pubsub.plumtree_topic_ids().await;
+        assert!(
+            after.contains(&sender_inbox_topic_id),
+            "receipt of a durable DM must pre-subscribe the sender's inbox for the reverse ACK: {after:?}"
+        );
+        assert!(
+            harness
+                .pipeline
+                .pubsub
+                .is_topic_subscribed(&sender_inbox_name)
+                .await,
+            "the subscription must be live (membership hold), not a one-shot refresh"
+        );
+
+        // The agent→machine mapping is registered from the envelope (fix b),
+        // so the C5 Direct hedge can look up the sender.
+        assert_eq!(
+            harness.pipeline.dm.get_machine_id(&sender.agent_id()).await,
+            Some(machine),
+            "the verified envelope must register the sender's agent→machine binding for the C5 Direct hedge"
         );
     }
 

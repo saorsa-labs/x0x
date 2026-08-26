@@ -499,6 +499,12 @@ struct DirectDiagnosticsCounters {
     incoming_dropped_expired: AtomicU64,
     incoming_typed_route_dropped: AtomicU64,
     ack_publish_route_failed: AtomicU64,
+    ack_gossip_route_succeeded: AtomicU64,
+    ack_gossip_route_failed: AtomicU64,
+    ack_direct_hedge_sent: AtomicU64,
+    ack_direct_hedge_saved_failure: AtomicU64,
+    ack_direct_hedge_skipped: AtomicU64,
+    ack_direct_hedge_failed: AtomicU64,
     incoming_delivered_to_subscribe: AtomicU64,
     subscriber_channel_lagged: AtomicU64,
     subscriber_events_evicted: AtomicU64,
@@ -572,6 +578,21 @@ pub struct DmDiagnosticsStats {
     /// results are not counted.
     #[serde(default)]
     pub ack_publish_route_failed: u64,
+    /// #380 leaf-reverse-ACK: gossip (inbox + compat-bus) ACK route split.
+    #[serde(default)]
+    pub ack_gossip_route_succeeded: u64,
+    #[serde(default)]
+    pub ack_gossip_route_failed: u64,
+    /// #380 leaf-reverse-ACK: Direct/typed ACK hedge outcome split —
+    /// `saved_failure` counts Direct carrying the ACK when gossip failed.
+    #[serde(default)]
+    pub ack_direct_hedge_sent: u64,
+    #[serde(default)]
+    pub ack_direct_hedge_saved_failure: u64,
+    #[serde(default)]
+    pub ack_direct_hedge_skipped: u64,
+    #[serde(default)]
+    pub ack_direct_hedge_failed: u64,
     pub incoming_delivered_to_subscribe: u64,
     /// Number of oldest buffered events evicted from slow subscriber queues.
     pub subscriber_events_evicted: u64,
@@ -665,6 +686,19 @@ pub struct DirectMessaging {
 
     /// #336 phase 1: last durable ACK publish duration (receiver side).
     last_ack_publish_ms: Mutex<Option<u64>>,
+}
+
+/// #380 leaf-reverse-ACK: Direct/typed ACK hedge outcome record.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum AckDirectHedgeOutcomeRecord {
+    /// Direct hedge sent the envelope (gossip may or may not have too).
+    Sent,
+    /// Gossip failed but Direct carried the ACK — the save.
+    SavedFailure,
+    /// No Direct connection existed (or agent→machine mapping missing).
+    SkippedOrNoDirect,
+    /// Direct send failed after a live connection existed.
+    Failed,
 }
 
 impl DirectMessaging {
@@ -1000,6 +1034,39 @@ impl DirectMessaging {
     /// Record an ACK publication in which every required route failed, or
     /// the job could not be scheduled. After the first-success hedge this
     /// is "ACK never left", not "one hedge was slow".
+    /// #380 leaf-reverse-ACK: gossip-route outcome counters (split from the
+    /// old combined `ack_publish_route_failed`; the legacy counter also
+    /// moves on gossip failure for existing gates).
+    pub(crate) fn record_ack_gossip_route_succeeded(&self) {
+        self.diagnostics
+            .ack_gossip_route_succeeded
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_ack_gossip_route_failed(&self) {
+        self.diagnostics
+            .ack_gossip_route_failed
+            .fetch_add(1, Ordering::Relaxed);
+        self.diagnostics
+            .ack_publish_route_failed
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// #380 leaf-reverse-ACK: Direct hedge outcome counter.
+    pub(crate) fn record_ack_direct_hedge(&self, outcome: AckDirectHedgeOutcomeRecord) {
+        let counter = match outcome {
+            AckDirectHedgeOutcomeRecord::Sent => &self.diagnostics.ack_direct_hedge_sent,
+            AckDirectHedgeOutcomeRecord::SavedFailure => {
+                &self.diagnostics.ack_direct_hedge_saved_failure
+            }
+            AckDirectHedgeOutcomeRecord::SkippedOrNoDirect => {
+                &self.diagnostics.ack_direct_hedge_skipped
+            }
+            AckDirectHedgeOutcomeRecord::Failed => &self.diagnostics.ack_direct_hedge_failed,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+
     pub(crate) fn record_ack_publish_route_failed(&self) {
         self.diagnostics
             .ack_publish_route_failed
@@ -1086,6 +1153,30 @@ impl DirectMessaging {
             ack_publish_route_failed: self
                 .diagnostics
                 .ack_publish_route_failed
+                .load(Ordering::Relaxed),
+            ack_gossip_route_succeeded: self
+                .diagnostics
+                .ack_gossip_route_succeeded
+                .load(Ordering::Relaxed),
+            ack_gossip_route_failed: self
+                .diagnostics
+                .ack_gossip_route_failed
+                .load(Ordering::Relaxed),
+            ack_direct_hedge_sent: self
+                .diagnostics
+                .ack_direct_hedge_sent
+                .load(Ordering::Relaxed),
+            ack_direct_hedge_saved_failure: self
+                .diagnostics
+                .ack_direct_hedge_saved_failure
+                .load(Ordering::Relaxed),
+            ack_direct_hedge_skipped: self
+                .diagnostics
+                .ack_direct_hedge_skipped
+                .load(Ordering::Relaxed),
+            ack_direct_hedge_failed: self
+                .diagnostics
+                .ack_direct_hedge_failed
                 .load(Ordering::Relaxed),
             incoming_delivered_to_subscribe: self
                 .diagnostics

@@ -4,6 +4,32 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- **Leaf↔reverse-ACK interaction: a durable DM receiver can ALWAYS return the ACK (#380).**
+  Live evidence on v0.39.8: durable messages arrived, verified, and committed on studio1, then the
+  receiver's ACK publish failed every route (`ack_publish_route_failed: 3/3`) — the sender 504'd at
+  `budget_stage: ack_wait_ms`. Three defects, all fixed:
+  1. **Receipt-triggered pre-subscribe (fix a)**: on a Leaf receiver, the sender's inbox topic was
+     not in the subscribed set (C2/C4 pre-warm only fires on connect events with a resolvable
+     agent_id and a trusted contact — neither guaranteed on a fresh daemon or first-ever message).
+     The targeted-inbox ACK publish found zero peers; the compat bus had the same zero-peer problem.
+     Now a signature-verified durable envelope pre-subscribes the sender's inbox topic at the
+     receipt point — before the durable dispatch, independent of commit outcome — so the ACK always
+     has a gossip route. No trust gate: the sender just delivered a verified envelope addressed to
+     us; we owe them the receipt.
+  2. **Agent→machine registration from the envelope (fix b)**: the C5 Direct hedge's
+     `get_machine_id` returned `SkippedNoDirect` on inbound connections where the `PeerConnected`
+     handler could not resolve the agent_id from the machine_id (fresh cache, no DM history). The
+     verified envelope carries both identities — the strongest binding evidence — and now
+     registers them, so the Direct hedge can fire.
+  3. **Split ACK-route outcome counters (fix c)**: `ack_publish_route_failed` incremented for
+     gossip failure AND Direct failure and warned "ACK never left" even when Direct had Sent — the
+     3/3 fleet reading was ambiguous. New split counters on `/diagnostics/dm`:
+     `ack_gossip_route_succeeded/failed` and `ack_direct_hedge_sent/saved_failure/skipped/failed`,
+     so "gossip routes dead, Direct saved it" is now distinguishable from "all dead". The legacy
+     combined counter still moves on gossip failure for existing gates.
+
 ## [v0.39.8] - 2026-08-25
 
 ### Fixed
