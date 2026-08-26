@@ -268,6 +268,13 @@ pub struct Agent {
     identity_listener_started: std::sync::atomic::AtomicBool,
     /// How often to re-announce identity (seconds).
     heartbeat_interval_secs: u64,
+    /// Whether to keep publishing the legacy V2 announce set (V2 identity +
+    /// machine announcements + periodic caps advert). Default FALSE since the
+    /// L3 retirement flip: the V3 announce carries everything, receivers for
+    /// V2 formats stay forever, and old peers self-update within the rollout
+    /// window. Escape hatch: `AgentBuilder::with_legacy_announce(true)` /
+    /// `[announce] legacy = true` in the daemon config.
+    legacy_announce: bool,
     /// How long before a cache entry is filtered out (seconds).
     identity_ttl_secs: u64,
     /// Handle for the running heartbeat task, if started.
@@ -325,6 +332,11 @@ pub struct Agent {
     /// Handle for the running capability advert service.
     capability_advert_service:
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
+    /// L3 fetch-on-miss cache for announce cert blobs (see `announce_blob`).
+    pub(crate) announce_blob_cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    /// This daemon's live `(user_id, agent_certificate)` pair, served to
+    /// blob fetchers by the responder task.
+    pub(crate) own_cert_pair: announce_blob::SharedCertPair,
     /// Handle for the running DM inbox service.
     dm_inbox_service: std::sync::Arc<tokio::sync::Mutex<Option<dm_inbox::DmInboxService>>>,
     /// In-memory grow-only revocation set.  Gate checks hold only a read lock
@@ -2181,6 +2193,7 @@ pub struct AgentBuilder {
     /// Useful for fully isolated embedders and test harnesses.
     disable_peer_cache: bool,
     heartbeat_interval_secs: Option<u64>,
+    legacy_announce: Option<bool>,
     identity_ttl_secs: Option<u64>,
     presence_beacon_interval_secs: Option<u64>,
     presence_event_poll_interval_secs: Option<u64>,
@@ -2221,6 +2234,8 @@ struct HeartbeatContext {
     last_revocation_generation: std::sync::atomic::AtomicU64,
     /// Heartbeat tick counter for the periodic revocation fallback.
     heartbeat_tick: std::sync::atomic::AtomicU64,
+    /// L3 retirement flip: publish the legacy V2 announce set only when true.
+    legacy_announce: bool,
 }
 
 impl HeartbeatContext {
@@ -2434,34 +2449,42 @@ impl HeartbeatContext {
             ))
         })?;
         let machine_payload = bytes::Bytes::from(machine_encoded);
-        self.runtime
-            .pubsub()
-            .publish(
-                shard_topic_for_machine(&machine_announcement.machine_id),
-                machine_payload.clone(),
-            )
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "heartbeat: machine shard publish failed: {e}"
-                )))
-            })?;
-        self.runtime
-            .pubsub()
-            .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "heartbeat: machine publish failed: {e}"
-                )))
-            })?;
+        // L3 retirement: the V3 announce below carries every machine field,
+        // so the separate machine broadcast only runs on the legacy escape
+        // hatch. The announcement struct is still built — local cache upserts
+        // and lookup fallbacks keep using it.
+        if self.legacy_announce {
+            self.runtime
+                .pubsub()
+                .publish(
+                    shard_topic_for_machine(&machine_announcement.machine_id),
+                    machine_payload.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "heartbeat: machine shard publish failed: {e}"
+                    )))
+                })?;
+            self.runtime
+                .pubsub()
+                .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "heartbeat: machine publish failed: {e}"
+                    )))
+                })?;
+        }
 
         let encoded = serialize_identity_announcement(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
                 "heartbeat: failed to serialize announcement: {e}"
             ))
         })?;
-        if should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored) {
+        if self.legacy_announce
+            && should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored)
+        {
             self.runtime
                 .pubsub()
                 .publish(
@@ -2937,6 +2960,7 @@ impl Agent {
             peer_cache_dir: None,
             disable_peer_cache: false,
             heartbeat_interval_secs: None,
+            legacy_announce: None,
             identity_ttl_secs: None,
             presence_beacon_interval_secs: None,
             presence_event_poll_interval_secs: None,
@@ -6390,27 +6414,33 @@ impl Agent {
                     "failed to serialize machine announcement: {e}"
                 ))
             })?);
-        runtime
-            .pubsub()
-            .publish(
-                shard_topic_for_machine(&machine_announcement.machine_id),
-                machine_payload.clone(),
-            )
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "failed to publish machine announcement to shard topic: {e}"
-                )))
-            })?;
-        runtime
-            .pubsub()
-            .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "failed to publish machine announcement: {e}"
-                )))
-            })?;
+        // L3 retirement: machine broadcast only on the legacy escape hatch —
+        // the V3 announce below carries every machine field.
+        if self.legacy_announce {
+            runtime
+                .pubsub()
+                .publish(
+                    shard_topic_for_machine(&machine_announcement.machine_id),
+                    machine_payload.clone(),
+                )
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to publish machine announcement to shard topic: {e}"
+                    )))
+                })?;
+        }
+        if self.legacy_announce {
+            runtime
+                .pubsub()
+                .publish(MACHINE_ANNOUNCE_TOPIC.to_string(), machine_payload)
+                .await
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "failed to publish machine announcement: {e}"
+                    )))
+                })?;
+        }
 
         let encoded = serialize_identity_announcement(&announcement).map_err(|e| {
             error::IdentityError::Serialization(format!(
@@ -6420,29 +6450,67 @@ impl Agent {
 
         let payload = bytes::Bytes::from(encoded);
 
-        // Publish to shard topic first (future-proof routing).
-        let shard_topic = shard_topic_for_agent(&announcement.agent_id);
-        runtime
-            .pubsub()
-            .publish(shard_topic, payload.clone())
-            .await
-            .map_err(|e| {
-                error::IdentityError::Storage(std::io::Error::other(format!(
-                    "failed to publish identity announcement to shard topic: {e}"
-                )))
-            })?;
-
-        // Also publish to legacy broadcast topic for backward compatibility.
-        if should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored) {
+        // L3 retirement: V2 identity publishes (shard + legacy broadcast)
+        // only on the legacy escape hatch.
+        if self.legacy_announce {
+            let shard_topic = shard_topic_for_agent(&announcement.agent_id);
             runtime
                 .pubsub()
-                .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
+                .publish(shard_topic, payload.clone())
                 .await
                 .map_err(|e| {
                     error::IdentityError::Storage(std::io::Error::other(format!(
-                        "failed to publish identity announcement: {e}"
+                        "failed to publish identity announcement to shard topic: {e}"
                     )))
                 })?;
+            if should_publish_identity_on_legacy(IdentityAnnouncementSource::LocallyAuthored) {
+                runtime
+                    .pubsub()
+                    .publish(IDENTITY_ANNOUNCE_TOPIC.to_string(), payload)
+                    .await
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(format!(
+                            "failed to publish identity announcement: {e}"
+                        )))
+                    })?;
+            }
+        }
+
+        // L3: the V3 announce is the primary format on this path too (the
+        // heartbeat already publishes it; phase 1 missed this join-time/REST
+        // path, which mattered less while V2 still ran every beat).
+        let v3_payload_version = if announcement.user_id.is_some() {
+            announcement.announced_at
+        } else {
+            0
+        };
+        match announce_v3::IdentityAnnouncementV3::build_from_v2(
+            &announcement,
+            self.identity.machine_keypair().secret_key(),
+            v3_payload_version,
+        )
+        .and_then(|v3| {
+            announce_v3::serialize_v3(&v3).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize v3 announcement: {e}"
+                ))
+            })
+        }) {
+            Ok(v3_encoded) => {
+                runtime
+                    .pubsub()
+                    .publish(
+                        IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                        bytes::Bytes::from(v3_encoded),
+                    )
+                    .await
+                    .map_err(|e| {
+                        error::IdentityError::Storage(std::io::Error::other(format!(
+                            "failed to publish v3 identity announcement: {e}"
+                        )))
+                    })?;
+            }
+            Err(e) => tracing::warn!("announce_identity: v3 build failed: {e}"),
         }
 
         let now = Self::unix_timestamp_secs();
@@ -6899,6 +6967,11 @@ impl Agent {
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
         let identity_dir_for_listener = self.identity_dir.clone();
         let contact_store_for_evict = std::sync::Arc::clone(&self.contact_store);
+        // L3 fetch-on-miss: the listener resolves V3 cert digests from the
+        // blob cache (hit) or fires a background fetch (miss) — never
+        // blocking the discovery pipeline.
+        let announce_blob_cache = std::sync::Arc::clone(&self.announce_blob_cache);
+        let blob_pubsub = std::sync::Arc::clone(runtime.pubsub());
 
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
@@ -7257,7 +7330,55 @@ impl Agent {
                         }
                         remember_verified_payload(&mut seen_identity_payloads, &raw_payload);
                     }
-                    v3.into_announcement()
+                    // L3 fetch-on-miss: resolve the cert digest into the
+                    // pair. Hit → merge the cached (verified) pair into the
+                    // converted announcement so the shared pipeline upserts
+                    // the full entry now. Miss → fire the non-blocking
+                    // fetch; this beat carries no pair (the existing merge
+                    // never erases a previously-known cert) and the next
+                    // beat hits the filled cache. Anonymous digests never
+                    // fetch — `(None, None)` is a well-known constant.
+                    let cert_digest = v3.cert_digest;
+                    let payload_version = v3.payload_version;
+                    let mut converted = v3.into_announcement();
+                    if announce_blob::fetch_warranted(&cert_digest) {
+                        match announce_blob_cache.get(&cert_digest).await {
+                            // SECURITY: the digest is attacker-choosable — any
+                            // agent can copy another agent's digest into its
+                            // own (validly signed) V3. The cached pair was
+                            // verified against the agent that FIRST triggered
+                            // the fetch, so re-check the certificate's own
+                            // agent binding against THIS announcement before
+                            // merging; a mismatch is treated as anonymous.
+                            Some(blob)
+                                if blob.agent_certificate.as_ref().is_some_and(|cert| {
+                                    cert.agent_id()
+                                        .is_ok_and(|id| id == converted.agent_id)
+                                }) =>
+                            {
+                                converted.user_id = blob.user_id;
+                                converted.agent_certificate = blob.agent_certificate.clone();
+                            }
+                            Some(_) => {
+                                tracing::warn!(
+                                    agent = %hex::encode(converted.agent_id.as_bytes()),
+                                    "v3 announce claims a cert digest whose certificate binds a different agent; ignoring pair"
+                                );
+                            }
+                            None => {
+                                announce_blob_cache
+                                    .ensure_blob(
+                                        &blob_pubsub,
+                                        &cert_digest,
+                                        payload_version,
+                                        &converted.agent_id,
+                                        &converted.machine_id,
+                                    )
+                                    .await;
+                            }
+                        }
+                    }
+                    converted
                 } else {
                     let announcement = match deserialize_identity_announcement(&raw_payload) {
                         Ok(a) => a,
@@ -8040,6 +8161,7 @@ impl Agent {
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+                legacy_announce: self.legacy_announce,
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -8091,13 +8213,18 @@ impl Agent {
             self.identity.agent_keypair(),
         ));
         let caps_rx = self.dm_capabilities_tx.subscribe();
-        let service = dm_capability_service::CapabilityAdvertService::spawn_default(
+        // L3 retirement: the periodic caps advert only runs on the legacy
+        // escape hatch. On-demand mode still answers targeted/warm requests
+        // and publishes on capability upgrades.
+        let service = dm_capability_service::CapabilityAdvertService::spawn(
             std::sync::Arc::clone(runtime.pubsub()),
             signing,
             self.identity.agent_id(),
             self.identity.machine_id(),
             caps_rx,
             std::sync::Arc::clone(&self.capability_store),
+            std::time::Duration::from_secs(dm_capability::ADVERT_PUBLISH_INTERVAL_SECS),
+            self.legacy_announce,
         )
         .await
         .map_err(|e| {
@@ -8119,6 +8246,22 @@ impl Agent {
         }
         *guard = Some(service);
         tracing::info!("Capability advert service started");
+
+        // L3: serve cert-blob fetches for peers that see our V3 announce
+        // digest but lack the cached pair. Same lifecycle as the caps
+        // service; the handle is detached (task ends with the pubsub).
+        if self.shutdown_token.is_cancelled() {
+            return Ok(());
+        }
+        if let Err(e) = announce_blob::spawn_blob_responder(
+            std::sync::Arc::clone(runtime.pubsub()),
+            std::sync::Arc::clone(&self.announce_blob_cache),
+            std::sync::Arc::clone(&self.own_cert_pair),
+        )
+        .await
+        {
+            tracing::warn!("announce blob responder spawn failed: {e}");
+        }
         Ok(())
     }
 
@@ -10060,6 +10203,7 @@ impl Agent {
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+            legacy_announce: self.legacy_announce,
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -11057,6 +11201,18 @@ impl AgentBuilder {
         self
     }
 
+    /// Re-enable the legacy V2 announce set (V2 identity + machine
+    /// announcements + periodic caps advert) alongside V3.
+    ///
+    /// Default is `false` since the L3 retirement flip — V3 carries the same
+    /// information in one slim, self-verifying message. This escape hatch
+    /// exists for debugging and for isolated networks stuck on pre-V3 nodes.
+    #[must_use]
+    pub fn with_legacy_announce(mut self, enabled: bool) -> Self {
+        self.legacy_announce = Some(enabled);
+        self
+    }
+
     /// Set the identity cache TTL.
     ///
     /// Cache entries with `last_seen` older than this threshold are filtered
@@ -11522,6 +11678,10 @@ impl AgentBuilder {
 
         // Load the revocation set from disk so enforcement takes effect
         // immediately on restart, even before the next gossip heartbeat.
+        // L3: capture the identity's cert pair before it moves into the
+        // struct — the blob responder serves this pair to fetchers.
+        let own_pair_user = identity.user_id();
+        let own_pair_cert = identity.agent_certificate().cloned();
         Ok(Agent {
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
@@ -11544,6 +11704,7 @@ impl AgentBuilder {
             heartbeat_interval_secs: self
                 .heartbeat_interval_secs
                 .unwrap_or(IDENTITY_HEARTBEAT_INTERVAL_SECS),
+            legacy_announce: self.legacy_announce.unwrap_or(false),
             identity_ttl_secs: self.identity_ttl_secs.unwrap_or(IDENTITY_TTL_SECS),
             heartbeat_handle: tokio::sync::Mutex::new(None),
             discovery_cache_reaper_handle: tokio::sync::Mutex::new(None),
@@ -11564,6 +11725,13 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
+            announce_blob_cache: std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(
+                self.identity_dir
+                    .clone()
+                    .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+                    .map(|dir| dir.join("announce-blob-cache.bin")),
+            )),
+            own_cert_pair: announce_blob::shared_cert_pair(own_pair_user, own_pair_cert),
             dm_inbox_service: std::sync::Arc::new(tokio::sync::Mutex::new(None)),
             revocation_set,
             identity_dir: self.identity_dir,
@@ -17658,6 +17826,107 @@ mod tests {
         assert_eq!(entry.agent_id, agent.agent_id());
         assert_eq!(entry.machine_id, agent.machine_id());
         assert_eq!(entry.user_id, agent.user_id());
+    }
+
+    /// L3 retirement flip: by default (legacy_announce == false) an announce
+    /// publishes ONLY the V3 format — no V2 identity payload and no separate
+    /// machine announcement reach the wire. If this regresses, the fleet
+    /// silently returns to 3 broadcast messages per beat and the entire L3
+    /// bandwidth win evaporates.
+    #[tokio::test]
+    async fn retired_announce_publishes_v3_only() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
+        let mut identity_sub = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+        let mut machine_sub = runtime
+            .pubsub()
+            .subscribe(MACHINE_ANNOUNCE_TOPIC.to_string())
+            .await;
+
+        agent.announce_identity(false, false).await.unwrap();
+
+        // Collect everything that arrives within the settle window.
+        let mut v3 = 0usize;
+        let mut v2_or_legacy = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                Some(msg) = identity_sub.recv() => {
+                    if announce_v3::is_v3_payload(&msg.payload) {
+                        let ann = announce_v3::deserialize_v3(&msg.payload).expect("v3 decodes");
+                        ann.verify().expect("published v3 verifies");
+                        v3 += 1;
+                    } else {
+                        v2_or_legacy += 1;
+                    }
+                }
+                Some(_) = machine_sub.recv() => {
+                    panic!("retired announce must not publish a machine announcement");
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(v3 >= 1, "retired announce must publish at least one V3");
+        assert_eq!(
+            v2_or_legacy, 0,
+            "retired announce must not publish V2/legacy identity payloads"
+        );
+    }
+
+    /// The escape hatch (`with_legacy_announce(true)`) restores the V2 set —
+    /// V2 identity AND machine announcements alongside V3 — for debugging and
+    /// isolated pre-V3 networks.
+    #[tokio::test]
+    async fn legacy_escape_hatch_publishes_v2_and_v3() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .with_legacy_announce(true)
+            .build()
+            .await
+            .unwrap();
+        let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
+        let mut identity_sub = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+        let mut machine_sub = runtime
+            .pubsub()
+            .subscribe(MACHINE_ANNOUNCE_TOPIC.to_string())
+            .await;
+
+        agent.announce_identity(false, false).await.unwrap();
+
+        let mut v3 = 0usize;
+        let mut v2 = 0usize;
+        let mut machine = 0usize;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline {
+            tokio::select! {
+                Some(msg) = identity_sub.recv() => {
+                    if announce_v3::is_v3_payload(&msg.payload) {
+                        v3 += 1;
+                    } else if deserialize_identity_announcement(&msg.payload).is_ok() {
+                        v2 += 1;
+                    }
+                }
+                Some(msg) = machine_sub.recv() => {
+                    if deserialize_machine_announcement(&msg.payload).is_ok() {
+                        machine += 1;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(v3 >= 1, "escape hatch still publishes V3");
+        assert!(v2 >= 1, "escape hatch publishes V2 identity");
+        assert!(machine >= 1, "escape hatch publishes machine announcement");
     }
 
     /// Enforcement point 2 (issue #130): a revoked agent MUST fail

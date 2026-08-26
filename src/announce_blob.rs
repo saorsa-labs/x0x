@@ -28,6 +28,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+use bytes::Bytes;
 use serde::{Deserialize, Serialize};
 
 use crate::gossip::PubSubManager;
@@ -51,6 +52,44 @@ pub(crate) const ANNOUNCE_BLOB_REQUEST_DOMAIN: &[u8] = b"x0x/announce/v3/blob-re
 /// topic so a Leaf that unsubscribes from announces still serves fetches).
 #[allow(dead_code)]
 pub(crate) const ANNOUNCE_BLOB_TOPIC: &str = "x0x/announce/v3/blob";
+
+/// Domain prefix for blob responses on `ANNOUNCE_BLOB_TOPIC` — lets the
+/// fetcher distinguish a response from a concurrent request (both ride the
+/// same topic).
+pub(crate) const ANNOUNCE_BLOB_RESPONSE_DOMAIN: &[u8] = b"x0x/announce/v3/blob-response-v1\0";
+
+/// How long a fetcher waits for a response before giving up (the next
+/// heartbeat retries). Generous for a mesh round-trip, short enough that a
+/// silent responder does not pin tasks.
+pub(crate) const BLOB_FETCH_TIMEOUT_SECS: u64 = 5;
+
+/// A verified requester can make peers serve blobs, but must not be able to
+/// amplify traffic without bound. Mirrors the caps responder's coalescing
+/// window (`dm_capability_service.rs`).
+const MIN_RESPONSE_INTERVAL_SECS: u64 = 1;
+
+/// The serving daemon's current `(user_id, agent_certificate)` pair, shared
+/// with the responder task so consent changes are picked up live.
+pub type SharedCertPair =
+    Arc<std::sync::RwLock<(Option<identity::UserId>, Option<identity::AgentCertificate>)>>;
+
+/// Whether a V3 announce's cert digest warrants a fetch: anonymous
+/// announces (the `(None, None)` constant) never do — there is nothing to
+/// fetch, and every beat from an anonymous agent would otherwise fire a
+/// pointless request. Single definition so the receiver arm and tests
+/// agree on the rule.
+#[must_use]
+pub fn fetch_warranted(cert_digest: &[u8; 32]) -> bool {
+    *cert_digest != crate::announce_v3::anonymous_cert_digest()
+}
+
+/// Build a [`SharedCertPair`] from an initial pair.
+pub fn shared_cert_pair(
+    user_id: Option<identity::UserId>,
+    cert: Option<identity::AgentCertificate>,
+) -> SharedCertPair {
+    Arc::new(std::sync::RwLock::new((user_id, cert)))
+}
 
 /// A cached `(user_id, agent_certificate)` pair, keyed by its BLAKE3
 /// digest — exactly the bytes [`crate::announce_v3::cert_digest`] commits
@@ -183,7 +222,7 @@ impl AnnounceBlobCache {
     #[allow(clippy::too_many_arguments)]
     pub async fn ensure_blob(
         self: &Arc<Self>,
-        pubsub: &PubSubManager,
+        pubsub: &Arc<PubSubManager>,
         digest: &[u8; 32],
         payload_version: u64,
         agent_id: &identity::AgentId,
@@ -195,18 +234,15 @@ impl AnnounceBlobCache {
 
         // Miss — spawn the fetch, return None immediately. `agent_id` is
         // the expected agent threaded into `verify_fetched_blob`'s cert
-        // binding check. The pubsub reference cannot cross the spawn
-        // boundary ('static); the fetch task goes through the cache's own
-        // handle once Claude's V3 receiver wires the responder side. Until
-        // then this is a metered no-op: `blob_fetches_failed` increments
-        // and the next heartbeat retries — never blocks the caller.
-        let _ = pubsub;
+        // binding check. Non-blocking by contract: the next heartbeat's
+        // ensure_blob sees the fetched entry (or retries the fetch).
         let cache = Arc::clone(self);
+        let pubsub = Arc::clone(pubsub);
         let digest = *digest;
         let agent_id = *agent_id;
         let machine_id = *machine_id;
         tokio::spawn(async move {
-            match fetch_and_verify(&cache, &digest, &agent_id, &machine_id).await {
+            match fetch_and_verify(&pubsub, &cache, &digest, &agent_id, &machine_id).await {
                 Ok(blob) => {
                     cache.stats_fetches_ok.fetch_add(1, Ordering::Relaxed);
                     cache
@@ -358,28 +394,94 @@ impl AnnounceBlobCache {
     }
 }
 
-/// Fetch a blob via targeted request and verify before returning.
-/// SECURITY: the fetched blob MUST pass `verify()` and the digest MUST
-/// match — this is the verify-before-cache invariant.
+/// Fetch a blob via the targeted/warm request routes and verify before
+/// returning. SECURITY: the fetched blob MUST pass the
+/// [`verify_fetched_blob`] gate — this is the verify-before-cache
+/// invariant.
+///
+/// Routes (mirroring `publish_targeted_capability_request`):
+/// - targeted: the domain-prefixed request on `ANNOUNCE_BLOB_TOPIC`;
+/// - warm: the same domain-prefixed bytes on the steady identity announce
+///   topic, so a responder that only watches the announce topic still
+///   serves. The domain prefix keeps pre-L3 subscribers from mistaking it
+///   for an announce (the X0A3/V2 decoders both reject it).
+///
+/// The response is matched by digest: every well-formed response carries
+/// the pair whose blake3 is the requested digest, so concurrent fetchers
+/// can share the topic and each picks out its own blob.
 async fn fetch_and_verify(
+    pubsub: &Arc<PubSubManager>,
     cache: &AnnounceBlobCache,
     digest: &[u8; 32],
     expected_agent_id: &identity::AgentId,
     machine_id: &identity::MachineId,
 ) -> Result<CachedBlob, String> {
-    // Phase 2 (Claude's receiver wiring) publishes an `AnnounceBlobRequest`
-    // over the warm-targeted-request domain and awaits the response; the
-    // verify_fetched_blob gate below is what makes any fetched bytes safe.
-    // Phase 1: no responder exists yet, so the miss is metered and retried.
-    tracing::debug!(
-        target: "announce.blob",
-        digest = %hex::encode(digest),
-        agent = %hex::encode(expected_agent_id.as_bytes()),
-        machine = %machine_id.as_bytes().iter().map(|b| format!("{b:02x}")).take(8).collect::<String>(),
-        cached = cache.snapshot().blob_cache_hits,
-        "announce blob fetch deferred (responder pending)"
+    let mut responses = pubsub.subscribe(ANNOUNCE_BLOB_TOPIC.to_string()).await;
+
+    // `encode_blob_request` returns domain-prefixed bytes; both carriers
+    // publish the same prefixed payload and the responder's decoder strips
+    // the domain from whichever carrier delivered it.
+    let request = encode_blob_request(digest, expected_agent_id);
+    let (targeted, warm) = tokio::join!(
+        pubsub.publish(
+            ANNOUNCE_BLOB_TOPIC.to_string(),
+            Bytes::from(request.clone())
+        ),
+        pubsub.publish(
+            crate::IDENTITY_ANNOUNCE_TOPIC.to_string(),
+            Bytes::from(request),
+        ),
     );
-    Err("announce blob fetch: responder protocol pending V3 receiver wiring".to_string())
+    if let (Err(t), Err(w)) = (&targeted, &warm) {
+        return Err(format!(
+            "both blob request carriers failed: targeted={t}; warm={w}"
+        ));
+    }
+    if let Err(e) = &targeted {
+        tracing::warn!(target: "announce.blob", %e, "targeted blob request carrier failed");
+    }
+    if let Err(e) = &warm {
+        tracing::warn!(target: "announce.blob", %e, "warm blob request carrier failed");
+    }
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(BLOB_FETCH_TIMEOUT_SECS);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err("announce blob fetch timed out".to_string());
+        }
+        let message = match tokio::time::timeout(remaining, responses.recv()).await {
+            Ok(Some(message)) => message,
+            Ok(None) => return Err("blob response subscription closed".to_string()),
+            Err(_) => return Err("announce blob fetch timed out".to_string()),
+        };
+        let Some(payload) = message.payload.strip_prefix(ANNOUNCE_BLOB_RESPONSE_DOMAIN) else {
+            // A request or foreign message on the topic — not ours.
+            continue;
+        };
+        let Some(response) = decode_blob_response(payload) else {
+            continue;
+        };
+        // The gate: digest match + pair verify + agent binding. A forged
+        // responder that controls both bytes and digest still fails here.
+        return verify_fetched_blob(
+            &response.announcement_bytes,
+            digest,
+            expected_agent_id,
+            0,
+        )
+        .map_err(|e| {
+            tracing::warn!(
+                target: "announce.blob",
+                agent = %hex::encode(expected_agent_id.as_bytes()),
+                machine = %machine_id.as_bytes().iter().map(|b| format!("{b:02x}")).take(8).collect::<String>(),
+                cached_hits = cache.snapshot().blob_cache_hits,
+                "fetched blob REJECTED by the verify gate: {e}"
+            );
+            e
+        });
+    }
 }
 
 /// Verify a fetched blob against the expected digest and agent.
@@ -505,11 +607,129 @@ pub(crate) fn decode_blob_response(wire: &[u8]) -> Option<AnnounceBlobResponse> 
     bincode::deserialize(wire).ok()
 }
 
+/// Decode a domain-stripped blob request from the wire.
+fn decode_blob_request_from(encoded: &[u8]) -> Option<AnnounceBlobRequest> {
+    bincode::deserialize(encoded).ok()
+}
+
+/// Spawn the blob responder: subscribes the targeted (`ANNOUNCE_BLOB_TOPIC`)
+/// and warm (identity announce topic) carriers, answers every verified
+/// domain-prefixed request with [`AnnounceBlobCache::serve_request`]'s pair
+/// bytes under `ANNOUNCE_BLOB_RESPONSE_DOMAIN`. Mirrors the caps
+/// warm-targeted-request responder (`dm_capability_service.rs`), including
+/// the 1-response-per-second coalescing window so a burst of requests
+/// cannot turn into a blob storm.
+///
+/// `own_pair` is read live per request, so consent changes (a new user→agent
+/// certificate) are served without a restart.
+pub async fn spawn_blob_responder(
+    pubsub: Arc<PubSubManager>,
+    cache: Arc<AnnounceBlobCache>,
+    own_pair: SharedCertPair,
+) -> crate::error::NetworkResult<tokio::task::JoinHandle<()>> {
+    let mut targeted = pubsub.subscribe(ANNOUNCE_BLOB_TOPIC.to_string()).await;
+    let mut warm = pubsub
+        .subscribe(crate::IDENTITY_ANNOUNCE_TOPIC.to_string())
+        .await;
+
+    let handle = tokio::spawn(async move {
+        let mut last_response = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(
+                MIN_RESPONSE_INTERVAL_SECS + 1,
+            ))
+            .unwrap_or_else(std::time::Instant::now);
+        loop {
+            // Drain whichever carrier delivers first; both decode the same
+            // domain-prefixed request shape.
+            let message = tokio::select! {
+                m = targeted.recv() => m,
+                m = warm.recv() => m,
+            };
+            let Some(message) = message else { continue };
+            if !message.verified || message.sender.is_none() {
+                continue;
+            }
+            let Some(encoded) = message.payload.strip_prefix(ANNOUNCE_BLOB_REQUEST_DOMAIN) else {
+                // An announce or foreign payload on the shared carrier.
+                continue;
+            };
+            let Some(request) = decode_blob_request_from(encoded) else {
+                continue;
+            };
+            let (own_user, own_cert) = own_pair
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clone();
+            let Some(pair_bytes) = cache
+                .serve_request(&request.digest, &own_user, &own_cert)
+                .await
+            else {
+                tracing::debug!(
+                    target: "announce.blob",
+                    digest = %hex::encode(request.digest),
+                    "blob request for an unknown digest — not served"
+                );
+                continue;
+            };
+            // Coalesce: at most one response per window, like the caps
+            // responder. A dropped response is retried by the next beat.
+            let now = std::time::Instant::now();
+            if now.duration_since(last_response)
+                < std::time::Duration::from_secs(MIN_RESPONSE_INTERVAL_SECS)
+            {
+                continue;
+            }
+            last_response = now;
+            // Wrap the pair bytes in the typed response envelope so the
+            // fetcher's decode_blob_response round-trips (a bare pair tuple
+            // does not deserialize as AnnounceBlobResponse).
+            let mut wire = encode_blob_response(pair_bytes);
+            let mut prefixed = Vec::with_capacity(ANNOUNCE_BLOB_RESPONSE_DOMAIN.len() + wire.len());
+            prefixed.extend_from_slice(ANNOUNCE_BLOB_RESPONSE_DOMAIN);
+            prefixed.append(&mut wire);
+            if let Err(e) = pubsub
+                .publish(ANNOUNCE_BLOB_TOPIC.to_string(), Bytes::from(prefixed))
+                .await
+            {
+                tracing::warn!(target: "announce.blob", %e, "blob response publish failed");
+            }
+        }
+    });
+    Ok(handle)
+}
+
 // ---------------------------------------------------------------------------
 // Tests — EXTEND this module, never replace pre-existing tests.
 // ---------------------------------------------------------------------------
 #[cfg(test)]
 mod tests {
+    /// SECURITY (digest-spoof attribution): an attacker can put a VICTIM's
+    /// cert digest inside their own validly-signed V3 announce. The receiver
+    /// hit-path must refuse to merge a cached pair whose certificate binds a
+    /// different agent — otherwise the attacker's cache entry inherits the
+    /// victim's user attribution. This pins the binding predicate the
+    /// discovery arm uses before merging.
+    #[test]
+    fn cached_pair_never_merges_into_a_different_agents_announcement() {
+        let victim_user = crate::identity::UserKeypair::generate().unwrap();
+        let victim_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let attacker_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&victim_user, &victim_agent)
+            .expect("cert issues");
+        let merge_allowed = |cert: &crate::identity::AgentCertificate,
+                             claimed: &crate::identity::AgentId| {
+            cert.agent_id().is_ok_and(|id| id == *claimed)
+        };
+        assert!(
+            merge_allowed(&cert, &victim_agent.agent_id()),
+            "victim's own announcement must merge its pair"
+        );
+        assert!(
+            !merge_allowed(&cert, &attacker_agent.agent_id()),
+            "attacker claiming the victim's digest must NOT inherit the pair"
+        );
+    }
+
     use super::*;
     use crate::identity::{AgentCertificate, AgentKeypair, UserKeypair};
 
@@ -736,5 +956,219 @@ mod tests {
         let cache = AnnounceBlobCache::new(None);
         let unknown: [u8; 32] = [0xCD; 32];
         assert!(cache.serve_request(&unknown, &None, &None).await.is_none());
+    }
+
+    // ── Hermetic protocol tests (issue #417: no prod dialing — local
+    //    pubsub delivery only, mirroring the caps-service test harness) ──
+
+    mod protocol {
+        use super::super::*;
+        use super::{issued_cert, pair_bytes};
+        use crate::gossip::SigningContext;
+        use crate::network::{NetworkConfig, NetworkNode};
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        async fn make_pubsub() -> Arc<PubSubManager> {
+            let node = Arc::new(
+                NetworkNode::new(NetworkConfig::default(), None, None)
+                    .await
+                    .expect("network node"),
+            );
+            let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+            let signing = Arc::new(SigningContext::from_keypair(&kp));
+            Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub"))
+        }
+
+        /// Wait until `cache` holds `digest` (the fetch task fills it
+        /// asynchronously) or fail after `secs`.
+        async fn wait_for_blob(
+            cache: &Arc<AnnounceBlobCache>,
+            digest: &[u8; 32],
+            secs: u64,
+        ) -> Option<Arc<CachedBlob>> {
+            let deadline = std::time::Instant::now() + Duration::from_secs(secs);
+            loop {
+                if let Some(hit) = cache.get(digest).await {
+                    return Some(hit);
+                }
+                if std::time::Instant::now() >= deadline {
+                    return None;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+
+        /// Two-agent loopback: a consented agent serves its pair via the
+        /// responder; the peer's ensure_blob misses, fetches, verifies, and
+        /// the cache gains the cert+user. Second ensure_blob hits.
+        #[tokio::test]
+        async fn two_agent_fetch_fills_peer_cache() {
+            let (cert, user_kp, agent_kp) = issued_cert();
+            let user_id = Some(user_kp.user_id());
+            let agent_id = agent_kp.agent_id();
+            let machine_id = crate::identity::MachineId([0x77; 32]);
+            let digest = crate::announce_v3::cert_digest(&user_id, &Some(cert.clone()));
+
+            let pubsub = make_pubsub().await;
+            // Serving agent: cache with the pair pre-cached + live pair source.
+            let serving_cache = Arc::new(AnnounceBlobCache::new(None));
+            serving_cache
+                .insert_verified(CachedBlob {
+                    digest,
+                    payload_version: 7,
+                    user_id,
+                    agent_certificate: Some(cert.clone()),
+                    fetched_at_unix: 1,
+                })
+                .await;
+            let own_pair = shared_cert_pair(None, None);
+            spawn_blob_responder(Arc::clone(&pubsub), serving_cache, own_pair)
+                .await
+                .expect("responder spawns");
+            // Let the responder's subscriptions register before fetching
+            // (same registration race the caps-service test sleeps for).
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            // Fetching agent: empty cache. Miss → None, fetch fires.
+            let fetching_cache = Arc::new(AnnounceBlobCache::new(None));
+            let immediate = fetching_cache
+                .ensure_blob(&pubsub, &digest, 7, &agent_id, &machine_id)
+                .await;
+            assert!(
+                immediate.is_none(),
+                "miss must return None (no-block contract)"
+            );
+
+            let filled = wait_for_blob(&fetching_cache, &digest, 8)
+                .await
+                .expect("fetch must fill the cache");
+            assert_eq!(filled.user_id, user_id);
+            assert_eq!(
+                filled
+                    .agent_certificate
+                    .as_ref()
+                    .and_then(|c| c.agent_id().ok()),
+                Some(agent_id),
+                "the fetched cert must bind the announced agent"
+            );
+            assert_eq!(filled.payload_version, 7, "version overlays the fetch");
+
+            // Hit path: immediate Some.
+            let hit = fetching_cache
+                .ensure_blob(&pubsub, &digest, 7, &agent_id, &machine_id)
+                .await;
+            assert!(hit.is_some(), "second call must hit the filled cache");
+
+            let stats = fetching_cache.snapshot();
+            assert!(stats.blob_fetches_ok >= 1, "metering must count the fetch");
+        }
+
+        /// Forged responder: serves tampered pair bytes whose digest DOES
+        /// match the tampered bytes (attacker controls both). The verify
+        /// gate must reject — the cache stays empty and the failure meters.
+        #[tokio::test]
+        async fn forged_responder_is_rejected() {
+            let (cert, user_kp, agent_kp) = issued_cert();
+            let user_id = Some(user_kp.user_id());
+            let agent_id = agent_kp.agent_id();
+            let machine_id = crate::identity::MachineId([0x88; 32]);
+
+            let pubsub = make_pubsub().await;
+            let requesting_cache = Arc::new(AnnounceBlobCache::new(None));
+
+            // Subscribe + answer with tampered bytes directly (no honest
+            // responder): flip a signature byte, digest the tampered bytes.
+            let mut tampered = pair_bytes(&user_id, &Some(cert));
+            let last = tampered.len() - 1;
+            tampered[last] ^= 0xFF;
+            let digest: [u8; 32] = blake3::hash(&tampered).into();
+
+            let forger_pubsub = Arc::clone(&pubsub);
+            tokio::spawn(async move {
+                let mut reqs = forger_pubsub
+                    .subscribe(ANNOUNCE_BLOB_TOPIC.to_string())
+                    .await;
+                while let Some(message) = reqs.recv().await {
+                    if message
+                        .payload
+                        .strip_prefix(ANNOUNCE_BLOB_REQUEST_DOMAIN)
+                        .is_some()
+                    {
+                        let mut wire = encode_blob_response(tampered.clone());
+                        let mut prefixed =
+                            Vec::with_capacity(ANNOUNCE_BLOB_RESPONSE_DOMAIN.len() + wire.len());
+                        prefixed.extend_from_slice(ANNOUNCE_BLOB_RESPONSE_DOMAIN);
+                        prefixed.append(&mut wire);
+                        let _ = forger_pubsub
+                            .publish(ANNOUNCE_BLOB_TOPIC.to_string(), Bytes::from(prefixed))
+                            .await;
+                        break; // one forged answer is enough
+                    }
+                }
+            });
+
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            requesting_cache
+                .ensure_blob(&pubsub, &digest, 1, &agent_id, &machine_id)
+                .await;
+            tokio::time::sleep(Duration::from_millis(500)).await;
+
+            assert!(
+                requesting_cache.get(&digest).await.is_none(),
+                "the forged blob must never enter the cache"
+            );
+            let stats = requesting_cache.snapshot();
+            assert!(
+                stats.blob_fetches_failed >= 1,
+                "the rejection must meter as a failed fetch"
+            );
+        }
+
+        /// The receiver-arm skip rule: anonymous digests never warrant a
+        /// fetch — `fetch_warranted` is the single definition.
+        #[test]
+        fn anonymous_digest_never_fetches() {
+            let anon = crate::announce_v3::anonymous_cert_digest();
+            assert!(!fetch_warranted(&anon), "anonymous digest must not fetch");
+            let real = crate::announce_v3::cert_digest(
+                &Some(
+                    crate::identity::UserKeypair::generate()
+                        .expect("kp")
+                        .user_id(),
+                ),
+                &None,
+            );
+            assert!(fetch_warranted(&real), "a real digest must fetch");
+        }
+
+        /// Protocol safety net: even if a caller ignores the skip rule, an
+        /// anonymous fetch round-trips `(None, None)` harmlessly — there is
+        /// nothing sensitive to leak and nothing to forge.
+        #[tokio::test]
+        async fn anonymous_pair_round_trip_is_harmless() {
+            let pubsub = make_pubsub().await;
+            let serving_cache = Arc::new(AnnounceBlobCache::new(None));
+            let own_pair = shared_cert_pair(None, None);
+            spawn_blob_responder(Arc::clone(&pubsub), serving_cache, own_pair)
+                .await
+                .expect("responder spawns");
+            tokio::time::sleep(Duration::from_millis(300)).await;
+
+            let anon_digest = crate::announce_v3::anonymous_cert_digest();
+            let agent_id = crate::identity::AgentKeypair::generate()
+                .expect("kp")
+                .agent_id();
+            let machine_id = crate::identity::MachineId([0x99; 32]);
+            let fetching_cache = Arc::new(AnnounceBlobCache::new(None));
+            fetching_cache
+                .ensure_blob(&pubsub, &anon_digest, 0, &agent_id, &machine_id)
+                .await;
+
+            let filled = wait_for_blob(&fetching_cache, &anon_digest, 8)
+                .await
+                .expect("anonymous fetch round-trips");
+            assert!(filled.user_id.is_none() && filled.agent_certificate.is_none());
+        }
     }
 }

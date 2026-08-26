@@ -193,6 +193,7 @@ impl CapabilityAdvertService {
         caps_rx: tokio::sync::watch::Receiver<DmCapabilities>,
         store: Arc<CapabilityStore>,
         publish_interval: Duration,
+        periodic: bool,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
         let mut targeted_response_subscription = pubsub
@@ -288,7 +289,16 @@ impl CapabilityAdvertService {
         let mut publisher_caps_rx = caps_rx;
         let publisher = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(FIRST_PUBLISH_DELAY_MS)).await;
-            let mut burst_idx: usize = 0;
+            // L3 retirement: in on-demand mode (periodic == false) there is no
+            // startup burst and no steady beat — the publisher wakes only for
+            // targeted/warm requests and capability upgrades, and publishes to
+            // the steady topic only on request-triggered cycles (warm-carrier
+            // requesters listen there).
+            let mut burst_idx: usize = if periodic {
+                0
+            } else {
+                STARTUP_BURST_INTERVALS_MS.len()
+            };
             let mut last_targeted_response_at: Option<tokio::time::Instant> = None;
             let mut targeted_response_pending = false;
             let mut requests_open = true;
@@ -325,6 +335,7 @@ impl CapabilityAdvertService {
                     }
                     continue;
                 }
+                let respond_on_steady = targeted_response_pending;
                 match build_signed_advert(
                     &publisher_signing,
                     self_agent_id,
@@ -358,13 +369,15 @@ impl CapabilityAdvertService {
                                 ),
                             }
                         }
-                        if let Err(e) = publisher_pubsub
-                            .publish(DM_CAPABILITY_TOPIC.to_string(), bytes)
-                            .await
-                        {
-                            tracing::warn!("capability advert publish failed: {e}");
-                        } else {
-                            tracing::debug!("capability advert published");
+                        if periodic || respond_on_steady {
+                            if let Err(e) = publisher_pubsub
+                                .publish(DM_CAPABILITY_TOPIC.to_string(), bytes)
+                                .await
+                            {
+                                tracing::warn!("capability advert publish failed: {e}");
+                            } else {
+                                tracing::debug!("capability advert published");
+                            }
                         }
                     }
                     Err(e) => tracing::warn!("capability advert build failed: {e}"),
@@ -373,8 +386,12 @@ impl CapabilityAdvertService {
                     let d = Duration::from_millis(STARTUP_BURST_INTERVALS_MS[burst_idx]);
                     burst_idx += 1;
                     d
-                } else {
+                } else if periodic {
                     publish_interval
+                } else {
+                    // On-demand mode: no steady beat. The select below still
+                    // wakes on requests and capability upgrades.
+                    Duration::from_secs(3600)
                 };
                 let publish_delay = tokio::time::sleep(next_delay);
                 tokio::pin!(publish_delay);
@@ -447,6 +464,7 @@ impl CapabilityAdvertService {
             caps_rx,
             store,
             Duration::from_secs(ADVERT_PUBLISH_INTERVAL_SECS),
+            true,
         )
         .await
     }
