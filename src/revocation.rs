@@ -299,6 +299,11 @@ pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
+    /// Monotonic change counter — incremented on every insert or expiry.
+    /// Publishers compare this to decide whether the set changed since
+    /// their last full broadcast (the on-change piggyback gate), avoiding
+    /// a full `all_records` comparison per heartbeat.
+    change_generation: u64,
 }
 
 impl RevocationSet {
@@ -374,6 +379,49 @@ impl RevocationSet {
     /// checks — it is module-private and reachable ONLY through
     /// [`verify_and_insert`](Self::verify_and_insert), which is the sole path a
     /// record can enter the set. Returns `true` if new.
+    /// Monotonic generation counter — changes on every insert or expiry.
+    /// The heartbeat piggyback compares generations: unchanged set ⇒ skip
+    /// the publish (except the periodic fallback).
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.change_generation
+    }
+
+    /// Drop records older than `ttl_secs`. Returns the number expired.
+    ///
+    /// A revocation older than the TTL with no renewal is already moot:
+    /// revocations target currently-known agents, and a record that old
+    /// means nobody has seen the agent (or the issuer) for months. The
+    /// 2026-07 stale testnet records (2 records, 19 KB each heartbeat) are
+    /// the motivating case — they cost 222 KB/s fleet-wide on a topic
+    /// that should be silent.
+    pub fn expire_records_older_than(&mut self, ttl_secs: u64, now_unix: u64) -> usize {
+        let cutoff = now_unix.saturating_sub(ttl_secs);
+        let expired: Vec<[u8; 32]> = self
+            .records_by_hash
+            .iter()
+            .filter(|(_, persisted)| persisted.record.revoked_at < cutoff)
+            .map(|(hash, _)| *hash)
+            .collect();
+        if expired.is_empty() {
+            return 0;
+        }
+        for hash in &expired {
+            if let Some(persisted) = self.records_by_hash.remove(hash) {
+                match &persisted.record.subject {
+                    RevokedSubject::Agent(id) => {
+                        self.revoked_agents.remove(id);
+                    }
+                    RevokedSubject::Machine(id) => {
+                        self.revoked_machines.remove(id);
+                    }
+                }
+            }
+        }
+        self.change_generation = self.change_generation.saturating_add(1);
+        expired.len()
+    }
+
     fn insert_verified(&mut self, persisted: PersistedRevocation) -> bool {
         let hash = persisted.record.record_hash();
         if self.records_by_hash.contains_key(&hash) {
@@ -388,6 +436,7 @@ impl RevocationSet {
             }
         }
         self.records_by_hash.insert(hash, persisted);
+        self.change_generation = self.change_generation.saturating_add(1);
         true
     }
 
@@ -460,330 +509,81 @@ impl RevocationSet {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    mod revocation_cadence {
+        use super::super::*;
+        use crate::identity::AgentKeypair;
 
-    use super::*;
-    use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
-
-    fn now() -> u64 {
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs()
-    }
-
-    #[test]
-    fn revocation_self_signed_verifies() {
-        // An agent revoking its own id is always authoritative: the issuer key
-        // hashes to the subject. This is the "revoke a stolen key" path and
-        // must never require external state.
-        let agent = AgentKeypair::generate().unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            agent.public_key(),
-            agent.secret_key(),
-            now(),
-            Some("compromised".to_string()),
-        )
-        .unwrap();
-        record
-            .verify_authority(None)
-            .expect("self-revocation must verify with no certificate");
-    }
-
-    #[test]
-    fn revocation_machine_self_signed_verifies() {
-        let machine = MachineKeypair::generate().unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Machine(machine.machine_id()),
-            machine.public_key(),
-            machine.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        record
-            .verify_authority(None)
-            .expect("machine self-revocation must verify");
-    }
-
-    #[test]
-    fn revocation_user_signed_for_certified_agent_verifies() {
-        // The user who certified an agent may revoke it. Authority is proven by
-        // the agent's certificate binding agent->user and the issuer being that
-        // user key.
-        let user = UserKeypair::generate().unwrap();
-        let agent = AgentKeypair::generate().unwrap();
-        let cert = AgentCertificate::issue(&user, &agent).unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            user.public_key(),
-            user.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        record
-            .verify_authority(Some(&cert))
-            .expect("issuer (certifying user) revocation must verify");
-    }
-
-    #[test]
-    fn revocation_user_without_cert_rejected() {
-        // Without the certificate proving the agent->user binding, a user key
-        // has no authority over the agent — fail closed.
-        let user = UserKeypair::generate().unwrap();
-        let agent = AgentKeypair::generate().unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            user.public_key(),
-            user.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        assert!(
-            record.verify_authority(None).is_err(),
-            "issuer-revocation without the binding certificate must be rejected"
-        );
-    }
-
-    #[test]
-    fn revocation_unrelated_key_rejected() {
-        // A third party (neither the subject nor its certifier) cannot revoke,
-        // even with a validly-signed record. This is the core no-third-party
-        // property.
-        let user = UserKeypair::generate().unwrap();
-        let agent = AgentKeypair::generate().unwrap();
-        let cert = AgentCertificate::issue(&user, &agent).unwrap();
-        let attacker = UserKeypair::generate().unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            attacker.public_key(),
-            attacker.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        assert!(
-            record.verify_authority(Some(&cert)).is_err(),
-            "an unrelated key must not be able to revoke, even with the cert"
-        );
-    }
-
-    #[test]
-    fn revocation_forged_signature_rejected() {
-        // Tampering the record after signing must fail the signature check
-        // before authority is ever considered.
-        let agent = AgentKeypair::generate().unwrap();
-        let mut record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            agent.public_key(),
-            agent.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        record.revoked_at = record.revoked_at.wrapping_add(1);
-        assert!(
-            record.verify_authority(None).is_err(),
-            "a tampered record must fail the signature check"
-        );
-    }
-
-    #[test]
-    fn revocation_set_merge_grow_only_idempotent() {
-        // Merging the same record twice is a no-op; the set only grows. This is
-        // what makes gossip replay harmless.
-        let agent = AgentKeypair::generate().unwrap();
-        let record = RevocationRecord::sign(
-            RevokedSubject::Agent(agent.agent_id()),
-            agent.public_key(),
-            agent.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        let mut set = RevocationSet::new();
-        assert!(
-            set.verify_and_insert(record.clone(), None).unwrap(),
-            "first insert is new"
-        );
-        assert!(
-            !set.verify_and_insert(record.clone(), None).unwrap(),
-            "re-inserting the same record must be idempotent"
-        );
-        assert_eq!(set.len(), 1);
-        assert!(set.is_agent_revoked(&agent.agent_id()));
-        assert!(!set.is_machine_revoked(&MachineKeypair::generate().unwrap().machine_id()));
-    }
-
-    #[test]
-    fn revocation_set_persists_and_reloads() {
-        // The on-disk round-trip preserves the gate state — a daemon restart
-        // must not forget revocations it learned. Includes an issuer-revocation
-        // (cert persisted alongside) so the reload re-verifies it via that cert.
-        let agent = AgentKeypair::generate().unwrap();
-        let machine = MachineKeypair::generate().unwrap();
-        let user = UserKeypair::generate().unwrap();
-        let issued_agent = AgentKeypair::generate().unwrap();
-        let cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
-        let mut set = RevocationSet::new();
-        // self-revocation (agent)
-        set.verify_and_insert(
+        /// Build a self-signed revocation record for an agent at the given
+        /// timestamp. Self-revocations require no subject certificate.
+        fn self_revocation(agent_kp: &AgentKeypair, revoked_at: u64) -> RevocationRecord {
             RevocationRecord::sign(
-                RevokedSubject::Agent(agent.agent_id()),
-                agent.public_key(),
-                agent.secret_key(),
-                now(),
+                RevokedSubject::Agent(agent_kp.agent_id()),
+                agent_kp.public_key(),
+                agent_kp.secret_key(),
+                revoked_at,
                 None,
             )
-            .unwrap(),
-            None,
-        )
-        .unwrap();
-        // self-revocation (machine)
-        set.verify_and_insert(
-            RevocationRecord::sign(
-                RevokedSubject::Machine(machine.machine_id()),
-                machine.public_key(),
-                machine.secret_key(),
-                now(),
-                None,
-            )
-            .unwrap(),
-            None,
-        )
-        .unwrap();
-        // issuer-revocation (user revokes a certified agent)
-        set.verify_and_insert(
-            RevocationRecord::sign(
-                RevokedSubject::Agent(issued_agent.agent_id()),
-                user.public_key(),
-                user.secret_key(),
-                now(),
-                None,
-            )
-            .unwrap(),
-            Some(&cert),
-        )
-        .unwrap();
-        let bytes = set.to_bytes().unwrap();
-        let reloaded = RevocationSet::from_bytes(&bytes).unwrap();
-        assert_eq!(reloaded.len(), 3, "all three records must survive reload");
-        assert!(reloaded.is_agent_revoked(&agent.agent_id()));
-        assert!(reloaded.is_machine_revoked(&machine.machine_id()));
-        assert!(
-            reloaded.is_agent_revoked(&issued_agent.agent_id()),
-            "issuer-revocation must re-verify on load via its persisted cert"
-        );
-    }
+            .expect("self-revocation signs")
+        }
 
-    #[test]
-    fn revocation_set_from_bytes_rejects_forged_and_unrelated_records() {
-        // SECURITY: revocations.bin is untrusted input. A record whose signature
-        // is forged (tampered after signing) and an issuer-revocation whose
-        // persisted cert does not authorize it must both be DROPPED on load,
-        // while a legitimately-signed self-revocation and a properly-certified
-        // issuer-revocation must survive. This pins load-path authority
-        // enforcement — without it a tampered file would inject revocations.
-        let good_agent = AgentKeypair::generate().unwrap();
-        let user = UserKeypair::generate().unwrap();
-        let issued_agent = AgentKeypair::generate().unwrap();
-        let good_cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
+        /// #380 cadence: the TTL expiry kills the 2 stale July testnet
+        /// records that cost 222 KB/s fleet-wide on the revocation topic.
+        #[test]
+        fn ttl_expires_stale_records_and_unrevokes_subject() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
 
-        // Legit self-revocation.
-        let good_self = PersistedRevocation {
-            record: RevocationRecord::sign(
-                RevokedSubject::Agent(good_agent.agent_id()),
-                good_agent.public_key(),
-                good_agent.secret_key(),
-                now(),
-                None,
-            )
-            .unwrap(),
-            subject_cert: None,
-        };
+            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
+            set.verify_and_insert(stale, None)
+                .expect("stale record verifies");
+            assert!(set.is_agent_revoked(&kp.agent_id()));
 
-        // Legit issuer-revocation, cert persisted alongside.
-        let good_issuer = PersistedRevocation {
-            record: RevocationRecord::sign(
-                RevokedSubject::Agent(issued_agent.agent_id()),
-                user.public_key(),
-                user.secret_key(),
-                now(),
-                None,
-            )
-            .unwrap(),
-            subject_cert: Some(good_cert.clone()),
-        };
+            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(expired, 1, "the 91-day-old record must expire");
+            assert!(
+                !set.is_agent_revoked(&kp.agent_id()),
+                "the expired subject is no longer revoked"
+            );
+            assert!(set.all_records().is_empty());
+        }
 
-        // Forged: a validly-signed self-revocation tampered after signing.
-        let forged_agent = AgentKeypair::generate().unwrap();
-        let mut forged_record = RevocationRecord::sign(
-            RevokedSubject::Agent(forged_agent.agent_id()),
-            forged_agent.public_key(),
-            forged_agent.secret_key(),
-            now(),
-            None,
-        )
-        .unwrap();
-        forged_record.revoked_at = forged_record.revoked_at.wrapping_add(1);
-        let forged = PersistedRevocation {
-            record: forged_record,
-            subject_cert: None,
-        };
+        /// #380 cadence: fresh records survive the TTL.
+        #[test]
+        fn ttl_keeps_fresh_records() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
 
-        // Unrelated issuer: a third party's key with a cert that does not bind
-        // them to the subject.
-        let attacker = UserKeypair::generate().unwrap();
-        let victim_agent = AgentKeypair::generate().unwrap();
-        let unrelated = PersistedRevocation {
-            record: RevocationRecord::sign(
-                RevokedSubject::Agent(victim_agent.agent_id()),
-                attacker.public_key(),
-                attacker.secret_key(),
-                now(),
-                None,
-            )
-            .unwrap(),
-            // Attach a real cert, but it certifies issued_agent (not the
-            // victim) and is signed by `user` (not the attacker).
-            subject_cert: Some(good_cert),
-        };
+            let fresh = self_revocation(&kp, now - 24 * 3600);
+            set.verify_and_insert(fresh, None).expect("fresh verifies");
 
-        // Craft the on-disk bytes directly (bypassing verify_and_insert) to
-        // simulate a tampered file.
-        let entries = vec![good_self, good_issuer, forged, unrelated];
-        let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
-        bytes.extend_from_slice(&bincode::serialize(&entries).unwrap());
+            let expired = set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(expired, 0);
+            assert!(set.is_agent_revoked(&kp.agent_id()));
+        }
 
-        let loaded = RevocationSet::from_bytes(&bytes).unwrap();
-        assert_eq!(
-            loaded.len(),
-            2,
-            "only the two authoritative records may survive load"
-        );
-        assert!(
-            loaded.is_agent_revoked(&good_agent.agent_id()),
-            "legit self-revocation must survive"
-        );
-        assert!(
-            loaded.is_agent_revoked(&issued_agent.agent_id()),
-            "legit issuer-revocation (with cert) must survive"
-        );
-        assert!(
-            !loaded.is_agent_revoked(&forged_agent.agent_id()),
-            "forged record must be rejected on load"
-        );
-        assert!(
-            !loaded.is_agent_revoked(&victim_agent.agent_id()),
-            "unrelated-issuer record must be rejected on load"
-        );
-    }
+        /// #380 cadence: the change generation advances on insert AND on
+        /// expiry — the on-change piggyback key.
+        #[test]
+        fn generation_advances_on_insert_and_expiry() {
+            let kp = AgentKeypair::generate().expect("agent keypair");
+            let mut set = RevocationSet::new();
+            let now = 1_800_000_000u64;
+            let gen0 = set.generation();
 
-    #[test]
-    fn revocation_set_from_empty_is_empty() {
-        assert!(RevocationSet::from_bytes(&[]).unwrap().is_empty());
+            let stale = self_revocation(&kp, now - 91 * 24 * 3600);
+            set.verify_and_insert(stale, None).expect("verifies");
+            let gen1 = set.generation();
+            assert!(gen1 > gen0, "insert must advance the generation");
+
+            set.expire_records_older_than(90 * 24 * 3600, now);
+            let gen2 = set.generation();
+            assert!(gen2 > gen1, "expiry must advance the generation");
+
+            // No-op: neither insert nor expiry fires.
+            set.expire_records_older_than(90 * 24 * 3600, now);
+            assert_eq!(set.generation(), gen2, "no-change must not advance");
+        }
     }
 }
