@@ -21,7 +21,7 @@
 //! cached — this closes the spoofing window into the cache.
 //!
 //! Disk persistence: bincode file under the daemon data dir, loaded at
-//! startup, saved on insert. Bounded at [`BLOB_CACHE_MAX_ENTRIES`] (LRU).
+//! startup, saved on insert. Bounded at `BLOB_CACHE_MAX_ENTRIES` (LRU).
 
 use std::collections::HashMap;
 use std::path::PathBuf;
