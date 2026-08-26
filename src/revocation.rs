@@ -509,6 +509,8 @@ impl RevocationSet {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
     mod revocation_cadence {
         use super::super::*;
         use crate::identity::AgentKeypair;
@@ -585,5 +587,330 @@ mod tests {
             set.expire_records_older_than(90 * 24 * 3600, now);
             assert_eq!(set.generation(), gen2, "no-change must not advance");
         }
+    }
+
+    use super::*;
+    use crate::identity::{AgentKeypair, MachineKeypair, UserKeypair};
+
+    fn now() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    #[test]
+    fn revocation_self_signed_verifies() {
+        // An agent revoking its own id is always authoritative: the issuer key
+        // hashes to the subject. This is the "revoke a stolen key" path and
+        // must never require external state.
+        let agent = AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            agent.public_key(),
+            agent.secret_key(),
+            now(),
+            Some("compromised".to_string()),
+        )
+        .unwrap();
+        record
+            .verify_authority(None)
+            .expect("self-revocation must verify with no certificate");
+    }
+
+    #[test]
+    fn revocation_machine_self_signed_verifies() {
+        let machine = MachineKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Machine(machine.machine_id()),
+            machine.public_key(),
+            machine.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        record
+            .verify_authority(None)
+            .expect("machine self-revocation must verify");
+    }
+
+    #[test]
+    fn revocation_user_signed_for_certified_agent_verifies() {
+        // The user who certified an agent may revoke it. Authority is proven by
+        // the agent's certificate binding agent->user and the issuer being that
+        // user key.
+        let user = UserKeypair::generate().unwrap();
+        let agent = AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&user, &agent).unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            user.public_key(),
+            user.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        record
+            .verify_authority(Some(&cert))
+            .expect("issuer (certifying user) revocation must verify");
+    }
+
+    #[test]
+    fn revocation_user_without_cert_rejected() {
+        // Without the certificate proving the agent->user binding, a user key
+        // has no authority over the agent — fail closed.
+        let user = UserKeypair::generate().unwrap();
+        let agent = AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            user.public_key(),
+            user.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            record.verify_authority(None).is_err(),
+            "issuer-revocation without the binding certificate must be rejected"
+        );
+    }
+
+    #[test]
+    fn revocation_unrelated_key_rejected() {
+        // A third party (neither the subject nor its certifier) cannot revoke,
+        // even with a validly-signed record. This is the core no-third-party
+        // property.
+        let user = UserKeypair::generate().unwrap();
+        let agent = AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&user, &agent).unwrap();
+        let attacker = UserKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            attacker.public_key(),
+            attacker.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        assert!(
+            record.verify_authority(Some(&cert)).is_err(),
+            "an unrelated key must not be able to revoke, even with the cert"
+        );
+    }
+
+    #[test]
+    fn revocation_forged_signature_rejected() {
+        // Tampering the record after signing must fail the signature check
+        // before authority is ever considered.
+        let agent = AgentKeypair::generate().unwrap();
+        let mut record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            agent.public_key(),
+            agent.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        record.revoked_at = record.revoked_at.wrapping_add(1);
+        assert!(
+            record.verify_authority(None).is_err(),
+            "a tampered record must fail the signature check"
+        );
+    }
+
+    #[test]
+    fn revocation_set_merge_grow_only_idempotent() {
+        // Merging the same record twice is a no-op; the set only grows. This is
+        // what makes gossip replay harmless.
+        let agent = AgentKeypair::generate().unwrap();
+        let record = RevocationRecord::sign(
+            RevokedSubject::Agent(agent.agent_id()),
+            agent.public_key(),
+            agent.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        let mut set = RevocationSet::new();
+        assert!(
+            set.verify_and_insert(record.clone(), None).unwrap(),
+            "first insert is new"
+        );
+        assert!(
+            !set.verify_and_insert(record.clone(), None).unwrap(),
+            "re-inserting the same record must be idempotent"
+        );
+        assert_eq!(set.len(), 1);
+        assert!(set.is_agent_revoked(&agent.agent_id()));
+        assert!(!set.is_machine_revoked(&MachineKeypair::generate().unwrap().machine_id()));
+    }
+
+    #[test]
+    fn revocation_set_persists_and_reloads() {
+        // The on-disk round-trip preserves the gate state — a daemon restart
+        // must not forget revocations it learned. Includes an issuer-revocation
+        // (cert persisted alongside) so the reload re-verifies it via that cert.
+        let agent = AgentKeypair::generate().unwrap();
+        let machine = MachineKeypair::generate().unwrap();
+        let user = UserKeypair::generate().unwrap();
+        let issued_agent = AgentKeypair::generate().unwrap();
+        let cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
+        let mut set = RevocationSet::new();
+        // self-revocation (agent)
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Agent(agent.agent_id()),
+                agent.public_key(),
+                agent.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        // self-revocation (machine)
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Machine(machine.machine_id()),
+                machine.public_key(),
+                machine.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            None,
+        )
+        .unwrap();
+        // issuer-revocation (user revokes a certified agent)
+        set.verify_and_insert(
+            RevocationRecord::sign(
+                RevokedSubject::Agent(issued_agent.agent_id()),
+                user.public_key(),
+                user.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            Some(&cert),
+        )
+        .unwrap();
+        let bytes = set.to_bytes().unwrap();
+        let reloaded = RevocationSet::from_bytes(&bytes).unwrap();
+        assert_eq!(reloaded.len(), 3, "all three records must survive reload");
+        assert!(reloaded.is_agent_revoked(&agent.agent_id()));
+        assert!(reloaded.is_machine_revoked(&machine.machine_id()));
+        assert!(
+            reloaded.is_agent_revoked(&issued_agent.agent_id()),
+            "issuer-revocation must re-verify on load via its persisted cert"
+        );
+    }
+
+    #[test]
+    fn revocation_set_from_bytes_rejects_forged_and_unrelated_records() {
+        // SECURITY: revocations.bin is untrusted input. A record whose signature
+        // is forged (tampered after signing) and an issuer-revocation whose
+        // persisted cert does not authorize it must both be DROPPED on load,
+        // while a legitimately-signed self-revocation and a properly-certified
+        // issuer-revocation must survive. This pins load-path authority
+        // enforcement — without it a tampered file would inject revocations.
+        let good_agent = AgentKeypair::generate().unwrap();
+        let user = UserKeypair::generate().unwrap();
+        let issued_agent = AgentKeypair::generate().unwrap();
+        let good_cert = AgentCertificate::issue(&user, &issued_agent).unwrap();
+
+        // Legit self-revocation.
+        let good_self = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(good_agent.agent_id()),
+                good_agent.public_key(),
+                good_agent.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            subject_cert: None,
+        };
+
+        // Legit issuer-revocation, cert persisted alongside.
+        let good_issuer = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(issued_agent.agent_id()),
+                user.public_key(),
+                user.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            subject_cert: Some(good_cert.clone()),
+        };
+
+        // Forged: a validly-signed self-revocation tampered after signing.
+        let forged_agent = AgentKeypair::generate().unwrap();
+        let mut forged_record = RevocationRecord::sign(
+            RevokedSubject::Agent(forged_agent.agent_id()),
+            forged_agent.public_key(),
+            forged_agent.secret_key(),
+            now(),
+            None,
+        )
+        .unwrap();
+        forged_record.revoked_at = forged_record.revoked_at.wrapping_add(1);
+        let forged = PersistedRevocation {
+            record: forged_record,
+            subject_cert: None,
+        };
+
+        // Unrelated issuer: a third party's key with a cert that does not bind
+        // them to the subject.
+        let attacker = UserKeypair::generate().unwrap();
+        let victim_agent = AgentKeypair::generate().unwrap();
+        let unrelated = PersistedRevocation {
+            record: RevocationRecord::sign(
+                RevokedSubject::Agent(victim_agent.agent_id()),
+                attacker.public_key(),
+                attacker.secret_key(),
+                now(),
+                None,
+            )
+            .unwrap(),
+            // Attach a real cert, but it certifies issued_agent (not the
+            // victim) and is signed by `user` (not the attacker).
+            subject_cert: Some(good_cert),
+        };
+
+        // Craft the on-disk bytes directly (bypassing verify_and_insert) to
+        // simulate a tampered file.
+        let entries = vec![good_self, good_issuer, forged, unrelated];
+        let mut bytes = REVOCATIONS_FILE_MAGIC.to_vec();
+        bytes.extend_from_slice(&bincode::serialize(&entries).unwrap());
+
+        let loaded = RevocationSet::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            loaded.len(),
+            2,
+            "only the two authoritative records may survive load"
+        );
+        assert!(
+            loaded.is_agent_revoked(&good_agent.agent_id()),
+            "legit self-revocation must survive"
+        );
+        assert!(
+            loaded.is_agent_revoked(&issued_agent.agent_id()),
+            "legit issuer-revocation (with cert) must survive"
+        );
+        assert!(
+            !loaded.is_agent_revoked(&forged_agent.agent_id()),
+            "forged record must be rejected on load"
+        );
+        assert!(
+            !loaded.is_agent_revoked(&victim_agent.agent_id()),
+            "unrelated-issuer record must be rejected on load"
+        );
+    }
+
+    #[test]
+    fn revocation_set_from_empty_is_empty() {
+        assert!(RevocationSet::from_bytes(&[]).unwrap().is_empty());
     }
 }
