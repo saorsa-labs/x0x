@@ -79,6 +79,9 @@ pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
 pub mod announce_v3;
 
+/// Storm control: announce-topic forward suppression (replay + flood).
+pub mod storm_control;
+
 /// Bootstrap node discovery and connection.
 ///
 /// This module handles initial connection to bootstrap nodes with
