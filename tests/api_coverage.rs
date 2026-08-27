@@ -95,6 +95,7 @@ const COVERED: &[CoveredEndpoint] = &[
         "/diagnostics/transport",
         daemon_api_diagnostics_transport
     ),
+    covered!(Get, "/diagnostics/relay", daemon_api_diagnostics_relay),
     covered!(Get, "/diagnostics/dm", daemon_api_diagnostics_dm),
     covered!(
         Get,

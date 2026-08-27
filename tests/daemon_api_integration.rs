@@ -2383,6 +2383,36 @@ async fn daemon_api_diagnostics_transport() {
 
 #[tokio::test]
 #[ignore]
+async fn daemon_api_diagnostics_relay() {
+    // ADR-0035 metering: the relay page aggregates the advert census, the
+    // selection-skew counters, and this node's inbound-dialer evidence.
+    // WIRING SEAM: asserts the route JSON exposes the three selection_skew
+    // counter keys exactly as SelectionSkewSnapshot serializes them (the
+    // envelope-blindness lesson — both halves green proves nothing about
+    // the seam).
+    let d = daemon().await;
+    let r: Value = ca(&d)
+        .get(d.url("/diagnostics/relay"))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(r["ok"], true);
+    let census = &r["census"];
+    assert!(census["agents_live"].is_u64());
+    assert!(census["relay_advertised"].is_u64());
+    assert!(census["relay_on_bootstrap"].is_u64());
+    assert!(census["coordinator_non_bootstrap"].is_u64());
+    let skew = &r["selection_skew"];
+    assert!(skew["chosen_bootstrap"].is_u64());
+    assert!(skew["chosen_non_bootstrap"].is_u64());
+    assert!(skew["none_available"].is_u64());
+}
+
+#[tokio::test]
+#[ignore]
 async fn daemon_api_diagnostics_ack() {
     let d = daemon().await;
     let r: Value = ca(&d)

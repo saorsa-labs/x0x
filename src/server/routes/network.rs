@@ -622,6 +622,35 @@ pub(in crate::server) async fn transport_diagnostics(
     }
 }
 
+/// GET /diagnostics/relay — ADR-0035 relay-decentralization metering.
+///
+/// Advertised relay/coordinator census (bootstrap vs community split) plus
+/// this node's own inbound-dialer evidence (`distinct_inbound_dialers_1h`
+/// rides in `/diagnostics/transport`'s churn block; duplicated here so the
+/// promotion signal and the pool it feeds read from one page), and the
+/// selection-skew counters (chosen bootstrap vs community vs none) from
+/// the coordinator-hint and connect-dial choice sites.
+pub(in crate::server) async fn relay_diagnostics(
+    State(state): State<Arc<AppState>>,
+) -> impl IntoResponse {
+    let census = state.agent.relay_census().await;
+    let selection_skew = state.agent.selection_skew_snapshot();
+    let inbound_dialers_1h = state
+        .agent
+        .transport_diagnostics()
+        .await
+        .and_then(|t| t.churn.map(|c| c.distinct_inbound_dialers_1h));
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "census": census,
+            "selection_skew": selection_skew,
+            "distinct_inbound_dialers_1h": inbound_dialers_1h,
+        })),
+    )
+}
+
 /// GET /diagnostics/groups — per-group ingest diagnostics.
 ///
 /// Mirrors `/diagnostics/dm` and `/diagnostics/exec`. For each

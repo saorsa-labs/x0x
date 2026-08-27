@@ -104,6 +104,16 @@ pub async fn diagnostics_gossip(client: &DaemonClient) -> Result<()> {
     client.run_get("/diagnostics/gossip").await
 }
 
+/// `x0x diagnostics relay` — GET /diagnostics/relay
+///
+/// Prints the ADR-0035 relay-decentralization metering page: the
+/// advertised relay/coordinator census (bootstrap vs community split),
+/// selection-skew counters from the coordinator-hint and connect-dial
+/// choice sites, and this node's distinct inbound-dialer evidence.
+pub async fn diagnostics_relay(client: &DaemonClient) -> Result<()> {
+    client.run_get("/diagnostics/relay").await
+}
+
 /// `x0x diagnostics transport` — GET /diagnostics/transport
 ///
 /// Prints ant-quic connection accounting: active vs proto-open connections,

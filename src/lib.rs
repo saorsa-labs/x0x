@@ -337,6 +337,8 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// L3 fetch-on-miss cache for announce cert blobs (see `announce_blob`).
     pub(crate) announce_blob_cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    /// ADR-0035 metering: relay/coordinator selection-skew counters.
+    pub(crate) selection_skew: std::sync::Arc<SelectionSkew>,
     /// This daemon's live `(user_id, agent_certificate)` pair, served to
     /// blob fetchers by the responder task.
     pub(crate) own_cert_pair: announce_blob::SharedCertPair,
@@ -803,6 +805,156 @@ pub const IDENTITY_HEARTBEAT_INTERVAL_SECS: u64 = 600;
 /// Entries not refreshed within this window are filtered from
 /// [`Agent::presence`] and [`Agent::discovered_agents`].
 pub const IDENTITY_TTL_SECS: u64 = 900;
+
+/// ADR-0035 metering: relay/coordinator advertisement census over the live
+/// discovery cache. `*_on_bootstrap` vs `*_non_bootstrap` is the
+/// centralization skew the relay-decentralization rollout tracks.
+/// ADR-0035 metering: selection skew at relay/coordinator choice sites.
+/// Every time x0x CHOOSES a coordinator hint or dials a coordinator from
+/// `reachable_via`, the choice is classified bootstrap vs community —
+/// the consumption-side skew the relay-decentralization rollout must
+/// shrink ([`RelayCensus`] measures the supply side). Telemetry only —
+/// nothing here changes selection behavior.
+#[derive(Debug, Default)]
+pub struct SelectionSkew {
+    chosen_bootstrap: std::sync::atomic::AtomicU64,
+    chosen_non_bootstrap: std::sync::atomic::AtomicU64,
+    none_available: std::sync::atomic::AtomicU64,
+}
+
+/// JSON-friendly [`SelectionSkew`] snapshot for `/diagnostics/relay`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SelectionSkewSnapshot {
+    /// Choices whose machine resolved to an operator bootstrap IP.
+    pub chosen_bootstrap: u64,
+    /// Choices resolved off bootstrap — the community pool.
+    pub chosen_non_bootstrap: u64,
+    /// Times a coordinator/relay was needed but none resolved live.
+    pub none_available: u64,
+}
+
+/// Classification of one relay/coordinator choice.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionChoice {
+    /// The chosen machine's discovery-cache addresses include an operator
+    /// bootstrap IP (deduped by IP — the same host's :443 and :5483 rows
+    /// classify identically).
+    Bootstrap,
+    /// The chosen machine resolved off every bootstrap IP.
+    NonBootstrap,
+    /// A coordinator/relay was needed but none resolved with a live
+    /// discovery-cache entry.
+    NoneAvailable,
+}
+
+impl SelectionSkew {
+    /// Record one classified choice.
+    pub fn record(&self, choice: SelectionChoice) {
+        use std::sync::atomic::Ordering;
+        match choice {
+            SelectionChoice::Bootstrap => {
+                self.chosen_bootstrap.fetch_add(1, Ordering::Relaxed);
+            }
+            SelectionChoice::NonBootstrap => {
+                self.chosen_non_bootstrap.fetch_add(1, Ordering::Relaxed);
+            }
+            SelectionChoice::NoneAvailable => {
+                self.none_available.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Monotone counter snapshot.
+    #[must_use]
+    pub fn snapshot(&self) -> SelectionSkewSnapshot {
+        use std::sync::atomic::Ordering;
+        SelectionSkewSnapshot {
+            chosen_bootstrap: self.chosen_bootstrap.load(Ordering::Relaxed),
+            chosen_non_bootstrap: self.chosen_non_bootstrap.load(Ordering::Relaxed),
+            none_available: self.none_available.load(Ordering::Relaxed),
+        }
+    }
+}
+
+/// Sync variant for call sites already holding the machine-cache read
+/// guard (the hint loop) — same classification as
+/// [`classify_relay_choice`].
+fn classify_with_cache(
+    cache: &std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+    bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    machine_id: &identity::MachineId,
+) -> SelectionChoice {
+    let Some(entry) = cache.get(machine_id) else {
+        return SelectionChoice::NoneAvailable;
+    };
+    if entry
+        .addresses
+        .iter()
+        .any(|a| bootstrap_ips.contains(&a.ip()))
+    {
+        SelectionChoice::Bootstrap
+    } else {
+        SelectionChoice::NonBootstrap
+    }
+}
+
+/// The operator bootstrap IP set, deduped by IP across port rows
+/// (`DEFAULT_BOOTSTRAP_PEERS` carries :443 and :5483 rows for the same
+/// hosts — the IP set collapses them).
+#[must_use]
+pub(crate) fn bootstrap_ip_set() -> std::collections::HashSet<std::net::IpAddr> {
+    network::DEFAULT_BOOTSTRAP_PEERS
+        .iter()
+        .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+        .map(|a| a.ip())
+        .collect()
+}
+
+/// Classify a machine id against the bootstrap IP set via the machine
+/// discovery cache — the machine-id → cache-addresses → bootstrap-IP
+/// bridge. Unknown machines (no live entry) classify
+/// [`SelectionChoice::NoneAvailable`].
+pub(crate) async fn classify_relay_choice(
+    machine_cache: &tokio::sync::RwLock<
+        std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+    >,
+    bootstrap_ips: &std::collections::HashSet<std::net::IpAddr>,
+    machine_id: &identity::MachineId,
+) -> SelectionChoice {
+    let cache = machine_cache.read().await;
+    let Some(entry) = cache.get(machine_id) else {
+        return SelectionChoice::NoneAvailable;
+    };
+    if entry
+        .addresses
+        .iter()
+        .any(|a| bootstrap_ips.contains(&a.ip()))
+    {
+        SelectionChoice::Bootstrap
+    } else {
+        SelectionChoice::NonBootstrap
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize)]
+pub struct RelayCensus {
+    /// Live (TTL-fresh) agents in the discovery cache.
+    pub agents_live: u64,
+    /// Agents advertising `can_receive_direct == true`.
+    pub direct_capable: u64,
+    /// Agents advertising relay capability.
+    pub relay_advertised: u64,
+    /// Relay advertisers whose addresses include an operator bootstrap IP.
+    pub relay_on_bootstrap: u64,
+    /// Relay advertisers with no bootstrap address — the community pool.
+    pub relay_non_bootstrap: u64,
+    /// Agents advertising coordinator capability.
+    pub coordinator_advertised: u64,
+    /// Coordinator advertisers on operator bootstrap IPs.
+    pub coordinator_on_bootstrap: u64,
+    /// Coordinator advertisers off bootstrap — the community pool.
+    pub coordinator_non_bootstrap: u64,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IdentityAnnouncementSource {
@@ -2041,6 +2193,7 @@ async fn collect_coordinator_hints(
         tokio::sync::RwLock<std::collections::HashMap<identity::MachineId, DiscoveredMachine>>,
     >,
     own_machine_id: identity::MachineId,
+    selection_skew: &SelectionSkew,
 ) -> (Vec<identity::MachineId>, Vec<identity::MachineId>) {
     /// Upper bound on hint list length. Keeps the signed payload small and
     /// avoids amplifying gossip if we accumulate many peers.
@@ -2048,9 +2201,15 @@ async fn collect_coordinator_hints(
 
     let connected = network.connected_peers().await;
     if connected.is_empty() {
+        // ADR-0035 metering: the announce wanted coordinator/relay hints
+        // but nothing connected could supply them.
+        selection_skew.record(SelectionChoice::NoneAvailable);
         return (Vec::new(), Vec::new());
     }
 
+    // ADR-0035 metering: classify every hint this announce is about to
+    // advertise — the supply-side choice skew.
+    let bootstrap_ips = bootstrap_ip_set();
     let cache = machine_cache.read().await;
     let mut reachable_via: Vec<identity::MachineId> = Vec::new();
     let mut relay_candidates: Vec<identity::MachineId> = Vec::new();
@@ -2067,12 +2226,14 @@ async fn collect_coordinator_hints(
             && !reachable_via.contains(&mid)
             && reachable_via.len() < MAX_COORDINATOR_HINTS
         {
+            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
             reachable_via.push(mid);
         }
         if entry.is_relay == Some(true)
             && !relay_candidates.contains(&mid)
             && relay_candidates.len() < MAX_COORDINATOR_HINTS
         {
+            selection_skew.record(classify_with_cache(&cache, &bootstrap_ips, &mid));
             relay_candidates.push(mid);
         }
     }
@@ -2239,6 +2400,8 @@ struct HeartbeatContext {
     heartbeat_tick: std::sync::atomic::AtomicU64,
     /// L3 retirement flip: publish the legacy V2 announce set only when true.
     legacy_announce: bool,
+    /// ADR-0035 metering: relay/coordinator selection-skew counters.
+    selection_skew: std::sync::Arc<SelectionSkew>,
 }
 
 impl HeartbeatContext {
@@ -2333,6 +2496,7 @@ impl HeartbeatContext {
                 self.network.as_ref(),
                 &self.machine_cache,
                 self.identity.machine_id(),
+                &self.selection_skew,
             )
             .await
         };
@@ -3146,6 +3310,64 @@ impl Agent {
             None => None,
         }
     }
+
+    /// ADR-0035 metering: census of relay/coordinator advertisement across
+    /// the discovery cache, split by whether the advertiser is one of the
+    /// operator bootstrap hosts. The skew between the bootstrap and
+    /// non-bootstrap columns is the centralization signal the
+    /// decentralization rollout exists to shrink. Telemetry only — nothing
+    /// here changes selection behavior.
+    /// ADR-0035 metering: selection-skew counter snapshot for
+    /// `/diagnostics/relay`.
+    pub fn selection_skew_snapshot(&self) -> SelectionSkewSnapshot {
+        self.selection_skew.snapshot()
+    }
+
+    pub async fn relay_census(&self) -> RelayCensus {
+        let bootstrap_ips: std::collections::HashSet<std::net::IpAddr> =
+            network::DEFAULT_BOOTSTRAP_PEERS
+                .iter()
+                .filter_map(|s| s.parse::<std::net::SocketAddr>().ok())
+                .map(|a| a.ip())
+                .collect();
+        let mut census = RelayCensus::default();
+        let now = Self::unix_timestamp_secs();
+        let cache = self.identity_discovery_cache.read().await;
+        for agent in cache.values() {
+            if !discovery_record_is_live(
+                agent.announced_at,
+                agent.last_seen,
+                now.saturating_sub(self.identity_ttl_secs),
+            ) {
+                continue;
+            }
+            census.agents_live += 1;
+            let on_bootstrap = agent
+                .addresses
+                .iter()
+                .any(|a| bootstrap_ips.contains(&a.ip()));
+            if agent.can_receive_direct == Some(true) {
+                census.direct_capable += 1;
+            }
+            if agent.is_relay == Some(true) {
+                census.relay_advertised += 1;
+                if on_bootstrap {
+                    census.relay_on_bootstrap += 1;
+                } else {
+                    census.relay_non_bootstrap += 1;
+                }
+            }
+            if agent.is_coordinator == Some(true) {
+                census.coordinator_advertised += 1;
+                if on_bootstrap {
+                    census.coordinator_on_bootstrap += 1;
+                } else {
+                    census.coordinator_non_bootstrap += 1;
+                }
+            }
+        }
+        census
+    }
     #[must_use]
     pub fn presence_system(&self) -> Option<&std::sync::Arc<presence::PresenceWrapper>> {
         self.presence.as_ref()
@@ -3908,7 +4130,18 @@ impl Agent {
             // announcement (`reachable_via`). Seed transport hints for each
             // so ant-quic picks whichever is already connected (or can reach
             // one) as the coordinator peer for NAT punch-timing.
+            //
+            // ADR-0035 metering: classify every coordinator this dial is
+            // about to rely on — the consumption-side selection skew. A
+            // target that needs coordination but names no live coordinator
+            // counts as none_available.
+            let bootstrap_ips = bootstrap_ip_set();
+            let mut coord_resolved_any = false;
             for coord in &info.reachable_via {
+                self.selection_skew.record(
+                    classify_relay_choice(&self.machine_discovery_cache, &bootstrap_ips, coord)
+                        .await,
+                );
                 if let Some(coord_machine) = self
                     .machine_discovery_cache
                     .read()
@@ -3916,6 +4149,7 @@ impl Agent {
                     .get(coord)
                     .cloned()
                 {
+                    coord_resolved_any = true;
                     let coord_peer = ant_quic::PeerId(coord_machine.machine_id.0);
                     let coord_addrs = coord_machine.addresses.clone();
                     if !coord_addrs.is_empty() {
@@ -3933,6 +4167,11 @@ impl Agent {
                         }
                     }
                 }
+            }
+            if !coord_resolved_any {
+                // Needs coordination but no live coordinator resolved
+                // (empty list, or every named coordinator is unknown).
+                self.selection_skew.record(SelectionChoice::NoneAvailable);
             }
 
             // Use the machine_id from discovery cache as the peer_id hint.
@@ -6388,6 +6627,7 @@ impl Agent {
                 network.as_ref(),
                 &self.machine_discovery_cache,
                 self.machine_id(),
+                &self.selection_skew,
             )
             .await
         } else {
@@ -8185,6 +8425,7 @@ impl Agent {
                 identity: std::sync::Arc::clone(&self.identity),
                 runtime: std::sync::Arc::clone(runtime),
                 network: std::sync::Arc::clone(network),
+                selection_skew: std::sync::Arc::clone(&self.selection_skew),
                 interval_secs: self.heartbeat_interval_secs,
                 cache: std::sync::Arc::clone(&self.identity_discovery_cache),
                 machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
@@ -10247,6 +10488,7 @@ impl Agent {
             machine_cache: std::sync::Arc::clone(&self.machine_discovery_cache),
             user_identity_consented: std::sync::Arc::clone(&self.user_identity_consented),
             allow_local_discovery_addrs,
+            selection_skew: std::sync::Arc::clone(&self.selection_skew),
             revocation_set: std::sync::Arc::clone(&self.revocation_set),
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
@@ -11772,6 +12014,7 @@ impl AgentBuilder {
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
+            selection_skew: std::sync::Arc::new(SelectionSkew::default()),
             announce_blob_cache: std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(
                 self.identity_dir
                     .clone()
@@ -17873,6 +18116,178 @@ mod tests {
         assert_eq!(entry.agent_id, agent.agent_id());
         assert_eq!(entry.machine_id, agent.machine_id());
         assert_eq!(entry.user_id, agent.user_id());
+    }
+
+    /// ADR-0035 metering: the census must (a) classify advertisers by
+    /// bootstrap membership via ADDRESS overlap with the operator fleet,
+    /// (b) skip TTL-stale entries — a dead relay advert would otherwise
+    /// inflate the community pool and mask the centralization skew the
+    /// rollout is measuring.
+    #[tokio::test]
+    async fn relay_census_classifies_bootstrap_and_skips_stale() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let now = Agent::unix_timestamp_secs();
+        let mk = |id: u8, addr: &str, relay: bool, coord: bool, last_seen: u64| DiscoveredAgent {
+            agent_id: identity::AgentId([id; 32]),
+            machine_id: identity::MachineId([id; 32]),
+            user_id: None,
+            addresses: vec![addr.parse().unwrap()],
+            announced_at: last_seen,
+            last_seen,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: Some(relay),
+            is_relay: Some(relay),
+            is_coordinator: Some(coord),
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: vec![],
+        };
+        // Bootstrap-hosted relay (NYC bootstrap IP), community relay,
+        // community coordinator, and a STALE community relay.
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(1, "142.93.199.50:443", true, true, now),
+        )
+        .await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(2, "203.0.113.9:5483", true, false, now),
+        )
+        .await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(3, "203.0.113.10:5483", false, true, now),
+        )
+        .await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(
+                4,
+                "203.0.113.11:5483",
+                true,
+                true,
+                now.saturating_sub(90_000),
+            ),
+        )
+        .await;
+
+        let census = agent.relay_census().await;
+        assert_eq!(census.relay_advertised, 2, "stale relay must not count");
+        assert_eq!(census.relay_on_bootstrap, 1);
+        assert_eq!(census.relay_non_bootstrap, 1);
+        assert_eq!(census.coordinator_advertised, 2);
+        assert_eq!(census.coordinator_on_bootstrap, 1);
+        assert_eq!(census.coordinator_non_bootstrap, 1);
+        assert!(census.agents_live >= 3);
+    }
+
+    /// ADR-0035 metering: selection-skew classification — machine id →
+    /// discovery-cache addresses → bootstrap-IP bridge. The :443/:5483
+    /// port rows for the same bootstrap host must classify identically
+    /// (IP dedupe), community addresses classify NonBootstrap, and an
+    /// unknown machine id classifies NoneAvailable.
+    #[tokio::test]
+    async fn selection_skew_classifies_bootstrap_community_and_unknown() {
+        let mkm = |id: u8, addr: &str| DiscoveredMachine {
+            machine_id: identity::MachineId([id; 32]),
+            addresses: vec![addr.parse().unwrap()],
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: Some(true),
+            is_coordinator: Some(false),
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            agent_ids: vec![],
+            user_ids: vec![],
+        };
+        let cache: tokio::sync::RwLock<
+            std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
+        > = tokio::sync::RwLock::new(std::collections::HashMap::new());
+        // Bootstrap host via the :5483 row, another bootstrap host via :443.
+        cache
+            .write()
+            .await
+            .insert(identity::MachineId([1; 32]), mkm(1, "142.93.199.50:5483"));
+        cache
+            .write()
+            .await
+            .insert(identity::MachineId([2; 32]), mkm(2, "147.182.234.192:443"));
+        // Community machine.
+        cache
+            .write()
+            .await
+            .insert(identity::MachineId([3; 32]), mkm(3, "203.0.113.9:5483"));
+
+        let ips = bootstrap_ip_set();
+        assert!(
+            classify_relay_choice(&cache, &ips, &identity::MachineId([1; 32])).await
+                == SelectionChoice::Bootstrap,
+            "the :5483 row of a bootstrap host classifies bootstrap"
+        );
+        assert!(
+            classify_relay_choice(&cache, &ips, &identity::MachineId([2; 32])).await
+                == SelectionChoice::Bootstrap,
+            "the :443 row of a bootstrap host classifies bootstrap"
+        );
+        assert!(
+            classify_relay_choice(&cache, &ips, &identity::MachineId([3; 32])).await
+                == SelectionChoice::NonBootstrap,
+            "a community address classifies non-bootstrap"
+        );
+        assert!(
+            classify_relay_choice(&cache, &ips, &identity::MachineId([9; 32])).await
+                == SelectionChoice::NoneAvailable,
+            "an unknown machine id classifies none-available"
+        );
+    }
+
+    /// ADR-0035 metering: counters are monotone under interleaved records
+    /// and the snapshot reflects every class.
+    #[tokio::test]
+    async fn selection_skew_counters_are_monotone() {
+        let skew = SelectionSkew::default();
+        let before = skew.snapshot();
+        assert_eq!(before, SelectionSkewSnapshot::default());
+
+        skew.record(SelectionChoice::Bootstrap);
+        skew.record(SelectionChoice::Bootstrap);
+        skew.record(SelectionChoice::NonBootstrap);
+        skew.record(SelectionChoice::NoneAvailable);
+
+        let after = skew.snapshot();
+        assert_eq!(after.chosen_bootstrap, 2);
+        assert_eq!(after.chosen_non_bootstrap, 1);
+        assert_eq!(after.none_available, 1);
+        assert!(after.chosen_bootstrap >= before.chosen_bootstrap);
+        assert!(after.chosen_non_bootstrap >= before.chosen_non_bootstrap);
+        assert!(after.none_available >= before.none_available);
+    }
+
+    /// SEAM PIN (envelope-blindness lesson): the snapshot's serde JSON —
+    /// what `/diagnostics/relay` emits — must expose exactly the three
+    /// counter keys the ADR-0035 dashboard reads. If this drifts from the
+    /// route consumer, the dashboard silently shows zeros.
+    #[test]
+    fn selection_skew_snapshot_json_contract() {
+        let skew = SelectionSkew::default();
+        skew.record(SelectionChoice::NonBootstrap);
+        let json = serde_json::to_value(skew.snapshot()).expect("snapshot serializes");
+        let obj = json.as_object().expect("snapshot is a JSON object");
+        assert_eq!(obj.len(), 3, "exactly three counters on the wire");
+        for key in ["chosen_bootstrap", "chosen_non_bootstrap", "none_available"] {
+            assert!(obj.contains_key(key), "counter {key} must be on the wire");
+        }
+        assert_eq!(obj["chosen_non_bootstrap"], serde_json::json!(1));
     }
 
     /// L3 retirement flip: by default (legacy_announce == false) an announce

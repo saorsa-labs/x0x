@@ -16,9 +16,11 @@
 //! and the residue lives elsewhere; if closed ≪ replaced, replaced
 //! generations retain state (the ant-quic #210/#255 class).
 
+use std::collections::HashMap;
 use std::collections::HashSet;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use ant_quic::{P2pEvent, PeerLifecycleEvent, Side};
 
@@ -47,7 +49,23 @@ pub(crate) struct ChurnCounters {
     event_lag_batches: AtomicU64,
     /// Event-view set of currently-connected peer ids.
     connected_view: Mutex<HashSet<ant_quic::PeerId>>,
+    /// ADR-0035 metering: peers that successfully dialed US inbound
+    /// (Server-side connects), with the most recent time each did.
+    /// Distinct-dialer counts over a window are the local ground truth for
+    /// future `verified_inbound` promotion — a node's OWN dial evidence,
+    /// never a peer's self-asserted count. Bounded (see
+    /// `MAX_TRACKED_INBOUND_DIALERS`).
+    inbound_dialers: Mutex<HashMap<ant_quic::PeerId, Instant>>,
 }
+
+/// Window over which a distinct inbound dialer counts as "recent" for the
+/// ADR-0035 reachability metering. Matches the promotion design's sustained
+/// window unit (hours, not the 60s gossip windows).
+pub(crate) const INBOUND_DIALER_WINDOW: Duration = Duration::from_secs(3600);
+
+/// Bound on the inbound-dialer table; window-expired entries are evicted on
+/// insert once the cap is reached.
+const MAX_TRACKED_INBOUND_DIALERS: usize = 4096;
 
 impl ChurnCounters {
     fn observe_p2p(&self, event: &P2pEvent) {
@@ -71,6 +89,13 @@ impl ChurnCounters {
                     }
                     Side::Server => {
                         self.connects_inbound.fetch_add(1, Ordering::Relaxed);
+                        if let Ok(mut dialers) = self.inbound_dialers.lock() {
+                            if dialers.len() >= MAX_TRACKED_INBOUND_DIALERS {
+                                let cutoff = Instant::now() - INBOUND_DIALER_WINDOW;
+                                dialers.retain(|_, t| *t >= cutoff);
+                            }
+                            dialers.insert(*peer_id, Instant::now());
+                        }
                     }
                 }
             }
@@ -153,6 +178,20 @@ impl ChurnCounters {
             generations_closed: self.generations_closed.load(Ordering::Relaxed),
             reader_exited: self.reader_exited.load(Ordering::Relaxed),
             event_lag_batches: self.event_lag_batches.load(Ordering::Relaxed),
+            distinct_inbound_dialers_1h: self.distinct_inbound_dialers(INBOUND_DIALER_WINDOW),
+        }
+    }
+
+    /// Distinct peers that completed an inbound handshake within `window`.
+    /// ADR-0035 metering: local dial evidence for reachability promotion.
+    pub(crate) fn distinct_inbound_dialers(&self, window: Duration) -> u64 {
+        let cutoff = match Instant::now().checked_sub(window) {
+            Some(c) => c,
+            None => return 0,
+        };
+        match self.inbound_dialers.lock() {
+            Ok(dialers) => dialers.values().filter(|t| **t >= cutoff).count() as u64,
+            Err(_) => 0,
         }
     }
 }
@@ -164,6 +203,11 @@ pub struct ChurnSnapshot {
     pub connects_outbound: u64,
     /// Completed inbound handshakes (Server side).
     pub connects_inbound: u64,
+    /// ADR-0035: distinct peers that completed an inbound handshake in the
+    /// last hour — the node's OWN evidence that it is publicly dialable
+    /// (promotion requires this to be sustained; a peer's self-asserted
+    /// count is never trusted in its place).
+    pub distinct_inbound_dialers_1h: u64,
     /// Handshakes for a peer still shown connected by the event view.
     pub connects_while_connected: u64,
     /// Outbound handshakes for a peer still shown connected — x0x redials
