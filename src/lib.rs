@@ -10113,6 +10113,45 @@ impl Agent {
         agent_id: &identity::AgentId,
         protocol: streams::StreamProtocol,
     ) -> error::NetworkResult<streams::PeerStream> {
+        let machine_id = self.gate_peer_outbound(agent_id).await?;
+
+        let network = self
+            .network
+            .as_ref()
+            .ok_or_else(|| error::NetworkError::NodeError("network not initialized".to_string()))?;
+        let peer = ant_quic::PeerId(machine_id.0);
+        let (mut send, recv) = network.open_bi(&peer).await?;
+        streams::write_protocol_prefix(&mut send, protocol).await?;
+        tracing::info!(
+            target: "x0x::streams",
+            agent = %hex::encode(agent_id.as_bytes()),
+            machine = %hex::encode(machine_id.as_bytes()),
+            protocol = ?protocol,
+            "outbound peer stream opened (identity gate cleared)"
+        );
+        Ok(streams::PeerStream::new(
+            vec![*agent_id],
+            machine_id,
+            protocol,
+            send,
+            recv,
+        ))
+    }
+
+    /// Outbound identity gate shared by every lane a peer connection can
+    /// carry — byte-streams ([`Self::open_peer_stream`]) and the
+    /// unreliable datagram lane ([`Self::open_peer_datagram_lane`]) — so
+    /// the two paths can never drift.
+    ///
+    /// Resolves `agent_id` → machine via the identity discovery cache
+    /// (a missing binding is [`error::NetworkError::PeerNotVerified`],
+    /// exactly like a raw `open_bi` caller without a verified binding),
+    /// then enforces [`streams::stream_gate`] in its fixed order:
+    /// not-revoked → not-expired → trust `Accept`.
+    async fn gate_peer_outbound(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> error::NetworkResult<identity::MachineId> {
         let (machine_id, cert_not_after) = {
             let cache = self.identity_discovery_cache.read().await;
             cache
@@ -10123,9 +10162,9 @@ impl Agent {
                 })?
         };
         // Runtime cert-expiry gate (issue #191): EP1 drops expired
-        // announcements at ingest but never re-checks a cached entry on the
-        // live path. Absent expiry (None) is fail-open — is_expired returns
-        // false, preserving compatibility with pre-#130 peers.
+        // announcements at ingest but never re-checks a cached entry on
+        // the live path. Absent expiry (None) is fail-open — is_expired
+        // returns false, preserving compatibility with pre-#130 peers.
         let expired = identity::is_expired(cert_not_after, Self::unix_timestamp_secs());
 
         let trust_decision = {
@@ -10150,28 +10189,181 @@ impl Agent {
             revoked_machine,
             expired,
         )?;
+        Ok(machine_id)
+    }
+
+    /// Inbound gate for connection-borne traffic from a
+    /// transport-authenticated machine — the accept-loop posture, shared
+    /// by inbound byte-streams and the datagram lane
+    /// ([`Self::open_peer_datagram_lane`]) so unsolicited datagrams can
+    /// never surface from a peer whose stream the accept loop would
+    /// reset.
+    ///
+    /// Resolves EVERY agent announced on `machine_id` (the QUIC session
+    /// proves the machine, not the specific opener) and requires each to
+    /// clear [`streams::stream_gate`] (fail-closed multi-agent, #192),
+    /// then the connect-ACL pair gate ([`streams::stream_acl_gate`],
+    /// #131). Each lock is taken in its own scope so no two identity
+    /// locks are held at once (`evict_revoked_subject` takes them in a
+    /// different order). Denials log with the accept loop's `outcome`
+    /// tags and surface the typed [`error::NetworkError`]; success
+    /// returns the ordered agent list for the stream/lane handle.
+    async fn gate_peer_machine_inbound(
+        discovery_cache: &std::sync::Arc<
+            tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+        >,
+        contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+        revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+        machine_id: &identity::MachineId,
+    ) -> error::NetworkResult<Vec<identity::AgentId>> {
+        // Identity gate — resolve ALL agents on this machine from the
+        // discovery cache, then check each (revoked → trust). A single
+        // non-Accept agent denies the traffic (fail-closed, #192).
+        let agents: Vec<(identity::AgentId, Option<u64>)> = {
+            let cache = discovery_cache.read().await;
+            let mut found: Vec<(identity::AgentId, Option<u64>)> = cache
+                .values()
+                .filter(|a| a.machine_id == *machine_id)
+                .map(|a| (a.agent_id, a.cert_not_after))
+                .collect();
+            // Deterministic order so logging / per-peer concurrency
+            // keying are stable across HashMap iteration orders.
+            found.sort_by_key(|(a, _)| a.0);
+            found
+        };
+        if agents.is_empty() {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                outcome = "deny_not_verified",
+                "inbound traffic from machine with no known agent — denied"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
+        }
+        let now_secs = Self::unix_timestamp_secs();
+        for (agent_id, cert_not_after) in &agents {
+            // Runtime cert-expiry gate (issue #191): a cached entry whose
+            // cert has expired must be refused on the live path.
+            let expired = identity::is_expired(*cert_not_after, now_secs);
+            let trust_decision = {
+                let contacts = contact_store.read().await;
+                let evaluator = trust::TrustEvaluator::new(&contacts);
+                Some(evaluator.evaluate(&trust::TrustContext {
+                    agent_id,
+                    machine_id,
+                }))
+            };
+            let (revoked_agent, revoked_machine) = {
+                let revoked = revocation_set.read().await;
+                (
+                    revoked.is_agent_revoked(agent_id),
+                    revoked.is_machine_revoked(machine_id),
+                )
+            };
+            if let Err(e) = streams::stream_gate(
+                agent_id,
+                trust_decision,
+                revoked_agent,
+                revoked_machine,
+                expired,
+            ) {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    agent_count = agents.len(),
+                    outcome = "deny_gate",
+                    error = %e,
+                    "inbound traffic denied at identity gate (one agent on the machine failed)"
+                );
+                return Err(e);
+            }
+        }
+
+        // Gate cleared for every agent — drop the expiry metadata and
+        // keep the ordered agent list for the stream/lane handle.
+        let agents: Vec<identity::AgentId> = agents.into_iter().map(|(a, _)| a).collect();
+
+        // Connect-ACL gate (#131 × #132): with an Enabled policy every
+        // announced agent on this machine must be pair-listed in the ACL;
+        // an unlisted peer's traffic is denied with zero application
+        // bytes surfaced (fail-closed second layer, mirrors
+        // forward::decide_inbound's every-agent rule, #192). A Disabled
+        // policy adds no constraint.
+        let policy = {
+            let guard = connect_policy
+                .read()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            std::sync::Arc::clone(&guard)
+        };
+        if let Err(e) = streams::stream_acl_gate(&policy, &agents, machine_id) {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                agent_count = agents.len(),
+                outcome = "deny_acl",
+                error = %e,
+                "inbound traffic denied at connect-ACL gate (unlisted peer)"
+            );
+            return Err(e);
+        }
+        Ok(agents)
+    }
+
+    /// Open the unreliable datagram lane to a verified, trusted peer
+    /// (ADR-0042 decision (c)) — the carriage for loss-tolerant voice
+    /// audio.
+    ///
+    /// Returns the ant-quic [`P2pLinkConn`] seam for the peer's QUIC
+    /// connection (`send_datagram` / `read_datagram` on
+    /// [`ant_quic::link_transport::LinkConn`]). Datagrams ride the
+    /// connection, not a stream, so they get **no** voice shortcut around
+    /// the stream gates — the lane clears both directions' posture once,
+    /// at open (the same granularity as stream open/accept; per-frame
+    /// re-checks would differ from stream semantics):
+    ///
+    /// * outbound: the shared identity gate ([`Self::gate_peer_outbound`])
+    ///   — the caller will *send* datagrams on the connection;
+    /// * inbound: [`Self::gate_peer_machine_inbound`] — unsolicited
+    ///   datagrams *arrive* on the same connection and must never surface
+    ///   from a peer whose inbound stream the accept loop would reset.
+    ///
+    /// # Errors
+    ///
+    /// Gate failures surface the same typed [`error::NetworkError`]s as
+    /// [`Self::open_peer_stream`] / the inbound accept loop;
+    /// [`error::NetworkError::NotConnected`] when no QUIC connection to
+    /// the peer's machine exists.
+    pub async fn open_peer_datagram_lane(
+        &self,
+        agent_id: &identity::AgentId,
+    ) -> error::NetworkResult<ant_quic::P2pLinkConn> {
+        let machine_id = self.gate_peer_outbound(agent_id).await?;
+        Self::gate_peer_machine_inbound(
+            &self.identity_discovery_cache,
+            &self.contact_store,
+            &self.revocation_set,
+            &self.connect_policy,
+            &machine_id,
+        )
+        .await?;
 
         let network = self
             .network
             .as_ref()
             .ok_or_else(|| error::NetworkError::NodeError("network not initialized".to_string()))?;
         let peer = ant_quic::PeerId(machine_id.0);
-        let (mut send, recv) = network.open_bi(&peer).await?;
-        streams::write_protocol_prefix(&mut send, protocol).await?;
+        let conn = network.peer_link_conn(&peer).await?;
         tracing::info!(
             target: "x0x::streams",
             agent = %hex::encode(agent_id.as_bytes()),
             machine = %hex::encode(machine_id.as_bytes()),
-            protocol = ?protocol,
-            "outbound peer stream opened (identity gate cleared)"
+            "outbound datagram lane opened (identity + ACL gates cleared)"
         );
-        Ok(streams::PeerStream::new(
-            vec![*agent_id],
-            machine_id,
-            protocol,
-            send,
-            recv,
-        ))
+        Ok(conn)
     }
 
     /// Await the next inbound byte-stream that has cleared the identity gate
@@ -10286,108 +10478,27 @@ impl Agent {
                 };
                 let machine_id = identity::MachineId(ant_peer_id.0);
 
-                // Identity gate — resolve ALL agents on this machine from
-                // the discovery cache, then check each (revoked → trust).
-                // The QUIC transport authenticates the machine, not the
-                // specific agent, so every agent on the machine must clear
-                // the gate — a single revoked or untrusted agent denies the
-                // stream (fail-closed, #192). Each lock is taken in its own
-                // scope so no two identity locks are held at once
-                // (evict_revoked_subject takes them in a different order).
-                let agents: Vec<(identity::AgentId, Option<u64>)> = {
-                    let cache = discovery_cache.read().await;
-                    let mut found: Vec<(identity::AgentId, Option<u64>)> = cache
-                        .values()
-                        .filter(|a| a.machine_id == machine_id)
-                        .map(|a| (a.agent_id, a.cert_not_after))
-                        .collect();
-                    // Deterministic order so logging / per-peer concurrency
-                    // keying are stable across HashMap iteration orders.
-                    found.sort_by_key(|(a, _)| a.0);
-                    found
+                // Identity gate + connect-ACL gate — the shared inbound
+                // posture (also used by the datagram lane) resolves every
+                // agent announced on the transport-authenticated machine
+                // and denies unless ALL clear: revoked → expired → trust
+                // `Accept` per agent (#192 fail-closed), then the ACL
+                // pair gate when the policy is Enabled (#131). Denials
+                // are logged inside the gate; the stream halves are
+                // dropped (→ QUIC reset) with zero application bytes.
+                let agents = match Agent::gate_peer_machine_inbound(
+                    &discovery_cache,
+                    &contact_store,
+                    &revocation_set,
+                    &connect_policy,
+                    &machine_id,
+                )
+                .await
+                {
+                    Ok(agents) => agents,
+                    Err(_) => continue,
                 };
-                if agents.is_empty() {
-                    tracing::info!(
-                        target: "x0x::streams",
-                        machine = %hex::encode(machine_id.as_bytes()),
-                        outcome = "deny_not_verified",
-                        "inbound stream from machine with no known agent — denied"
-                    );
-                    continue;
-                }
-                let now_secs = Agent::unix_timestamp_secs();
-                let mut gate_denied: Option<(identity::AgentId, error::NetworkError)> = None;
-                for (agent_id, cert_not_after) in &agents {
-                    // Runtime cert-expiry gate (issue #191): a cached entry
-                    // whose cert has expired must be refused on the live path.
-                    let expired = identity::is_expired(*cert_not_after, now_secs);
-                    let trust_decision = {
-                        let contacts = contact_store.read().await;
-                        let evaluator = trust::TrustEvaluator::new(&contacts);
-                        Some(evaluator.evaluate(&trust::TrustContext {
-                            agent_id,
-                            machine_id: &machine_id,
-                        }))
-                    };
-                    let (revoked_agent, revoked_machine) = {
-                        let revoked = revocation_set.read().await;
-                        (
-                            revoked.is_agent_revoked(agent_id),
-                            revoked.is_machine_revoked(&machine_id),
-                        )
-                    };
-                    if let Err(e) = streams::stream_gate(
-                        agent_id,
-                        trust_decision,
-                        revoked_agent,
-                        revoked_machine,
-                        expired,
-                    ) {
-                        gate_denied = Some((*agent_id, e));
-                        break;
-                    }
-                }
-                if let Some((agent_id, e)) = gate_denied {
-                    tracing::info!(
-                        target: "x0x::streams",
-                        agent = %hex::encode(agent_id.as_bytes()),
-                        machine = %hex::encode(machine_id.as_bytes()),
-                        agent_count = agents.len(),
-                        outcome = "deny_gate",
-                        error = %e,
-                        "inbound stream denied at identity gate (one agent on the machine failed)"
-                    );
-                    continue;
-                }
 
-                // Gate cleared for every agent — drop the expiry metadata and
-                // keep the ordered agent list for the stream handle.
-                let agents: Vec<identity::AgentId> =
-                    agents.into_iter().map(|(a, _)| a).collect();
-
-                // Connect-ACL gate (#131 × #132): with an Enabled policy every
-                // announced agent on this machine must be pair-listed in the
-                // ACL; an unlisted peer's stream is reset here with zero
-                // application bytes exchanged (fail-closed second layer,
-                // mirrors forward::decide_inbound's every-agent rule, #192).
-                // A Disabled policy adds no constraint.
-                let policy = {
-                    let guard = connect_policy
-                        .read()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner);
-                    std::sync::Arc::clone(&guard)
-                };
-                if let Err(e) = streams::stream_acl_gate(&policy, &agents, &machine_id) {
-                    tracing::info!(
-                        target: "x0x::streams",
-                        machine = %hex::encode(machine_id.as_bytes()),
-                        agent_count = agents.len(),
-                        outcome = "deny_acl",
-                        error = %e,
-                        "inbound stream denied at connect-ACL gate (unlisted peer)"
-                    );
-                    continue;
-                }
 
                 // DISPATCH (DoS hardening, issue #132): the protocol-prefix
                 // read + surfacing run in a per-stream task so a peer that

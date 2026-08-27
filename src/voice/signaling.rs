@@ -78,6 +78,14 @@ impl X0xSignaling {
                 let Some(body) = msg.payload.strip_prefix(VOICE_SIGNALING_DM_PREFIX) else {
                     continue;
                 };
+                // x0x transport-extension frames (`"type": "x0x_*"`, e.g.
+                // the ADR-0042 datagram-capability advert) ride the same
+                // prefix but are consumed by `X0xLinkTransport`'s own
+                // subscriber — skip them silently here instead of logging
+                // a decode warning per frame.
+                if is_x0x_extension_frame(body) {
+                    continue;
+                }
                 match serde_json::from_slice::<SignalingMessage>(body) {
                     Ok(parsed) => {
                         if tx.try_send((VoicePeerId(msg.sender), parsed)).is_err() {
@@ -157,6 +165,25 @@ impl SignalingTransport for X0xSignaling {
     }
 }
 
+/// Whether a voice-signaling DM body is an x0x transport-extension frame
+/// (`"type"` starting with `x0x_`) rather than an upstream
+/// [`SignalingMessage`].
+///
+/// The `x0x_` namespace is disjoint from upstream's snake_case tags, so
+/// this never swallows a real signaling message. Extension frames have
+/// their own consumers (e.g. the ADR-0042 datagram-capability advert is
+/// consumed by `X0xLinkTransport`'s DM subscriber); this predicate lets
+/// the signaling reader skip them silently instead of logging a decode
+/// warning per frame. Undecodable bodies are NOT extensions (only a
+/// decodable JSON object with a matching tag is).
+fn is_x0x_extension_frame(body: &[u8]) -> bool {
+    serde_json::from_slice::<serde_json::Value>(body).is_ok_and(|value| {
+        value
+            .get("type")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|tag| tag.starts_with("x0x_"))
+    })
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -174,6 +201,23 @@ mod tests {
     fn voice_peer_id_rejects_bad_input() {
         assert!(VoicePeerId::from_str("zz").is_err());
         assert!(VoicePeerId::from_str(&"ab".repeat(31)).is_err());
+    }
+
+    #[test]
+    fn x0x_extension_frames_are_recognized_and_upstream_tags_are_not() {
+        // The ADR-0042 datagram advert is an extension frame.
+        assert!(is_x0x_extension_frame(
+            br#"{"type":"x0x_datagram_cap","datagram":true}"#
+        ));
+        // Future x0x_ extensions too.
+        assert!(is_x0x_extension_frame(br#"{"type":"x0x_anything"}"#));
+        // Upstream SignalingMessage tags never match the namespace…
+        assert!(!is_x0x_extension_frame(
+            br#"{"type":"capability_exchange","session_id":"s"}"#
+        ));
+        // …and neither do undecodable bodies (they keep the decode-warn
+        // path — an extension frame must be valid JSON by definition).
+        assert!(!is_x0x_extension_frame(b"not json"));
     }
 
     #[test]

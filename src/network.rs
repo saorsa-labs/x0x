@@ -3727,6 +3727,44 @@ impl NetworkNode {
             .map_err(|e| NetworkError::NodeError(format!("accept_bi: {e}")))
     }
 
+    // === Unreliable datagram lane (ADR-0042 c) ===
+
+    /// Get the ant-quic [`P2pLinkConn`] seam for a connected peer's QUIC
+    /// connection — the unreliable-datagram surface (`send_datagram` /
+    /// `read_datagram`) used by the voice audio lane.
+    ///
+    /// Thin transport wrapper over
+    /// `Node::inner_endpoint().get_quic_connection`, mirroring
+    /// [`Self::open_bi`]: the identity gate (outbound + inbound posture)
+    /// lives in [`crate::Agent::open_peer_datagram_lane`], the sole
+    /// caller — application code never reaches this without clearing the
+    /// gate.
+    ///
+    /// # Errors
+    ///
+    /// [`NetworkError::NodeError`] when the node is not initialized;
+    /// [`NetworkError::NotConnected`] when no QUIC connection to
+    /// `peer_id` exists.
+    pub(crate) async fn peer_link_conn(
+        &self,
+        peer_id: &AntPeerId,
+    ) -> NetworkResult<ant_quic::P2pLinkConn> {
+        let node = self
+            .node
+            .read()
+            .await
+            .as_ref()
+            .cloned()
+            .ok_or_else(|| NetworkError::NodeError("node not initialized".to_string()))?;
+        let conn = node
+            .inner_endpoint()
+            .get_quic_connection(peer_id)
+            .map_err(|e| NetworkError::NodeError(format!("get_quic_connection: {e}")))?
+            .ok_or(NetworkError::NotConnected(peer_id.0))?;
+        let remote_addr = conn.remote_address();
+        Ok(ant_quic::P2pLinkConn::new(conn, *peer_id, remote_addr))
+    }
+
     // === Direct Messaging ===
 
     /// Send a direct message to a connected peer.
