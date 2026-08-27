@@ -1696,7 +1696,7 @@ fn take_lp<'a>(data: &'a [u8], pos: &mut usize, what: &str) -> NetworkResult<&'a
 }
 
 /// Decode a v2 (signed) message, verifying the ML-DSA-65 signature.
-fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
+pub(crate) fn decode_v2(data: &[u8]) -> NetworkResult<PubSubMessage> {
     // Minimum: 1 (version) + 32 (agent_id) + 2 (pk_len) + 2 (sig_len) + 2 (topic_len)
     if data.len() < 39 {
         return Err(NetworkError::SerializationError(

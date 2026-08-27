@@ -77,6 +77,17 @@ pub struct AnnounceFacts {
 /// `X0A2`, or `X0A3`). `None` when the payload does not decode — callers
 /// MUST fail open on `None`.
 pub fn identity_announce_facts(payload: &[u8]) -> Option<AnnounceFacts> {
+    // The wire payload in handle_eager is the x0x V2 GOSSIP ENVELOPE
+    // (agent-signed wrapper), not the bare announcement — unwrap it first.
+    // Bare bytes are still accepted as a fallback so pre-envelope senders
+    // and direct unit inputs classify identically.
+    if let Ok(msg) = crate::gossip::pubsub::decode_v2(payload) {
+        return identity_announce_facts_bare(&msg.payload);
+    }
+    identity_announce_facts_bare(payload)
+}
+
+fn identity_announce_facts_bare(payload: &[u8]) -> Option<AnnounceFacts> {
     if crate::announce_v3::is_v3_payload(payload) {
         let v3 = crate::announce_v3::deserialize_v3(payload).ok()?;
         return Some(AnnounceFacts {
@@ -93,6 +104,13 @@ pub fn identity_announce_facts(payload: &[u8]) -> Option<AnnounceFacts> {
 
 /// Extract [`AnnounceFacts`] from a machine-announce payload.
 pub fn machine_announce_facts(payload: &[u8]) -> Option<AnnounceFacts> {
+    if let Ok(msg) = crate::gossip::pubsub::decode_v2(payload) {
+        return machine_announce_facts_bare(&msg.payload);
+    }
+    machine_announce_facts_bare(payload)
+}
+
+fn machine_announce_facts_bare(payload: &[u8]) -> Option<AnnounceFacts> {
     let ann = crate::deserialize_machine_announcement(payload).ok()?;
     Some(AnnounceFacts {
         author: ann.machine_id.0,
@@ -364,5 +382,149 @@ mod tests {
         assert_eq!(f.author, agent.agent_id().0);
         assert_eq!(f.announced_at, NOW);
         assert!(identity_announce_facts(&bytes[..10]).is_none());
+    }
+}
+
+#[cfg(test)]
+mod wiring_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    /// End-to-end wiring proof: a STALE identity announce published by one
+    /// agent is DROPPED by the receiving agent's registered validator — the
+    /// validator counter increments and the payload is never delivered to
+    /// subscribers. If this regresses (topic-id mismatch, registration not
+    /// running, sg hook moved), storm control silently stops protecting the
+    /// network while everything else stays green.
+    #[tokio::test]
+    async fn stale_announce_is_dropped_by_receiving_validator() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let mk = |n: &str| {
+            crate::Agent::builder()
+                .with_machine_key(dir.path().join(format!("{n}-machine.key")))
+                .with_agent_key_path(dir.path().join(format!("{n}-agent.key")))
+                .with_contact_store_path(dir.path().join(format!("{n}-contacts.json")))
+                .with_peer_cache_dir(dir.path().join(format!("{n}-peers")))
+                .with_network_config(crate::network::NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                    bootstrap_nodes: Vec::new(),
+                    ..crate::network::NetworkConfig::default()
+                })
+        };
+        let alice = mk("alice").build().await.expect("alice");
+        let bob = mk("bob").build().await.expect("bob");
+
+        // Connect transport + gossip (join_network wires the gossip runtime
+        // onto the transport; without it publishes go nowhere).
+        alice.join_network().await.expect("alice join");
+        bob.join_network().await.expect("bob join");
+        let alice_net = alice.network().expect("alice net");
+        let bob_net = bob.network().expect("bob net");
+        let mut bob_addr = bob_net.bound_addr().await.expect("bob bound");
+        if bob_addr.ip().is_unspecified() {
+            bob_addr.set_ip(std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST));
+        }
+        alice_net.connect_addr(bob_addr).await.expect("connect");
+        let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while tokio::time::Instant::now() < deadline {
+            if alice_net.is_connected(&bob_peer).await {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        assert!(alice_net.is_connected(&bob_peer).await, "transport connect");
+
+        // Both subscribe the identity topic so the eager mesh carries it.
+        let _sub_a = alice
+            .subscribe(crate::IDENTITY_ANNOUNCE_TOPIC)
+            .await
+            .unwrap();
+        let mut sub_b = bob.subscribe(crate::IDENTITY_ANNOUNCE_TOPIC).await.unwrap();
+        // Allow PlumTree to exchange subscription announcements (same wait
+        // as tests/group_bidirectional_delivery.rs).
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+
+        // Craft a STALE but well-formed V3 announce (signed 2h ago).
+        let stale_at = now_unix_test() - 7200;
+        let machine = crate::identity::MachineKeypair::generate().unwrap();
+        let agent_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let v2 = crate::IdentityAnnouncement {
+            agent_id: agent_kp.agent_id(),
+            machine_id: machine.machine_id(),
+            user_id: None,
+            agent_certificate: None,
+            machine_public_key: machine.public_key().as_bytes().to_vec(),
+            machine_signature: Vec::new(),
+            addresses: vec![],
+            announced_at: stale_at,
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            agent_public_key: agent_kp.public_key().as_bytes().to_vec(),
+        };
+        let v3 =
+            crate::announce_v3::IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0)
+                .unwrap();
+        let stale_bytes = crate::announce_v3::serialize_v3(&v3).unwrap();
+
+        // Mesh-proving control: an undecodable payload FORWARDS (fail-open),
+        // so its delivery proves the A->B eager path works before we assert
+        // on the stale drop (otherwise a dead mesh would greenwash the test).
+        alice
+            .publish(crate::IDENTITY_ANNOUNCE_TOPIC, b"not-an-announce".to_vec())
+            .await
+            .expect("control publish");
+        let control_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match tokio::time::timeout_at(control_deadline, sub_b.recv()).await {
+                Ok(Some(m)) if m.payload.as_ref() == b"not-an-announce" => break,
+                Ok(Some(_)) => continue,
+                _ => panic!("control payload never delivered — mesh not formed"),
+            }
+        }
+
+        // Alice publishes the stale payload; Bob's handle_eager must DROP it.
+        alice
+            .publish(crate::IDENTITY_ANNOUNCE_TOPIC, stale_bytes)
+            .await
+            .expect("publish");
+
+        let bob_pubsub = bob.gossip_runtime.as_ref().expect("bob runtime").pubsub();
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(8);
+        let mut dropped = 0u64;
+        while tokio::time::Instant::now() < deadline {
+            dropped = bob_pubsub.stage_stats().validator.dropped;
+            if dropped > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        if dropped == 0 {
+            // Diagnose: was it delivered instead (validator not registered /
+            // topic mismatch) or lost elsewhere?
+            let delivered =
+                tokio::time::timeout(std::time::Duration::from_secs(2), sub_b.recv()).await;
+            panic!(
+                "validator counter stayed 0 — wiring broken; stale delivered to subscriber: {:?}",
+                delivered.map(|o| o.map(|m| m.payload.len()))
+            );
+        }
+        // And it must never reach Bob's subscribers.
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(300), sub_b.recv())
+                .await
+                .is_err()
+                || false,
+            "stale announce must not be delivered"
+        );
+    }
+
+    fn now_unix_test() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
     }
 }
