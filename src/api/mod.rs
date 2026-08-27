@@ -244,6 +244,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/diagnostics/relay",
+        cli_name: "diagnostics relay",
+        description: "ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence",
+        category: "network",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/diagnostics/dm",
         cli_name: "diagnostics dm",
         description: "Direct-message send/receive counters and per-peer health",

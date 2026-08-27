@@ -452,6 +452,8 @@ enum DiagnosticsSub {
     Gossip,
     /// Print transport connection accounting (open/active/orphaned connections, #368).
     Transport,
+    /// Print ADR-0035 relay metering: advert census, selection skew, inbound dialers.
+    Relay,
     /// Print direct-message counters, fan-out health, and per-peer state.
     Dm,
     /// Print per-group ingest counters and drop-reason buckets.
@@ -1521,6 +1523,7 @@ async fn run(
             DiagnosticsSub::Ack => commands::network::diagnostics_ack(&client).await,
             DiagnosticsSub::Gossip => commands::network::diagnostics_gossip(&client).await,
             DiagnosticsSub::Transport => commands::network::diagnostics_transport(&client).await,
+            DiagnosticsSub::Relay => commands::network::diagnostics_relay(&client).await,
             DiagnosticsSub::Dm => commands::network::diagnostics_dm(&client).await,
             DiagnosticsSub::Groups => commands::network::diagnostics_groups(&client).await,
             DiagnosticsSub::Exec => commands::exec::diagnostics(&client).await,

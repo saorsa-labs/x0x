@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 149,
+  "endpoint_count": 150,
   "endpoints": [
     {
       "category": "status",
@@ -189,6 +189,13 @@
       "description": "Transport connection accounting (zombie-connection hunt, #368)",
       "method": "GET",
       "path": "/diagnostics/transport"
+    },
+    {
+      "category": "network",
+      "cli_name": "diagnostics relay",
+      "description": "ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence",
+      "method": "GET",
+      "path": "/diagnostics/relay"
     },
     {
       "category": "network",
