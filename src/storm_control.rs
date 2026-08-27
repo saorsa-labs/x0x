@@ -11,14 +11,14 @@
 //!
 //! - **Stale replay** — the payload's *signed* `announced_at` is older than
 //!   the freshness TTL (or unreasonably far in the future). Unforgeable
-//!   without the author's machine key. → [`Verdict::Drop`]: neither
+//!   without the author's machine key. → `Verdict::Drop`: neither
 //!   delivered nor forwarded.
 //! - **Author flood** — more than one announce per author inside the
-//!   per-author window. Valid but redundant. → [`Verdict::DeliverOnly`]:
+//!   per-author window. Valid but redundant. → `Verdict::DeliverOnly`:
 //!   local subscribers still see it (the app dedupes), but it is not
 //!   forwarded, so the flood dies one hop from its source.
 //! - **Anything else** — fresh, in-rate, or *undecodable*. →
-//!   [`Verdict::Forward`]. Fail-open on decode: a future announce format
+//!   `Verdict::Forward`. Fail-open on decode: a future announce format
 //!   must not be censored by old relays; garbage without a valid gossip
 //!   signature already dies in saorsa-gossip's verify stage.
 //!
