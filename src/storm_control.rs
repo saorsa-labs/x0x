@@ -153,6 +153,70 @@ pub fn classify_announce(
     }
 }
 
+/// Register announce-topic validators on the PlumTree instance.
+///
+/// Called once at `PubSubManager` construction. Identity announces (legacy /
+/// `X0A2` / `X0A3`) and machine announces each get a classifier keyed on the
+/// SIGNED author id; both share the stale-TTL policy. Shard topics carry the
+/// same payload formats, but shard ids are per-entity and unbounded — the
+/// global broadcast topics are where the measured storm lives, so those are
+/// the enforcement points.
+pub fn register_announce_validators<T>(plumtree: &saorsa_gossip_pubsub::PlumtreePubSub<T>)
+where
+    T: saorsa_gossip_transport::GossipTransport + Send + Sync + 'static,
+{
+    use saorsa_gossip_pubsub::ValidationAction;
+    use saorsa_gossip_types::TopicId;
+
+    fn now_unix() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+    fn to_action(v: Verdict) -> ValidationAction {
+        match v {
+            Verdict::Forward => ValidationAction::ForwardAndDeliver,
+            Verdict::DeliverOnly => ValidationAction::DeliverOnly,
+            Verdict::Drop => ValidationAction::Drop,
+        }
+    }
+
+    let identity_rate = std::sync::Arc::new(std::sync::Mutex::new(AuthorRate::default()));
+    let identity_validator: saorsa_gossip_pubsub::TopicValidator = {
+        let rate = std::sync::Arc::clone(&identity_rate);
+        std::sync::Arc::new(move |_topic, payload| {
+            let facts = identity_announce_facts(payload);
+            // A poisoned lock means a panic elsewhere; fail open rather than
+            // let the validator become a network-wide censor.
+            let Ok(mut rate) = rate.lock() else {
+                return ValidationAction::ForwardAndDeliver;
+            };
+            to_action(classify_announce(facts, &mut rate, now_unix()))
+        })
+    };
+    plumtree.set_topic_validator(
+        TopicId::from_entity(crate::IDENTITY_ANNOUNCE_TOPIC.as_bytes()),
+        identity_validator,
+    );
+
+    let machine_rate = std::sync::Arc::new(std::sync::Mutex::new(AuthorRate::default()));
+    let machine_validator: saorsa_gossip_pubsub::TopicValidator = {
+        let rate = std::sync::Arc::clone(&machine_rate);
+        std::sync::Arc::new(move |_topic, payload| {
+            let facts = machine_announce_facts(payload);
+            let Ok(mut rate) = rate.lock() else {
+                return ValidationAction::ForwardAndDeliver;
+            };
+            to_action(classify_announce(facts, &mut rate, now_unix()))
+        })
+    };
+    plumtree.set_topic_validator(
+        TopicId::from_entity(crate::MACHINE_ANNOUNCE_TOPIC.as_bytes()),
+        machine_validator,
+    );
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]

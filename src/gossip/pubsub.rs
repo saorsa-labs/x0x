@@ -492,6 +492,7 @@ impl PubSubManager {
         };
         let plumtree = Arc::new(plumtree_inner);
         register_x0x_topic_priorities(plumtree.admission().registry());
+        crate::storm_control::register_announce_validators(plumtree.as_ref());
 
         Ok(Self {
             network,
