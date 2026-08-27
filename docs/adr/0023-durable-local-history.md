@@ -1,6 +1,6 @@
 # ADR 0023: Durable Local History Is a Core x0x Capability
 
-- **Status:** Accepted (2026-07-22)
+- **Status:** Accepted (2026-07-22); **Amended by [ADR 0041](./0041-cross-machine-state-sync-tiers.md)** (2026-08-27) — the cross-node backfill non-goal is now scoped: owner-to-owner tiered sync per ADR 0041; all other non-goals stand
 - **Date:** 2026-07-22
 - **Decision owners:** David Irvine
 - **Reviewers:** <pending>
