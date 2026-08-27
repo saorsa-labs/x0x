@@ -7967,21 +7967,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
-                let commit = match seal_commit_owner_certified(
-                    state, &mut next, signing_kp, now_ms,
-                )
-                .await
-                {
-                    Ok(commit) => commit,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined: failed to seal authoritative add: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
+                let commit =
+                    match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+                        Ok(commit) => commit,
+                        Err(e) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined: failed to seal authoritative add: {e}"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    };
                 let rollback_snapshot = match guard.to_snapshot_bytes() {
                     Ok(snapshot) => snapshot,
                     Err(e) => {
@@ -12447,7 +12444,6 @@ pub(in crate::server) async fn get_group_state_commits(
         })),
     )
 }
-
 
 /// ADR-0038 `POST /groups/:id/state/seal` OwnerCertified arm: re-verify the
 /// roster, evict failing members, and — for GSS (`MlsEncrypted`) groups —
