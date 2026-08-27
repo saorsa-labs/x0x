@@ -171,6 +171,62 @@ pub fn classify_announce(
     }
 }
 
+/// Window for the inner-payload dedupe on broadcast topics: an identical
+/// inner payload (envelope stripped) re-published inside this window is a
+/// replay — sg's own payload-replay cache cannot catch it because each
+/// re-publish carries a fresh envelope signature, making the wire bytes
+/// unique every time (the same envelope-blindness that hid the announce
+/// storm from the validators until #423).
+pub const INNER_REPLAY_WINDOW: Duration = Duration::from_secs(300);
+
+/// Per-author + inner-payload state for a generic broadcast-topic validator.
+#[derive(Debug, Default)]
+pub struct BroadcastGuard {
+    rate: AuthorRate,
+    seen_inner: HashMap<[u8; 32], u64>,
+}
+
+impl BroadcastGuard {
+    /// Classify a wire payload on a broadcast topic with no per-format
+    /// timestamp semantics (revocation sets, group cards):
+    ///
+    /// - identical INNER payload (envelope stripped) seen inside
+    ///   `INNER_REPLAY_WINDOW` → `Drop` (pure replay; receivers already
+    ///   have it);
+    /// - envelope author exceeding the per-author forward window →
+    ///   `DeliverOnly`;
+    /// - unwrappable payloads (no envelope) → fail open per the same
+    ///   contract as the announce validators.
+    pub fn classify(
+        &mut self,
+        author: Option<[u8; 32]>,
+        inner_hash: [u8; 32],
+        now_unix: u64,
+    ) -> Verdict {
+        // Bound + expire the inner-seen table.
+        if self.seen_inner.len() >= MAX_TRACKED_AUTHORS {
+            let cutoff = now_unix.saturating_sub(INNER_REPLAY_WINDOW.as_secs());
+            self.seen_inner.retain(|_, t| *t >= cutoff);
+        }
+        match self.seen_inner.get(&inner_hash) {
+            Some(t) if now_unix.saturating_sub(*t) < INNER_REPLAY_WINDOW.as_secs() => {
+                return Verdict::Drop;
+            }
+            _ => {
+                self.seen_inner.insert(inner_hash, now_unix);
+            }
+        }
+        let Some(author) = author else {
+            return Verdict::Forward; // fail open: no envelope, unknown sender
+        };
+        if self.rate.allow(author, now_unix, PER_AUTHOR_FORWARD_WINDOW) {
+            Verdict::Forward
+        } else {
+            Verdict::DeliverOnly
+        }
+    }
+}
+
 /// Register announce-topic validators on the PlumTree instance.
 ///
 /// Called once at `PubSubManager` construction. Identity announces (legacy /
@@ -233,6 +289,31 @@ where
         TopicId::from_entity(crate::MACHINE_ANNOUNCE_TOPIC.as_bytes()),
         machine_validator,
     );
+
+    // Broadcast topics with no per-format timestamp semantics get the
+    // generic guard: inner-payload replay dedupe + per-author rate limit.
+    // The measured storm migrated here the moment the announce topics were
+    // guarded (revocation.v1 hit 405 KB/s of identical stale sets).
+    for topic in [crate::REVOCATION_TOPIC, "x0x.discovery.groups"] {
+        let guard = std::sync::Arc::new(std::sync::Mutex::new(BroadcastGuard::default()));
+        let validator: saorsa_gossip_pubsub::TopicValidator = {
+            let guard = std::sync::Arc::clone(&guard);
+            std::sync::Arc::new(move |_topic, payload| {
+                let (author, inner_hash) = match crate::gossip::pubsub::decode_v2(payload) {
+                    Ok(msg) => (
+                        msg.sender.map(|a| a.0),
+                        *blake3::hash(msg.payload.as_ref()).as_bytes(),
+                    ),
+                    Err(_) => (None, *blake3::hash(payload).as_bytes()),
+                };
+                let Ok(mut guard) = guard.lock() else {
+                    return ValidationAction::ForwardAndDeliver;
+                };
+                to_action(guard.classify(author, inner_hash, now_unix()))
+            })
+        };
+        plumtree.set_topic_validator(TopicId::from_entity(topic.as_bytes()), validator);
+    }
 }
 
 #[cfg(test)]
@@ -332,6 +413,38 @@ mod tests {
         );
         assert_eq!(
             classify_announce(facts(10, NOW + MAX_FUTURE_SKEW_SECS), &mut rate, NOW),
+            Verdict::Forward
+        );
+    }
+
+    /// Broadcast-guard semantics: identical inner payloads inside the
+    /// replay window are DROPPED even from a compliant author (that is the
+    /// revocation-storm signature — same 2-record set re-published forever
+    /// under fresh envelope signatures), while distinct payloads from a
+    /// flooding author fall back to the per-author DeliverOnly limit, and
+    /// envelope-less payloads fail open on authorship.
+    #[test]
+    fn broadcast_guard_drops_inner_replays_and_limits_authors() {
+        let mut g = BroadcastGuard::default();
+        let author = Some([1u8; 32]);
+        let set_hash = [7u8; 32];
+        assert_eq!(g.classify(author, set_hash, NOW), Verdict::Forward);
+        // Same inner payload 2s later (fresh envelope in reality) — replay.
+        assert_eq!(g.classify(author, set_hash, NOW + 2), Verdict::Drop);
+        assert_eq!(g.classify(author, set_hash, NOW + 200), Verdict::Drop);
+        // Distinct payload, same author, inside the author window — limited.
+        assert_eq!(g.classify(author, [8u8; 32], NOW + 3), Verdict::DeliverOnly);
+        // Distinct payload from another author — forwards.
+        assert_eq!(
+            g.classify(Some([2u8; 32]), [9u8; 32], NOW + 4),
+            Verdict::Forward
+        );
+        // No envelope: dedupe still applies, authorship fails open.
+        assert_eq!(g.classify(None, [10u8; 32], NOW + 5), Verdict::Forward);
+        assert_eq!(g.classify(None, [10u8; 32], NOW + 6), Verdict::Drop);
+        // Window expiry readmits the original set (fallback anti-entropy).
+        assert_eq!(
+            g.classify(author, set_hash, NOW + INNER_REPLAY_WINDOW.as_secs() + 200),
             Verdict::Forward
         );
     }
