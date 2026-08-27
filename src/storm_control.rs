@@ -487,7 +487,7 @@ mod wiring_tests {
 
         // Alice publishes the stale payload; Bob's handle_eager must DROP it.
         alice
-            .publish(crate::IDENTITY_ANNOUNCE_TOPIC, stale_bytes)
+            .publish(crate::IDENTITY_ANNOUNCE_TOPIC, stale_bytes.clone())
             .await
             .expect("publish");
 
@@ -511,14 +511,18 @@ mod wiring_tests {
                 delivered.map(|o| o.map(|m| m.payload.len()))
             );
         }
-        // And it must never reach Bob's subscribers.
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(300), sub_b.recv())
-                .await
-                .is_err()
-                || false,
-            "stale announce must not be delivered"
-        );
+        // And the STALE payload itself must never reach Bob's subscribers.
+        // Other traffic on the topic (the agents' own fresh announces) is
+        // legitimate and may arrive in this window — only the crafted stale
+        // bytes are forbidden.
+        let drain_deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(400);
+        while let Ok(Some(m)) = tokio::time::timeout_at(drain_deadline, sub_b.recv()).await {
+            assert_ne!(
+                m.payload.as_ref(),
+                stale_bytes.as_slice(),
+                "stale announce must not be delivered"
+            );
+        }
     }
 
     fn now_unix_test() -> u64 {
