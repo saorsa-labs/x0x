@@ -102,6 +102,7 @@ fn signed_identity_announcement_with_nat_fields() -> IdentityAnnouncement {
     let machine_signature = machine_signature_for_test(&machine_keypair, &unsigned_bytes);
 
     IdentityAnnouncement {
+        self_name: None,
         agent_id: unsigned.agent_id,
         machine_id: unsigned.machine_id,
         user_id: unsigned.user_id,
@@ -283,6 +284,7 @@ async fn announcement_timestamp_non_zero() {
 fn announcement_nat_fields_round_trip() {
     let coord = x0x::identity::MachineId([9u8; 32]);
     let ann = IdentityAnnouncement {
+        self_name: None,
         agent_id: x0x::identity::AgentId([1u8; 32]),
         machine_id: x0x::identity::MachineId([2u8; 32]),
         user_id: None,
@@ -397,6 +399,7 @@ async fn discovery_cache_insert_and_retrieve() {
 
     let fake_id = x0x::identity::AgentId([42u8; 32]);
     let fake = DiscoveredAgent {
+        self_name: None,
         agent_id: fake_id,
         machine_id: x0x::identity::MachineId([7u8; 32]),
         user_id: None,
@@ -447,6 +450,7 @@ async fn reachability_info_from_discovery_cache() {
 
     let fake_id = x0x::identity::AgentId([55u8; 32]);
     let fake = DiscoveredAgent {
+        self_name: None,
         agent_id: fake_id,
         machine_id: x0x::identity::MachineId([6u8; 32]),
         user_id: None,

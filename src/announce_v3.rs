@@ -88,8 +88,74 @@ pub struct IdentityAnnouncementV3 {
     pub payload_version: u64,
     /// ML-DSA-65 machine signature over the bincode of the unsigned struct.
     pub machine_signature: Vec<u8>,
+    /// Agent self-name (ADR-0036) — additive on the wire: an unnamed beat
+    /// is byte-identical to the pre-0036 form (`skip_serializing_if`), and
+    /// a beat from an old peer (field absent) decodes via the
+    /// [`IdentityAnnouncementV3Core`] fallback in [`deserialize_v3`] —
+    /// bincode cannot express "field absent" to serde's `default`.
+    /// Deliberately OUTSIDE the machine-signed
+    /// `IdentityAnnouncementV3Unsigned` (same pattern as V2's
+    /// `agent_public_key`): signing it would change the canonical signed
+    /// bytes and break signature verification of old beats. It also never
+    /// enters `cert_digest` — that digest still commits to
+    /// `bincode((user_id, agent_certificate))` only, so the V3 digest gate
+    /// and the blob fetch/verify path are untouched. Old peers that reject
+    /// trailing bytes on a NAMED beat fall back to the dual-published V2,
+    /// which never carries the name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub self_name: Option<String>,
 }
 
+/// The pre-0036 V3 wire shape: [`IdentityAnnouncementV3`] minus the
+/// trailing `self_name`. bincode is positional and NOT self-describing, so
+/// a beat from an old peer simply ends after `machine_signature` —
+/// `#[serde(default)]` cannot express "field absent" in bincode's
+/// struct-as-seq decode (it errors `UnexpectedEof` instead). The decoder
+/// therefore parses the CURRENT shape first and falls back to this core
+/// shape, both strictly (see [`deserialize_v3`]). Keep this struct in
+/// lockstep with `IdentityAnnouncementV3`'s pre-`self_name` fields —
+/// `v3_without_self_name_is_byte_identical_to_pre0036` guards the pairing.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdentityAnnouncementV3Core {
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    agent_public_key: Vec<u8>,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    reachable_via: Vec<identity::MachineId>,
+    relay_candidates: Vec<identity::MachineId>,
+    cert_digest: [u8; 32],
+    payload_version: u64,
+    machine_signature: Vec<u8>,
+}
+
+impl From<IdentityAnnouncementV3Core> for IdentityAnnouncementV3 {
+    fn from(core: IdentityAnnouncementV3Core) -> Self {
+        Self {
+            agent_id: core.agent_id,
+            machine_id: core.machine_id,
+            agent_public_key: core.agent_public_key,
+            machine_public_key: core.machine_public_key,
+            addresses: core.addresses,
+            announced_at: core.announced_at,
+            nat_type: core.nat_type,
+            can_receive_direct: core.can_receive_direct,
+            is_relay: core.is_relay,
+            is_coordinator: core.is_coordinator,
+            reachable_via: core.reachable_via,
+            relay_candidates: core.relay_candidates,
+            cert_digest: core.cert_digest,
+            payload_version: core.payload_version,
+            machine_signature: core.machine_signature,
+            self_name: None,
+        }
+    }
+}
 /// Digest committing to the fetchable part of an announcement:
 /// `blake3(bincode((user_id, agent_certificate)))`.
 pub fn cert_digest(
@@ -152,6 +218,7 @@ impl IdentityAnnouncementV3 {
             reachable_via: v2.reachable_via.clone(),
             relay_candidates: v2.relay_candidates.clone(),
             cert_digest: cert_digest(&v2.user_id, &v2.agent_certificate),
+            self_name: v2.self_name.clone(),
             payload_version,
             machine_signature: Vec::new(),
         };
@@ -252,6 +319,7 @@ impl IdentityAnnouncementV3 {
             reachable_via: self.reachable_via,
             relay_candidates: self.relay_candidates,
             agent_public_key: self.agent_public_key,
+            self_name: self.self_name,
         }
     }
 }
@@ -285,11 +353,25 @@ pub fn deserialize_v3(payload: &[u8]) -> Result<IdentityAnnouncementV3, Box<binc
             "missing X0A3 magic".to_string(),
         )));
     }
-    bincode::DefaultOptions::new()
-        .with_fixint_encoding()
-        .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
-        .reject_trailing_bytes()
-        .deserialize(&payload[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..])
+    let body = &payload[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..];
+    let opts = || {
+        bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+            .reject_trailing_bytes()
+    };
+    // Stage 1 — the ADR-0036 shape (trailing optional self_name). A beat
+    // from an old peer ends at `machine_signature`, so stage 1 hits EOF at
+    // the last field and falls through.
+    if let Ok(v3) = opts().deserialize::<IdentityAnnouncementV3>(body) {
+        return Ok(v3);
+    }
+    // Stage 2 — the pre-0036 core shape, equally strict: trailing bytes
+    // here mean the payload is corrupt or from a newer shape, never an
+    // old beat, so the error propagates.
+    opts()
+        .deserialize::<IdentityAnnouncementV3Core>(body)
+        .map(IdentityAnnouncementV3::from)
 }
 
 #[cfg(test)]
@@ -300,10 +382,15 @@ mod tests {
     use crate::identity::{AgentKeypair, MachineKeypair};
 
     /// Build a V2 announcement (anonymous) with real keypairs, then derive V3.
-    fn v2_and_v3() -> (crate::IdentityAnnouncement, IdentityAnnouncementV3) {
+    fn v2_and_v3() -> (
+        crate::IdentityAnnouncement,
+        MachineKeypair,
+        IdentityAnnouncementV3,
+    ) {
         let agent = AgentKeypair::generate().unwrap();
         let machine = MachineKeypair::generate().unwrap();
         let v2 = crate::IdentityAnnouncement {
+            self_name: None,
             agent_id: agent.agent_id(),
             machine_id: machine.machine_id(),
             user_id: None,
@@ -321,7 +408,7 @@ mod tests {
             agent_public_key: agent.public_key().as_bytes().to_vec(),
         };
         let v3 = IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
-        (v2, v3)
+        (v2, machine, v3)
     }
 
     /// L3's whole point: the self-verifying beat must stay small. 8 KB is the
@@ -330,7 +417,7 @@ mod tests {
     /// behind the digest.
     #[test]
     fn v3_wire_size_stays_under_8kb() {
-        let (_, v3) = v2_and_v3();
+        let (_, _machine, v3) = v2_and_v3();
         let encoded = serialize_v3(&v3).unwrap();
         assert!(
             encoded.len() <= 8192,
@@ -348,7 +435,7 @@ mod tests {
 
     #[test]
     fn v3_round_trip_verifies() {
-        let (v2, v3) = v2_and_v3();
+        let (v2, _machine, v3) = v2_and_v3();
         let encoded = serialize_v3(&v3).unwrap();
         assert!(is_v3_payload(&encoded));
         let decoded = deserialize_v3(&encoded).unwrap();
@@ -368,7 +455,7 @@ mod tests {
     /// id-binding (the V2 design only had the binding).
     #[test]
     fn v3_tampered_fields_are_rejected() {
-        let (_, v3) = v2_and_v3();
+        let (_, _machine, v3) = v2_and_v3();
         let mut addr_tampered = v3.clone();
         addr_tampered.addresses = vec!["198.51.100.9:9999".parse().unwrap()];
         assert!(
@@ -393,11 +480,147 @@ mod tests {
     /// announcement (old daemons log-and-drop it instead of mis-parsing).
     #[test]
     fn v3_payload_is_rejected_by_v2_decoder() {
-        let (_, v3) = v2_and_v3();
+        let (_, _machine, v3) = v2_and_v3();
         let encoded = serialize_v3(&v3).unwrap();
         assert!(
             crate::deserialize_identity_announcement(&encoded).is_err(),
             "a V3 envelope must not be decodable under V2/legacy rules"
         );
+    }
+
+    // ── ADR-0036: agent self-name on the V3 announce ─────────────────────
+
+    /// The pre-0036 wire shape: exactly `IdentityAnnouncementV3` minus
+    /// `self_name`. Defined in the test so compat is proven against a
+    /// frozen copy of the old struct, not against today's.
+    #[derive(serde::Serialize, serde::Deserialize)]
+    struct IdentityAnnouncementV3Pre0036 {
+        agent_id: crate::identity::AgentId,
+        machine_id: crate::identity::MachineId,
+        agent_public_key: Vec<u8>,
+        machine_public_key: Vec<u8>,
+        addresses: Vec<std::net::SocketAddr>,
+        announced_at: u64,
+        nat_type: Option<String>,
+        can_receive_direct: Option<bool>,
+        is_relay: Option<bool>,
+        is_coordinator: Option<bool>,
+        reachable_via: Vec<crate::identity::MachineId>,
+        relay_candidates: Vec<crate::identity::MachineId>,
+        cert_digest: [u8; 32],
+        payload_version: u64,
+        machine_signature: Vec<u8>,
+    }
+
+    impl IdentityAnnouncementV3Pre0036 {
+        fn from_current(v: &IdentityAnnouncementV3) -> Self {
+            Self {
+                agent_id: v.agent_id,
+                machine_id: v.machine_id,
+                agent_public_key: v.agent_public_key.clone(),
+                machine_public_key: v.machine_public_key.clone(),
+                addresses: v.addresses.clone(),
+                announced_at: v.announced_at,
+                nat_type: v.nat_type.clone(),
+                can_receive_direct: v.can_receive_direct,
+                is_relay: v.is_relay,
+                is_coordinator: v.is_coordinator,
+                reachable_via: v.reachable_via.clone(),
+                relay_candidates: v.relay_candidates.clone(),
+                cert_digest: v.cert_digest,
+                payload_version: v.payload_version,
+                machine_signature: v.machine_signature.clone(),
+            }
+        }
+    }
+
+    /// WHY: an unnamed beat must be byte-identical to the pre-0036 wire
+    /// form. Old peers run `reject_trailing_bytes` on the V3 body and would
+    /// drop a beat that grew even one tag byte; `skip_serializing_if` is
+    /// what keeps unnamed installs on the old wire exactly.
+    #[test]
+    fn v3_without_self_name_is_byte_identical_to_pre0036() {
+        use bincode::Options;
+        let (_, _machine, v3) = v2_and_v3();
+        let unnamed = IdentityAnnouncementV3 {
+            self_name: None,
+            ..v3.clone()
+        };
+        let new_bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&unnamed)
+            .unwrap();
+        let old_bytes = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&IdentityAnnouncementV3Pre0036::from_current(&v3))
+            .unwrap();
+        assert_eq!(
+            new_bytes, old_bytes,
+            "an unnamed v3 must serialize exactly like the pre-0036 shape"
+        );
+    }
+
+    /// WHY: old-decoder compat — a beat from a pre-0036 peer carries no
+    /// self_name field; the serde default must decode it (as `None`) and
+    /// the machine signature must still verify, because the name lives
+    /// outside the signed struct so the canonical signed bytes are
+    /// unchanged.
+    #[test]
+    fn v3_old_shape_decodes_and_verifies_with_defaulted_self_name() {
+        use bincode::Options;
+        let (_, _machine, v3) = v2_and_v3();
+        // Forge a pre-0036 body (struct without the field) in a v3 envelope.
+        let old_body = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .serialize(&IdentityAnnouncementV3Pre0036::from_current(&v3))
+            .unwrap();
+        let mut envelope = IDENTITY_ANNOUNCEMENT_V3_MAGIC.to_vec();
+        envelope.extend_from_slice(&old_body);
+
+        let decoded = deserialize_v3(&envelope).expect("old-shape body must decode");
+        assert_eq!(decoded.self_name, None);
+        decoded
+            .verify()
+            .expect("old-shape beat must still verify (name outside signature)");
+    }
+
+    /// `v2_and_v3` with a self-name set on the V2 (the machine key is the
+    /// one the V2's `machine_public_key` was built from, so re-deriving V3
+    /// from this V2 verifies).
+    fn v2_and_v3_named() -> (
+        crate::IdentityAnnouncement,
+        MachineKeypair,
+        IdentityAnnouncementV3,
+    ) {
+        let (mut v2, machine, _) = v2_and_v3();
+        v2.self_name = Some("fae".to_string());
+        let v3 = IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+        (v2, machine, v3)
+    }
+
+    /// WHY: a named beat must round-trip its self-name end-to-end and stay
+    /// verifiable; and the name must never leak into `cert_digest` — the
+    /// digest gate and the blob cache are keyed on
+    /// `blake3(bincode((user_id, cert)))` and old peers verify fetched
+    /// blobs under exactly that rule.
+    #[test]
+    fn v3_self_name_round_trips_and_leaves_cert_digest_untouched() {
+        let (v2, machine, v3) = v2_and_v3_named();
+        let digest_before = cert_digest(&v2.user_id, &v2.agent_certificate);
+
+        assert_eq!(v3.self_name.as_deref(), Some("fae"));
+        assert_eq!(v3.cert_digest, digest_before);
+        v3.verify().expect("named v3 must verify");
+        let _ = machine; // v3 was derived inside the helper with this key
+
+        // Round-trip through the wire and the V2 in-memory conversion.
+        let decoded = deserialize_v3(&serialize_v3(&v3).unwrap()).unwrap();
+        assert_eq!(decoded.self_name.as_deref(), Some("fae"));
+        let converted = decoded.into_announcement();
+        assert_eq!(converted.self_name.as_deref(), Some("fae"));
+
+        // Setting a name must not change the digest either (pair-only input).
+        let digest_after = cert_digest(&v2.user_id, &v2.agent_certificate);
+        assert_eq!(digest_before, digest_after);
     }
 }

@@ -48,24 +48,25 @@ use routes::{
     forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
     get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
-    history_list, history_message, history_purge, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    get_named_group_members, get_profile, gossip_diagnostics, group_membership_lock,
+    groups_diagnostics, handle_file_message, handle_join_result_message,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
+    health, history_diagnostics, history_list, history_message, history_purge, history_search,
+    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
     list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
     mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    network_status, now_millis_u64, owner_agents, peer_health_handler, peers, pin_machine,
+    presence, presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler,
+    publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
+    relay_diagnostics, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -73,15 +74,15 @@ use routes::{
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
     unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
-    update_member_role, update_named_group, update_task, withdraw_group_state, AtomicWriteOutcome,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    update_member_role, update_named_group, update_profile, update_task, withdraw_group_state,
+    AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
+    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
+    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -176,6 +177,62 @@ pub async fn run_update_check_and_report(
         println!("self-update check skipped by --skip-update-check");
     }
     Ok(())
+}
+
+/// Resolve where `x0x user-id create` recorded the install's owner.
+///
+/// Mirrors the CLI's write side exactly: the owner profile is a sibling of
+/// the user key file — the explicit `user_key_path` when configured, the
+/// daemon's identity dir otherwise (which is the instance data dir for
+/// named instances and `~/.x0x` for the default install).
+fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(ref key_path) = config.user_key_path {
+        return Some(x0x::profile::OwnerProfile::path_for_key(key_path));
+    }
+    identity_dir
+        .as_ref()
+        .map(|dir| dir.join(x0x::profile::OWNER_PROFILE_FILE))
+}
+
+/// ADR-0036 owner singleton enforcement (daemon side).
+///
+/// An install with a recorded `OwnerProfile` is owned by that `UserId`.
+/// When the daemon loads a *different* user key it refuses to start: the
+/// owner key is the install's authority, and swapping it must be the
+/// explicit `x0x user-id create --rotate-owner` act (which also causes the
+/// agent certificates to be re-issued on the next start, because the
+/// existing certs no longer bind to the new owner). No recorded owner (or
+/// no user key loaded) enforces nothing — the very first `user-id create`
+/// has not happened yet.
+async fn enforce_owner_singleton(
+    config: &DaemonConfig,
+    identity_dir: &Option<PathBuf>,
+    agent: &Arc<Agent>,
+) -> anyhow::Result<()> {
+    let Some(path) = owner_profile_path(config, identity_dir) else {
+        return Ok(());
+    };
+    let owner = x0x::profile::OwnerProfile::load_from(&path)
+        .await
+        .with_context(|| format!("failed to read owner profile at {}", path.display()))?;
+    let Some(owner) = owner else {
+        return Ok(());
+    };
+    let recorded = owner.user_id;
+    match agent.user_id() {
+        Some(loaded) if hex::encode(loaded.as_bytes()) == recorded => Ok(()),
+        Some(loaded) => Err(anyhow::anyhow!(
+            "install is owned by user {recorded} but user.key resolves to {}; \
+             run `x0x user-id create --rotate-owner` to replace the owner \
+             (agent certificates are re-issued on the next start)",
+            hex::encode(loaded.as_bytes())
+        )),
+        None => Err(anyhow::anyhow!(
+            "install is owned by user {recorded} but no user identity is \
+             configured; point the daemon at the owner's user.key or rotate \
+             the owner with `x0x user-id create --rotate-owner`"
+        )),
+    }
 }
 
 /// Start the x0x server in-process and return a [`ServerHandle`].
@@ -639,6 +696,18 @@ pub async fn serve_with_options(
     // into the RwLock below).
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
 
+    // ADR-0036: load the daemon self-profile (names) and enforce the owner
+    // singleton — an install whose recorded owner differs from the user key
+    // the daemon just loaded refuses to start. Rotation is an explicit,
+    // deliberate act (`x0x user-id create --rotate-owner`).
+    let profile_path = x0x::profile::SelfProfile::path_in(&config.data_dir);
+    let profile = x0x::profile::SelfProfile::load_from(&profile_path)
+        .await
+        .context("failed to load self-profile from data dir")?
+        .unwrap_or_default();
+    agent.set_self_name(profile.display_name.clone());
+    enforce_owner_singleton(&config, &identity_dir, &agent).await?;
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         history_record_topics: config.history.record_topics.clone(),
@@ -677,6 +746,8 @@ pub async fn serve_with_options(
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),
+        profile: RwLock::new(profile),
+        profile_path,
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
         expected_join_result_inviters: StdMutex::new(HashMap::new()),
@@ -1478,6 +1549,8 @@ pub async fn serve_with_options(
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/profile", get(get_profile).put(update_profile))
+        .route("/owner/agents", get(owner_agents))
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))

@@ -20514,7 +20514,7 @@ pub(in crate::server) mod tests {
         Ok((state, dir))
     }
 
-    async fn secure_endpoint_test_state_at(
+    pub(in crate::server) async fn secure_endpoint_test_state_at(
         data_dir: &FsPath,
         agent: Arc<Agent>,
     ) -> Result<Arc<AppState>> {
@@ -20575,6 +20575,14 @@ pub(in crate::server) mod tests {
             public_message_tasks: RwLock::new(HashMap::new()),
             agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),
             contacts,
+            profile: RwLock::new(
+                x0x::profile::SelfProfile::load_from(&data_dir.join("profile.json"))
+                    .await
+                    .ok()
+                    .flatten()
+                    .unwrap_or_default(),
+            ),
+            profile_path: data_dir.join("profile.json"),
             mls_groups: RwLock::new(HashMap::new()),
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),

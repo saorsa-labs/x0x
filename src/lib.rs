@@ -189,6 +189,9 @@ pub mod exec;
 /// The x0x Constitution — The Four Laws of Intelligent Coexistence — embedded at compile time.
 pub mod constitution;
 
+/// Owner singleton and self-profile persistence (ADR-0036).
+pub mod profile;
+
 /// Privacy-preserving log identifier wrappers (salted-hash redaction).
 pub mod logging;
 
@@ -241,6 +244,10 @@ pub struct Agent {
     network: Option<std::sync::Arc<network::NetworkNode>>,
     /// The gossip runtime for pub/sub messaging.
     gossip_runtime: Option<std::sync::Arc<gossip::GossipRuntime>>,
+    /// Agent self-name (ADR-0036 display_name). Interior-mutable so
+    /// `PUT /profile` updates apply to the next heartbeat without a
+    /// restart; `None` announces anonymously (no self_name field).
+    self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Bootstrap peer cache for quality-based peer selection across restarts.
     bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
     /// Gossip cache adapter wrapping bootstrap_cache with coordinator advert storage.
@@ -1083,6 +1090,12 @@ pub struct IdentityAnnouncement {
     /// checks the binding rejects a swapped key. Introduced in the v2 gossip
     /// envelope (`X0A2` magic prefix).
     pub agent_public_key: Vec<u8>,
+    /// Agent self-name (ADR-0036). In-memory only: `serde(skip)` keeps the
+    /// V2 wire bytes byte-identical — the name rides the V3 envelope
+    /// (`IdentityAnnouncementV3::self_name`), never the V2 payload, so
+    /// old peers' strict V2 decoder is untouched.
+    #[serde(skip)]
+    pub self_name: Option<String>,
 }
 
 impl IdentityAnnouncement {
@@ -1655,6 +1668,10 @@ pub struct DiscoveredAgent {
     /// propagated — the agent cannot be attested and a `ForwardV2` stream
     /// is denied fail-closed.
     pub agent_public_key: Vec<u8>,
+    /// Agent self-name from the V3 announce (ADR-0036), when the peer
+    /// set one. Lets the roster and discovery views render names without
+    /// importing a card.
+    pub self_name: Option<String>,
 }
 
 /// Cached machine endpoint data derived from signed machine announcements.
@@ -2115,6 +2132,7 @@ impl IdentityAnnouncementLegacy {
             .map(|c| c.agent_public_key().to_vec())
             .unwrap_or_default();
         IdentityAnnouncement {
+            self_name: None,
             agent_id: self.agent_id,
             machine_id: self.machine_id,
             user_id: self.user_id,
@@ -2402,9 +2420,20 @@ struct HeartbeatContext {
     legacy_announce: bool,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
     selection_skew: std::sync::Arc<SelectionSkew>,
+    /// Shared with `Agent::self_name` so `PUT /profile` updates apply to
+    /// the next beat without a restart.
+    self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
 }
 
 impl HeartbeatContext {
+    /// Snapshot the agent self-name for this beat. Lock poisoning is
+    /// impossible in practice (the guard never survives a panic) and reads
+    /// as "unnamed" if it ever happens — a name is display metadata, never
+    /// worth failing a heartbeat over.
+    fn current_self_name(&self) -> Option<String> {
+        self.self_name.read().ok().and_then(|g| g.clone())
+    }
+
     async fn announce(&self) -> error::Result<()> {
         let machine_public_key = self
             .identity
@@ -2558,6 +2587,7 @@ impl HeartbeatContext {
             .as_bytes()
             .to_vec();
         let announcement = IdentityAnnouncement {
+            self_name: self.current_self_name(),
             agent_id: unsigned.agent_id,
             machine_id: unsigned.machine_id,
             user_id: unsigned.user_id,
@@ -2715,6 +2745,7 @@ impl HeartbeatContext {
         )
         .await;
         let discovered_agent = DiscoveredAgent {
+            self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
             machine_id: announcement.machine_id,
             user_id: announcement.user_id,
@@ -3195,6 +3226,25 @@ impl Agent {
     #[must_use]
     pub fn agent_certificate(&self) -> Option<&identity::AgentCertificate> {
         self.identity.agent_certificate()
+    }
+
+    /// Get the agent self-name (ADR-0036 `display_name`), if set.
+    ///
+    /// Announced on the V3 identity beat so peers render a name without
+    /// importing a card. `None` = unnamed (announces without the field).
+    #[must_use]
+    pub fn self_name(&self) -> Option<String> {
+        self.self_name.read().ok().and_then(|guard| guard.clone())
+    }
+
+    /// Set the agent self-name for subsequent identity announcements.
+    ///
+    /// Live-updates the heartbeat (no restart): the announce builder reads
+    /// this per beat. `None` reverts to anonymous beats.
+    pub fn set_self_name(&self, name: Option<String>) {
+        if let Ok(mut guard) = self.self_name.write() {
+            *guard = name;
+        }
     }
 
     /// Get the network node, if initialized.
@@ -6796,6 +6846,7 @@ impl Agent {
         )
         .await;
         let discovered_agent = DiscoveredAgent {
+            self_name: announcement.self_name.clone(),
             agent_id: announcement.agent_id,
             machine_id: announcement.machine_id,
             user_id: announcement.user_id,
@@ -7806,24 +7857,22 @@ impl Agent {
                     .agent_certificate
                     .as_ref()
                     .and_then(|c| c.not_after());
-                let discovered_agent = DiscoveredAgent {
-                    agent_id: announcement.agent_id,
-                    machine_id: announcement.machine_id,
-                    user_id: announcement.user_id,
-                    addresses: discovery_addresses,
-                    announced_at: announcement.announced_at,
-                    last_seen: now,
-                    machine_public_key: announcement.machine_public_key.clone(),
-                    nat_type: announcement.nat_type.clone(),
-                    can_receive_direct: announcement.can_receive_direct,
-                    is_relay: announcement.is_relay,
-                    is_coordinator: announcement.is_coordinator,
-                    reachable_via: announcement.reachable_via.clone(),
-                    relay_candidates: announcement.relay_candidates.clone(),
-                    cert_not_after,
-                    agent_certificate: announcement.agent_certificate.clone(),
-                    agent_public_key: announcement.agent_public_key.clone(),
-                };
+                let discovered_agent = DiscoveredAgent { self_name: announcement.self_name.clone(), agent_id: announcement.agent_id,
+                machine_id: announcement.machine_id,
+                user_id: announcement.user_id,
+                addresses: discovery_addresses,
+                announced_at: announcement.announced_at,
+                last_seen: now,
+                machine_public_key: announcement.machine_public_key.clone(),
+                nat_type: announcement.nat_type.clone(),
+                can_receive_direct: announcement.can_receive_direct,
+                is_relay: announcement.is_relay,
+                is_coordinator: announcement.is_coordinator,
+                reachable_via: announcement.reachable_via.clone(),
+                relay_candidates: announcement.relay_candidates.clone(),
+                cert_not_after,
+                agent_certificate: announcement.agent_certificate.clone(),
+                agent_public_key: announcement.agent_public_key.clone(), };
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -8090,6 +8139,7 @@ impl Agent {
         .to_vec();
 
         Ok(IdentityAnnouncement {
+            self_name: self.self_name(),
             agent_id: unsigned.agent_id,
             machine_id: unsigned.machine_id,
             user_id: unsigned.user_id,
@@ -8435,6 +8485,7 @@ impl Agent {
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
                 legacy_announce: self.legacy_announce,
+                self_name: std::sync::Arc::clone(&self.self_name),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -9353,6 +9404,7 @@ impl Agent {
                                     .and_then(|c| c.not_after()),
                                 agent_certificate: ann.agent_certificate.clone(),
                                 agent_public_key: ann.agent_public_key.clone(),
+                                self_name: ann.self_name.clone(),
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -9374,6 +9426,7 @@ impl Agent {
             upsert_discovered_agent(
                 &cache,
                 DiscoveredAgent {
+                    self_name: None,
                     agent_id,
                     machine_id: identity::MachineId([0u8; 32]),
                     user_id: None,
@@ -9500,6 +9553,53 @@ impl Agent {
             })
             .cloned()
             .collect())
+    }
+
+    /// Certificates the install's owner has issued for agents this daemon
+    /// knows about (ADR-0036 `GET /owner/agents`).
+    ///
+    /// Sources, in precedence order: this daemon's own certificate, the
+    /// cached verified [`UserAnnouncement`] roster for the owner's
+    /// `UserId`, and certificates embedded in discovered agents'
+    /// announcements. Deduplicated by agent id — a stale discovery cert
+    /// never shadows a fresher roster entry for the same agent. Every
+    /// certificate binds to the owner's `UserId` (verified at announce
+    /// time), so foreign certs cannot enter the roster.
+    ///
+    /// Empty when no user identity is configured.
+    #[must_use]
+    pub async fn owner_issued_certificates(&self) -> Vec<identity::AgentCertificate> {
+        let Some(owner) = self.identity.user_id() else {
+            return Vec::new();
+        };
+        let mut out: Vec<identity::AgentCertificate> = Vec::new();
+        let mut seen: std::collections::HashSet<identity::AgentId> =
+            std::collections::HashSet::new();
+        let push = |cert: identity::AgentCertificate,
+                    seen: &mut std::collections::HashSet<identity::AgentId>,
+                    out: &mut Vec<identity::AgentCertificate>| {
+            if let Ok(id) = cert.agent_id() {
+                if seen.insert(id) {
+                    out.push(cert);
+                }
+            }
+        };
+        if let Some(own) = self.identity.agent_certificate() {
+            push(own.clone(), &mut seen, &mut out);
+        }
+        if let Some(discovered_user) = self.user_discovery_cache.read().await.get(&owner) {
+            for cert in &discovered_user.agent_certificates {
+                push(cert.clone(), &mut seen, &mut out);
+            }
+        }
+        for agent in self.identity_discovery_cache.read().await.values() {
+            if let Some(cert) = &agent.agent_certificate {
+                if cert.user_id().is_ok_and(|uid| uid == owner) {
+                    push(cert.clone(), &mut seen, &mut out);
+                }
+            }
+        }
+        out
     }
 
     /// Return the local socket address this agent's network node is bound to, if any.
@@ -10493,6 +10593,7 @@ impl Agent {
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             legacy_announce: self.legacy_announce,
+            self_name: std::sync::Arc::clone(&self.self_name),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -11974,6 +12075,7 @@ impl AgentBuilder {
         Ok(Agent {
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
+            self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
@@ -18132,6 +18234,7 @@ mod tests {
             .unwrap();
         let now = Agent::unix_timestamp_secs();
         let mk = |id: u8, addr: &str, relay: bool, coord: bool, last_seen: u64| DiscoveredAgent {
+            self_name: None,
             agent_id: identity::AgentId([id; 32]),
             machine_id: identity::MachineId([id; 32]),
             user_id: None,
@@ -18342,6 +18445,55 @@ mod tests {
         );
     }
 
+    /// ADR-0036: an agent with a self-name set announces it on the V3 beat
+    /// (verified end-to-end through the real publish path), and an unnamed
+    /// agent's V3 payload carries no name — the two states peers must be
+    /// able to distinguish.
+    #[tokio::test]
+    async fn named_agent_announces_self_name_on_v3_beat() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let runtime = agent.gossip_runtime.as_ref().expect("gossip runtime");
+        let mut identity_sub = runtime
+            .pubsub()
+            .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
+            .await;
+
+        // Unnamed beat first: V3 with self_name None.
+        agent.announce_identity(false, false).await.unwrap();
+        // Then set the name the way `PUT /profile` does and beat again.
+        agent.set_self_name(Some("fae".to_string()));
+        agent.announce_identity(false, false).await.unwrap();
+
+        let mut saw_unnamed = false;
+        let mut saw_named = false;
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+        while tokio::time::Instant::now() < deadline && !(saw_unnamed && saw_named) {
+            tokio::select! {
+                Some(msg) = identity_sub.recv() => {
+                    if announce_v3::is_v3_payload(&msg.payload) {
+                        let v3 = announce_v3::deserialize_v3(&msg.payload).expect("v3 decodes");
+                        v3.verify().expect("published v3 verifies");
+                        match v3.self_name.as_deref() {
+                            Some("fae") => saw_named = true,
+                            None => saw_unnamed = true,
+                            other => panic!("unexpected self_name on beat: {other:?}"),
+                        }
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => break,
+            }
+        }
+        assert!(
+            saw_unnamed,
+            "unnamed beat must announce without a self_name"
+        );
+        assert!(saw_named, "named beat must announce the self_name");
+    }
+
     /// The escape hatch (`with_legacy_announce(true)`) restores the V2 set —
     /// V2 identity AND machine announcements alongside V3 — for debugging and
     /// isolated pre-V3 networks.
@@ -18477,6 +18629,7 @@ mod tests {
         cache.insert(
             agent_id,
             DiscoveredAgent {
+                self_name: None,
                 agent_id,
                 machine_id: identity::MachineId([0u8; 32]),
                 user_id: None,
@@ -19111,6 +19264,7 @@ fn discovered_agent_fixture(
     user_id: Option<identity::UserId>,
 ) -> DiscoveredAgent {
     DiscoveredAgent {
+        self_name: None,
         agent_id: identity::AgentId([tag; 32]),
         machine_id: identity::MachineId([tag; 32]),
         user_id,
@@ -19164,6 +19318,7 @@ fn signed_identity_announcement_fixture(
     .as_bytes()
     .to_vec();
     IdentityAnnouncement {
+        self_name: None,
         agent_id,
         machine_id: machine.machine_id(),
         user_id: None,

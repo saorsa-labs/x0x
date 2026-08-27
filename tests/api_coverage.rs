@@ -67,6 +67,9 @@ const COVERED: &[CoveredEndpoint] = &[
         "/identity/revocations",
         revocation_list_contains_issued_record
     ),
+    covered!(Get, "/profile", daemon_api_profile_round_trip),
+    covered!(Put, "/profile", daemon_api_profile_round_trip),
+    covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
     // ── Network ─────────────────────────────────────────────────────────
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
@@ -486,6 +489,7 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         "tests/history_point_lookup_wiring.rs",
         include_str!("history_point_lookup_wiring.rs"),
     ),
+    ("tests/profile_api.rs", include_str!("profile_api.rs")),
     (
         "tests/peer_lifecycle_integration.rs",
         include_str!("peer_lifecycle_integration.rs"),

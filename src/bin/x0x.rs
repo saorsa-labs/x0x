@@ -87,6 +87,16 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<AgentSub>,
     },
+    /// Show or update this daemon's self-profile names (ADR-0036).
+    Profile {
+        #[command(subcommand)]
+        sub: Option<ProfileSub>,
+    },
+    /// Owner-scoped views of this install (ADR-0036).
+    Owner {
+        #[command(subcommand)]
+        sub: Option<OwnerSub>,
+    },
     /// Manage user identity.
     UserId {
         #[command(subcommand)]
@@ -394,6 +404,32 @@ enum AgentSub {
     },
 }
 
+/// `x0x profile` subcommands (ADR-0036).
+#[derive(Subcommand)]
+enum ProfileSub {
+    /// Update stored profile names — every flag optional (partial update).
+    /// Setting a value requires a non-empty string; omit a flag to keep the
+    /// stored name.
+    Set {
+        /// Owner's human name (e.g. "David Irvine").
+        #[arg(long, value_name = "NAME")]
+        human_name: Option<String>,
+        /// This agent's display name; announced to peers on the next beat.
+        #[arg(long, value_name = "NAME")]
+        display_name: Option<String>,
+        /// Label for this machine.
+        #[arg(long, value_name = "NAME")]
+        machine_name: Option<String>,
+    },
+}
+
+/// `x0x owner` subcommands (ADR-0036).
+#[derive(Subcommand)]
+enum OwnerSub {
+    /// List agents certified by this install's owner (the "my agents" roster).
+    Agents,
+}
+
 #[derive(Subcommand)]
 enum UserIdSub {
     /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
@@ -405,6 +441,12 @@ enum UserIdSub {
         /// (64 hex chars) via FIPS 204 seeded KeyGen. Same seed, same keypair.
         #[arg(long, value_name = "HEX")]
         from_seed: Option<String>,
+        /// ADR-0036: explicitly replace a different recorded owner for this
+        /// install. Without this flag a second create refuses (one owner per
+        /// install). Rotation re-issues the agent certificates on the next
+        /// daemon start (existing certs bind to the previous owner).
+        #[arg(long)]
+        rotate_owner: bool,
     },
     /// Read and validate a user identity file (no daemon needed).
     /// Defaults to ~/.x0x/user.key.
@@ -1364,9 +1406,14 @@ async fn run(
             };
         }
         Commands::UserId { sub } => match sub {
-            UserIdSub::Create { path, from_seed } => {
+            UserIdSub::Create {
+                path,
+                from_seed,
+                rotate_owner,
+            } => {
                 let resolved =
-                    commands::user_id::create(path.clone(), from_seed.as_deref()).await?;
+                    commands::user_id::create(path.clone(), from_seed.as_deref(), *rotate_owner)
+                        .await?;
                 match format {
                     OutputFormat::Json => x0x::cli::print_value(
                         format,
@@ -1446,6 +1493,25 @@ async fn run(
             }
             Ok(())
         }
+        Commands::Profile { sub } => match sub {
+            None => commands::identity::profile(&client).await,
+            Some(ProfileSub::Set {
+                human_name,
+                display_name,
+                machine_name,
+            }) => {
+                commands::identity::profile_set(
+                    &client,
+                    human_name.as_deref(),
+                    display_name.as_deref(),
+                    machine_name.as_deref(),
+                )
+                .await
+            }
+        },
+        Commands::Owner { sub } => match sub {
+            None | Some(OwnerSub::Agents) => commands::identity::owner_agents(&client).await,
+        },
         Commands::Health => commands::network::health(&client).await,
         Commands::Status => commands::network::status(&client).await,
         Commands::Agent { sub } => match sub {
@@ -2075,6 +2141,9 @@ x0x (v{VERSION})
 |   |   +-- import         Import an agent card to contacts
 |   +-- user-id create     Create user identity keypair
 |   +-- user-id inspect    Validate a user identity file (daemonless)
+|   +-- profile           Show stored self-profile names
+|   +-- profile set       Update self-profile names (partial update)
+|   +-- owner agents      List agents certified by this install's owner
 |   +-- announce           Announce identity to network
 |
 +-- Network

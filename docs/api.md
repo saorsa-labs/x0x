@@ -8,7 +8,7 @@ the `x0x` CLI consume it so routes and CLI commands stay in lockstep
 (`x0x routes` prints them at runtime). For request/response examples and
 the WebSocket protocol details, see [api-reference.md](api-reference.md).
 
-The daemon currently exposes **142 endpoints**. Authentication is by bearer
+The daemon currently exposes **153 endpoints**. Authentication is by bearer
 token (`Authorization: Bearer …`). The token is auto-discovered from
 `~/.local/share/x0x/api-token` (Linux) or
 `~/Library/Application Support/x0x/api-token` (macOS).
@@ -38,6 +38,9 @@ token (`Authorization: Bearer …`). The token is auto-discovered from
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed revocation for an agent-id or machine-id keypair |
 | GET | `/identity/revocations` | `x0x identity revocations` | List all revocation records held by this daemon |
+| GET | `/profile` | `x0x profile` | Stored self-profile names (human/display/machine, ADR-0036) |
+| PUT | `/profile` | `x0x profile set` | Partial update of self-profile names (persists across restart) |
+| GET | `/owner/agents` | `x0x owner agents` | Roster of agents certified by this install's owner (ADR-0036) |
 
 ## Network and diagnostics
 

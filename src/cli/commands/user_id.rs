@@ -17,7 +17,19 @@ pub fn default_user_key_path() -> Result<PathBuf> {
 /// With `from_seed_hex` (issue #95), the keypair is derived
 /// deterministically from the 32-byte seed via FIPS 204 seeded KeyGen:
 /// same seed → same keypair on any machine. Without it, random keygen.
-pub async fn create(output: Option<PathBuf>, from_seed_hex: Option<&str>) -> Result<PathBuf> {
+///
+/// ADR-0036 owner singleton: the first create records an
+/// [`OwnerProfile`](crate::profile::OwnerProfile) beside the key
+/// (`owner.json`). A later create that would install a DIFFERENT `UserId`
+/// refuses unless `rotate_owner` is set — replacing the owner is a
+/// deliberate act, and the agent certificates are re-issued on the next
+/// daemon start (the old ones bind to the previous owner). Re-creating the
+/// same identity (e.g. from the same seed) is idempotent.
+pub async fn create(
+    output: Option<PathBuf>,
+    from_seed_hex: Option<&str>,
+    rotate_owner: bool,
+) -> Result<PathBuf> {
     let path = match output {
         Some(path) => path,
         None => default_user_key_path()?,
@@ -39,9 +51,42 @@ pub async fn create(output: Option<PathBuf>, from_seed_hex: Option<&str>) -> Res
         None => UserKeypair::generate()
             .map_err(|e| anyhow::anyhow!("failed to generate user keypair: {e}"))?,
     };
+
+    // ADR-0036: one owner per install. The record lives beside the key so a
+    // custom PATH scopes the owner to that identity directory (which is the
+    // instance data dir for named daemon installs).
+    let owner_path = crate::profile::OwnerProfile::path_for_key(&path);
+    let existing_owner = crate::profile::OwnerProfile::load_from(&owner_path)
+        .await
+        .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?;
+    let new_user_id = hex::encode(keypair.user_id().as_bytes());
+    if let Some(owner) = &existing_owner {
+        if owner.user_id != new_user_id && !rotate_owner {
+            anyhow::bail!(
+                "refusing to replace owner {} with {}: one owner per install \
+                 (ADR-0036). Pass --rotate-owner to replace the owner; agent \
+                 certificates are re-issued on the next daemon start.",
+                owner.user_id,
+                new_user_id
+            );
+        }
+    }
+
     save_user_keypair_to(&keypair, &path)
         .await
         .with_context(|| format!("failed to write user keypair to {}", path.display()))?;
+
+    // Record (or re-affirm) the owner. A rotation keeps the recorded
+    // human_name — the name belongs to whoever manages the install and can
+    // be changed separately via `PUT /profile`.
+    let owner = crate::profile::OwnerProfile {
+        user_id: new_user_id,
+        human_name: existing_owner.and_then(|o| o.human_name),
+    };
+    owner
+        .save_to(&owner_path)
+        .await
+        .with_context(|| format!("failed to write owner profile to {}", owner_path.display()))?;
 
     Ok(path)
 }
@@ -98,7 +143,7 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().join("user.key");
 
-        let resolved = create(Some(path.clone()), None).await?;
+        let resolved = create(Some(path.clone()), None, false).await?;
 
         ensure!(
             resolved == path,
@@ -119,7 +164,7 @@ mod tests {
     async fn inspect_reports_user_id_and_words_for_valid_file() -> Result<()> {
         let temp_dir = tempfile::tempdir()?;
         let path = temp_dir.path().join("user.key");
-        create(Some(path.clone()), None).await?;
+        create(Some(path.clone()), None, false).await?;
         let expected = hex::encode(load_user_keypair_from(&path).await?.user_id().as_bytes());
 
         let report = inspect(Some(path.clone())).await?;
@@ -147,18 +192,21 @@ mod tests {
         let temp_dir = tempfile::tempdir()?;
         let seed_hex = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
 
-        let path_a = temp_dir.path().join("a.key");
-        let path_b = temp_dir.path().join("b.key");
-        create(Some(path_a.clone()), Some(seed_hex)).await?;
-        create(Some(path_b.clone()), Some(seed_hex)).await?;
+        // Each key gets its own directory: ADR-0036 records the install
+        // owner beside the key (owner.json), and this seed-determinism test
+        // is about DERIVATION, not the owner singleton.
+        let path_a = temp_dir.path().join("a/user.key");
+        let path_b = temp_dir.path().join("b/user.key");
+        create(Some(path_a.clone()), Some(seed_hex), false).await?;
+        create(Some(path_b.clone()), Some(seed_hex), false).await?;
 
         let id_a = load_user_keypair_from(&path_a).await?.user_id();
         let id_b = load_user_keypair_from(&path_b).await?.user_id();
         ensure!(id_a == id_b, "same seed must derive the same user_id");
 
-        let path_c = temp_dir.path().join("c.key");
+        let path_c = temp_dir.path().join("c/user.key");
         let other_seed = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
-        create(Some(path_c.clone()), Some(other_seed)).await?;
+        create(Some(path_c.clone()), Some(other_seed), false).await?;
         let id_c = load_user_keypair_from(&path_c).await?.user_id();
         ensure!(
             id_a != id_c,
@@ -173,11 +221,15 @@ mod tests {
         let path = temp_dir.path().join("user.key");
 
         assert!(
-            create(Some(path.clone()), Some("not-hex")).await.is_err(),
+            create(Some(path.clone()), Some("not-hex"), false)
+                .await
+                .is_err(),
             "non-hex seed must be rejected"
         );
         assert!(
-            create(Some(path.clone()), Some("aabb")).await.is_err(),
+            create(Some(path.clone()), Some("aabb"), false)
+                .await
+                .is_err(),
             "short seed must be rejected"
         );
         assert!(
@@ -211,4 +263,84 @@ mod tests {
             "malformed file must fail validation"
         );
     }
+
+    // ── ADR-0036: owner singleton ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn second_create_with_different_owner_refuses_without_rotate() {
+        // WHY: the owner key is the install's authority (ADR-0036). Without
+        // this guard a stray `user-id create` would silently re-root every
+        // issued certificate and the daemon would adopt a foreign owner.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("user.key");
+        create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .unwrap();
+
+        let err = create(Some(path.clone()), Some(SEED_B), false)
+            .await
+            .expect_err("a second, different owner must be refused");
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error must name the escape hatch: {err}"
+        );
+
+        // The original owner record and key survive the refusal.
+        let owner = crate::profile::OwnerProfile::load_from(
+            &crate::profile::OwnerProfile::path_for_key(&path),
+        )
+        .await
+        .unwrap()
+        .expect("owner record survives");
+        let id_a = load_user_keypair_from(&path).await.unwrap().user_id();
+        assert_eq!(owner.user_id, hex::encode(id_a.as_bytes()));
+    }
+
+    #[tokio::test]
+    async fn rotate_owner_replaces_the_record_and_preserves_human_name() {
+        // WHY: rotation is the explicit path to change owners; it must not
+        // lose the recorded human name (that is the operator's label, not a
+        // property of either key).
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("user.key");
+        create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .unwrap();
+        let owner_path = crate::profile::OwnerProfile::path_for_key(&path);
+        let mut owner = crate::profile::OwnerProfile::load_from(&owner_path)
+            .await
+            .unwrap()
+            .unwrap();
+        owner.human_name = Some("David Irvine".to_string());
+        owner.save_to(&owner_path).await.unwrap();
+
+        create(Some(path.clone()), Some(SEED_B), true)
+            .await
+            .unwrap();
+
+        let rotated = crate::profile::OwnerProfile::load_from(&owner_path)
+            .await
+            .unwrap()
+            .expect("rotated owner record exists");
+        let id_b = load_user_keypair_from(&path).await.unwrap().user_id();
+        assert_eq!(rotated.user_id, hex::encode(id_b.as_bytes()));
+        assert_eq!(rotated.human_name.as_deref(), Some("David Irvine"));
+    }
+
+    #[tokio::test]
+    async fn recreating_the_same_identity_is_idempotent() {
+        // WHY: re-running create with the SAME seed is a restore, not a
+        // rotation — refusing it would break key recovery workflows.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("user.key");
+        create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .unwrap();
+        create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .expect("same user_id must not require --rotate-owner");
+    }
+
+    const SEED_A: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+    const SEED_B: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 }

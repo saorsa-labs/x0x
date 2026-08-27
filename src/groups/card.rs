@@ -70,6 +70,15 @@ pub struct AgentCard {
     /// signed cards; legacy unsigned cards carry `None` and still parse.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub signature: Option<String>,
+
+    /// Human-readable name of the owner behind this agent (ADR-0036),
+    /// e.g. "David Irvine". Populated from the daemon's stored self-profile
+    /// (`human_name`); absent on cards from installs without one. Additive
+    /// and serde-defaulted, so cards minted before 0036 still parse and
+    /// still verify — `signable_bytes` encodes `None` as the empty string,
+    /// exactly like the pre-existing optional `user_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_name: Option<String>,
 }
 
 /// A group reference inside an agent card.
@@ -104,6 +113,7 @@ impl AgentCard {
             agent_id: hex::encode(agent_id.as_bytes()),
             machine_id: machine_id.to_string(),
             user_id: None,
+            owner_name: None,
             addresses: Vec::new(),
             groups: Vec::new(),
             stores: Vec::new(),
@@ -185,12 +195,19 @@ impl AgentCard {
             push_len_prefixed(&mut buf, s.name.as_bytes());
             push_len_prefixed(&mut buf, s.topic.as_bytes());
         }
-        buf.extend_from_slice(&self.created_at.to_le_bytes());
+        buf.extend_from_slice(&(self.created_at).to_le_bytes());
         let dm_bytes = bincode::serialize(&self.dm_capabilities).unwrap_or_default();
         push_len_prefixed(&mut buf, &dm_bytes);
         push_len_prefixed(
             &mut buf,
             self.agent_public_key.as_deref().unwrap_or("").as_bytes(),
+        );
+        // ADR-0036: appended LAST so a card without owner_name serializes
+        // to exactly the pre-0036 signable bytes — old signatures keep
+        // verifying. `None` encodes as the empty string, mirroring user_id.
+        push_len_prefixed(
+            &mut buf,
+            self.owner_name.as_deref().unwrap_or("").as_bytes(),
         );
         buf
     }
@@ -418,5 +435,50 @@ mod tests {
         restored
             .verify_signature()
             .expect("verify after link roundtrip");
+    }
+
+    #[test]
+    fn test_owner_name_is_signed_and_link_round_trips() {
+        // WHY (ADR-0036): owner_name is display metadata shared out-of-band
+        // — an unsigned name could be swapped by a relay to impersonate the
+        // owner, so it must be covered by the signature like every other
+        // semantic field, and must survive the link transport.
+        let kp = AgentKeypair::generate().expect("kp");
+        let mut card = AgentCard::new("fae".to_string(), &kp.agent_id(), &hex::encode([9u8; 32]));
+        card.owner_name = Some("David Irvine".to_string());
+        card.sign(&kp).expect("sign");
+        assert!(card.verify_signature().is_ok());
+
+        let restored = AgentCard::from_link(&card.to_link()).expect("parse");
+        assert_eq!(restored.owner_name.as_deref(), Some("David Irvine"));
+        restored.verify_signature().expect("named card verifies");
+
+        // Tampering with the owner name must fail — it is a signed field.
+        let mut bad = restored;
+        bad.owner_name = Some("Mallory".to_string());
+        assert!(bad.verify_signature().is_err());
+    }
+
+    #[test]
+    fn test_owner_name_none_keeps_pre0036_signable_bytes() {
+        // WHY: cards signed before 0036 must still verify after the field
+        // exists — `None` encodes as the empty string, appended last, so
+        // the signable bytes of an owner-less card are byte-identical to
+        // the pre-0036 encoding.
+        let kp = AgentKeypair::generate().expect("kp");
+        let mut card = AgentCard::new("fae".to_string(), &kp.agent_id(), &hex::encode([9u8; 32]));
+        card.sign(&kp).expect("sign");
+        card.owner_name = None;
+        // Stripping the field from a SIGNED card must not change the bytes
+        // the verifier reconstructs.
+        let with_none = card.signable_bytes();
+        let pre0036 = {
+            let mut c = card.clone();
+            c.owner_name = None;
+            c.signable_bytes()
+        };
+        assert_eq!(with_none, pre0036);
+        card.verify_signature()
+            .expect("a card with owner_name None verifies like a pre-0036 card");
     }
 }

@@ -19,6 +19,7 @@ mod messaging;
 pub(crate) mod named_groups;
 mod network;
 mod presence;
+mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
 mod status;
 mod stores;
@@ -105,6 +106,7 @@ pub(super) use network::{
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,
 };
+pub(super) use profile::{get_profile, owner_agents, update_profile};
 pub(super) use status::{
     get_constitution, get_constitution_json, health, shutdown_handler, status,
 };

@@ -149,6 +149,7 @@ pub fn presence_record_to_discovered_agent(
     let agent_id = AgentId(*peer_id.as_bytes());
     let machine_id = MachineId(*peer_id.as_bytes());
     Some(DiscoveredAgent {
+        self_name: None,
         agent_id,
         machine_id,
         user_id: None,
@@ -733,6 +734,7 @@ mod tests {
 
     fn make_discovered_agent(agent_id: AgentId, machine_id: MachineId) -> DiscoveredAgent {
         DiscoveredAgent {
+            self_name: None,
             agent_id,
             machine_id,
             user_id: None,

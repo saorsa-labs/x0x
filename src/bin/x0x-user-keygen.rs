@@ -15,7 +15,9 @@ async fn main() -> Result<()> {
         .map(PathBuf::from)
         .context("usage: x0x-user-keygen <output-path>")?;
 
-    let resolved = x0x::cli::commands::user_id::create(Some(output), None).await?;
+    let resolved = // The deprecated shim never rotates: a second owner requires the
+    // explicit `x0x user-id create --rotate-owner` path.
+    x0x::cli::commands::user_id::create(Some(output), None, false).await?;
     println!("{}", resolved.display());
     Ok(())
 }

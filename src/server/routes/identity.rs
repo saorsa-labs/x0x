@@ -82,6 +82,7 @@ pub(in crate::server) async fn agent_info(
     State(state): State<Arc<AppState>>,
 ) -> Json<ApiResponse<AgentData>> {
     use base64::Engine as _;
+    let profile = state.profile.read().await;
     Json(ApiResponse {
         ok: true,
         data: AgentData {
@@ -89,6 +90,9 @@ pub(in crate::server) async fn agent_info(
             machine_id: hex::encode(state.agent.machine_id().as_bytes()),
             user_id: state.agent.user_id().map(|u| hex::encode(u.as_bytes())),
             kem_public_key_b64: BASE64.encode(&state.agent_kem_keypair.public_bytes),
+            human_name: profile.human_name.clone(),
+            display_name: profile.display_name.clone(),
+            machine_name: profile.machine_name.clone(),
         },
     })
 }
@@ -314,7 +318,9 @@ fn default_import_trust() -> String {
 /// Request body for GET /agent/card query params.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CardQuery {
-    /// Display name to include in the card.
+    /// Display name to include in the card. DEPRECATED (ADR-0036): the
+    /// daemon-persisted profile (`PUT /profile`) takes precedence; this
+    /// parameter is only a fallback for installs that never stored one.
     #[serde(default)]
     pub(in crate::server) display_name: Option<String>,
     /// Whether to include group invites.
@@ -397,9 +403,19 @@ pub(in crate::server) async fn get_agent_card(
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
     let machine_id = hex::encode(state.agent.machine_id().as_bytes());
-    let display_name = query.display_name.unwrap_or_default();
+    // ADR-0036: the stored profile's display_name is the source of truth.
+    // `?display_name=` is DEPRECATED — still accepted as a fallback for
+    // callers that never set a profile, but a stored name always wins, so
+    // cards can no longer disagree with what the daemon announces.
+    let profile = state.profile.read().await;
+    let display_name = profile
+        .display_name
+        .clone()
+        .or(query.display_name)
+        .unwrap_or_default();
 
     let mut card = x0x::groups::card::AgentCard::new(display_name, &agent_id, &machine_id);
+    card.owner_name = profile.human_name.clone();
     // ADR 0030 §3: the card must carry the same protocol version the mesh
     // advert claims. Hardcoding v1 here made an imported card contradict the
     // live advert, and a lower-version card import would then have to be
@@ -715,6 +731,7 @@ pub(in crate::server) async fn import_agent_card(
         state
             .agent
             .insert_discovered_agent_for_testing(x0x::DiscoveredAgent {
+                self_name: None,
                 agent_id,
                 machine_id: x0x::identity::MachineId(machine_id_bytes),
                 user_id: None,
@@ -1087,6 +1104,13 @@ pub(in crate::server) struct AgentData {
     /// Base64 of the agent's ML-KEM-768 public key. Used by other daemons to
     /// seal group-shared-secret envelopes to this agent.
     kem_public_key_b64: String,
+    /// ADR-0036 self-profile names (daemon-persisted, `PUT /profile`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    human_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    machine_name: Option<String>,
 }
 
 /// Introduction card response (fields vary by trust level).

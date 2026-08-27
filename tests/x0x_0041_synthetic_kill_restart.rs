@@ -240,6 +240,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         .expect("system time after epoch")
         .as_secs();
     let bob_card = DiscoveredAgent {
+        self_name: None,
         agent_id: bob.agent_id(),
         machine_id: bob.machine_id(),
         user_id: None,
@@ -264,6 +265,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         .await;
 
     let alice_card = DiscoveredAgent {
+        self_name: None,
         agent_id: alice.agent_id(),
         machine_id: alice.machine_id(),
         user_id: None,
@@ -468,6 +470,7 @@ async fn discovered_but_disconnected_peer_is_dialed_by_same_send() {
         .expect("system time after epoch")
         .as_secs();
     let discovered = |agent: &Agent, addr| x0x::DiscoveredAgent {
+        self_name: None,
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,

@@ -53,6 +53,37 @@ pub async fn user_id(client: &DaemonClient) -> Result<()> {
     client.run_get("/agent/user-id").await
 }
 
+/// `x0x profile` — GET /profile (ADR-0036 self-profile names).
+pub async fn profile(client: &DaemonClient) -> Result<()> {
+    client.run_get("/profile").await
+}
+
+/// `x0x profile set` — PUT /profile (partial update; omitted names are kept).
+///
+/// The daemon persists the names and, for `display_name`, live-updates the
+/// V3 announce self-name so peers render it without importing a card.
+pub async fn profile_set(
+    client: &DaemonClient,
+    human_name: Option<&str>,
+    display_name: Option<&str>,
+    machine_name: Option<&str>,
+) -> Result<()> {
+    let body = serde_json::json!({
+        "human_name": human_name,
+        "display_name": display_name,
+        "machine_name": machine_name,
+    });
+    let resp = client.put("/profile", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x owner agents` — GET /owner/agents (the "my agents" roster,
+/// derived from issued AgentCertificates + contact store).
+pub async fn owner_agents(client: &DaemonClient) -> Result<()> {
+    client.run_get("/owner/agents").await
+}
+
 /// `x0x announce` — POST /announce
 pub async fn announce(client: &DaemonClient, include_user: bool, consent: bool) -> Result<()> {
     client.ensure_running().await?;

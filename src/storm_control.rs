@@ -471,6 +471,7 @@ mod tests {
         let agent = crate::identity::AgentKeypair::generate().unwrap();
         let machine = crate::identity::MachineKeypair::generate().unwrap();
         let v2 = crate::IdentityAnnouncement {
+            self_name: None,
             agent_id: agent.agent_id(),
             machine_id: machine.machine_id(),
             user_id: None,
@@ -561,6 +562,7 @@ mod wiring_tests {
         let machine = crate::identity::MachineKeypair::generate().unwrap();
         let agent_kp = crate::identity::AgentKeypair::generate().unwrap();
         let v2 = crate::IdentityAnnouncement {
+            self_name: None,
             agent_id: agent_kp.agent_id(),
             machine_id: machine.machine_id(),
             user_id: None,

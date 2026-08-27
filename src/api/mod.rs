@@ -149,6 +149,27 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "List all revocation records held by this daemon",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Get,
+        path: "/profile",
+        cli_name: "profile",
+        description: "Daemon self-profile names (human/display/machine)",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Put,
+        path: "/profile",
+        cli_name: "profile set",
+        description: "Update stored self-profile names (partial update)",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/owner/agents",
+        cli_name: "owner agents",
+        description: "Roster of agents certified by this install's owner",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

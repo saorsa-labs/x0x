@@ -69,6 +69,7 @@ fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
 
 fn discovered_for(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) -> DiscoveredAgent {
     DiscoveredAgent {
+        self_name: None,
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,
