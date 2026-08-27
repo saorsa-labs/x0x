@@ -17,6 +17,7 @@ pub mod discovery;
 pub mod invite;
 pub mod kem_envelope;
 pub mod member;
+pub mod owner_cert;
 pub mod policy;
 pub mod public_message;
 pub mod request;
@@ -39,6 +40,9 @@ pub use self::discovery::{
     MAX_NAME_WORDS, MAX_TAGS_PER_GROUP, SHARD_COUNT,
 };
 pub use self::member::{GroupMember, GroupMemberState, GroupRole};
+pub use self::owner_cert::{
+    failing_active_members, verify_owner_certified_member, OwnerCertEvidence, OwnerCertFailure,
+};
 pub use self::policy::{
     GroupAdmission, GroupConfidentiality, GroupDiscoverability, GroupPolicy, GroupPolicyPreset,
     GroupPolicySummary, GroupReadAccess, GroupWriteAccess,
@@ -559,7 +563,73 @@ impl GroupInfo {
     /// Callers must mutate the group first (e.g. `add_member`, `ban_member`,
     /// policy update) **and then** call `seal_commit` to produce the
     /// authority-signed commit that can be published and verified by peers.
+    ///
+    /// ADR-0038: for [`policy::GroupAdmission::OwnerCertified`] groups this
+    /// method REFUSES to seal — an OwnerCertified roster must never be
+    /// committed without certificate evidence, because the seal is the
+    /// re-verification point that evicts revoked/expired/uncertified
+    /// members. Use [`Self::seal_commit_with_owner_certs`], which takes the
+    /// evidence snapshot and enforces the rule. Refusing (rather than
+    /// sealing blind) makes a forgotten enforcement point fail loudly at the
+    /// seal instead of silently certifying an unverified roster.
     pub fn seal_commit(
+        &mut self,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+    ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        if self.policy.admission.owner_certified_user_id().is_some() {
+            return Err(state_commit::ApplyError::OwnerCertifiedEvidenceRequired {
+                group_id: self.stable_group_id().to_string(),
+            });
+        }
+        self.seal_commit_inner(keypair, now_ms)
+    }
+
+    /// ADR-0038 seal path for OwnerCertified groups (and a valid choice for
+    /// any group): re-verify every active member's `AgentCertificate`
+    /// against the admission owner BEFORE the commit is signed, roster-remove
+    /// (evict) the failures, then seal. Returns the commit plus the evicted
+    /// `(agent_hex, failure)` pairs so the caller can publish `MemberRemoved`
+    /// events and re-seal the group secret to the survivors — the roster
+    /// prune alone must never be the end of an eviction that also needs a
+    /// rekey.
+    ///
+    /// Eviction removals may trip [`state_commit::enforce_last_admin_invariant`]
+    /// (e.g. the sole admin's own certificate expired): the seal fails and
+    /// the local state is left unmutated-by-the-commit — fail-closed per the
+    /// ADR's "Home locks itself out" consequence; recovery is owner-key
+    /// re-certification, not a weaker seal.
+    pub fn seal_commit_with_owner_certs(
+        &mut self,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+        evidence: &owner_cert::OwnerCertEvidence,
+    ) -> Result<
+        (
+            state_commit::GroupStateCommit,
+            Vec<(String, owner_cert::OwnerCertFailure)>,
+        ),
+        state_commit::ApplyError,
+    > {
+        let original = self.clone();
+        let signer_hex = hex::encode(keypair.agent_id().as_bytes());
+        let evicted = self.enforce_owner_certified_admission(&signer_hex, evidence);
+        match self.seal_commit_inner(keypair, now_ms) {
+            Ok(commit) => Ok((commit, evicted)),
+            // A failed seal leaves the group untouched: without this
+            // restore, the prune above would outlive the commit it was
+            // meant to be part of, and a retry (or the last-admin veto
+            // itself) would see a silently-amputated roster.
+            Err(err) => {
+                *self = original;
+                Err(err)
+            }
+        }
+    }
+
+    /// Shared sealing core: chain advance + signature. No admission logic —
+    /// the public entry points own that.
+    fn seal_commit_inner(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
@@ -631,6 +701,36 @@ impl GroupInfo {
         Ok(commit)
     }
 
+    /// ADR-0038: re-verify every ACTIVE member of an OwnerCertified group
+    /// against the admission owner and roster-remove (evict) the failures.
+    /// No-op for every other admission axis. Returns the evicted
+    /// `(agent_hex, failure)` pairs — callers that also need a rekey (GSS
+    /// secret rotation + survivor re-seal) must act on them; the roster
+    /// prune alone is only the commit-visible half of an eviction.
+    pub fn enforce_owner_certified_admission(
+        &mut self,
+        authority_hex: &str,
+        evidence: &owner_cert::OwnerCertEvidence,
+    ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
+        let Some(owner) = self.policy.admission.owner_certified_user_id().copied() else {
+            return Vec::new();
+        };
+        let failures = owner_cert::failing_active_members(&owner, &self.members_v2, evidence);
+        if failures.is_empty() {
+            return failures;
+        }
+        for (agent_hex, failure) in &failures {
+            tracing::warn!(
+                group_id = %self.stable_group_id(),
+                member = %agent_hex,
+                reason = %failure,
+                "ADR-0038: evicting member failing OwnerCertified re-verification"
+            );
+            self.remove_member(agent_hex, Some(authority_hex.to_string()));
+        }
+        failures
+    }
+
     /// Append a retained commit for the just-committed state and enforce
     /// [`COMMIT_LOG_CAP`]. `self` must already reflect the committed roster
     /// (callers mutate then seal/finalize, so this holds). The single
@@ -686,7 +786,11 @@ impl GroupInfo {
 
         let original = self.clone();
         self.withdrawn = true;
-        match self.seal_commit(keypair, now_ms) {
+        // Terminal withdrawal seals via the inner path: a withdrawn
+        // tombstone grants no access, so OwnerCertified re-verification is
+        // moot and must not be able to block tearing a group down
+        // (ADR-0038 enforcement targets LIVE admission, not exits).
+        match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
                 self.shared_secret = None;
                 Ok(commit)

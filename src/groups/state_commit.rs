@@ -546,6 +546,12 @@ pub enum ApplyError {
     /// The event's `group_id` does not match the target group.
     #[error("group_id mismatch: got {got}, expected {expected}")]
     GroupIdMismatch { expected: String, got: String },
+
+    /// ADR-0038: the group's admission axis is `OwnerCertified`, so sealing
+    /// requires certificate evidence (`seal_commit_with_owner_certs`). A
+    /// blind seal is refused rather than committing an unverified roster.
+    #[error("owner-certified group {group_id} requires certificate evidence to seal (ADR-0038)")]
+    OwnerCertifiedEvidenceRequired { group_id: String },
 }
 
 // ─────────────────────────── Apply checks ───────────────────────────────

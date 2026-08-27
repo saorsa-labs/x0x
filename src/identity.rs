@@ -131,6 +131,40 @@ impl UserId {
     }
 }
 
+/// Serde adapter rendering a [`UserId`] as its 64-character hex encoding in
+/// self-describing formats (JSON/TOML), and as the hex string's own bytes in
+/// positional formats (bincode).
+///
+/// WHY hex instead of the derived `[u8; 32]` array-of-numbers shape: the
+/// ADR-0038 `GroupAdmission::OwnerCertified(UserId)` axis is persisted inside
+/// `GroupPolicy` JSON and printed by the CLI, where a 32-element numeric
+/// array is unreadable and awkward to pass back. There is no legacy wire
+/// shape to preserve — no stored policy has ever carried a `UserId` on this
+/// axis — so the representation is free to choose the repo-wide hex
+/// convention from day one.
+pub mod user_id_hex {
+    use super::UserId;
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    /// Serialize the 32-byte id as 64 lowercase hex characters.
+    pub fn serialize<S: Serializer>(id: &UserId, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(id.as_bytes()))
+    }
+
+    /// Deserialize from 64 hex characters (case-insensitive, like
+    /// `parse_agent_id_hex` on the server).
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<UserId, D::Error> {
+        let text = String::deserialize(d)?;
+        let bytes = hex::decode(text.trim()).map_err(|e| {
+            serde::de::Error::custom(format!("invalid user id hex ({e}): expected 64 hex chars"))
+        })?;
+        let arr: [u8; 32] = bytes.try_into().map_err(|v: Vec<u8>| {
+            serde::de::Error::custom(format!("user id must be 32 bytes, got {}", v.len()))
+        })?;
+        Ok(UserId(arr))
+    }
+}
+
 impl std::fmt::Display for UserId {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "UserId(0x{})", hex::encode(&self.0[..8]))
