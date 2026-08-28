@@ -94,7 +94,7 @@ pub struct AgentCard {
     /// e.g. "David Irvine". Populated from the daemon's stored self-profile
     /// (`human_name`); absent on cards from installs without one. A card
     /// carrying an owner_name is signed under the v2 domain
-    /// ([`AGENT_CARD_SIGNATURE_DOMAIN_V2`]) and records
+    /// (`AGENT_CARD_SIGNATURE_DOMAIN_V2`) and records
     /// [`AGENT_CARD_SIGNATURE_SCHEME_V2`] in `signature_scheme`; cards
     /// without one keep the exact v1 encoding, so pre-0036 verifiers only
     /// ever see byte-compatible v1 cards.

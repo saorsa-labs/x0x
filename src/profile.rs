@@ -2,13 +2,13 @@
 //!
 //! Two pieces of daemon-trusted naming state, deliberately kept apart:
 //!
-//! - [`OwnerProfile`] — WHO owns this install. Written by
+//! - [`crate::profile::OwnerProfile`] — WHO owns this install. Written by
 //!   `x0x user-id create` next to the user key (`owner.json` in the key's
 //!   directory, i.e. inside the instance data dir for named instances).
 //!   One owner per install: `create` refuses to record a second, different
 //!   `UserId` unless `--rotate-owner` is passed, and the daemon refuses to
 //!   adopt a user key that does not match the recorded owner.
-//! - [`SelfProfile`] — WHAT this install calls itself. The daemon-side
+//! - [`crate::profile::SelfProfile`] — WHAT this install calls itself. The daemon-side
 //!   `{ human_name, display_name, machine_name }` served by
 //!   `PUT/GET /profile` and persisted at `<data_dir>/profile.json`.
 //!   `display_name` feeds the V3 announce self-name so peers render it
