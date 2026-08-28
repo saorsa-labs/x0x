@@ -165,6 +165,7 @@ pub fn presence_record_to_discovered_agent(
         relay_candidates: Vec::new(),
         cert_not_after: None,
         agent_certificate: None,
+        cert_digest: None,
         agent_public_key: Vec::new(), // populated when identity heartbeat arrives
     })
 }
@@ -751,6 +752,7 @@ mod tests {
             cert_not_after: None,
             agent_certificate: None,
             agent_public_key: Vec::new(),
+            cert_digest: None,
         }
     }
 

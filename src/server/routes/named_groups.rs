@@ -817,6 +817,14 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
         /// future removal does not depend on the original inviter or target.
         #[serde(default)]
         member_recovery_history: Vec<NamedGroupMetadataEvent>,
+        /// ADR-0038 (review B1): bincode of the AgentCertificate the
+        /// member was admitted under (base64), carried so RECEIVERS of this
+        /// authority commit can enforce OwnerCertified admission against
+        /// committed evidence — the commit's roster root covers the cert
+        /// digest, and this field is what lets a receiver install it.
+        /// `None` for every legacy event.
+        #[serde(default)]
+        certificate_b64: Option<String>,
         #[serde(default)]
         commit: Option<x0x::groups::GroupStateCommit>,
     },
@@ -1266,7 +1274,7 @@ async fn publish_group_card_to_discovery_inner(
                 tracing::warn!(group_id, "refusing to reseal withdrawn group");
                 return None;
             }
-            match candidate.seal_commit(signing_kp, now_ms) {
+            match seal_commit_owner_certified(state, &mut candidate, signing_kp, now_ms).await {
                 Ok(c) => Some(c),
                 Err(e) => {
                     tracing::warn!(group_id, "seal_commit failed: {e}");
@@ -2482,6 +2490,34 @@ pub(in crate::server) fn validate_public_group_bootstrap(
     {
         return false;
     }
+    // ADR-0038 round-2: a bootstrapped OwnerCertified roster must carry a
+    // verifiable committed certificate for EVERY active member — pure
+    // checks (signature, owner chain, agent binding, expiry). Without
+    // this, the signed-public bootstrap path could install an uncertified
+    // roster wholesale. Revocation is enforced by the local revocation set
+    // at this node's own seals (not checkable in this pure fn).
+    if let Some(owner) = group.policy.admission.owner_certified_user_id() {
+        let now_unix = x0x::groups::owner_cert::restore_clock_now();
+        let all_certified = group
+            .members_v2
+            .values()
+            .filter(|m| m.is_active())
+            .all(|m| {
+                m.certificate.as_ref().is_some_and(|cert| {
+                    x0x::groups::owner_cert::verify_cert_against_owner(
+                        owner,
+                        &m.agent_id,
+                        cert,
+                        false,
+                        now_unix,
+                    )
+                    .is_ok()
+                })
+            });
+        if !all_certified {
+            return false;
+        }
+    }
     x0x::groups::enforce_last_admin_invariant(&group.members_v2, group.withdrawn).is_ok()
 }
 
@@ -2892,6 +2928,10 @@ fn treekem_membership_event_frontier(
             actor,
             agent_id,
             treekem_epoch,
+            // ADR-0038 round-2: cert-bearing OwnerCertified adds must ride
+            // the same frontier/queue/replay machinery — the shape is not a
+            // discriminator for direct-vs-invite adds.
+            certificate_b64: _,
             commit: Some(commit),
             ..
         }
@@ -2993,6 +3033,9 @@ fn authorized_treekem_membership_event_for_queue(
     match event {
         NamedGroupMetadataEvent::MemberAdded {
             actor,
+            // ADR-0038 round-2: accept cert-bearing adds (see the frontier
+            // pattern above).
+            certificate_b64: _,
             commit: Some(_),
             treekem_commit_b64: Some(_),
             treekem_epoch: Some(_),
@@ -6279,6 +6322,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
 
     match event {
         NamedGroupMetadataEvent::MemberAdded {
+            group_id: _,
             revision,
             actor,
             agent_id,
@@ -6290,9 +6334,71 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             treekem_key_package_hash,
             member_joined_recovery,
             member_recovery_history,
+            certificate_b64,
             commit,
-            ..
         } => {
+            // ADR-0038 review B1 (+round-2): receivers enforce OwnerCertified
+            // admission on inbound authority commits too. The event must
+            // carry the AgentCertificate the member was admitted under; it
+            // must verify against the group's owner AND the target must not
+            // be in the local ADR-0018 revocation set (positive knowledge of
+            // compromise is enforced at ingress, not deferred to our own
+            // seal). Without this gate a compromised admin could add an
+            // outsider with an old client and every receiver would accept
+            // the signed commit.
+            let owner_certified_certificate: Option<x0x::identity::AgentCertificate> = if let Some(
+                owner,
+            ) =
+                info.policy.admission.owner_certified_user_id()
+            {
+                use base64::Engine as _;
+                let Some(cert_b64) = certificate_b64.as_ref() else {
+                    tracing::info!(
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        "MemberAdded: rejecting OwnerCertified add without committed certificate"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                };
+                let bytes = BASE64.decode(cert_b64).unwrap_or_default();
+                let cert: x0x::identity::AgentCertificate = match bincode::deserialize(&bytes) {
+                    Ok(cert) => cert,
+                    Err(_) => {
+                        tracing::info!(
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            "MemberAdded: rejecting OwnerCertified add with undecodable certificate"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+                let target_revoked = {
+                    let revocation_set = state.agent.revocation_set();
+                    let revoked = revocation_set.read().await;
+                    parse_agent_id_hex(&agent_id)
+                        .map(|agent| revoked.is_agent_revoked(&agent))
+                        .unwrap_or(true)
+                };
+                if x0x::groups::owner_cert::verify_cert_against_owner(
+                    owner,
+                    &agent_id,
+                    &cert,
+                    target_revoked,
+                    x0x::groups::owner_cert::restore_clock_now(),
+                )
+                .is_err()
+                {
+                    tracing::info!(
+                        group_id = %resolved_group_key,
+                        member = %agent_id,
+                        "MemberAdded: rejecting OwnerCertified add whose certificate fails verification (or target is revoked)"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+                Some(cert)
+            } else {
+                None
+            };
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
@@ -6331,6 +6437,12 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     );
                     if let Some(package_hash) = treekem_key_package_hash.clone() {
                         next.set_member_treekem_key_package_hash(&agent_id, package_hash);
+                    }
+                    if let Some(cert) = owner_certified_certificate.clone() {
+                        // ADR-0038: install the committed evidence so the
+                        // apply-side roster-root check (which covers the
+                        // cert digest) validates.
+                        next.set_member_certificate(&agent_id, cert);
                     }
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(&agent_id, name);
@@ -6773,6 +6885,19 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             let Some(commit) = commit else {
                 return ApplyMetadataResult::REJECTED;
             };
+            // ADR-0038 review B2: receivers reject any policy transition
+            // that changes or removes an existing OwnerCertified owner
+            // axis, even inside an admin-signed commit — immutability is
+            // enforced at apply time, not just at the authoring API.
+            if let Some(current_owner) = info.policy.admission.owner_certified_user_id() {
+                if policy.admission.owner_certified_user_id() != Some(current_owner) {
+                    tracing::warn!(
+                        group_id = %resolved_group_key,
+                        "PolicyUpdated: rejecting change/removal of the OwnerCertified axis"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
             let current = info.clone();
             let Ok(next) = apply_stateful_event_to_group(
                 &current,
@@ -7097,6 +7222,8 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 kem_public_key_b64: Some(kem_b64),
                                 treekem_key_package_b64: treekem_key_package_b64.clone(),
                                 treekem_key_package_hash: None,
+                                certificate: None,
+                                certificate_missing_since_ms: None,
                             });
                     }
                     if let Some(kp_b64) = treekem_key_package_b64.clone() {
@@ -7855,6 +7982,29 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
 
+            // 7b. ADR-0038 OwnerCertified admission. Deliberately AFTER the
+            //     inviter-role authorization above and BEFORE the invite is
+            //     consumed: admin role is INERT for admission here — an
+            //     admin-issued invite to an uncertified agent is rejected
+            //     exactly like anyone else's. Fail closed on missing
+            //     evidence (the joiner's announce blob may not have
+            //     propagated yet; it retries on the next volley). The
+            //     verified certificate is bound INTO the roster entry below
+            //     so the MemberAdded commit covers it (constraint 2).
+            let owner_certified_admission =
+                match owner_certified_admission_check(state, &info, &member_agent_id).await {
+                    Ok(cert) => cert,
+                    Err(failure) => {
+                        tracing::info!(
+                            group_id = %resolved_group_key,
+                            member = %member_agent_id,
+                            reason = %failure,
+                            "MemberJoined: rejecting uncertified joiner (ADR-0038 OwnerCertified)"
+                        );
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                };
+
             // 8. Build the authoritative committed add on a clone first. If
             //    validation/signing fails, the live group remains unchanged.
             let signing_kp = state.agent.identity().agent_keypair();
@@ -7926,6 +8076,13 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 next.set_member_treekem_key_package(&member_agent_id, kp_b64);
             }
             let revision = next.roster_revision;
+
+            if let Some(cert) = owner_certified_admission.clone() {
+                // Constraint 2: the certificate the joiner was admitted
+                // under becomes COMMITTED evidence — sealed into the roster
+                // entry the MemberAdded commit's roster root covers.
+                next.set_member_certificate(&member_agent_id, cert);
+            }
             let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
                     Ok(id) => id,
@@ -7948,17 +8105,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 };
                 next.security_binding = Some(binding);
                 next.secret_epoch = expected_epoch;
-                let commit = match next.seal_commit(signing_kp, now_ms) {
-                    Ok(commit) => commit,
-                    Err(e) => {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(&resolved_group_key),
-                            member = %LogHexId::agent(&member_agent_id),
-                            "MemberJoined: failed to seal authoritative add: {e}"
-                        );
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                };
+                let commit =
+                    match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
+                        Ok(commit) => commit,
+                        Err(e) => {
+                            tracing::warn!(
+                                group_id = %LogHexId::group(&resolved_group_key),
+                                member = %LogHexId::agent(&member_agent_id),
+                                "MemberJoined: failed to seal authoritative add: {e}"
+                            );
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    };
                 let rollback_snapshot = match guard.to_snapshot_bytes() {
                     Ok(snapshot) => snapshot,
                     Err(e) => {
@@ -8008,7 +8166,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 treekem_welcome = Some(out.welcome);
                 commit
             } else {
-                match next.seal_commit(signing_kp, now_ms) {
+                match seal_commit_owner_certified(state, &mut next, signing_kp, now_ms).await {
                     Ok(commit) => commit,
                     Err(e) => {
                         tracing::warn!(
@@ -8105,6 +8263,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     .and_then(|member| member.treekem_key_package_hash.clone()),
                 member_joined_recovery: None,
                 member_recovery_history: Vec::new(),
+                certificate_b64: owner_certified_admission.as_ref().map(|cert| {
+                    use base64::Engine as _;
+                    BASE64.encode(bincode::serialize(cert).unwrap_or_default())
+                }),
                 commit: Some(commit),
             };
             stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
@@ -8378,8 +8540,13 @@ pub(in crate::server) async fn create_named_group(
                     );
                 };
                 info.security_binding = Some(binding);
-                let creator_commit = match info
-                    .seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())
+                let creator_commit = match seal_commit_owner_certified(
+                    &state,
+                    &mut info,
+                    state.agent.identity().agent_keypair(),
+                    now_millis_u64(),
+                )
+                .await
                 {
                     Ok(commit) => commit,
                     Err(e) => {
@@ -10250,6 +10417,30 @@ pub(in crate::server) async fn join_group_via_invite(
     }
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
 
+    // ADR-0038 fail-fast: an invite into an OwnerCertified group is
+    // unusable without a certificate chaining to the admission owner. The
+    // authority re-checks at invite-accept (and every seal) — this local
+    // check exists so an uncertified joiner learns WHY immediately instead
+    // of creating a stub and waiting for a rejection that never arrives as
+    // a REST response. `invite.policy` is the authority's own snapshot, so
+    // the owner id it names is authoritative.
+    if let Some(owner) = invite
+        .policy
+        .as_ref()
+        .and_then(|p| p.admission.owner_certified_user_id())
+        .copied()
+    {
+        let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let evidence = owner_cert_evidence_for(&state, &[&joiner_hex]).await;
+        if let Err(failure) =
+            x0x::groups::owner_cert::verify_owner_certified_member(&owner, &joiner_hex, &evidence)
+        {
+            return forbidden(format!(
+                "invite requires an agent certificate chaining to the group owner ({failure})"
+            ));
+        }
+    }
+
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
@@ -10676,6 +10867,20 @@ pub(in crate::server) async fn add_named_group_member(
         if info.has_member(&agent_hex) {
             return api_error(StatusCode::CONFLICT, "member already present");
         }
+
+        // ADR-0038 admin-inert: in an OwnerCertified group even an admin
+        // cannot add an uncertified agent — admission is cryptographic, so
+        // this runs after the role gate and decides alone. The verified
+        // certificate is bound into the roster entry (constraint 2).
+        let owner_certified_admission =
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+                Ok(cert) => cert,
+                Err(failure) => {
+                    return forbidden(format!(
+                        "group admission requires an owner-certified agent ({failure})"
+                    ));
+                }
+            };
         let mut next = info.clone();
         next.roster_revision = next.roster_revision.saturating_add(1);
         next.add_member(
@@ -10687,8 +10892,12 @@ pub(in crate::server) async fn add_named_group_member(
         if let Some(display_name) = req.display_name.clone() {
             next.set_display_name(&agent_hex, display_name);
         }
+        if let Some(cert) = owner_certified_admission.clone() {
+            next.set_member_certificate(&agent_hex, cert);
+        }
         let revision = next.roster_revision;
-        let commit = match next.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -10755,6 +10964,10 @@ pub(in crate::server) async fn add_named_group_member(
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: owner_certified_admission.as_ref().map(|cert| {
+                use base64::Engine as _;
+                BASE64.encode(bincode::serialize(cert).unwrap_or_default())
+            }),
             commit: Some(commit),
         };
         (metadata_topic, event, members, epoch, bootstrap_group)
@@ -10813,7 +11026,7 @@ async fn add_treekem_named_group_member(
         }
     };
 
-    let (mut next, metadata_topic, event_group_id) = {
+    let (mut next, metadata_topic, event_group_id, owner_certified_admission) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -10833,10 +11046,25 @@ async fn add_treekem_named_group_member(
                 Json(serde_json::json!({ "ok": false, "error": "member already present" })),
             );
         }
+
+        // ADR-0038 admin-inert (TreeKEM sibling of the GSS check): an
+        // OwnerCertified group rejects uncertified direct adds regardless
+        // of the admin role that authorized them. Verified certificate is
+        // returned for roster binding below (constraint 2).
+        let owner_certified_admission =
+            match owner_certified_admission_check(state.as_ref(), info, &agent_hex).await {
+                Ok(cert) => cert,
+                Err(failure) => {
+                    return forbidden(format!(
+                        "group admission requires an owner-certified agent ({failure})"
+                    ));
+                }
+            };
         (
             info.clone(),
             info.metadata_topic.clone(),
             info.stable_group_id().to_string(),
+            owner_certified_admission,
         )
     };
 
@@ -10883,6 +11111,9 @@ async fn add_treekem_named_group_member(
         signature_b64: String::new(),
     };
     next.set_member_treekem_key_package(&agent_hex, kp_b64.clone());
+    if let Some(cert) = owner_certified_admission.clone() {
+        next.set_member_certificate(&agent_hex, cert);
+    }
     next.secret_epoch = treekem_epoch;
     let Some(binding) = treekem_recovery_security_binding(treekem_epoch, &direct_recovery_original)
     else {
@@ -10892,7 +11123,7 @@ async fn add_treekem_named_group_member(
         );
     };
     next.security_binding = Some(binding);
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -10965,6 +11196,12 @@ async fn add_treekem_named_group_member(
             .and_then(|member| member.treekem_key_package_hash.clone()),
         member_joined_recovery: None,
         member_recovery_history: Vec::new(),
+        // ADR-0038 round-2: receivers of OwnerCertified groups require the
+        // committed certificate on the event — publish it (base64 bincode).
+        certificate_b64: owner_certified_admission.as_ref().map(|cert| {
+            use base64::Engine as _;
+            BASE64.encode(bincode::serialize(cert).unwrap_or_default())
+        }),
         commit: Some(commit),
     };
     cache_treekem_member_key_package(
@@ -11156,7 +11393,8 @@ pub(in crate::server) async fn remove_named_group_member(
                 }
             }
         }
-        let commit = match next.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -11197,7 +11435,7 @@ pub(in crate::server) async fn remove_named_group_member(
         let event = NamedGroupMetadataEvent::MemberRemoved {
             group_id: event_group_id,
             revision,
-            actor: local_agent_hex,
+            actor: local_agent_hex.clone(),
             agent_id: agent_id_hex.clone(),
             treekem_commit_b64: None,
             treekem_epoch: None,
@@ -11248,10 +11486,9 @@ pub(in crate::server) async fn remove_named_group_member(
         &delivery_roster,
         &event,
         std::slice::from_ref(&agent_id_hex),
-    );
-    // F1 §5a step 5: publish the buffered survivor envelopes only after the
-    // removal is live and persisted. Each is broadcast on the metadata topic
-    // plus direct + delayed delivery, mirroring publish_secure_share's shape.
+    ); // F1 §5a step 5: publish the buffered survivor envelopes only after the
+       // removal is live and persisted. Each is broadcast on the metadata topic
+       // plus direct + delayed delivery, mirroring publish_secure_share's shape.
     for (recipient_hex, ev) in &buffered_survivor_envelopes {
         publish_named_group_metadata_event(&state, &metadata_topic, ev).await;
         spawn_named_group_event_delivery(&state, recipient_hex, ev);
@@ -11916,7 +12153,7 @@ async fn leave_treekem_group(
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
     next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -12060,7 +12297,7 @@ async fn remove_treekem_named_group_member(
     next.remove_member(&agent_id_hex, Some(local_agent_hex.clone()));
     next.secret_epoch = treekem_epoch;
     next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -12313,11 +12550,440 @@ pub(in crate::server) async fn get_group_state_commits(
     )
 }
 
+/// ADR-0038 `POST /groups/:id/state/seal` OwnerCertified arm: re-verify the
+/// roster, evict failing members, and — for GSS (`MlsEncrypted`) groups —
+/// rekey with the same fail-closed preflight the admin-remove handler uses
+/// (rotate the secret, build EVERY survivor envelope in memory, abort
+/// unchanged on any gap). Returns `None` for non-OwnerCertified groups so
+/// the caller keeps its existing path.
+///
+/// TreeKEM groups: the roster prune + commit still run here, but ratchet
+/// rekey stays with the TreeKEM remove/ban handlers
+/// (`remove_member_verified`) — there is no GSS secret to rotate and the
+/// MLS-layer eviction is delivered by those paths when the certificate
+/// failure is observed there.
+async fn owner_certified_seal_with_eviction(
+    state: &Arc<AppState>,
+    id: &str,
+    local_hex: &str,
+) -> Option<
+    Result<(x0x::groups::GroupStateCommit, Vec<String>), (StatusCode, Json<serde_json::Value>)>,
+> {
+    use base64::Engine as _;
+
+    let membership_lock = group_membership_lock(state, id).await;
+    let _membership_guard = membership_lock.lock().await;
+    let signing_kp = state.agent.identity().agent_keypair();
+    let mut evicted_total: Vec<String> = Vec::new();
+    let mut last_commit: Option<x0x::groups::GroupStateCommit> = None;
+
+    // Round-5: ONE verdict for the WHOLE operation — evaluated here, at
+    // start, under the write guard (the producer stamps grace timestamps).
+    // The loop below evicts exactly this verdict's Failed set and never
+    // re-evaluates: an InGrace member whose grace expires mid-operation
+    // (e.g. while an earlier rekey transition runs) is NOT evicted this
+    // operation — it becomes Failed for the NEXT one.
+    let is_owner_certified = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(id)
+            .is_some_and(|info| info.policy.admission.owner_certified_user_id().is_some())
+    };
+    if !is_owner_certified {
+        // Not an OwnerCertified group — the caller keeps its plain
+        // reseal path.
+        return None;
+    }
+    let verdict = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(id) else {
+            return Some(Err(not_found("group not found")));
+        };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return Some(Err(resp));
+        }
+        let evidence = owner_cert_seal_evidence(state, info).await;
+        info.owner_cert_verdict(&evidence)
+    };
+    // The members that remain seated once the Failed set is gone: Clean ∪
+    // InGrace, per the operation's single verdict.
+    let in_grace_initially = !verdict.in_grace().is_empty();
+    // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
+    // member per sealed transition. The verdict is frozen for this
+    // operation — no re-evaluation, so mid-operation grace expiry cannot
+    // grow the set.
+    let mut failed_queue = verdict.failed();
+
+    loop {
+        if failed_queue.is_empty() {
+            if let Some(commit) = last_commit {
+                // Round-2: after evictions, DO NOT mint an extra clean
+                // no-op commit — it is published by no event channel, so
+                // peers would stall one commit behind and reject the next
+                // mutation's chain link; the last eviction commit is the
+                // response.
+                //
+                // Round-5 quarantine rule (documented): the operation ends
+                // with every remaining member Clean IN THE OPERATION'S
+                // VERDICT iff no member was InGrace initially — the Failed
+                // set is fully evicted and the rest were Clean at
+                // evaluation. Exactly then the restore quarantine lifts,
+                // here, explicitly (no clean seal is minted to do it).
+                // Otherwise it stays set until a later all-clean seal.
+                if !in_grace_initially {
+                    let mut groups = state.named_groups.write().await;
+                    if let Some(info) = groups.get_mut(id) {
+                        info.owner_cert_reverify_required = false;
+                    }
+                    drop(groups);
+                    persist_named_groups_mutation(state, |groups| {
+                        if let Some(info) = groups.get_mut(id) {
+                            info.owner_cert_reverify_required = false;
+                        }
+                        true
+                    })
+                    .await
+                    .ok();
+                    return Some(Ok((commit, evicted_total.clone())));
+                }
+                // InGrace members remain (they were NOT evicted — not in
+                // this operation's Failed set): typed, retryable refusal;
+                // the evicted transitions are already committed/published.
+                return Some(Err(api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "owner-certified group has members pending certificate resolution: {:?}; \
+                         evictions committed, retry the seal once evidence converges",
+                        verdict.in_grace()
+                    ),
+                )));
+            }
+            if !verdict.is_all_clean() {
+                // No Failed members but some are InGrace — no clean seal
+                // may mint on a non-clean verdict, and the restore
+                // quarantine must stay set. Typed, retryable.
+                return Some(Err(api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "owner-certified group has members pending certificate resolution: {:?}; \
+                         retry the seal once evidence converges",
+                        verdict.in_grace()
+                    ),
+                )));
+            }
+            // All-clean roster from the start: one evidence-bearing seal
+            // consuming the SAME verdict instance (single evaluation; the
+            // seal re-derives nothing) — this legitimately lifts the
+            // quarantine.
+            let commit = {
+                let groups = state.named_groups.read().await;
+                let Some(info) = groups.get(id) else {
+                    return Some(Err(not_found("group not found")));
+                };
+                let mut next = info.clone();
+                let commit =
+                    match next.seal_commit_with_owner_certs(signing_kp, now_millis_u64(), &verdict)
+                    {
+                        Ok((commit, _)) => commit,
+                        Err(e) => {
+                            return Some(Err(api_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                format!("seal failed: {e}"),
+                            )))
+                        }
+                    };
+                drop(groups);
+                if !matches!(
+                    persist_named_group_info(state, id, next).await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    return Some(Err(api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    )));
+                }
+                commit
+            };
+            return Some(Ok((commit, evicted_total)));
+        }
+
+        // Review B3/B4: evictions happen ONE MEMBER PER SEALED TRANSITION so
+        // every event reconstructs the committed roster exactly, the GSS
+        // secret rotates (or the TreeKEM leaf is cryptographically removed)
+        // in the same commit, and receivers can validate each step.
+        let (evict_hex, failure) = failed_queue.remove(0);
+        tracing::warn!(
+            group_id = %id,
+            member = %evict_hex,
+            reason = %failure,
+            "ADR-0038: explicit seal evicting member failing OwnerCertified re-verification"
+        );
+        let is_treekem = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(id)
+                .is_some_and(|info| info.secure_plane == x0x::mls::SecureGroupPlane::TreeKem)
+        };
+
+        if is_treekem {
+            // Cryptographic eviction (review B4): resolve the target's
+            // KeyPackage, remove the roster leaf AND the ratchet leaf in one
+            // committed transition; receivers get treekem_commit + epoch.
+            let target_agent = match parse_agent_id_hex(&evict_hex) {
+                Ok(id) => id,
+                Err(_) => {
+                    return Some(Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "eviction target is not a parsable agent id",
+                    )))
+                }
+            };
+            let target_kp_b64 =
+                match resolve_member_treekem_kp_for_removal_locked(state, id, &evict_hex).await {
+                    Ok(kp_b64) => kp_b64,
+                    Err(resp) => return Some(Err(resp)),
+                };
+            let target_kp_bytes =
+                match base64::engine::general_purpose::STANDARD.decode(&target_kp_b64) {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return Some(Err(api_error(
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                        "cannot evict {evict_hex}: member TreeKEM KeyPackage is not valid base64"
+                    ),
+                        )))
+                    }
+                };
+            let group = {
+                let map = state.treekem_groups.read().await;
+                map.get(id).cloned()
+            };
+            let Some(group) = group else {
+                return Some(Err(api_error(
+                    StatusCode::FAILED_DEPENDENCY,
+                    "TreeKEM group not loaded — restart or re-share required",
+                )));
+            };
+            let mut guard = group.lock().await;
+            let treekem_epoch = guard.epoch().saturating_add(1);
+            let now_ms = now_millis_u64();
+            let (commit, event, metadata_topic, delivery_roster) = {
+                let groups = state.named_groups.read().await;
+                let Some(info) = groups.get(id) else {
+                    return Some(Err(not_found("group not found")));
+                };
+                let mut next = info.clone();
+                next.set_member_treekem_key_package(&evict_hex, target_kp_b64.clone());
+                next.roster_revision = next.roster_revision.saturating_add(1);
+                let revision = next.roster_revision;
+                next.remove_member(&evict_hex, Some(local_hex.to_string()));
+                next.secret_epoch = treekem_epoch;
+                next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
+                // No-prune seal: the remaining failing members (if any) get
+                // their OWN transitions on the next loop iteration.
+                let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
+                    Ok(commit) => commit,
+                    Err(e) => {
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("seal failed: {e}"),
+                        )))
+                    }
+                };
+                let treekem_commit =
+                    match guard.remove_member_verified(target_agent, &target_kp_bytes) {
+                        Ok(commit) => commit,
+                        Err(e) => {
+                            return Some(Err(api_error(
+                                StatusCode::CONFLICT,
+                                format!("TreeKEM remove_member failed: {e}"),
+                            )))
+                        }
+                    };
+                if guard.epoch() != treekem_epoch {
+                    return Some(Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "TreeKEM epoch did not advance as expected",
+                    )));
+                }
+                let event = NamedGroupMetadataEvent::MemberRemoved {
+                    group_id: next.stable_group_id().to_string(),
+                    revision,
+                    actor: local_hex.to_string(),
+                    agent_id: evict_hex.clone(),
+                    treekem_commit_b64: Some(BASE64.encode(&treekem_commit)),
+                    treekem_epoch: Some(treekem_epoch),
+                    secret_epoch: None,
+                    commit: Some(commit.clone()),
+                };
+                let metadata_topic = next.metadata_topic.clone();
+                let delivery_roster = next.clone();
+                drop(groups);
+                if let Err(e) =
+                    persist_treekem_and_named_groups_atomic_with_info(state, id, next, &guard).await
+                {
+                    tracing::error!(group_id = %id, "failed to persist TreeKEM snapshot after eviction: {e}");
+                    return Some(Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "failed to persist secure group state",
+                    )));
+                }
+                (commit, event, metadata_topic, delivery_roster)
+            };
+            drop(guard);
+            if !drop_initial_volley(&event) {
+                publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+                spawn_named_group_event_delivery_to_active_members(
+                    state,
+                    &delivery_roster,
+                    &event,
+                    std::slice::from_ref(&evict_hex),
+                );
+            }
+            evicted_total.push(evict_hex.clone());
+            last_commit = Some(commit);
+            continue;
+        }
+
+        // GSS eviction: rotate the secret + preflight every survivor
+        // envelope BEFORE sealing (F1 §2/§5a — an unbuilt envelope aborts
+        // the rotation, never strands survivors), then seal, persist, and
+        // publish the single-member MemberRemoved + envelopes.
+        let now_ms = now_millis_u64();
+        let (commit, event, metadata_topic, delivery_roster, buffered_envelopes) = {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(id) else {
+                return Some(Err(not_found("group not found")));
+            };
+            let mut next = info.clone();
+            next.roster_revision = next.roster_revision.saturating_add(1);
+            let revision = next.roster_revision;
+            next.remove_member(&evict_hex, Some(local_hex.to_string()));
+            let is_encrypted =
+                next.policy.confidentiality == x0x::groups::GroupConfidentiality::MlsEncrypted;
+            let mut new_secret_epoch: Option<u64> = None;
+            let mut buffered_envelopes: Vec<(String, NamedGroupMetadataEvent)> = Vec::new();
+            if is_encrypted {
+                let (sec_vec, ep) = next.rotate_shared_secret();
+                let sec: [u8; 32] = match sec_vec.try_into() {
+                    Ok(s) => s,
+                    Err(v) => {
+                        return Some(Err(api_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            format!("rotated secret has wrong length ({} bytes)", v.len()),
+                        )))
+                    }
+                };
+                new_secret_epoch = Some(ep);
+                let event_group_id = next.stable_group_id().to_string();
+                let survivors: Vec<(String, Option<String>)> = next
+                    .active_members()
+                    .map(|m| (m.agent_id.clone(), m.kem_public_key_b64.clone()))
+                    .filter(|(recipient, _)| recipient != local_hex)
+                    .collect();
+                for (recipient_hex, kem_b64) in &survivors {
+                    let Some(kem) = kem_b64 else {
+                        return Some(Err(api_error(
+                            StatusCode::FAILED_DEPENDENCY,
+                            format!(
+                                "cannot rotate group secret: survivor {recipient_hex} has no roster KEM key"
+                            ),
+                        )));
+                    };
+                    match build_secure_share_event(
+                        &event_group_id,
+                        recipient_hex,
+                        kem,
+                        local_hex,
+                        &sec,
+                        ep,
+                    ) {
+                        Ok(ev) => buffered_envelopes.push((recipient_hex.clone(), ev)),
+                        Err(_) => {
+                            return Some(Err(api_error(
+                                StatusCode::FAILED_DEPENDENCY,
+                                format!(
+                                    "cannot rotate group secret: survivor {recipient_hex} envelope build failed"
+                                ),
+                            )))
+                        }
+                    }
+                }
+            }
+            // No-prune seal: remaining failing members get their own
+            // transitions on the next loop iteration.
+            let commit = match next.seal_commit_evicting(signing_kp, now_ms) {
+                Ok(commit) => commit,
+                Err(e) => {
+                    return Some(Err(api_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        format!("seal failed: {e}"),
+                    )))
+                }
+            };
+            let event = NamedGroupMetadataEvent::MemberRemoved {
+                group_id: next.stable_group_id().to_string(),
+                revision,
+                actor: local_hex.to_string(),
+                agent_id: evict_hex.clone(),
+                treekem_commit_b64: None,
+                treekem_epoch: None,
+                secret_epoch: new_secret_epoch,
+                commit: Some(commit.clone()),
+            };
+            let metadata_topic = next.metadata_topic.clone();
+            let delivery_roster = next.clone();
+            drop(groups);
+            if !matches!(
+                persist_named_group_info(state, id, next).await,
+                Ok(AtomicWriteOutcome::Durable)
+            ) {
+                return Some(Err(api_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "named-group state is not directory-durable",
+                )));
+            }
+            (
+                commit,
+                event,
+                metadata_topic,
+                delivery_roster,
+                buffered_envelopes,
+            )
+        };
+        if !drop_initial_volley(&event) {
+            publish_named_group_metadata_event(state, &metadata_topic, &event).await;
+            spawn_named_group_event_delivery_to_active_members(
+                state,
+                &delivery_roster,
+                &event,
+                std::slice::from_ref(&evict_hex),
+            );
+        }
+        for (recipient_hex, ev) in &buffered_envelopes {
+            publish_named_group_metadata_event(state, &metadata_topic, ev).await;
+            spawn_named_group_event_delivery(state, recipient_hex, ev);
+            spawn_named_group_event_delivery_after(
+                state,
+                recipient_hex,
+                ev,
+                GROUP_BACKGROUND_PUBLISH_DELAY,
+            );
+        }
+        evicted_total.push(evict_hex.clone());
+        last_commit = Some(commit);
+    }
+}
+
 /// POST /groups/:id/state/seal — Phase D.3: advance the state-commit
 /// chain and republish the signed public card (no-op payload change —
 /// used to refresh / repair / force-propagate the chain).
 ///
 /// Admin or higher only.
+///
+/// ADR-0038: for OwnerCertified groups this endpoint is the full
+/// re-verification point — see `owner_certified_seal_with_eviction`.
 pub(in crate::server) async fn seal_group_state(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -12338,6 +13004,23 @@ pub(in crate::server) async fn seal_group_state(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp;
         }
+    }
+    // ADR-0038: for an OwnerCertified group the explicit seal is the
+    // re-verification point — evict failing members WITH the full rekey
+    // (GSS rotation + survivor envelopes), then return that commit. Other
+    // admission axes keep the plain reseal path.
+    if let Some(result) = owner_certified_seal_with_eviction(&state, &id, &local_hex).await {
+        return match result {
+            Ok((commit, evicted)) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "commit": commit,
+                    "evicted": evicted,
+                })),
+            ),
+            Err(resp) => resp,
+        };
     }
     let commit = publish_group_card_with_reseal(&state, &id).await;
     let Some(commit) = commit else {
@@ -12586,7 +13269,7 @@ pub(in crate::server) async fn leave_group(
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
     next.remove_member(&local_agent_hex, Some(local_agent_hex.clone()));
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -12692,6 +13375,172 @@ pub(in crate::server) fn now_millis_u64() -> u64 {
         .as_millis() as u64
 }
 
+/// ADR-0038: build the certificate-evidence snapshot for an OwnerCertified
+/// admission decision over `agents` (hex ids).
+///
+/// Certificate RESOLUTION is the V3 announce blob-fetch path (PR #419): the
+/// identity-discovery cache holds `(user_id, AgentCertificate)` pairs that
+/// arrived via verified announces (blob fetches are digest-committed and
+/// verify-before-cache, so a cached cert is one this daemon has already
+/// authenticated). The local daemon's own certificate is included directly
+/// — it is held, not fetched. Revocation comes from the shared ADR-0018
+/// grow-only set. Agents whose hex does not parse produce no entry and so
+/// fail closed downstream (`NoCertificate`/not-revoked evidence still fails
+/// the chain check).
+async fn owner_cert_evidence_for(
+    state: &AppState,
+    agents: &[&str],
+) -> x0x::groups::owner_cert::OwnerCertEvidence {
+    let now_unix = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let mut evidence = x0x::groups::owner_cert::OwnerCertEvidence::new(now_unix);
+
+    // Keyed lookups (review finding 7): normalize the wanted set once so
+    // every source below is O(wanted) with hash membership, never a linear
+    // scan per cache entry — a Sybil-inflated discovery cache must not tax
+    // every seal.
+    let wanted: std::collections::HashSet<String> =
+        agents.iter().map(|a| a.to_ascii_lowercase()).collect();
+
+    // Revocation set first: grow-only, cheap, and authoritative even when
+    // the agent never announced a certificate.
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        for agent_hex in &wanted {
+            if let Ok(agent_id) = parse_agent_id_hex(agent_hex) {
+                if revoked.is_agent_revoked(&agent_id) {
+                    evidence.mark_revoked(agent_hex.clone());
+                }
+            }
+        }
+    }
+
+    // Own identity: the local agent's cert is authoritative here.
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if wanted.contains(&local_hex) {
+        if let Some(cert) = state.agent.identity().agent_certificate() {
+            evidence.insert_cert(local_hex, cert.clone());
+        }
+    }
+
+    // Discovery cache: peers' verified announce-blob certificates, coupled
+    // to the digest each agent's LATEST announce committed to (round-3).
+    // One keyed pass. An entry whose cert is absent but whose digest is
+    // known records a PENDING warranted fetch — the grace-aware ladder
+    // reads that as evidence-in-flight rather than "never certified".
+    {
+        let cache = state.agent.identity_discovery_cache();
+        let cache = cache.read().await;
+        for entry in cache.values() {
+            let entry_hex = hex::encode(entry.agent_id.as_bytes());
+            if !wanted.contains(&entry_hex) {
+                continue;
+            }
+            match entry.agent_certificate.as_ref() {
+                Some(cert) => {
+                    evidence.insert_cert(entry_hex.clone(), cert.clone());
+                    // Keep the EXACT announced digest when the entry knows
+                    // it (it equals the cert's digest after a resolved
+                    // fetch; upsert maintains that coupling).
+                    if let Some(digest) = entry.cert_digest {
+                        evidence.observe_pending_digest(entry_hex, digest);
+                    }
+                }
+                None => {
+                    if let Some(digest) = entry.cert_digest {
+                        evidence.observe_pending_digest(entry_hex, digest);
+                    }
+                }
+            }
+        }
+    }
+    evidence
+}
+
+/// ADR-0038 seal-time evidence: snapshot certificates for every ACTIVE
+/// roster member (plus the local agent) so `seal_commit_with_owner_certs`
+/// can re-verify the whole roster. Cheap no-op snapshot for groups on any
+/// other admission axis — the seal never consults it.
+async fn owner_cert_seal_evidence(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+) -> x0x::groups::owner_cert::OwnerCertEvidence {
+    if info.policy.admission.owner_certified_user_id().is_none() {
+        return x0x::groups::owner_cert::OwnerCertEvidence::new(0);
+    }
+    let mut agents: Vec<String> = info.active_members().map(|m| m.agent_id.clone()).collect();
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !agents.iter().any(|a| a.eq_ignore_ascii_case(&local_hex)) {
+        agents.push(local_hex);
+    }
+    let refs: Vec<&str> = agents.iter().map(String::as_str).collect();
+    owner_cert_evidence_for(state, &refs).await
+}
+
+/// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
+/// path NEVER evicts. If any active member currently fails OwnerCertified
+/// re-verification it refuses with a typed error directing the caller to
+/// the explicit eviction+rekey path (review B3: a silent prune here would
+/// publish a roster receivers cannot reconstruct from the site's own
+/// event, and would leave the GSS secret / TreeKEM leaves unrotated so the
+/// evicted member keeps decrypting). For every other admission axis — or a
+/// fully certified roster — this is exactly `seal_commit`.
+async fn seal_commit_owner_certified(
+    state: &AppState,
+    info: &mut x0x::groups::GroupInfo,
+    signing_kp: &crate::identity::AgentKeypair,
+    now_ms: u64,
+) -> Result<x0x::groups::GroupStateCommit, x0x::groups::state_commit::ApplyError> {
+    // Round-4: ONE verdict for the whole operation; the seal consumes the
+    // SAME instance — no second evaluation, no fresh clock read. Ordinary
+    // seals require an ALL-CLEAN roster: Failed members direct to the
+    // explicit eviction+rekey path; InGrace members are pending evidence
+    // (fetch lag / mid-rotation) and get the retryable typed refusal.
+    // Never prune here.
+    let evidence = owner_cert_seal_evidence(state, info).await;
+    let verdict = info.owner_cert_verdict(&evidence);
+    if !verdict.is_all_clean() {
+        let group_id = info.stable_group_id().to_string();
+        let failed = verdict.failed();
+        if !failed.is_empty() {
+            return Err(
+                x0x::groups::state_commit::ApplyError::OwnerCertifiedEvictionRequired {
+                    group_id,
+                    members: failed.iter().map(|(hex, _)| hex.clone()).collect(),
+                },
+            );
+        }
+        return Err(
+            x0x::groups::state_commit::ApplyError::OwnerCertMemberPending {
+                group_id,
+                members: verdict.in_grace(),
+            },
+        );
+    }
+    info.seal_commit_with_owner_certs(signing_kp, now_ms, &verdict)
+        .map(|(commit, _evicted)| commit)
+}
+
+/// ADR-0038 admission gate for one prospective member. `Ok(())` admits;
+/// `Err(failure)` rejects (invite-accept or direct admin add — admin role
+/// is INERT for admission in an OwnerCertified group, so this runs after,
+/// and independently of, any inviter/role authorization check).
+async fn owner_certified_admission_check(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    member_hex: &str,
+) -> Result<Option<x0x::identity::AgentCertificate>, x0x::groups::owner_cert::OwnerCertFailure> {
+    let Some(owner) = info.policy.admission.owner_certified_user_id().copied() else {
+        return Ok(None);
+    };
+    let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
+    x0x::groups::owner_cert::verify_owner_certified_member(&owner, member_hex, &evidence)
+        .map(|()| evidence.cert_for(member_hex).cloned())
+}
+
 /// Require the caller to be an active Admin or higher.
 fn require_admin_or_above(
     info: &x0x::groups::GroupInfo,
@@ -12710,6 +13559,22 @@ fn reject_withdrawn_group(
         .then(|| api_error(StatusCode::CONFLICT, "group is withdrawn"))
 }
 
+/// ADR-0038 review finding 6: an OwnerCertified group restored from disk is
+/// quarantined (`owner_cert_reverify_required`) until an evidence-bearing
+/// seal re-verifies the roster. Secure crypto operations refuse with a
+/// typed, retryable error meanwhile — restored GSS/TreeKEM key material
+/// must not serve a stale membership.
+fn reject_unverified_owner_certified_restore(
+    info: &x0x::groups::GroupInfo,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    info.owner_cert_reverify_required.then(|| {
+        api_error(
+            StatusCode::CONFLICT,
+            "owner-certified group requires state re-verification after restore: \
+             POST /groups/:id/state/seal",
+        )
+    })
+}
 #[cfg(test)]
 static POST_CRYPTO_FORCED_WITHDRAWN_GROUPS: std::sync::LazyLock<StdMutex<HashSet<String>>> =
     std::sync::LazyLock::new(|| StdMutex::new(HashSet::new()));
@@ -12947,7 +13812,7 @@ pub(in crate::server) async fn update_named_group(
     next.updated_at = now_ms;
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -13042,6 +13907,25 @@ pub(in crate::server) async fn update_group_policy(
         new_policy.write_access = w;
     }
 
+    // ADR-0038 review B2: the OwnerCertified axis is IMMUTABLE once set —
+    // an admin (even a compromised one) must not be able to swap the group
+    // to a weaker admission variant or a different owner, which would
+    // defeat "admin role is inert" and "only my human forever". Opting IN
+    // (no current owner axis → OwnerCertified) remains possible; changing
+    // or removing an existing owner axis is a typed 403. v1: rotate via
+    // group recreation.
+    if let (Some(current_owner), new_axis) = (
+        info.policy.admission.owner_certified_user_id(),
+        new_policy.admission.owner_certified_user_id(),
+    ) {
+        if new_axis != Some(current_owner) {
+            return forbidden(
+                "owner_certified admission is immutable: the owner axis cannot be changed or \
+                 removed; recreate the group instead",
+            );
+        }
+    }
+
     let mut next = info.clone();
     next.policy = new_policy.clone();
     next.policy_revision = next.policy_revision.saturating_add(1);
@@ -13058,7 +13942,7 @@ pub(in crate::server) async fn update_group_policy(
         ));
     }
 
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -13167,7 +14051,7 @@ pub(in crate::server) async fn update_member_role(
     next.set_member_role(&agent_id_hex, new_role);
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -13267,7 +14151,7 @@ pub(in crate::server) async fn ban_group_member(
     } else {
         (None, 0, Vec::new())
     };
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -13461,7 +14345,7 @@ async fn ban_treekem_group_member(
     next.ban_member(&agent_id_hex, Some(caller_hex.clone()));
     next.secret_epoch = treekem_epoch;
     next.security_binding = Some(format!("treekem:epoch={treekem_epoch}"));
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return (
@@ -13580,7 +14464,7 @@ pub(in crate::server) async fn unban_group_member(
     }
     next.roster_revision = next.roster_revision.saturating_add(1);
     let revision = next.roster_revision;
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -13721,7 +14605,8 @@ pub(in crate::server) async fn create_join_request(
         let mut next = info.clone();
         next.join_requests
             .insert(request.request_id.clone(), request.clone());
-        let commit = match next.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -14078,7 +14963,8 @@ pub(in crate::server) async fn approve_join_request(
             None,
         );
         info.roster_revision = info.roster_revision.saturating_add(1);
-        let commit = match info.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut *info, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -14617,7 +15503,7 @@ async fn approve_treekem_join_request(
     };
     next.security_binding = Some(binding);
     let revision = next.roster_revision;
-    let commit = match next.seal_commit(signing_kp, now_ms) {
+    let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
             return api_error(
@@ -14769,7 +15655,8 @@ pub(in crate::server) async fn reject_join_request(
         // the request, or a sole admin who rejected the only request is
         // 409'd forever (#369 re-created).
         next.clear_pending_joiner(&requester_hex, Some(caller_hex.clone()));
-        let commit = match next.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -14847,7 +15734,8 @@ pub(in crate::server) async fn cancel_join_request(
         let requester_hex = req.requester_agent_id.clone();
         // PR #370 r2 blocker 1: same mirror cleanup on self-cancellation.
         next.clear_pending_joiner(&requester_hex, Some(caller_hex.clone()));
-        let commit = match next.seal_commit(signing_kp, now_ms) {
+        let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
+        {
             Ok(c) => c,
             Err(e) => {
                 return api_error(
@@ -15450,6 +16338,15 @@ async fn treekem_group_encrypt(
             return bad_request("invalid base64 payload");
         }
     };
+    // ADR-0038 restore quarantine: refuse before touching ratchet state.
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(group_id_hex) {
+            if let Some(resp) = reject_unverified_owner_certified_restore(info) {
+                return resp;
+            }
+        }
+    }
     let group = {
         let map = state.treekem_groups.read().await;
         match map.get(group_id_hex) {
@@ -15527,6 +16424,15 @@ async fn treekem_group_decrypt(
             return bad_request("invalid base64 ciphertext");
         }
     };
+    // ADR-0038 restore quarantine: refuse before touching ratchet state.
+    {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(group_id_hex) {
+            if let Some(resp) = reject_unverified_owner_certified_restore(info) {
+                return resp;
+            }
+        }
+    }
     let group = {
         let map = state.treekem_groups.read().await;
         match map.get(group_id_hex) {
@@ -15594,6 +16500,9 @@ pub(in crate::server) async fn secure_group_encrypt(
         return not_found("group not found");
     };
     if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
+    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
     if !info.has_active_member(&caller_hex) {
@@ -15703,6 +16612,9 @@ pub(in crate::server) async fn secure_group_decrypt(
         return not_found("group not found");
     };
     if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
+    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
     if !info.has_active_member(&caller_hex) && !info.is_banned(&caller_hex) {
@@ -15855,6 +16767,12 @@ pub(in crate::server) async fn secure_group_reseal(
         return not_found("group not found");
     };
     if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
+    // ADR-0038 round-2 (finding 6): this endpoint re-seals the RESTORED
+    // shared secret — it must obey the same restore quarantine as
+    // encrypt/decrypt; an evidence-bearing seal lifts the marker first.
+    if let Some(resp) = reject_unverified_owner_certified_restore(info) {
         return resp;
     }
     if !info.has_active_member(&caller_hex) {
@@ -16336,6 +17254,11 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                         })?;
                     for info in groups.values_mut() {
                         info.migrate_from_v1();
+                        if info.policy.admission.owner_certified_user_id().is_some() {
+                            // Same ADR-0038 restore quarantine as
+                            // `load_named_groups`.
+                            info.owner_cert_reverify_required = true;
+                        }
                     }
                     Some(groups)
                 }
@@ -16645,6 +17568,14 @@ pub(in crate::server) async fn load_named_groups(
                 })?;
             for info in groups.values_mut() {
                 info.migrate_from_v1();
+                // ADR-0038 review finding 6: restored OwnerCertified state
+                // is untrusted until re-verified. Secure ops are gated on
+                // the marker; the next evidence-bearing seal (which
+                // re-verifies the roster and refuses on any failing member)
+                // clears it.
+                if info.policy.admission.owner_certified_user_id().is_some() {
+                    info.owner_cert_reverify_required = true;
+                }
             }
             tracing::info!(
                 "Loaded {} named groups from {}",
@@ -17789,6 +18720,8 @@ fn build_listener_request_candidate_for_restart(
                         kem_public_key_b64: Some(kem_b64),
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
                         treekem_key_package_hash: None,
+                        certificate: None,
+                        certificate_missing_since_ms: None,
                     });
             }
             if let Some(kp_b64) = treekem_key_package_b64.clone() {
@@ -19910,6 +20843,7 @@ pub(in crate::server) mod tests {
     mod adr0028_roster_replay_controls;
     mod adr0028_row6_recovery_controls;
     mod adr0028_sidecar_recovery_controls;
+    mod adr0038_owner_certified;
     mod cache_hardening_followup;
     mod pr291_restart_marker_matrix;
     fn fake_group_state_commit(
@@ -22063,7 +22997,7 @@ pub(in crate::server) mod tests {
                 ));
             }
         };
-        let commit = committed.seal_commit(&admin_kp, 1_000)?;
+        let commit = seal_commit_owner_certified(&state, &mut committed, &admin_kp, 1_000).await?;
         let committed_state_hash = committed.state_hash.clone();
 
         // Seal the rotated secret to the survivor daemon. The opener
@@ -23764,7 +24698,13 @@ pub(in crate::server) mod tests {
             accepted.secret_epoch = initial_epoch.saturating_add(1);
             accepted.security_binding =
                 treekem_recovery_security_binding(accepted.secret_epoch, &event);
-            let commit = accepted.seal_commit(state.agent.identity().agent_keypair(), now_ms)?;
+            let commit = seal_commit_owner_certified(
+                &state,
+                &mut accepted,
+                state.agent.identity().agent_keypair(),
+                now_ms,
+            )
+            .await?;
             let retained = accepted
                 .commit_log
                 .last()
@@ -25382,6 +26322,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: Some(fake_group_state_commit(&group_id, 2, &admin_hex)),
         };
         assert!(authorized_treekem_membership_event_for_queue(
@@ -25508,6 +26449,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: Some(fake_group_state_commit(&group_id, 3, &creator_hex)),
         };
 
@@ -25886,6 +26828,7 @@ pub(in crate::server) mod tests {
             }),
             treekem_epoch: Some(3),
             treekem_key_package_hash: None,
+            certificate_b64: None,
             commit: Some(x0x::groups::GroupStateCommit {
                 group_id: info.stable_group_id().to_string(),
                 revision: 3,
@@ -25942,6 +26885,7 @@ pub(in crate::server) mod tests {
                 treekem_key_package_hash: None,
                 member_joined_recovery: None,
                 member_recovery_history: Vec::new(),
+                certificate_b64: None,
                 commit: None,
             }),
         };
@@ -26100,6 +27044,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: None,
         };
         let json = serde_json::to_value(event);
@@ -26290,6 +27235,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: None,
         };
         assert!(!treekem_metadata_event_requires_phase3(&member_added));
@@ -26349,6 +27295,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: Some(fake_commit(2, "state-1")),
         };
         let ban_epoch_3 = NamedGroupMetadataEvent::MemberBanned {
@@ -26416,6 +27363,7 @@ pub(in crate::server) mod tests {
             treekem_key_package_hash: None,
             member_joined_recovery: None,
             member_recovery_history: Vec::new(),
+            certificate_b64: None,
             commit: Some(commit),
         };
 

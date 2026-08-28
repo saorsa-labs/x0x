@@ -28,6 +28,8 @@ fn active(hex_id: &str, role: GroupRole) -> GroupMember {
         kem_public_key_b64: None,
         treekem_key_package_b64: None,
         treekem_key_package_hash: None,
+        certificate: None,
+        certificate_missing_since_ms: None,
     }
 }
 

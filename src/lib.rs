@@ -1666,6 +1666,14 @@ pub struct DiscoveredAgent {
     /// pre-#130 peers that announce no cert, and for machine/rendezvous-only
     /// cache entries.
     pub agent_certificate: Option<identity::AgentCertificate>,
+    /// ADR-0038 round-2 freshness coupling: the cert digest the LATEST
+    /// announcement committed to (`announce_v3::cert_digest` of the
+    /// `(user_id, certificate)` pair), when the receive path knew it. When a
+    /// later announce carries a DIFFERENT digest, the cached certificate
+    /// predates that announce and is dropped rather than trusted — evidence
+    /// stays coupled to what the agent currently claims. `None` for
+    /// pre-V3/legacy observations.
+    pub cert_digest: Option<[u8; 32]>,
     /// Raw ML-DSA-65 agent public key bytes from the v2 gossip envelope
     /// (or recovered from the cert on legacy announcements).
     ///
@@ -1700,6 +1708,11 @@ pub struct OwnerIssuedCert {
     /// discovery only.
     pub from_journal: bool,
 }
+
+/// ADR-0038 round-2: hard cap on live identity-discovery cache entries.
+/// The fleet is ~50 active agents; 1024 gives 20× headroom while bounding
+/// what a Sybil announce flood can cost every OwnerCertified evidence pass.
+const DISCOVERY_CACHE_MAX_ENTRIES: usize = 1024;
 
 /// Cached machine endpoint data derived from signed machine announcements.
 #[derive(Debug, Clone)]
@@ -1951,6 +1964,43 @@ async fn upsert_discovered_agent(
                 }
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
+                // ADR-0038 / review finding 5 + round-2 freshness: promote
+                // certificate evidence, COUPLED to the digest the latest
+                // announce committed to.
+                //  - incoming carries a resolved certificate → promote it
+                //    (it verified against this beat's digest) and record
+                //    that digest;
+                //  - incoming is cert-less but announces a digest that
+                //    DIFFERS from the one the cached cert arrived under →
+                //    the cached cert predates this announce (re-issue or
+                //    re-key) → DROP it; evidence reads a retryable
+                //    NoCertificate until the fetch lands instead of
+                //    trusting stale material;
+                //  - same digest, or a legacy digest-less record → keep
+                //    (monotone; never demote on missing information).
+                if let Some(cert) = incoming.agent_certificate.take() {
+                    existing.cert_not_after = cert.not_after();
+                    existing.agent_certificate = Some(cert);
+                    existing.cert_digest = incoming
+                        .cert_digest
+                        .or(Some(announce_v3::cert_digest(
+                            &existing.user_id,
+                            &existing.agent_certificate,
+                        )))
+                        .or(existing.cert_digest);
+                } else if let Some(digest) = incoming.cert_digest {
+                    if existing.cert_digest != Some(digest) {
+                        if existing.agent_certificate.is_some() {
+                            tracing::debug!(
+                                agent = %hex::encode(&incoming.agent_id.0[..8]),
+                                "dropping stale cached certificate: announce committed to a new digest"
+                            );
+                        }
+                        existing.agent_certificate = None;
+                        existing.cert_not_after = None;
+                        existing.cert_digest = Some(digest);
+                    }
+                }
                 // LWW the agent public key — a v2 announcement always
                 // carries it; a legacy/rendezvous entry may not (#204).
                 if !incoming.agent_public_key.is_empty() {
@@ -1960,6 +2010,20 @@ async fn upsert_discovered_agent(
             existing.last_seen = incoming.last_seen;
         }
         None => {
+            // ADR-0038 round-2 (review finding 7): hard entry cap so Sybil
+            // announcements cannot grow the live cache (and thus every
+            // seal's evidence pass) without bound. At the cap, evict the
+            // stalest entry (lowest last_seen) — TTL pruning still runs,
+            // this is the belt to its braces.
+            if cache.len() >= DISCOVERY_CACHE_MAX_ENTRIES {
+                if let Some(stalest) = cache
+                    .iter()
+                    .min_by_key(|(_, entry)| entry.last_seen)
+                    .map(|(id, _)| *id)
+                {
+                    cache.remove(&stalest);
+                }
+            }
             cache.insert(incoming.agent_id, incoming);
         }
     }
@@ -2830,6 +2894,7 @@ impl HeartbeatContext {
             cert_not_after: None,
             agent_certificate: None,
             agent_public_key: announcement.agent_public_key.clone(),
+            cert_digest: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
@@ -6959,6 +7024,7 @@ impl Agent {
             cert_not_after: None,
             agent_certificate: None,
             agent_public_key: announcement.agent_public_key.clone(),
+            cert_digest: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
@@ -7734,6 +7800,10 @@ impl Agent {
                 // The cert/user pair is absent from a V3 beat: the digest blob
                 // is fetched on demand (announce_blob module) and the cache
                 // merge never erases an existing cert with an absent one.
+                // ADR-0038 freshness: the digest this beat's announce
+                // committed to (V3 only; V2 computes it from the inline
+                // pair when present).
+                let mut announce_digest: Option<[u8; 32]> = None;
                 let announcement = if announce_v3::is_v3_payload(&raw_payload) {
                     let v3 = match announce_v3::deserialize_v3(&raw_payload) {
                         Ok(v3) => v3,
@@ -7758,6 +7828,7 @@ impl Agent {
                     // beat hits the filled cache. Anonymous digests never
                     // fetch — `(None, None)` is a well-known constant.
                     let cert_digest = v3.cert_digest;
+                    announce_digest = Some(cert_digest);
                     let payload_version = v3.payload_version;
                     let is_v31 = raw_payload
                         .starts_with(announce_v3::IDENTITY_ANNOUNCEMENT_V3_1_MAGIC);
@@ -7963,22 +8034,36 @@ impl Agent {
                     .agent_certificate
                     .as_ref()
                     .and_then(|c| c.not_after());
-                let discovered_agent = DiscoveredAgent { self_name: announcement.self_name.clone(), agent_id: announcement.agent_id,
-                machine_id: announcement.machine_id,
-                user_id: announcement.user_id,
-                addresses: discovery_addresses,
-                announced_at: announcement.announced_at,
-                last_seen: now,
-                machine_public_key: announcement.machine_public_key.clone(),
-                nat_type: announcement.nat_type.clone(),
-                can_receive_direct: announcement.can_receive_direct,
-                is_relay: announcement.is_relay,
-                is_coordinator: announcement.is_coordinator,
-                reachable_via: announcement.reachable_via.clone(),
-                relay_candidates: announcement.relay_candidates.clone(),
-                cert_not_after,
-                agent_certificate: announcement.agent_certificate.clone(),
-                agent_public_key: announcement.agent_public_key.clone(), };
+                let cert_digest = if announce_digest.is_some() {
+                    announce_digest
+                } else if announcement.agent_certificate.is_some() {
+                    Some(announce_v3::cert_digest(
+                        &announcement.user_id,
+                        &announcement.agent_certificate,
+                    ))
+                } else {
+                    None
+                };
+                let discovered_agent = DiscoveredAgent {
+                    agent_id: announcement.agent_id,
+                    machine_id: announcement.machine_id,
+                    user_id: announcement.user_id,
+                    self_name: announcement.self_name.clone(),
+                    addresses: discovery_addresses,
+                    announced_at: announcement.announced_at,
+                    last_seen: now,
+                    machine_public_key: announcement.machine_public_key.clone(),
+                    nat_type: announcement.nat_type.clone(),
+                    can_receive_direct: announcement.can_receive_direct,
+                    is_relay: announcement.is_relay,
+                    is_coordinator: announcement.is_coordinator,
+                    reachable_via: announcement.reachable_via.clone(),
+                    relay_candidates: announcement.relay_candidates.clone(),
+                    cert_not_after,
+                    agent_certificate: announcement.agent_certificate.clone(),
+                    agent_public_key: announcement.agent_public_key.clone(),
+                    cert_digest,
+                };
                 record_authenticated_machine_binding_from_message(
                     &authenticated_machine_bindings,
                     &msg,
@@ -9512,6 +9597,7 @@ impl Agent {
                                 agent_certificate: ann.agent_certificate.clone(),
                                 agent_public_key: ann.agent_public_key.clone(),
                                 self_name: ann.self_name.clone(),
+                                cert_digest: None,
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
@@ -9550,6 +9636,7 @@ impl Agent {
                     cert_not_after: None,
                     agent_certificate: None,
                     agent_public_key: Vec::new(),
+                    cert_digest: None,
                 },
             )
             .await;
@@ -18559,6 +18646,7 @@ mod tests {
             cert_not_after: None,
             agent_certificate: None,
             agent_public_key: vec![],
+            cert_digest: None,
         };
         // Bootstrap-hosted relay (NYC bootstrap IP), community relay,
         // community coordinator, and a STALE community relay.
@@ -18597,6 +18685,132 @@ mod tests {
         assert_eq!(census.coordinator_on_bootstrap, 1);
         assert_eq!(census.coordinator_non_bootstrap, 1);
         assert!(census.agents_live >= 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_promotes_certificate_into_existing_cert_less_entry() {
+        // WHY (ADR-0038 review finding 5): a V3 announce whose blob fetch
+        // was still in flight inserts a cert-less entry; heartbeats keep it
+        // alive (last_seen refreshes). Without promotion, the entry stays
+        // cert-less FOREVER and OwnerCertified evidence destructively
+        // evicts a valid member as NoCertificate. A later announce carrying
+        // the resolved certificate must promote it into the existing entry.
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let now = Agent::unix_timestamp_secs();
+        let user = identity::UserKeypair::generate().unwrap();
+        let member = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+        let mk = |last_seen: u64, cert: Option<identity::AgentCertificate>| DiscoveredAgent {
+            agent_id: member.agent_id(),
+            machine_id: identity::MachineId([9; 32]),
+            user_id: None,
+            self_name: None,
+            addresses: vec![],
+            announced_at: last_seen,
+            last_seen,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: cert.as_ref().and_then(|c| c.not_after()),
+            agent_certificate: cert,
+            agent_public_key: vec![],
+            cert_digest: None,
+        };
+        // Cold miss: cert-less entry lands first.
+        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now, None)).await;
+        // Later heartbeat, same agent, now with the fetched certificate.
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(now + 5, Some(cert.clone())),
+        )
+        .await;
+        let cache = agent.identity_discovery_cache.read().await;
+        let entry = cache.get(&member.agent_id()).expect("entry retained");
+        assert!(
+            entry.agent_certificate.as_ref().is_some_and(|c| c == &cert),
+            "the fetched certificate must be promoted into the existing entry"
+        );
+        // And a cert-less later announce must NOT demote it.
+        drop(cache);
+        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now + 10, None)).await;
+        let cache = agent.identity_discovery_cache.read().await;
+        let entry = cache.get(&member.agent_id()).expect("entry retained");
+        assert!(
+            entry.agent_certificate.is_some(),
+            "promotion is monotone: a cert-less announce never clears evidence"
+        );
+        // Round-2 freshness coupling: an announce committing to a DIFFERENT
+        // digest re-keys the agent's claim — the cached cert predates it and
+        // must be dropped (evidence reads a retryable NoCertificate until the
+        // new blob lands) instead of being trusted blindly.
+        drop(cache);
+        let mut rekeyed = mk(now + 15, None);
+        rekeyed.cert_digest = Some([0xAA; 32]);
+        upsert_discovered_agent(&agent.identity_discovery_cache, rekeyed).await;
+        let cache = agent.identity_discovery_cache.read().await;
+        let entry = cache.get(&member.agent_id()).expect("entry retained");
+        assert!(
+            entry.agent_certificate.is_none(),
+            "a new announced digest must invalidate the stale cached certificate"
+        );
+        assert_eq!(entry.cert_digest, Some([0xAA; 32]));
+    }
+
+    #[tokio::test]
+    async fn discovery_cache_insertion_is_hard_capped() {
+        // WHY (round-2 finding 7): Sybil announcements must not grow the
+        // live identity cache without bound — every OwnerCertified evidence
+        // pass walks it. At the cap the stalest entry is evicted.
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let now = Agent::unix_timestamp_secs();
+        let mk = |id: u8, last_seen: u64| DiscoveredAgent {
+            agent_id: identity::AgentId([id; 32]),
+            machine_id: identity::MachineId([id; 32]),
+            user_id: None,
+            self_name: None,
+            addresses: vec![],
+            announced_at: last_seen,
+            last_seen,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: vec![],
+            cert_digest: None,
+        };
+        // Fill past the cap with distinct agents (byte ids wrap but the
+        // full [u8;32] arrays stay distinct via the index).
+        for i in 0..=(DISCOVERY_CACHE_MAX_ENTRIES as u16) {
+            let mut id = [0u8; 32];
+            id[..2].copy_from_slice(&i.to_be_bytes());
+            let mut entry = mk(0, now + u64::from(i));
+            entry.agent_id = identity::AgentId(id);
+            entry.machine_id = identity::MachineId(id);
+            upsert_discovered_agent(&agent.identity_discovery_cache, entry).await;
+        }
+        let cache = agent.identity_discovery_cache.read().await;
+        assert!(
+            cache.len() <= DISCOVERY_CACHE_MAX_ENTRIES,
+            "cache must stay capped, got {}",
+            cache.len()
+        );
     }
 
     /// ADR-0035 metering: selection-skew classification — machine id →
@@ -18976,6 +19190,7 @@ mod tests {
                 cert_not_after: cert.not_after(),
                 agent_certificate: Some(cert.clone()),
                 agent_public_key: cert.agent_public_key().to_vec(),
+                cert_digest: None,
             },
         );
 
@@ -19614,6 +19829,7 @@ fn discovered_agent_fixture(
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     }
 }
 

@@ -257,6 +257,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     };
     alice.insert_discovered_agent_for_testing(bob_card).await;
     alice
@@ -284,6 +285,7 @@ async fn synthetic_kill_restart_lands_on_new_connection_within_500ms() {
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     };
     bob.insert_discovered_agent_for_testing(alice_card).await;
 
@@ -487,6 +489,7 @@ async fn discovered_but_disconnected_peer_is_dialed_by_same_send() {
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     };
     alice
         .insert_discovered_agent_for_testing(discovered(&bob, bob_addr))

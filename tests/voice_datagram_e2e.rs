@@ -100,6 +100,8 @@ fn discovered_agent(
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,
+        self_name: None,
+        cert_digest: None,
         addresses: vec![addr],
         announced_at: now_secs,
         last_seen: now_secs,

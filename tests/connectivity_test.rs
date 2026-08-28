@@ -41,6 +41,7 @@ fn fake_discovered(
     let now = now_secs();
     DiscoveredAgent {
         self_name: None,
+        cert_digest: None,
         agent_id: x0x::identity::AgentId([id_byte; 32]),
         machine_id: x0x::identity::MachineId([id_byte + 100; 32]),
         user_id: None,

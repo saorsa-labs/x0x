@@ -416,6 +416,7 @@ async fn discovery_cache_insert_and_retrieve() {
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     };
 
     agent
@@ -467,6 +468,7 @@ async fn reachability_info_from_discovery_cache() {
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        cert_digest: None,
     };
 
     agent.insert_discovered_agent_for_testing(fake).await;

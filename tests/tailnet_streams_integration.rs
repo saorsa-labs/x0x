@@ -70,6 +70,7 @@ fn discovered_agent(
 ) -> DiscoveredAgent {
     DiscoveredAgent {
         self_name: None,
+        cert_digest: None,
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,

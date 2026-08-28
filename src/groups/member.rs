@@ -152,10 +152,26 @@ pub struct GroupMember {
     /// members and old pre-Phase-3 rosters.
     #[serde(default)]
     pub treekem_key_package_b64: Option<String>,
-    /// BLAKE3 hash of the admitted TreeKEM KeyPackage. This remains in
+    /// BLAKE3 hash of the TreeKEM KeyPackage. This remains in
     /// key-stripped invite state so recovery can authenticate the exact leaf.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treekem_key_package_hash: Option<String>,
+    /// ADR-0038: the `AgentCertificate` this member was admitted under,
+    /// bound INTO the roster entry so the signed state-commit's roster root
+    /// covers it (verification against committed evidence, not a live
+    /// lookup alone — Codex design review constraint 2). Present only for
+    /// members of `OwnerCertified` groups; `None` for every legacy roster,
+    /// which keeps the v1 roster-root hash input byte-identical.
+
+    /// ADR-0038 round-2 grace window: when evidence for this member was
+    /// first observed MISSING (`NoCertificate`) at a seal-time
+    /// re-verification, in unix ms. Transient bookkeeping — NOT part of the
+    /// roster-root hash; absent after restart (the restore quarantine
+    /// restarts the window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_missing_since_ms: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate: Option<crate::identity::AgentCertificate>,
 }
 
 impl GroupMember {
@@ -175,6 +191,8 @@ impl GroupMember {
             kem_public_key_b64: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
+            certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 
@@ -195,6 +213,8 @@ impl GroupMember {
             kem_public_key_b64: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
+            certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 
@@ -219,6 +239,8 @@ impl GroupMember {
             kem_public_key_b64: None,
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
+            certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 
