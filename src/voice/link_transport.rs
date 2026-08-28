@@ -103,6 +103,30 @@ const DATAGRAM_BYTE_RATE: u64 = 100 * 1024;
 /// absorbs a keyframe-scale burst before the sustained rate binds.
 const DATAGRAM_BYTE_BURST: u64 = 50 * 1024;
 
+/// Advert initial re-send cadence (Codex r2 finding 1): DM subscribers
+/// only receive future messages, so the peer may start after our first
+/// challenge and never see it. The initial is re-sent on this cadence
+/// until answered.
+const ADVERT_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Total initial-send attempts (20 s at [`ADVERT_RETRY_INTERVAL`]) before
+/// settling on the reliable lane for this session.
+const ADVERT_RETRY_ATTEMPTS: usize = 10;
+
+/// Per-send bound for advert DMs: the DM layer can park a send on its
+/// ack/backoff window for far longer than the retry cadence, and a
+/// stalled send must never stall the listener loop consuming inbound
+/// frames.
+const ADVERT_SEND_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Per-write bound on the reliable lane: a stream whose connection died
+/// mid-churn does not ERROR — its flow control simply stops progressing
+/// and `write_all` awaits forever (observed as an 18-of-50 stall when
+/// the advert DM churn replaced the connection underneath the lane). A
+/// write exceeding this bound is treated as a dead lane: evicted and
+/// reopened once.
+const RELIABLE_WRITE_BOUND: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Outbound lane: the send half of an opened `WebRtcV1` stream, keyed by
 /// [`StreamType`]. The recv half is parked alongside so the peer's stream
 /// state stays open for the lane's lifetime.
@@ -125,6 +149,12 @@ struct DatagramLane {
     /// Listens on the DM fan-out for the peer's capability advert; exits
     /// once seen (or when the agent's DM channel closes).
     advert_listener: tokio::task::JoinHandle<()>,
+    /// Re-sends our session initial (challenge) every 2 s for up to 20 s
+    /// until answered — DM subscribers only receive FUTURE messages
+    /// (`direct.rs`), so a peer that starts later than our first send
+    /// would otherwise never see the challenge and negotiation would
+    /// time out into silent reliable fallback (Codex r2 finding 1).
+    advert_retry: tokio::task::JoinHandle<()>,
 }
 
 /// Challenge-response state binding the datagram lane to THIS transport
@@ -141,9 +171,6 @@ struct DatagramSession {
     /// Our per-start nonce (hex). The peer echoes it to prove liveness
     /// on this session.
     our_nonce: String,
-    /// The peer challenge we have already acked (dedup: one ack per
-    /// distinct challenge, no loops).
-    acked_challenge: Option<String>,
 }
 
 /// [`LinkTransport`] over x0x `WebRtcV1` peer streams.
@@ -437,7 +464,6 @@ impl X0xLinkTransport {
             .unwrap_or_else(|p| p.into_inner()) = Some(DatagramSession {
             machine,
             our_nonce: our_nonce.clone(),
-            acked_challenge: None,
         });
 
         // Inbound reader — the SOLE consumer of read_datagram on this
@@ -461,11 +487,18 @@ impl X0xLinkTransport {
         // inside a multi-agent machine is impossible at this layer (the
         // wire format carries no sender field) — parity with the
         // reliable stream path, which also has no per-stream sender
-        // discriminator. A per-datagram session tag is an upstream
-        // (saorsa-webrtc) wire change — recorded as the follow-up.
-        // Revocation mid-call does NOT tear the reader down: no cheap
-        // revocation hook exists, and accepted byte-streams behave
-        // identically (gates run at open/accept time only).
+        // discriminator. ACCEPTED v1 TRUST BOUNDARY (Codex r2): the
+        // single-acceptor `SessionConflict` rule (one call session per
+        // agent per connection) bounds the datagram injection surface
+        // to a co-located agent on the SAME machine under the SAME
+        // daemon custody — i.e. an actor already inside the daemon's
+        // process trust domain, identical to every other DM/stream
+        // control path. A per-datagram wire discriminator and a
+        // connection-level dispatcher are recorded follow-ups (upstream
+        // saorsa-webrtc wire v2 + the daemon demux hub), deliberately
+        // not built in v1. Revocation mid-call does NOT tear the reader
+        // down: no cheap revocation hook exists, and accepted byte-streams
+        // behave identically (gates run at open/accept time only).
         //
         // Replay stance (v1): in-call duplicates/replays are absorbed by
         // the mandatory jitter buffer's sequence dedupe (upstream
@@ -487,6 +520,7 @@ impl X0xLinkTransport {
         let reader = tokio::spawn(async move {
             let mut bucket = DATAGRAM_BYTE_BURST;
             let mut invalid = 0u64;
+            let mut over_rate = 0u64;
             let mut last_refill = std::time::Instant::now();
             while let Ok(bytes) = hl_conn.read_datagram().await {
                 {
@@ -501,11 +535,15 @@ impl X0xLinkTransport {
                     let len_u64 = u64::try_from(bytes.len()).unwrap_or(u64::MAX);
                     if len_u64 > bucket {
                         rate_dropped.fetch_add(1, Ordering::Relaxed);
-                        tracing::warn!(
-                            target: "voice",
-                            len = bytes.len(),
-                            "datagram exceeded per-connection byte ceiling; dropped"
-                        );
+                        over_rate += 1;
+                        if over_rate == 1 || over_rate.is_multiple_of(100) {
+                            tracing::warn!(
+                                target: "voice",
+                                len = bytes.len(),
+                                total_over_rate = over_rate,
+                                "datagram exceeded per-connection byte ceiling; dropped (log throttled)"
+                            );
+                        }
                         continue;
                     }
                     bucket -= len_u64;
@@ -581,16 +619,12 @@ impl X0xLinkTransport {
                 }
                 // Copy the session facts out and release the guard — a
                 // std MutexGuard must never live across the await below.
-                let (session_machine, our_nonce, acked_challenge) = {
+                let (session_machine, our_nonce) = {
                     let state = session_state.lock().unwrap_or_else(|p| p.into_inner());
                     let Some(session) = state.as_ref() else {
                         continue; // no live session — lane torn down
                     };
-                    (
-                        session.machine,
-                        session.our_nonce.clone(),
-                        session.acked_challenge.clone(),
-                    )
+                    (session.machine, session.our_nonce.clone())
                 };
                 // Authenticated binding (P1-1): right machine, verified
                 // binding, trust Accept.
@@ -615,70 +649,89 @@ impl X0xLinkTransport {
                     .and_then(serde_json::Value::as_str)
                     .map(str::to_owned);
                 if response.as_deref() == Some(our_nonce.as_str()) {
-                    capable.store(true, Ordering::SeqCst);
-                    tracing::info!(
-                        target: "voice",
-                        "peer proved the datagram lane session (nonce echo); Audio sends switch to datagrams"
-                    );
-                    return;
+                    if !capable.swap(true, Ordering::SeqCst) {
+                        tracing::info!(
+                            target: "voice",
+                            "peer proved the datagram lane session (nonce echo); Audio sends switch to datagrams"
+                        );
+                    }
+                    // Keep listening: exiting here would DROP this
+                    // receiver from the DM registry, and the peer —
+                    // which may still be re-sending its initial on the
+                    // retry cadence — would never get its ack (the
+                    // sequential-startup deadlock). stop()/Drop owns
+                    // this task's lifetime. Repeat echoes are idempotent
+                    // (swap logs once).
+                    continue;
                 }
                 // A peer initial (challenge, no valid response): ack it
-                // once per distinct challenge so the peer can prove its
-                // session — but never flip our own lane on it.
+                // EVERY time. Acks are idempotent and never generate a
+                // reply (no loop), and a peer whose earlier ack raced its
+                // own subscription needs the re-send — deduping here
+                // would recreate the one-shot startup regression. Never
+                // flip our own lane on a peer initial.
                 if let Some(challenge) = value.get("challenge").and_then(serde_json::Value::as_str)
                 {
-                    if acked_challenge.as_deref() != Some(challenge) {
-                        let challenge = challenge.to_owned();
-                        let _ = send_advert_frame(
-                            &agent,
-                            &remote,
-                            serde_json::json!({
-                                "type": DATAGRAM_ADVERT_TYPE,
-                                "datagram": true,
-                                "response": challenge,
-                            }),
-                        )
-                        .await;
-                        if let Some(state) = session_state
-                            .lock()
-                            .unwrap_or_else(|p| p.into_inner())
-                            .as_mut()
-                        {
-                            state.acked_challenge = Some(challenge);
-                        }
-                    }
+                    let _ = send_advert_frame(
+                        &agent,
+                        &remote,
+                        serde_json::json!({
+                            "type": DATAGRAM_ADVERT_TYPE,
+                            "datagram": true,
+                            "response": challenge,
+                        }),
+                    )
+                    .await;
                 }
             }
         });
 
         // Advertise our capability — the session initial with our fresh
-        // challenge. A failed DM send leaves the lane up (the reader
-        // still drains) but the peer will never switch to datagrams
-        // toward us; audio stays reliable in that direction until the
-        // next start.
+        // challenge, re-sent every 2 s for up to 20 s until answered
+        // (the peer's subscriber only sees future messages; one-shot
+        // negotiation silently timed out under sequential startup).
+        let agent_for_retry = Arc::clone(&self.agent);
+        let remote_for_retry = self.remote;
+        let capable_for_retry = Arc::clone(&self.peer_datagram_capable);
         let initial = serde_json::json!({
             "type": DATAGRAM_ADVERT_TYPE,
             "datagram": true,
             "challenge": our_nonce,
         });
-        if let Err(e) = send_advert_frame(&self.agent, &self.remote, initial).await {
-            tracing::warn!(
-                target: "voice",
-                error = %e,
-                "datagram capability advert not delivered; audio stays reliable"
-            );
-        }
+        let advert_retry = tokio::spawn(async move {
+            for _ in 0..ADVERT_RETRY_ATTEMPTS {
+                if capable_for_retry.load(Ordering::SeqCst) {
+                    return; // answered — stop sending
+                }
+                // Bound each send: a stalled DM backoff must not stall
+                // the retry cadence (the attempt is abandoned, not
+                // awaited).
+                let _ = tokio::time::timeout(
+                    ADVERT_RETRY_INTERVAL,
+                    send_advert_frame(&agent_for_retry, &remote_for_retry, initial.clone()),
+                )
+                .await;
+                tokio::time::sleep(ADVERT_RETRY_INTERVAL).await;
+            }
+        });
 
         *lane_guard = Some(DatagramLane {
             conn,
             reader,
             advert_listener,
+            advert_retry,
         });
         Ok(())
     }
 
     /// Reliable path: one ordered `WebRtcV1` stream per
     /// `(direction, StreamType)` lane, `u32-BE length ‖ payload` frames.
+    ///
+    /// Connection churn (Codex r2 finding 2): a cached stream from a
+    /// replaced connection errors on write ("sending stopped by peer").
+    /// On any write failure the cached lane is EVICTED and reopened on
+    /// the current connection (one retry); a stream from a dead
+    /// connection must never wedge the reliable path.
     async fn send_reliable(
         &self,
         stream_type: StreamType,
@@ -692,35 +745,96 @@ impl X0xLinkTransport {
             })?;
 
         let mut lanes = self.lanes.lock().await;
-        if let std::collections::hash_map::Entry::Vacant(slot) = lanes.entry(stream_type.as_u8()) {
-            let mut stream = self
-                .agent
-                .open_peer_stream(&self.remote, StreamProtocol::WebRtcV1)
+        // First attempt on the cached lane (opening it if absent); on a
+        // write failure evict and re-open once on the current
+        // connection.
+        for attempt in 0..2 {
+            if let std::collections::hash_map::Entry::Vacant(slot) =
+                lanes.entry(stream_type.as_u8())
+            {
+                let mut stream = self
+                    .agent
+                    .open_peer_stream(&self.remote, StreamProtocol::WebRtcV1)
+                    .await
+                    .map_err(|e| {
+                        LinkTransportError::SendError(format!("open WebRtcV1 lane: {e}"))
+                    })?;
+                match tokio::time::timeout(
+                    RELIABLE_WRITE_BOUND,
+                    stream.send_mut().write_all(&[stream_type.as_u8()]),
+                )
                 .await
-                .map_err(|e| LinkTransportError::SendError(format!("open WebRtcV1 lane: {e}")))?;
-            stream
-                .send_mut()
-                .write_all(&[stream_type.as_u8()])
-                .await
-                .map_err(|e| lt_err("write StreamType byte", e))?;
-            let (send, recv) = stream.into_split();
-            slot.insert(OutboundLane { send, _recv: recv });
+                {
+                    Ok(Ok(())) => {}
+                    // A stream whose open/prefix write already failed is
+                    // useless — do not cache it.
+                    Ok(Err(e)) if attempt == 0 => {
+                        tracing::warn!(
+                            target: "voice",
+                            error = %e,
+                            "lane prefix write failed; reopening on the current connection"
+                        );
+                        continue; // evicted by not inserting; retry open
+                    }
+                    Ok(Err(e)) => return Err(lt_err("write StreamType byte", e)),
+                    Err(_) if attempt == 0 => {
+                        tracing::warn!(
+                            target: "voice",
+                            "lane prefix write exceeded bound; reopening on the current connection"
+                        );
+                        continue;
+                    }
+                    Err(_) => {
+                        return Err(LinkTransportError::SendError(
+                            "lane prefix write timed out — connection likely replaced".to_owned(),
+                        ));
+                    }
+                }
+                let (send, recv) = stream.into_split();
+                slot.insert(OutboundLane { send, _recv: recv });
+            }
+            let Some(lane) = lanes.get_mut(&stream_type.as_u8()) else {
+                return Err(LinkTransportError::SendError(
+                    "lane vanished during send".to_owned(),
+                ));
+            };
+            // Bounded write: a stream whose connection died mid-churn
+            // does not error — flow control stops progressing and
+            // write_all awaits forever. The bound converts that stall
+            // into an eviction + reopen.
+            let written = tokio::time::timeout(RELIABLE_WRITE_BOUND, async {
+                lane.send.write_all(&len.to_be_bytes()).await?;
+                lane.send.write_all(data).await
+            })
+            .await;
+            match written {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(e)) if attempt == 0 => {
+                    tracing::warn!(
+                        target: "voice",
+                        error = %e,
+                        "cached reliable lane failed; evicting and reopening on the current connection"
+                    );
+                    lanes.remove(&stream_type.as_u8());
+                }
+                Ok(Err(e)) => return Err(lt_err("write frame", e)),
+                Err(_) if attempt == 0 => {
+                    tracing::warn!(
+                        target: "voice",
+                        "reliable lane write exceeded bound; evicting and reopening on the current connection"
+                    );
+                    lanes.remove(&stream_type.as_u8());
+                }
+                Err(_) => {
+                    return Err(LinkTransportError::SendError(
+                        "reliable lane write timed out — connection likely replaced".to_owned(),
+                    ));
+                }
+            }
         }
-        // Entry guaranteed by the insert above; avoid unwrap per house rules.
-        let Some(lane) = lanes.get_mut(&stream_type.as_u8()) else {
-            return Err(LinkTransportError::SendError(
-                "lane vanished during send".to_owned(),
-            ));
-        };
-        lane.send
-            .write_all(&len.to_be_bytes())
-            .await
-            .map_err(|e| lt_err("write frame length", e))?;
-        lane.send
-            .write_all(data)
-            .await
-            .map_err(|e| lt_err("write frame body", e))?;
-        Ok(())
+        Err(LinkTransportError::SendError(
+            "reliable lane reopen failed after eviction".to_owned(),
+        ))
     }
 
     /// Datagram path (ADR-0042 c): one unreliable QUIC datagram per
@@ -789,6 +903,7 @@ impl Drop for X0xLinkTransport {
             if let Some(lane) = guard.take() {
                 lane.reader.abort();
                 lane.advert_listener.abort();
+                lane.advert_retry.abort();
             }
         }
         *self
@@ -810,15 +925,26 @@ fn placeholder_addr() -> SocketAddr {
 async fn send_advert_frame(
     agent: &Arc<Agent>,
     remote: &AgentId,
-    frame: serde_json::Value,
+    mut frame: serde_json::Value,
 ) -> Result<(), String> {
+    // Unique per-send id (additive, serde-defaulted, ignored by
+    // receivers): the DM layer dedupes identical payloads, so retrying
+    // an unchanged frame is silently swallowed — the sequential-startup
+    // regression traced to exactly this.
+    frame["id"] = serde_json::Value::String(hex::encode(rand::random::<u32>().to_be_bytes()));
     let mut payload = VOICE_SIGNALING_DM_PREFIX.to_vec();
     payload.extend_from_slice(&serde_json::to_vec(&frame).map_err(|e| e.to_string())?);
-    agent
-        .send_direct(remote, payload)
-        .await
-        .map(|_| ())
-        .map_err(|e| e.to_string())
+    // Bound the send: the DM machinery can park a send on its
+    // ack/backoff window for a long time, and an unbounded await would
+    // stall the CALLER — for the listener that means inbound advert
+    // frames queue (and evict) behind a stuck ack, which is exactly the
+    // sequential-startup deadlock this bounds away. A timed-out attempt
+    // is abandoned; the peer's retry cadence re-covers it.
+    match tokio::time::timeout(ADVERT_SEND_BOUND, agent.send_direct(remote, payload)).await {
+        Ok(Ok(_)) => Ok(()),
+        Ok(Err(e)) => Err(e.to_string()),
+        Err(_) => Err("advert send exceeded bound; abandoned".to_owned()),
+    }
 }
 
 fn lt_err(context: &str, e: impl std::fmt::Display) -> LinkTransportError {

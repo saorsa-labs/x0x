@@ -70,12 +70,12 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        // Explicit skip, never a silent pass (Codex review P2): without
-        // real UDP sockets this e2e proves nothing, so say so loudly.
-        Err(e) if is_network_bind_permission_error(&e) => {
-            eprintln!("SKIP: UDP binds forbidden in this environment — datagram e2e requires real sockets");
-            None
-        }
+        // Never a silent pass on environment failure (Codex r2 finding
+        // 4): without real UDP sockets this e2e proves nothing, so fail
+        // loudly rather than returning Ok from a body that ran nothing.
+        Err(e) if is_network_bind_permission_error(&e) => panic!(
+            "environment forbids UDP binds — this datagram e2e cannot run and must not pass: {e}"
+        ),
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -713,6 +713,16 @@ async fn connection_churn_falls_back_to_reliable() {
         "mutual capability must land before the churn"
     );
 
+    // PRIME a reliable lane before the churn (Codex r2 finding 2): the
+    // Data lane always rides the reliable stream (only Audio is
+    // routable to datagrams), so this populates the cached-stream map
+    // the eviction logic must recover from.
+    let peer = alice_link.default_peer().expect("default peer");
+    alice_link
+        .send(&peer, StreamType::Data, &[0xA5; 64])
+        .await
+        .expect("prime reliable Data lane");
+
     // Kill the connection alice's datagram lane negotiated on, then
     // bring up its REPLACEMENT (realistic churn: the old connection is
     // gone, a new one takes over — `disconnect` removes the peer, so the
@@ -761,9 +771,14 @@ async fn connection_churn_falls_back_to_reliable() {
     );
     let sent_at_churn = alice_link.datagram_frames_sent();
 
-    // Post-churn audio: reliable lane, still delivered (open_peer_stream
-    // redials through the discovery cache).
-    let peer = alice_link.default_peer().expect("default peer");
+    // Post-churn audio: reliable lane, still delivered — the primed
+    // cached stream from the dead connection must be evicted and
+    // reopened (audio lane was never cached, so also exercise the Data
+    // lane again: eviction covers every cached lane type).
+    alice_link
+        .send(&peer, StreamType::Data, &[0x5A; 64])
+        .await
+        .expect("post-churn Data send must evict the dead cached lane and reopen");
     const POST: usize = 25;
     for seq in 0..POST {
         let dg = AudioDatagram {
@@ -779,14 +794,18 @@ async fn connection_churn_falls_back_to_reliable() {
             .expect("post-churn send must fall back to the reliable lane");
     }
 
+    // Count AUDIO frames only: the primed + evicted Data-lane frames
+    // also surface here (same inbound queue) and prove their own
+    // delivery by arriving at all.
     let mut received = 0usize;
     let deadline = Instant::now() + Duration::from_secs(30);
     while received < POST && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, bob_link.receive()).await {
             Ok(Ok((_, ty, _))) => {
-                assert_eq!(ty, StreamType::Audio);
-                received += 1;
+                if ty == StreamType::Audio {
+                    received += 1;
+                }
             }
             Ok(Err(e)) => panic!("bob receive failed: {e}"),
             Err(_) => break,
@@ -794,12 +813,54 @@ async fn connection_churn_falls_back_to_reliable() {
     }
     assert_eq!(
         received, POST,
-        "post-churn frames must arrive via the reliable lane"
+        "post-churn audio frames must arrive via the reliable lane"
     );
     assert_eq!(
         alice_link.datagram_frames_sent(),
         sent_at_churn,
         "no post-churn frame may leave as a datagram"
+    );
+
+    let _ = alice_link.stop().await;
+    let _ = bob_link.stop().await;
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// Sequential startup regression (Codex r2 finding 1): DM subscribers
+/// only receive FUTURE messages, so a peer that starts AFTER our first
+/// challenge never sees it. The periodic advert retry (2 s cadence,
+/// 20 s budget) must recover mutual capability even when one side is
+/// already running for seconds before the other starts — the one-shot
+/// implementation silently timed out here.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback sequential-startup negotiation; binds UDP. Integration tier."]
+async fn sequential_startup_still_negotiates_datagram_lane() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    // Alice fully starts FIRST — her initial challenge is fanned out
+    // long before bob's listener exists (well past the DM window).
+    let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    alice_link.start().await.expect("alice link starts alone");
+    assert!(
+        !alice_link.peer_datagram_capable(),
+        "no peer yet — lane must not be capable"
+    );
+    tokio::time::sleep(Duration::from_secs(5)).await;
+
+    // Bob starts NOW; alice's retry cadence must deliver a fresh
+    // challenge his subscriber can see, and his ack must flip her lane.
+    let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    bob_link.start().await.expect("bob link starts late");
+
+    assert!(
+        await_mutual_capability(&alice_link, &bob_link).await,
+        "periodic advert retry must recover negotiation across sequential startup"
     );
 
     let _ = alice_link.stop().await;

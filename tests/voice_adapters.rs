@@ -358,7 +358,9 @@ async fn datagram_mode_falls_back_to_reliable_lane_without_peer_advert() {
     tokio::time::sleep(Duration::from_millis(500)).await;
 
     let mut received = Vec::with_capacity(frames.len());
-    let deadline = Instant::now() + Duration::from_secs(30);
+    // Generous deadline: this suite runs UDP-binding integration tests in
+    // parallel; under load the loopback convergence eats into a tight one.
+    let deadline = Instant::now() + Duration::from_secs(60);
     while received.len() < frames.len() && Instant::now() < deadline {
         let remaining = deadline.saturating_duration_since(Instant::now());
         match tokio::time::timeout(remaining, bob_link.receive()).await {
