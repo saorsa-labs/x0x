@@ -54,6 +54,7 @@ This directory contains architecture decision records for x0x.
 ## Proposed
 
 - [ADR 0024: GSS Rotation on Admin Remove Is Fail-Closed and Seals Before It Persists](./0024-gss-rotation-on-admin-remove-fail-closed.md) — the legacy GSS plane (ADR 0010) rotates and reseals on admin remove as it already does on ban; every survivor envelope is built before `seal_commit`, persistence and publication, and any failure aborts the removal outright; records the accepted availability and map-lock contention costs, and the no-drop map-lock rule as conservative policy whose necessity is unproven
+- [ADR 0043: Agent Key-Move Protocol](./0043-agent-key-move-protocol.md) (proposed 2026-08-28) — **amends ADR 0037**; machines enroll ML-KEM-768 keys via an additive X0A4 announce (V2→V3 transition pattern); roaming moves are a commit-then-activate ceremony (`Exported → Imported → Activated → SourceRetired`, owner-signed, epoch-keyed, idempotent re-entry) whose activation atomically issues a permanent `AgentMachineBinding(AgentId, MachineId)` revocation and the successor owner-signed placement record; DM/stream gates enforce binding + placement epoch (fail-open for pre-0043 peers, documented); mechanics in [docs/design/agent-key-move.md](../design/agent-key-move.md)
 
 ## Errata (Accepted ADRs are immutable; corrections recorded here)
 
