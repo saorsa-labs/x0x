@@ -71,11 +71,8 @@ fn is_network_bind_permission_error(error: &impl std::fmt::Display) -> bool {
 
 fn discovered_agent(agent: &Agent, addr: std::net::SocketAddr, now_secs: u64) -> DiscoveredAgent {
     DiscoveredAgent {
-<<<<<<< HEAD
         self_name: None,
-=======
         cert_digest: None,
->>>>>>> 8e1b64d (fix(groups): ADR-0038 round-2 review — ingress completeness, no unpublished seals, cert freshness + grace, reseal quarantine, cache cap)
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,
