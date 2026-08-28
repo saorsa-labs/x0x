@@ -12,7 +12,8 @@
 //!    before consuming the invite and committing `MemberAdded`. Admin role is
 //!    inert here: an admin-issued invite to an uncertified agent is rejected.
 //! 2. **Every state-commit seal** —
-//!    [`GroupInfo::seal_commit_with_owner_certs`] re-verifies every active
+//!    [`GroupInfo::seal_commit_with_owner_certs`](crate::groups::GroupInfo::seal_commit_with_owner_certs)
+//!    re-verifies every active
 //!    member and evicts (roster-removes) the failures before the commit is
 //!    signed, so a stolen invite or a revoked/expired cert cannot survive the
 //!    next seal.
