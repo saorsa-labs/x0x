@@ -113,6 +113,7 @@ fn discovered_agent(
         cert_not_after: None,
         agent_certificate: None,
         agent_public_key: Vec::new(),
+        self_name: None,
     }
 }
 
