@@ -1269,3 +1269,77 @@ async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()
     drop(dir);
     Ok(())
 }
+
+#[tokio::test]
+async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Result<()> {
+    // WHY (round-5 quarantine rule): the explicit eviction path ends
+    // with every remaining member Clean IN THE OPERATION'S VERDICT
+    // (Failed set fully evicted, nobody InGrace) — the restore
+    // quarantine must lift right there, without a further clean seal,
+    // so secure ops work again immediately after the eviction.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "82".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    // A FAILED member: certificate chained to a different owner
+    // (definitive, no grace).
+    let bad = AgentKeypair::generate()?;
+    let bad_hex = hex::encode(bad.agent_id().as_bytes());
+    let foreign = UserKeypair::generate()?;
+    let foreign_cert = x0x::identity::AgentCertificate::issue(&foreign, &bad)?;
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(bad_hex.clone(), x0x::groups::GroupRole::Member, None, None);
+        live.set_member_certificate(&bad_hex, foreign_cert);
+        live.shared_secret = Some(vec![4u8; 32]);
+        live.owner_cert_reverify_required = true;
+    }
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required
+    );
+
+    // Explicit eviction seal: the Failed member is evicted, the owner
+    // is Clean, nobody InGrace -> quarantine lifts in the same
+    // operation.
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "explicit eviction seal: {body}");
+    assert_eq!(body["evicted"], serde_json::json!([bad_hex]), "{body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required,
+        "quarantine must clear when the operation's verdict ends all-Clean"
+    );
+
+    // Secure ops work again (no 409 quarantine).
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) =
+        secure_group_encrypt(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "secure ops must work after the quarantine lifted: {}",
+        json.0
+    );
+    Ok(())
+}

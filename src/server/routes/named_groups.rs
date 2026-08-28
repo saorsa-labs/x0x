@@ -12577,41 +12577,91 @@ async fn owner_certified_seal_with_eviction(
     let mut evicted_total: Vec<String> = Vec::new();
     let mut last_commit: Option<x0x::groups::GroupStateCommit> = None;
 
-    loop {
-        let verdict = {
-            // Write guard: the verdict producer stamps
-            // `certificate_missing_since_ms` on first observation.
-            let mut groups = state.named_groups.write().await;
-            let Some(info) = groups.get_mut(id) else {
-                return Some(Err(not_found("group not found")));
-            };
-            if info.policy.admission.owner_certified_user_id().is_none() {
-                return if evicted_total.is_empty() {
-                    None
-                } else {
-                    // Evictions already happened; the caller only wanted the
-                    // seal. Return the last commit and the evicted list.
-                    last_commit
-                        .map(|commit| Ok((commit, evicted_total.clone())))
-                        .or(Some(Err(api_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "seal failed",
-                        ))))
-                };
-            }
-            if let Some(resp) = reject_withdrawn_group(info) {
-                return Some(Err(resp));
-            }
-            let evidence = owner_cert_seal_evidence(state, info).await;
-            info.owner_cert_verdict(&evidence)
+    // Round-5: ONE verdict for the WHOLE operation — evaluated here, at
+    // start, under the write guard (the producer stamps grace timestamps).
+    // The loop below evicts exactly this verdict's Failed set and never
+    // re-evaluates: an InGrace member whose grace expires mid-operation
+    // (e.g. while an earlier rekey transition runs) is NOT evicted this
+    // operation — it becomes Failed for the NEXT one.
+    let is_owner_certified = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(id)
+            .is_some_and(|info| info.policy.admission.owner_certified_user_id().is_some())
+    };
+    if !is_owner_certified {
+        // Not an OwnerCertified group — the caller keeps its plain
+        // reseal path.
+        return None;
+    }
+    let verdict = {
+        let mut groups = state.named_groups.write().await;
+        let Some(info) = groups.get_mut(id) else {
+            return Some(Err(not_found("group not found")));
         };
+        if let Some(resp) = reject_withdrawn_group(info) {
+            return Some(Err(resp));
+        }
+        let evidence = owner_cert_seal_evidence(state, info).await;
+        info.owner_cert_verdict(&evidence)
+    };
+    // The members that remain seated once the Failed set is gone: Clean ∪
+    // InGrace, per the operation's single verdict.
+    let in_grace_initially = !verdict.in_grace().is_empty();
+    // Work queue: EXACTLY the operation-verdict's Failed set, evicted one
+    // member per sealed transition. The verdict is frozen for this
+    // operation — no re-evaluation, so mid-operation grace expiry cannot
+    // grow the set.
+    let mut failed_queue = verdict.failed();
 
-        let failed = verdict.failed();
-        if failed.is_empty() {
+    loop {
+        if failed_queue.is_empty() {
+            if let Some(commit) = last_commit {
+                // Round-2: after evictions, DO NOT mint an extra clean
+                // no-op commit — it is published by no event channel, so
+                // peers would stall one commit behind and reject the next
+                // mutation's chain link; the last eviction commit is the
+                // response.
+                //
+                // Round-5 quarantine rule (documented): the operation ends
+                // with every remaining member Clean IN THE OPERATION'S
+                // VERDICT iff no member was InGrace initially — the Failed
+                // set is fully evicted and the rest were Clean at
+                // evaluation. Exactly then the restore quarantine lifts,
+                // here, explicitly (no clean seal is minted to do it).
+                // Otherwise it stays set until a later all-clean seal.
+                if !in_grace_initially {
+                    let mut groups = state.named_groups.write().await;
+                    if let Some(info) = groups.get_mut(id) {
+                        info.owner_cert_reverify_required = false;
+                    }
+                    drop(groups);
+                    persist_named_groups_mutation(state, |groups| {
+                        if let Some(info) = groups.get_mut(id) {
+                            info.owner_cert_reverify_required = false;
+                        }
+                        true
+                    })
+                    .await
+                    .ok();
+                    return Some(Ok((commit, evicted_total.clone())));
+                }
+                // InGrace members remain (they were NOT evicted — not in
+                // this operation's Failed set): typed, retryable refusal;
+                // the evicted transitions are already committed/published.
+                return Some(Err(api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "owner-certified group has members pending certificate resolution: {:?}; \
+                         evictions committed, retry the seal once evidence converges",
+                        verdict.in_grace()
+                    ),
+                )));
+            }
             if !verdict.is_all_clean() {
-                // Round-4: no Failed members but some are InGrace — no
-                // clean seal may mint on a non-clean verdict, and the
-                // restore quarantine must stay set. Typed, retryable.
+                // No Failed members but some are InGrace — no clean seal
+                // may mint on a non-clean verdict, and the restore
+                // quarantine must stay set. Typed, retryable.
                 return Some(Err(api_error(
                     StatusCode::CONFLICT,
                     format!(
@@ -12621,19 +12671,10 @@ async fn owner_certified_seal_with_eviction(
                     ),
                 )));
             }
-            if let Some(commit) = last_commit {
-                // Round-2: after evictions, DO NOT mint an extra clean
-                // no-op commit — it is published by no event channel, so
-                // peers would stall one commit behind and reject the next
-                // mutation's chain link. The verdict is all-clean here, so
-                // the quarantine has legitimately lifted via the final
-                // clean seal below on a no-eviction call; with evictions
-                // the last eviction commit is the response.
-                return Some(Ok((commit, evicted_total.clone())));
-            }
-            // All-clean roster: one evidence-bearing seal consuming the
-            // SAME verdict instance (single evaluation; the seal
-            // re-derives nothing).
+            // All-clean roster from the start: one evidence-bearing seal
+            // consuming the SAME verdict instance (single evaluation; the
+            // seal re-derives nothing) — this legitimately lifts the
+            // quarantine.
             let commit = {
                 let groups = state.named_groups.read().await;
                 let Some(info) = groups.get(id) else {
@@ -12670,7 +12711,7 @@ async fn owner_certified_seal_with_eviction(
         // every event reconstructs the committed roster exactly, the GSS
         // secret rotates (or the TreeKEM leaf is cryptographically removed)
         // in the same commit, and receivers can validate each step.
-        let (evict_hex, failure) = failed[0].clone();
+        let (evict_hex, failure) = failed_queue.remove(0);
         tracing::warn!(
             group_id = %id,
             member = %evict_hex,
