@@ -5196,6 +5196,21 @@ async function createSpace(){
   if(desc)body.description=desc;
   const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
+    // ADR-0038 round-2 fix 4: when an EXPLICIT policy was sent, the daemon
+    // echoes the effective policy — validate it. Missing echo = older
+    // daemon silently ignored `policy` (mixed-version downgrade); mismatch
+    // = wrong policy applied. Fail loudly either way.
+    if(body.policy){
+      if(!r.policy){
+        toast('Daemon did not echo the applied policy — it may be an older version that ignored it. The space was created with the WRONG policy.','error');
+        if(r.group_id)toast('Delete space '+r.group_id+' or upgrade the daemon.','error');
+        return;
+      }
+      if(JSON.stringify(r.policy)!==JSON.stringify(body.policy)){
+        toast('Daemon applied a different policy than requested — space NOT created as intended.','error');
+        return;
+      }
+    }
     document.querySelector('.modal-overlay').remove();
     toast('Space "'+name+'" created','success');
     await pollGroups();

@@ -162,7 +162,7 @@ Disabled unless an exec ACL is loaded with `[exec].enabled = true`. See
 
 | Method | Path | CLI | Description |
 |---|---|---|---|
-| POST | `/groups` | `x0x group create` | Create named group |
+| POST | `/groups` | `x0x group create` | Create named group. May carry `preset` OR an explicit `policy` object (never both); an `OwnerCertified` policy additionally requires this daemon's certificate to chain to the claimed owner (403 otherwise). The response echoes the **effective** policy — third-party callers that send an explicit policy MUST compare the echo and treat a missing/mismatching one as a version downgrade (an older daemon silently ignores the unknown field and applies the default) |
 | GET | `/groups` | `x0x group list` | List groups |
 | GET | `/groups/:id` | `x0x group info` | Group info |
 | PATCH | `/groups/:id` | `x0x group update` | Update name/description (admin+) |

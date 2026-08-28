@@ -955,6 +955,11 @@ enum GroupSub {
         /// Policy preset: private_secure | public_request_secure | public_open | public_announce.
         #[arg(long)]
         preset: Option<String>,
+        /// Explicit full policy as JSON (mutually exclusive with --preset).
+        /// The daemon echoes the effective policy back; a missing/mismatched
+        /// echo (older daemon silently ignoring the field) fails loudly.
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Get group details.
     Info {
@@ -1809,6 +1814,7 @@ async fn run(
                 description,
                 display_name,
                 preset,
+                policy,
             }) => {
                 commands::group::create(
                     &client,
@@ -1816,6 +1822,7 @@ async fn run(
                     description.as_deref(),
                     display_name.as_deref(),
                     preset.as_deref(),
+                    policy.as_deref(),
                 )
                 .await
             }

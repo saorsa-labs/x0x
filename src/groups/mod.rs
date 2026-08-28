@@ -606,6 +606,31 @@ impl GroupInfo {
         );
     }
 
+    /// Whether the stored `state_hash` matches the state as currently
+    /// populated — i.e. nothing (including ADR-0038 `home` metadata, whose
+    /// digest rides the meta hash) changed since the last seal. Restore
+    /// paths use this to detect legacy-unsigned or tampered Home metadata
+    /// (round-2 fix 1): a `9c86f2d`-era Home (sealed before `home_digest`
+    /// existed) decodes with a state hash that does NOT commit to its
+    /// metadata.
+    #[must_use]
+    pub fn state_hash_is_current(&self) -> bool {
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        let policy_hash = state_commit::compute_policy_hash(&self.policy);
+        let meta_hash = state_commit::compute_public_meta_hash(&self.public_meta());
+        let recomputed = state_commit::compute_state_hash(
+            self.stable_group_id(),
+            self.state_revision,
+            self.prev_state_hash.as_deref(),
+            &roster_root,
+            &policy_hash,
+            &meta_hash,
+            self.security_binding.as_deref(),
+            self.withdrawn,
+        );
+        recomputed == self.state_hash
+    }
+
     /// Seal the current (already-mutated) state into a signed commit.
     ///
     /// - bumps `state_revision` by 1,

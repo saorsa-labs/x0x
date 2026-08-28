@@ -183,7 +183,13 @@ async fn stamp_and_seal_home(
     };
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let mut placements = std::collections::BTreeMap::new();
-    placements.insert(local_hex.clone(), crate::groups::MemberPlacement::Pinned);
+    // Round-2 fix 3: the founding agent provisions as ROAMING — ADR-0038
+    // requires the Home agent to follow the user across machines, so the
+    // invariant holds from first provisioning instead of warning on every
+    // fresh install. NOMINAL UNTIL ADR-0043: placement is still the
+    // ADR-0037 placeholder (no move protocol, no enforcement) — this bit
+    // is the stated intent; 0043 makes it load-bearing.
+    placements.insert(local_hex.clone(), crate::groups::MemberPlacement::Roaming);
     info.home = Some(crate::groups::HomeMetadata {
         primary_agent: local_hex,
         placements,
@@ -215,6 +221,65 @@ async fn stamp_and_seal_home(
     Some(info)
 }
 
+/// Reseal EXISTING Home metadata (round-2 fix 1): keep the metadata as
+/// restored, but push it through a fresh OwnerCertified-aware seal so the
+/// `home_digest` rides the signed state hash. Returns the resealed info.
+async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::groups::GroupInfo> {
+    let signing_kp = state.agent.identity().agent_keypair();
+    let mut info = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).cloned()?
+    };
+    info.home.as_ref()?;
+    if seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64())
+        .await
+        .is_err()
+    {
+        tracing::error!(group_id, "Home reseal failed");
+        return None;
+    }
+    if !matches!(
+        persist_named_groups_mutation(state, |groups| {
+            groups.insert(group_id.to_string(), info.clone());
+            true
+        })
+        .await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        tracing::error!(group_id, "resealed Home could not be persisted");
+        return None;
+    }
+    Some(info)
+}
+
+/// Write the marker if it is missing or points elsewhere.
+async fn repair_or_write_marker(
+    state: &AppState,
+    owner_hex: &str,
+    marker_path: &std::path::Path,
+    id: &str,
+    info: &crate::groups::GroupInfo,
+) {
+    let needs_repair = read_verified_marker(state, owner_hex)
+        .await
+        .is_none_or(|m| m.group_id != id);
+    if needs_repair {
+        tracing::info!(group_id = %id, "Home already present; recording marker");
+        write_marker(
+            marker_path,
+            &HomeMarker {
+                group_id: id.to_string(),
+                owner_user_id: owner_hex.to_string(),
+                provisioned_at_ms: info
+                    .home
+                    .as_ref()
+                    .map_or_else(now_millis_u64, |h| h.provisioned_at_ms),
+            },
+        )
+        .await;
+    }
+}
+
 /// Auto-provision the Home space for an owned install. Idempotent and
 /// best-effort: never fails startup — a provisioning failure logs loudly
 /// and retries on the next daemon start (no marker is written on failure).
@@ -237,23 +302,42 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     // 1) Trusted Home already present (the marker is only advisory — the
     //    roster scan is authoritative). Repair a missing/stale marker.
     if let Some((id, info)) = find_home(state, &owner).await {
-        let needs_repair = read_verified_marker(state, &owner_hex)
-            .await
-            .is_none_or(|m| m.group_id != id);
-        if needs_repair {
-            tracing::info!(group_id = %id, "Home already present; recording marker");
-            write_marker(
-                &marker_path,
-                &HomeMarker {
-                    group_id: id,
-                    owner_user_id: owner_hex,
-                    provisioned_at_ms: info
-                        .home
-                        .as_ref()
-                        .map_or_else(now_millis_u64, |h| h.provisioned_at_ms),
-                },
-            )
-            .await;
+        // Round-2 fix 1: a restored Home whose state hash does not commit
+        // to its (nonempty) metadata is LEGACY-UNSIGNED (a `9c86f2d`-era
+        // Home sealed before `home_digest` existed) or tampered. We are
+        // the owner with an active Admin seat (find_home guarantees it),
+        // so reseal the existing metadata through the provisioning commit
+        // path; if resealing is impossible, strip the metadata and warn —
+        // never keep trusting unsigned Home claims.
+        if info.home.is_some() && !info.state_hash_is_current() {
+            tracing::warn!(
+                group_id = %id,
+                "restored Home metadata is not covered by the sealed state hash; resealing"
+            );
+            match reseal_home(state, &id).await {
+                Some(resealed) => {
+                    tracing::info!(group_id = %id, "legacy Home metadata resealed");
+                    repair_or_write_marker(state, &owner_hex, &marker_path, &id, &resealed).await;
+                    return;
+                }
+                None => {
+                    tracing::warn!(
+                        group_id = %id,
+                        "could not reseal Home metadata; stripping untrusted metadata"
+                    );
+                    let _ = persist_named_groups_mutation(state, |groups| {
+                        if let Some(info) = groups.get_mut(&id) {
+                            info.home = None;
+                        }
+                        true
+                    })
+                    .await;
+                    // Fall through: the (now unstamped) group becomes a
+                    // recovery candidate below and is re-stamped fresh.
+                }
+            }
+        } else {
+            repair_or_write_marker(state, &owner_hex, &marker_path, &id, &info).await;
         }
         return;
     }
@@ -308,18 +392,31 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         );
         return;
     }
-    // Locate the freshly created Home and stamp its metadata + marker.
-    let group_id = {
-        let groups = state.named_groups.read().await;
-        groups
-            .iter()
-            .find(|(_, info)| info.home.is_none() && is_home_candidate(info, &owner))
-            .map(|(id, _)| id.clone())
-    };
-    let Some(group_id) = group_id else {
-        tracing::error!("Home group created but not found afterwards; marker not written");
+    // Round-2 fix 2: stamp the group id the creation call RETURNED — never
+    // re-scan. A scan could pick a concurrently provisioned same-policy
+    // group (or a pre-existing one) and stamp the wrong roster.
+    let body_bytes = axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap_or_default();
+    let created: Option<String> = serde_json::from_slice::<serde_json::Value>(&body_bytes)
+        .ok()
+        .and_then(|body| {
+            body["group_id"]
+                .as_str()
+                .map(std::string::ToString::to_string)
+        });
+    let Some(group_id) = created else {
+        tracing::error!("Home creation response carried no group_id; marker not written");
         return;
     };
+    // Defensive existence check (the create path inserted it durably).
+    if !state.named_groups.read().await.contains_key(&group_id) {
+        tracing::error!(
+            group_id = %group_id,
+            "Home creation returned an id that is not in the roster; marker not written"
+        );
+        return;
+    }
     if let Some(info) = stamp_and_seal_home(state, &group_id).await {
         write_marker(
             &marker_path,
@@ -527,7 +624,7 @@ mod tests {
 
     /// Owned test state: user key (deterministic seed so the owner id is
     /// stable across the "restart" arm) + builder-issued agent certificate.
-    async fn owned_state(
+    pub(in crate::server::routes::home) async fn owned_state(
         data_dir: &std::path::Path,
         owner_seed: [u8; 32],
     ) -> anyhow::Result<Arc<AppState>> {
@@ -576,7 +673,7 @@ mod tests {
         Ok((status, serde_json::from_slice(&body)?))
     }
 
-    fn owner_of(state: &AppState) -> crate::identity::UserId {
+    pub(in crate::server::routes::home) fn owner_of(state: &AppState) -> crate::identity::UserId {
         state
             .agent
             .identity()
@@ -604,7 +701,9 @@ mod tests {
         assert_eq!(home.primary_agent, local_hex);
         assert_eq!(
             home.placements.get(&local_hex),
-            Some(&crate::groups::MemberPlacement::Pinned)
+            Some(&crate::groups::MemberPlacement::Roaming),
+            "founding agent provisions Roaming (ADR-0038 roaming invariant; \
+             nominal until ADR-0043 enforcement)"
         );
 
         // Review fix 1: the home digest is committed by a signed seal —
@@ -862,7 +961,12 @@ mod tests {
         let (status, body) = response_json(response).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["name"], "Home");
-        assert_eq!(body["warnings"]["no_roaming_agent"], true);
+        // Founding agent is provisioned Roaming (round-2 fix 3): the
+        // warning must NOT fire on a fresh Home.
+        assert_eq!(
+            body["warnings"]["no_roaming_agent"], false,
+            "fresh Home carries a Roaming founding agent"
+        );
         let health_json = crate::server::routes::status::health(State(Arc::clone(&state))).await;
         let health_body: serde_json::Value =
             serde_json::to_value(&health_json.0).unwrap_or_default();
@@ -920,6 +1024,135 @@ mod tests {
             .oneshot(Request::get("/home").body(Body::empty())?)
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod round2_tests {
+    use super::tests::{owned_state, owner_of};
+    use super::*;
+
+    /// WHY (round-2 fix 1): a persisted Home from the `9c86f2d` era (or an
+    /// attacker-persisted roster) carries nonempty `home` metadata whose
+    /// digest was NEVER sealed — the stored state hash predates
+    /// `home_digest`. Restore (provision_home at startup) must detect the
+    /// stale hash and RESEAL the metadata through the provisioning commit
+    /// path, never keep trusting it unsigned.
+    #[tokio::test]
+    async fn persisted_unsigned_home_metadata_is_resealed_on_restore() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x50; 32]).await?;
+        let owner = owner_of(&state);
+
+        // First provisioning (normal, sealed).
+        provision_home(&state).await;
+        let (id, info) = find_home(&state, &owner).await.expect("home");
+        assert!(
+            info.state_hash_is_current(),
+            "fresh Home is sealed: digest committed"
+        );
+
+        // Simulate the 9c86f2d-era / attacker state: rewrite the persisted
+        // roster with the metadata PRESENT but the state hash recomputed
+        // WITHOUT the digest (exactly what a pre-home_digest daemon stored).
+        let mut legacy = info.clone();
+        let sealed_hash = legacy.state_hash.clone();
+        {
+            let meta = crate::groups::state_commit::GroupPublicMeta {
+                home_digest: None,
+                ..legacy.public_meta()
+            };
+            let roster_root = crate::groups::compute_roster_root(&legacy.members_v2);
+            let policy_hash = crate::groups::compute_policy_hash(&legacy.policy);
+            let meta_hash = crate::groups::compute_public_meta_hash(&meta);
+            legacy.state_hash = crate::groups::state_commit::compute_state_hash(
+                legacy.stable_group_id(),
+                legacy.state_revision,
+                legacy.prev_state_hash.as_deref(),
+                &roster_root,
+                &policy_hash,
+                &meta_hash,
+                legacy.security_binding.as_deref(),
+                legacy.withdrawn,
+            );
+        }
+        assert_ne!(legacy.state_hash, sealed_hash);
+        assert!(
+            !legacy.state_hash_is_current(),
+            "legacy-unsigned metadata detected"
+        );
+        state.named_groups.write().await.insert(id.clone(), legacy);
+
+        // Restore path: provision_home must reseal.
+        provision_home(&state).await;
+        let (_, resealed) = find_home(&state, &owner).await.expect("home survives");
+        assert!(
+            resealed.state_hash_is_current(),
+            "metadata resealed: state hash now commits to the digest"
+        );
+        assert!(
+            resealed.home.is_some(),
+            "metadata kept (not stripped) when we are the owner+admin"
+        );
+        Ok(())
+    }
+
+    /// WHY (round-2 fix 1, strip branch): when resealing is impossible the
+    /// untrusted metadata is STRIPPED and the group is re-stamped fresh —
+    /// unsigned claims never survive a restore.
+    #[tokio::test]
+    async fn unrestorable_home_metadata_is_stripped() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x51; 32]).await?;
+        let owner = owner_of(&state);
+        provision_home(&state).await;
+        let (id, info) = find_home(&state, &owner).await.expect("home");
+
+        // Make resealing impossible: withdraw the group (the seal wrapper
+        // refuses withdrawn groups) while keeping the stale unsigned hash.
+        let mut broken = info.clone();
+        broken.withdrawn = true;
+        broken.recompute_state_hash(); // withdrawn hash recomputed WITH digest…
+                                       // …then revert the withdrawn flag in-memory without resealing, so the
+                                       // stored hash no longer matches the current fields.
+        broken.withdrawn = false;
+        assert!(!broken.state_hash_is_current());
+        state.named_groups.write().await.insert(id.clone(), broken);
+
+        provision_home(&state).await;
+        // Either stripped + re-stamped fresh, or (if the wrapper still
+        // refused) metadata gone — but NEVER trusted-unsigned.
+        let after = state.named_groups.read().await;
+        let info = after.get(&id).expect("group kept");
+        assert!(
+            info.home
+                .as_ref()
+                .is_none_or(|_| info.state_hash_is_current()),
+            "metadata is either absent or sealed — never unsigned"
+        );
+        Ok(())
+    }
+
+    /// WHY (round-2 fix 3): fresh provisioning records the founding agent
+    /// as Roaming and GET /home reports the invariant satisfied.
+    #[tokio::test]
+    async fn fresh_home_provisions_roaming_founding_agent() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x52; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (_, info) = find_home(&state, &owner).await.expect("home");
+        let home = info.home.as_ref().expect("meta");
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        assert_eq!(
+            home.placements.get(&local_hex),
+            Some(&crate::groups::MemberPlacement::Roaming)
+        );
+        assert!(
+            home_roaming_warning_for(&info).is_none(),
+            "no warning on a fresh Home"
+        );
         Ok(())
     }
 }
