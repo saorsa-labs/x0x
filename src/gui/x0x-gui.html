@@ -584,6 +584,7 @@ tr:hover td{background:rgba(255,255,255,.01)}
     <div class="chain" id="sb-chain"></div>
   </div>
   <div class="sb-section" style="flex:1;overflow-y:auto">
+    <div class="sb-item" id="sb-home" onclick="navigate('homespace')"><span class="icon">&#127968;</span><span>Home</span></div>
     <div class="sb-section-title" onclick="toggleSection('spaces')" style="cursor:pointer">
       <span>Spaces</span>
       <span style="display:flex;gap:2px">
@@ -1592,6 +1593,7 @@ function renderView(){
   el.className='main-content animate-in';
   switch(view){
     case 'home':el.innerHTML=renderHome();mountHome();break;
+    case 'homespace':el.innerHTML=renderHomeSpace();mountHomeSpace();break;
     case 'space':el.innerHTML=renderSpace();mountSpace();break;
     case 'dm':el.innerHTML=renderDm();mountDm();break;
     case 'discover':el.innerHTML=renderDiscover();mountDiscover();break;
@@ -1670,6 +1672,104 @@ function renderHome(){
 
 function mountHome(){
   pollDash();
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   ADR-0038 HOME SPACE VIEW — the owner's personal space (distinct from
+   this dashboard). Renders the auto-provisioned Home group's chat via
+   the standard space plumbing (renderSpaceChat/sendSpaceChat key off
+   S.get('spaceId')), plus the primary-agent panel, member self-names
+   (ADR-0036), the roaming warning, and the "speaking as … (owner)" chip
+   on the composer when a human_name is set.
+   ═══════════════════════════════════════════════════════════════════ */
+function renderHomeSpace(){
+  const hd=S.get('homeData');
+  if(!hd){
+    return `<h2>Home</h2><div class="card">Loading Home…</div>`;
+  }
+  const membersHtml=(hd.members||[]).map(m=>{
+    const label=m.self_name||short(m.agent_id,10);
+    const isPrimary=m.agent_id===hd.primary_agent.agent_id;
+    return `<div class="row" style="justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--bd)">
+      <span>${esc(label)}${isPrimary?' <span class="tag" style="background:var(--cy);color:var(--bg1)">primary</span>':''}</span>
+      <span class="tag">${m.placement||'pinned'}</span>
+    </div>`;
+  }).join('');
+  const warn=hd.warnings&&hd.warnings.no_roaming_agent
+    ?`<div class="card" style="border-color:var(--wn,#c90);margin:8px 0">⚠ Home has no Roaming agent — it will not follow you to a new machine until one is marked Roaming (ADR-0037).</div>`
+    :'';
+  return `<div class="row mb" style="justify-content:space-between;align-items:center">
+    <h2 style="margin:0">🏠 ${esc(hd.name||'Home')}</h2>
+    <div class="row" style="gap:4px">
+      <button class="ghost" onclick="renameHomeSpace()" title="Rename Home">✏️</button>
+    </div>
+  </div>
+  ${warn}
+  <div class="card mb" id="home-primary-panel">
+    <div class="label" style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--tx3)">Primary agent</div>
+    <div class="row" style="gap:8px;align-items:center;margin-top:4px">
+      <span style="font-size:20px">🤖</span>
+      <div>
+        <div>${esc(hd.primary_agent.self_name||short(hd.primary_agent.agent_id,12))}</div>
+        <div style="font-size:11px;color:var(--tx3)">${short(hd.primary_agent.agent_id,16)} · speaks for the owner</div>
+      </div>
+    </div>
+    <div class="label" style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--tx3);margin-top:10px">Members</div>
+    ${membersHtml}
+  </div>
+  <div id="home-chat"></div>`;
+}
+
+async function mountHomeSpace(){
+  const hd=await api('/home');
+  if(!hd||!hd.ok){
+    document.getElementById('view-container').innerHTML=
+      `<h2>Home</h2><div class="card">No Home space${hd&&hd.error?' — '+esc(hd.error):''}. An owned install provisions one at daemon start.</div>`;
+    return;
+  }
+  S.set('homeData',hd);
+  // The shell rendered before the fetch resolved ("Loading Home…") —
+  // re-render now that the metadata is in state.
+  document.getElementById('view-container').innerHTML=renderHomeSpace();
+  // Reuse the standard space plumbing: renderSpaceChat + sendSpaceChat
+  // both key off S.get('spaceId').
+  const sid=hd.group_id;
+  S.set('spaceId',sid);
+  S.set('spaceApp','chat');
+  const g=await api('/groups/'+sid);
+  if(g&&g.ok){
+    spaceChatTopic=g.chat_topic||'';
+    if(spaceChatTopic)wsSub(spaceChatTopic);
+    currentSpaceConfidentiality=(g.policy&&g.policy.confidentiality)||'';
+  }
+  const chan=S.get('channel')||'general';
+  currentChannelTopic=getChannelTopic(sid,chan);
+  wsSub(currentChannelTopic);
+  renderSidebar();
+  const el=document.getElementById('home-chat');
+  if(el)renderSpaceChat(el,sid);
+  // Owner chip on the composer when the profile has a human_name
+  // (ADR-0038: the human participates through the primary agent).
+  const human=hd.human_name;
+  const chatIn=document.getElementById('chat-in');
+  if(human&&chatIn&&chatIn.parentElement){
+    const chip=document.createElement('span');
+    chip.id='home-owner-chip';
+    chip.title='Messages are signed by your primary agent';
+    chip.style.cssText='align-self:center;font-size:11px;padding:2px 8px;border-radius:10px;background:var(--cy);color:var(--bg1);white-space:nowrap';
+    chip.textContent='speaking as '+human+' (owner)';
+    chatIn.parentElement.insertBefore(chip,chatIn);
+  }
+}
+
+function renameHomeSpace(){
+  const hd=S.get('homeData');
+  const cur=hd?(hd.name||'Home'):'Home';
+  const name=prompt('Rename Home:',cur);
+  if(!name||name===cur)return;
+  api('/home/rename',{method:'POST',body:JSON.stringify({name})}).then(r=>{
+    if(r&&r.ok){mountHomeSpace();renderSidebar();}
+  });
 }
 
 function renderUpgradeBanner(upg){

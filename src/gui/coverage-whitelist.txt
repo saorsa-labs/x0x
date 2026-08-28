@@ -39,3 +39,8 @@ GET /gui
 
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
+
+# ── ADR-0038 Home space — entered from the sidebar via navigate('homespace'),
+# not a URL the coverage crawler follows from /api listing. GUI calls both.
+GET /home
+POST /home/rename
