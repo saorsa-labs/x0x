@@ -330,7 +330,7 @@ pub async fn write_private_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
 /// # Returns
 ///
 /// The path to the .x0x directory in the user's home directory
-async fn x0x_dir() -> Result<std::path::PathBuf> {
+pub(crate) async fn x0x_dir() -> Result<std::path::PathBuf> {
     let home = dirs::home_dir().ok_or_else(|| {
         IdentityError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,

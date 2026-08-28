@@ -73,6 +73,7 @@ fn discovered_agent(
     now_secs: u64,
 ) -> DiscoveredAgent {
     DiscoveredAgent {
+        self_name: None,
         agent_id: agent.agent_id(),
         machine_id: agent.machine_id(),
         user_id: None,

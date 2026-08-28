@@ -152,6 +152,7 @@ async fn test_online_agents_uses_presence_beacon_liveness() -> Result<(), Box<dy
 
     agent
         .insert_discovered_agent_for_testing(DiscoveredAgent {
+            self_name: None,
             agent_id,
             machine_id: MachineId(peer_bytes),
             user_id: None,

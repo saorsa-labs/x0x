@@ -714,6 +714,11 @@ pub(super) struct AppState {
     /// seal to us. Replaces the earlier publicly-derivable envelope key.
     pub(super) agent_kem_keypair: Arc<x0x::groups::kem_envelope::AgentKemKeypair>,
     pub(super) contacts: Arc<RwLock<ContactStore>>,
+    /// ADR-0036 daemon self-profile (human/agent/machine names). Mutated by
+    /// `PUT /profile`, persisted at `profile_path` (`<data_dir>/profile.json`).
+    pub(super) profile: RwLock<x0x::profile::SelfProfile>,
+    /// On-disk location of the self-profile.
+    pub(super) profile_path: PathBuf,
     pub(super) mls_groups: RwLock<HashMap<String, x0x::mls::MlsGroup>>,
     #[allow(dead_code)]
     pub(super) mls_groups_path: PathBuf,

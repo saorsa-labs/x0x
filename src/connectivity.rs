@@ -504,6 +504,7 @@ mod tests {
         is_coordinator: Option<bool>,
     ) -> DiscoveredAgent {
         DiscoveredAgent {
+            self_name: None,
             agent_id: AgentId([1u8; 32]),
             machine_id: MachineId([2u8; 32]),
             user_id: None,

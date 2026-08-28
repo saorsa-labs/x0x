@@ -22,6 +22,9 @@ pub(in crate::server) struct DiscoveredAgentEntry {
     pub(in crate::server) addresses: Vec<String>,
     pub(in crate::server) announced_at: u64,
     pub(in crate::server) last_seen: u64,
+    /// ADR-0036 agent self-name from the V3 announce, when the peer set one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(in crate::server) self_name: Option<String>,
 }
 
 /// Discovered machine endpoint entry from machine announcements.
@@ -68,6 +71,8 @@ pub(in crate::server) fn discovered_agent_entry(
         addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
         announced_at: agent.announced_at,
         last_seen: agent.last_seen,
+        // Some("") is the internal explicit-clear marker — never display it.
+        self_name: agent.self_name.filter(|n| !n.is_empty()),
     }
 }
 

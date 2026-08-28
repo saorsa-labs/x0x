@@ -48,24 +48,25 @@ use routes::{
     forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
     get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, gossip_diagnostics, group_membership_lock, groups_diagnostics,
-    handle_file_message, handle_join_result_message, handle_treekem_catchup_request,
-    handle_treekem_catchup_response, handle_welcome_blob_message, health, history_diagnostics,
-    history_list, history_message, history_purge, history_search, history_stats,
-    identity_revocations, identity_revoke, import_agent_card, import_group_card,
+    get_named_group_members, get_profile, gossip_diagnostics, group_membership_lock,
+    groups_diagnostics, handle_file_message, handle_join_result_message,
+    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
+    health, history_diagnostics, history_list, history_message, history_purge, history_search,
+    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
     list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
     mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, peer_health_handler, peers, pin_machine, presence,
-    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    network_status, now_millis_u64, owner_agents, peer_health_handler, peers, pin_machine,
+    presence, presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler,
+    publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
+    relay_diagnostics, remove_mls_member, remove_named_group_member,
+    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
+    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -73,15 +74,15 @@ use routes::{
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
     unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
-    update_member_role, update_named_group, update_task, withdraw_group_state, AtomicWriteOutcome,
-    JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent, PendingListenerAdmission,
-    PredecessorRelayObligation, PublicGroupBootstrap, SelfPublishedReleaseManifests,
-    TreeKemCatchupRequest, TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
-    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
-    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    update_member_role, update_named_group, update_profile, update_task, withdraw_group_state,
+    AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
+    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
+    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
+    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
+    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -176,6 +177,137 @@ pub async fn run_update_check_and_report(
         println!("self-update check skipped by --skip-update-check");
     }
     Ok(())
+}
+
+/// Resolve where `x0x user-id create` recorded the install's owner.
+///
+/// Mirrors the CLI's write side exactly: the owner profile is a sibling of
+/// the user key file — the explicit `user_key_path` when configured, the
+/// daemon's identity dir otherwise (which is the instance data dir for
+/// named instances and `~/.x0x` for the default install).
+fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> Option<PathBuf> {
+    if let Some(ref key_path) = config.user_key_path {
+        return Some(x0x::profile::OwnerProfile::path_for_key(key_path));
+    }
+    if let Some(dir) = identity_dir {
+        return Some(dir.join(x0x::profile::OWNER_PROFILE_FILE));
+    }
+    // Default install (review P0): no explicit user_key_path and no identity
+    // dir — the user key lives at ~/.x0x/user.key, so the owner record is
+    // its sibling. Returning None here would silently disable enforcement
+    // for every default install.
+    dirs::home_dir().map(|home| home.join(".x0x").join(x0x::profile::OWNER_PROFILE_FILE))
+}
+
+/// ADR-0036 owner singleton enforcement (daemon side).
+///
+/// Runs BEFORE `AgentBuilder::build()` (review R2 regression): by the time
+/// the builder returns, a replacement user key has already re-issued and
+/// SAVED `agent.cert` and the network/exec tasks exist — rejecting after
+/// build would leave persisted state and spawned tasks behind a refused
+/// key. This pre-build check resolves the user key exactly as the builder
+/// will (explicit `user_key_path` > identity-dir `user.key` > default
+/// `~/.x0x/user.key`), loads it directly (fail-closed on a corrupt key),
+/// and compares against the recorded owner — so NOTHING persists or spawns
+/// on a mismatched key. Replacing the owner is the explicit
+/// `x0x user-id create --rotate-owner` act (which also causes the agent
+/// certificates to be re-issued on the next start, because the existing
+/// certs no longer bind to the new owner).
+async fn enforce_owner_singleton_prebuild(
+    config: &DaemonConfig,
+    identity_dir: &Option<PathBuf>,
+) -> anyhow::Result<()> {
+    let Some(owner_path) = owner_profile_path(config, identity_dir) else {
+        return Ok(());
+    };
+    // Mirror AgentBuilder's user-key precedence exactly (lib.rs resolve
+    // step): explicit path > identity dir > default ~/.x0x/user.key.
+    let key_path = match (&config.user_key_path, identity_dir) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(dir)) => Some(dir.join("user.key")),
+        (None, None) => dirs::home_dir().map(|h| h.join(".x0x").join("user.key")),
+    };
+    // R3 fix: load the OWNER RECORD FIRST — a recorded owner demands a
+    // matching key, whatever the key slot looks like. Only an UNRECORDED
+    // install may start keyless (anonymous opt-in) or adopt.
+    let owner = x0x::profile::OwnerProfile::load_from(&owner_path)
+        .await
+        .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?;
+
+    let Some(key_path) = key_path else {
+        // No key path resolvable at all: refuse only when an owner is
+        // recorded (a keyless host cannot load the owner's key by design).
+        return match owner {
+            Some(owner) => Err(anyhow::anyhow!(
+                "install is owned by user {} but no user key path is resolvable; \
+                 restore the owner's user.key or run `x0x user-id create --rotate-owner`",
+                owner.user_id
+            )),
+            None => Ok(()),
+        };
+    };
+    match tokio::fs::try_exists(&key_path).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // R3 fix (regression): a RECORDED owner whose key is absent
+            // must refuse — starting anonymously would silently drop the
+            // install's authority. No owner recorded + no key = legitimate
+            // anonymous opt-in.
+            return match owner {
+                Some(owner) => Err(anyhow::anyhow!(
+                    "install is owned by user {} but the user key is missing at {}; \
+                     restore the key or run `x0x user-id create --rotate-owner`",
+                    owner.user_id,
+                    key_path.display()
+                )),
+                None => Ok(()),
+            };
+        }
+        // stat itself failed: we cannot prove the key present or absent —
+        // fail closed rather than guess.
+        Err(e) => {
+            if owner.is_some() {
+                return Err(anyhow::anyhow!(
+                    "cannot determine whether the owner's user key exists at {}: {e}",
+                    key_path.display()
+                ));
+            }
+        }
+    }
+    // Fail closed on an unreadable key — the same class of error the
+    // builder now refuses on; catch it here BEFORE anything persists.
+    let key = x0x::storage::load_user_keypair_from(&key_path)
+        .await
+        .with_context(|| format!("user key at {} is unreadable", key_path.display()))?;
+    let loaded_id = hex::encode(key.user_id().as_bytes());
+    match owner {
+        Some(owner) if owner.user_id == loaded_id => Ok(()),
+        Some(owner) => Err(anyhow::anyhow!(
+            "install is owned by user {} but {} resolves to {}; \
+             run `x0x user-id create --rotate-owner` to replace the owner \
+             (agent certificates are re-issued on the next start)",
+            owner.user_id,
+            key_path.display(),
+            loaded_id
+        )),
+        None => {
+            // Migration (review P0): an install from before ADR-0036 has a
+            // user key but no owner record — adopt the resident identity as
+            // the owner on first start so enforcement applies from now on.
+            let adopted = x0x::profile::OwnerProfile {
+                user_id: loaded_id,
+                human_name: None,
+            };
+            adopted.save_to(&owner_path).await.with_context(|| {
+                format!("failed to record adopted owner at {}", owner_path.display())
+            })?;
+            tracing::info!(
+                owner = %adopted.user_id,
+                "adopted existing user identity as install owner (ADR-0036 migration)"
+            );
+            Ok(())
+        }
+    }
 }
 
 /// Start the x0x server in-process and return a [`ServerHandle`].
@@ -514,6 +646,18 @@ pub async fn serve_with_options(
         agent_kem_keypair.public_bytes.len()
     );
 
+    // ADR-0036 (review R2 regression fix): enforce the owner singleton
+    // BEFORE the builder runs — a mismatched user key must not re-issue and
+    // persist agent.cert, and no network/exec task may exist for a key the
+    // install refuses to adopt.
+    //
+    // ACCEPTED side effects of earlier startup steps (data-dir creation,
+    // API token, KEM keypair — review R3): none of them grants identity or
+    // authority; they are inert files/keys without an adopted agent, so
+    // creating them before this check is harmless and no restructure is
+    // needed.
+    enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
+
     // All agent-independent fallible startup has succeeded. Build the agent now
     // (this spawns the network tasks and binds the QUIC socket). From here on,
     // any fallible step must `agent.shutdown().await` on the error path so a
@@ -639,6 +783,17 @@ pub async fn serve_with_options(
     // into the RwLock below).
     let treekem_groups = restore_treekem_groups(&named_groups, agent.as_ref(), &treekem_dir).await;
 
+    // ADR-0036: load the daemon self-profile (names) and enforce the owner
+    // singleton — an install whose recorded owner differs from the user key
+    // the daemon just loaded refuses to start. Rotation is an explicit,
+    // deliberate act (`x0x user-id create --rotate-owner`).
+    let profile_path = x0x::profile::SelfProfile::path_in(&config.data_dir);
+    let profile = x0x::profile::SelfProfile::load_from(&profile_path)
+        .await
+        .context("failed to load self-profile from data dir")?
+        .unwrap_or_default();
+    agent.set_self_name(profile.display_name.clone());
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         history_record_topics: config.history.record_topics.clone(),
@@ -677,6 +832,8 @@ pub async fn serve_with_options(
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),
+        profile: RwLock::new(profile),
+        profile_path,
         mls_groups_path,
         pending_join_results: RwLock::new(HashMap::new()),
         expected_join_result_inviters: StdMutex::new(HashMap::new()),
@@ -1478,6 +1635,8 @@ pub async fn serve_with_options(
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/profile", get(get_profile).put(update_profile))
+        .route("/owner/agents", get(owner_agents))
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))
@@ -3052,5 +3211,163 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // replay acquires its own membership lock via _inner_serialized.
     if let Some(gid) = replay_after {
         replay_pending_causal_approvals(relay_state, &gid).await;
+    }
+}
+
+#[cfg(test)]
+mod owner_singleton_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// WHY (review P0): the default daemon runs with no explicit
+    /// `user_key_path` and no `identity_dir`; the owner record is the
+    /// sibling of the default `~/.x0x/user.key`. A `None` here silently
+    /// disabled enforcement for every default install.
+    #[test]
+    fn owner_profile_path_resolves_default_install() {
+        let config = DaemonConfig {
+            user_key_path: None,
+            ..DaemonConfig::default()
+        };
+        let path = owner_profile_path(&config, &None).expect("default install must resolve");
+        assert!(path.ends_with(".x0x/owner.json") || path.ends_with(".x0x\\owner.json"));
+
+        // Explicit user key path wins (sibling of that key).
+        let custom = PathBuf::from("/custom/dir/user.key");
+        let config = DaemonConfig {
+            user_key_path: Some(custom.clone()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            owner_profile_path(&config, &None),
+            Some(x0x::profile::OwnerProfile::path_for_key(&custom))
+        );
+
+        // Identity dir (named instances) scopes the record into it.
+        let dir = PathBuf::from("/instance/data");
+        assert_eq!(
+            owner_profile_path(&DaemonConfig::default(), &Some(dir.clone())),
+            Some(dir.join(x0x::profile::OWNER_PROFILE_FILE))
+        );
+    }
+
+    /// WHY (review R2 regression): enforcement must run BEFORE the builder —
+    /// a mismatched key must not re-issue/persist agent.cert nor spawn tasks.
+    /// Simulated at the unit level: adoption on first sight of an ownerless
+    /// key, refusal when the resident key later differs from the record.
+    #[tokio::test]
+    async fn prebuild_enforcement_adopts_then_refuses_mismatch_without_building() {
+        use x0x::storage::{load_user_keypair_from, save_user_keypair_to};
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        let config = DaemonConfig {
+            user_key_path: Some(key_path.clone()),
+            ..DaemonConfig::default()
+        };
+
+        // Resident key, no owner record: adopt on first check.
+        let first = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&first, &key_path).await.unwrap();
+        enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .unwrap();
+        let owner_path = owner_profile_path(&config, &None).unwrap();
+        let adopted = x0x::profile::OwnerProfile::load_from(&owner_path)
+            .await
+            .unwrap()
+            .expect("adopted owner record exists");
+        assert_eq!(
+            adopted.user_id,
+            hex::encode(
+                load_user_keypair_from(&key_path)
+                    .await
+                    .unwrap()
+                    .user_id()
+                    .as_bytes()
+            )
+        );
+
+        // Swap the resident key (as an accidental overwrite would): refuse —
+        // the pre-build check rejects BEFORE any builder work.
+        let second = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&second, &key_path).await.unwrap();
+        let err = enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .expect_err("mismatched resident key must refuse pre-build");
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error must name the escape hatch: {err}"
+        );
+    }
+
+    /// WHY (R3 regression of the round-2 no-key refusal): a RECORDED owner
+    /// whose key file is MISSING must refuse startup — starting anonymously
+    /// would silently drop the install's authority. An unrecorded install
+    /// with no key stays a legitimate anonymous opt-in.
+    #[tokio::test]
+    async fn prebuild_enforcement_refuses_missing_key_for_recorded_owner() {
+        use x0x::storage::save_user_keypair_to;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        let config = DaemonConfig {
+            user_key_path: Some(key_path.clone()),
+            ..DaemonConfig::default()
+        };
+        // Record an owner (via create-style adoption), then LOSE the key.
+        let key = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&key, &key_path).await.unwrap();
+        enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&key_path).await.unwrap();
+
+        let err = enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .expect_err("missing key for a recorded owner must refuse");
+        assert!(
+            err.to_string().contains("user key is missing"),
+            "error names the reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error names the escape hatch: {err}"
+        );
+
+        // No owner recorded + no key: anonymous opt-in, no refusal.
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean = DaemonConfig {
+            user_key_path: Some(clean_dir.path().join("user.key")),
+            ..DaemonConfig::default()
+        };
+        enforce_owner_singleton_prebuild(&clean, &None)
+            .await
+            .expect("unrecorded install with no key starts anonymously");
+    }
+
+    /// WHY (review R2 regression): a CORRUPT user key must refuse BEFORE
+    /// build too — the builder would otherwise hard-fail later with a
+    /// different (persisted-state-adjacent) error, or worse, on legacy
+    /// paths silently degrade.
+    #[tokio::test]
+    async fn prebuild_enforcement_refuses_corrupt_user_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        tokio::fs::write(&key_path, b"garbage-not-a-key")
+            .await
+            .unwrap();
+        let config = DaemonConfig {
+            user_key_path: Some(key_path.clone()),
+            ..DaemonConfig::default()
+        };
+        let err = enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .expect_err("corrupt user key must refuse pre-build");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "error names the reason: {err}"
+        );
     }
 }

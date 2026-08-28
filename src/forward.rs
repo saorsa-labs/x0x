@@ -1983,6 +1983,7 @@ mod tests {
         cache.insert(
             agent_id,
             crate::DiscoveredAgent {
+                self_name: None,
                 agent_id,
                 machine_id: machine,
                 user_id: None,
@@ -2847,6 +2848,7 @@ mod tests {
             cache_map.insert(
                 id,
                 crate::DiscoveredAgent {
+                    self_name: None,
                     agent_id: id,
                     machine_id: machine,
                     user_id: None,
@@ -2935,6 +2937,7 @@ mod tests {
         cache_map.insert(
             agent,
             crate::DiscoveredAgent {
+                self_name: None,
                 agent_id: agent,
                 machine_id: machine,
                 user_id: None,

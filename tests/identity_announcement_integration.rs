@@ -401,6 +401,7 @@ fn fake_agent(last_seen: u64) -> DiscoveredAgent {
 
 fn fake_agent_with_timestamps(announced_at: u64, last_seen: u64) -> DiscoveredAgent {
     DiscoveredAgent {
+        self_name: None,
         agent_id: x0x::identity::AgentId([1u8; 32]),
         machine_id: x0x::identity::MachineId([2u8; 32]),
         user_id: None,

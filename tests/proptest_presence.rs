@@ -63,6 +63,7 @@ proptest! {
                 agent_id,
                 machine_id,
                 user_id: None,
+                self_name: None,
                 addresses: Vec::new(),
                 announced_at: 1,
                 last_seen: 1,
