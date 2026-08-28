@@ -611,7 +611,7 @@ impl GroupInfo {
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
-        evidence: &owner_cert::OwnerCertEvidence,
+        verdict: &owner_cert::OwnerCertVerdict,
     ) -> Result<
         (
             state_commit::GroupStateCommit,
@@ -619,15 +619,20 @@ impl GroupInfo {
         ),
         state_commit::ApplyError,
     > {
+        // Round-4: consumes the CALLER'S verdict — no re-evaluation, no
+        // fresh clock read; the commit and the evaluation cannot disagree.
         let original = self.clone();
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
-        let evicted = self.enforce_owner_certified_admission(&signer_hex, evidence);
+        let evicted = self.enforce_owner_certified_admission(&signer_hex, verdict);
         match self.seal_commit_inner(keypair, now_ms) {
             Ok(commit) => {
-                // The roster just passed (or was pruned by) evidence-based
-                // re-verification — the restore quarantine (review finding
-                // 6) is lifted.
-                self.owner_cert_reverify_required = false;
+                // Round-4 regression rule: the restore quarantine lifts
+                // ONLY on an all-clean verdict — a grace-admitted
+                // evidence-missing member must keep the group
+                // quarantined.
+                if verdict.is_all_clean() {
+                    self.owner_cert_reverify_required = false;
+                }
                 Ok((commit, evicted))
             }
             // A failed seal leaves the group untouched: without this
@@ -647,20 +652,16 @@ impl GroupInfo {
     /// silently prune the remaining failing members into the same
     /// unrepresentable commit (they get their own transitions on the next
     /// loop iteration). Contract: the caller has run
-    /// [`Self::owner_cert_admission_failures`] and is mid-eviction; this
-    /// method only advances the chain and lifts the restore quarantine.
+    /// [`Self::owner_cert_verdict`] and is mid-eviction; this method only
+    /// advances the chain. Round-4: it deliberately does NOT lift the
+    /// restore quarantine — that happens only when the engine's final
+    /// verdict is all-clean (via `seal_commit_with_owner_certs`).
     pub fn seal_commit_evicting(
         &mut self,
         keypair: &AgentKeypair,
         now_ms: u64,
     ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
-        match self.seal_commit_inner(keypair, now_ms) {
-            Ok(commit) => {
-                self.owner_cert_reverify_required = false;
-                Ok(commit)
-            }
-            Err(err) => Err(err),
-        }
+        self.seal_commit_inner(keypair, now_ms)
     }
     /// Shared sealing core: chain advance + signature. No admission logic —
     /// the public entry points own that.
@@ -812,27 +813,36 @@ impl GroupInfo {
             .collect()
     }
 
-    /// [`Self::owner_cert_admission_failures`] with the round-2 grace
-    /// window applied: a member whose ONLY problem is missing evidence
-    /// (`NoCertificate` — nothing to check, fetch lag) gets
-    /// [`owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS`] before it
-    /// becomes evictable, tracked per member in
-    /// `certificate_missing_since_ms`. Definitive failures (revocation,
-    /// bad signature, wrong owner, wrong agent, expiry) and verified
-    /// members clear the timestamp immediately. Mutating variant for the
-    /// seal-time paths (ordinary wrapper + eviction engine); the pure
-    /// `&self` peek stays strict for ingress gates.
-    pub fn owner_cert_admission_failures_mut(
+    /// Round-4 prescriptive: THE single grace-aware, digestpending-fetch
+    /// aware evaluation of an OwnerCertified roster. Called ONCE per
+    /// operation; every seal path consumes the returned
+    /// [`owner_cert::OwnerCertVerdict`] instance — no seal re-derives a
+    /// verdict or reads the wall clock again, so evaluation and commit
+    /// cannot disagree (structural TOCTOU removal).
+    ///
+    /// Ladder per ACTIVE member: revoked → `Failed`; live digest-coupled
+    /// cert verifies → `Clean`; otherwise the roster-embedded cert —
+    /// unless the agent's latest announced digest differs from the
+    /// embedded cert's digest (STALE — must not seat) — verifies →
+    /// `Clean`; evidence in flight (warranted digest, cert unresolved,
+    /// including an expired/stale embedded cert mid-rotation) or totally
+    /// missing → `InGrace` (first observation stamps
+    /// `certificate_missing_since_ms`); any other present-but-failing
+    /// certificate → `Failed` (definitive, no grace).
+    pub fn owner_cert_verdict(
         &mut self,
         evidence: &owner_cert::OwnerCertEvidence,
-    ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
+    ) -> owner_cert::OwnerCertVerdict {
         let Some(owner) = self.policy.admission.owner_certified_user_id().copied() else {
-            return Vec::new();
+            return owner_cert::OwnerCertVerdict {
+                evaluated_at_ms: now_millis(),
+                per_member: std::collections::HashMap::new(),
+            };
         };
         let now = evidence.now_unix();
         let now_ms = now_millis();
         let grace_ms = owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS * 1_000;
-        let mut failures = Vec::new();
+        let mut per_member = std::collections::HashMap::new();
         let active_hexes: Vec<String> = self
             .members_v2
             .values()
@@ -855,13 +865,14 @@ impl GroupInfo {
             };
             if evidence.is_revoked(&agent_hex) {
                 clear_ts(&mut self.members_v2);
-                failures.push((agent_hex, owner_cert::OwnerCertFailure::Revoked));
+                per_member.insert(
+                    agent_hex,
+                    owner_cert::MemberCertStatus::Failed {
+                        reason: owner_cert::OwnerCertFailure::Revoked,
+                    },
+                );
                 continue;
             }
-            // Digest-gated embedded fallback (round-3): a known announce
-            // digest that differs from the embedded cert's digest makes the
-            // embedded cert STALE — it must not seat the member while the
-            // replacement blob is in flight.
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
                 evidence.digest_for(&agent_hex).is_some_and(|announced| {
                     announced
@@ -875,75 +886,98 @@ impl GroupInfo {
                 || (!embedded_is_stale && embedded.as_ref().is_some_and(|cert| check(cert).is_ok()))
             {
                 clear_ts(&mut self.members_v2);
+                per_member.insert(agent_hex, owner_cert::MemberCertStatus::Clean);
                 continue;
             }
-            // Evidence in flight (round-3): a warranted fetch outstanding
-            // (announce committed to a digest whose cert has not resolved)
-            // means the member is mid-rotation — INCLUDING the case where
-            // the stale/expired embedded cert just failed. Grace applies;
-            // the replacement cert lands or the window expires.
+            // Evidence in flight: a warranted fetch outstanding means the
+            // member is mid-rotation (INCLUDING a stale/expired embedded
+            // cert awaiting its replacement). Grace applies.
             if evidence.fetch_in_flight(&agent_hex) {
-                Self::apply_missing_evidence_grace(
+                match Self::apply_missing_evidence_grace(
                     &mut self.members_v2,
                     &agent_hex,
                     now_ms,
                     grace_ms,
-                    &mut failures,
-                );
+                ) {
+                    Some(since_ms) => {
+                        per_member.insert(
+                            agent_hex,
+                            owner_cert::MemberCertStatus::InGrace { since_ms },
+                        );
+                    }
+                    None => {
+                        per_member.insert(
+                            agent_hex,
+                            owner_cert::MemberCertStatus::Failed {
+                                reason: owner_cert::OwnerCertFailure::NoCertificate,
+                            },
+                        );
+                    }
+                }
                 continue;
             }
             // A present-but-failing certificate is a definitive failure:
-            // no grace. Only evidence absence (or in-flight rotation) is
-            // fetch lag.
+            // no grace.
             if resolved.is_some() || embedded.is_some() {
                 clear_ts(&mut self.members_v2);
-                let failure = resolved
+                let reason = resolved
                     .and_then(|cert| check(cert).err())
                     .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
                     .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
-                failures.push((agent_hex, failure));
+                per_member.insert(agent_hex, owner_cert::MemberCertStatus::Failed { reason });
                 continue;
             }
-            // NoCertificate: grace window bookkeeping.
-            Self::apply_missing_evidence_grace(
+            // Totally missing evidence: grace window bookkeeping.
+            match Self::apply_missing_evidence_grace(
                 &mut self.members_v2,
                 &agent_hex,
                 now_ms,
                 grace_ms,
-                &mut failures,
-            );
+            ) {
+                Some(since_ms) => {
+                    per_member.insert(
+                        agent_hex,
+                        owner_cert::MemberCertStatus::InGrace { since_ms },
+                    );
+                }
+                None => {
+                    per_member.insert(
+                        agent_hex,
+                        owner_cert::MemberCertStatus::Failed {
+                            reason: owner_cert::OwnerCertFailure::NoCertificate,
+                        },
+                    );
+                }
+            }
         }
-        failures
+        owner_cert::OwnerCertVerdict {
+            evaluated_at_ms: now_ms,
+            per_member,
+        }
     }
 
     /// Grace-window bookkeeping shared by every missing-evidence path:
-    /// first observation stamps `certificate_missing_since_ms` (member
-    /// stays seated), inside the window nothing happens, past the window
-    /// the member becomes evictable as `NoCertificate`.
+    /// first observation stamps `certificate_missing_since_ms` and returns
+    /// `Some(now)`; inside the window returns `Some(window_start)`; past
+    /// the window returns `None` — the member is evictable as
+    /// `NoCertificate`.
     fn apply_missing_evidence_grace(
         members_v2: &mut BTreeMap<String, GroupMember>,
         agent_hex: &str,
         now_ms: u64,
         grace_ms: u64,
-        failures: &mut Vec<(String, owner_cert::OwnerCertFailure)>,
-    ) {
+    ) -> Option<u64> {
         let since = members_v2
             .get(agent_hex)
             .and_then(|m| m.certificate_missing_since_ms);
         match since {
-            Some(ts) if now_ms.saturating_sub(ts) < grace_ms => {
-                // Still inside the retry window — not evictable yet.
-            }
-            Some(_) => {
-                failures.push((
-                    agent_hex.to_string(),
-                    owner_cert::OwnerCertFailure::NoCertificate,
-                ));
-            }
+            Some(ts) if now_ms.saturating_sub(ts) < grace_ms => Some(ts),
+            Some(_) => None,
             None => {
                 if let Some(m) = members_v2.get_mut(agent_hex) {
                     m.certificate_missing_since_ms = Some(now_ms);
                 }
+                Some(now_ms)
             }
         }
     }
@@ -956,14 +990,12 @@ impl GroupInfo {
     pub fn enforce_owner_certified_admission(
         &mut self,
         authority_hex: &str,
-        evidence: &owner_cert::OwnerCertEvidence,
+        verdict: &owner_cert::OwnerCertVerdict,
     ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
-        // Round-3 single-authority rule: enforcement consumes the
-        // GRACE-AWARE evaluation — the same verdict the ordinary-seal
-        // wrapper and the eviction engine preflight on. Re-deriving with
-        // the strict peek here silently pruned members that were inside
-        // their grace window.
-        let failures = self.owner_cert_admission_failures_mut(evidence);
+        // Round-4: enforcement consumes the verdict produced by
+        // [`Self::owner_cert_verdict`] — `Failed` members only; `InGrace`
+        // members are retained by construction.
+        let failures = verdict.failed();
         for (agent_hex, failure) in &failures {
             tracing::warn!(
                 group_id = %self.stable_group_id(),

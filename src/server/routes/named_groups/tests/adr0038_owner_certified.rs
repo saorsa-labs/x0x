@@ -307,11 +307,16 @@ async fn missing_evidence_gets_grace_window_then_evicts_at_seal() -> Result<()> 
         .await
         .into_response();
     let (status, body) = response_json(response).await?;
-    assert_eq!(status, StatusCode::OK, "grace seal must succeed: {body}");
     assert_eq!(
-        body["evicted"],
-        serde_json::json!([]),
-        "missing evidence inside the grace window must NOT evict: {body}"
+        status,
+        StatusCode::CONFLICT,
+        "in-grace member must produce the typed pending refusal: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pending certificate resolution")),
+        "typed pending error: {body}"
     );
     {
         let groups = state.named_groups.read().await;
@@ -452,8 +457,9 @@ fn blind_seal_of_owner_certified_group_is_refused() {
     // admin's retry timestamp and the seal SUCCEEDS with the member
     // retained (fetch-lag, not a fact about the certificate). A
     // DEFINITIVE failure is what must trip the last-admin veto.
+    let empty_verdict = info.owner_cert_verdict(&OwnerCertEvidence::new(1_000));
     let (commit, evicted) = info
-        .seal_commit_with_owner_certs(&creator, 1_000, &OwnerCertEvidence::new(1_000))
+        .seal_commit_with_owner_certs(&creator, 1_000, &empty_verdict)
         .expect("empty evidence seals under grace");
     assert!(
         evicted.is_empty(),
@@ -469,8 +475,9 @@ fn blind_seal_of_owner_certified_group_is_refused() {
         &hex::encode(creator.agent_id().as_bytes()),
         x0x::identity::AgentCertificate::issue(&foreign, &creator).expect("foreign cert"),
     );
+    let failed_verdict = info.owner_cert_verdict(&OwnerCertEvidence::new(2_000));
     let err = info
-        .seal_commit_with_owner_certs(&creator, 2_000, &OwnerCertEvidence::new(2_000))
+        .seal_commit_with_owner_certs(&creator, 2_000, &failed_verdict)
         .expect_err("definitive failure must fail closed");
     assert!(
         err.to_string().contains("zero active admins"),
@@ -484,8 +491,9 @@ fn blind_seal_of_owner_certified_group_is_refused() {
     let creator_hex = hex::encode(creator.agent_id().as_bytes());
     let mut evidence = OwnerCertEvidence::new(3_000);
     evidence.insert_cert(creator_hex, cert);
+    let clean_verdict = info.owner_cert_verdict(&evidence);
     let (commit, evicted) = info
-        .seal_commit_with_owner_certs(&creator, 3_000, &evidence)
+        .seal_commit_with_owner_certs(&creator, 3_000, &clean_verdict)
         .expect("seal with evidence");
     assert!(evicted.is_empty(), "certified creator must not be evicted");
     assert_eq!(commit.revision, 2);
@@ -1086,10 +1094,15 @@ async fn ordinary_mutation_retains_member_inside_grace_window() -> Result<()> {
             .await
             .into_response();
     let (status, body) = response_json(response).await?;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "ordinary mutation must seal while a member is merely inside its grace window: {body}"
+    assert!(
+        status == StatusCode::CONFLICT || status == StatusCode::INTERNAL_SERVER_ERROR,
+        "ordinary mutation must refuse while a member is inside its grace window: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pending certificate resolution")),
+        "refusal must be the typed OwnerCertMemberPending error: {body}"
     );
     let groups = state.named_groups.read().await;
     let live = groups.get(&group_id).expect("group");
@@ -1143,11 +1156,16 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
         .await
         .into_response();
     let (status, body) = response_json(response).await?;
-    assert_eq!(status, StatusCode::OK, "in-flight rotation seal: {body}");
     assert_eq!(
-        body["evicted"],
-        serde_json::json!([]),
-        "a member whose replacement cert is in flight must not be evicted: {body}"
+        status,
+        StatusCode::CONFLICT,
+        "in-flight rotation seal: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("pending certificate resolution")),
+        "typed pending error: {body}"
     );
     {
         let groups = state.named_groups.read().await;
@@ -1167,5 +1185,87 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "post-rotation seal: {body}");
     assert_eq!(body["evicted"], serde_json::json!([]), "seated: {body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()> {
+    // WHY (round-4 regression rule): the restore quarantine may only
+    // lift on an ALL-CLEAN verdict. A restored group with a member
+    // whose evidence has not re-resolved yet (InGrace) must REFUSE the
+    // seal and STAY quarantined — secure ops stay blocked until every
+    // member's certificate re-verifies.
+    let (state, dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "81".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let member = AgentKeypair::generate()?;
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        live.shared_secret = Some(vec![1u8; 32]);
+    }
+    // Restore: the loader's quarantine marker, as after a restart.
+    assert!(save_named_groups(&state).await);
+    let mut reloaded = load_named_groups(&state.named_groups_path).await?;
+    reloaded
+        .get_mut(&group_id)
+        .expect("group")
+        .owner_cert_reverify_required = true;
+    *state.named_groups.write().await = reloaded;
+
+    // Seal with an InGrace member: refused, quarantine intact.
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "in-grace seal must refuse: {body}"
+    );
+    assert!(
+        state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required,
+        "an InGrace member must keep the restore quarantine set"
+    );
+
+    // Evidence converges (the member's cert resolves): all-clean seal
+    // lifts the quarantine.
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    announce_cert_for(state.as_ref(), cert).await;
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "all-clean seal: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required,
+        "the all-clean verdict lifts the restore quarantine"
+    );
+    drop(dir);
     Ok(())
 }

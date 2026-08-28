@@ -607,6 +607,19 @@ pub enum ApplyError {
         group_id: String,
         members: Vec<String>,
     },
+
+    /// ADR-0038 round-4: members are inside the OwnerCertified grace
+    /// window (evidence missing or a replacement fetch in flight). Seals
+    /// that require a clean roster refuse; retry after the announce/blob
+    /// fetch converges, or use the explicit eviction path once the window
+    /// expires.
+    #[error(
+        "owner-certified group {group_id} has members pending certificate resolution: {members:?} (retry after fetch convergence)"
+    )]
+    OwnerCertMemberPending {
+        group_id: String,
+        members: Vec<String>,
+    },
 }
 
 // ─────────────────────────── Apply checks ───────────────────────────────

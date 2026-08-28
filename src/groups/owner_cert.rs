@@ -51,6 +51,69 @@ pub fn restore_clock_now() -> u64 {
 /// not about fetch lag.
 pub const OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS: u64 = 300;
 
+/// Round-4 prescriptive verdict: the per-member outcome of ONE
+/// grace-aware, digest+pending-fetch-aware evaluation. Produced by
+/// [`crate::groups::GroupInfo::owner_cert_verdict`] and consumed by every
+/// seal path — no seal re-derives or re-reads the wall clock, so the
+/// evaluation and the commit cannot disagree (the TOCTOU is gone
+/// structurally).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MemberCertStatus {
+    /// Evidence verified (live digest-coupled, or a non-stale committed
+    /// cert). The member is seated.
+    Clean,
+    /// Evidence missing or in flight (fetch lag, mid-rotation). The member
+    /// stays seated for now; a seal that requires a clean roster must
+    /// REFUSE, and the restore quarantine must NOT lift.
+    InGrace { since_ms: u64 },
+    /// Definitive failure (revoked / bad signature / wrong owner / wrong
+    /// agent / expired with no replacement in flight). Evictable.
+    Failed { reason: OwnerCertFailure },
+}
+
+/// One evaluation of a whole OwnerCertified roster.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerCertVerdict {
+    /// Wall-clock ms captured ONCE at evaluation; grace arithmetic uses
+    /// this, never a fresh read.
+    pub evaluated_at_ms: u64,
+    /// agent hex → status. ACTIVE members only.
+    pub per_member: std::collections::HashMap<String, MemberCertStatus>,
+}
+
+impl OwnerCertVerdict {
+    /// True iff every member is [`MemberCertStatus::Clean`].
+    #[must_use]
+    pub fn is_all_clean(&self) -> bool {
+        self.per_member
+            .values()
+            .all(|status| matches!(status, MemberCertStatus::Clean))
+    }
+
+    /// The evictable members with their failure reasons.
+    #[must_use]
+    pub fn failed(&self) -> Vec<(String, OwnerCertFailure)> {
+        self.per_member
+            .iter()
+            .filter_map(|(hex, status)| match status {
+                MemberCertStatus::Failed { reason } => Some((hex.clone(), *reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Members that are neither Clean nor Failed (inside the grace
+    /// window).
+    #[must_use]
+    pub fn in_grace(&self) -> Vec<String> {
+        self.per_member
+            .iter()
+            .filter(|(_, status)| matches!(status, MemberCertStatus::InGrace { .. }))
+            .map(|(hex, _)| hex.clone())
+            .collect()
+    }
+}
+
 /// Snapshot of the certificate evidence available to a verifier at one
 /// decision point (invite-accept or seal).
 /// Deliberately a value snapshot, not a live view: the underlying discovery
