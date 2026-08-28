@@ -40,6 +40,17 @@ pub fn restore_clock_now() -> u64 {
         .as_secs()
 }
 
+/// ADR-0038 round-2 (finding 5): how long a member may sit with MISSING
+/// certificate evidence (`NoCertificate`) before a seal evicts it. The
+/// announce pipeline is eventually-consistent — a cold cache miss triggers
+/// a background blob fetch and the NEXT heartbeat lands the pair, and
+/// invite volleys re-send (#333) — so a member whose evidence simply has
+/// not arrived yet gets a retry window instead of a destructive eviction.
+/// Definitive failures (revoked, invalid signature, wrong owner, wrong
+/// agent, expired) get NO grace: they are facts about the certificate,
+/// not about fetch lag.
+pub const OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS: u64 = 300;
+
 /// Snapshot of the certificate evidence available to a verifier at one
 /// decision point (invite-accept or seal).
 /// Deliberately a value snapshot, not a live view: the underlying discovery

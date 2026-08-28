@@ -75,6 +75,7 @@ async fn announce_cert_for(state: &AppState, cert: x0x::identity::AgentCertifica
             cert_not_after: cert.not_after(),
             agent_certificate: Some(cert),
             agent_public_key: Vec::new(),
+            cert_digest: None,
         },
     );
 }
@@ -273,11 +274,13 @@ async fn revoked_cert_member_evicted_with_rekey_at_seal() -> Result<()> {
 }
 
 #[tokio::test]
-async fn uncertified_roster_member_is_pruned_at_seal() -> Result<()> {
-    // WHY (ADR-0038 validation gate 1b): even when an uncertified agent
-    // is ALREADY on the roster (legacy roster, pre-upgrade join, or a
-    // node that missed the accept-time check), the next seal must prune
-    // it — a later-stolen invite cannot resurrect membership.
+async fn missing_evidence_gets_grace_window_then_evicts_at_seal() -> Result<()> {
+    // WHY (round-2 finding 5): an uncertified roster member whose evidence
+    // simply has not ARRIVED yet (cold blob-fetch lag) must not be
+    // destructively evicted on first sight — the announce pipeline is
+    // eventually consistent, so a grace window (`NoCertificate` only)
+    // defers eviction while the fetch/heartbeat retry converges. Past the
+    // window, the member is evicted by the same sequential engine.
     let (state, _dir, owner_kp) = owner_authority_state().await?;
     let group_id = "73".repeat(32);
     insert_owner_group(
@@ -299,21 +302,56 @@ async fn uncertified_roster_member_is_pruned_at_seal() -> Result<()> {
         );
     }
 
+    // First seal: grace — not evicted, timestamp stamped.
     let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
         .await
         .into_response();
     let (status, body) = response_json(response).await?;
-    assert_eq!(status, StatusCode::OK, "seal must succeed: {body}");
+    assert_eq!(status, StatusCode::OK, "grace seal must succeed: {body}");
+    assert_eq!(
+        body["evicted"],
+        serde_json::json!([]),
+        "missing evidence inside the grace window must NOT evict: {body}"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(live.has_active_member(&stranger_hex));
+        assert!(
+            live.members_v2
+                .get(&stranger_hex)
+                .and_then(|m| m.certificate_missing_since_ms)
+                .is_some(),
+            "the grace window must stamp the retry timestamp"
+        );
+    }
+
+    // Expire the window and seal again: now the eviction fires.
+    {
+        let mut groups = state.named_groups.write().await;
+        let member = groups
+            .get_mut(&group_id)
+            .expect("group")
+            .members_v2
+            .get_mut(&stranger_hex)
+            .expect("member");
+        member.certificate_missing_since_ms = Some(0);
+    }
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "post-grace seal: {body}");
     assert_eq!(
         body["evicted"],
         serde_json::json!([stranger_hex]),
-        "uncertified roster member must be pruned at seal: {body}"
+        "missing evidence past the grace window must evict: {body}"
     );
     let groups = state.named_groups.read().await;
     let live = groups.get(&group_id).expect("group");
     assert!(
         !live.has_active_member(&stranger_hex),
-        "uncertified member must not survive the seal"
+        "uncertified member must not survive past the grace window"
     );
     Ok(())
 }
@@ -554,15 +592,23 @@ async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Resu
         "unused",
     )
     .await;
+    // A DEFINITIVE failure (not fetch lag): the member carries a
+    // certificate chained to a DIFFERENT owner — refused immediately,
+    // no grace window applies.
     let stranger_hex = "9c".repeat(32);
+    let foreign_user = UserKeypair::generate()?;
+    let foreign_cert =
+        x0x::identity::AgentCertificate::issue(&foreign_user, &AgentKeypair::generate()?)?;
     {
         let mut groups = state.named_groups.write().await;
-        groups.get_mut(&group_id).expect("group").add_member(
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(
             stranger_hex.clone(),
             x0x::groups::GroupRole::Member,
             None,
             None,
         );
+        live.set_member_certificate(&stranger_hex, foreign_cert);
     }
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
@@ -620,12 +666,17 @@ async fn multi_eviction_seal_is_sequential_with_per_member_rekey() -> Result<()>
         let mut groups = state.named_groups.write().await;
         let live = groups.get_mut(&group_id).expect("group");
         live.add_member_with_kem(
-            hex,
+            hex.clone(),
             x0x::groups::GroupRole::Member,
             None,
             None,
             Some(kem_b64),
         );
+        // Pre-expire the grace window: this test targets the eviction
+        // engine, not the retry policy.
+        if let Some(member) = live.members_v2.get_mut(&hex) {
+            member.certificate_missing_since_ms = Some(0);
+        }
         live.shared_secret = Some(vec![3u8; 32]);
     }
     let revision_before = {
@@ -653,7 +704,7 @@ async fn multi_eviction_seal_is_sequential_with_per_member_rekey() -> Result<()>
         // Two evicting transitions + one clean seal = +3 revisions.
         assert_eq!(
             live.state_revision,
-            revision_before + 3,
+            revision_before + 2,
             "each eviction is its own committed transition"
         );
     }
@@ -789,5 +840,150 @@ async fn receiver_rejects_member_added_without_committed_certificate() -> Result
             "receiver must not admit an OwnerCertified add without a committed certificate"
         );
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn receiver_rejects_member_added_for_revoked_target() -> Result<()> {
+    // WHY (round-2 finding 1): the receiver-side gate must check the
+    // ADR-0018 revocation set at INGRESS — a still-valid-looking
+    // certificate for a since-revoked key must not re-enter through an
+    // authority commit.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7c".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let member = AgentKeypair::generate()?;
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    // Self-revocation: authority-verifiable from the record alone.
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs();
+    let record = x0x::revocation::RevocationRecord::sign(
+        x0x::revocation::RevokedSubject::Agent(member.agent_id()),
+        member.public_key(),
+        member.secret_key(),
+        now,
+        Some("round-2 ingress test".to_string()),
+    )?;
+    state
+        .agent
+        .revocation_set()
+        .write()
+        .await
+        .verify_and_insert(record, Some(&cert))?;
+    use base64::Engine as _;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: group_id.clone(),
+        revision: 2,
+        actor: owner_hex,
+        agent_id: member_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: Some(BASE64.encode(bincode::serialize(&cert)?)),
+        commit: None,
+    };
+    let should_exit = apply_named_group_metadata_event_inner(
+        &state,
+        event,
+        state.agent.agent_id(),
+        true,
+        true,
+        None,
+    )
+    .await;
+    assert!(!should_exit.should_exit);
+    let groups = state.named_groups.read().await;
+    assert!(
+        !groups
+            .get(&group_id)
+            .expect("group")
+            .has_active_member(&member_hex),
+        "a revoked target must be rejected at ingress even with a valid certificate"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn direct_add_binds_certificate_into_roster() -> Result<()> {
+    // WHY (round-2 finding 1): the direct-add producers must both bind
+    // the verified certificate into the roster (and publish it on the
+    // MemberAdded event — the receiver gate below plus the invite-path
+    // test prove fixed receivers accept exactly that shape).
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7d".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let target = AgentKeypair::generate()?;
+    let target_hex = hex::encode(target.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &target)?;
+    announce_cert_for(state.as_ref(), cert.clone()).await;
+    let req: AddNamedGroupMemberRequest = serde_json::from_value(serde_json::json!({
+        "agent_id": target_hex
+    }))?;
+    let response =
+        add_named_group_member(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "certified direct add: {body}");
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert!(
+        live.committed_certificate(&target_hex).is_some(),
+        "direct add must bind the committed certificate into the roster"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn reseal_refuses_while_restore_quarantined() -> Result<()> {
+    // WHY (round-2 finding 6): secure/reseal re-seals the RESTORED
+    // shared secret; it must obey the same quarantine as
+    // encrypt/decrypt until an evidence-bearing seal re-verifies.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7e".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.shared_secret = Some(vec![9u8; 32]);
+        live.owner_cert_reverify_required = true;
+    }
+    let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let req: ResealRequest = serde_json::from_value(serde_json::json!({ "recipient": owner_hex }))?;
+    let (status, json) =
+        secure_group_reseal(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "reseal must obey the restore quarantine: {}",
+        json.0
+    );
     Ok(())
 }

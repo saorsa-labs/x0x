@@ -2000,6 +2000,7 @@ mod tests {
                 cert_not_after: None,
                 agent_certificate: None,
                 agent_public_key: keypair.public_key().as_bytes().to_vec(),
+                cert_digest: None,
             },
         );
         Arc::new(tokio::sync::RwLock::new(cache))
@@ -2865,6 +2866,7 @@ mod tests {
                     cert_not_after: None,
                     agent_certificate: None,
                     agent_public_key: kp.public_key().as_bytes().to_vec(),
+                    cert_digest: None,
                 },
             );
         }
@@ -2954,6 +2956,7 @@ mod tests {
                 cert_not_after: None,
                 agent_certificate: None,
                 agent_public_key: Vec::new(), // empty — beacon case
+                cert_digest: None,
             },
         );
         let cache = Arc::new(tokio::sync::RwLock::new(cache_map));

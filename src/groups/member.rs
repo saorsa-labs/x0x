@@ -162,6 +162,14 @@ pub struct GroupMember {
     /// lookup alone — Codex design review constraint 2). Present only for
     /// members of `OwnerCertified` groups; `None` for every legacy roster,
     /// which keeps the v1 roster-root hash input byte-identical.
+
+    /// ADR-0038 round-2 grace window: when evidence for this member was
+    /// first observed MISSING (`NoCertificate`) at a seal-time
+    /// re-verification, in unix ms. Transient bookkeeping — NOT part of the
+    /// roster-root hash; absent after restart (the restore quarantine
+    /// restarts the window).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_missing_since_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<crate::identity::AgentCertificate>,
 }
@@ -184,6 +192,7 @@ impl GroupMember {
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 
@@ -205,6 +214,7 @@ impl GroupMember {
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 
@@ -230,6 +240,7 @@ impl GroupMember {
             treekem_key_package_b64: None,
             treekem_key_package_hash: None,
             certificate: None,
+            certificate_missing_since_ms: None,
         }
     }
 

@@ -521,6 +521,7 @@ mod tests {
             cert_not_after: None,
             agent_certificate: None,
             agent_public_key: Vec::new(),
+            cert_digest: None,
         }
     }
 

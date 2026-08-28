@@ -781,6 +781,7 @@ impl GroupInfo {
                 {
                     return None;
                 }
+
                 // Neither source verifies: report the informative failure
                 // kind — the resolved cert's own failure when one existed,
                 // otherwise "no certificate at all".
@@ -793,6 +794,91 @@ impl GroupInfo {
                 Some((agent_hex.clone(), failure))
             })
             .collect()
+    }
+
+    /// [`Self::owner_cert_admission_failures`] with the round-2 grace
+    /// window applied: a member whose ONLY problem is missing evidence
+    /// (`NoCertificate` — nothing to check, fetch lag) gets
+    /// [`owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS`] before it
+    /// becomes evictable, tracked per member in
+    /// `certificate_missing_since_ms`. Definitive failures (revocation,
+    /// bad signature, wrong owner, wrong agent, expiry) and verified
+    /// members clear the timestamp immediately. Mutating variant for the
+    /// seal-time paths (ordinary wrapper + eviction engine); the pure
+    /// `&self` peek stays strict for ingress gates.
+    pub fn owner_cert_admission_failures_mut(
+        &mut self,
+        evidence: &owner_cert::OwnerCertEvidence,
+    ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
+        let Some(owner) = self.policy.admission.owner_certified_user_id().copied() else {
+            return Vec::new();
+        };
+        let now = evidence.now_unix();
+        let now_ms = now_millis();
+        let grace_ms = owner_cert::OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS * 1_000;
+        let mut failures = Vec::new();
+        let active_hexes: Vec<String> = self
+            .members_v2
+            .values()
+            .filter(|m| m.is_active())
+            .map(|m| m.agent_id.clone())
+            .collect();
+        for agent_hex in active_hexes {
+            let check = |cert: &crate::identity::AgentCertificate| {
+                owner_cert::verify_cert_against_owner(&owner, &agent_hex, cert, false, now)
+            };
+            let resolved = evidence.cert_for(&agent_hex);
+            let embedded = self
+                .members_v2
+                .get(&agent_hex)
+                .and_then(|m| m.certificate.clone());
+            let clear_ts = |members: &mut BTreeMap<String, GroupMember>| {
+                if let Some(m) = members.get_mut(&agent_hex) {
+                    m.certificate_missing_since_ms = None;
+                }
+            };
+            if evidence.is_revoked(&agent_hex) {
+                clear_ts(&mut self.members_v2);
+                failures.push((agent_hex, owner_cert::OwnerCertFailure::Revoked));
+                continue;
+            }
+            if resolved.is_some_and(|cert| check(cert).is_ok())
+                || embedded.as_ref().is_some_and(|cert| check(cert).is_ok())
+            {
+                clear_ts(&mut self.members_v2);
+                continue;
+            }
+            // A present-but-failing certificate is a definitive failure:
+            // no grace. Only total evidence absence is fetch lag.
+            if resolved.is_some() || embedded.is_some() {
+                clear_ts(&mut self.members_v2);
+                let failure = resolved
+                    .and_then(|cert| check(cert).err())
+                    .or_else(|| embedded.as_ref().and_then(|cert| check(cert).err()))
+                    .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
+                failures.push((agent_hex, failure));
+                continue;
+            }
+            // NoCertificate: grace window bookkeeping.
+            let since = self
+                .members_v2
+                .get(&agent_hex)
+                .and_then(|m| m.certificate_missing_since_ms);
+            match since {
+                Some(ts) if now_ms.saturating_sub(ts) < grace_ms => {
+                    // Still inside the retry window — not evictable yet.
+                }
+                Some(_) => {
+                    failures.push((agent_hex, owner_cert::OwnerCertFailure::NoCertificate));
+                }
+                None => {
+                    if let Some(m) = self.members_v2.get_mut(&agent_hex) {
+                        m.certificate_missing_since_ms = Some(now_ms);
+                    }
+                }
+            }
+        }
+        failures
     }
 
     /// ADR-0038: roster-remove (evict) exactly the members returned by
@@ -1223,6 +1309,7 @@ impl GroupInfo {
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,
+                certificate_missing_since_ms: None,
             });
     }
 
@@ -1303,6 +1390,7 @@ impl GroupInfo {
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
                 certificate: None,
+                certificate_missing_since_ms: None,
             });
     }
 
