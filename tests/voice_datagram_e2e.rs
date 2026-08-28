@@ -70,7 +70,12 @@ async fn build_agent(dir: &TempDir, name: &str) -> Option<x0x::Agent> {
         .await
     {
         Ok(agent) => Some(agent),
-        Err(e) if is_network_bind_permission_error(&e) => None,
+        // Explicit skip, never a silent pass (Codex review P2): without
+        // real UDP sockets this e2e proves nothing, so say so loudly.
+        Err(e) if is_network_bind_permission_error(&e) => {
+            eprintln!("SKIP: UDP binds forbidden in this environment — datagram e2e requires real sockets");
+            None
+        }
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
@@ -520,6 +525,285 @@ async fn datagram_lane_survives_injected_loss_and_reorder() {
         "every audio frame must leave as a datagram"
     );
 
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// Flood defense (ADR-0042 addendum): the per-connection inbound byte
+/// ceiling must make a datagram flood cost the SENDER, not the lane —
+/// excess is dropped and counted, and the limiter must recover (bucket
+/// refills) so legitimate post-flood audio still flows. 300 × ~1 KB
+/// valid frames in a tight loop ≈ 300 KB against a 50 KB burst +
+/// 100 KB/s ceiling ⇒ a large fraction must drop on any fast machine.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram flood; binds UDP. Integration tier."]
+async fn datagram_flood_rate_limited_and_lane_recovers() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    bob_link.start().await.expect("bob link");
+    alice_link.start().await.expect("alice link");
+    assert!(
+        await_mutual_capability(&alice_link, &bob_link).await,
+        "mutual datagram capability advert did not land"
+    );
+
+    const FLOOD: u32 = 300;
+    let peer = alice_link.default_peer().expect("default peer");
+    for seq in 0..FLOOD {
+        let dg = AudioDatagram {
+            seq,
+            timestamp_ms: now_ms(),
+            flags: 0,
+            payload: bytes::Bytes::from(vec![0u8; 1000]), // ~1 KB wire frame
+        };
+        let wire = dg.encode().expect("wire encode");
+        alice_link
+            .send(&peer, StreamType::Audio, &wire)
+            .await
+            .expect("send flood frame");
+    }
+
+    // Let the reader drain and the counters settle.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    let dropped = bob_link.datagram_rate_limited_dropped();
+    let received = bob_link.datagram_frames_received();
+    assert!(
+        dropped > 0,
+        "a {FLOOD}-frame ~1 KB tight-loop flood (~{} KB) must exceed the 50 KB burst + 100 KB/s ceiling",
+        FLOOD
+    );
+    assert!(
+        received < u64::from(FLOOD),
+        "not all flood frames may be accepted (received {received}, dropped {dropped})"
+    );
+
+    // Recovery: after the bucket refills, paced real-rate audio still
+    // flows (the limiter is a token bucket, not a circuit breaker).
+    tokio::time::sleep(Duration::from_millis(600)).await;
+    for seq in FLOOD..FLOOD + 10 {
+        let dg = AudioDatagram {
+            seq,
+            timestamp_ms: now_ms(),
+            flags: 0,
+            payload: bytes::Bytes::from(vec![0u8; 200]),
+        };
+        let wire = dg.encode().expect("wire encode");
+        alice_link
+            .send(&peer, StreamType::Audio, &wire)
+            .await
+            .expect("send post-flood frame");
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // Drain: flood leftovers first, then the paced tail. Recovery is
+    // proven by any post-flood seq (≥ FLOOD) surfacing.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut max_seq = None;
+    while Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, bob_link.receive()).await {
+            Ok(Ok((_, ty, data))) => {
+                assert_eq!(ty, StreamType::Audio);
+                if let Ok(dg) = AudioDatagram::decode(data.into()) {
+                    max_seq = Some(max_seq.map_or(dg.seq, |m: u32| m.max(dg.seq)));
+                    if dg.seq >= FLOOD {
+                        break; // post-flood frame surfaced — lane recovered
+                    }
+                }
+            }
+            Ok(Err(e)) => panic!("bob receive failed: {e}"),
+            Err(_) => break,
+        }
+    }
+    assert!(
+        max_seq.is_some_and(|s| s >= FLOOD),
+        "post-flood paced audio must still flow after the byte ceiling refills (max seq {max_seq:?})"
+    );
+
+    let _ = alice_link.stop().await;
+    let _ = bob_link.stop().await;
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// Advert authentication + session binding (Codex review P1-1): a
+/// connected, authenticated peer that is NOT running a datagram-capable
+/// transport must not be able to flip our lane by sending crafted
+/// advert frames — right sender id, right (authenticated) machine, but
+/// no valid echo of OUR per-start nonce. Every variant (old v1 shape,
+/// bogus response, bare challenge) must leave the lane un-flipped.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback advert-auth proof; binds UDP. Integration tier."]
+async fn spoofed_or_replayed_advert_cannot_flip_lane() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    // Alice pins Datagram; bob runs NO transport at all (old-peer
+    // stand-in — nothing of his will ever legitimately respond).
+    let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    alice_link.start().await.expect("alice link");
+
+    // Crafted advert frames from the REAL bob (his DMs carry the right
+    // authenticated machine + verified + trust) — the auth layer alone
+    // would pass all of these; only the nonce binding must stop them.
+    let crafted = [
+        // v1 shape (no challenge/response) — a replay of an old build.
+        r#"{"type":"x0x_datagram_cap","datagram":true}"#,
+        // Bogus response echo.
+        r#"{"type":"x0x_datagram_cap","datagram":true,"response":"0000000000000000"}"#,
+        // A bare challenge (peer initial) — must never flip OUR lane.
+        r#"{"type":"x0x_datagram_cap","datagram":true,"challenge":"deadbeef"}"#,
+    ];
+    for body in crafted {
+        let mut payload = x0x::voice::VOICE_SIGNALING_DM_PREFIX.to_vec();
+        payload.extend_from_slice(body.as_bytes());
+        bob.send_direct(&alice.agent_id(), payload)
+            .await
+            .expect("crafted advert DM delivered");
+    }
+    // Give the listener ample time to (wrongly) process them.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    assert!(
+        !alice_link.peer_datagram_capable(),
+        "crafted/replayed adverts without our nonce echo must never flip the lane"
+    );
+    assert_eq!(
+        alice_link.datagram_frames_sent(),
+        0,
+        "lane never flipped, so no audio left as datagrams"
+    );
+
+    let _ = alice_link.stop().await;
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// Connection churn must degrade the lane, never kill the call (Codex
+/// review P1-3): after the negotiated connection closes, the reader
+/// exits and clears capability, and subsequent audio flows over the
+/// reliable stream (re-opened through the redial machinery) instead of
+/// wedging on the dead datagram connection.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback churn-fallback proof; binds UDP. Integration tier."]
+async fn connection_churn_falls_back_to_reliable() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    bob_link.start().await.expect("bob link");
+    alice_link.start().await.expect("alice link");
+    assert!(
+        await_mutual_capability(&alice_link, &bob_link).await,
+        "mutual capability must land before the churn"
+    );
+
+    // Kill the connection alice's datagram lane negotiated on, then
+    // bring up its REPLACEMENT (realistic churn: the old connection is
+    // gone, a new one takes over — `disconnect` removes the peer, so the
+    // reliable path needs the replacement before open_bi can succeed).
+    let bob_peer = ant_quic::PeerId(bob.machine_id().0);
+    let alice_network = alice.network().expect("alice network").clone();
+    let bob_addr = normalize_loopback(
+        bob.network()
+            .expect("bob network")
+            .bound_addr()
+            .await
+            .expect("bob bound"),
+    );
+    alice_network
+        .disconnect(&bob_peer)
+        .await
+        .expect("disconnect");
+    alice_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("replacement connection");
+    // Let the replacement converge on BOTH sides (same discipline as
+    // `trusted_pair`): a stream opened into a half-torn-down connection
+    // gets reset by the teardown, not by the peer's accept loop.
+    let alice_peer = ant_quic::PeerId(alice.machine_id().0);
+    let bob_network = bob.network().expect("bob network").clone();
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while Instant::now() < deadline {
+        if alice_network.is_connected(&bob_peer).await
+            && bob_network.is_connected(&alice_peer).await
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+
+    // The reader must exit and clear capability (this is the regression:
+    // a stale capable flag would wedge every send on the dead lane).
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while alice_link.peer_datagram_capable() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(
+        !alice_link.peer_datagram_capable(),
+        "reader exit on connection close must clear the capability flag"
+    );
+    let sent_at_churn = alice_link.datagram_frames_sent();
+
+    // Post-churn audio: reliable lane, still delivered (open_peer_stream
+    // redials through the discovery cache).
+    let peer = alice_link.default_peer().expect("default peer");
+    const POST: usize = 25;
+    for seq in 0..POST {
+        let dg = AudioDatagram {
+            seq: seq as u32,
+            timestamp_ms: now_ms(),
+            flags: 0,
+            payload: bytes::Bytes::from(vec![0u8; 200]),
+        };
+        let wire = dg.encode().expect("wire encode");
+        alice_link
+            .send(&peer, StreamType::Audio, &wire)
+            .await
+            .expect("post-churn send must fall back to the reliable lane");
+    }
+
+    let mut received = 0usize;
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while received < POST && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, bob_link.receive()).await {
+            Ok(Ok((_, ty, _))) => {
+                assert_eq!(ty, StreamType::Audio);
+                received += 1;
+            }
+            Ok(Err(e)) => panic!("bob receive failed: {e}"),
+            Err(_) => break,
+        }
+    }
+    assert_eq!(
+        received, POST,
+        "post-churn frames must arrive via the reliable lane"
+    );
+    assert_eq!(
+        alice_link.datagram_frames_sent(),
+        sent_at_churn,
+        "no post-churn frame may leave as a datagram"
+    );
+
+    let _ = alice_link.stop().await;
+    let _ = bob_link.stop().await;
     alice.shutdown().await;
     bob.shutdown().await;
 }

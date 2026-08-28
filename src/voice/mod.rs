@@ -30,7 +30,7 @@
 mod link_transport;
 mod signaling;
 
-pub use link_transport::X0xLinkTransport;
+pub use link_transport::{VoiceLaneError, X0xLinkTransport};
 pub use signaling::{VoicePeerId, X0xSignaling};
 
 /// Which lane carries encoded audio (ADR-0042 c): the ordered reliable

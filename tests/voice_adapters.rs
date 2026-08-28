@@ -432,3 +432,50 @@ async fn connect_acl_denies_unlisted_datagram_lane() {
         ),
     }
 }
+
+/// Single-acceptor rule (Codex review finding 2): exactly ONE consumer
+/// may register `WebRtcV1` per agent, so a second concurrent call on the
+/// same agent cannot start today. It must fail FAST and TYPED
+/// (`VoiceLaneError::SessionConflict`) — never silently steal or share
+/// the acceptor — and `stop()` must release the acceptor so a later
+/// session starts cleanly (self-heal). The shared daemon-level demux
+/// that would make concurrent calls WORK is the recorded follow-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback acceptor-conflict proof; binds UDP. Integration tier."]
+async fn second_concurrent_call_fails_typed_and_stop_self_heals() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    let mut first = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
+    first
+        .start_lane()
+        .await
+        .expect("first session claims the WebRtcV1 acceptor");
+
+    // A second concurrent call on the SAME agent (any remote) hits the
+    // single-acceptor rule: typed rejection, not a stringly error and
+    // not a silent takeover.
+    let mut second = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
+    match second.start_lane().await {
+        Err(x0x::voice::VoiceLaneError::SessionConflict) => {}
+        other => panic!("expected SessionConflict, got: {other:?}"),
+    }
+    // The failed start must not wedge the transport: `running` was
+    // reset, so a retry after the conflict is cleared succeeds below.
+
+    first
+        .stop()
+        .await
+        .expect("first session stops (releases acceptor)");
+
+    second
+        .start_lane()
+        .await
+        .expect("acceptor released by stop; second session now starts");
+    let _ = second.stop().await;
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
