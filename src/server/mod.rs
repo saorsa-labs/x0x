@@ -189,9 +189,14 @@ fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> 
     if let Some(ref key_path) = config.user_key_path {
         return Some(x0x::profile::OwnerProfile::path_for_key(key_path));
     }
-    identity_dir
-        .as_ref()
-        .map(|dir| dir.join(x0x::profile::OWNER_PROFILE_FILE))
+    if let Some(dir) = identity_dir {
+        return Some(dir.join(x0x::profile::OWNER_PROFILE_FILE));
+    }
+    // Default install (review P0): no explicit user_key_path and no identity
+    // dir — the user key lives at ~/.x0x/user.key, so the owner record is
+    // its sibling. Returning None here would silently disable enforcement
+    // for every default install.
+    dirs::home_dir().map(|home| home.join(".x0x").join(x0x::profile::OWNER_PROFILE_FILE))
 }
 
 /// ADR-0036 owner singleton enforcement (daemon side).
@@ -216,6 +221,24 @@ async fn enforce_owner_singleton(
         .await
         .with_context(|| format!("failed to read owner profile at {}", path.display()))?;
     let Some(owner) = owner else {
+        // Migration (review P0): an install from before ADR-0036 has a user
+        // key but no owner record. ADOPT the loaded identity as the owner
+        // on first start so enforcement applies from now on — silently
+        // enforcing nothing would keep the singleton meaningless.
+        if let Some(user_id) = agent.user_id() {
+            let adopted = x0x::profile::OwnerProfile {
+                user_id: hex::encode(user_id.as_bytes()),
+                human_name: None,
+            };
+            adopted
+                .save_to(&path)
+                .await
+                .with_context(|| format!("failed to record adopted owner at {}", path.display()))?;
+            tracing::info!(
+                owner = %adopted.user_id,
+                "adopted existing user identity as install owner (ADR-0036 migration)"
+            );
+        }
         return Ok(());
     };
     let recorded = owner.user_id;
@@ -3125,5 +3148,101 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     // replay acquires its own membership lock via _inner_serialized.
     if let Some(gid) = replay_after {
         replay_pending_causal_approvals(relay_state, &gid).await;
+    }
+}
+
+#[cfg(test)]
+mod owner_singleton_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// WHY (review P0): the default daemon runs with no explicit
+    /// `user_key_path` and no `identity_dir`; the owner record is the
+    /// sibling of the default `~/.x0x/user.key`. A `None` here silently
+    /// disabled enforcement for every default install.
+    #[test]
+    fn owner_profile_path_resolves_default_install() {
+        let config = DaemonConfig {
+            user_key_path: None,
+            ..DaemonConfig::default()
+        };
+        let path = owner_profile_path(&config, &None).expect("default install must resolve");
+        assert!(path.ends_with(".x0x/owner.json") || path.ends_with(".x0x\\owner.json"));
+
+        // Explicit user key path wins (sibling of that key).
+        let custom = PathBuf::from("/custom/dir/user.key");
+        let config = DaemonConfig {
+            user_key_path: Some(custom.clone()),
+            ..DaemonConfig::default()
+        };
+        assert_eq!(
+            owner_profile_path(&config, &None),
+            Some(x0x::profile::OwnerProfile::path_for_key(&custom))
+        );
+
+        // Identity dir (named instances) scopes the record into it.
+        let dir = PathBuf::from("/instance/data");
+        assert_eq!(
+            owner_profile_path(&DaemonConfig::default(), &Some(dir.clone())),
+            Some(dir.join(x0x::profile::OWNER_PROFILE_FILE))
+        );
+    }
+
+    /// WHY (review P0): an existing pre-0036 install (user key, no owner
+    /// record) must be ADOPTED on first daemon start, so a later key swap
+    /// is caught — and a mismatched key must abort startup.
+    #[tokio::test]
+    async fn owner_enforcement_adopts_then_refuses_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("m.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_user_key(x0x::identity::UserKeypair::from_seed(&[7u8; 32]).unwrap())
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let config = DaemonConfig {
+            user_key_path: Some(data_dir.join("user.key")),
+            ..DaemonConfig::default()
+        };
+        // No owner record yet: adoption must record the LOADED identity.
+        enforce_owner_singleton(&config, &None, &agent)
+            .await
+            .unwrap();
+        let owner_path = owner_profile_path(&config, &None).unwrap();
+        let adopted = x0x::profile::OwnerProfile::load_from(&owner_path)
+            .await
+            .unwrap()
+            .expect("adopted owner record exists");
+        assert_eq!(
+            adopted.user_id,
+            hex::encode(agent.user_id().unwrap().as_bytes())
+        );
+
+        // A DIFFERENT user key against the recorded owner must refuse.
+        let other = Arc::new(
+            Agent::builder()
+                .with_machine_key(data_dir.join("m2.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_user_key(user)
+                .with_agent_cert_path(data_dir.join("agent2.cert"))
+                .build()
+                .await
+                .unwrap(),
+        );
+        let err = enforce_owner_singleton(&config, &None, &other)
+            .await
+            .expect_err("mismatched owner must abort startup");
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error must name the escape hatch: {err}"
+        );
+        let _ = &agent;
     }
 }

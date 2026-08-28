@@ -48,8 +48,10 @@ impl OwnerProfile {
         key_path.with_file_name(OWNER_PROFILE_FILE)
     }
 
-    /// Persist next to the user key (best-effort directory creation —
-    /// `user-id create` already created it for the key itself).
+    /// Persist next to the user key. ATOMIC (review P1): temp file +
+    /// rename, so a crash never leaves a truncated owner record — a torn
+    /// `owner.json` would either disable enforcement (parse error is loud,
+    /// but still an outage) or worse, read as a different owner.
     ///
     /// # Errors
     /// Returns the underlying IO error if the record cannot be written.
@@ -59,7 +61,7 @@ impl OwnerProfile {
         }
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::other(format!("serialize owner profile: {e}")))?;
-        tokio::fs::write(path, bytes).await
+        write_atomically(path, &bytes).await
     }
 
     /// Load the owner record, if one exists.
@@ -103,14 +105,15 @@ impl SelfProfile {
         data_dir.join(SELF_PROFILE_FILE)
     }
 
-    /// Persist to `path`.
+    /// Persist to `path` atomically (temp + rename), so a crash mid-write
+    /// can never truncate the stored names.
     ///
     /// # Errors
     /// Returns the underlying IO error if the profile cannot be written.
     pub async fn save_to(&self, path: &Path) -> std::io::Result<()> {
         let bytes = serde_json::to_vec_pretty(self)
             .map_err(|e| std::io::Error::other(format!("serialize self profile: {e}")))?;
-        tokio::fs::write(path, bytes).await
+        write_atomically(path, &bytes).await
     }
 
     /// Load the self-profile, if one exists. A missing file is an empty
@@ -129,25 +132,98 @@ impl SelfProfile {
         }
     }
 
-    /// Apply a partial update: every `Some` field replaces the stored
-    /// value, every `None` field is left untouched. Returns whether
-    /// anything changed.
+    /// Apply a partial update. Field semantics (review P2):
+    /// - `None` (field omitted or JSON `null`) — leave the stored name
+    ///   untouched;
+    /// - `Some("")` (EMPTY STRING) — explicitly CLEAR the stored name;
+    /// - `Some(name)` — set/replace.
+    ///
+    /// Returns whether anything changed.
     #[must_use]
     pub fn merge(&mut self, update: &SelfProfile) -> bool {
+        /// `Some("")` clears; otherwise replace.
+        fn apply(slot: &mut Option<String>, v: &Option<String>) -> bool {
+            match v {
+                None => false,
+                Some(v) if v.is_empty() => {
+                    let changed = slot.is_some();
+                    *slot = None;
+                    changed
+                }
+                Some(v) => {
+                    let changed = slot.as_ref() != Some(v);
+                    *slot = Some(v.clone());
+                    changed
+                }
+            }
+        }
         let mut changed = false;
-        if let Some(v) = &update.human_name {
-            changed |= self.human_name.as_ref() != Some(v);
-            self.human_name = Some(v.clone());
-        }
-        if let Some(v) = &update.display_name {
-            changed |= self.display_name.as_ref() != Some(v);
-            self.display_name = Some(v.clone());
-        }
-        if let Some(v) = &update.machine_name {
-            changed |= self.machine_name.as_ref() != Some(v);
-            self.machine_name = Some(v.clone());
-        }
+        changed |= apply(&mut self.human_name, &update.human_name);
+        changed |= apply(&mut self.display_name, &update.display_name);
+        changed |= apply(&mut self.machine_name, &update.machine_name);
         changed
+    }
+
+    /// Maximum accepted name length. Names reach the announce wire, agent
+    /// cards, and API responses — a bounded, small cap keeps every consumer
+    /// cheap and blocks storage/wire abuse via megabyte-scale "names".
+    pub const MAX_NAME_LEN: usize = 128;
+
+    /// Validate one name (review P2): 1..=MAX_NAME_LEN chars after
+    /// trimming surrounding whitespace, no control characters. The empty
+    /// string is NOT accepted here — it is the CLEAR sentinel handled by
+    /// [`SelfProfile::merge`] and must not be stored.
+    ///
+    /// # Errors
+    /// Returns a human-readable reason string.
+    pub fn validate_name(field: &str, value: &str) -> std::result::Result<(), String> {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err(format!("{field} must not be blank"));
+        }
+        if trimmed.len() > Self::MAX_NAME_LEN {
+            return Err(format!(
+                "{field} exceeds {} bytes (got {})",
+                Self::MAX_NAME_LEN,
+                trimmed.len()
+            ));
+        }
+        if trimmed.chars().any(char::is_control) {
+            return Err(format!("{field} must not contain control characters"));
+        }
+        Ok(())
+    }
+}
+
+/// Write `bytes` to `path` via a unique temp file + rename (atomic on both
+/// unix and windows for same-directory renames). The temp name embeds the
+/// pid + a counter so concurrent writers never collide.
+async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "profile path has no file name",
+        )
+    })?;
+    let tmp = dir.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::Relaxed)
+    ));
+    tokio::fs::write(&tmp, bytes).await?;
+    match tokio::fs::rename(&tmp, path).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            Err(e)
+        }
     }
 }
 
@@ -204,8 +280,9 @@ mod tests {
 
     #[test]
     fn self_profile_merge_updates_only_present_fields() {
-        // WHY: PUT /profile is partial — omitted fields must not clobber
-        // stored names (a client setting only machine_name keeps the rest).
+        // WHY: PUT /profile is partial — omitted/null fields must not
+        // clobber stored names (a client setting only machine_name keeps
+        // the rest), while an EMPTY STRING is the explicit clear.
         let mut profile = SelfProfile {
             human_name: Some("David".to_string()),
             display_name: Some("fae".to_string()),
@@ -227,5 +304,30 @@ mod tests {
             machine_name: Some("m5".to_string()),
             ..SelfProfile::default()
         }));
+
+        // Empty string clears; null/omitted never does.
+        assert!(profile.merge(&SelfProfile {
+            display_name: Some(String::new()),
+            ..SelfProfile::default()
+        }));
+        assert_eq!(profile.display_name, None);
+        assert_eq!(profile.human_name.as_deref(), Some("David"));
+    }
+
+    #[test]
+    fn validate_name_rejects_blank_long_and_control_names() {
+        // WHY (review P2): names persist to disk and propagate to the wire
+        // and cards — blank, oversized, or control-character "names" are
+        // garbage or abuse at every consumer.
+        assert!(SelfProfile::validate_name("human_name", "David Irvine").is_ok());
+        assert!(SelfProfile::validate_name("human_name", "  padded  ").is_ok());
+        assert!(SelfProfile::validate_name("display_name", "").is_err());
+        assert!(SelfProfile::validate_name("display_name", "   ").is_err());
+        assert!(SelfProfile::validate_name(
+            "machine_name",
+            &"x".repeat(SelfProfile::MAX_NAME_LEN + 1)
+        )
+        .is_err());
+        assert!(SelfProfile::validate_name("machine_name", "bad\u{0007}name").is_err());
     }
 }

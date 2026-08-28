@@ -14,6 +14,9 @@ pub fn default_user_key_path() -> Result<PathBuf> {
 
 /// `x0x user-id create [PATH]` — create a user identity keypair on disk.
 ///
+/// Overwrites an existing key at the target path ONLY for the same identity
+/// or with `--rotate-owner` (ADR-0036); a different identity refuses.
+///
 /// With `from_seed_hex` (issue #95), the keypair is derived
 /// deterministically from the 32-byte seed via FIPS 204 seeded KeyGen:
 /// same seed → same keypair on any machine. Without it, random keygen.
@@ -72,6 +75,37 @@ pub async fn create(
         }
     }
 
+    // Review P0/P1 — fail closed on a pre-existing key file even when NO
+    // owner record exists (a pre-0036 install): the resident key's identity
+    // IS the owner until explicitly rotated. An unreadable existing key
+    // also refuses (never overwrite what cannot be compared).
+    if tokio::fs::try_exists(&path).await.unwrap_or(false) && !rotate_owner {
+        // (--rotate-owner skips the load entirely: replacing a key we
+        // cannot read is exactly what rotation is FOR.)
+        let existing_key = load_user_keypair_from(&path).await.map_err(|e| {
+            anyhow::anyhow!(
+                "existing user key at {} is unreadable ({e}); pass --rotate-owner \
+                 to replace it deliberately",
+                path.display()
+            )
+        })?;
+        let existing_id = hex::encode(existing_key.user_id().as_bytes());
+        if existing_id != new_user_id && !rotate_owner {
+            anyhow::bail!(
+                "refusing to overwrite user key {} with a different identity \
+                 {}: one owner per install (ADR-0036). Pass --rotate-owner; \
+                 agent certificates are re-issued on the next daemon start.",
+                existing_id,
+                new_user_id
+            );
+        }
+    }
+
+    // Transactional ordering (review P1): both writes are atomic
+    // (temp+rename). On a crash BETWEEN them the install is left
+    // key-new/owner-old (or vice versa) — a MISMATCH, which the daemon and
+    // create both treat as fail-closed refusal; re-running with
+    // --rotate-owner restores consistency. Never a silent authority swap.
     save_user_keypair_to(&keypair, &path)
         .await
         .with_context(|| format!("failed to write user keypair to {}", path.display()))?;
@@ -339,6 +373,47 @@ mod tests {
         create(Some(path.clone()), Some(SEED_A), false)
             .await
             .expect("same user_id must not require --rotate-owner");
+    }
+
+    #[tokio::test]
+    async fn pre0036_key_without_owner_record_still_refuses_different_identity() {
+        // WHY (review P0/P1): an install from before ADR-0036 has a user
+        // key but no owner.json. The resident key's identity is the owner
+        // until explicitly rotated — a create with a different identity
+        // must refuse even without a record, and the daemon adopts the
+        // resident key on first start.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let path = temp_dir.path().join("user.key");
+        // Seed-A key, no owner.json (simulate pre-0036 by writing the key
+        // through create then removing the record).
+        create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .unwrap();
+        let owner_path = crate::profile::OwnerProfile::path_for_key(&path);
+        tokio::fs::remove_file(&owner_path).await.unwrap();
+
+        let err = create(Some(path.clone()), Some(SEED_B), false)
+            .await
+            .expect_err("different identity over an ownerless key must refuse");
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error names the escape hatch: {err}"
+        );
+
+        // Corrupt resident key: refuse rather than overwrite blindly.
+        tokio::fs::write(&path, b"garbage").await.unwrap();
+        let err = create(Some(path.clone()), Some(SEED_A), false)
+            .await
+            .expect_err("unreadable existing key must refuse");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "error names the reason: {err}"
+        );
+
+        // Explicit rotation recovers.
+        create(Some(path.clone()), Some(SEED_A), true)
+            .await
+            .expect("rotate recovers an unreadable key");
     }
 
     const SEED_A: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";

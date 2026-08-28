@@ -64,10 +64,33 @@ pub(in crate::server) async fn update_profile(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateProfileRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Review P2: validate BEFORE persisting or announcing anything. An
+    // empty string is the explicit CLEAR sentinel and skips validation;
+    // a non-empty value must be a sane bounded name (no control chars,
+    // <= 128 bytes) — names reach profile.json, the announce wire, and
+    // signed agent cards.
+    for (field, value) in [
+        ("human_name", &req.human_name),
+        ("display_name", &req.display_name),
+        ("machine_name", &req.machine_name),
+    ] {
+        if let Some(v) = value {
+            if !v.is_empty() {
+                if let Err(reason) = crate::profile::SelfProfile::validate_name(field, v) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({ "ok": false, "error": reason })),
+                    );
+                }
+            }
+        }
+    }
     let update = crate::profile::SelfProfile {
-        human_name: req.human_name,
-        display_name: req.display_name,
-        machine_name: req.machine_name,
+        // Trim accepted names so whitespace never reaches the wire; keep
+        // the empty-string clear sentinel intact.
+        human_name: req.human_name.as_ref().map(|v| v.trim().to_string()),
+        display_name: req.display_name.as_ref().map(|v| v.trim().to_string()),
+        machine_name: req.machine_name.as_ref().map(|v| v.trim().to_string()),
     };
     let (profile, persist_err) = {
         let mut profile = state.profile.write().await;
@@ -118,10 +141,14 @@ pub(in crate::server) struct OwnerAgentEntry {
     pub(in crate::server) is_local: bool,
 }
 
-/// GET /owner/agents — the authoritative roster of agents certified by this
-/// install's owner (ADR-0036): issued `AgentCertificate`s joined with the
-/// contact store and the discovery cache for names. `409` when no user
-/// identity (and therefore no owner) is configured.
+/// GET /owner/agents — the roster of agents certified by this install's
+/// owner (ADR-0036): certificates this daemon has VERIFIED for the owner's
+/// `UserId` (its own, the owner's signed announcement roster, and certs
+/// embedded in discovered beats), joined with the contact store and the
+/// discovery cache for names. Honest scope (review P1): best-effort and
+/// discovery-derived — not a persisted issuance journal; owned agents that
+/// are offline and uncached drop out after restart until re-observed.
+/// `409` when no user identity (and therefore no owner) is configured.
 pub(in crate::server) async fn owner_agents(
     State(state): State<Arc<AppState>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
@@ -341,6 +368,70 @@ mod tests {
         assert_eq!(
             json["card"]["owner_name"], "David Irvine",
             "owner_name must come from the stored profile human_name"
+        );
+    }
+
+    /// WHY (review P2): names persist and propagate to the wire and cards —
+    /// garbage must be rejected with 400 BEFORE persistence, and an empty
+    /// string must CLEAR the stored name (null/omitted keeps it).
+    #[tokio::test]
+    async fn profile_put_validates_names_and_empty_string_clears() {
+        let (state, _dir) = test_state().await;
+
+        // Oversized and control-character names are rejected, nothing persisted.
+        let (code, body) = update_profile(
+            State(Arc::clone(&state)),
+            Json(UpdateProfileRequest {
+                human_name: Some(format!("x{}", "y".repeat(200))),
+                display_name: None,
+                machine_name: None,
+            }),
+        )
+        .await;
+        assert_eq!(code, SC::BAD_REQUEST, "{}", body.0);
+        let (code, body) = update_profile(
+            State(Arc::clone(&state)),
+            Json(UpdateProfileRequest {
+                human_name: Some("bad\u{0007}name".to_string()),
+                display_name: None,
+                machine_name: None,
+            }),
+        )
+        .await;
+        assert_eq!(code, SC::BAD_REQUEST, "{}", body.0);
+        let Json(ApiResponse { data, .. }) = get_profile(State(Arc::clone(&state))).await;
+        assert!(
+            data.human_name.is_none(),
+            "rejected writes must not persist"
+        );
+
+        // Set, then clear with the empty string; null keeps the rest.
+        let (code, _) = update_profile(
+            State(Arc::clone(&state)),
+            Json(UpdateProfileRequest {
+                human_name: Some("David".to_string()),
+                display_name: Some("fae".to_string()),
+                machine_name: None,
+            }),
+        )
+        .await;
+        assert_eq!(code, SC::OK);
+        let (code, _) = update_profile(
+            State(Arc::clone(&state)),
+            Json(UpdateProfileRequest {
+                human_name: Some(String::new()), // explicit clear
+                display_name: None,              // keep
+                machine_name: None,
+            }),
+        )
+        .await;
+        assert_eq!(code, SC::OK);
+        let Json(ApiResponse { data, .. }) = get_profile(State(state)).await;
+        assert_eq!(data.human_name, None, "empty string clears");
+        assert_eq!(data.display_name.as_deref(), Some("fae"), "null keeps");
+        assert_eq!(
+            crate::profile::SelfProfile::default(),
+            crate::profile::SelfProfile::default()
         );
     }
 

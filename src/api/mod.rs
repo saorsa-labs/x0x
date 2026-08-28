@@ -167,7 +167,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/owner/agents",
         cli_name: "owner agents",
-        description: "Roster of agents certified by this install's owner",
+        description: "Best-effort roster of agents certified by this install's owner (discovery-derived; not a persisted issuance journal)",
         category: "identity",
     },
     // ── Network ─────────────────────────────────────────────────────────

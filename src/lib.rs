@@ -1912,6 +1912,13 @@ async fn upsert_discovered_agent(
                 if incoming.is_coordinator.is_some() {
                     existing.is_coordinator = incoming.is_coordinator;
                 }
+                // ADR-0036: same "present wins, absent preserves" rule as
+                // the other optional fields — a legacy X0A3 beat carries no
+                // name and must not erase one learned from a V3.1 beat (a
+                // cleared name ages out with the record's TTL instead).
+                if incoming.self_name.is_some() {
+                    existing.self_name = incoming.self_name;
+                }
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
                 // LWW the agent public key — a v2 announcement always
@@ -2701,6 +2708,11 @@ impl HeartbeatContext {
         // payload_version tracks the (user_id, cert) pair: 0 = anonymous,
         // announced_at otherwise (any change to the pair changes the digest,
         // and a consent flip bumps the version past every cached value).
+        //
+        // ADR-0036: a NAMED install dual-publishes — the legacy X0A3 beat
+        // (name dropped, byte-identical to pre-0036 so old decoders keep
+        // accepting it) plus the X0A4 V3.1 beat carrying the self-name.
+        // Unnamed installs publish X0A3 only, exactly as before.
         let v3_payload_version = if announcement.user_id.is_some() {
             announcement.announced_at
         } else {
@@ -2710,25 +2722,45 @@ impl HeartbeatContext {
             &announcement,
             self.identity.machine_keypair().secret_key(),
             v3_payload_version,
-        )
-        .and_then(|v3| {
-            announce_v3::serialize_v3(&v3).map_err(|e| {
-                error::IdentityError::Serialization(format!(
-                    "heartbeat: failed to serialize v3 announcement: {e}"
-                ))
-            })
-        }) {
-            Ok(v3_encoded) => {
-                if let Err(e) = self
-                    .runtime
-                    .pubsub()
-                    .publish(
-                        IDENTITY_ANNOUNCE_TOPIC.to_string(),
-                        bytes::Bytes::from(v3_encoded),
-                    )
-                    .await
-                {
-                    tracing::debug!("heartbeat: v3 publish failed: {e}");
+        ) {
+            Ok(mut v3) => {
+                match announce_v3::serialize_v3(&v3) {
+                    Ok(v3_encoded) => {
+                        if let Err(e) = self
+                            .runtime
+                            .pubsub()
+                            .publish(
+                                IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                                bytes::Bytes::from(v3_encoded),
+                            )
+                            .await
+                        {
+                            tracing::debug!("heartbeat: v3 publish failed: {e}");
+                        }
+                    }
+                    Err(e) => tracing::debug!("heartbeat: v3 serialize failed: {e}"),
+                }
+                if v3.self_name.is_some() {
+                    if let Err(e) = v3.sign_v3_1(self.identity.machine_keypair().secret_key()) {
+                        tracing::debug!("heartbeat: v3.1 resign failed: {e}");
+                    } else {
+                        match announce_v3::serialize_v3_1(&v3) {
+                            Ok(v31_encoded) => {
+                                if let Err(e) = self
+                                    .runtime
+                                    .pubsub()
+                                    .publish(
+                                        IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                                        bytes::Bytes::from(v31_encoded),
+                                    )
+                                    .await
+                                {
+                                    tracing::debug!("heartbeat: v3.1 publish failed: {e}");
+                                }
+                            }
+                            Err(e) => tracing::debug!("heartbeat: v3.1 serialize failed: {e}"),
+                        }
+                    }
                 }
             }
             Err(e) => tracing::debug!("heartbeat: v3 build failed: {e}"),
@@ -6806,19 +6838,19 @@ impl Agent {
         } else {
             0
         };
+        // ADR-0036: dual-publish — legacy X0A3 beat always (old decoders),
+        // X0A4 V3.1 beat additionally when the agent is named.
         match announce_v3::IdentityAnnouncementV3::build_from_v2(
             &announcement,
             self.identity.machine_keypair().secret_key(),
             v3_payload_version,
-        )
-        .and_then(|v3| {
-            announce_v3::serialize_v3(&v3).map_err(|e| {
-                error::IdentityError::Serialization(format!(
-                    "failed to serialize v3 announcement: {e}"
-                ))
-            })
-        }) {
-            Ok(v3_encoded) => {
+        ) {
+            Ok(mut v3) => {
+                let v3_encoded = announce_v3::serialize_v3(&v3).map_err(|e| {
+                    error::IdentityError::Serialization(format!(
+                        "failed to serialize v3 announcement: {e}"
+                    ))
+                })?;
                 runtime
                     .pubsub()
                     .publish(
@@ -6831,6 +6863,26 @@ impl Agent {
                             "failed to publish v3 identity announcement: {e}"
                         )))
                     })?;
+                if v3.self_name.is_some() {
+                    v3.sign_v3_1(self.identity.machine_keypair().secret_key())?;
+                    let v31_encoded = announce_v3::serialize_v3_1(&v3).map_err(|e| {
+                        error::IdentityError::Serialization(format!(
+                            "failed to serialize v3.1 announcement: {e}"
+                        ))
+                    })?;
+                    runtime
+                        .pubsub()
+                        .publish(
+                            IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                            bytes::Bytes::from(v31_encoded),
+                        )
+                        .await
+                        .map_err(|e| {
+                            error::IdentityError::Storage(std::io::Error::other(format!(
+                                "failed to publish v3.1 identity announcement: {e}"
+                            )))
+                        })?;
+                }
             }
             Err(e) => tracing::warn!("announce_identity: v3 build failed: {e}"),
         }
@@ -9556,15 +9608,18 @@ impl Agent {
     }
 
     /// Certificates the install's owner has issued for agents this daemon
-    /// knows about (ADR-0036 `GET /owner/agents`).
+    /// currently knows about (ADR-0036 `GET /owner/agents`).
     ///
-    /// Sources, in precedence order: this daemon's own certificate, the
-    /// cached verified [`UserAnnouncement`] roster for the owner's
-    /// `UserId`, and certificates embedded in discovered agents'
-    /// announcements. Deduplicated by agent id — a stale discovery cert
-    /// never shadows a fresher roster entry for the same agent. Every
-    /// certificate binds to the owner's `UserId` (verified at announce
-    /// time), so foreign certs cannot enter the roster.
+    /// HONEST SCOPE (review P1): this is a best-effort, discovery-derived
+    /// view — the daemon's own certificate, the cached verified
+    /// [`UserAnnouncement`] roster for the owner, and certificates embedded
+    /// in discovered announcements. It is NOT a persisted issuance journal:
+    /// owned agents that are offline and not cached drop out after a
+    /// restart until re-observed. Where the same agent id carries multiple
+    /// certs (a renewal), the LATEST-issued wins, so a stale discovery
+    /// entry can no longer shadow a renewed roster cert or misreport
+    /// expiry. Every certificate binds to the owner's `UserId` (verified
+    /// at announce time), so foreign certs cannot enter the roster.
     ///
     /// Empty when no user identity is configured.
     #[must_use]
@@ -9572,33 +9627,44 @@ impl Agent {
         let Some(owner) = self.identity.user_id() else {
             return Vec::new();
         };
-        let mut out: Vec<identity::AgentCertificate> = Vec::new();
-        let mut seen: std::collections::HashSet<identity::AgentId> =
-            std::collections::HashSet::new();
-        let push = |cert: identity::AgentCertificate,
-                    seen: &mut std::collections::HashSet<identity::AgentId>,
-                    out: &mut Vec<identity::AgentCertificate>| {
+        // agent_id → (issued_at, cert); latest issuance replaces earlier.
+        let mut best: std::collections::HashMap<
+            identity::AgentId,
+            (u64, identity::AgentCertificate),
+        > = std::collections::HashMap::new();
+        let consider = |cert: identity::AgentCertificate,
+                        best: &mut std::collections::HashMap<
+            identity::AgentId,
+            (u64, identity::AgentCertificate),
+        >| {
             if let Ok(id) = cert.agent_id() {
-                if seen.insert(id) {
-                    out.push(cert);
+                let issued = cert.issued_at();
+                match best.get(&id) {
+                    Some((prev_issued, _)) if *prev_issued >= issued => {}
+                    _ => {
+                        best.insert(id, (issued, cert));
+                    }
                 }
             }
         };
         if let Some(own) = self.identity.agent_certificate() {
-            push(own.clone(), &mut seen, &mut out);
+            consider(own.clone(), &mut best);
         }
         if let Some(discovered_user) = self.user_discovery_cache.read().await.get(&owner) {
             for cert in &discovered_user.agent_certificates {
-                push(cert.clone(), &mut seen, &mut out);
+                consider(cert.clone(), &mut best);
             }
         }
         for agent in self.identity_discovery_cache.read().await.values() {
             if let Some(cert) = &agent.agent_certificate {
                 if cert.user_id().is_ok_and(|uid| uid == owner) {
-                    push(cert.clone(), &mut seen, &mut out);
+                    consider(cert.clone(), &mut best);
                 }
             }
         }
+        let mut out: Vec<identity::AgentCertificate> =
+            best.into_values().map(|(_, cert)| cert).collect();
+        out.sort_by_key(|cert| cert.agent_id().map_or([0u8; 32], |id| *id.as_bytes()));
         out
     }
 
@@ -11733,15 +11799,26 @@ impl AgentBuilder {
             kp
         };
 
-        // Resolve user keypair: explicit > path-based > default storage > None (opt-in)
+        // Resolve user keypair: explicit > path-based > default storage > None (opt-in).
+        //
+        // ADR-0036 (review P0): a user key that EXISTS but fails to load is
+        // a HARD ERROR, never a silent downgrade to anonymous — the user
+        // key is the install's authority, and running without it while an
+        // owner record names it would be exactly the silent-authority-loss
+        // the owner singleton exists to prevent. A missing file stays a
+        // legitimate opt-out.
         let user_keypair = if let Some(kp) = self.user_keypair {
             Some(kp)
         } else if let Some(path) = self.user_key_path {
             // Custom path: load if exists, otherwise None (don't auto-generate)
-            storage::load_user_keypair_from(&path).await.ok()
+            if tokio::fs::try_exists(&path).await.unwrap_or(false) {
+                Some(storage::load_user_keypair_from(&path).await?)
+            } else {
+                None
+            }
         } else if storage::user_keypair_exists().await {
             // Default path exists: load it
-            storage::load_user_keypair().await.ok()
+            Some(storage::load_user_keypair().await?)
         } else {
             None
         };
@@ -18462,25 +18539,28 @@ mod tests {
             .subscribe(IDENTITY_ANNOUNCE_TOPIC.to_string())
             .await;
 
-        // Unnamed beat first: V3 with self_name None.
+        // Unnamed beat first: X0A3 only.
         agent.announce_identity(false, false).await.unwrap();
-        // Then set the name the way `PUT /profile` does and beat again.
+        // Then set the name the way `PUT /profile` does and beat again: the
+        // named beat must dual-publish X0A4 (name) + the X0A3 companion.
         agent.set_self_name(Some("fae".to_string()));
         agent.announce_identity(false, false).await.unwrap();
 
-        let mut saw_unnamed = false;
+        let mut x0a3_unnamed = 0usize;
         let mut saw_named = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline && !(saw_unnamed && saw_named) {
+        while tokio::time::Instant::now() < deadline && !(x0a3_unnamed >= 2 && saw_named) {
             tokio::select! {
                 Some(msg) = identity_sub.recv() => {
                     if announce_v3::is_v3_payload(&msg.payload) {
+                        let is_v31 = msg.payload
+                            .starts_with(announce_v3::IDENTITY_ANNOUNCEMENT_V3_1_MAGIC);
                         let v3 = announce_v3::deserialize_v3(&msg.payload).expect("v3 decodes");
                         v3.verify().expect("published v3 verifies");
-                        match v3.self_name.as_deref() {
-                            Some("fae") => saw_named = true,
-                            None => saw_unnamed = true,
-                            other => panic!("unexpected self_name on beat: {other:?}"),
+                        match (is_v31, v3.self_name.as_deref()) {
+                            (false, None) => x0a3_unnamed += 1,
+                            (true, Some("fae")) => saw_named = true,
+                            other => panic!("unexpected (envelope, self_name) on beat: {other:?}"),
                         }
                     }
                 }
@@ -18488,10 +18568,17 @@ mod tests {
             }
         }
         assert!(
-            saw_unnamed,
-            "unnamed beat must announce without a self_name"
+            x0a3_unnamed >= 1,
+            "unnamed beat must publish X0A3 without a self_name"
         );
-        assert!(saw_named, "named beat must announce the self_name");
+        assert!(
+            saw_named,
+            "named beat must publish X0A4 carrying the self_name"
+        );
+        assert!(
+            x0a3_unnamed >= 2,
+            "named beat must dual-publish the legacy X0A3 companion (review P0: old peers' decoders reject grown bodies and V2 is retired)"
+        );
     }
 
     /// The escape hatch (`with_legacy_announce(true)`) restores the V2 set —

@@ -433,7 +433,8 @@ enum OwnerSub {
 #[derive(Subcommand)]
 enum UserIdSub {
     /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
-    /// Overwrites any existing file at the target path without prompting.
+    /// Overwrites an existing key only for the same identity or with
+    /// --rotate-owner (ADR-0036); a different identity refuses.
     Create {
         /// Output path. Existing file at this path is overwritten.
         path: Option<PathBuf>,

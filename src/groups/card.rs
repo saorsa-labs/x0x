@@ -15,8 +15,20 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
 
-/// Domain separator for agent card signatures (ADR-0017).
+/// Domain separator for v1 agent card signatures (ADR-0017, pre-0036).
+/// FROZEN: v1 bytes are exactly the pre-0036 encoding — see
+/// [`AgentCard::signable_bytes`].
 const AGENT_CARD_SIGNATURE_DOMAIN: &[u8] = b"x0x-agent-card-v1";
+
+/// Domain separator for v2 agent card signatures (ADR-0036): the v1 fields
+/// plus `owner_name`, under a distinct domain so a v2 signature can never
+/// verify under the v1 rule (and vice versa). Old verifiers fail CLOSED on
+/// v2 cards — an explicit version error, never a silent domain change.
+const AGENT_CARD_SIGNATURE_DOMAIN_V2: &[u8] = b"x0x-agent-card-v2";
+
+/// Stable scheme identifier recorded on v2-signed cards (mirrors the
+/// `x0x.agent-sign.v2.ml-dsa-65` convention from `/agent/sign`).
+pub const AGENT_CARD_SIGNATURE_SCHEME_V2: &str = "x0x.agent-card.v2.ml-dsa-65";
 
 /// A shareable identity card for an x0x agent.
 ///
@@ -73,12 +85,22 @@ pub struct AgentCard {
 
     /// Human-readable name of the owner behind this agent (ADR-0036),
     /// e.g. "David Irvine". Populated from the daemon's stored self-profile
-    /// (`human_name`); absent on cards from installs without one. Additive
-    /// and serde-defaulted, so cards minted before 0036 still parse and
-    /// still verify — `signable_bytes` encodes `None` as the empty string,
-    /// exactly like the pre-existing optional `user_id`.
+    /// (`human_name`); absent on cards from installs without one. A card
+    /// carrying an owner_name is signed under the v2 domain
+    /// ([`AGENT_CARD_SIGNATURE_DOMAIN_V2`]) and records
+    /// [`AGENT_CARD_SIGNATURE_SCHEME_V2`] in `signature_scheme`; cards
+    /// without one keep the exact v1 encoding, so pre-0036 verifiers only
+    /// ever see byte-compatible v1 cards.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub owner_name: Option<String>,
+
+    /// Signing scheme marker. `None` (or absent) = v1 (pre-0036) signature;
+    /// `Some(AGENT_CARD_SIGNATURE_SCHEME_V2)` = v2. The marker is itself a
+    /// v2-signed field, so stripping it from a v2 card invalidates the
+    /// signature (fail-closed), and a v1 card cannot gain one without a new
+    /// signature.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signature_scheme: Option<String>,
 }
 
 /// A group reference inside an agent card.
@@ -114,6 +136,7 @@ impl AgentCard {
             machine_id: machine_id.to_string(),
             user_id: None,
             owner_name: None,
+            signature_scheme: None,
             addresses: Vec::new(),
             groups: Vec::new(),
             stores: Vec::new(),
@@ -168,11 +191,19 @@ impl AgentCard {
         format!("{} ({}…)", self.display_name, id_short)
     }
 
-    /// Canonical bytes signed by the agent to produce [`AgentCard::signature`].
+    /// Canonical v1 bytes signed by the agent to produce
+    /// [`AgentCard::signature`] (ADR-0017, pre-0036).
     ///
     /// Deterministic, domain-prefixed, length-prefixed encoding of every
     /// semantic field plus `agent_public_key`. Excludes `signature` itself.
     /// Mirrors the `GroupCard` signing scheme for consistency.
+    ///
+    /// FROZEN (review P0): `owner_name` and `signature_scheme` are NOT
+    /// encoded here, even as empty strings — `push_len_prefixed("")`
+    /// appends four zero bytes and would break every pre-0036 signature in
+    /// both directions. v1 bytes must remain byte-identical to the
+    /// pre-0036 encoder; `signable_bytes_v1_matches_frozen_pre0036_vector`
+    /// pins them against a hardcoded vector.
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(512);
@@ -202,13 +233,27 @@ impl AgentCard {
             &mut buf,
             self.agent_public_key.as_deref().unwrap_or("").as_bytes(),
         );
-        // ADR-0036: appended LAST so a card without owner_name serializes
-        // to exactly the pre-0036 signable bytes — old signatures keep
-        // verifying. `None` encodes as the empty string, mirroring user_id.
+        buf
+    }
+
+    /// Canonical v2 bytes (ADR-0036): the v1 field set, under the v2
+    /// domain, plus `owner_name` and the scheme identifier — both
+    /// committed, so neither can be stripped or swapped without breaking
+    /// the signature.
+    #[must_use]
+    pub fn signable_bytes_v2(&self) -> Vec<u8> {
+        let mut buf = self.signable_bytes();
+        // Re-prefix under the v2 domain: the v1 builder started with the v1
+        // domain bytes; swap them so the rest of the encoding is shared.
+        let v1_len = AGENT_CARD_SIGNATURE_DOMAIN.len();
+        let v2_len = AGENT_CARD_SIGNATURE_DOMAIN_V2.len();
+        buf.splice(0..v1_len, AGENT_CARD_SIGNATURE_DOMAIN_V2.iter().copied());
+        buf.reserve(v2_len - v1_len + 4 + self.owner_name.as_deref().map_or(0, str::len));
         push_len_prefixed(
             &mut buf,
             self.owner_name.as_deref().unwrap_or("").as_bytes(),
         );
+        push_len_prefixed(&mut buf, AGENT_CARD_SIGNATURE_SCHEME_V2.as_bytes());
         buf
     }
 
@@ -218,12 +263,29 @@ impl AgentCard {
     /// the agent public key, binding it to `agent_id` (SHA-256 of that key) so
     /// a recipient cannot swap in a foreign key.
     ///
+    /// ADR-0036 domain selection: a card with an `owner_name` signs the v2
+    /// encoding and records [`AGENT_CARD_SIGNATURE_SCHEME_V2`]; a card
+    /// without one signs the v1 encoding exactly as pre-0036 did. The
+    /// scheme marker is itself signed, so it cannot be stripped.
+    ///
     /// # Errors
     /// Returns an error if ML-DSA-65 signing fails.
     pub fn sign(&mut self, keypair: &AgentKeypair) -> Result<(), IdentityError> {
         self.agent_public_key = Some(hex::encode(keypair.public_key().as_bytes()));
         self.signature = None;
-        let sig = sign_with_ml_dsa(keypair.secret_key(), &self.signable_bytes()).map_err(|e| {
+        // The v2 encoding commits the SCHEME CONSTANT (not this field), so
+        // the field is purely a verifier-facing marker set here.
+        if self.owner_name.is_some() {
+            self.signature_scheme = Some(AGENT_CARD_SIGNATURE_SCHEME_V2.to_string());
+        } else {
+            self.signature_scheme = None;
+        }
+        let bytes = if self.owner_name.is_some() {
+            self.signable_bytes_v2()
+        } else {
+            self.signable_bytes()
+        };
+        let sig = sign_with_ml_dsa(keypair.secret_key(), &bytes).map_err(|e| {
             IdentityError::CertificateVerification(format!("agent card sign: {e:?}"))
         })?;
         self.signature = Some(hex::encode(sig.as_bytes()));
@@ -233,10 +295,22 @@ impl AgentCard {
     /// Verify the agent signature on this card.
     ///
     /// Checks the embedded `agent_public_key` hashes to `agent_id` and that
-    /// `signature` verifies over [`AgentCard::signable_bytes`].
+    /// `signature` verifies under the card's recorded signing scheme.
+    ///
+    /// ADR-0036 scheme dispatch:
+    /// - `signature_scheme: None` → v1 verification over
+    ///   [`AgentCard::signable_bytes`] (byte-identical to pre-0036). A v1
+    ///   card that carries an `owner_name` is REJECTED: v1 bytes do not
+    ///   cover that field, so the name would ride unsigned (fail closed).
+    /// - `signature_scheme: Some(AGENT_CARD_SIGNATURE_SCHEME_V2)` → v2
+    ///   verification over [`AgentCard::signable_bytes_v2`], which commits
+    ///   the owner name and the scheme marker.
+    /// - any other scheme → explicit unknown-scheme error (never a silent
+    ///   fallback).
     ///
     /// # Errors
-    /// Returns an error if the card is unsigned, the key/id binding fails, or
+    /// Returns an error if the card is unsigned, the key/id binding fails,
+    /// the scheme is unknown, an unsigned field is present on a v1 card, or
     /// the signature is invalid.
     pub fn verify_signature(&self) -> Result<(), IdentityError> {
         let (Some(sig_hex), Some(pk_hex)) =
@@ -261,7 +335,24 @@ impl AgentCard {
             .map_err(|e| IdentityError::CertificateVerification(format!("bad sig hex: {e}")))?;
         let sig = MlDsaSignature::from_bytes(&sig_bytes)
             .map_err(|e| IdentityError::CertificateVerification(format!("bad sig: {e:?}")))?;
-        verify_with_ml_dsa(&pubkey, &self.signable_bytes(), &sig).map_err(|e| {
+        let bytes = match self.signature_scheme.as_deref() {
+            None => {
+                if self.owner_name.is_some() {
+                    return Err(IdentityError::CertificateVerification(
+                        "v1-signed card carries an unsigned owner_name; rejecting (ADR-0036)"
+                            .to_string(),
+                    ));
+                }
+                self.signable_bytes()
+            }
+            Some(AGENT_CARD_SIGNATURE_SCHEME_V2) => self.signable_bytes_v2(),
+            Some(other) => {
+                return Err(IdentityError::CertificateVerification(format!(
+                    "unknown agent card signature scheme: {other}"
+                )));
+            }
+        };
+        verify_with_ml_dsa(&pubkey, &bytes, &sig).map_err(|e| {
             IdentityError::CertificateVerification(format!("agent card verify: {e:?}"))
         })?;
         Ok(())
@@ -438,47 +529,113 @@ mod tests {
     }
 
     #[test]
-    fn test_owner_name_is_signed_and_link_round_trips() {
+    fn signable_bytes_v1_matches_frozen_pre0036_vector() {
+        // A card whose v1 signable bytes are pinned to a HARDCODED pre-0036
+        // vector (review P0: `push_len_prefixed("")` appends four zero
+        // bytes, so a well-meant "encode None as empty" broke every pre-0036
+        // signature in both directions — this test makes that class of
+        // break impossible to reintroduce silently).
+        let mut card = AgentCard::new("fae".to_string(), &agent(1), &hex::encode([2u8; 32]));
+        card.addresses = vec!["203.0.113.7:5483".to_string()];
+        card.created_at = 1_700_000_000;
+        card.dm_capabilities = None; // bincode: single 0x00 None tag
+        card.agent_public_key = Some("aabb".to_string());
+        // Fields that must NEVER enter v1 bytes, even as empty strings.
+        card.owner_name = Some("David Irvine".to_string());
+        card.signature_scheme = Some(AGENT_CARD_SIGNATURE_SCHEME_V2.to_string());
+        const FROZEN_PRE0036: &[u8] = &[
+            120, 48, 120, 45, 97, 103, 101, 110, 116, 45, 99, 97, 114, 100, 45, 118, 49, 3, 0, 0,
+            0, 102, 97, 101, 64, 0, 0, 0, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49,
+            48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49,
+            48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49, 48, 49,
+            48, 49, 48, 49, 48, 49, 64, 0, 0, 0, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50,
+            48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50,
+            48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50, 48, 50,
+            48, 50, 48, 50, 48, 50, 48, 50, 0, 0, 0, 0, 1, 0, 0, 0, 16, 0, 0, 0, 50, 48, 51, 46,
+            48, 46, 49, 49, 51, 46, 55, 58, 53, 52, 56, 51, 0, 0, 0, 0, 0, 0, 0, 0, 0, 241, 83,
+            101, 0, 0, 0, 0, 1, 0, 0, 0, 0, 4, 0, 0, 0, 97, 97, 98, 98,
+        ];
+        assert_eq!(
+            card.signable_bytes(),
+            FROZEN_PRE0036,
+            "v1 bytes must stay byte-identical to the pre-0036 encoder"
+        );
+    }
+
+    #[test]
+    fn test_owner_name_is_signed_under_v2_domain_and_round_trips() {
         // WHY (ADR-0036): owner_name is display metadata shared out-of-band
         // — an unsigned name could be swapped by a relay to impersonate the
-        // owner, so it must be covered by the signature like every other
-        // semantic field, and must survive the link transport.
+        // owner, so a named card signs the v2 domain (which commits the
+        // name AND the scheme marker) and must survive the link transport.
         let kp = AgentKeypair::generate().expect("kp");
         let mut card = AgentCard::new("fae".to_string(), &kp.agent_id(), &hex::encode([9u8; 32]));
         card.owner_name = Some("David Irvine".to_string());
         card.sign(&kp).expect("sign");
+        assert_eq!(
+            card.signature_scheme.as_deref(),
+            Some(AGENT_CARD_SIGNATURE_SCHEME_V2)
+        );
         assert!(card.verify_signature().is_ok());
 
         let restored = AgentCard::from_link(&card.to_link()).expect("parse");
         assert_eq!(restored.owner_name.as_deref(), Some("David Irvine"));
+        assert_eq!(
+            restored.signature_scheme.as_deref(),
+            Some(AGENT_CARD_SIGNATURE_SCHEME_V2)
+        );
         restored.verify_signature().expect("named card verifies");
 
-        // Tampering with the owner name must fail — it is a signed field.
-        let mut bad = restored;
+        // Tampering with the owner name must fail — it is a v2-signed field.
+        let mut bad = restored.clone();
         bad.owner_name = Some("Mallory".to_string());
         assert!(bad.verify_signature().is_err());
+
+        // Stripping the scheme marker must fail — the v2 bytes commit it.
+        let mut stripped = restored;
+        stripped.signature_scheme = None;
+        assert!(
+            stripped.verify_signature().is_err(),
+            "scheme strip must not downgrade to a passing v1 verify"
+        );
     }
 
     #[test]
-    fn test_owner_name_none_keeps_pre0036_signable_bytes() {
-        // WHY: cards signed before 0036 must still verify after the field
-        // exists — `None` encodes as the empty string, appended last, so
-        // the signable bytes of an owner-less card are byte-identical to
-        // the pre-0036 encoding.
+    fn test_v1_card_with_injected_owner_name_is_rejected() {
+        // WHY: v1 bytes do not cover owner_name, so an attacker could append
+        // a name to a legitimately v1-signed card and have it display as if
+        // the owner wrote it. New verifiers fail closed on that shape.
         let kp = AgentKeypair::generate().expect("kp");
         let mut card = AgentCard::new("fae".to_string(), &kp.agent_id(), &hex::encode([9u8; 32]));
         card.sign(&kp).expect("sign");
-        card.owner_name = None;
-        // Stripping the field from a SIGNED card must not change the bytes
-        // the verifier reconstructs.
-        let with_none = card.signable_bytes();
-        let pre0036 = {
-            let mut c = card.clone();
-            c.owner_name = None;
-            c.signable_bytes()
-        };
-        assert_eq!(with_none, pre0036);
-        card.verify_signature()
-            .expect("a card with owner_name None verifies like a pre-0036 card");
+        assert!(card.signature_scheme.is_none());
+        assert!(card.verify_signature().is_ok());
+
+        let mut forged = card;
+        forged.owner_name = Some("Mallory".to_string());
+        let err = forged
+            .verify_signature()
+            .expect_err("v1 card + unsigned owner_name must be rejected");
+        assert!(
+            err.to_string().contains("unsigned owner_name"),
+            "error names the reason: {err}"
+        );
+    }
+
+    #[test]
+    fn test_ownerless_card_stays_v1_and_verifies_like_pre0036() {
+        // WHY: cards without an owner_name must remain v1 — byte-compatible
+        // with every pre-0036 signer and verifier (no scheme field, no v2
+        // domain), so the rollout only affects named cards.
+        let kp = AgentKeypair::generate().expect("kp");
+        let mut card = AgentCard::new("fae".to_string(), &kp.agent_id(), &hex::encode([9u8; 32]));
+        card.sign(&kp).expect("sign");
+        assert!(card.owner_name.is_none());
+        assert!(card.signature_scheme.is_none());
+        assert!(card.verify_signature().is_ok());
+        let restored = AgentCard::from_link(&card.to_link()).expect("parse");
+        restored
+            .verify_signature()
+            .expect("ownerless card round-trips as v1");
     }
 }

@@ -19,6 +19,15 @@
 //!   a V2 signature. Old nodes see an unknown magic, fail the legacy bincode
 //!   decode, and drop the payload — V2 continues to be published alongside V3
 //!   during the transition, so old nodes lose nothing.
+//! - ADR-0036 V3.1: the agent self-name rides a NEW envelope (`X0A4`), never
+//!   an in-place extension of `X0A3`. The V3 body is positional bincode under
+//!   `reject_trailing_bytes`, so an appended field would make every pre-0036
+//!   decoder drop the beat (and V2 is retired by default) — the agent would
+//!   vanish from old peers. A named install therefore dual-publishes: `X0A3`
+//!   (name dropped, byte-identical to pre-0036) for old peers, `X0A4`
+//!   (carrying `self_name`) for new ones. The name stays outside the machine
+//!   signature and outside `cert_digest`, so verification and the blob
+//!   fetch path are untouched by either envelope.
 
 use crate::{error, identity};
 
@@ -26,6 +35,12 @@ use crate::{error, identity};
 /// 32-byte `agent_id` (a hash prefix), so a fixed ASCII magic is
 /// collision-resistant the same way `X0A2` is.
 pub const IDENTITY_ANNOUNCEMENT_V3_MAGIC: &[u8; 4] = b"X0A3";
+
+/// Wire magic for the V3.1 envelope (ADR-0036): the V3 shape plus the
+/// trailing `self_name`. Pre-0036 nodes treat it exactly as they treated
+/// `X0A3` before it existed: an unknown magic, log-and-drop — which is why
+/// the legacy `X0A3` beat is dual-published alongside it while named.
+pub const IDENTITY_ANNOUNCEMENT_V3_1_MAGIC: &[u8; 4] = b"X0A4";
 
 /// Everything the machine key signs. `agent_public_key` is INSIDE the signed
 /// struct (unlike V2, where it rides outside the signature and is only
@@ -47,6 +62,30 @@ struct IdentityAnnouncementV3Unsigned {
     relay_candidates: Vec<identity::MachineId>,
     cert_digest: [u8; 32],
     payload_version: u64,
+}
+
+/// Everything the machine key signs for a V3.1 (`X0A4`) beat: the V3
+/// unsigned shape PLUS `self_name` (ADR-0036 review P0-3: the name is
+/// machine-signed on named beats — an unsigned suffix would let any peer
+/// republish another agent's core with an attacker-chosen name and have it
+/// cached). The legacy `X0A3` signature never covers the name.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct IdentityAnnouncementV31Unsigned {
+    agent_id: identity::AgentId,
+    machine_id: identity::MachineId,
+    agent_public_key: Vec<u8>,
+    machine_public_key: Vec<u8>,
+    addresses: Vec<std::net::SocketAddr>,
+    announced_at: u64,
+    nat_type: Option<String>,
+    can_receive_direct: Option<bool>,
+    is_relay: Option<bool>,
+    is_coordinator: Option<bool>,
+    reachable_via: Vec<identity::MachineId>,
+    relay_candidates: Vec<identity::MachineId>,
+    cert_digest: [u8; 32],
+    payload_version: u64,
+    self_name: Option<String>,
 }
 
 /// Signed V3 identity announcement.
@@ -88,33 +127,40 @@ pub struct IdentityAnnouncementV3 {
     pub payload_version: u64,
     /// ML-DSA-65 machine signature over the bincode of the unsigned struct.
     pub machine_signature: Vec<u8>,
-    /// Agent self-name (ADR-0036) — additive on the wire: an unnamed beat
-    /// is byte-identical to the pre-0036 form (`skip_serializing_if`), and
-    /// a beat from an old peer (field absent) decodes via the
-    /// [`IdentityAnnouncementV3Core`] fallback in [`deserialize_v3`] —
-    /// bincode cannot express "field absent" to serde's `default`.
-    /// Deliberately OUTSIDE the machine-signed
+    /// Agent self-name (ADR-0036). Carried ONLY by the V3.1 (`X0A4`)
+    /// envelope — the V3 (`X0A3`) serializer drops it so the legacy beat
+    /// stays byte-identical to pre-0036 and old decoders keep working. The
+    /// X0A4 body always serializes the field (bincode is positional; a
+    /// conditionally-absent trailing field would be undecodable), `None`
+    /// meaning "explicitly unnamed". Deliberately OUTSIDE the machine-signed
     /// `IdentityAnnouncementV3Unsigned` (same pattern as V2's
     /// `agent_public_key`): signing it would change the canonical signed
-    /// bytes and break signature verification of old beats. It also never
-    /// enters `cert_digest` — that digest still commits to
-    /// `bincode((user_id, agent_certificate))` only, so the V3 digest gate
-    /// and the blob fetch/verify path are untouched. Old peers that reject
-    /// trailing bytes on a NAMED beat fall back to the dual-published V2,
-    /// which never carries the name.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// bytes and break signature verification of beats signed before the
+    /// field existed. It also never enters `cert_digest` — that digest
+    /// commits to `bincode((user_id, agent_certificate))` only, so the
+    /// digest gate and the blob fetch/verify path are untouched.
+    #[serde(default)]
     pub self_name: Option<String>,
+
+    /// Which canonical form `machine_signature` covers: `false` = the
+    /// legacy V3 unsigned bytes (`X0A3`), `true` = the V3.1 unsigned bytes
+    /// (`X0A4`, name signed). Set by [`Self::sign_v3_1`] and by
+    /// [`deserialize_v3`] (from the envelope magic); never serialized —
+    /// `verify()` uses it to reconstruct the signed bytes, so flipping it
+    /// on a forged card merely fails the signature.
+    #[serde(skip)]
+    pub v31_signed: bool,
 }
 
-/// The pre-0036 V3 wire shape: [`IdentityAnnouncementV3`] minus the
-/// trailing `self_name`. bincode is positional and NOT self-describing, so
-/// a beat from an old peer simply ends after `machine_signature` —
-/// `#[serde(default)]` cannot express "field absent" in bincode's
-/// struct-as-seq decode (it errors `UnexpectedEof` instead). The decoder
-/// therefore parses the CURRENT shape first and falls back to this core
-/// shape, both strictly (see [`deserialize_v3`]). Keep this struct in
-/// lockstep with `IdentityAnnouncementV3`'s pre-`self_name` fields —
-/// `v3_without_self_name_is_byte_identical_to_pre0036` guards the pairing.
+/// The V3 (`X0A3`) wire shape: [`IdentityAnnouncementV3`] minus the
+/// trailing `self_name` — exactly what pre-0036 peers encode and decode.
+/// bincode is positional and NOT self-describing, so the V3 and V3.1
+/// bodies are distinct FIXED layouts distinguished by envelope magic, not
+/// by field presence (`#[serde(default)]` cannot express "field absent" in
+/// bincode's struct-as-seq decode — it errors `UnexpectedEof` instead).
+/// Keep this struct in lockstep with `IdentityAnnouncementV3`'s
+/// pre-`self_name` fields — `x0a3_beat_is_byte_identical_to_pre0036_shape`
+/// guards the pairing against a frozen copy of the old struct.
 #[derive(serde::Serialize, serde::Deserialize)]
 struct IdentityAnnouncementV3Core {
     agent_id: identity::AgentId,
@@ -132,6 +178,29 @@ struct IdentityAnnouncementV3Core {
     cert_digest: [u8; 32],
     payload_version: u64,
     machine_signature: Vec<u8>,
+}
+
+impl IdentityAnnouncementV3Core {
+    /// Project the current shape onto the legacy V3 body (name dropped).
+    fn from_current(v: &IdentityAnnouncementV3) -> Self {
+        Self {
+            agent_id: v.agent_id,
+            machine_id: v.machine_id,
+            agent_public_key: v.agent_public_key.clone(),
+            machine_public_key: v.machine_public_key.clone(),
+            addresses: v.addresses.clone(),
+            announced_at: v.announced_at,
+            nat_type: v.nat_type.clone(),
+            can_receive_direct: v.can_receive_direct,
+            is_relay: v.is_relay,
+            is_coordinator: v.is_coordinator,
+            reachable_via: v.reachable_via.clone(),
+            relay_candidates: v.relay_candidates.clone(),
+            cert_digest: v.cert_digest,
+            payload_version: v.payload_version,
+            machine_signature: v.machine_signature.clone(),
+        }
+    }
 }
 
 impl From<IdentityAnnouncementV3Core> for IdentityAnnouncementV3 {
@@ -153,6 +222,7 @@ impl From<IdentityAnnouncementV3Core> for IdentityAnnouncementV3 {
             payload_version: core.payload_version,
             machine_signature: core.machine_signature,
             self_name: None,
+            v31_signed: false,
         }
     }
 }
@@ -172,6 +242,20 @@ pub fn cert_digest(
 /// receivers so anonymous agents never trigger a fetch.
 pub fn anonymous_cert_digest() -> [u8; 32] {
     cert_digest(&None, &None)
+}
+
+/// Sign canonical bytes with the machine key (shared by both envelopes).
+fn sign_canonical_bytes(
+    machine_secret: &ant_quic::MlDsaSecretKey,
+    bytes: &[u8],
+) -> error::Result<Vec<u8>> {
+    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(machine_secret, bytes)
+        .map(|sig| sig.as_bytes().to_vec())
+        .map_err(|e| {
+            error::IdentityError::Storage(std::io::Error::other(format!(
+                "failed to sign announcement with machine key: {e:?}"
+            )))
+        })
 }
 
 impl IdentityAnnouncementV3 {
@@ -221,24 +305,59 @@ impl IdentityAnnouncementV3 {
             self_name: v2.self_name.clone(),
             payload_version,
             machine_signature: Vec::new(),
+            v31_signed: false,
         };
-        let unsigned_bytes = bincode::serialize(&v3.to_unsigned()).map_err(|e| {
-            error::IdentityError::Serialization(format!(
-                "failed to serialize unsigned v3 announcement: {e}"
-            ))
-        })?;
-        v3.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        // Signs the LEGACY (X0A3) canonical form — the form every existing
+        // peer verifies. Call [`Self::sign_v3_1`] afterwards to re-sign for
+        // the V3.1 envelope before [`serialize_v3_1`].
+        v3.machine_signature = sign_canonical_bytes(
             machine_secret,
-            &unsigned_bytes,
-        )
-        .map_err(|e| {
-            error::IdentityError::Storage(std::io::Error::other(format!(
-                "failed to sign v3 announcement with machine key: {e:?}"
-            )))
-        })?
-        .as_bytes()
-        .to_vec();
+            &bincode::serialize(&v3.to_unsigned()).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize unsigned v3 announcement: {e}"
+                ))
+            })?,
+        )?;
         Ok(v3)
+    }
+
+    /// Re-sign for the V3.1 (`X0A4`) envelope: the machine signature is
+    /// recomputed over the V3.1 canonical bytes, which COMMIT `self_name`
+    /// (review P0-3 — a name outside the signature was forgeable by
+    /// republishing another agent's core). After this call the in-memory
+    /// value verifies as V3.1 only; serialize the legacy beat BEFORE
+    /// calling this.
+    ///
+    /// # Errors
+    /// Returns an error if serialization or ML-DSA signing fails.
+    pub fn sign_v3_1(&mut self, machine_secret: &ant_quic::MlDsaSecretKey) -> error::Result<()> {
+        let unsigned = IdentityAnnouncementV31Unsigned {
+            agent_id: self.agent_id,
+            machine_id: self.machine_id,
+            agent_public_key: self.agent_public_key.clone(),
+            machine_public_key: self.machine_public_key.clone(),
+            addresses: self.addresses.clone(),
+            announced_at: self.announced_at,
+            nat_type: self.nat_type.clone(),
+            can_receive_direct: self.can_receive_direct,
+            is_relay: self.is_relay,
+            is_coordinator: self.is_coordinator,
+            reachable_via: self.reachable_via.clone(),
+            relay_candidates: self.relay_candidates.clone(),
+            cert_digest: self.cert_digest,
+            payload_version: self.payload_version,
+            self_name: self.self_name.clone(),
+        };
+        self.machine_signature = sign_canonical_bytes(
+            machine_secret,
+            &bincode::serialize(&unsigned).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize unsigned v3.1 announcement: {e}"
+                ))
+            })?,
+        )?;
+        self.v31_signed = true;
+        Ok(())
     }
 
     /// Verify the V3 announcement standalone: machine-key ↔ machine_id
@@ -267,11 +386,40 @@ impl IdentityAnnouncementV3 {
                 "v3 agent_id does not match agent public key".to_string(),
             ));
         }
-        let unsigned_bytes = bincode::serialize(&self.to_unsigned()).map_err(|e| {
-            error::IdentityError::Serialization(format!(
-                "failed to serialize v3 announcement for verification: {e}"
-            ))
-        })?;
+        // Pick the canonical form the signature covers. The flag is set at
+        // decode time from the envelope magic and at sign time — an
+        // attacker flipping it only changes WHICH bytes are reconstructed,
+        // and the signature matches exactly one of the two forms.
+        let unsigned_bytes = if self.v31_signed {
+            let v31 = IdentityAnnouncementV31Unsigned {
+                agent_id: self.agent_id,
+                machine_id: self.machine_id,
+                agent_public_key: self.agent_public_key.clone(),
+                machine_public_key: self.machine_public_key.clone(),
+                addresses: self.addresses.clone(),
+                announced_at: self.announced_at,
+                nat_type: self.nat_type.clone(),
+                can_receive_direct: self.can_receive_direct,
+                is_relay: self.is_relay,
+                is_coordinator: self.is_coordinator,
+                reachable_via: self.reachable_via.clone(),
+                relay_candidates: self.relay_candidates.clone(),
+                cert_digest: self.cert_digest,
+                payload_version: self.payload_version,
+                self_name: self.self_name.clone(),
+            };
+            bincode::serialize(&v31).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize unsigned v3.1 announcement: {e}"
+                ))
+            })?
+        } else {
+            bincode::serialize(&self.to_unsigned()).map_err(|e| {
+                error::IdentityError::Serialization(format!(
+                    "failed to serialize v3 announcement for verification: {e}"
+                ))
+            })?
+        };
         let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
             &self.machine_signature,
         )
@@ -324,54 +472,84 @@ impl IdentityAnnouncementV3 {
     }
 }
 
-/// Whether a raw discovery payload is a V3 envelope.
+/// Whether a raw discovery payload is a V3-family envelope (V3 `X0A3` or
+/// V3.1 `X0A4`).
 pub fn is_v3_payload(payload: &[u8]) -> bool {
     payload.len() >= IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()
-        && &payload[..IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()] == IDENTITY_ANNOUNCEMENT_V3_MAGIC
+        && (&payload[..IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()] == IDENTITY_ANNOUNCEMENT_V3_MAGIC
+            || &payload[..IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len()]
+                == IDENTITY_ANNOUNCEMENT_V3_1_MAGIC)
 }
 
-/// Serialize a V3 announcement in its envelope (magic prefix + bincode).
+/// Serialize a V3 announcement in the LEGACY `X0A3` envelope.
+///
+/// The `self_name` is deliberately DROPPED: this body is byte-identical to
+/// the pre-0036 wire form so pre-0036 decoders (positional bincode +
+/// `reject_trailing_bytes`) keep accepting every beat. A named install
+/// publishes [`serialize_v3_1`] alongside this.
 pub fn serialize_v3(
     announcement: &IdentityAnnouncementV3,
 ) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
     use bincode::Options;
     let body = bincode::DefaultOptions::new()
         .with_fixint_encoding()
-        .serialize(announcement)?;
+        .serialize(&IdentityAnnouncementV3Core::from_current(announcement))?;
     let mut out = Vec::with_capacity(IDENTITY_ANNOUNCEMENT_V3_MAGIC.len() + body.len());
     out.extend_from_slice(IDENTITY_ANNOUNCEMENT_V3_MAGIC);
     out.extend_from_slice(&body);
     Ok(out)
 }
 
-/// Deserialize a V3 envelope. Callers MUST run [`IdentityAnnouncementV3::verify`]
+/// Serialize a V3.1 announcement in the `X0A4` envelope, carrying
+/// `self_name`. Published IN ADDITION to the legacy [`serialize_v3`] beat
+/// while an install is named; pre-0036 nodes see an unknown magic and drop
+/// it, losing nothing (their beat arrives as `X0A3`).
+pub fn serialize_v3_1(
+    announcement: &IdentityAnnouncementV3,
+) -> Result<Vec<u8>, Box<bincode::ErrorKind>> {
+    use bincode::Options;
+    let body = bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .serialize(announcement)?;
+    let mut out = Vec::with_capacity(IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len() + body.len());
+    out.extend_from_slice(IDENTITY_ANNOUNCEMENT_V3_1_MAGIC);
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Deserialize a V3-family envelope. The magic selects the fixed body
+/// layout (positional bincode cannot self-describe, so each envelope
+/// parses with exactly one strict shape — no cross-shape fallback, no
+/// trailing bytes). Callers MUST run [`IdentityAnnouncementV3::verify`]
 /// before acting on the result.
 pub fn deserialize_v3(payload: &[u8]) -> Result<IdentityAnnouncementV3, Box<bincode::ErrorKind>> {
     use bincode::Options;
-    if !is_v3_payload(payload) {
-        return Err(Box::new(bincode::ErrorKind::Custom(
-            "missing X0A3 magic".to_string(),
-        )));
-    }
-    let body = &payload[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..];
     let opts = || {
         bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
             .reject_trailing_bytes()
     };
-    // Stage 1 — the ADR-0036 shape (trailing optional self_name). A beat
-    // from an old peer ends at `machine_signature`, so stage 1 hits EOF at
-    // the last field and falls through.
-    if let Ok(v3) = opts().deserialize::<IdentityAnnouncementV3>(body) {
-        return Ok(v3);
+    if payload.len() >= IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()
+        && &payload[..IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()] == IDENTITY_ANNOUNCEMENT_V3_MAGIC
+    {
+        return opts()
+            .deserialize::<IdentityAnnouncementV3Core>(
+                &payload[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..],
+            )
+            .map(IdentityAnnouncementV3::from);
     }
-    // Stage 2 — the pre-0036 core shape, equally strict: trailing bytes
-    // here mean the payload is corrupt or from a newer shape, never an
-    // old beat, so the error propagates.
-    opts()
-        .deserialize::<IdentityAnnouncementV3Core>(body)
-        .map(IdentityAnnouncementV3::from)
+    if payload.len() >= IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len()
+        && &payload[..IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len()] == IDENTITY_ANNOUNCEMENT_V3_1_MAGIC
+    {
+        let mut v31: IdentityAnnouncementV3 =
+            opts().deserialize(&payload[IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len()..])?;
+        v31.v31_signed = true;
+        return Ok(v31);
+    }
+    Err(Box::new(bincode::ErrorKind::Custom(
+        "missing X0A3/X0A4 magic".to_string(),
+    )))
 }
 
 #[cfg(test)]
@@ -534,54 +712,64 @@ mod tests {
         }
     }
 
-    /// WHY: an unnamed beat must be byte-identical to the pre-0036 wire
-    /// form. Old peers run `reject_trailing_bytes` on the V3 body and would
-    /// drop a beat that grew even one tag byte; `skip_serializing_if` is
-    /// what keeps unnamed installs on the old wire exactly.
+    /// WHY: the legacy `X0A3` serializer drops the name by construction, so
+    /// even a NAMED install's legacy beat must serialize to exactly the
+    /// pre-0036 bytes — old peers run `reject_trailing_bytes` on this body
+    /// and would drop a beat that grew even one tag byte.
     #[test]
-    fn v3_without_self_name_is_byte_identical_to_pre0036() {
-        use bincode::Options;
+    fn x0a3_beat_is_byte_identical_to_pre0036_shape() {
         let (_, _machine, v3) = v2_and_v3();
-        let unnamed = IdentityAnnouncementV3 {
-            self_name: None,
-            ..v3.clone()
+        let encoded = serialize_v3(&v3).unwrap();
+        let old_bytes = {
+            use bincode::Options;
+            bincode::DefaultOptions::new()
+                .with_fixint_encoding()
+                .serialize(&IdentityAnnouncementV3Pre0036::from_current(&v3))
+                .unwrap()
         };
-        let new_bytes = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .serialize(&unnamed)
-            .unwrap();
-        let old_bytes = bincode::DefaultOptions::new()
-            .with_fixint_encoding()
-            .serialize(&IdentityAnnouncementV3Pre0036::from_current(&v3))
-            .unwrap();
         assert_eq!(
-            new_bytes, old_bytes,
-            "an unnamed v3 must serialize exactly like the pre-0036 shape"
+            &encoded[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..],
+            &old_bytes[..],
+            "the X0A3 body must be byte-identical to the frozen pre-0036 shape"
+        );
+        assert_eq!(
+            &encoded[..IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()],
+            IDENTITY_ANNOUNCEMENT_V3_MAGIC
         );
     }
 
-    /// WHY: old-decoder compat — a beat from a pre-0036 peer carries no
-    /// self_name field; the serde default must decode it (as `None`) and
-    /// the machine signature must still verify, because the name lives
-    /// outside the signed struct so the canonical signed bytes are
-    /// unchanged.
+    /// WHY: bidirectional old-peer compat on the legacy envelope. (a) A beat
+    /// from a pre-0036 peer carries no self_name — the `X0A3` decode maps it
+    /// to `None` and the machine signature still verifies (the name lives
+    /// outside the signed struct). (b) A named install's `X0A3` beat must
+    /// decode under a FROZEN pre-0036 decoder — the exact path an old peer
+    /// runs, proving the dual publish keeps old peers' caches populated.
     #[test]
-    fn v3_old_shape_decodes_and_verifies_with_defaulted_self_name() {
+    fn x0a3_beat_decodes_under_frozen_pre0036_decoder_and_back() {
         use bincode::Options;
         let (_, _machine, v3) = v2_and_v3();
-        // Forge a pre-0036 body (struct without the field) in a v3 envelope.
+        // (a) old peer's beat → new decoder.
         let old_body = bincode::DefaultOptions::new()
             .with_fixint_encoding()
             .serialize(&IdentityAnnouncementV3Pre0036::from_current(&v3))
             .unwrap();
         let mut envelope = IDENTITY_ANNOUNCEMENT_V3_MAGIC.to_vec();
         envelope.extend_from_slice(&old_body);
-
         let decoded = deserialize_v3(&envelope).expect("old-shape body must decode");
         assert_eq!(decoded.self_name, None);
         decoded
             .verify()
             .expect("old-shape beat must still verify (name outside signature)");
+
+        // (b) named install's legacy beat → frozen pre-0036 decoder.
+        let legacy = serialize_v3(&v3).unwrap();
+        let frozen: IdentityAnnouncementV3Pre0036 = bincode::DefaultOptions::new()
+            .with_fixint_encoding()
+            .with_limit(crate::network::MAX_MESSAGE_DESERIALIZE_SIZE)
+            .reject_trailing_bytes()
+            .deserialize(&legacy[IDENTITY_ANNOUNCEMENT_V3_MAGIC.len()..])
+            .expect("an X0A3 beat must parse under the old decoder");
+        assert_eq!(frozen.agent_id, v3.agent_id);
     }
 
     /// `v2_and_v3` with a self-name set on the V2 (the machine key is the
@@ -592,35 +780,94 @@ mod tests {
         MachineKeypair,
         IdentityAnnouncementV3,
     ) {
-        let (mut v2, machine, _) = v2_and_v3();
+        let (mut v2, machine, mut v3) = v2_and_v3();
         v2.self_name = Some("fae".to_string());
-        let v3 = IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+        v3.self_name = Some("fae".to_string());
+        // V3.1 requires the dedicated re-sign: build_from_v2 signs the
+        // legacy form; the X0A4 beat must sign the name-inclusive bytes.
+        v3.sign_v3_1(machine.secret_key()).unwrap();
         (v2, machine, v3)
     }
 
-    /// WHY: a named beat must round-trip its self-name end-to-end and stay
-    /// verifiable; and the name must never leak into `cert_digest` — the
-    /// digest gate and the blob cache are keyed on
-    /// `blake3(bincode((user_id, cert)))` and old peers verify fetched
-    /// blobs under exactly that rule.
+    /// WHY: a named V3.1 (`X0A4`) beat must round-trip its self-name
+    /// end-to-end and stay verifiable; the same announcement's legacy
+    /// `X0A3` beat must drop the name (dual publish); and the name must
+    /// never leak into `cert_digest` — the digest gate and the blob cache
+    /// are keyed on `blake3(bincode((user_id, cert)))` and old peers verify
+    /// fetched blobs under exactly that rule.
     #[test]
-    fn v3_self_name_round_trips_and_leaves_cert_digest_untouched() {
+    fn v3_1_self_name_round_trips_and_leaves_cert_digest_untouched() {
         let (v2, machine, v3) = v2_and_v3_named();
         let digest_before = cert_digest(&v2.user_id, &v2.agent_certificate);
 
         assert_eq!(v3.self_name.as_deref(), Some("fae"));
         assert_eq!(v3.cert_digest, digest_before);
         v3.verify().expect("named v3 must verify");
-        let _ = machine; // v3 was derived inside the helper with this key
 
-        // Round-trip through the wire and the V2 in-memory conversion.
-        let decoded = deserialize_v3(&serialize_v3(&v3).unwrap()).unwrap();
+        // V3.1 wire round-trip keeps the name through the V2 conversion.
+        let x0a4 = serialize_v3_1(&v3).unwrap();
+        assert_eq!(
+            &x0a4[..IDENTITY_ANNOUNCEMENT_V3_1_MAGIC.len()],
+            IDENTITY_ANNOUNCEMENT_V3_1_MAGIC
+        );
+        let decoded = deserialize_v3(&x0a4).unwrap();
         assert_eq!(decoded.self_name.as_deref(), Some("fae"));
         let converted = decoded.into_announcement();
         assert_eq!(converted.self_name.as_deref(), Some("fae"));
 
-        // Setting a name must not change the digest either (pair-only input).
+        // The legacy beat of the SAME announcement drops the name and still
+        // verifies as X0A3. The publisher serializes the legacy beat BEFORE
+        // the V3.1 re-sign (see the heartbeat path); mirror that order by
+        // building a legacy-signed struct from the same v2.
+        let legacy_struct =
+            IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+        let legacy = deserialize_v3(&serialize_v3(&legacy_struct).unwrap()).unwrap();
+        assert_eq!(legacy.self_name, None);
+        assert_eq!(legacy.agent_id, v3.agent_id);
+        legacy
+            .verify()
+            .expect("the legacy companion beat must verify as X0A3");
+
+        // The name never changes the digest (pair-only input).
         let digest_after = cert_digest(&v2.user_id, &v2.agent_certificate);
         assert_eq!(digest_before, digest_after);
+    }
+
+    /// WHY (review P0-3): the self-name must be UNFORGEABLE. On V3.1 it is
+    /// machine-signed, so a peer that captures a beat and republishes it
+    /// with a replaced, stripped, or flag-flipped name fails signature
+    /// verification — the attack of "relabel another agent's core with an
+    /// attacker-chosen name and have it cached" is closed.
+    #[test]
+    fn v3_1_self_name_tampering_fails_signature_verification() {
+        let (_, _machine, v3) = v2_and_v3_named();
+
+        // Replace the name on an otherwise-valid V3.1 beat.
+        let mut renamed = v3.clone();
+        renamed.self_name = Some("mallory".to_string());
+        assert!(
+            renamed.verify().is_err(),
+            "a replaced self_name must fail the V3.1 signature"
+        );
+
+        // Strip the name from a named V3.1 beat (relabel to anonymous).
+        let mut stripped = v3.clone();
+        stripped.self_name = None;
+        assert!(
+            stripped.verify().is_err(),
+            "stripping the self_name must fail the V3.1 signature"
+        );
+
+        // Flip the canonical-form flag on a LEGACY-signed beat to try to
+        // smuggle an unsigned name through the V3.1 path.
+        let (v2, machine, _) = v2_and_v3_named();
+        let mut legacy =
+            IdentityAnnouncementV3::build_from_v2(&v2, machine.secret_key(), 0).unwrap();
+        legacy.self_name = Some("mallory".to_string());
+        legacy.v31_signed = true; // pretends the name is signed
+        assert!(
+            legacy.verify().is_err(),
+            "a legacy signature must never validate the V3.1 form"
+        );
     }
 }
