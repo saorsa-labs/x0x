@@ -580,6 +580,10 @@ impl GroupInfo {
             tags: self.tags.clone(),
             avatar_url: self.avatar_url.clone(),
             banner_url: self.banner_url.clone(),
+            // ADR-0038 review fix 1: the Home metadata commitment rides
+            // the signed state hash; forging `home` after the fact breaks
+            // state-hash validation.
+            home_digest: self.home.as_ref().map(state_commit::compute_home_digest),
         }
     }
 

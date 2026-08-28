@@ -1711,7 +1711,7 @@ function renderHomeSpace(){
       <span style="font-size:20px">🤖</span>
       <div>
         <div>${esc(hd.primary_agent.self_name||short(hd.primary_agent.agent_id,12))}</div>
-        <div style="font-size:11px;color:var(--tx3)">${short(hd.primary_agent.agent_id,16)} · speaks for the owner</div>
+        <div style="font-size:11px;color:var(--tx3)">${esc(short(hd.primary_agent.agent_id,16))} · ${hd.primary_agent.verified?'speaks for the owner':'unverified primary agent'}</div>
       </div>
     </div>
     <div class="label" style="font-size:10px;text-transform:uppercase;letter-spacing:1px;color:var(--tx3);margin-top:10px">Members</div>
@@ -1748,11 +1748,15 @@ async function mountHomeSpace(){
   renderSidebar();
   const el=document.getElementById('home-chat');
   if(el)renderSpaceChat(el,sid);
-  // Owner chip on the composer when the profile has a human_name
-  // (ADR-0038: the human participates through the primary agent).
+  // Owner chip (review fix 5): ONLY when the SENDING agent
+  // (S.agentId) IS the Home's verified primary agent and the profile
+  // has a human_name — otherwise messages would be signed by a
+  // different agent and the chip would assert false ownership.
   const human=hd.human_name;
+  const primary=hd.primary_agent&&hd.primary_agent.agent_id;
+  const primaryVerified=hd.primary_agent&&hd.primary_agent.verified;
   const chatIn=document.getElementById('chat-in');
-  if(human&&chatIn&&chatIn.parentElement){
+  if(human&&primary&&primaryVerified&&S.get('agentId')===primary&&chatIn&&chatIn.parentElement){
     const chip=document.createElement('span');
     chip.id='home-owner-chip';
     chip.title='Messages are signed by your primary agent';

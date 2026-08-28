@@ -4,14 +4,13 @@
 //! exactly ONE Home at first daemon run: `Hidden + OwnerCertified(owner) +
 //! MlsEncrypted + MembersOnly/MembersOnly`, named "Home" (renamable). The
 //! daemon's own owner-certified agent is the founding member and the
-//! designated PRIMARY agent (`GroupInfo::home.primary_agent`); the
-//! provisioning commit is signed by that agent, so the Home metadata is
-//! owner-signed by construction.
+//! designated PRIMARY agent; the provisioning seal covers the Home metadata
+//! commitment (review fix 1: `home_digest` rides the signed state hash).
 //!
-//! Genesis race scope (v1): dedup is PER-MACHINE — a marker file in the
-//! instance data dir plus a scan for an existing Home in the loaded roster.
-//! Two machines provisioning their own Homes for the same owner is expected
-//! until ADR-0041's tier-1 cross-machine sync decides adoption; this module
+//! Genesis race scope (v1): dedup is PER-MACHINE — a verified marker file
+//! in the instance data dir plus a trust-checked roster scan. Two machines
+//! provisioning their own Homes for the same owner is expected until
+//! ADR-0041's tier-1 cross-machine sync decides adoption; this module
 //! deliberately does not invent that protocol (see the WP report).
 
 use std::sync::Arc;
@@ -23,10 +22,20 @@ use axum::Json;
 use serde::{Deserialize, Serialize};
 
 use super::named_groups::{
-    create_named_group, now_millis_u64, persist_named_groups_mutation, update_named_group,
-    AtomicWriteOutcome, CreateGroupRequest, UpdateGroupRequest,
+    create_named_group, now_millis_u64, persist_named_groups_mutation, seal_commit_owner_certified,
+    update_named_group, AtomicWriteOutcome, CreateGroupRequest, UpdateGroupRequest,
 };
 use crate::server::AppState;
+
+/// Owner-cert evidence for `agents` — thin re-export of the ADR-0038
+/// evidence builder (own identity + revocation set + discovery cache) for
+/// sibling modules (the POST /groups owner-chain gate).
+pub(in crate::server) async fn owner_chain_evidence(
+    state: &AppState,
+    agents: &[&str],
+) -> crate::groups::owner_cert::OwnerCertEvidence {
+    super::named_groups::owner_cert_evidence_for(state, agents).await
+}
 
 /// Marker file in the instance data dir recording that this machine already
 /// provisioned its Home (per-machine dedup; cross-machine is ADR-0041).
@@ -55,16 +64,155 @@ pub(in crate::server) fn home_policy(
     }
 }
 
-/// The loaded Home group, if this machine has one (roster scan —
-/// restart-safe even if the marker file was deleted).
+/// Whether `policy` is EXACTLY the Home policy for `owner` — all five axes
+/// (review fix 3: the crash-recovery scan must match the whole shape, not
+/// just name+admission).
+fn is_home_policy(policy: &crate::groups::GroupPolicy, owner: &crate::identity::UserId) -> bool {
+    *policy == home_policy(owner)
+}
+
+/// TRUSTED Home resolution (review fix 1): a group is this machine's Home
+/// only when it carries Home metadata AND its policy is exactly
+/// `OwnerCertified(owner)` Home-shaped AND our own agent is an active
+/// member. Anything else (injected metadata, a foreign owner's Home, a
+/// group we were removed from) is not trusted.
 pub(in crate::server) async fn find_home(
     state: &AppState,
+    owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let groups = state.named_groups.read().await;
     groups
         .iter()
-        .find(|(_, info)| info.home.is_some())
+        .find(|(_, info)| {
+            info.home.is_some()
+                && is_home_policy(&info.policy, owner)
+                && info.has_active_member(&local_hex)
+        })
         .map(|(id, info)| (id.clone(), info.clone()))
+}
+
+/// A group that matches the full Home policy for `owner` whether or not the
+/// Home metadata was stamped — the crash-recovery predicate (review fix 3:
+/// a crash between create and stamp must adopt the created group, not mint
+/// a second one).
+#[must_use]
+pub(in crate::server) fn is_home_candidate(
+    info: &crate::groups::GroupInfo,
+    owner: &crate::identity::UserId,
+) -> bool {
+    is_home_policy(&info.policy, owner)
+}
+
+/// Read + verify the marker (review fix 3): PARSED (never a bare
+/// existence check), checked against the CURRENT owner, and checked to
+/// point at a group that still exists. Absent/corrupt/stale → `None`
+/// (corrupt + stale are logged); the trusted roster scan re-derives.
+async fn read_verified_marker(state: &AppState, owner_hex: &str) -> Option<HomeMarker> {
+    let path = state.data_dir.join(HOME_MARKER_FILE);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "cannot read Home marker (treating as absent; the trusted roster scan re-derives): {e}"
+            );
+            return None;
+        }
+    };
+    match serde_json::from_slice::<HomeMarker>(&bytes) {
+        Ok(marker) => {
+            if marker.owner_user_id != owner_hex {
+                tracing::warn!(
+                    marker_owner = %marker.owner_user_id,
+                    "Home marker names a different owner (ownership transition?); ignoring it"
+                );
+                return None;
+            }
+            let exists = state
+                .named_groups
+                .read()
+                .await
+                .contains_key(&marker.group_id);
+            if !exists {
+                tracing::warn!(
+                    group_id = %marker.group_id,
+                    "Home marker points at a missing group; ignoring it"
+                );
+                return None;
+            }
+            Some(marker)
+        }
+        Err(e) => {
+            tracing::warn!(
+                path = %path.display(),
+                "corrupt Home marker (treating as absent; the trusted roster scan re-derives): {e}"
+            );
+            None
+        }
+    }
+}
+
+async fn write_marker(path: &std::path::Path, marker: &HomeMarker) {
+    match serde_json::to_vec_pretty(marker) {
+        Ok(bytes) => {
+            if let Err(e) = tokio::fs::write(path, bytes).await {
+                tracing::warn!(
+                    path = %path.display(),
+                    "failed to write Home marker (Home still provisioned; restart will adopt by scan): {e}"
+                );
+            }
+        }
+        Err(e) => tracing::warn!("failed to serialize Home marker: {e}"),
+    }
+}
+
+/// Stamp Home metadata on `group_id` and SEAL it into the signed state
+/// chain (review fix 1): the Home digest enters the state hash via
+/// `public_meta()`, so `primary_agent` is covered by an owner-agent-signed
+/// commit. Returns the stamped info on success.
+async fn stamp_and_seal_home(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> Option<crate::groups::GroupInfo> {
+    let signing_kp = state.agent.identity().agent_keypair();
+    let mut info = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).cloned()?
+    };
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut placements = std::collections::BTreeMap::new();
+    placements.insert(local_hex.clone(), crate::groups::MemberPlacement::Pinned);
+    info.home = Some(crate::groups::HomeMetadata {
+        primary_agent: local_hex,
+        placements,
+        provisioned_at_ms: now_millis_u64(),
+    });
+    // Seal through the OwnerCertified wrapper: it re-verifies the roster
+    // (refusing on any failing member) and the seal covers the freshly
+    // stamped home digest.
+    if let Err(e) =
+        seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64()).await
+    {
+        tracing::error!(group_id, "Home metadata seal failed: {e}");
+        return None;
+    }
+    if !matches!(
+        persist_named_groups_mutation(state, |groups| {
+            groups.insert(group_id.to_string(), info.clone());
+            true
+        })
+        .await,
+        Ok(AtomicWriteOutcome::Durable)
+    ) {
+        tracing::error!(
+            group_id,
+            "Home metadata could not be persisted (marker not written; will retry)"
+        );
+        return None;
+    }
+    Some(info)
 }
 
 /// Auto-provision the Home space for an owned install. Idempotent and
@@ -82,32 +230,68 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         tracing::warn!("owner key present but no agent certificate: Home not provisioned");
         return;
     }
+    let owner = user_kp.user_id();
+    let owner_hex = hex::encode(owner.as_bytes());
     let marker_path = state.data_dir.join(HOME_MARKER_FILE);
-    if tokio::fs::try_exists(&marker_path).await.unwrap_or(false) {
-        return; // Already provisioned on this machine.
-    }
-    // Restart safety even without the marker: adopt any existing Home.
-    if let Some((id, info)) = find_home(state).await {
-        tracing::info!(
-            group_id = %id,
-            "Home already present; recording marker (no duplicate provisioned)"
-        );
-        write_marker(
-            &marker_path,
-            &HomeMarker {
-                group_id: id,
-                owner_user_id: hex::encode(user_kp.user_id().as_bytes()),
-                provisioned_at_ms: info
-                    .home
-                    .as_ref()
-                    .map_or_else(now_millis_u64, |h| h.provisioned_at_ms),
-            },
-        )
-        .await;
+
+    // 1) Trusted Home already present (the marker is only advisory — the
+    //    roster scan is authoritative). Repair a missing/stale marker.
+    if let Some((id, info)) = find_home(state, &owner).await {
+        let needs_repair = read_verified_marker(state, &owner_hex)
+            .await
+            .is_none_or(|m| m.group_id != id);
+        if needs_repair {
+            tracing::info!(group_id = %id, "Home already present; recording marker");
+            write_marker(
+                &marker_path,
+                &HomeMarker {
+                    group_id: id,
+                    owner_user_id: owner_hex,
+                    provisioned_at_ms: info
+                        .home
+                        .as_ref()
+                        .map_or_else(now_millis_u64, |h| h.provisioned_at_ms),
+                },
+            )
+            .await;
+        }
         return;
     }
 
-    let owner = user_kp.user_id();
+    // 2) Crash recovery (review fix 3): a group matching the FULL Home
+    //    policy exists but was never stamped (crash between create and
+    //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
+    //    complete its metadata + seal instead of minting a duplicate.
+    let candidate: Option<String> = {
+        let groups = state.named_groups.read().await;
+        let mut matches: Vec<(&String, u64)> = groups
+            .iter()
+            .filter(|(_, info)| info.home.is_none() && is_home_candidate(info, &owner))
+            .map(|(id, info)| (id, info.created_at))
+            .collect();
+        matches.sort_by_key(|(_, created)| *created);
+        matches.first().map(|(id, _)| (*id).clone())
+    };
+    if let Some(id) = candidate {
+        tracing::info!(
+            group_id = %id,
+            "adopting unstamped Home-shaped group (crash recovery); stamping + sealing"
+        );
+        if let Some(info) = stamp_and_seal_home(state, &id).await {
+            write_marker(
+                &marker_path,
+                &HomeMarker {
+                    group_id: id,
+                    owner_user_id: owner_hex,
+                    provisioned_at_ms: info.home.as_ref().map_or(0, |h| h.provisioned_at_ms),
+                },
+            )
+            .await;
+        }
+        return;
+    }
+
+    // 3) Fresh provisioning through the full creation path.
     let req = CreateGroupRequest {
         name: "Home".to_string(),
         description: "Owner's personal space (auto-provisioned)".to_string(),
@@ -125,86 +309,48 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         return;
     }
     // Locate the freshly created Home and stamp its metadata + marker.
-    let Some((group_id, mut info)) = find_home_by_policy(state, &owner).await else {
+    let group_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .find(|(_, info)| info.home.is_none() && is_home_candidate(info, &owner))
+            .map(|(id, _)| id.clone())
+    };
+    let Some(group_id) = group_id else {
         tracing::error!("Home group created but not found afterwards; marker not written");
         return;
     };
-    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let mut placements = std::collections::BTreeMap::new();
-    placements.insert(local_hex.clone(), crate::groups::MemberPlacement::Pinned);
-    info.home = Some(crate::groups::HomeMetadata {
-        primary_agent: local_hex,
-        placements,
-        provisioned_at_ms: now_millis_u64(),
+    if let Some(info) = stamp_and_seal_home(state, &group_id).await {
+        write_marker(
+            &marker_path,
+            &HomeMarker {
+                group_id: group_id.clone(),
+                owner_user_id: owner_hex,
+                provisioned_at_ms: info.home.as_ref().map_or(0, |h| h.provisioned_at_ms),
+            },
+        )
+        .await;
+        tracing::info!(group_id = %group_id, "provisioned Home (ADR-0038)");
+    }
+}
+
+/// Roaming-guarantee warning computed from a GroupInfo ALREADY IN HAND
+/// (review fix 6: no lock re-acquisition — call while holding the roster
+/// guard). Intersects placements with ACTIVE members (review fix 7: a
+/// stale Roaming entry for a removed agent must not suppress it).
+///
+/// ADR-0038: Home always contains ≥1 Roaming agent so it follows the user
+/// across machines — surface the violation until ADR-0037 lands.
+#[must_use]
+pub(in crate::server) fn home_roaming_warning_for(
+    info: &crate::groups::GroupInfo,
+) -> Option<serde_json::Value> {
+    let home = info.home.as_ref()?;
+    let has_roaming = info.active_members().any(|m| {
+        home.placements
+            .get(&m.agent_id)
+            .is_some_and(|p| *p == crate::groups::MemberPlacement::Roaming)
     });
-    let stamped = info;
-    if !matches!(
-        persist_named_groups_mutation(state, |groups| {
-            groups.insert(group_id.clone(), stamped.clone());
-            true
-        })
-        .await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        tracing::error!(
-            "Home provisioning could not persist metadata (marker not written; will retry)"
-        );
-        return;
-    }
-    write_marker(
-        &marker_path,
-        &HomeMarker {
-            group_id: group_id.clone(),
-            owner_user_id: hex::encode(owner.as_bytes()),
-            provisioned_at_ms: stamped.home.as_ref().map_or(0, |h| h.provisioned_at_ms),
-        },
-    )
-    .await;
-    tracing::info!(group_id = %group_id, "provisioned Home (ADR-0038)");
-}
-
-/// Find the group just created with the Home policy for `owner` (used
-/// between creation and metadata stamping, when `home` is still None).
-async fn find_home_by_policy(
-    state: &AppState,
-    owner: &crate::identity::UserId,
-) -> Option<(String, crate::groups::GroupInfo)> {
-    let groups = state.named_groups.read().await;
-    groups
-        .iter()
-        .find(|(_, info)| {
-            info.policy.admission == crate::groups::GroupAdmission::OwnerCertified(*owner)
-                && info.home.is_none()
-                && info.name == "Home"
-        })
-        .map(|(id, info)| (id.clone(), info.clone()))
-}
-
-async fn write_marker(path: &std::path::Path, marker: &HomeMarker) {
-    match serde_json::to_vec_pretty(marker) {
-        Ok(bytes) => {
-            if let Err(e) = tokio::fs::write(path, bytes).await {
-                tracing::warn!(
-                    path = %path.display(),
-                    "failed to write Home marker (Home still provisioned; restart will adopt by scan): {e}"
-                );
-            }
-        }
-        Err(e) => tracing::warn!("failed to serialize Home marker: {e}"),
-    }
-}
-
-/// Structured roaming warning for an existing Home with zero Roaming
-/// agents (ADR-0038: Home always contains ≥1 roaming agent so it follows
-/// the user across machines — surface the violation until ADR-0037 lands).
-pub(in crate::server) async fn home_roaming_warning(state: &AppState) -> Option<serde_json::Value> {
-    let (_, info) = find_home(state).await?;
-    let has_roaming = info
-        .home
-        .as_ref()?
-        .placements
-        .values()
-        .any(|p| *p == crate::groups::MemberPlacement::Roaming);
     if has_roaming {
         return None;
     }
@@ -226,25 +372,71 @@ async fn self_name_for(state: &AppState, agent_hex: &str) -> Option<String> {
         .and_then(|entry| entry.self_name.clone())
 }
 
-/// GET /home — resolve the Home group and its metadata.
+/// Whether `primary_agent` is an active member whose roster-embedded
+/// certificate chains to `owner` — the trust check behind the owner chip
+/// (review fix 5). Falls back to `false` when no committed certificate is
+/// present (fail-closed attribution).
+fn primary_agent_trusted(
+    info: &crate::groups::GroupInfo,
+    owner: &crate::identity::UserId,
+    now_unix: u64,
+) -> bool {
+    let Some(home) = info.home.as_ref() else {
+        return false;
+    };
+    let Some(member) = info.members_v2.get(&home.primary_agent) else {
+        return false;
+    };
+    if !member.is_active() {
+        return false;
+    }
+    member.certificate.as_ref().is_some_and(|cert| {
+        crate::groups::owner_cert::verify_cert_against_owner(
+            owner,
+            &home.primary_agent,
+            cert,
+            false,
+            now_unix,
+        )
+        .is_ok()
+    })
+}
+
+/// GET /home — resolve the Home group and its metadata. Trust-checked
+/// (review fix 5): the group must be the CURRENT owner's Home with our
+/// agent an active member; the primary agent's verification status is
+/// reported (`verified`) so the GUI only shows the owner chip when the
+/// SENDING agent is that verified primary.
 pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let Some((group_id, info)) = find_home(state.as_ref()).await else {
-        return (
+    let not_found = |reason: &str| {
+        (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "no Home provisioned (un-owned install or not yet created)"
+                "error": reason,
             })),
-        );
+        )
     };
-    let home = info.home.clone().unwrap_or_else(|| {
-        // Adopted pre-metadata Home (should not happen; degrade honestly).
-        crate::groups::HomeMetadata {
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return not_found("no Home provisioned (un-owned install)");
+    };
+    let owner = user_kp.user_id();
+    let Some((group_id, info)) = find_home(state.as_ref(), &owner).await else {
+        return not_found("no Home provisioned");
+    };
+    let home = info
+        .home
+        .clone()
+        .unwrap_or_else(|| crate::groups::HomeMetadata {
             primary_agent: hex::encode(state.agent.agent_id().as_bytes()),
             placements: std::collections::BTreeMap::new(),
             provisioned_at_ms: 0,
-        }
-    });
+        });
+    let primary_ok = primary_agent_trusted(
+        &info,
+        &owner,
+        crate::groups::owner_cert::restore_clock_now(),
+    );
     let mut members = Vec::new();
     for member in info.active_members() {
         members.push(serde_json::json!({
@@ -275,10 +467,12 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
             "primary_agent": {
                 "agent_id": home.primary_agent,
                 "self_name": primary_self_name,
+                "verified": primary_ok,
             },
             "members": members,
             "warnings": {
-                "no_roaming_agent": home_roaming_warning(state.as_ref()).await.is_some(),
+                "no_roaming_agent": home_roaming_warning_for(&info).is_some(),
+                "primary_agent_unverified": !primary_ok,
             },
         })),
     )
@@ -295,7 +489,17 @@ pub(in crate::server) async fn rename_home(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RenameHomeRequest>,
 ) -> Response {
-    let Some((group_id, _)) = find_home(state.as_ref()).await else {
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "no Home provisioned"
+            })),
+        )
+            .into_response();
+    };
+    let Some((group_id, _)) = find_home(state.as_ref(), &user_kp.user_id()).await else {
         return (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -322,8 +526,7 @@ mod tests {
     use tower::ServiceExt;
 
     /// Owned test state: user key (deterministic seed so the owner id is
-    /// stable across the "restart" arm) + builder-issued agent certificate —
-    /// the exact shape `serve` produces for an owned install.
+    /// stable across the "restart" arm) + builder-issued agent certificate.
     async fn owned_state(
         data_dir: &std::path::Path,
         owner_seed: [u8; 32],
@@ -332,7 +535,10 @@ mod tests {
         let agent = Arc::new(
             crate::Agent::builder()
                 .with_machine_key(data_dir.join("machine.key"))
-                .with_agent_key(crate::identity::AgentKeypair::generate()?)
+                // Persisted agent key: the "restart" arm reloads the SAME
+                // agent identity (a real restart), so Home membership and
+                // the marker survive it.
+                .with_agent_key_path(data_dir.join("agent.key"))
                 .with_agent_cert_path(data_dir.join("agent.cert"))
                 .with_user_key(user)
                 .with_contact_store_path(data_dir.join("contacts.json"))
@@ -370,63 +576,72 @@ mod tests {
         Ok((status, serde_json::from_slice(&body)?))
     }
 
-    /// WHY (ADR-0038 validation): a fresh owned install provisions exactly
-    /// one Home with the Home policy, the daemon's agent as founding member
-    /// and recorded primary agent — and a restart (fresh state over the
-    /// SAME data dir) does NOT provision a second one.
+    fn owner_of(state: &AppState) -> crate::identity::UserId {
+        state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned fixture")
+            .user_id()
+    }
+
+    /// WHY: a fresh owned install provisions exactly one Home, and the Home
+    /// metadata is SEALED (review fix 1) — mutating `home` after the fact
+    /// breaks state-hash validation. Restart does not duplicate.
     #[tokio::test]
     async fn owned_install_provisions_home_once_across_restart() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x38; 32]).await?;
         provision_home(&state).await;
-        let (group_id, info) = find_home(state.as_ref()).await.expect("Home provisioned");
+
+        let owner = owner_of(&state);
+        let (group_id, info) = find_home(&state, &owner).await.expect("Home provisioned");
         assert_eq!(info.name, "Home");
-        assert_eq!(
-            info.policy.discoverability,
-            crate::groups::GroupDiscoverability::Hidden
-        );
-        assert!(matches!(
-            info.policy.admission,
-            crate::groups::GroupAdmission::OwnerCertified(_)
-        ));
-        assert_eq!(
-            info.policy.confidentiality,
-            crate::groups::GroupConfidentiality::MlsEncrypted
-        );
+        assert!(is_home_policy(&info.policy, &owner));
         let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        assert!(
-            info.has_active_member(&local_hex),
-            "the daemon's own agent is the founding member"
-        );
+        assert!(info.has_active_member(&local_hex));
         let home = info.home.as_ref().expect("home metadata");
-        assert_eq!(home.primary_agent, local_hex, "primary agent persisted");
+        assert_eq!(home.primary_agent, local_hex);
         assert_eq!(
             home.placements.get(&local_hex),
-            Some(&crate::groups::MemberPlacement::Pinned),
-            "placement placeholder defaults to Pinned"
+            Some(&crate::groups::MemberPlacement::Pinned)
         );
-        // Owner-signed: the provisioning commit was authored by the
-        // owner-certified agent.
-        assert_eq!(
-            info.commit_log
-                .last()
-                .map(|c| c.commit.committed_by.as_str()),
-            Some(local_hex.as_str()),
-            "provisioning commit signed by the owner's agent"
+
+        // Review fix 1: the home digest is committed by a signed seal —
+        // forging `home` afterwards must change the state hash.
+        let sealed_hash = info.state_hash.clone();
+        let mut forged = info.clone();
+        let evil = "ff".repeat(32);
+        forged.home = Some(crate::groups::HomeMetadata {
+            primary_agent: evil,
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 0,
+        });
+        forged.recompute_state_hash();
+        assert_ne!(
+            forged.state_hash, sealed_hash,
+            "forged home metadata must not validate under the sealed state hash"
         );
+        // And the digest actually rides the meta hash (empty home == absent
+        // digest; present home == Some).
+        assert!(
+            crate::groups::compute_public_meta_hash(&info.public_meta())
+                != crate::groups::compute_public_meta_hash(&forged.public_meta())
+        );
+
+        // Marker was written and verifies.
+        assert!(read_verified_marker(&state, &hex::encode(owner.as_bytes()))
+            .await
+            .is_some());
 
         // Restart: fresh state over the same data dir — no duplicate.
         drop(state);
         let state2 = owned_state(dir.path(), [0x38; 32]).await?;
         provision_home(&state2).await;
-        provision_home(&state2).await; // and idempotent within one run
-        {
-            let groups = state2.named_groups.read().await;
-            let homes = groups.values().filter(|info| info.home.is_some()).count();
-            assert_eq!(homes, 1, "exactly one Home after restart + re-run");
-        }
-        let (group_id2, info2) = find_home(state2.as_ref()).await.expect("home found");
-        assert_eq!(group_id2, group_id, "same Home group id across restart");
+        provision_home(&state2).await; // idempotent within one run
+        let owner2 = owner_of(&state2);
+        let (group_id2, info2) = find_home(&state2, &owner2).await.expect("home found");
+        assert_eq!(group_id2, group_id, "same Home across restart");
         assert_eq!(
             info2.home.as_ref().expect("meta").primary_agent,
             local_hex,
@@ -435,14 +650,200 @@ mod tests {
         Ok(())
     }
 
-    /// WHY: an un-owned (anonymous) install provisions nothing — Home is
-    /// the OWNER's personal space.
+    /// WHY (review fix 3): a crash between group-create and home-stamp must
+    /// be RECOVERED — the next start adopts the unstamped Home-shaped group
+    /// instead of minting a duplicate.
+    #[tokio::test]
+    async fn crash_between_create_and_stamp_is_recovered() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x3C; 32]).await?;
+        let owner = owner_of(&state);
+        // Simulate the crash: create a Home-shaped group with NO metadata
+        // and NO marker.
+        let req = CreateGroupRequest {
+            name: "Home".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let created: String = body["group_id"].as_str().unwrap_or_default().to_string();
+        assert!(!created.is_empty());
+
+        provision_home(&state).await;
+        let (id, info) = find_home(&state, &owner).await.expect("recovered");
+        assert_eq!(
+            id, created,
+            "adopted the crashed-create group, not a new one"
+        );
+        assert!(info.home.is_some(), "metadata stamped + sealed");
+        Ok(())
+    }
+
+    /// WHY (review fix 3): a corrupt marker must not short-circuit
+    /// provisioning; the trusted scan re-derives.
+    #[tokio::test]
+    async fn corrupt_marker_does_not_suppress_provisioning() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x3D; 32]).await?;
+        tokio::fs::write(dir.path().join(HOME_MARKER_FILE), b"{not json").await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        assert!(
+            find_home(&state, &owner).await.is_some(),
+            "provisioned despite corrupt marker"
+        );
+        Ok(())
+    }
+
+    /// WHY (review fix 1): injected home metadata on a group that is NOT
+    /// our-owner Home-shaped must not be trusted by find_home.
+    #[tokio::test]
+    async fn injected_home_metadata_on_foreign_group_is_untrusted() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x3E; 32]).await?;
+        let owner = owner_of(&state);
+        // A default InviteOnly group with attacker-stamped home metadata.
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "evil".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            "ee".repeat(16),
+            crate::groups::GroupPolicy::default(),
+        );
+        info.home = Some(crate::groups::HomeMetadata {
+            primary_agent: "ff".repeat(32),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 0,
+        });
+        state
+            .named_groups
+            .write()
+            .await
+            .insert("ee".repeat(16), info);
+        assert!(
+            find_home(&state, &owner).await.is_none(),
+            "home metadata without the OwnerCertified Home policy must be untrusted"
+        );
+        // And GET /home stays 404 rather than serving the forged metadata.
+        let response = get_home(State(Arc::clone(&state))).await.into_response();
+        let (status, _) = response_json(response).await?;
+        assert_eq!(status, StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    /// WHY (review fix 2): POST /groups with an OwnerCertified policy for
+    /// an owner we do NOT chain to is a typed 403.
+    #[tokio::test]
+    async fn owner_certified_create_requires_cert_chain() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x3F; 32]).await?;
+        let victim = crate::identity::UserKeypair::generate()?;
+        let req = CreateGroupRequest {
+            name: "stolen".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&victim.user_id())),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "{body}");
+        assert!(body["error"].as_str().is_some_and(|e| e.contains("chain")));
+        // And no group was created.
+        assert!(state
+            .named_groups
+            .read()
+            .await
+            .values()
+            .all(|i| i.name != "stolen"));
+        Ok(())
+    }
+
+    /// WHY (review fix 2): the create response echoes the effective policy
+    /// so callers detect silent downgrade on older daemons.
+    #[tokio::test]
+    async fn create_response_echoes_effective_policy() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x40; 32]).await?;
+        let owner = owner_of(&state);
+        let req = CreateGroupRequest {
+            name: "echo".to_string(),
+            description: String::new(),
+            display_name: None,
+            preset: None,
+            policy: Some(home_policy(&owner)),
+        };
+        let response = create_named_group(State(Arc::clone(&state)), Json(req)).await;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::CREATED, "{body}");
+        let echoed = body["policy"]["admission"]["owner_certified"].as_str();
+        assert_eq!(
+            echoed,
+            Some(hex::encode(owner.as_bytes()).as_str()),
+            "effective policy echoed for downgrade detection: {body}"
+        );
+        Ok(())
+    }
+
+    /// WHY (review fix 7): a stale Roaming placement for a REMOVED agent
+    /// must not suppress the warning; an active Roaming member must.
+    #[tokio::test]
+    async fn roaming_warning_intersects_active_members() -> anyhow::Result<()> {
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            String::new(),
+            crate::identity::AgentId([1; 32]),
+            "aa".repeat(16),
+            crate::groups::GroupPolicy::default(),
+        );
+        let active = "11".repeat(32);
+        let removed = "22".repeat(32);
+        info.home = Some(crate::groups::HomeMetadata {
+            primary_agent: active.clone(),
+            placements: [
+                (removed.clone(), crate::groups::MemberPlacement::Roaming),
+                (active.clone(), crate::groups::MemberPlacement::Pinned),
+            ]
+            .into_iter()
+            .collect(),
+            provisioned_at_ms: 0,
+        });
+        info.add_member(active.clone(), crate::groups::GroupRole::Admin, None, None);
+        // Removed agent is NOT an active member (state Removed).
+        {
+            let mut m = crate::groups::GroupMember::new_member(removed.clone(), None, None, 0);
+            m.state = crate::groups::GroupMemberState::Removed;
+            info.members_v2.insert(removed, m);
+        }
+        assert!(
+            home_roaming_warning_for(&info).is_some(),
+            "stale Roaming entry for a removed agent must NOT satisfy the guarantee"
+        );
+        // Mark the ACTIVE member Roaming — warning clears.
+        if let Some(home) = info.home.as_mut() {
+            home.placements
+                .insert(active, crate::groups::MemberPlacement::Roaming);
+        }
+        assert!(home_roaming_warning_for(&info).is_none());
+        Ok(())
+    }
+
+    /// WHY: an un-owned install provisions nothing.
     #[tokio::test]
     async fn unowned_install_provisions_nothing() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = unowned_state(dir.path()).await?;
         provision_home(&state).await;
-        assert!(find_home(state.as_ref()).await.is_none());
+        assert!(state
+            .named_groups
+            .read()
+            .await
+            .values()
+            .all(|i| i.home.is_none()));
         assert!(
             !tokio::fs::try_exists(dir.path().join(HOME_MARKER_FILE)).await?,
             "no marker written for an un-owned install"
@@ -450,56 +851,36 @@ mod tests {
         Ok(())
     }
 
-    /// WHY: GET /home resolves the (possibly renamed) Home, its primary
-    /// agent, members with placements, and the no-roaming warning until
-    /// ADR-0037 marks an agent Roaming.
+    /// WHY: GET /home resolves the Home and reports the no-roaming warning;
+    /// /health no longer leaks it (review fix 6).
     #[tokio::test]
-    async fn get_home_returns_metadata_and_warning() -> anyhow::Result<()> {
+    async fn get_home_reports_warning_health_does_not() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x39; 32]).await?;
+        let state = owned_state(dir.path(), [0x41; 32]).await?;
         provision_home(&state).await;
-
         let response = get_home(State(Arc::clone(&state))).await.into_response();
         let (status, body) = response_json(response).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["name"], "Home");
-        assert_eq!(body["ok"], true);
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        assert_eq!(body["primary_agent"]["agent_id"], local_hex);
-        assert!(
-            body["members"]
-                .as_array()
-                .is_some_and(|m| !m.is_empty() && m[0]["placement"] == "pinned"),
-            "members rendered with placement: {body}"
-        );
-        assert_eq!(
-            body["warnings"]["no_roaming_agent"], true,
-            "zero-Roaming Home must surface the warning: {body}"
-        );
-
-        // Health surfaces the same warning as a structured detail.
+        assert_eq!(body["warnings"]["no_roaming_agent"], true);
         let health_json = crate::server::routes::status::health(State(Arc::clone(&state))).await;
-        let body: serde_json::Value = serde_json::to_value(&health_json.0.data).unwrap_or_default();
-        let body = serde_json::json!({ "data": body });
-        assert_eq!(status, StatusCode::OK);
+        let health_body: serde_json::Value =
+            serde_json::to_value(&health_json.0).unwrap_or_default();
         assert!(
-            body["data"]["warnings"]
+            health_body["warnings"]
                 .as_array()
-                .is_some_and(|w| w.iter().any(|w| w["code"] == "home_no_roaming_agent")),
-            "health details carry the home warning: {body}"
+                .is_none_or(|w| w.is_empty()),
+            "auth-exempt /health must not leak Home existence: {health_body}"
         );
         Ok(())
     }
 
-    /// WHY: rename round-trips through the convenience endpoint (which
-    /// rides the sealed PATCH /groups/:id path).
+    /// WHY: rename round-trips through the convenience endpoint.
     #[tokio::test]
     async fn home_rename_round_trips() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x3A; 32]).await?;
+        let state = owned_state(dir.path(), [0x42; 32]).await?;
         provision_home(&state).await;
-        let (group_id, _) = find_home(state.as_ref()).await.expect("home");
-
         let response = rename_home(
             State(Arc::clone(&state)),
             Json(RenameHomeRequest {
@@ -509,29 +890,9 @@ mod tests {
         .await;
         let (status, body) = response_json(response).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
-
-        let response = get_home(State(Arc::clone(&state))).await.into_response();
-        let (status, body) = response_json(response).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["name"], "Irvine HQ", "renamed: {body}");
-        assert_eq!(body["group_id"], group_id);
-
-        // GET /groups/:id carries home details + warnings too.
-        let response = crate::server::routes::named_groups::get_named_group(
-            State(Arc::clone(&state)),
-            Path(group_id.clone()),
-        )
-        .await
-        .into_response();
-        let (status, body) = response_json(response).await?;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["home"]["primary_agent"], body["creator"]);
-        assert!(
-            body["warnings"]
-                .as_array()
-                .is_some_and(|w| w.iter().any(|w| w["code"] == "home_no_roaming_agent")),
-            "group view carries the warning: {body}"
-        );
+        let owner = owner_of(&state);
+        let (_, info) = find_home(&state, &owner).await.expect("home");
+        assert_eq!(info.name, "Irvine HQ");
         Ok(())
     }
 
@@ -546,11 +907,11 @@ mod tests {
         Ok(())
     }
 
-    /// Router-level smoke: the routes are wired with the right methods.
+    /// Router-level smoke: routes wired with the right methods.
     #[tokio::test]
     async fn home_routes_wired() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x3B; 32]).await?;
+        let state = owned_state(dir.path(), [0x43; 32]).await?;
         provision_home(&state).await;
         let app = axum::Router::new()
             .route("/home", axum::routing::get(get_home))

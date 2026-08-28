@@ -8429,6 +8429,22 @@ pub(in crate::server) async fn create_named_group(
         if req.preset.is_some() {
             return bad_request("pass either `preset` or `policy`, not both");
         }
+        // ADR-0038 review fix 2: an explicit OwnerCertified(owner) claim is
+        // only honored when THIS daemon's agent certificate actually chains
+        // to that owner — otherwise any token holder could mint and
+        // advertise `OwnerCertified(victim)` groups and seat itself Admin.
+        if let Some(owner) = explicit.admission.owner_certified_user_id() {
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let evidence = super::home::owner_chain_evidence(state.as_ref(), &[&local_hex]).await;
+            if x0x::groups::owner_cert::verify_owner_certified_member(owner, &local_hex, &evidence)
+                .is_err()
+            {
+                return forbidden(
+                    "cannot create an OwnerCertified group: this agent's certificate does \
+                     not chain to the requested owner",
+                );
+            }
+        }
         explicit
     } else {
         match req.preset.as_deref() {
@@ -8729,6 +8745,14 @@ pub(in crate::server) async fn create_named_group(
                     "group_id": group_id_hex,
                     "name": info.name,
                     "chat_topic": chat_topic,
+                    // ADR-0038 review fix 2 (downgrade detection): echo
+                    // the EFFECTIVE policy. An older daemon that silently
+                    // ignored the unknown `policy` field returns no
+                    // `policy` echo — a caller that sent an explicit
+                    // policy treats the omission as a version downgrade
+                    // and can retry/fail loudly instead of trusting a
+                    // default-policy group it believes is OwnerCertified.
+                    "policy": info.policy,
                 })),
             )
         }
@@ -8799,14 +8823,9 @@ pub(in crate::server) async fn get_named_group(
                     (agent.clone(), serde_json::json!(if *placement == x0x::groups::MemberPlacement::Roaming { "roaming" } else { "pinned" }))
                 }).collect::<serde_json::Map<String, serde_json::Value>>(),
             })),
-            "warnings": if info.home.is_some() {
-                match super::home::home_roaming_warning(state.as_ref()).await {
-                    Some(warning) => vec![warning],
-                    None => Vec::new(),
-                }
-            } else {
-                Vec::new()
-            },
+            "warnings": super::home::home_roaming_warning_for(info)
+                .map(|warning| vec![warning])
+                .unwrap_or_default(),
         })),
     )
 }
@@ -13415,7 +13434,7 @@ pub(in crate::server) fn now_millis_u64() -> u64 {
 /// grow-only set. Agents whose hex does not parse produce no entry and so
 /// fail closed downstream (`NoCertificate`/not-revoked evidence still fails
 /// the chain check).
-async fn owner_cert_evidence_for(
+pub(in crate::server) async fn owner_cert_evidence_for(
     state: &AppState,
     agents: &[&str],
 ) -> x0x::groups::owner_cert::OwnerCertEvidence {
@@ -13516,7 +13535,7 @@ async fn owner_cert_seal_evidence(
 /// event, and would leave the GSS secret / TreeKEM leaves unrotated so the
 /// evicted member keeps decrypting). For every other admission axis — or a
 /// fully certified roster — this is exactly `seal_commit`.
-async fn seal_commit_owner_certified(
+pub(in crate::server) async fn seal_commit_owner_certified(
     state: &AppState,
     info: &mut x0x::groups::GroupInfo,
     signing_kp: &crate::identity::AgentKeypair,
