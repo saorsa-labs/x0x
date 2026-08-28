@@ -235,6 +235,13 @@ async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 /// the authoritative base roster (discovery only ENRICHES it).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedCertRecord {
+    /// Hex-encoded `UserId` of the ISSUING owner (R3: records are
+    /// owner-scoped — after `--rotate-owner` the previous owner's lines
+    /// stay in the file as history but are EXCLUDED from the roster by the
+    /// current-owner filter). Required, no default: journal lines from
+    /// before this field existed fail to parse and are skipped by the
+    /// tolerant loader (the journal ships in this same release).
+    pub user_id: String,
     /// Hex-encoded certified agent id.
     pub agent_id: String,
     /// BLAKE3 (hex) of the certificate's storage bytes — identifies the
@@ -258,11 +265,16 @@ pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
 }
 
 impl IssuedCertRecord {
-    /// Build the record for a certificate about to be journaled.
+    /// Build the record for a certificate about to be journaled, scoped to
+    /// the issuing owner.
     #[must_use]
-    pub fn from_cert(cert: &crate::identity::AgentCertificate) -> Option<Self> {
+    pub fn from_cert(
+        owner: &crate::identity::UserId,
+        cert: &crate::identity::AgentCertificate,
+    ) -> Option<Self> {
         let agent_id = cert.agent_id().ok()?;
         Some(Self {
+            user_id: hex::encode(owner.as_bytes()),
             agent_id: hex::encode(agent_id.as_bytes()),
             cert_digest: cert_storage_digest(cert),
             issued_at: cert.issued_at(),
@@ -425,12 +437,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(CERT_JOURNAL_FILE);
         let r1 = IssuedCertRecord {
+            user_id: "07".repeat(32),
             agent_id: "ab".repeat(32),
             cert_digest: "cd".repeat(32),
             issued_at: 100,
             not_after: None,
         };
         let r2 = IssuedCertRecord {
+            user_id: "07".repeat(32),
             agent_id: "ef".repeat(32),
             cert_digest: "12".repeat(32),
             issued_at: 200,

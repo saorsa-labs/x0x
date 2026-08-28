@@ -9687,8 +9687,15 @@ impl Agent {
         let journal_path = self.cert_journal_path.clone();
         let mut journal_digests: std::collections::HashSet<String> =
             std::collections::HashSet::new();
+        let owner_hex = hex::encode(owner.as_bytes());
         if let Some(ref jp) = journal_path {
             for record in profile::IssuedCertRecord::load(jp).await {
+                // R3: records are owner-scoped — lines from a PREVIOUS
+                // owner (pre-rotation history) are kept in the file but
+                // excluded from this owner's roster.
+                if record.user_id != owner_hex {
+                    continue;
+                }
                 journal_digests.insert(record.cert_digest.clone());
                 let entry = OwnerIssuedCert {
                     agent_id: record.agent_id.clone(),
@@ -9717,7 +9724,7 @@ impl Agent {
         }
 
         for cert in live {
-            let Some(record) = profile::IssuedCertRecord::from_cert(&cert) else {
+            let Some(record) = profile::IssuedCertRecord::from_cert(&owner, &cert) else {
                 continue;
             };
             // Append-on-first-seen: the journal converges to every owned
@@ -11980,7 +11987,9 @@ impl AgentBuilder {
                 // Record the issuance (append-only; best-effort — a journal
                 // write failure degrades the roster, never startup).
                 if let Some(ref jp) = journal_path {
-                    if let Some(record) = profile::IssuedCertRecord::from_cert(&new_cert) {
+                    if let Some(record) =
+                        profile::IssuedCertRecord::from_cert(&user_kp.user_id(), &new_cert)
+                    {
                         if let Err(e) = profile::IssuedCertRecord::append(jp, &record).await {
                             tracing::warn!("failed to append owner cert journal: {e}");
                         }

@@ -227,11 +227,52 @@ async fn enforce_owner_singleton_prebuild(
         (None, Some(dir)) => Some(dir.join("user.key")),
         (None, None) => dirs::home_dir().map(|h| h.join(".x0x").join("user.key")),
     };
+    // R3 fix: load the OWNER RECORD FIRST — a recorded owner demands a
+    // matching key, whatever the key slot looks like. Only an UNRECORDED
+    // install may start keyless (anonymous opt-in) or adopt.
+    let owner = x0x::profile::OwnerProfile::load_from(&owner_path)
+        .await
+        .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?;
+
     let Some(key_path) = key_path else {
-        return Ok(());
+        // No key path resolvable at all: refuse only when an owner is
+        // recorded (a keyless host cannot load the owner's key by design).
+        return match owner {
+            Some(owner) => Err(anyhow::anyhow!(
+                "install is owned by user {} but no user key path is resolvable; \
+                 restore the owner's user.key or run `x0x user-id create --rotate-owner`",
+                owner.user_id
+            )),
+            None => Ok(()),
+        };
     };
-    if !tokio::fs::try_exists(&key_path).await.unwrap_or(false) {
-        return Ok(()); // no user identity configured: nothing to enforce
+    match tokio::fs::try_exists(&key_path).await {
+        Ok(true) => {}
+        Ok(false) => {
+            // R3 fix (regression): a RECORDED owner whose key is absent
+            // must refuse — starting anonymously would silently drop the
+            // install's authority. No owner recorded + no key = legitimate
+            // anonymous opt-in.
+            return match owner {
+                Some(owner) => Err(anyhow::anyhow!(
+                    "install is owned by user {} but the user key is missing at {}; \
+                     restore the key or run `x0x user-id create --rotate-owner`",
+                    owner.user_id,
+                    key_path.display()
+                )),
+                None => Ok(()),
+            };
+        }
+        // stat itself failed: we cannot prove the key present or absent —
+        // fail closed rather than guess.
+        Err(e) => {
+            if owner.is_some() {
+                return Err(anyhow::anyhow!(
+                    "cannot determine whether the owner's user key exists at {}: {e}",
+                    key_path.display()
+                ));
+            }
+        }
     }
     // Fail closed on an unreadable key — the same class of error the
     // builder now refuses on; catch it here BEFORE anything persists.
@@ -239,10 +280,7 @@ async fn enforce_owner_singleton_prebuild(
         .await
         .with_context(|| format!("user key at {} is unreadable", key_path.display()))?;
     let loaded_id = hex::encode(key.user_id().as_bytes());
-    match x0x::profile::OwnerProfile::load_from(&owner_path)
-        .await
-        .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?
-    {
+    match owner {
         Some(owner) if owner.user_id == loaded_id => Ok(()),
         Some(owner) => Err(anyhow::anyhow!(
             "install is owned by user {} but {} resolves to {}; \
@@ -612,6 +650,12 @@ pub async fn serve_with_options(
     // BEFORE the builder runs — a mismatched user key must not re-issue and
     // persist agent.cert, and no network/exec task may exist for a key the
     // install refuses to adopt.
+    //
+    // ACCEPTED side effects of earlier startup steps (data-dir creation,
+    // API token, KEM keypair — review R3): none of them grants identity or
+    // authority; they are inert files/keys without an adopted agent, so
+    // creating them before this check is harmless and no restructure is
+    // needed.
     enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
 
     // All agent-independent fallible startup has succeeded. Build the agent now
@@ -3256,6 +3300,51 @@ mod owner_singleton_tests {
             err.to_string().contains("--rotate-owner"),
             "error must name the escape hatch: {err}"
         );
+    }
+
+    /// WHY (R3 regression of the round-2 no-key refusal): a RECORDED owner
+    /// whose key file is MISSING must refuse startup — starting anonymously
+    /// would silently drop the install's authority. An unrecorded install
+    /// with no key stays a legitimate anonymous opt-in.
+    #[tokio::test]
+    async fn prebuild_enforcement_refuses_missing_key_for_recorded_owner() {
+        use x0x::storage::save_user_keypair_to;
+
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        let config = DaemonConfig {
+            user_key_path: Some(key_path.clone()),
+            ..DaemonConfig::default()
+        };
+        // Record an owner (via create-style adoption), then LOSE the key.
+        let key = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&key, &key_path).await.unwrap();
+        enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .unwrap();
+        tokio::fs::remove_file(&key_path).await.unwrap();
+
+        let err = enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .expect_err("missing key for a recorded owner must refuse");
+        assert!(
+            err.to_string().contains("user key is missing"),
+            "error names the reason: {err}"
+        );
+        assert!(
+            err.to_string().contains("--rotate-owner"),
+            "error names the escape hatch: {err}"
+        );
+
+        // No owner recorded + no key: anonymous opt-in, no refusal.
+        let clean_dir = tempfile::tempdir().unwrap();
+        let clean = DaemonConfig {
+            user_key_path: Some(clean_dir.path().join("user.key")),
+            ..DaemonConfig::default()
+        };
+        enforce_owner_singleton_prebuild(&clean, &None)
+            .await
+            .expect("unrecorded install with no key starts anonymously");
     }
 
     /// WHY (review R2 regression): a CORRUPT user key must refuse BEFORE

@@ -148,12 +148,12 @@ pub(in crate::server) struct OwnerAgentEntry {
 }
 
 /// GET /owner/agents — the roster of agents certified by this install's
-/// owner (ADR-0036): certificates this daemon has VERIFIED for the owner's
-/// `UserId` (its own, the owner's signed announcement roster, and certs
-/// embedded in discovered beats), joined with the contact store and the
-/// discovery cache for names. Honest scope (review P1): best-effort and
-/// discovery-derived — not a persisted issuance journal; owned agents that
-/// are offline and uncached drop out after restart until re-observed.
+/// owner (ADR-0036). Authoritative base: the persisted, owner-scoped
+/// issuance journal (`owner-cert-journal.jsonl`, written at cert-issue
+/// time and on first-seen owner-bound certs — entries survive restarts
+/// and list offline owned agents). Live discovery only adds renewals and
+/// enriches labels/names/machines. Journal records from a PREVIOUS owner
+/// (pre-rotation history) are excluded by the current-owner filter.
 /// `409` when no user identity (and therefore no owner) is configured.
 pub(in crate::server) async fn owner_agents(
     State(state): State<Arc<AppState>>,
@@ -506,5 +506,32 @@ mod tests {
         let records = state2.agent.owner_issued_certificates().await;
         assert_eq!(records.len(), 1);
         assert!(records[0].from_journal, "entry is journal-backed");
+
+        // R3: the journal is owner-scoped — a record from a PREVIOUS owner
+        // (pre-rotation history) stays in the file but is EXCLUDED from
+        // this owner's roster.
+        let mut foreign = crate::profile::IssuedCertRecord {
+            user_id: "ee".repeat(32),
+            agent_id: "99".repeat(32),
+            cert_digest: "77".repeat(32),
+            issued_at: 9_999,
+            not_after: None,
+        };
+        // Higher issued_at than the real record: only the owner filter can
+        // keep it out of the roster.
+        foreign.issued_at = records[0].issued_at + 10;
+        crate::profile::IssuedCertRecord::append(&journal_path, &foreign)
+            .await
+            .unwrap();
+        let records = state2.agent.owner_issued_certificates().await;
+        assert_eq!(
+            records.len(),
+            1,
+            "previous-owner journal history must be excluded from the roster"
+        );
+        assert_eq!(
+            records[0].agent_id,
+            hex::encode(state2.agent.agent_id().as_bytes())
+        );
     }
 }
