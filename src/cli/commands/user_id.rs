@@ -12,6 +12,98 @@ pub fn default_user_key_path() -> Result<PathBuf> {
     Ok(home.join(".x0x").join("user.key"))
 }
 
+/// Inter-process lock around the `user.key` + `owner.json` two-file update
+/// (review R2). Per-file writes stay atomic (temp+rename); the lock
+/// prevents two concurrent creates/rotates from interleaving their write
+/// pairs. Crash semantics: a crash between the two writes leaves a
+/// key/owner MISMATCH — the fail-closed refusing state — recovered by
+/// re-running with `--rotate-owner`; a stale lock older than
+/// [`ROTATE_LOCK_STALE_AFTER_SECS`] is stolen (the holder cannot be alive
+/// meaningfully past that without a hung filesystem).
+const ROTATE_LOCK_STALE_AFTER_SECS: u64 = 60;
+
+struct RotateLock {
+    path: std::path::PathBuf,
+    released: bool,
+}
+
+impl RotateLock {
+    /// Acquire `<key>.ownerlock` exclusively; steals locks older than the
+    /// stale threshold.
+    ///
+    /// # Errors
+    /// Returns an error when the lock is held by a live process, or the
+    /// filesystem refuses the lock file.
+    async fn acquire(key_path: &std::path::Path) -> Result<Self> {
+        // `<key-file-name>.ownerlock` (sibling of the key; NOT
+        // with_extension — that would rename user.key to user.ownerlock).
+        let path = key_path.with_file_name(format!(
+            "{}.ownerlock",
+            key_path.file_name().map_or_else(
+                || "user.key".to_string(),
+                |n| n.to_string_lossy().into_owned()
+            )
+        ));
+        if let Some(dir) = path.parent() {
+            std::fs::create_dir_all(dir)?;
+        }
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(Self {
+                path,
+                released: false,
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                let stale = tokio::fs::metadata(&path)
+                    .await
+                    .ok()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.elapsed().ok())
+                    .is_some_and(|age| age.as_secs() > ROTATE_LOCK_STALE_AFTER_SECS);
+                if !stale {
+                    anyhow::bail!(
+                        "another user-id create/rotate appears to be in progress \
+                         (lock {}); retry shortly or remove the file if stale",
+                        path.display()
+                    );
+                }
+                let _ = tokio::fs::remove_file(&path).await;
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .open(&path)
+                    .map_err(|e| {
+                        anyhow::anyhow!("failed to acquire rotate lock {}: {e}", path.display())
+                    })?;
+                Ok(Self {
+                    path,
+                    released: false,
+                })
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to create rotate lock {}: {e}",
+                path.display()
+            )),
+        }
+    }
+
+    fn release(&mut self) {
+        if !self.released {
+            let _ = std::fs::remove_file(&self.path);
+            self.released = true;
+        }
+    }
+}
+
+impl Drop for RotateLock {
+    fn drop(&mut self) {
+        self.release();
+    }
+}
+
 /// `x0x user-id create [PATH]` — create a user identity keypair on disk.
 ///
 /// Overwrites an existing key at the target path ONLY for the same identity
@@ -54,6 +146,11 @@ pub async fn create(
         None => UserKeypair::generate()
             .map_err(|e| anyhow::anyhow!("failed to generate user keypair: {e}"))?,
     };
+
+    // Review R2: the two-file update runs under an inter-process lock so
+    // concurrent creates/rotates cannot interleave (crash leaves the
+    // fail-closed mismatch, never a silent authority swap).
+    let _rotate_lock = RotateLock::acquire(&path).await?;
 
     // ADR-0036: one owner per install. The record lives beside the key so a
     // custom PATH scopes the owner to that identity directory (which is the

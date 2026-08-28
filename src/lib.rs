@@ -248,6 +248,15 @@ pub struct Agent {
     /// `PUT /profile` updates apply to the next heartbeat without a
     /// restart; `None` announces anonymously (no self_name field).
     self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Latched "has ever been named" (ADR-0036): once an install has
+    /// published a name, X0A4 beats continue even after the name is
+    /// cleared — carrying an explicit no-name — so peers ERASE the cached
+    /// name instead of displaying it forever (see the upsert clear rule).
+    self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ADR-0036 owner certificate journal (sibling of `agent.cert`);
+    /// `None` when no user identity is configured. Written at cert-issue
+    /// time; read by `GET /owner/agents` as the authoritative base roster.
+    cert_journal_path: Option<std::path::PathBuf>,
     /// Bootstrap peer cache for quality-based peer selection across restarts.
     bootstrap_cache: Option<std::sync::Arc<ant_quic::BootstrapCache>>,
     /// Gossip cache adapter wrapping bootstrap_cache with coordinator advert storage.
@@ -1674,6 +1683,24 @@ pub struct DiscoveredAgent {
     pub self_name: Option<String>,
 }
 
+/// One entry of the owner's certificate roster (journal-backed; see
+/// [`Agent::owner_issued_certificates`]).
+#[derive(Debug, Clone)]
+pub struct OwnerIssuedCert {
+    /// Hex-encoded certified agent id.
+    pub agent_id: String,
+    /// Unix seconds when the certificate was issued.
+    pub issued_at: u64,
+    /// Certificate expiry (unix seconds); `None` = no expiry.
+    pub not_after: Option<u64>,
+    /// BLAKE3 hex of the certificate's storage bytes.
+    pub digest: String,
+    /// `true` when this entry was loaded from the persisted issuance
+    /// journal (survives restarts); `false` when it came from live
+    /// discovery only.
+    pub from_journal: bool,
+}
+
 /// Cached machine endpoint data derived from signed machine announcements.
 #[derive(Debug, Clone)]
 pub struct DiscoveredMachine {
@@ -1912,12 +1939,15 @@ async fn upsert_discovered_agent(
                 if incoming.is_coordinator.is_some() {
                     existing.is_coordinator = incoming.is_coordinator;
                 }
-                // ADR-0036: same "present wins, absent preserves" rule as
-                // the other optional fields — a legacy X0A3 beat carries no
-                // name and must not erase one learned from a V3.1 beat (a
-                // cleared name ages out with the record's TTL instead).
-                if incoming.self_name.is_some() {
-                    existing.self_name = incoming.self_name;
+                // ADR-0036 name semantics (review R2): Some(name) sets or
+                // renames; Some("") is the explicit CLEAR from an X0A4
+                // no-name beat (a cleared peer keeps dual-publishing X0A4,
+                // so the clear propagates instead of aging out); None is a
+                // legacy X0A3 beat — no name information, preserve.
+                match incoming.self_name.as_deref() {
+                    Some("") => existing.self_name = None,
+                    Some(_) => existing.self_name.clone_from(&incoming.self_name),
+                    None => {}
                 }
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
@@ -2430,6 +2460,8 @@ struct HeartbeatContext {
     /// Shared with `Agent::self_name` so `PUT /profile` updates apply to
     /// the next beat without a restart.
     self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
+    /// Shared ever-named latch (see `Agent::self_name_ever_set`).
+    self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl HeartbeatContext {
@@ -2740,7 +2772,11 @@ impl HeartbeatContext {
                     }
                     Err(e) => tracing::debug!("heartbeat: v3 serialize failed: {e}"),
                 }
-                if v3.self_name.is_some() {
+                let publish_v31 = v3.self_name.is_some()
+                    || self
+                        .self_name_ever_set
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if publish_v31 {
                     if let Err(e) = v3.sign_v3_1(self.identity.machine_keypair().secret_key()) {
                         tracing::debug!("heartbeat: v3.1 resign failed: {e}");
                     } else {
@@ -3274,6 +3310,10 @@ impl Agent {
     /// Live-updates the heartbeat (no restart): the announce builder reads
     /// this per beat. `None` reverts to anonymous beats.
     pub fn set_self_name(&self, name: Option<String>) {
+        if name.is_some() {
+            self.self_name_ever_set
+                .store(true, std::sync::atomic::Ordering::Release);
+        }
         if let Ok(mut guard) = self.self_name.write() {
             *guard = name;
         }
@@ -6863,7 +6903,11 @@ impl Agent {
                             "failed to publish v3 identity announcement: {e}"
                         )))
                     })?;
-                if v3.self_name.is_some() {
+                let publish_v31 = v3.self_name.is_some()
+                    || self
+                        .self_name_ever_set
+                        .load(std::sync::atomic::Ordering::Acquire);
+                if publish_v31 {
                     v3.sign_v3_1(self.identity.machine_keypair().secret_key())?;
                     let v31_encoded = announce_v3::serialize_v3_1(&v3).map_err(|e| {
                         error::IdentityError::Serialization(format!(
@@ -7715,7 +7759,17 @@ impl Agent {
                     // fetch — `(None, None)` is a well-known constant.
                     let cert_digest = v3.cert_digest;
                     let payload_version = v3.payload_version;
+                    let is_v31 = raw_payload
+                        .starts_with(announce_v3::IDENTITY_ANNOUNCEMENT_V3_1_MAGIC);
                     let mut converted = v3.into_announcement();
+                    // ADR-0036 clear propagation (review R2): an X0A4 beat
+                    // that explicitly carries NO name is a CLEAR — mark it
+                    // with the empty-string sentinel so the upsert erases a
+                    // previously cached name. A legacy X0A3 beat carries no
+                    // name INFORMATION at all (None preserves).
+                    if is_v31 && converted.self_name.is_none() {
+                        converted.self_name = Some(String::new());
+                    }
                     if announce_blob::fetch_warranted(&cert_digest) {
                         match announce_blob_cache.get(&cert_digest).await {
                             // SECURITY: the digest is attacker-choosable — any
@@ -8538,6 +8592,7 @@ impl Agent {
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
+                self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
             };
             // Routed through spawn_tracked (issue #116) so a shutdown racing
             // bootstrap refuses to start it once the registry is closed; it is
@@ -9607,64 +9662,95 @@ impl Agent {
             .collect())
     }
 
-    /// Certificates the install's owner has issued for agents this daemon
-    /// currently knows about (ADR-0036 `GET /owner/agents`).
+    /// Certificates the install's owner has issued (ADR-0036
+    /// `GET /owner/agents`).
     ///
-    /// HONEST SCOPE (review P1): this is a best-effort, discovery-derived
-    /// view — the daemon's own certificate, the cached verified
-    /// [`UserAnnouncement`] roster for the owner, and certificates embedded
-    /// in discovered announcements. It is NOT a persisted issuance journal:
-    /// owned agents that are offline and not cached drop out after a
-    /// restart until re-observed. Where the same agent id carries multiple
-    /// certs (a renewal), the LATEST-issued wins, so a stale discovery
-    /// entry can no longer shadow a renewed roster cert or misreport
-    /// expiry. Every certificate binds to the owner's `UserId` (verified
-    /// at announce time), so foreign certs cannot enter the roster.
+    /// AUTHORITATIVE BASE (review R2): the append-only issuance journal
+    /// (written at cert-issue time beside `agent.cert`, and appended when
+    /// an owner-bound certificate is first observed via a verified
+    /// announcement) survives restarts — an owned agent stays on the roster
+    /// even while offline. Live sources (this daemon's own certificate, the
+    /// owner's cached [`UserAnnouncement`] roster, certificates embedded in
+    /// discovered beats) only ADD renewals and enrich display data; per
+    /// agent the LATEST-issued certificate wins, journal first on ties.
+    /// Every live certificate binds to the owner's `UserId` (verified at
+    /// announce time), so foreign certs cannot enter the roster.
     ///
     /// Empty when no user identity is configured.
-    #[must_use]
-    pub async fn owner_issued_certificates(&self) -> Vec<identity::AgentCertificate> {
+    pub async fn owner_issued_certificates(&self) -> Vec<OwnerIssuedCert> {
         let Some(owner) = self.identity.user_id() else {
             return Vec::new();
         };
-        // agent_id → (issued_at, cert); latest issuance replaces earlier.
-        let mut best: std::collections::HashMap<
-            identity::AgentId,
-            (u64, identity::AgentCertificate),
-        > = std::collections::HashMap::new();
-        let consider = |cert: identity::AgentCertificate,
-                        best: &mut std::collections::HashMap<
-            identity::AgentId,
-            (u64, identity::AgentCertificate),
-        >| {
-            if let Ok(id) = cert.agent_id() {
-                let issued = cert.issued_at();
-                match best.get(&id) {
-                    Some((prev_issued, _)) if *prev_issued >= issued => {}
-                    _ => {
-                        best.insert(id, (issued, cert));
-                    }
-                }
+        // agent_id hex → best (latest-issued) record.
+        let mut best: std::collections::HashMap<String, OwnerIssuedCert> =
+            std::collections::HashMap::new();
+        let journal_path = self.cert_journal_path.clone();
+        let mut journal_digests: std::collections::HashSet<String> =
+            std::collections::HashSet::new();
+        if let Some(ref jp) = journal_path {
+            for record in profile::IssuedCertRecord::load(jp).await {
+                journal_digests.insert(record.cert_digest.clone());
+                let entry = OwnerIssuedCert {
+                    agent_id: record.agent_id.clone(),
+                    issued_at: record.issued_at,
+                    not_after: record.not_after,
+                    digest: record.cert_digest,
+                    from_journal: true,
+                };
+                best.insert(record.agent_id, entry);
             }
-        };
+        }
+
+        let mut live: Vec<identity::AgentCertificate> = Vec::new();
         if let Some(own) = self.identity.agent_certificate() {
-            consider(own.clone(), &mut best);
+            live.push(own.clone());
         }
         if let Some(discovered_user) = self.user_discovery_cache.read().await.get(&owner) {
-            for cert in &discovered_user.agent_certificates {
-                consider(cert.clone(), &mut best);
-            }
+            live.extend(discovered_user.agent_certificates.iter().cloned());
         }
         for agent in self.identity_discovery_cache.read().await.values() {
             if let Some(cert) = &agent.agent_certificate {
                 if cert.user_id().is_ok_and(|uid| uid == owner) {
-                    consider(cert.clone(), &mut best);
+                    live.push(cert.clone());
                 }
             }
         }
-        let mut out: Vec<identity::AgentCertificate> =
-            best.into_values().map(|(_, cert)| cert).collect();
-        out.sort_by_key(|cert| cert.agent_id().map_or([0u8; 32], |id| *id.as_bytes()));
+
+        for cert in live {
+            let Some(record) = profile::IssuedCertRecord::from_cert(&cert) else {
+                continue;
+            };
+            // Append-on-first-seen: the journal converges to every owned
+            // certificate this daemon has ever verified (renewals included
+            // as new lines). Best-effort — a failed append degrades nothing.
+            if !journal_digests.contains(&record.cert_digest) {
+                if let Some(ref jp) = journal_path {
+                    if let Err(e) = profile::IssuedCertRecord::append(jp, &record).await {
+                        tracing::warn!("failed to append owner cert journal: {e}");
+                    }
+                }
+            }
+            match best.get(&record.agent_id) {
+                // Journal is authoritative on ties: keep it.
+                Some(prev) if prev.issued_at > record.issued_at => {}
+                Some(prev) if prev.issued_at == record.issued_at && prev.from_journal => {}
+                _ => {
+                    best.insert(
+                        record.agent_id.clone(),
+                        OwnerIssuedCert {
+                            agent_id: record.agent_id,
+                            issued_at: record.issued_at,
+                            not_after: record.not_after,
+                            digest: record.cert_digest,
+                            from_journal: false,
+                        },
+                    );
+                }
+            }
+        }
+
+        let mut out: Vec<OwnerIssuedCert> = best.into_values().collect();
+        out.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
         out
     }
 
@@ -10660,6 +10746,7 @@ impl Agent {
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             legacy_announce: self.legacy_announce,
             self_name: std::sync::Arc::clone(&self.self_name),
+            self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -11840,6 +11927,10 @@ impl AgentBuilder {
         // The per-daemon `agent_cert_path` (set by `with_agent_cert_path()`)
         // is the structural fix for scenario (2); the agent_id check is the
         // defensive net in case two processes still land on the same path.
+        // ADR-0036 (review R2): the owner certificate journal lives beside
+        // the agent certificate — written at issue time, read by
+        // `GET /owner/agents` as the authoritative issuance record.
+        let mut cert_journal_path: Option<std::path::PathBuf> = None;
         let identity = if let Some(user_kp) = user_keypair {
             let cert_path = self.agent_cert_path.clone();
             let existing_cert = if let Some(ref p) = cert_path {
@@ -11866,6 +11957,13 @@ impl AgentBuilder {
                 user_match && agent_match
             });
 
+            let journal_path = match cert_path.as_ref() {
+                Some(p) => Some(p.with_file_name(profile::CERT_JOURNAL_FILE)),
+                None => storage::x0x_dir()
+                    .await
+                    .ok()
+                    .map(|d| d.join(profile::CERT_JOURNAL_FILE)),
+            };
             let cert = if cert_still_valid {
                 existing_cert.ok_or_else(|| {
                     error::IdentityError::Storage(std::io::Error::other(
@@ -11879,8 +11977,18 @@ impl AgentBuilder {
                 } else {
                     storage::save_agent_certificate(&new_cert).await?;
                 }
+                // Record the issuance (append-only; best-effort — a journal
+                // write failure degrades the roster, never startup).
+                if let Some(ref jp) = journal_path {
+                    if let Some(record) = profile::IssuedCertRecord::from_cert(&new_cert) {
+                        if let Err(e) = profile::IssuedCertRecord::append(jp, &record).await {
+                            tracing::warn!("failed to append owner cert journal: {e}");
+                        }
+                    }
+                }
                 new_cert
             };
+            cert_journal_path = journal_path;
             identity::Identity::new_with_user(machine_keypair, agent_keypair, user_kp, cert)
         } else {
             identity::Identity::new(machine_keypair, agent_keypair)
@@ -12153,6 +12261,8 @@ impl AgentBuilder {
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
+            self_name_ever_set: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            cert_journal_path,
             identity: std::sync::Arc::new(identity),
             network,
             gossip_runtime,
@@ -18545,11 +18655,18 @@ mod tests {
         // named beat must dual-publish X0A4 (name) + the X0A3 companion.
         agent.set_self_name(Some("fae".to_string()));
         agent.announce_identity(false, false).await.unwrap();
+        // Then CLEAR the name: the ever-named latch keeps X0A4 publishing,
+        // now with an explicit no-name (the clear signal for peers).
+        agent.set_self_name(None);
+        agent.announce_identity(false, false).await.unwrap();
 
         let mut x0a3_unnamed = 0usize;
         let mut saw_named = false;
+        let mut saw_cleared = false;
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-        while tokio::time::Instant::now() < deadline && !(x0a3_unnamed >= 2 && saw_named) {
+        while tokio::time::Instant::now() < deadline
+            && !(x0a3_unnamed >= 2 && saw_named && saw_cleared)
+        {
             tokio::select! {
                 Some(msg) = identity_sub.recv() => {
                     if announce_v3::is_v3_payload(&msg.payload) {
@@ -18560,6 +18677,7 @@ mod tests {
                         match (is_v31, v3.self_name.as_deref()) {
                             (false, None) => x0a3_unnamed += 1,
                             (true, Some("fae")) => saw_named = true,
+                            (true, None) => saw_cleared = true,
                             other => panic!("unexpected (envelope, self_name) on beat: {other:?}"),
                         }
                     }
@@ -18578,6 +18696,10 @@ mod tests {
         assert!(
             x0a3_unnamed >= 2,
             "named beat must dual-publish the legacy X0A3 companion (review P0: old peers' decoders reject grown bodies and V2 is retired)"
+        );
+        assert!(
+            saw_cleared,
+            "a cleared name must keep publishing X0A4 with an explicit no-name              (review R2: clears must propagate, not age out)"
         );
     }
 
@@ -19660,6 +19782,72 @@ async fn revocation_discovery_eviction_preserves_authenticated_binding() {
         )
         .await,
         Some(machine.machine_id())
+    );
+}
+
+#[tokio::test]
+async fn upsert_self_name_sets_renames_clears_and_preserves() {
+    // WHY (review R2): the cached name must follow the peer's live
+    // state — Some(name) sets/renames, Some("") is the explicit CLEAR
+    // from an X0A4 no-name beat, and None (legacy X0A3) carries no name
+    // information and must preserve whatever is cached.
+    let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let id = identity::AgentId([9; 32]);
+
+    // Set via a fresh (first-seen) record.
+    let mut first = discovered_agent_fixture(9, 100, &["10.0.0.1:5483"], None);
+    first.self_name = Some("fae".to_string());
+    upsert_discovered_agent(&cache, first).await;
+    assert_eq!(
+        cache
+            .read()
+            .await
+            .get(&id)
+            .and_then(|a| a.self_name.clone()),
+        Some("fae".to_string())
+    );
+
+    // Rename via a fresher beat.
+    let mut rename = discovered_agent_fixture(9, 200, &["10.0.0.1:5483"], None);
+    rename.self_name = Some("fae2".to_string());
+    upsert_discovered_agent(&cache, rename).await;
+    assert_eq!(
+        cache
+            .read()
+            .await
+            .get(&id)
+            .and_then(|a| a.self_name.clone()),
+        Some("fae2".to_string())
+    );
+
+    // Legacy X0A3 beat (None): preserves the cached name.
+    upsert_discovered_agent(
+        &cache,
+        discovered_agent_fixture(9, 300, &["10.0.0.1:5483"], None),
+    )
+    .await;
+    assert_eq!(
+        cache
+            .read()
+            .await
+            .get(&id)
+            .and_then(|a| a.self_name.clone()),
+        Some("fae2".to_string()),
+        "a legacy beat must not erase the name"
+    );
+
+    // X0A4 explicit clear (Some("")): erases it.
+    let mut cleared = discovered_agent_fixture(9, 400, &["10.0.0.1:5483"], None);
+    cleared.self_name = Some(String::new());
+    upsert_discovered_agent(&cache, cleared).await;
+    assert_eq!(
+        cache
+            .read()
+            .await
+            .get(&id)
+            .and_then(|a| a.self_name.clone()),
+        None,
+        "an explicit X0A4 clear must erase the cached name"
     );
 }
 

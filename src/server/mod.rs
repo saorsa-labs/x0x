@@ -201,60 +201,74 @@ fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> 
 
 /// ADR-0036 owner singleton enforcement (daemon side).
 ///
-/// An install with a recorded `OwnerProfile` is owned by that `UserId`.
-/// When the daemon loads a *different* user key it refuses to start: the
-/// owner key is the install's authority, and swapping it must be the
-/// explicit `x0x user-id create --rotate-owner` act (which also causes the
-/// agent certificates to be re-issued on the next start, because the
-/// existing certs no longer bind to the new owner). No recorded owner (or
-/// no user key loaded) enforces nothing — the very first `user-id create`
-/// has not happened yet.
-async fn enforce_owner_singleton(
+/// Runs BEFORE `AgentBuilder::build()` (review R2 regression): by the time
+/// the builder returns, a replacement user key has already re-issued and
+/// SAVED `agent.cert` and the network/exec tasks exist — rejecting after
+/// build would leave persisted state and spawned tasks behind a refused
+/// key. This pre-build check resolves the user key exactly as the builder
+/// will (explicit `user_key_path` > identity-dir `user.key` > default
+/// `~/.x0x/user.key`), loads it directly (fail-closed on a corrupt key),
+/// and compares against the recorded owner — so NOTHING persists or spawns
+/// on a mismatched key. Replacing the owner is the explicit
+/// `x0x user-id create --rotate-owner` act (which also causes the agent
+/// certificates to be re-issued on the next start, because the existing
+/// certs no longer bind to the new owner).
+async fn enforce_owner_singleton_prebuild(
     config: &DaemonConfig,
     identity_dir: &Option<PathBuf>,
-    agent: &Arc<Agent>,
 ) -> anyhow::Result<()> {
-    let Some(path) = owner_profile_path(config, identity_dir) else {
+    let Some(owner_path) = owner_profile_path(config, identity_dir) else {
         return Ok(());
     };
-    let owner = x0x::profile::OwnerProfile::load_from(&path)
+    // Mirror AgentBuilder's user-key precedence exactly (lib.rs resolve
+    // step): explicit path > identity dir > default ~/.x0x/user.key.
+    let key_path = match (&config.user_key_path, identity_dir) {
+        (Some(path), _) => Some(path.clone()),
+        (None, Some(dir)) => Some(dir.join("user.key")),
+        (None, None) => dirs::home_dir().map(|h| h.join(".x0x").join("user.key")),
+    };
+    let Some(key_path) = key_path else {
+        return Ok(());
+    };
+    if !tokio::fs::try_exists(&key_path).await.unwrap_or(false) {
+        return Ok(()); // no user identity configured: nothing to enforce
+    }
+    // Fail closed on an unreadable key — the same class of error the
+    // builder now refuses on; catch it here BEFORE anything persists.
+    let key = x0x::storage::load_user_keypair_from(&key_path)
         .await
-        .with_context(|| format!("failed to read owner profile at {}", path.display()))?;
-    let Some(owner) = owner else {
-        // Migration (review P0): an install from before ADR-0036 has a user
-        // key but no owner record. ADOPT the loaded identity as the owner
-        // on first start so enforcement applies from now on — silently
-        // enforcing nothing would keep the singleton meaningless.
-        if let Some(user_id) = agent.user_id() {
+        .with_context(|| format!("user key at {} is unreadable", key_path.display()))?;
+    let loaded_id = hex::encode(key.user_id().as_bytes());
+    match x0x::profile::OwnerProfile::load_from(&owner_path)
+        .await
+        .with_context(|| format!("failed to read owner profile at {}", owner_path.display()))?
+    {
+        Some(owner) if owner.user_id == loaded_id => Ok(()),
+        Some(owner) => Err(anyhow::anyhow!(
+            "install is owned by user {} but {} resolves to {}; \
+             run `x0x user-id create --rotate-owner` to replace the owner \
+             (agent certificates are re-issued on the next start)",
+            owner.user_id,
+            key_path.display(),
+            loaded_id
+        )),
+        None => {
+            // Migration (review P0): an install from before ADR-0036 has a
+            // user key but no owner record — adopt the resident identity as
+            // the owner on first start so enforcement applies from now on.
             let adopted = x0x::profile::OwnerProfile {
-                user_id: hex::encode(user_id.as_bytes()),
+                user_id: loaded_id,
                 human_name: None,
             };
-            adopted
-                .save_to(&path)
-                .await
-                .with_context(|| format!("failed to record adopted owner at {}", path.display()))?;
+            adopted.save_to(&owner_path).await.with_context(|| {
+                format!("failed to record adopted owner at {}", owner_path.display())
+            })?;
             tracing::info!(
                 owner = %adopted.user_id,
                 "adopted existing user identity as install owner (ADR-0036 migration)"
             );
+            Ok(())
         }
-        return Ok(());
-    };
-    let recorded = owner.user_id;
-    match agent.user_id() {
-        Some(loaded) if hex::encode(loaded.as_bytes()) == recorded => Ok(()),
-        Some(loaded) => Err(anyhow::anyhow!(
-            "install is owned by user {recorded} but user.key resolves to {}; \
-             run `x0x user-id create --rotate-owner` to replace the owner \
-             (agent certificates are re-issued on the next start)",
-            hex::encode(loaded.as_bytes())
-        )),
-        None => Err(anyhow::anyhow!(
-            "install is owned by user {recorded} but no user identity is \
-             configured; point the daemon at the owner's user.key or rotate \
-             the owner with `x0x user-id create --rotate-owner`"
-        )),
     }
 }
 
@@ -594,6 +608,12 @@ pub async fn serve_with_options(
         agent_kem_keypair.public_bytes.len()
     );
 
+    // ADR-0036 (review R2 regression fix): enforce the owner singleton
+    // BEFORE the builder runs — a mismatched user key must not re-issue and
+    // persist agent.cert, and no network/exec task may exist for a key the
+    // install refuses to adopt.
+    enforce_owner_singleton_prebuild(&config, &identity_dir).await?;
+
     // All agent-independent fallible startup has succeeded. Build the agent now
     // (this spawns the network tasks and binds the QUIC socket). From here on,
     // any fallible step must `agent.shutdown().await` on the error path so a
@@ -729,7 +749,6 @@ pub async fn serve_with_options(
         .context("failed to load self-profile from data dir")?
         .unwrap_or_default();
     agent.set_self_name(profile.display_name.clone());
-    enforce_owner_singleton(&config, &identity_dir, &agent).await?;
 
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
@@ -3189,30 +3208,25 @@ mod owner_singleton_tests {
         );
     }
 
-    /// WHY (review P0): an existing pre-0036 install (user key, no owner
-    /// record) must be ADOPTED on first daemon start, so a later key swap
-    /// is caught — and a mismatched key must abort startup.
+    /// WHY (review R2 regression): enforcement must run BEFORE the builder —
+    /// a mismatched key must not re-issue/persist agent.cert nor spawn tasks.
+    /// Simulated at the unit level: adoption on first sight of an ownerless
+    /// key, refusal when the resident key later differs from the record.
     #[tokio::test]
-    async fn owner_enforcement_adopts_then_refuses_mismatch() {
+    async fn prebuild_enforcement_adopts_then_refuses_mismatch_without_building() {
+        use x0x::storage::{load_user_keypair_from, save_user_keypair_to};
+
         let dir = tempfile::tempdir().unwrap();
-        let data_dir = dir.path().to_path_buf();
-        let user = x0x::identity::UserKeypair::generate().unwrap();
-        let agent = Arc::new(
-            Agent::builder()
-                .with_machine_key(data_dir.join("m.key"))
-                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
-                .with_user_key(x0x::identity::UserKeypair::from_seed(&[7u8; 32]).unwrap())
-                .with_agent_cert_path(data_dir.join("agent.cert"))
-                .build()
-                .await
-                .unwrap(),
-        );
+        let key_path = dir.path().join("user.key");
         let config = DaemonConfig {
-            user_key_path: Some(data_dir.join("user.key")),
+            user_key_path: Some(key_path.clone()),
             ..DaemonConfig::default()
         };
-        // No owner record yet: adoption must record the LOADED identity.
-        enforce_owner_singleton(&config, &None, &agent)
+
+        // Resident key, no owner record: adopt on first check.
+        let first = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&first, &key_path).await.unwrap();
+        enforce_owner_singleton_prebuild(&config, &None)
             .await
             .unwrap();
         let owner_path = owner_profile_path(&config, &None).unwrap();
@@ -3222,27 +3236,49 @@ mod owner_singleton_tests {
             .expect("adopted owner record exists");
         assert_eq!(
             adopted.user_id,
-            hex::encode(agent.user_id().unwrap().as_bytes())
+            hex::encode(
+                load_user_keypair_from(&key_path)
+                    .await
+                    .unwrap()
+                    .user_id()
+                    .as_bytes()
+            )
         );
 
-        // A DIFFERENT user key against the recorded owner must refuse.
-        let other = Arc::new(
-            Agent::builder()
-                .with_machine_key(data_dir.join("m2.key"))
-                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
-                .with_user_key(user)
-                .with_agent_cert_path(data_dir.join("agent2.cert"))
-                .build()
-                .await
-                .unwrap(),
-        );
-        let err = enforce_owner_singleton(&config, &None, &other)
+        // Swap the resident key (as an accidental overwrite would): refuse —
+        // the pre-build check rejects BEFORE any builder work.
+        let second = x0x::identity::UserKeypair::generate().unwrap();
+        save_user_keypair_to(&second, &key_path).await.unwrap();
+        let err = enforce_owner_singleton_prebuild(&config, &None)
             .await
-            .expect_err("mismatched owner must abort startup");
+            .expect_err("mismatched resident key must refuse pre-build");
         assert!(
             err.to_string().contains("--rotate-owner"),
             "error must name the escape hatch: {err}"
         );
-        let _ = &agent;
+    }
+
+    /// WHY (review R2 regression): a CORRUPT user key must refuse BEFORE
+    /// build too — the builder would otherwise hard-fail later with a
+    /// different (persisted-state-adjacent) error, or worse, on legacy
+    /// paths silently degrade.
+    #[tokio::test]
+    async fn prebuild_enforcement_refuses_corrupt_user_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let key_path = dir.path().join("user.key");
+        tokio::fs::write(&key_path, b"garbage-not-a-key")
+            .await
+            .unwrap();
+        let config = DaemonConfig {
+            user_key_path: Some(key_path.clone()),
+            ..DaemonConfig::default()
+        };
+        let err = enforce_owner_singleton_prebuild(&config, &None)
+            .await
+            .expect_err("corrupt user key must refuse pre-build");
+        assert!(
+            err.to_string().contains("unreadable"),
+            "error names the reason: {err}"
+        );
     }
 }

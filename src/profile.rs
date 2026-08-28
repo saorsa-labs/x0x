@@ -227,6 +227,108 @@ async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     }
 }
 
+/// One line of the append-only owner certificate journal (ADR-0036,
+/// review R2): the minimal issuance record — which agent the owner
+/// certified, when, the certificate's digest, and its expiry. Written at
+/// certificate-issue time and when an owner-bound certificate is first
+/// observed via a verified announcement; read by `GET /owner/agents` as
+/// the authoritative base roster (discovery only ENRICHES it).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct IssuedCertRecord {
+    /// Hex-encoded certified agent id.
+    pub agent_id: String,
+    /// BLAKE3 (hex) of the certificate's storage bytes — identifies the
+    /// exact issuance (renewals differ) and dedupes journal appends.
+    pub cert_digest: String,
+    /// Unix seconds when the certificate was issued.
+    pub issued_at: u64,
+    /// Certificate expiry (unix seconds); `None` = no expiry.
+    pub not_after: Option<u64>,
+}
+
+/// File name of the owner certificate journal, in the instance data dir
+/// (sibling of `agent.cert`).
+pub const CERT_JOURNAL_FILE: &str = "owner-cert-journal.jsonl";
+
+/// BLAKE3 hex digest of a certificate's storage bytes.
+#[must_use]
+pub fn cert_storage_digest(cert: &crate::identity::AgentCertificate) -> String {
+    let bytes = cert.to_storage_bytes().unwrap_or_default();
+    hex::encode(blake3::hash(&bytes).as_bytes())
+}
+
+impl IssuedCertRecord {
+    /// Build the record for a certificate about to be journaled.
+    #[must_use]
+    pub fn from_cert(cert: &crate::identity::AgentCertificate) -> Option<Self> {
+        let agent_id = cert.agent_id().ok()?;
+        Some(Self {
+            agent_id: hex::encode(agent_id.as_bytes()),
+            cert_digest: cert_storage_digest(cert),
+            issued_at: cert.issued_at(),
+            not_after: cert.not_after(),
+        })
+    }
+
+    /// Append one record as a JSONL line (creates the file on first write;
+    /// append-only — renewals add lines, history is never rewritten).
+    ///
+    /// # Errors
+    /// Returns the underlying IO error. Journal failures are non-fatal at
+    /// the issuance call sites (warn + continue): a missing journal line
+    /// degrades the roster to discovery-derived, it never blocks startup.
+    pub async fn append(path: &Path, record: &Self) -> std::io::Result<()> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        if let Some(dir) = path.parent() {
+            tokio::fs::create_dir_all(dir).await?;
+        }
+        let line = serde_json::to_string(record)
+            .map_err(|e| std::io::Error::other(format!("serialize journal record: {e}")))?;
+        let tmp = path.with_file_name(format!(
+            ".{}.{}.journal.tmp",
+            path.file_name().map_or_else(
+                || "journal".to_string(),
+                |n| n.to_string_lossy().into_owned()
+            ),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        // Append via read-modify-write under a temp+rename: JSONL appends
+        // through File::open(append) are single-write atomic on practice,
+        // but the temp+rename shape keeps the file NEVER partially written
+        // even on weird filesystems.
+        let mut content = tokio::fs::read(path).await.unwrap_or_default();
+        content.extend_from_slice(line.as_bytes());
+        content.push(b'\n');
+        tokio::fs::write(&tmp, &content).await?;
+        match tokio::fs::rename(&tmp, path).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Load the journal; malformed lines are skipped (the journal is
+    /// advisory-authoritative, and one corrupt line must not blank the
+    /// roster).
+    ///
+    /// # Errors
+    /// Returns the underlying IO error only when the file cannot be READ
+    /// (a missing file is an empty journal).
+    #[must_use]
+    pub async fn load(path: &Path) -> Vec<Self> {
+        match tokio::fs::read_to_string(path).await {
+            Ok(text) => text
+                .lines()
+                .filter_map(|line| serde_json::from_str(line).ok())
+                .collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -312,6 +414,43 @@ mod tests {
         }));
         assert_eq!(profile.display_name, None);
         assert_eq!(profile.human_name.as_deref(), Some("David"));
+    }
+
+    #[tokio::test]
+    async fn cert_journal_appends_and_loads_tolerantly() {
+        // WHY (review R2): the journal is the roster's authoritative base —
+        // appends must persist verbatim, and one malformed line (partial
+        // write on a foreign filesystem, manual edit) must never blank the
+        // whole roster.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(CERT_JOURNAL_FILE);
+        let r1 = IssuedCertRecord {
+            agent_id: "ab".repeat(32),
+            cert_digest: "cd".repeat(32),
+            issued_at: 100,
+            not_after: None,
+        };
+        let r2 = IssuedCertRecord {
+            agent_id: "ef".repeat(32),
+            cert_digest: "12".repeat(32),
+            issued_at: 200,
+            not_after: Some(300),
+        };
+        IssuedCertRecord::append(&path, &r1).await.unwrap();
+        IssuedCertRecord::append(&path, &r2).await.unwrap();
+        assert_eq!(IssuedCertRecord::load(&path).await, vec![r1, r2]);
+
+        // Malformed line is skipped, the rest survive.
+        let mut text = tokio::fs::read_to_string(&path).await.unwrap();
+        text.insert_str(0, "{not json}\n");
+        tokio::fs::write(&path, text).await.unwrap();
+        let loaded = IssuedCertRecord::load(&path).await;
+        assert_eq!(loaded.len(), 2, "corrupt line skipped, records kept");
+
+        // Missing file is an empty journal, not an error.
+        assert!(IssuedCertRecord::load(&dir.path().join("nope.jsonl"))
+            .await
+            .is_empty());
     }
 
     #[test]

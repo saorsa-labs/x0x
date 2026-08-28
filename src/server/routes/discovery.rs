@@ -71,7 +71,8 @@ pub(in crate::server) fn discovered_agent_entry(
         addresses: agent.addresses.into_iter().map(|a| a.to_string()).collect(),
         announced_at: agent.announced_at,
         last_seen: agent.last_seen,
-        self_name: agent.self_name,
+        // Some("") is the internal explicit-clear marker — never display it.
+        self_name: agent.self_name.filter(|n| !n.is_empty()),
     }
 }
 

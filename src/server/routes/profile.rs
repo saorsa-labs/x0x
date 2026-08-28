@@ -58,8 +58,11 @@ pub(in crate::server) async fn get_profile(
 /// PUT /profile — partially update and persist the self-profile.
 ///
 /// Setting `display_name` live-updates the identity announce self-name (the
-/// next V3 beat carries it); clearing it (JSON `null`) reverts to anonymous
-/// beats. The persisted file is the source of truth across restarts.
+/// next V3 beat carries it). CLEARING a name is done with an EMPTY STRING
+/// (`""`) — JSON `null` and omitted fields both mean "leave unchanged"
+/// (indistinguishable by design; no double-Option). A cleared name keeps
+/// publishing explicit no-name X0A4 beats so peers erase it. The persisted
+/// file is the source of truth across restarts.
 pub(in crate::server) async fn update_profile(
     State(state): State<Arc<AppState>>,
     Json(req): Json<UpdateProfileRequest>,
@@ -139,6 +142,9 @@ pub(in crate::server) struct OwnerAgentEntry {
     pub(in crate::server) machine_id: Option<String>,
     /// True for this daemon's own agent.
     pub(in crate::server) is_local: bool,
+    /// True when the entry comes from the persisted issuance journal
+    /// (survives restarts) rather than live discovery only.
+    pub(in crate::server) from_journal: bool,
 }
 
 /// GET /owner/agents — the roster of agents certified by this install's
@@ -161,26 +167,36 @@ pub(in crate::server) async fn owner_agents(
             })),
         );
     };
-    let certs = state.agent.owner_issued_certificates().await;
+    let roster = state.agent.owner_issued_certificates().await;
     let contacts = state.contacts.read().await;
     let local_agent_id = state.agent.agent_id();
-    let mut entries = Vec::with_capacity(certs.len());
-    for cert in &certs {
-        let Ok(agent_id) = cert.agent_id() else {
+    let local_agent_hex = hex::encode(local_agent_id.as_bytes());
+    let mut entries = Vec::with_capacity(roster.len());
+    for record in &roster {
+        let Ok(agent_id) = hex::decode(&record.agent_id) else {
             continue;
         };
-        // Enrichment is best-effort: the roster is certificate-authoritative,
-        // names/machines come from whatever this daemon has seen.
+        let Ok(agent_id) = <[u8; 32]>::try_from(agent_id.as_slice()) else {
+            continue;
+        };
+        let agent_id = crate::identity::AgentId(agent_id);
+        // Enrichment is best-effort: the roster is journal/certificate
+        // authoritative; names and machines come from whatever this daemon
+        // has seen live.
         let discovered = state.agent.discovered_agent(agent_id).await.ok().flatten();
         entries.push(OwnerAgentEntry {
-            agent_id: hex::encode(agent_id.as_bytes()),
-            cert_not_after: cert.not_after(),
+            agent_id: record.agent_id.clone(),
+            cert_not_after: record.not_after,
             label: contacts.get(&agent_id).and_then(|c| c.label.clone()),
-            self_name: discovered.as_ref().and_then(|d| d.self_name.clone()),
+            self_name: discovered
+                .as_ref()
+                .and_then(|d| d.self_name.clone())
+                .filter(|n| !n.is_empty()),
             machine_id: discovered
                 .as_ref()
                 .map(|d| hex::encode(d.machine_id.as_bytes())),
-            is_local: agent_id == local_agent_id,
+            is_local: record.agent_id == local_agent_hex,
+            from_journal: record.from_journal,
         });
     }
     entries.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -471,5 +487,24 @@ mod tests {
             hex::encode(state2.agent.agent_id().as_bytes())
         );
         assert_eq!(agents[0]["is_local"], serde_json::json!(true));
+
+        // Review R2: the issuance journal is persisted at cert-issue time
+        // (sibling of agent.cert) and the roster reads it — so an owned
+        // agent STAYS on the roster across a restart even with empty
+        // discovery caches.
+        let journal_path = data_dir.join(crate::profile::CERT_JOURNAL_FILE);
+        let journal = crate::profile::IssuedCertRecord::load(&journal_path).await;
+        assert_eq!(journal.len(), 1, "issuance journaled: {journal:?}");
+        assert_eq!(
+            journal[0].agent_id,
+            hex::encode(state2.agent.agent_id().as_bytes())
+        );
+
+        // The roster read is journal-backed: the entry survives even with
+        // empty discovery caches (the state2 agent's caches are empty —
+        // only its own cert + the journal know the agent).
+        let records = state2.agent.owner_issued_certificates().await;
+        assert_eq!(records.len(), 1);
+        assert!(records[0].from_journal, "entry is journal-backed");
     }
 }

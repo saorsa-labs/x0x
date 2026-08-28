@@ -32,6 +32,13 @@ pub const AGENT_CARD_SIGNATURE_SCHEME_V2: &str = "x0x.agent-card.v2.ml-dsa-65";
 
 /// A shareable identity card for an x0x agent.
 ///
+/// ACCEPTED v1 LIMITATION (review R2, documented not built): pre-0036
+/// peers REJECT owner-named (v2) cards outright — they verify under v1
+/// only and fail closed. This is the same posture as ADR-0029 (fail-closed
+/// on unknown versions) and converges via fleet self-update; ownerless
+/// cards remain fully interoperable both ways. Unicode normalization of
+/// names is likewise deferred (names are stored/compared verbatim).
+///
 /// Contains everything someone needs to find and trust you on the network.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentCard {
