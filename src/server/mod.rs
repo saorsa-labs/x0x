@@ -974,6 +974,11 @@ pub async fn serve_with_options(
         ensure_named_group_listeners(Arc::clone(&state), &group_id).await;
     }
 
+    // ADR-0038: auto-provision the Home space for an owned install. Runs
+    // AFTER restore so an existing Home is adopted (marker + roster scan)
+    // instead of duplicated; best-effort — never fails startup.
+    routes::home::provision_home(&state).await;
+
     // ADR 0028: post-restore queue drain — any queued approvals whose
     // predecessors arrived during downtime can now be drained (Kimi blocker 9).
     {
@@ -1636,6 +1641,8 @@ pub async fn serve_with_options(
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
         .route("/profile", get(get_profile).put(update_profile))
+        .route("/home", get(routes::home::get_home))
+        .route("/home/rename", post(routes::home::rename_home))
         .route("/owner/agents", get(owner_agents))
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))

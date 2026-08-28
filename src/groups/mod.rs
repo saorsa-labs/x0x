@@ -94,6 +94,37 @@ fn default_invite_max_role() -> GroupRole {
     GroupRole::Member
 }
 
+/// ADR-0037 placement placeholder for Home members (ADR-0038 WP5).
+///
+/// An ABSENT entry in [`HomeMetadata::placements`] means `Pinned`. The
+/// real placement model + roaming move protocol land with the ADR-0037
+/// wave; this placeholder exists so the roaming guarantee (Home must
+/// contain at least one Roaming agent) is observable now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MemberPlacement {
+    /// Bound to this machine (default).
+    Pinned,
+    /// Intended to follow the owner across machines (ADR-0037 roaming).
+    Roaming,
+}
+
+/// ADR-0038 Home metadata — carried by the auto-provisioned personal
+/// space (`GroupInfo::home`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeMetadata {
+    /// Agent hex of the owner's designated PRIMARY agent — the founding
+    /// member whose certificate binds it to the owner `UserId`. The owner
+    /// participates in Home through this agent (GUI renders its panel with
+    /// the "speaking as" chip).
+    pub primary_agent: String,
+    /// ADR-0037 placement placeholder per member (absent = Pinned).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub placements: std::collections::BTreeMap<String, MemberPlacement>,
+    /// Unix ms when this Home was provisioned.
+    pub provisioned_at_ms: u64,
+}
+
 /// Metadata for a group.
 ///
 /// Persisted as JSON. The legacy v1 layout used a flat `members: BTreeSet`
@@ -208,6 +239,15 @@ pub struct GroupInfo {
     /// roster. Transient — never serialized.
     #[serde(skip)]
     pub owner_cert_reverify_required: bool,
+    /// ADR-0038 Home metadata: present iff this group is the install's
+    /// auto-provisioned personal space. `primary_agent` is the owner's
+    /// designated participating agent (the founding member at provisioning
+    /// — the provisioning commit is signed by that owner-certified agent).
+    /// `placements` is the ADR-0037 PLACEHOLDER — an absent member key
+    /// means `Pinned`; the real placement/move protocol lands with the
+    /// ADR-0037 wave.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home: Option<HomeMetadata>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -490,6 +530,7 @@ impl GroupInfo {
             banner_url: None,
             withdrawn: false,
             owner_cert_reverify_required: false,
+            home: None,
             issued_invite_secrets: HashSet::new(),
             issued_invites: HashMap::new(),
         };

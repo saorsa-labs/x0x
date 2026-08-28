@@ -33,6 +33,10 @@ pub(in crate::server) struct HealthData {
     uptime_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
+    /// Structured advisory warnings (never liveness-affecting). ADR-0038:
+    /// `home_no_roaming_agent` when the Home space has no Roaming agent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<serde_json::Value>,
 }
 
 /// Classify liveness for `GET /health` (issue #262).
@@ -119,6 +123,12 @@ pub(in crate::server) async fn health(
     let uptime_secs = state.start_time.elapsed().as_secs();
     let (status, degraded_reason) = classify_health(peers, send_ready_peers, uptime_secs);
 
+    // ADR-0038: surface the Home roaming-guarantee violation as a
+    // structured detail (advisory only — never flips `status`).
+    let mut warnings = Vec::new();
+    if let Some(warning) = super::home::home_roaming_warning(state.as_ref()).await {
+        warnings.push(warning);
+    }
     Json(ApiResponse {
         ok: true,
         data: HealthData {
@@ -128,6 +138,7 @@ pub(in crate::server) async fn health(
             send_ready_peers,
             uptime_secs,
             degraded_reason,
+            warnings,
         },
     })
 }

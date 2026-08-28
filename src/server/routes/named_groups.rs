@@ -357,16 +357,22 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 /// Request body for POST /groups.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateGroupRequest {
-    name: String,
+    pub(in crate::server) name: String,
     #[serde(default)]
-    description: String,
+    pub(in crate::server) description: String,
     /// Optional display name for the creator in this group.
     #[serde(default)]
-    display_name: Option<String>,
+    pub(in crate::server) display_name: Option<String>,
     /// Policy preset name (private_secure / public_request_secure / public_open /
     /// public_announce). Defaults to `private_secure`.
     #[serde(default)]
-    preset: Option<String>,
+    pub(in crate::server) preset: Option<String>,
+    /// ADR-0038: full explicit policy. When present it wins over `preset`
+    /// (passing both is a 400) — used by Home auto-provisioning to install
+    /// the OwnerCertified axis, whose owner id is install-specific and so
+    /// cannot be a named preset.
+    #[serde(default)]
+    pub(in crate::server) policy: Option<x0x::groups::GroupPolicy>,
 }
 
 /// Request body for POST /groups/join.
@@ -8419,14 +8425,21 @@ pub(in crate::server) async fn create_named_group(
     let agent_id = state.agent.agent_id();
 
     // Resolve policy preset (defaults to private_secure).
-    let policy = match req.preset.as_deref() {
-        Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
-            Some(preset) => preset.to_policy(),
-            None => {
-                return bad_request("unknown preset");
-            }
-        },
-        None => x0x::groups::GroupPolicy::default(),
+    let policy = if let Some(explicit) = req.policy {
+        if req.preset.is_some() {
+            return bad_request("pass either `preset` or `policy`, not both");
+        }
+        explicit
+    } else {
+        match req.preset.as_deref() {
+            Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
+                Some(preset) => preset.to_policy(),
+                None => {
+                    return bad_request("unknown preset");
+                }
+            },
+            None => x0x::groups::GroupPolicy::default(),
+        }
     };
 
     // Create the legacy demo MLS group object (kept for the `/mls/groups/:id`
@@ -8779,6 +8792,21 @@ pub(in crate::server) async fn get_named_group(
             "roster_revision": info.roster_revision,
             "member_count": members.len(),
             "members": members,
+            "home": info.home.as_ref().map(|home| serde_json::json!({
+                "primary_agent": home.primary_agent,
+                "provisioned_at_ms": home.provisioned_at_ms,
+                "placements": home.placements.iter().map(|(agent, placement)| {
+                    (agent.clone(), serde_json::json!(if *placement == x0x::groups::MemberPlacement::Roaming { "roaming" } else { "pinned" }))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+            })),
+            "warnings": if info.home.is_some() {
+                match super::home::home_roaming_warning(state.as_ref()).await {
+                    Some(warning) => vec![warning],
+                    None => Vec::new(),
+                }
+            } else {
+                Vec::new()
+            },
         })),
     )
 }
@@ -13344,8 +13372,8 @@ pub(in crate::server) async fn leave_group(
 
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct UpdateGroupRequest {
-    name: Option<String>,
-    description: Option<String>,
+    pub(in crate::server) name: Option<String>,
+    pub(in crate::server) description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30068,6 +30096,8 @@ pub(in crate::server) mod tests {
                 description: String::new(),
                 display_name: None,
                 preset: Some("private_secure".to_string()),
+
+                policy: None,
             }),
         )
         .await
