@@ -1,21 +1,29 @@
-# Agent Key-Move Protocol — Design Mechanics (r2)
+# Agent Key-Move Protocol — Design Mechanics (r3)
 
 Companion to [ADR 0043](../adr/0043-agent-key-move-protocol.md), which
 **amends [ADR 0037](../adr/0037-agent-placement-and-key-custody.md)**.
-This revision responds in full to the Codex REQUEST-CHANGES review of r1
-(`codex-review-wp4.md`); every blocking finding is addressed and every
-citation below was re-verified against `origin/main@ccb288e` in the
-worktree (r1's baseline read was accidentally taken from a stale checkout
-— that is how the shipped `X0A4` collision was missed; r2 reads happen in
-the worktree only).
+r3 responds to the round-2 Codex review (`codex-r2-wp4.md`); r2
+responded to the round-1 review (`codex-review-wp4.md`). Every citation
+was re-verified against `origin/main@ccb288e` in the worktree (r1's
+baseline read was accidentally taken from a stale checkout — that is how
+the shipped `X0A4` collision was missed; later rounds read the worktree
+only).
 
-Review findings → sections:
+Round-2 findings → sections:
+
+| Finding | Section |
+|---|---|
+| 1. Equal epochs disable placement enforcement (`>` should treat equality as the coherent activation case) | §9 (P rule), §12.8 |
+| 2. No atomic activation carrier; bundle lacked the certificate shipped authority verification requires | §3.1, §7.5 |
+| 3. Recovery contradictions: abort legality vs diagram; "exactly one signer" vs zero-signer rows | §3.1, §5.2 (Abort), §5.3 invariant, §12.11 |
+
+Round-1 findings → sections:
 
 | Finding | Section |
 |---|---|
 | 1. `X0A4` already shipped; cert-specific blob path; machine key belongs in machine announce | §2, §8.2 |
-| 2. Export-record cryptographic cycle | §4.1–§4.2 |
-| 3. No transition chain / crash ordering / atomic activation / pre-activation log access | §4, §5 |
+| 2. Export-record cryptographic cycle | §3.1, §4 |
+| 3. No transition chain / crash ordering / atomic activation / pre-activation log access | §3, §5 |
 | 4. Single-live-signer not enforced by shipped signing paths | §6 |
 | 5. Wrong stream-gate citation; missing direct-QUIC gate; no epoch in binding; `Roaming` naming; shipped-Home reality | §7, §8, §9 |
 | 6. Unknown variant poisons the whole v1 revocation batch | §7.4 |
@@ -114,13 +122,19 @@ enum MoveRecord {
     ExportReceipt   { auth_hash: [u8;32], envelope_digest: [u8;32], sealed_at },
     // target-machine-signed, owner-countersigned
     ImportReceipt   { auth_hash: [u8;32], imported_at },
-    // owner-signed ATOMIC bundle — activation is one record, not three
+    // owner-signed ATOMIC bundle — activation is one record, not three.
+    // The certificate is INSIDE the bundle: shipped authority verification
+    // rejects issuer-revocations without the subject cert (§7.2).
     ActivationBundle { auth_hash: [u8;32],
                        binding_revocation: RevocationRecord,   // §7
-                       placement_record: PlacementRecord },    // §8
+                       placement_record: PlacementRecord,      // §8
+                       agent_certificate: AgentCertificate },  // §7.2
     // source-machine-signed, owner-countersigned
     RetireReceipt   { auth_hash: [u8;32], retired_at },
-    // owner-signed; legal only while head ∈ {ExportReceipt, ImportReceipt}
+    // owner-signed; legal from ANY pre-activation head —
+    // MoveAuthorization | ExportReceipt | ImportReceipt — so an
+    // intent+quiesce followed by an unrecoverable seal failure still
+    // rolls back (r2 restricted this to post-receipt heads; fixed)
     AbortRecord     { auth_hash: [u8;32], reason },
 }
 struct ChainedRecord { prev: [u8; 32], record: MoveRecord,
@@ -158,9 +172,10 @@ shared its epoch — is deleted; ordering is the chain, epochs are just
 labels carried for the placement comparison (§9.2).
 
 `move_epoch` increments only on a new `MoveAuthorization`, whose `prev`
-must be the last terminal record (`ActivationBundle`-descended chain
-head); `AbortRecord` burns its epoch permanently (a burned epoch can never
-reappear because every future record must chain past the abort).
+must be the record that terminally ended the previous move
+(`ActivationBundle`/`RetireReceipt`, or `AbortRecord` after a rollback);
+a burned epoch can never reappear because every future record must chain
+past the record that ended it.
 
 ## 4. Export envelope
 
@@ -204,19 +219,24 @@ keypair + durable **quarantine** flag → fsync → countersign
 `ImportReceipt` (owner countersigns on receipt).
 
 **Owner, activate:** verify head is `ImportReceipt` → check Home/roaming
-invariant (§8.3) → build `ActivationBundle` (one record containing the
-binding revocation and placement record) → append to move log → fsync →
-gossip the single bundle record. Activation commits: the chain now makes
-rollback structurally impossible (an abort can no longer chain past
-`ActivationBundle`).
+invariant (§8.3) → build `ActivationBundle` (tombstone + successor
+placement + the agent certificate, §7.5) → append to move log → fsync →
+publish ONE message on the activation carrier (§7.5). Activation commits:
+the chain now makes rollback structurally impossible (an abort can no
+longer chain past `ActivationBundle`). The target's `AgentSigningGate`
+un-quarantines the agent **only** on local verification of this bundle —
+no component alone flips the gate.
 
 **Source, retire:** observe the bundle (gossip or operator-carried) →
 persist retire-pending → fsync → secure-delete key material → clear
 quiesce state, persist retired → fsync → countersign `RetireReceipt`.
 
-**Abort:** owner signs `AbortRecord` (chains from current head); source
-un-quiesces and deletes the envelope; target discards the quarantined
-key; epoch burned.
+**Abort:** owner signs `AbortRecord` chaining from the current
+pre-activation head — including straight from `MoveAuthorization`, which
+covers crash-after-quiesce-before-seal (r2's text contradicted the
+diagram here; the diagram was right); source un-quiesces and deletes the
+envelope; target (if it imported) discards the quarantined key; epoch
+burned either way.
 
 ### 5.3 Crash matrix
 
@@ -233,20 +253,24 @@ key; epoch burned.
 | retire-pending, before delete | re-run deletion (idempotent) | target only |
 | delete, before receipt | re-emit receipt from retired marker | target only |
 
-At every row exactly one signer is live (the source before export
-completion is the only live signer and no transferable envelope exists
-yet); the key never exists solely on a machine that acknowledged
-deletion — the operator-held envelope persists until `RetireReceipt`.
+The invariant is **at most one** live signer at every instant — zero is
+the transfer norm (r2 prose claimed "exactly one", contradicting the
+zero-signer rows above); after a completed move **or** an abort exactly
+one signer is restored. The key never exists solely on a machine that
+acknowledged deletion — the operator-held envelope persists until
+`RetireReceipt`.
 
 ### 5.4 Who stores what; re-entry without mesh access
 
 - **Owner machine**: the move log (append-only `moves.bin`, atomic-write
   pattern of `revocations.bin`, `src/storage.rs:693`) + placement ledger.
   Pre-activation records are **not** mesh-replicated — the operator CLI
-  carries the bundle between machines (r1 implied daemons could read the
-  owner's log remotely; withdrawn). Post-activation, the
-  `ActivationBundle` and its embedded revocation/placement records are
-  gossiped on the v2 carriers (§7.4, §8.2).
+  carries them between machines (r1 implied daemons could read the
+  owner's log remotely; withdrawn). Activation is mesh-replicated as the
+  single bundle message on the activation carrier (§7.5); afterwards the
+  embedded tombstone and placement record are also re-published on their
+  steady-state carriers (§7.4, §8.2) for late joiners — republication,
+  not the activation mechanism.
 - **Source/target**: durable per-move markers (intent, quiesce,
   quarantine, retire-pending/retired) — startup re-entry per §5.3.
 - Every command takes `(agent_id, move_epoch)` and is idempotent against
@@ -300,9 +324,12 @@ and is carried **in the signed bytes**, not inferred.
 
 `verify_authority` (`src/revocation.rs:164-211`) extended: for a binding
 subject, the issuer must be the user key that signed the subject agent's
-`AgentCertificate` (cert from the discovery cache or the bundle —
-`verify_and_insert` already threads `subject_cert`, `:359-376`;
-`DiscoveredAgent.agent_certificate` exists for exactly this,
+`AgentCertificate` — the certificate travels INSIDE the
+`ActivationBundle` (§3.1), because shipped authority verification
+**rejects issuer-revocations that present no subject cert**
+(`verify_and_insert` threads `subject_cert`, `src/revocation.rs:359-376`;
+the gossip arm resolves it the same way, `src/lib.rs:7698-7705`); the
+discovery cache is the fallback source (`DiscoveredAgent.agent_certificate`,
 `src/lib.rs:1646`). Self-revocation cannot apply: the issuer key hashes
 to one 32-byte id; the subject contains two ids plus an epoch — equality
 is structurally unreachable. Neither the moving agent key nor either
@@ -345,6 +372,39 @@ upgraded publisher. Fix:
   `max_revoked_binding_epoch(&AgentId) -> Option<u64>` beside
   `is_agent_revoked`/`is_machine_revoked` (`src/revocation.rs:318`,
   `:324`), backed by a `HashMap<AgentId, u64>` index updated on insert.
+
+
+### 7.5 Activation carrier — the atomic artifact (round-2 finding 2)
+
+Activation is carried by ONE message, not by its components:
+
+- **Topic** `x0x.move.activation.v1`. **Payload:** exactly one
+  `ChainedRecord { prev, ActivationBundle {auth_hash,
+  binding_revocation, placement_record, agent_certificate} }` — the
+  r2 draft claimed atomicity but then shipped the tombstone on
+  revocation-v2 and the placement record through blob-v2 as separate
+  objects; those carriers re-publish for late joiners (§5.4) and never
+  carry activation itself.
+- **Who verifies what, where.** Every 0043 peer subscribed to the topic
+  runs one handler: (1) verify the owner signature over the whole
+  chained record; (2) verify the embedded tombstone's authority with the
+  embedded certificate (`verify_authority(Some(&cert))`, §7.2); (3)
+  verify the embedded placement record's owner signature and that its
+  issuer equals the certificate's issuer; (4) chain CAS — `prev` must
+  equal the local head for that agent. The **target** additionally uses
+  the same verified bundle as the only key that flips its
+  `AgentSigningGate` out of quarantine (delivered by gossip or operator
+  import — identical bytes, identical verification).
+- **Why partial application is impossible.** All verification precedes
+  any mutation, and the three mutations are each idempotent in a fixed
+  fail-closed order: tombstone insert (record-hash dedup,
+  `src/revocation.rs:425-441`) → placement cache insert (digest-keyed) →
+  head advance (CAS). A crash mid-apply leaves a prefix in which the
+  tombstone — the only security-relevant component — is already present;
+  a missing placement merely fails open for the target until gossip
+  at-least-once re-delivery re-runs the handler to convergence. No
+  ordering of crashes can produce "placement applied, tombstone missing",
+  because the tombstone is applied first.
 
 ## 8. Placement ledger (finding 5)
 
@@ -404,24 +464,43 @@ Two checks, evaluated wherever `(agent, machine)` is known:
 
 - **B** — `is_binding_revoked(agent, machine)`;
 - **P** — if a placement record is cached for the agent and
-  `record.placement_epoch > max_revoked_binding_epoch(agent)` (when any)
-  and placement is `Pinned(X)` with `X ≠ machine` → deny. Stale or absent
-  record → allow (fail-open, §9.3).
+  `record.placement_epoch >= max_revoked_binding_epoch(agent)`
+  (vacuously true when no tombstone exists) and placement is `Pinned(X)`
+  with `X ≠ machine` → deny. **Equality is the coherent activation
+  case** (round-2 finding 1): the tombstone and the successor placement
+  record carry the SAME move epoch because one `ActivationBundle` mints
+  both (§7.5); the r2 `>` rule made `n > n` false and silently disabled
+  enforcement of the record a move had just produced. Only strictly
+  older records (`placement_epoch < max_revoked_binding_epoch`) are
+  ignored as stale; an absent record allows (fail-open, §9.3). A forged
+  equal-epoch record with a different pin fails the owner signature, so
+  equality cannot be exploited.
 
 | Gate (shipped) | Where | Check |
 |---|---|---|
-| Outbound streams | `Agent::gate_peer_outbound` `src/lib.rs:10497` | B, P for `(agent, resolved machine)` |
+| Outbound streams | `Agent::gate_peer_outbound` `src/lib.rs:10497` | B, P for `(agent, resolved machine)` — per pairing, including a stale cached source pairing during the transition window (below) |
 | Inbound streams + datagram lanes | `Agent::gate_peer_machine_inbound` `src/lib.rs:10557` (per resolved agent, fail-closed multi-agent) | B, P per `(agent, machine)` |
 | Gossip DMs | attestation resolve `src/dm_inbox.rs:1231` then revoked-sender drop `:1302`/`:2171` | B, P on `(sender, attested machine)` |
 | Direct-QUIC DMs | `src/lib.rs:10313-10327` (`direct::inbound_peer_revoked`) | B, P |
-| Forward mid-flight | `src/forward.rs:757-760` | B for `(agents, machine)` |
-| Announce ingest/eviction | `src/lib.rs:7952`, `:7960` | drop announces whose binding is revoked (source heartbeats vanish fleet-wide); stale P beats evicted on newer placement epoch |
+| Forward mid-flight | `src/forward.rs:757-760` | B, P for **every** `(agent, machine)` pairing the lane resolves — during the transition window the agent is discoverable on BOTH machines, so the check must run per pairing, never per agent |
+| Announce ingest/eviction | `src/lib.rs:7952`, `:7960` | drop announces whose binding is revoked (source heartbeats vanish fleet-wide); **and** a cached placement record satisfying the P epoch rule with `Pinned(X)`, `X ≠ announce.machine_id` ⇒ drop — an announce placing a pinned agent on a non-pinned machine is rejected at ingest, not only at the live gates; stale P beats evicted on newer placement epoch |
 | Pubsub delivery sender-gate | `src/gossip/pubsub.rs:1397` | B impossible — no machine context on that path; enforced one layer up (DM/stream). Documented, not silent. |
 
-Announce **verification** stays stateless (self-certification only,
-`src/announce_v3.rs:180` region) per gapcheck #13: a blob miss must never
-be an admission oracle — the cache-merge/eviction step above is the
-enforcement point for discovery.
+**Transition window** (`ActivationBundle` observed … `RetireReceipt`):
+discovery can hold the agent on **both** machines — the target announces,
+the source entry lingers until eviction. Every gate above evaluates B/P
+per `(agent, machine)` pairing: source pairings fail B (tombstone),
+target pairings pass B and P (equal epoch, §P rule). Outbound opens
+toward a stale cached source address die at `gate_peer_outbound`; the
+forward re-check must iterate both machines' pairings (round-2 finding
+2's forward note).
+
+Announce **signature verification** stays stateless (self-certification
+only, `src/announce_v3.rs:180` region). The **ingest/cache-merge step**
+additionally applies B and P from already-local state (tombstone set +
+placement cache); the check triggers no fetch, so gapcheck #13's
+blob-miss-as-admission-oracle concern does not apply — absent evidence
+fails open, present evidence fails closed.
 
 ### 9.3 Old peers
 
@@ -444,6 +523,8 @@ closes by fleet upgrade, same as V2∥V3∥X0A4.
   bindings on v2 topic + `X0R2` store; `RevocationRecord` struct gains a
   variant — v1 wire never carries it.
 - Blob protocol: v1 cert path untouched; v2 is kind-tagged and separate.
+- Activation: new topic `x0x.move.activation.v1` carrying exactly one
+  chained bundle per activation (§7.5); no existing topic changes.
 - On-disk: no existing format changes; new files: machine KEM key,
   `moves.bin`, placement ledger, `placement-blobs.bin`, `revocations-v2.bin`.
 
@@ -483,20 +564,34 @@ deny-by-default scope.
    wrong-owner, wrong-agent, digest-mismatch; v1 cert path byte-identical.
 7. Signing gate: quiesced and quarantined agents refused on `/agent/sign`,
    DM sign, forward sign; public-key reads unaffected.
-8. Placement: epoch comparisons (`>` max revoked binding epoch); mint
-   always yields ≥1 Roaming; all-Pinned mint rejected.
+8. Placement: epoch comparisons — **equal** epoch enforces (the
+   activation successor record is coherent with its own tombstone),
+   strictly-older record ignored, absent record fails open; forged
+   equal-epoch pin fails the owner signature; mint always yields
+   ≥1 Roaming; all-Pinned mint rejected.
+9. Activation carrier (§7.5): tampered inner tombstone fails the bundle;
+   bundle without the certificate fails authority (shipped rule,
+   `src/revocation.rs:359-376`); crash between the three idempotent
+   mutations converges on re-delivery with the tombstone-first ordering
+   preserved; no component alone flips the target signing gate.
+10. Announce ingest: a pinned-agent announce from a non-pinned machine is
+    dropped when a qualifying placement record is cached; passes when no
+    record is cached (fail-open).
 
 **Integration / E2E**
 
-9. Full move with crash injection at every row of §5.3: re-entry
-   converges; exactly one live signer at every sampled instant (gate
-   counters prove refusals).
-10. Post-Activate: source traffic (fresh, VALID attestations) drops at
-    all six enforcing gates on upgraded peers; co-resident source agents
+11. Full move with crash injection at every row of §5.3: re-entry
+    converges; **at most** one live signer at every sampled instant and
+    exactly one after completion or abort (gate counters prove refusals).
+12. Post-Activate: source traffic (fresh, VALID attestations) drops at
+    all enforcing gates on upgraded peers; co-resident source agents
     unaffected; v1-only peer still enforces a legacy machine revocation.
-11. Stolen-copy: offline-signed DM from source machine fails B at
+13. Transition window: with the agent discoverable on BOTH machines, a
+    forward lane and an outbound open toward each pairing resolve
+    correctly (source pairing denied by B, target pairing accepted).
+14. Stolen-copy: offline-signed DM from source machine fails B at
     upgraded receivers; offline signature with no machine context still
     verifies (documented residual — assert it stays out of
     machine-context paths).
-12. Home: mint produces ≥1 Roaming; activate refuses stranding; move of a
+15. Home: mint produces ≥1 Roaming; activate refuses stranding; move of a
     roamer to another machine keeps it Roaming.
