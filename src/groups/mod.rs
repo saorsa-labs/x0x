@@ -775,9 +775,25 @@ impl GroupInfo {
                 {
                     return None;
                 }
-                if m.certificate
-                    .as_ref()
-                    .is_some_and(|cert| check(cert).is_ok())
+                // Digest-gated embedded fallback (round-3): the committed
+                // cert seats the member ONLY when the agent's latest
+                // announce does not contradict it. A known announce digest
+                // different from the embedded cert's digest means the owner
+                // re-keyed/re-issued — the embedded cert is STALE and must
+                // not seat.
+                let embedded_is_stale = m.certificate.as_ref().is_some_and(|cert| {
+                    evidence.digest_for(agent_hex).is_some_and(|announced| {
+                        announced
+                            != crate::announce_v3::cert_digest(
+                                &cert.user_id().ok(),
+                                &Some(cert.clone()),
+                            )
+                    })
+                });
+                if !embedded_is_stale
+                    && m.certificate
+                        .as_ref()
+                        .is_some_and(|cert| check(cert).is_ok())
                 {
                     return None;
                 }
@@ -842,14 +858,43 @@ impl GroupInfo {
                 failures.push((agent_hex, owner_cert::OwnerCertFailure::Revoked));
                 continue;
             }
+            // Digest-gated embedded fallback (round-3): a known announce
+            // digest that differs from the embedded cert's digest makes the
+            // embedded cert STALE — it must not seat the member while the
+            // replacement blob is in flight.
+            let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
+                evidence.digest_for(&agent_hex).is_some_and(|announced| {
+                    announced
+                        != crate::announce_v3::cert_digest(
+                            &cert.user_id().ok(),
+                            &Some(cert.clone()),
+                        )
+                })
+            });
             if resolved.is_some_and(|cert| check(cert).is_ok())
-                || embedded.as_ref().is_some_and(|cert| check(cert).is_ok())
+                || (!embedded_is_stale && embedded.as_ref().is_some_and(|cert| check(cert).is_ok()))
             {
                 clear_ts(&mut self.members_v2);
                 continue;
             }
+            // Evidence in flight (round-3): a warranted fetch outstanding
+            // (announce committed to a digest whose cert has not resolved)
+            // means the member is mid-rotation — INCLUDING the case where
+            // the stale/expired embedded cert just failed. Grace applies;
+            // the replacement cert lands or the window expires.
+            if evidence.fetch_in_flight(&agent_hex) {
+                Self::apply_missing_evidence_grace(
+                    &mut self.members_v2,
+                    &agent_hex,
+                    now_ms,
+                    grace_ms,
+                    &mut failures,
+                );
+                continue;
+            }
             // A present-but-failing certificate is a definitive failure:
-            // no grace. Only total evidence absence is fetch lag.
+            // no grace. Only evidence absence (or in-flight rotation) is
+            // fetch lag.
             if resolved.is_some() || embedded.is_some() {
                 clear_ts(&mut self.members_v2);
                 let failure = resolved
@@ -860,25 +905,47 @@ impl GroupInfo {
                 continue;
             }
             // NoCertificate: grace window bookkeeping.
-            let since = self
-                .members_v2
-                .get(&agent_hex)
-                .and_then(|m| m.certificate_missing_since_ms);
-            match since {
-                Some(ts) if now_ms.saturating_sub(ts) < grace_ms => {
-                    // Still inside the retry window — not evictable yet.
-                }
-                Some(_) => {
-                    failures.push((agent_hex, owner_cert::OwnerCertFailure::NoCertificate));
-                }
-                None => {
-                    if let Some(m) = self.members_v2.get_mut(&agent_hex) {
-                        m.certificate_missing_since_ms = Some(now_ms);
-                    }
+            Self::apply_missing_evidence_grace(
+                &mut self.members_v2,
+                &agent_hex,
+                now_ms,
+                grace_ms,
+                &mut failures,
+            );
+        }
+        failures
+    }
+
+    /// Grace-window bookkeeping shared by every missing-evidence path:
+    /// first observation stamps `certificate_missing_since_ms` (member
+    /// stays seated), inside the window nothing happens, past the window
+    /// the member becomes evictable as `NoCertificate`.
+    fn apply_missing_evidence_grace(
+        members_v2: &mut BTreeMap<String, GroupMember>,
+        agent_hex: &str,
+        now_ms: u64,
+        grace_ms: u64,
+        failures: &mut Vec<(String, owner_cert::OwnerCertFailure)>,
+    ) {
+        let since = members_v2
+            .get(agent_hex)
+            .and_then(|m| m.certificate_missing_since_ms);
+        match since {
+            Some(ts) if now_ms.saturating_sub(ts) < grace_ms => {
+                // Still inside the retry window — not evictable yet.
+            }
+            Some(_) => {
+                failures.push((
+                    agent_hex.to_string(),
+                    owner_cert::OwnerCertFailure::NoCertificate,
+                ));
+            }
+            None => {
+                if let Some(m) = members_v2.get_mut(agent_hex) {
+                    m.certificate_missing_since_ms = Some(now_ms);
                 }
             }
         }
-        failures
     }
 
     /// ADR-0038: roster-remove (evict) exactly the members returned by
@@ -891,7 +958,12 @@ impl GroupInfo {
         authority_hex: &str,
         evidence: &owner_cert::OwnerCertEvidence,
     ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
-        let failures = self.owner_cert_admission_failures(evidence);
+        // Round-3 single-authority rule: enforcement consumes the
+        // GRACE-AWARE evaluation — the same verdict the ordinary-seal
+        // wrapper and the eviction engine preflight on. Re-deriving with
+        // the strict peek here silently pruned members that were inside
+        // their grace window.
+        let failures = self.owner_cert_admission_failures_mut(evidence);
         for (agent_hex, failure) in &failures {
             tracing::warn!(
                 group_id = %self.stable_group_id(),

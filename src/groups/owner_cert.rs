@@ -62,8 +62,17 @@ pub const OWNER_CERT_MISSING_EVIDENCE_GRACE_SECS: u64 = 300;
 #[derive(Debug, Clone, Default)]
 pub struct OwnerCertEvidence {
     /// Verified certificates by agent id (hex), resolved via the V3 announce
-    /// blob path or held locally by this daemon's own identity.
+    /// blob path or held locally by this daemon's own identity. A member
+    /// whose latest announce committed to a digest that has NOT resolved
+    /// yet is ABSENT here (fetch in flight) — see `digests`.
     certs: HashMap<String, AgentCertificate>,
+    /// The cert digest each agent's LATEST announcement committed to (hex
+    /// keyed). Round-3: this is what couples evidence freshness to the
+    /// announce stream — a digest present without a matching `certs` entry
+    /// means a warranted fetch is outstanding; a digest that differs from
+    /// the roster-embedded cert's digest means the embedded cert is STALE
+    /// and must not seat the member.
+    digests: HashMap<String, [u8; 32]>,
     /// Agent ids (hex) present in the local ADR-0018 revocation set.
     revoked: HashSet<String>,
     /// Wall-clock unix seconds used for expiry checks.
@@ -76,14 +85,27 @@ impl OwnerCertEvidence {
     pub fn new(now_unix: u64) -> Self {
         Self {
             certs: HashMap::new(),
+            digests: HashMap::new(),
             revoked: HashSet::new(),
             now_unix,
         }
     }
 
-    /// Record a (verified) certificate for `agent_hex`.
+    /// Record a (verified) certificate for `agent_hex`, with the announce
+    /// digest it was resolved under (when known).
     pub fn insert_cert(&mut self, agent_hex: impl Into<String>, cert: AgentCertificate) {
-        self.certs.insert(agent_hex.into(), cert);
+        let agent_hex = agent_hex.into();
+        let digest = crate::announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+        self.digests.insert(agent_hex.clone(), digest);
+        self.certs.insert(agent_hex, cert);
+    }
+
+    /// Record the digest an agent's LATEST announcement committed to, when
+    /// the certificate itself has not resolved yet (warranted fetch in
+    /// flight). Absent cert + present digest = evidence in flight.
+    pub fn observe_pending_digest(&mut self, agent_hex: impl Into<String>, digest: [u8; 32]) {
+        let agent_hex = agent_hex.into();
+        self.digests.insert(agent_hex, digest);
     }
 
     /// Record that `agent_hex` is in the local revocation set.
@@ -91,10 +113,24 @@ impl OwnerCertEvidence {
         self.revoked.insert(agent_hex.into());
     }
 
-    /// The certificate resolved for `agent_hex`, if any.
+    /// The digest-coupled certificate resolved for `agent_hex`, if any.
+    /// Returns `None` while a warranted fetch is outstanding.
     #[must_use]
     pub fn cert_for(&self, agent_hex: &str) -> Option<&AgentCertificate> {
         self.certs.get(agent_hex)
+    }
+
+    /// The digest the agent's latest announce committed to, when observed.
+    #[must_use]
+    pub fn digest_for(&self, agent_hex: &str) -> Option<[u8; 32]> {
+        self.digests.get(agent_hex).copied()
+    }
+
+    /// Whether a warranted fetch is outstanding for `agent_hex` (announce
+    /// committed to a digest whose certificate has not resolved here).
+    #[must_use]
+    pub fn fetch_in_flight(&self, agent_hex: &str) -> bool {
+        self.digest_for(agent_hex).is_some() && self.cert_for(agent_hex).is_none()
     }
 
     /// Whether `agent_hex` is locally known to be revoked (ADR-0018).

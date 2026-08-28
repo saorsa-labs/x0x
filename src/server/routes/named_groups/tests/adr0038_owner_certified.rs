@@ -447,28 +447,48 @@ fn blind_seal_of_owner_certified_group_is_refused() {
         "wrong error: {err}"
     );
 
-    // Empty evidence prunes the uncertified sole admin, and the
-    // last-admin invariant then vetoes the commit — the documented
-    // fail-closed "Home locks itself out" consequence (ADR-0038).
-    let err = info
+    // Empty evidence is now MISSING evidence under the round-3
+    // single-authority rule: the grace-aware enforcement stamps the sole
+    // admin's retry timestamp and the seal SUCCEEDS with the member
+    // retained (fetch-lag, not a fact about the certificate). A
+    // DEFINITIVE failure is what must trip the last-admin veto.
+    let (commit, evicted) = info
         .seal_commit_with_owner_certs(&creator, 1_000, &OwnerCertEvidence::new(1_000))
-        .expect_err("empty evidence must fail closed");
+        .expect("empty evidence seals under grace");
+    assert!(
+        evicted.is_empty(),
+        "grace retains the uncertified sole admin"
+    );
+    assert_eq!(commit.revision, 1);
+
+    // Definitive failure: the sole admin carries a certificate chained to
+    // a DIFFERENT owner — pruned, and the last-admin invariant vetoes the
+    // commit (fail-closed "Home locks itself out", ADR-0038).
+    let foreign = UserKeypair::generate().expect("foreign owner");
+    info.set_member_certificate(
+        &hex::encode(creator.agent_id().as_bytes()),
+        x0x::identity::AgentCertificate::issue(&foreign, &creator).expect("foreign cert"),
+    );
+    let err = info
+        .seal_commit_with_owner_certs(&creator, 2_000, &OwnerCertEvidence::new(2_000))
+        .expect_err("definitive failure must fail closed");
     assert!(
         err.to_string().contains("zero active admins"),
         "expected last-admin veto, got: {err}"
     );
 
-    // With the creator's own owner-signed cert in evidence the same
-    // seal succeeds and evicts nobody.
+    // With the creator's own owner-signed cert in LIVE evidence the seal
+    // succeeds (live evidence outranks the stale/foreign embedded one) and
+    // evicts nobody.
     let cert = x0x::identity::AgentCertificate::issue(&owner, &creator).expect("cert");
     let creator_hex = hex::encode(creator.agent_id().as_bytes());
-    let mut evidence = OwnerCertEvidence::new(1_000);
+    let mut evidence = OwnerCertEvidence::new(3_000);
     evidence.insert_cert(creator_hex, cert);
     let (commit, evicted) = info
-        .seal_commit_with_owner_certs(&creator, 1_000, &evidence)
+        .seal_commit_with_owner_certs(&creator, 3_000, &evidence)
         .expect("seal with evidence");
     assert!(evicted.is_empty(), "certified creator must not be evicted");
-    assert_eq!(commit.revision, 1);
+    assert_eq!(commit.revision, 2);
 }
 
 // ── Review-fix tests (Codex adversarial review, REQUEST-CHANGES) ──────
@@ -985,5 +1005,167 @@ async fn reseal_refuses_while_restore_quarantined() -> Result<()> {
         "reseal must obey the restore quarantine: {}",
         json.0
     );
+    Ok(())
+}
+
+/// Seed the discovery cache with a PENDING warranted fetch: the agent's
+/// latest announce committed to `digest` but the cert has not resolved
+/// locally (round-3 freshness coupling).
+async fn announce_pending_digest(state: &AppState, agent_hex: &str, digest: [u8; 32]) {
+    let agent_id = parse_agent_id_hex(agent_hex).expect("agent hex");
+    let cache = state.agent.identity_discovery_cache();
+    cache.write().await.insert(
+        agent_id,
+        x0x::DiscoveredAgent {
+            agent_id,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: None,
+            addresses: Vec::new(),
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            cert_not_after: None,
+            agent_certificate: None,
+            agent_public_key: Vec::new(),
+            cert_digest: Some(digest),
+        },
+    );
+}
+
+#[tokio::test]
+async fn ordinary_mutation_retains_member_inside_grace_window() -> Result<()> {
+    // WHY (round-3 regression): ordinary mutations preflight with the
+    // grace-aware evaluation but then sealed through
+    // `seal_commit_with_owner_certs`, whose enforcement re-derived the
+    // verdict STRICTLY (no grace) and silently pruned the in-grace
+    // member on an unrelated change. The single-authority rule makes
+    // the grace-aware evaluation the only verdict: this member (no
+    // evidence yet, inside the window) must survive an unrelated
+    // metadata seal.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7f".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let member_hex = "9d".repeat(32);
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.get_mut(&group_id).expect("group").add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+    }
+    // Stamp the member INTO the grace window (as a first seal would).
+    {
+        let mut groups = state.named_groups.write().await;
+        groups
+            .get_mut(&group_id)
+            .expect("group")
+            .members_v2
+            .get_mut(&member_hex)
+            .expect("member")
+            .certificate_missing_since_ms = Some(now_millis_u64());
+    }
+    // Unrelated metadata mutation through the ORDINARY seal path.
+    let req: UpdateGroupPolicyRequest =
+        serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
+    let response =
+        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "ordinary mutation must seal while a member is merely inside its grace window: {body}"
+    );
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert!(
+        live.has_active_member(&member_hex),
+        "an in-grace member must NEVER be pruned by an ordinary mutation"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Result<()> {
+    // WHY (round-3 leak): the ladder used to fall back to the
+    // roster-embedded cert whenever live evidence was missing — so a
+    // newer announced digest (owner re-keyed) never actually gated
+    // membership, and an expired embedded cert mid-rotation hard-failed
+    // without grace. Now: a known announce digest different from the
+    // embedded cert's digest makes the embedded cert STALE (no seating);
+    // the pending fetch puts the member in the grace window; once the
+    // replacement cert resolves the member is seated again.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "80".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let member = AgentKeypair::generate()?;
+    let member_hex = hex::encode(member.agent_id().as_bytes());
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member(
+            member_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        live.set_member_certificate(&member_hex, cert.clone());
+    }
+    // The owner re-keys: the member's next announce commits to a NEW
+    // digest; the replacement cert has not resolved here yet.
+    announce_pending_digest(state.as_ref(), &member_hex, [0xEE; 32]).await;
+
+    // Seal: the (still-valid) embedded cert is STALE — the member is
+    // not seated by it, but the pending fetch holds the seat via grace.
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "in-flight rotation seal: {body}");
+    assert_eq!(
+        body["evicted"],
+        serde_json::json!([]),
+        "a member whose replacement cert is in flight must not be evicted: {body}"
+    );
+    {
+        let groups = state.named_groups.read().await;
+        assert!(groups
+            .get(&group_id)
+            .expect("group")
+            .has_active_member(&member_hex));
+    }
+
+    // The replacement resolves: the member is seated by LIVE evidence
+    // again (and the stale embedded cert no longer matters).
+    let renewed = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
+    announce_cert_for(state.as_ref(), renewed).await;
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "post-rotation seal: {body}");
+    assert_eq!(body["evicted"], serde_json::json!([]), "seated: {body}");
     Ok(())
 }

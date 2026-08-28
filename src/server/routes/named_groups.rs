@@ -13371,20 +13371,34 @@ async fn owner_cert_evidence_for(
         }
     }
 
-    // Discovery cache: peers' verified announce-blob certificates. One
-    // keyed pass; entries without a certificate contribute nothing (the
-    // announce blob may not have been fetched yet — NoCertificate below is
-    // the transient, retryable denial, see the module docs in owner_cert).
+    // Discovery cache: peers' verified announce-blob certificates, coupled
+    // to the digest each agent's LATEST announce committed to (round-3).
+    // One keyed pass. An entry whose cert is absent but whose digest is
+    // known records a PENDING warranted fetch — the grace-aware ladder
+    // reads that as evidence-in-flight rather than "never certified".
     {
         let cache = state.agent.identity_discovery_cache();
         let cache = cache.read().await;
         for entry in cache.values() {
-            let Some(cert) = entry.agent_certificate.as_ref() else {
-                continue;
-            };
             let entry_hex = hex::encode(entry.agent_id.as_bytes());
-            if wanted.contains(&entry_hex) {
-                evidence.insert_cert(entry_hex, cert.clone());
+            if !wanted.contains(&entry_hex) {
+                continue;
+            }
+            match entry.agent_certificate.as_ref() {
+                Some(cert) => {
+                    evidence.insert_cert(entry_hex.clone(), cert.clone());
+                    // Keep the EXACT announced digest when the entry knows
+                    // it (it equals the cert's digest after a resolved
+                    // fetch; upsert maintains that coupling).
+                    if let Some(digest) = entry.cert_digest {
+                        evidence.observe_pending_digest(entry_hex, digest);
+                    }
+                }
+                None => {
+                    if let Some(digest) = entry.cert_digest {
+                        evidence.observe_pending_digest(entry_hex, digest);
+                    }
+                }
             }
         }
     }
