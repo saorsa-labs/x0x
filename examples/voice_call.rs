@@ -9,13 +9,15 @@
 //! and jitter counters printed at the end.
 //!
 //! Lane mode: **Reliable** (a single ordered ADR-0022 byte stream per
-//! lane). The saorsa-webrtc `AudioLaneMode::Datagram` path exists in
-//! `saorsa-webrtc-core 0.5.0` over raw ant-quic connections, but the x0x
-//! adapter seam (`X0xLinkTransport` over `PeerStream`) does not expose an
-//! unreliable lane yet — that is V1.2/V1.3 follow-up work, noted in
-//! `docs/design/` upstream. The datagram *wire format* and the jitter
-//! buffer run end-to-end here regardless, so the playout path is the real
-//! one.
+//! lane) — the default. The ADR-0042 (c) datagram lane is available via
+//! `X0xLinkTransport::with_audio_lane_mode(AudioLaneMode::Datagram)`:
+//! audio then rides unreliable QUIC datagrams on the peer connection
+//! once both ends exchange the capability advert, falling back to this
+//! reliable lane otherwise. This demo keeps the reliable lane; the
+//! datagram path (including injected loss/reorder) is proven in
+//! `tests/voice_datagram_e2e.rs`. The datagram *wire format*
+//! (`AudioDatagram`) and the jitter buffer run end-to-end here
+//! regardless, so the playout path is the real one.
 //!
 //! Run:
 //! ```text

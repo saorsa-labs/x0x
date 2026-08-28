@@ -22,7 +22,7 @@ use saorsa_webrtc_core::link_transport::{LinkTransport, StreamType};
 use saorsa_webrtc_core::signaling::{SignalingMessage, SignalingTransport};
 use tempfile::TempDir;
 use x0x::network::NetworkConfig;
-use x0x::voice::{X0xLinkTransport, X0xSignaling};
+use x0x::voice::{AudioLaneMode, X0xLinkTransport, X0xSignaling};
 use x0x::DiscoveredAgent;
 
 fn loopback_network_config() -> NetworkConfig {
@@ -304,10 +304,180 @@ async fn connect_acl_denies_unlisted_voice_peer() {
     let _ = alice_link.send(&peer, StreamType::Audio, &[0u8; 200]).await;
 
     let nothing = tokio::time::timeout(Duration::from_secs(5), bob_link.receive()).await;
+
     assert!(
         nothing.is_err(),
         "bob must not receive frames from an ACL-unlisted peer: {nothing:?}"
     );
+
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// ADR-0042 (c) fallback: alice pins `Datagram`, bob stays on the
+/// default `Reliable` (the old-peer stand-in — he never advertises).
+/// Alice's audio must ride the reliable stream lane anyway:
+/// byte-identical ordered frames, and the datagram frame counter stays
+/// zero (proving the fallback actually engaged, not that datagrams
+/// silently worked).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback fallback proof; binds UDP + waits on convergence. Integration tier."]
+async fn datagram_mode_falls_back_to_reliable_lane_without_peer_advert() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    let mut alice_link = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id())
+        .with_audio_lane_mode(AudioLaneMode::Datagram);
+    let mut bob_link = X0xLinkTransport::new(Arc::clone(&bob), alice.agent_id());
+    assert_eq!(
+        bob_link.audio_lane_mode(),
+        AudioLaneMode::Reliable,
+        "default mode must stay Reliable (V1.2 wire behavior preserved)"
+    );
+    bob_link.start().await.expect("bob link starts");
+    alice_link.start().await.expect("alice link starts");
+
+    let frames: Vec<Vec<u8>> = (0u8..50)
+        .map(|i| {
+            let mut f = vec![i; 200]; // opus-frame-sized
+            f[0] = i; // sequence marker
+            f
+        })
+        .collect();
+    let peer = alice_link.default_peer().expect("default peer");
+    for frame in &frames {
+        alice_link
+            .send(&peer, StreamType::Audio, frame)
+            .await
+            .expect("send audio frame");
+    }
+    // Give a (never-arriving) advert ample time to land before the
+    // fallback assertions — the counter must be zero by conviction, not
+    // by race.
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let mut received = Vec::with_capacity(frames.len());
+    // Generous deadline: this suite runs UDP-binding integration tests in
+    // parallel; under load the loopback convergence eats into a tight one.
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while received.len() < frames.len() && Instant::now() < deadline {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match tokio::time::timeout(remaining, bob_link.receive()).await {
+            Ok(Ok((_, ty, data))) => {
+                assert_eq!(ty, StreamType::Audio);
+                received.push(data);
+            }
+            Ok(Err(e)) => panic!("bob receive failed: {e}"),
+            Err(_) => break,
+        }
+    }
+    // Reliable-lane semantics held: byte-identical AND ordered.
+    assert_eq!(
+        received.len(),
+        frames.len(),
+        "all frames delivered via fallback"
+    );
+    assert_eq!(received, frames, "byte-identical, in order (reliable lane)");
+    // Fallback proof: no audio datagram was ever sent, and alice never
+    // saw bob advertise.
+    assert_eq!(
+        alice_link.datagram_frames_sent(),
+        0,
+        "datagram-pinned sender must not send datagrams to a silent peer"
+    );
+    assert!(
+        !alice_link.peer_datagram_capable(),
+        "old-peer (non-advertising) peer must never mark the lane capable"
+    );
+
+    alice_link.stop().await.expect("alice stop");
+    bob_link.stop().await.expect("bob stop");
+    alice.shutdown().await;
+    bob.shutdown().await;
+}
+
+/// The datagram lane gets no connect-ACL bypass: with an Enabled policy
+/// that does not list alice, bob's `open_peer_datagram_lane` must fail
+/// at the inbound ACL gate — the lane surface must never appear for a
+/// peer whose inbound stream the accept loop would reset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback datagram-lane ACL denial; binds UDP. Integration tier."]
+async fn connect_acl_denies_unlisted_datagram_lane() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    // Bob enables a policy listing a random pair that is NOT
+    // (alice, alice-machine) — alice becomes an unlisted peer inbound.
+    let stranger_agent = x0x::identity::AgentId([0x55; 32]);
+    let stranger_machine = x0x::identity::MachineId([0x66; 32]);
+    bob.set_connect_policy(Arc::new(x0x::connect::ConnectPolicy::Enabled(
+        x0x::connect::ConnectAcl {
+            loaded_from: std::path::Path::new("/test").to_path_buf(),
+            loaded_at_unix_ms: 0,
+            allow: vec![x0x::connect::ConnectAllowEntry {
+                description: None,
+                agent_id: stranger_agent,
+                machine_id: stranger_machine,
+                targets: vec!["127.0.0.1:22".parse().expect("loopback literal")],
+            }],
+        },
+    )));
+
+    match bob.open_peer_datagram_lane(&alice.agent_id()).await {
+        Ok(_) => panic!("unlisted peer must be denied the datagram lane"),
+        Err(e) => assert!(
+            matches!(e, x0x::error::NetworkError::PeerNotInConnectAcl { .. }),
+            "expected PeerNotInConnectAcl, got: {e:?}"
+        ),
+    }
+}
+
+/// Single-acceptor rule (Codex review finding 2): exactly ONE consumer
+/// may register `WebRtcV1` per agent, so a second concurrent call on the
+/// same agent cannot start today. It must fail FAST and TYPED
+/// (`VoiceLaneError::SessionConflict`) — never silently steal or share
+/// the acceptor — and `stop()` must release the acceptor so a later
+/// session starts cleanly (self-heal). The shared daemon-level demux
+/// that would make concurrent calls WORK is the recorded follow-up.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "two-agent loopback acceptor-conflict proof; binds UDP. Integration tier."]
+async fn second_concurrent_call_fails_typed_and_stop_self_heals() {
+    let dir = TempDir::new().expect("tmpdir");
+    let Some((alice, bob)) = trusted_pair(&dir).await else {
+        return;
+    };
+
+    let mut first = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
+    first
+        .start_lane()
+        .await
+        .expect("first session claims the WebRtcV1 acceptor");
+
+    // A second concurrent call on the SAME agent (any remote) hits the
+    // single-acceptor rule: typed rejection, not a stringly error and
+    // not a silent takeover.
+    let mut second = X0xLinkTransport::new(Arc::clone(&alice), bob.agent_id());
+    match second.start_lane().await {
+        Err(x0x::voice::VoiceLaneError::SessionConflict) => {}
+        other => panic!("expected SessionConflict, got: {other:?}"),
+    }
+    // The failed start must not wedge the transport: `running` was
+    // reset, so a retry after the conflict is cleared succeeds below.
+
+    first
+        .stop()
+        .await
+        .expect("first session stops (releases acceptor)");
+
+    second
+        .start_lane()
+        .await
+        .expect("acceptor released by stop; second session now starts");
+    let _ = second.stop().await;
 
     alice.shutdown().await;
     bob.shutdown().await;
