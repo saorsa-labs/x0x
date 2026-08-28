@@ -10317,7 +10317,7 @@ impl Agent {
     /// (ADR-0042 decision (c)) — the carriage for loss-tolerant voice
     /// audio.
     ///
-    /// Returns the ant-quic [`P2pLinkConn`] seam for the peer's QUIC
+    /// Returns the ant-quic `P2pLinkConn` seam for the peer's QUIC
     /// connection (`send_datagram` / `read_datagram` on
     /// [`ant_quic::link_transport::LinkConn`]). Datagrams ride the
     /// connection, not a stream, so they get **no** voice shortcut around
@@ -10325,9 +10325,10 @@ impl Agent {
     /// at open (the same granularity as stream open/accept; per-frame
     /// re-checks would differ from stream semantics):
     ///
-    /// * outbound: the shared identity gate ([`Self::gate_peer_outbound`])
-    ///   — the caller will *send* datagrams on the connection;
-    /// * inbound: [`Self::gate_peer_machine_inbound`] — unsolicited
+    /// * outbound: the shared identity gate (`gate_peer_outbound`, also
+    ///   used by `open_peer_stream`) — the caller will *send* datagrams
+    ///   on the connection;
+    /// * inbound: the accept-loop posture (`gate_peer_machine_inbound`) — unsolicited
     ///   datagrams *arrive* on the same connection and must never surface
     ///   from a peer whose inbound stream the accept loop would reset.
     ///

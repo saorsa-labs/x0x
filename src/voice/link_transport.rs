@@ -271,8 +271,9 @@ impl X0xLinkTransport {
         self.datagram_frames_received.load(Ordering::Relaxed)
     }
 
-    /// Datagrams dropped by the per-connection byte ceiling (see
-    /// [`DATAGRAM_BYTE_RATE`]) — observability for the flood defense.
+    /// Datagrams dropped by the per-connection byte ceiling (see the
+    /// `DATAGRAM_BYTE_RATE` token bucket) — observability for the flood
+    /// defense.
     #[must_use]
     pub fn datagram_rate_limited_dropped(&self) -> u64 {
         self.datagram_rate_limited.load(Ordering::Relaxed)

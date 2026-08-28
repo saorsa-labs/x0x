@@ -15,7 +15,7 @@
 //!   the x0x protocol prefix is the saorsa-webrtc
 //!   [`saorsa_webrtc_core::link_transport::StreamType`] (0x20–0x24), so
 //!   audio/video/control lanes nest inside one gated x0x stream protocol.
-//!   With [`AudioLaneMode::Datagram`] pinned, encoded audio additionally
+//!   With `AudioLaneMode::Datagram` pinned, encoded audio additionally
 //!   rides unreliable QUIC datagrams on the same peer connection once both
 //!   ends advertise the lane — falling back to the reliable stream
 //!   otherwise (ADR-0042 decision (c)); the jitter buffer stays mandatory
