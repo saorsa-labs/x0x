@@ -136,6 +136,7 @@ fn roster_from_specs(specs: &[RosterMemberSpec]) -> BTreeMap<String, GroupMember
                     kem_public_key_b64: None,
                     treekem_key_package_b64: None,
                     treekem_key_package_hash: None,
+                    certificate: None,
                 },
             )
         })
@@ -467,6 +468,7 @@ fn member_from_spec(
         kem_public_key_b64: None,
         treekem_key_package_b64: None,
         treekem_key_package_hash: None,
+        certificate: None,
     }
 }
 

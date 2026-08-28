@@ -71,29 +71,53 @@ fn blake3_hex(input: &[u8]) -> String {
 /// role) and `Banned` entries (so ban state is part of the commit).
 /// `Removed` and `Pending` entries are excluded because they do not
 /// currently affect effective access.
+///
+/// ADR-0038: an entry carrying a roster-embedded `AgentCertificate`
+/// additionally contributes its BLAKE3 digest as a `#<hex>` suffix, so the
+/// signed commit covers the exact certificate the member was admitted
+/// under (committed evidence — Codex design review constraint 2). Entries
+/// without a certificate hash byte-identically to the pre-0038 v1 format,
+/// so legacy chains are unaffected.
 #[must_use]
 pub fn compute_roster_root(members_v2: &BTreeMap<String, GroupMember>) -> String {
-    let mut entries: Vec<(&str, GroupRole, GroupMemberState)> = members_v2
+    let mut entries: Vec<(&str, GroupRole, GroupMemberState, Option<String>)> = members_v2
         .iter()
         .filter(|(_, m)| matches!(m.state, GroupMemberState::Active | GroupMemberState::Banned))
-        .map(|(id, m)| (id.as_str(), m.role, m.state))
+        .map(|(id, m)| {
+            (
+                id.as_str(),
+                m.role,
+                m.state,
+                m.certificate
+                    .as_ref()
+                    .map(crate::groups::owner_cert::certificate_digest_hex),
+            )
+        })
         .collect();
     roster_root_from_entries(&mut entries)
 }
 
-fn roster_root_from_entries(entries: &mut [(&str, GroupRole, GroupMemberState)]) -> String {
-    // `(id, role, state)` is the v1 canonical roster entry. KeyPackage
-    // incarnation hashes are authenticated by the add commit's signed
-    // `security_binding`; changing this root would partition older peers.
+fn roster_root_from_entries(
+    entries: &mut [(&str, GroupRole, GroupMemberState, Option<String>)],
+) -> String {
+    // `(id, role, state)` is the v1 canonical roster entry; `#<digest>` is
+    // the ADR-0038 cert-binding suffix, present ONLY when the entry carries
+    // a certificate. KeyPackage incarnation hashes are authenticated by the
+    // add commit's signed `security_binding`; changing the v1 portion would
+    // partition older peers.
     entries.sort_by(|a, b| a.0.cmp(b.0));
     let mut buf = Vec::with_capacity(entries.len() * 48 + 16);
     buf.extend_from_slice(b"x0x.roster-root.v1");
-    for (id, role, state) in entries.iter() {
+    for (id, role, state, cert_digest) in entries.iter() {
         buf.push(b'|');
         buf.extend_from_slice(id.as_bytes());
         buf.push(b':');
         buf.push(role_byte(*role));
         buf.push(state_byte(*state));
+        if let Some(digest) = cert_digest {
+            buf.push(b'#');
+            buf.extend_from_slice(digest.as_bytes());
+        }
     }
     blake3_hex(&buf)
 }
@@ -109,7 +133,12 @@ pub struct RosterMemberSnapshot {
     pub state: GroupMemberState,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub treekem_key_package_hash: Option<String>,
+    /// ADR-0038: BLAKE3 digest of the roster-embedded `AgentCertificate`,
+    /// when the entry carries one (legacy snapshots deserialize without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_digest: Option<String>,
 }
+
 /// Project the roster-root-relevant view of a roster: `Active` + `Banned`
 /// members with their `(role, state)`. Mirrors [`compute_roster_root`]'s
 /// filter exactly so [`roster_root_of_projection`] re-derives the same root.
@@ -127,6 +156,10 @@ pub fn roster_projection(
                     role: m.role,
                     state: m.state,
                     treekem_key_package_hash: m.treekem_key_package_hash.clone(),
+                    certificate_digest: m
+                        .certificate
+                        .as_ref()
+                        .map(crate::groups::owner_cert::certificate_digest_hex),
                 },
             )
         })
@@ -136,9 +169,16 @@ pub fn roster_projection(
 /// Re-derive the roster root from a projection (see [`roster_projection`]).
 #[must_use]
 pub fn roster_root_of_projection(projection: &BTreeMap<String, RosterMemberSnapshot>) -> String {
-    let mut entries: Vec<(&str, GroupRole, GroupMemberState)> = projection
+    let mut entries: Vec<(&str, GroupRole, GroupMemberState, Option<String>)> = projection
         .iter()
-        .map(|(id, s)| (id.as_str(), s.role, s.state))
+        .map(|(id, snap)| {
+            (
+                id.as_str(),
+                snap.role,
+                snap.state,
+                snap.certificate_digest.clone(),
+            )
+        })
         .collect();
     roster_root_from_entries(&mut entries)
 }
@@ -552,6 +592,21 @@ pub enum ApplyError {
     /// blind seal is refused rather than committing an unverified roster.
     #[error("owner-certified group {group_id} requires certificate evidence to seal (ADR-0038)")]
     OwnerCertifiedEvidenceRequired { group_id: String },
+
+    /// ADR-0038 (review B3): an ordinary seal found OwnerCertified members
+    /// failing re-verification. Ordinary seals MUST NOT silently prune —
+    /// the roster change would not be representable to receivers by their
+    /// own event and the GSS secret/TreeKEM leaves would not rotate. Route
+    /// through the explicit eviction+rekey path (`POST /groups/:id/state/
+    /// seal`, admin remove) which performs one atomic, event-representable
+    /// transition per evicted member.
+    #[error(
+        "owner-certified group {group_id} requires explicit eviction+rekey for members {members:?} (ADR-0038)"
+    )]
+    OwnerCertifiedEvictionRequired {
+        group_id: String,
+        members: Vec<String>,
+    },
 }
 
 // ─────────────────────────── Apply checks ───────────────────────────────

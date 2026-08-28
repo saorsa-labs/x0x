@@ -1951,6 +1951,20 @@ async fn upsert_discovered_agent(
                 }
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
+                // ADR-0038 / review finding 5: promote certificate evidence.
+                // A V3 announce that resolved its blob (or a V2 announce
+                // carrying the cert inline) carries fresher signed evidence
+                // than what the entry may hold — and a cold-miss entry holds
+                // `None` even though the background blob fetch has since
+                // landed on OTHER nodes. Never demote: a cert-less incoming
+                // record (V3 pre-L3 conversion, rendezvous-only) leaves the
+                // cached certificate intact so evidence is monotone.
+                if let Some(cert) = incoming.agent_certificate.take() {
+                    existing.cert_not_after = cert.not_after();
+                    existing.agent_certificate = Some(cert);
+                } else if existing.agent_certificate.is_none() {
+                    existing.cert_not_after = incoming.cert_not_after;
+                }
                 // LWW the agent public key — a v2 announcement always
                 // carries it; a legacy/rendezvous entry may not (#204).
                 if !incoming.agent_public_key.is_empty() {
@@ -18597,6 +18611,66 @@ mod tests {
         assert_eq!(census.coordinator_on_bootstrap, 1);
         assert_eq!(census.coordinator_non_bootstrap, 1);
         assert!(census.agents_live >= 3);
+    }
+
+    #[tokio::test]
+    async fn upsert_promotes_certificate_into_existing_cert_less_entry() {
+        // WHY (ADR-0038 review finding 5): a V3 announce whose blob fetch
+        // was still in flight inserts a cert-less entry; heartbeats keep it
+        // alive (last_seen refreshes). Without promotion, the entry stays
+        // cert-less FOREVER and OwnerCertified evidence destructively
+        // evicts a valid member as NoCertificate. A later announce carrying
+        // the resolved certificate must promote it into the existing entry.
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let now = Agent::unix_timestamp_secs();
+        let user = identity::UserKeypair::generate().unwrap();
+        let member = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+        let mk = |last_seen: u64, cert: Option<identity::AgentCertificate>| DiscoveredAgent {
+            agent_id: member.agent_id(),
+            machine_id: identity::MachineId([9; 32]),
+            user_id: None,
+            addresses: vec![],
+            announced_at: last_seen,
+            last_seen,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: cert.as_ref().and_then(|c| c.not_after()),
+            agent_certificate: cert,
+            agent_public_key: vec![],
+        };
+        // Cold miss: cert-less entry lands first.
+        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now, None)).await;
+        // Later heartbeat, same agent, now with the fetched certificate.
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            mk(now + 5, Some(cert.clone())),
+        )
+        .await;
+        let cache = agent.identity_discovery_cache.read().await;
+        let entry = cache.get(&member.agent_id()).expect("entry retained");
+        assert!(
+            entry.agent_certificate.as_ref().is_some_and(|c| c == &cert),
+            "the fetched certificate must be promoted into the existing entry"
+        );
+        // And a cert-less later announce must NOT demote it.
+        drop(cache);
+        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now + 10, None)).await;
+        let cache = agent.identity_discovery_cache.read().await;
+        let entry = cache.get(&member.agent_id()).expect("entry retained");
+        assert!(
+            entry.agent_certificate.is_some(),
+            "promotion is monotone: a cert-less announce never clears evidence"
+        );
     }
 
     /// ADR-0035 metering: selection-skew classification — machine id →

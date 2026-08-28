@@ -28,9 +28,20 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use crate::groups::member::GroupMember;
 use crate::identity::{AgentCertificate, UserId};
 
+/// Wall-clock unix seconds for pure (evidence-snapshot-free) verifications
+/// — receiver-side event gates and the restore-from-disk sweep. Returns 0
+/// if the clock is before the epoch (verification then fails closed for
+/// expiring certs, which is the safe direction).
+#[must_use]
+pub fn restore_clock_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
 /// Snapshot of the certificate evidence available to a verifier at one
 /// decision point (invite-accept or seal).
-///
 /// Deliberately a value snapshot, not a live view: the underlying discovery
 /// cache and revocation set are async-guarded, while the verification
 /// predicates here are pure and synchronous (and callable from the sealing
@@ -132,14 +143,82 @@ pub fn verify_owner_certified_member(
     member_agent_hex: &str,
     evidence: &OwnerCertEvidence,
 ) -> Result<(), OwnerCertFailure> {
-    // Revocation first: positive knowledge of compromise outranks everything
-    // else — a still-valid-looking certificate must not rescue a revoked key.
+    // Revocation first (positive knowledge of compromise dominates), then
+    // resolve the announce-path certificate and run the pure core over it.
+    // A cache MISS is `NoCertificate` — deny + retryable, never fail-open:
+    // the background blob fetch (PR #419) fills the discovery cache, and
+    // the next invite volley / seal re-runs this check.
     if evidence.is_revoked(member_agent_hex) {
         return Err(OwnerCertFailure::Revoked);
     }
     let cert = evidence
         .cert_for(member_agent_hex)
         .ok_or(OwnerCertFailure::NoCertificate)?;
+    verify_cert_against_owner(
+        owner,
+        member_agent_hex,
+        cert,
+        evidence.is_revoked(member_agent_hex),
+        evidence.now_unix(),
+    )
+}
+
+/// Every ACTIVE member of `members_v2` that fails OwnerCertified
+/// verification against `owner`, in roster (BTreeMap) order so evictions are
+/// deterministic. Non-active members (Removed/Pending/Banned) hold no access
+/// and are not re-verified.
+pub fn failing_active_members(
+    owner: &UserId,
+    members_v2: &BTreeMap<String, GroupMember>,
+    evidence: &OwnerCertEvidence,
+) -> Vec<(String, OwnerCertFailure)> {
+    members_v2
+        .iter()
+        .filter(|(_, m)| m.is_active())
+        .filter_map(|(agent_hex, _)| {
+            verify_owner_certified_member(owner, agent_hex, evidence)
+                .err()
+                .map(|failure| (agent_hex.clone(), failure))
+        })
+        .collect()
+}
+
+/// BLAKE3-256 (hex) over the certificate's canonical bincode bytes — the
+/// digest the ADR-0038 roster root binds per cert-carrying member
+/// (`compute_roster_root`). Serialization of this struct is infallible in
+/// practice; the fallback (digest over the agent public key) keeps the
+/// function total and deterministic without panicking.
+#[must_use]
+pub fn certificate_digest_hex(cert: &AgentCertificate) -> String {
+    let bytes = bincode::serialize(cert).unwrap_or_else(|_| cert.agent_public_key().to_vec());
+    hex::encode(blake3::hash(&bytes).as_bytes())
+}
+
+/// Verify one certificate against the admission owner, given the live
+/// revocation flag and clock — the pure core shared by evidence-based
+/// (announce-resolved) checks and roster-embedded (committed-evidence)
+/// checks.
+///
+/// Expiry policy (ADR-0018 / `identity.rs` `AgentCertificate`): a
+/// certificate with `not_after == None` is a LEGACY certificate that never
+/// expires — it stays valid until the owner revokes it (an issuer- or
+/// self-revocation in the ADR-0018 set). A present `not_after` is enforced
+/// with the fleet's clock-skew tolerance. Choosing "absent expiry ⇒
+/// revoked-at-seal" would evict every pre-#130 fleet cert on upgrade, so
+/// absent expiry is honored as valid-indefinitely, and revocation is the
+/// kill switch for stale legacy certificates.
+pub fn verify_cert_against_owner(
+    owner: &UserId,
+    member_agent_hex: &str,
+    cert: &AgentCertificate,
+    revoked: bool,
+    now_unix: u64,
+) -> Result<(), OwnerCertFailure> {
+    // Revocation first: positive knowledge of compromise outranks everything
+    // else — a still-valid-looking certificate must not rescue a revoked key.
+    if revoked {
+        return Err(OwnerCertFailure::Revoked);
+    }
     cert.verify()
         .map_err(|_| OwnerCertFailure::InvalidSignature)?;
     // The chain: the cert must have been signed by the group owner's user
@@ -161,30 +240,10 @@ pub fn verify_owner_certified_member(
     if !cert_agent_hex.eq_ignore_ascii_case(member_agent_hex) {
         return Err(OwnerCertFailure::AgentMismatch);
     }
-    if cert.is_expired(evidence.now_unix()) {
+    if cert.is_expired(now_unix) {
         return Err(OwnerCertFailure::Expired);
     }
     Ok(())
-}
-
-/// Every ACTIVE member of `members_v2` that fails OwnerCertified
-/// verification against `owner`, in roster (BTreeMap) order so evictions are
-/// deterministic. Non-active members (Removed/Pending/Banned) hold no access
-/// and are not re-verified.
-pub fn failing_active_members(
-    owner: &UserId,
-    members_v2: &BTreeMap<String, GroupMember>,
-    evidence: &OwnerCertEvidence,
-) -> Vec<(String, OwnerCertFailure)> {
-    members_v2
-        .iter()
-        .filter(|(_, m)| m.is_active())
-        .filter_map(|(agent_hex, _)| {
-            verify_owner_certified_member(owner, agent_hex, evidence)
-                .err()
-                .map(|failure| (agent_hex.clone(), failure))
-        })
-        .collect()
 }
 
 #[cfg(test)]

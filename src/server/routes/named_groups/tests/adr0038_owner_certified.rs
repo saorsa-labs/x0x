@@ -432,3 +432,362 @@ fn blind_seal_of_owner_certified_group_is_refused() {
     assert!(evicted.is_empty(), "certified creator must not be evicted");
     assert_eq!(commit.revision, 1);
 }
+
+// ── Review-fix tests (Codex adversarial review, REQUEST-CHANGES) ──────
+
+#[tokio::test]
+async fn admission_oracle_fails_closed_on_blob_cache_miss_and_recovers() -> Result<()> {
+    // WHY (review finding 5 / addendum 1): the admission oracle resolves
+    // certificates from the discovery cache; a cold miss must DENY
+    // (retryable), never fail open — and the promotion fix means a later
+    // heartbeat carrying the fetched certificate actually converges.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "76".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let joiner = AgentKeypair::generate()?;
+    let joiner_hex = hex::encode(joiner.agent_id().as_bytes());
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).expect("group").clone()
+    };
+
+    // 1. Miss: no cache entry at all → typed failure, denied.
+    let denied = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    assert_eq!(
+        denied,
+        Err(x0x::groups::owner_cert::OwnerCertFailure::NoCertificate),
+        "cache miss must fail closed with NoCertificate"
+    );
+
+    // 2. Recovery: the announce path lands the certificate (upsert
+    //    promotion) and the SAME check now returns the cert for binding.
+    let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &joiner)?;
+    announce_cert_for(state.as_ref(), cert.clone()).await;
+    let admitted = owner_certified_admission_check(state.as_ref(), &info, &joiner_hex).await;
+    assert_eq!(
+        admitted,
+        Ok(Some(cert)),
+        "after the blob lands, admission must succeed and return the cert for roster binding"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<()> {
+    // WHY (review B2): admin role must be INERT for admission policy —
+    // a compromised admin must not downgrade OwnerCertified to
+    // InviteOnly (or swap the owner), locally or via a signed event.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "77".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "admission": "invite_only"
+    }))?;
+    let response =
+        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::FORBIDDEN,
+        "axis removal must be a typed 403: {body}"
+    );
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("immutable")),
+        "error must name immutability: {body}"
+    );
+
+    // Swapping to a DIFFERENT owner is equally refused.
+    let stranger = UserKeypair::generate()?;
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "admission": {"owner_certified": hex::encode(stranger.user_id().as_bytes())}
+    }))?;
+    let response =
+        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::FORBIDDEN, "owner swap refused: {body}");
+
+    // A same-owner PATCH (e.g. write_access change) still goes through.
+    let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
+        "admission": {"owner_certified": hex::encode(owner_kp.user_id().as_bytes())}
+    }))?;
+    let response =
+        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "same-owner policy retained: {body}");
+    Ok(())
+}
+
+#[tokio::test]
+async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Result<()> {
+    // WHY (review B3): an ordinary seal (here: policy/display-class
+    // mutation via the PATCH endpoint, which uses the common wrapper)
+    // must NEVER silently prune — the roster change would not be
+    // representable to receivers and the secret would not rotate. It
+    // refuses with a typed error naming the members and the explicit
+    // path.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "78".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let stranger_hex = "9c".repeat(32);
+    {
+        let mut groups = state.named_groups.write().await;
+        groups.get_mut(&group_id).expect("group").add_member(
+            stranger_hex.clone(),
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+        );
+    }
+    let req: UpdateGroupPolicyRequest =
+        serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
+    let response =
+        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
+            .await
+            .into_response();
+    let (status, body) = response_json(response).await?;
+    assert!(
+        status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::CONFLICT,
+        "ordinary seal must refuse, got {status}: {body}"
+    );
+    let err_text = body["error"].as_str().unwrap_or_default();
+    assert!(
+        err_text.contains("explicit eviction+rekey"),
+        "error must direct to the explicit path: {body}"
+    );
+    // And the roster was NOT silently pruned by the refused mutation.
+    let groups = state.named_groups.read().await;
+    let live = groups.get(&group_id).expect("group");
+    assert!(
+        live.has_active_member(&stranger_hex),
+        "a refused ordinary seal must leave the roster untouched"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn multi_eviction_seal_is_sequential_with_per_member_rekey() -> Result<()> {
+    // WHY (review B3/B4): every eviction must be its own atomic
+    // roster+crypto transition whose event reconstructs the committed
+    // roster. Two failing members ⇒ two evicting commits (plus the
+    // final clean seal), roster ends clean, and the GSS secret rotates
+    // per eviction.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "79".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let bad1 = AgentKeypair::generate()?;
+    let bad2 = AgentKeypair::generate()?;
+    for bad in [&bad1, &bad2] {
+        let hex = hex::encode(bad.agent_id().as_bytes());
+        // Real ML-KEM-768 keys: the per-eviction rotation preflights a
+        // survivor envelope for the (still-seated) other member, and a
+        // survivor without a roster KEM key correctly aborts the whole
+        // transition (F1 §5).
+        let kem = x0x::groups::kem_envelope::AgentKemKeypair::generate()?;
+        use base64::Engine as _;
+        let kem_b64 = BASE64.encode(kem.public_bytes);
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.add_member_with_kem(
+            hex,
+            x0x::groups::GroupRole::Member,
+            None,
+            None,
+            Some(kem_b64),
+        );
+        live.shared_secret = Some(vec![3u8; 32]);
+    }
+    let revision_before = {
+        let groups = state.named_groups.read().await;
+        groups.get(&group_id).expect("group").state_revision
+    };
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "sequential eviction seal: {body}");
+    let evicted: Vec<String> = body["evicted"]
+        .as_array()
+        .expect("evicted list")
+        .iter()
+        .map(|v| v.as_str().unwrap_or_default().to_string())
+        .collect();
+    assert_eq!(evicted.len(), 2, "both failing members evicted: {body}");
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        for evicted_hex in &evicted {
+            assert!(!live.has_active_member(evicted_hex));
+        }
+        // Two evicting transitions + one clean seal = +3 revisions.
+        assert_eq!(
+            live.state_revision,
+            revision_before + 3,
+            "each eviction is its own committed transition"
+        );
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()> {
+    // WHY (review finding 6): restored OwnerCertified state (roster +
+    // GSS/TreeKEM material) must not serve secure operations until an
+    // evidence-bearing seal re-verifies it. load_named_groups sets the
+    // quarantine marker; secure encrypt refuses with a typed 409; the
+    // seal endpoint clears it.
+    let (state, dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7a".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    {
+        let mut groups = state.named_groups.write().await;
+        let live = groups.get_mut(&group_id).expect("group");
+        live.shared_secret = Some(vec![5u8; 32]);
+    }
+    // Persist + reload through the real restore path.
+    assert!(save_named_groups(&state).await);
+    let reloaded = load_named_groups(&state.named_groups_path).await?;
+    assert!(
+        reloaded
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required,
+        "restore must set the quarantine marker"
+    );
+    *state.named_groups.write().await = reloaded;
+
+    // Secure encrypt refuses while quarantined.
+    let req: SecureEncryptRequest =
+        serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
+    let (status, json) =
+        secure_group_encrypt(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let body: serde_json::Value = json.0;
+    assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|e| e.contains("re-verification")),
+        "typed quarantine error: {body}"
+    );
+
+    // The evidence-bearing seal clears the quarantine.
+    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
+        .await
+        .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "seal clears quarantine: {body}");
+    assert!(
+        !state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .expect("group")
+            .owner_cert_reverify_required,
+        "marker cleared by the evidence-bearing seal"
+    );
+    drop(dir);
+    Ok(())
+}
+
+#[tokio::test]
+async fn receiver_rejects_member_added_without_committed_certificate() -> Result<()> {
+    // WHY (review B1): receivers must enforce OwnerCertified admission
+    // on inbound authority commits — a compromised admin with an old
+    // client emits MemberAdded without a certificate; every receiver
+    // must reject the signed commit rather than admit the outsider.
+    // Path: authority-side apply of a MemberAdded event shaped like a
+    // relayed authority commit, on a group whose roster the event would
+    // extend. The receiver gate below is the same one non-inviter
+    // receivers run.
+    let (state, _dir, owner_kp) = owner_authority_state().await?;
+    let group_id = "7b".repeat(32);
+    insert_owner_group(
+        state.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    // Build the event the way the receiver arm consumes it. A missing
+    // certificate is rejected by the receiver gate BEFORE any roster
+    // work — verified by calling the gate logic through the full apply
+    // entry with a minimal event (commit validation happens after the
+    // cert gate, so a None commit is fine for the rejection arm).
+    let outsider = AgentKeypair::generate()?;
+    let outsider_hex = hex::encode(outsider.agent_id().as_bytes());
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: group_id.clone(),
+        revision: 2,
+        actor: owner_hex.clone(),
+        agent_id: outsider_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: None,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: None,
+        commit: None,
+    };
+    let should_exit = apply_named_group_metadata_event_inner(
+        &state,
+        event,
+        state.agent.agent_id(),
+        true,
+        true,
+        None,
+    )
+    .await;
+    assert!(!should_exit.should_exit);
+    {
+        let groups = state.named_groups.read().await;
+        let live = groups.get(&group_id).expect("group");
+        assert!(
+            !live.has_active_member(&outsider_hex),
+            "receiver must not admit an OwnerCertified add without a committed certificate"
+        );
+    }
+    Ok(())
+}

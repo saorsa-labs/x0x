@@ -378,6 +378,27 @@ mod tests {
     }
 
     #[test]
+    fn owner_certified_bincode_round_trips_and_old_decoder_rejects() {
+        // WHY (review item 9): pin the NEW variant's bincode shape — index 3
+        // (u32 LE) followed by the hex-string payload — so a future reorder
+        // cannot silently renumber it, and prove an old (3-variant) decoder
+        // rejects those bytes as an unknown variant index rather than
+        // misreading them as some legacy axis.
+        let owner = UserId([0x5A; 32]);
+        let bytes = bincode::serialize(&GroupAdmission::OwnerCertified(owner))
+            .expect("bincode new variant");
+        assert_eq!(&bytes[..4], &[3, 0, 0, 0], "variant index must be 3");
+        let decoded: GroupAdmission = bincode::deserialize(&bytes).expect("round trip");
+        assert_eq!(decoded, GroupAdmission::OwnerCertified(owner));
+        let err = bincode::deserialize::<LegacyAdmission>(&bytes)
+            .expect_err("old decoder must reject the new variant index");
+        assert!(
+            err.to_string().contains("variant index"),
+            "error must name the unknown variant index: {err}"
+        );
+    }
+
+    #[test]
     fn other_admission_axes_have_no_owner() {
         // WHY: `owner_certified_user_id()` gates every enforcement site;
         // a legacy axis returning Some() would wrongly drag cert checks

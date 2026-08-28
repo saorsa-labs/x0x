@@ -201,6 +201,13 @@ pub struct GroupInfo {
     /// subsequent public cards must carry the withdrawal flag.
     #[serde(default)]
     pub withdrawn: bool,
+    /// ADR-0038 (review finding 6): set at restore-from-disk for
+    /// OwnerCertified groups; secure operations refuse with a typed error
+    /// until an evidence-bearing seal (`POST /groups/:id/state/seal` or any
+    /// OwnerCertified-aware commit path) has re-verified the restored
+    /// roster. Transient — never serialized.
+    #[serde(skip)]
+    pub owner_cert_reverify_required: bool,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -482,6 +489,7 @@ impl GroupInfo {
             avatar_url: None,
             banner_url: None,
             withdrawn: false,
+            owner_cert_reverify_required: false,
             issued_invite_secrets: HashSet::new(),
             issued_invites: HashMap::new(),
         };
@@ -615,7 +623,13 @@ impl GroupInfo {
         let signer_hex = hex::encode(keypair.agent_id().as_bytes());
         let evicted = self.enforce_owner_certified_admission(&signer_hex, evidence);
         match self.seal_commit_inner(keypair, now_ms) {
-            Ok(commit) => Ok((commit, evicted)),
+            Ok(commit) => {
+                // The roster just passed (or was pruned by) evidence-based
+                // re-verification — the restore quarantine (review finding
+                // 6) is lifted.
+                self.owner_cert_reverify_required = false;
+                Ok((commit, evicted))
+            }
             // A failed seal leaves the group untouched: without this
             // restore, the prune above would outlive the commit it was
             // meant to be part of, and a retry (or the last-admin veto
@@ -627,6 +641,27 @@ impl GroupInfo {
         }
     }
 
+    /// ADR-0038 (review B3): seal WITHOUT auto-pruning — for the sequential
+    /// eviction engine, which has ALREADY applied its own single-member
+    /// roster removal for this transition and must not let the seal
+    /// silently prune the remaining failing members into the same
+    /// unrepresentable commit (they get their own transitions on the next
+    /// loop iteration). Contract: the caller has run
+    /// [`Self::owner_cert_admission_failures`] and is mid-eviction; this
+    /// method only advances the chain and lifts the restore quarantine.
+    pub fn seal_commit_evicting(
+        &mut self,
+        keypair: &AgentKeypair,
+        now_ms: u64,
+    ) -> Result<state_commit::GroupStateCommit, state_commit::ApplyError> {
+        match self.seal_commit_inner(keypair, now_ms) {
+            Ok(commit) => {
+                self.owner_cert_reverify_required = false;
+                Ok(commit)
+            }
+            Err(err) => Err(err),
+        }
+    }
     /// Shared sealing core: chain advance + signature. No admission logic —
     /// the public entry points own that.
     fn seal_commit_inner(
@@ -701,24 +736,76 @@ impl GroupInfo {
         Ok(commit)
     }
 
-    /// ADR-0038: re-verify every ACTIVE member of an OwnerCertified group
-    /// against the admission owner and roster-remove (evict) the failures.
-    /// No-op for every other admission axis. Returns the evicted
-    /// `(agent_hex, failure)` pairs — callers that also need a rekey (GSS
-    /// secret rotation + survivor re-seal) must act on them; the roster
-    /// prune alone is only the commit-visible half of an eviction.
-    pub fn enforce_owner_certified_admission(
-        &mut self,
-        authority_hex: &str,
+    /// ADR-0038: which ACTIVE members of an OwnerCertified group currently
+    /// FAIL re-verification — the pure PEEK used by ordinary seals to fail
+    /// closed (typed error) instead of silently pruning (review B3).
+    /// Seating ladder per member: revoked → fail; an announce-resolved
+    /// certificate that verifies → seated; otherwise the ROSTER-EMBEDDED
+    /// certificate (the committed evidence the signed chain covers) →
+    /// seated; neither → fail.
+    ///
+    /// v1 policy (documented): re-certification rebinding happens at the
+    /// admission paths (invite-accept / admin add bind the fresh cert into
+    /// the roster and carry it in the MemberAdded event). Seal-time
+    /// verification never mutates a surviving member's roster entry, so
+    /// every seal's roster is either unchanged or evicting — always
+    /// representable to receivers.
+    #[must_use]
+    pub fn owner_cert_admission_failures(
+        &self,
         evidence: &owner_cert::OwnerCertEvidence,
     ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
         let Some(owner) = self.policy.admission.owner_certified_user_id().copied() else {
             return Vec::new();
         };
-        let failures = owner_cert::failing_active_members(&owner, &self.members_v2, evidence);
-        if failures.is_empty() {
-            return failures;
-        }
+        let now = evidence.now_unix();
+        self.members_v2
+            .iter()
+            .filter(|(_, m)| m.is_active())
+            .filter_map(|(agent_hex, m)| {
+                if evidence.is_revoked(agent_hex) {
+                    return Some((agent_hex.clone(), owner_cert::OwnerCertFailure::Revoked));
+                }
+                let check = |cert: &crate::identity::AgentCertificate| {
+                    owner_cert::verify_cert_against_owner(&owner, agent_hex, cert, false, now)
+                };
+                if evidence
+                    .cert_for(agent_hex)
+                    .is_some_and(|cert| check(cert).is_ok())
+                {
+                    return None;
+                }
+                if m.certificate
+                    .as_ref()
+                    .is_some_and(|cert| check(cert).is_ok())
+                {
+                    return None;
+                }
+                // Neither source verifies: report the informative failure
+                // kind — the resolved cert's own failure when one existed,
+                // otherwise "no certificate at all".
+                let failure = evidence
+                    .cert_for(agent_hex)
+                    .map(check)
+                    .unwrap_or_else(|| Err(owner_cert::OwnerCertFailure::NoCertificate))
+                    .err()
+                    .unwrap_or(owner_cert::OwnerCertFailure::NoCertificate);
+                Some((agent_hex.clone(), failure))
+            })
+            .collect()
+    }
+
+    /// ADR-0038: roster-remove (evict) exactly the members returned by
+    /// [`Self::owner_cert_admission_failures`]. Mutation ONLY — callers are
+    /// the explicit eviction+rekey paths that seal the pruned roster in the
+    /// same transition and emit a receiver-representable `MemberRemoved`.
+    /// Ordinary seals call the peek and refuse instead.
+    pub fn enforce_owner_certified_admission(
+        &mut self,
+        authority_hex: &str,
+        evidence: &owner_cert::OwnerCertEvidence,
+    ) -> Vec<(String, owner_cert::OwnerCertFailure)> {
+        let failures = self.owner_cert_admission_failures(evidence);
         for (agent_hex, failure) in &failures {
             tracing::warn!(
                 group_id = %self.stable_group_id(),
@@ -729,6 +816,31 @@ impl GroupInfo {
             self.remove_member(agent_hex, Some(authority_hex.to_string()));
         }
         failures
+    }
+
+    /// ADR-0038: bind the verified `AgentCertificate` into a member's roster
+    /// entry so the signed state-commit's roster root covers it.
+    pub fn set_member_certificate(
+        &mut self,
+        agent_id_hex: &str,
+        certificate: crate::identity::AgentCertificate,
+    ) {
+        if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
+            m.certificate = Some(certificate);
+            m.updated_at = now_millis();
+        }
+    }
+
+    /// ADR-0038: the roster-embedded certificate for `agent_id_hex` — the
+    /// committed admission evidence — if any.
+    #[must_use]
+    pub fn committed_certificate(
+        &self,
+        agent_id_hex: &str,
+    ) -> Option<&crate::identity::AgentCertificate> {
+        self.members_v2
+            .get(agent_id_hex)
+            .and_then(|m| m.certificate.as_ref())
     }
 
     /// Append a retained commit for the just-committed state and enforce
@@ -1110,6 +1222,7 @@ impl GroupInfo {
                 kem_public_key_b64,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
+                certificate: None,
             });
     }
 
@@ -1189,6 +1302,7 @@ impl GroupInfo {
                 kem_public_key_b64: None,
                 treekem_key_package_b64: None,
                 treekem_key_package_hash: None,
+                certificate: None,
             });
     }
 
