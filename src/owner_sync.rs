@@ -96,24 +96,42 @@ pub const SYNC_PROTOCOL_VERSION: u32 = 2;
 /// are tiny; anything larger is hostile or corrupt — fail closed.
 pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
 
-/// Version-vector entries per `VersionVector` frame (paging keeps any one
-/// frame far below [`MAX_FRAME_BYTES`] and the writer inside the QUIC
-/// stream window even when the peer has not started reading).
+/// Version-vector entries per `VersionVector` frame (an upper bound; the
+/// byte budget below usually splits earlier). Paging keeps any one frame
+/// far below [`MAX_FRAME_BYTES`] and the writer inside the QUIC stream
+/// window even when the peer has not started reading.
 pub const VV_ENTRIES_PER_FRAME: usize = 256;
 
-/// Records per `Records` frame.
+/// Byte budget for one `VersionVector` frame.
+pub const VV_PAGE_BYTES: usize = 64 * 1024;
+
+/// Records per `Records` frame (an upper bound; the byte budget below
+/// splits earlier when values are large — review R3 finding 5).
 pub const RECORDS_PER_FRAME: usize = 16;
+
+/// Byte budget for one `Records` frame. A single record larger than the
+/// budget still ships alone: values are capped at [`MAX_VALUE_BYTES`], so
+/// any one frame stays far below [`MAX_FRAME_BYTES`].
+pub const RECORDS_PAGE_BYTES: usize = 64 * 1024;
 
 /// Total version-vector entries a session will accept (both directions of
 /// the state space are bounded; beyond this the peer is hostile).
 pub const MAX_VECTOR_ENTRIES: usize = 4096;
 
-/// Total records a session will accept in one batch.
-pub const MAX_RECORDS_PER_SESSION: usize = 1024;
+/// Total records a session will accept in one batch. Equal to the store
+/// capacity so a fresh peer can atomically synchronize a FULL valid store
+/// (review R3 finding 5).
+pub const MAX_RECORDS_PER_SESSION: usize = MAX_STORED_RECORDS;
 
 /// Hard cap on stored (winning) records. Tier-1 state is small by design;
 /// exceeding this is a StoreLimit failure, never silent truncation.
 pub const MAX_STORED_RECORDS: usize = 4096;
+
+/// Maximum serialized [`SyncValue`] size in bytes (review R3 finding 5:
+/// values are bounded so no legal record — and no 16-record page — can
+/// exceed the frame limit). Oversize values are rejected at verify and at
+/// mint.
+pub const MAX_VALUE_BYTES: usize = 64 * 1024;
 
 /// Maximum record key length in bytes.
 pub const MAX_KEY_BYTES: usize = 256;
@@ -377,12 +395,20 @@ impl VersionedRecord {
                 self.key.len()
             )));
         }
+        let value_bytes = bincode::serialize(&self.value)
+            .map_err(|e| SyncError::BadSignature(format!("value encode: {e}")))?;
+        if value_bytes.len() > MAX_VALUE_BYTES {
+            // Bounded values keep every legal page under the frame cap
+            // (review R3 finding 5).
+            return Err(SyncError::MalformedFrame(format!(
+                "record value of {} bytes exceeds limit {MAX_VALUE_BYTES}",
+                value_bytes.len()
+            )));
+        }
         let owner_pubkey = MlDsaPublicKey::from_bytes(&self.owner_public_key)
             .map_err(|_| SyncError::BadSignature("invalid owner public key".into()))?;
         let signature = MlDsaSignature::from_bytes(&self.signature)
             .map_err(|e| SyncError::BadSignature(format!("invalid signature format: {e:?}")))?;
-        let value_bytes = bincode::serialize(&self.value)
-            .map_err(|e| SyncError::BadSignature(format!("value encode: {e}")))?;
         let message = Self::canonical_message(&self.kind, &self.key, &self.clock, &value_bytes);
         verify_with_ml_dsa(&owner_pubkey, &message, &signature)
             .map_err(|e| SyncError::BadSignature(format!("bad signature: {e:?}")))?;
@@ -762,42 +788,33 @@ pub struct CommitOutcome {
 
 impl OwnerSyncStore {
     /// Load (or start empty under) `<data_dir>/sync`, creating the
-    /// directory. Corrupt or missing files start empty — the next session
-    /// re-derives Tier-1 state from a live peer, and records are
-    /// owner-signed so poison dies at verify.
+    /// directory. **Only genuine absence is empty** (fresh install): a
+    /// records/devices file that exists but is corrupt or unreadable is a
+    /// HARD error — silently starting with an empty anti-rollback store
+    /// would let an old owner-signed record win again (review R3
+    /// finding 2).
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] when the directory cannot be created — persistence
-    /// would silently fail forever, so construction fails instead
-    /// (review R2 finding 2).
+    /// [`SyncError::Io`] when the directory cannot be created, or a state
+    /// file exists but cannot be read or parsed.
     pub async fn load(data_dir: &Path) -> Result<Self, SyncError> {
         let dir = data_dir.join(SYNC_DIR);
         tokio::fs::create_dir_all(&dir).await.map_err(|e| {
             SyncError::Io(format!("failed to create sync dir {}: {e}", dir.display()))
         })?;
-        let records = match tokio::fs::read(dir.join(RECORDS_FILE)).await {
-            Ok(bytes) => serde_json::from_slice::<PersistedRecords>(&bytes)
-                .map(|p| {
-                    p.records
-                        .into_iter()
-                        .map(|r| ((r.kind, r.key.clone()), r))
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
-            Err(_) => BTreeMap::new(),
-        };
-        let devices = match tokio::fs::read(dir.join(DEVICES_FILE)).await {
-            Ok(bytes) => serde_json::from_slice::<PersistedDevices>(&bytes)
-                .map(|p| {
-                    p.devices
-                        .into_iter()
-                        .map(|d| (d.machine_id, d))
-                        .collect::<BTreeMap<_, _>>()
-                })
-                .unwrap_or_default(),
-            Err(_) => BTreeMap::new(),
-        };
+        let persisted_records: PersistedRecords = Self::load_json(&dir.join(RECORDS_FILE)).await?;
+        let persisted_devices: PersistedDevices = Self::load_json(&dir.join(DEVICES_FILE)).await?;
+        let records = persisted_records
+            .records
+            .into_iter()
+            .map(|r| ((r.kind, r.key.clone()), r))
+            .collect::<BTreeMap<_, _>>();
+        let devices = persisted_devices
+            .devices
+            .into_iter()
+            .map(|d| (d.machine_id, d))
+            .collect::<BTreeMap<_, _>>();
         let (generation_tx, _) = tokio::sync::watch::channel(0);
         Ok(Self {
             dir,
@@ -808,14 +825,54 @@ impl OwnerSyncStore {
         })
     }
 
-    /// Write `bytes` to `path` via a unique temp file + rename (atomic for
-    /// same-directory renames; mirrors `src/profile.rs`).
+    /// Read a persisted state file: `NotFound` → default (fresh install);
+    /// any other read error, or a parse error, → hard error. Never a
+    /// silent fallback to empty (review R3 finding 2).
+    async fn load_json<T: serde::de::DeserializeOwned + Default>(
+        path: &Path,
+    ) -> Result<T, SyncError> {
+        match tokio::fs::read(path).await {
+            Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {
+                SyncError::Io(format!(
+                    "corrupt sync state file {}: {e} — refusing to start with an empty store",
+                    path.display()
+                ))
+            }),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(T::default()),
+            Err(e) => Err(SyncError::Io(format!(
+                "unreadable sync state file {}: {e}",
+                path.display()
+            ))),
+        }
+    }
+
+    /// Write `bytes` to `path` durably and atomically: unique temp file →
+    /// fsync the temp file (data durable) → rename over the target →
+    /// fsync the target file and its parent directory (the rename entry
+    /// durable). A crash after a successful persist can no longer lose the
+    /// durable state the caller just verified (review R3 finding 2).
     async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt as _;
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp-{}-{unique}", std::process::id()));
-        tokio::fs::write(&tmp, bytes).await?;
-        tokio::fs::rename(&tmp, path).await
+        let mut file = tokio::fs::File::create(&tmp).await?;
+        file.write_all(bytes).await?;
+        file.sync_all().await?;
+        drop(file);
+        tokio::fs::rename(&tmp, path).await?;
+        // fsync the renamed file and the parent directory so the new name
+        // survives a crash. (Directory fds support fsync on Unix.)
+        let target = tokio::fs::File::open(path).await?;
+        target.sync_all().await?;
+        #[cfg(unix)]
+        if let Some(parent) = path.parent() {
+            let dir = tokio::fs::File::open(parent).await?;
+            dir.sync_all().await?;
+        }
+        #[cfg(not(unix))]
+        let _ = path.parent();
+        Ok(())
     }
 
     /// Persist the winning records. Errors PROPAGATE — callers never report
@@ -962,10 +1019,17 @@ impl OwnerSyncStore {
     /// Commit a verified batch atomically (review R2 finding 4): all
     /// classification decisions are made against the live map, all accepted
     /// records inserted, and ONE file write persists the result. On any
-    /// failure the in-memory map is rolled back and the error propagates —
-    /// a partial batch is never committed or advertised.
+    /// failure the in-memory map is rolled back to its **pre-batch** state
+    /// — each key's pre-batch value is captured ONCE, on its first touch
+    /// in the batch, so a key replaced twice in a failing batch restores
+    /// the original, not an intermediate replacement (review R3 finding 4)
+    /// — and the error propagates. A partial batch is never committed or
+    /// advertised.
     ///
     /// Records must have been verified (`verify_owner`) by the caller.
+    /// Callers must NOT hold this future inside a cancellable timeout: the
+    /// rollback paths assume the await completes (the session wrapper
+    /// commits outside its time budget for exactly that reason).
     ///
     /// # Errors
     ///
@@ -977,7 +1041,8 @@ impl OwnerSyncStore {
         owner: &UserId,
     ) -> Result<CommitOutcome, SyncError> {
         let mut records = self.records.write().await;
-        let mut touched: Vec<((SyncKind, String), Option<VersionedRecord>)> = Vec::new();
+        // (kind, key) → the value held BEFORE this batch first touched it.
+        let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
         let mut outcome = CommitOutcome::default();
         let result = (|| -> Result<(), SyncError> {
             for record in batch {
@@ -991,7 +1056,8 @@ impl OwnerSyncStore {
                         "store at capacity ({MAX_STORED_RECORDS} records)"
                     )));
                 }
-                let stored = records.get(&(record.kind, record.key.clone()));
+                let key = (record.kind, record.key.clone());
+                let stored = records.get(&key);
                 // Equal clock with different signed content is an
                 // equivocation whichever side wins the hash tie-break —
                 // surfaced, never silently merged (review R2 finding 3).
@@ -1009,16 +1075,18 @@ impl OwnerSyncStore {
                 let decision = stored.map(|existing| Self::classify(&record, existing));
                 match decision {
                     None => {
-                        touched.push(((record.kind, record.key.clone()), None));
-                        records.insert((record.kind, record.key.clone()), record.clone());
+                        // First touch of a fresh key: pre-batch value None.
+                        touched.entry(key.clone()).or_insert(None);
+                        records.insert(key, record.clone());
                         outcome.accepted.push(record);
                     }
                     Some(MergeOutcome::Accepted) => {
-                        if let Some(prev) =
-                            records.insert((record.kind, record.key.clone()), record.clone())
-                        {
-                            touched.push(((record.kind, record.key.clone()), Some(prev)));
-                        }
+                        // Capture the pre-batch value ONCE (entry.or_insert
+                        // keeps the first capture even on repeat touches).
+                        touched
+                            .entry(key.clone())
+                            .or_insert_with(|| stored.cloned());
+                        records.insert(key, record.clone());
                         outcome.accepted.push(record);
                     }
                     Some(MergeOutcome::Superseded) => {
@@ -1052,10 +1120,11 @@ impl OwnerSyncStore {
         }
     }
 
-    /// Restore the in-memory map to its pre-batch state.
+    /// Restore the in-memory map to its pre-batch state: every touched key
+    /// returns to the value captured on its FIRST touch in the batch.
     fn rollback(
         records: &mut BTreeMap<(SyncKind, String), VersionedRecord>,
-        touched: &[((SyncKind, String), Option<VersionedRecord>)],
+        touched: &BTreeMap<(SyncKind, String), Option<VersionedRecord>>,
     ) {
         for ((kind, key), previous) in touched {
             match previous {
@@ -1103,6 +1172,14 @@ impl OwnerSyncStore {
         owner: &UserKeypair,
         writer_machine: MachineId,
     ) -> Result<(), SyncError> {
+        let value_bytes = bincode::serialize(desired)
+            .map_err(|e| SyncError::BadSignature(format!("value encode: {e}")))?;
+        if value_bytes.len() > MAX_VALUE_BYTES {
+            return Err(SyncError::MalformedFrame(format!(
+                "value of {} bytes exceeds limit {MAX_VALUE_BYTES}",
+                value_bytes.len()
+            )));
+        }
         let now_ms = now_unix_ms();
         let mut records = self.records.write().await;
         let stored = records.get(&(kind, key.to_string()));
@@ -1316,36 +1393,49 @@ where
     R: AsyncRead + Unpin,
     F: FnMut(&VersionedRecord),
 {
-    tokio::time::timeout(
+    // The NETWORK protocol runs under the budget; the durable commit runs
+    // OUTSIDE it, after the timeout future has completed. Cancelling at the
+    // budget can therefore never rip a persistence await out from under
+    // commit_batch's rollback paths (review R3 finding 4).
+    let pending = tokio::time::timeout(
         budget,
-        run_sync_session_inner(
-            send,
-            recv,
-            store,
-            owner,
-            local_machine,
-            peer_machine,
-            &mut on_accept,
-        ),
+        negotiate_sync_session(send, recv, store, owner, local_machine, peer_machine),
     )
     .await
-    .map_err(|_| SyncError::SessionTimeout)?
+    .map_err(|_| SyncError::SessionTimeout)??;
+    let owner_id = owner.user_id();
+    let outcome = store.commit_batch(pending.verified, &owner_id).await?;
+    let mut summary = pending.summary;
+    summary.accepted = outcome.accepted.len();
+    summary.superseded = outcome.superseded;
+    summary.equivocations = outcome.equivocations;
+    // Apply committed records only now, so partial sessions never mutate
+    // live daemon state.
+    for record in outcome.accepted {
+        on_accept(&record);
+    }
+    Ok(summary)
 }
 
-/// The session body (no timeout wrapper).
-async fn run_sync_session_inner<S, R, F>(
+/// A session that cleared every gate and exchange but has not yet committed.
+struct PendingCommit {
+    summary: SessionSummary,
+    verified: Vec<VersionedRecord>,
+}
+
+/// The network protocol body (no timeout wrapper, no commit — the caller
+/// commits the verified batch outside the time budget).
+async fn negotiate_sync_session<S, R>(
     send: &mut S,
     recv: &mut R,
     store: &OwnerSyncStore,
     owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
-    on_accept: &mut F,
-) -> Result<SessionSummary, SyncError>
+) -> Result<PendingCommit, SyncError>
 where
     S: AsyncWrite + Unpin,
     R: AsyncRead + Unpin,
-    F: FnMut(&VersionedRecord),
 {
     let owner_id = owner.user_id();
     let mut summary = SessionSummary::default();
@@ -1447,25 +1537,16 @@ where
     write_frame(send, &SyncFrame::Done).await?;
 
     // Receive the peer's paged records (terminated by their Done or an
-    // Abort); verify EVERY record before any commit — one forgery aborts
-    // with nothing stored (review R2 finding 4).
+    // Abort); verify EVERY record before returning — one forgery aborts
+    // with nothing stored (review R2 finding 4). The caller commits the
+    // verified batch atomically, outside the session's time budget.
     let inbound = read_paged_records(recv).await?;
     let mut verified = Vec::with_capacity(inbound.len());
     for record in inbound {
         record.verify_owner(&owner_id)?;
         verified.push(record);
     }
-    let outcome = store.commit_batch(verified, &owner_id).await?;
-    summary.accepted = outcome.accepted.len();
-    summary.superseded = outcome.superseded;
-    summary.equivocations = outcome.equivocations;
-
-    // Apply committed records after the clean Done so partial sessions never
-    // mutate live daemon state.
-    for record in outcome.accepted {
-        on_accept(&record);
-    }
-    Ok(summary)
+    Ok(PendingCommit { summary, verified })
 }
 
 /// Write the version table as bounded pages (always at least one page, so
@@ -1474,14 +1555,35 @@ async fn write_paged_vector<S: AsyncWrite + Unpin>(
     send: &mut S,
     vector: &[KindVersions],
 ) -> Result<(), SyncError> {
-    // Each frame carries one kind with at most VV_ENTRIES_PER_FRAME entries.
+    // Each frame carries one kind with at most VV_ENTRIES_PER_FRAME
+    // entries AND at most ~VV_PAGE_BYTES of serialized entries (byte
+    // budget; review R3 finding 5).
+    const ENTRY_OVERHEAD_BYTES: usize = 96; // clock (48) + hash (32) + framing
     let mut pages: Vec<KindVersions> = Vec::new();
     for kv in vector {
-        for chunk in kv.entries.chunks(VV_ENTRIES_PER_FRAME) {
-            pages.push(KindVersions {
-                kind: kv.kind,
-                entries: chunk.to_vec(),
-            });
+        let mut current = KindVersions {
+            kind: kv.kind,
+            entries: Vec::new(),
+        };
+        let mut current_bytes = 0usize;
+        for entry in &kv.entries {
+            let entry_bytes = entry.0.len() + ENTRY_OVERHEAD_BYTES;
+            if !current.entries.is_empty()
+                && (current.entries.len() >= VV_ENTRIES_PER_FRAME
+                    || current_bytes + entry_bytes > VV_PAGE_BYTES)
+            {
+                pages.push(current);
+                current = KindVersions {
+                    kind: kv.kind,
+                    entries: Vec::new(),
+                };
+                current_bytes = 0;
+            }
+            current_bytes += entry_bytes;
+            current.entries.push(entry.clone());
+        }
+        if !current.entries.is_empty() {
+            pages.push(current);
         }
     }
     for page in pages {
@@ -1507,6 +1609,16 @@ async fn read_paged_vector<R: AsyncRead + Unpin>(
                         return Err(SyncError::TooManyRecords(format!(
                             "version vector exceeds {MAX_VECTOR_ENTRIES} entries"
                         )));
+                    }
+                    for (key, ..) in &kv.entries {
+                        if key.len() > MAX_KEY_BYTES {
+                            // Structural bound, same as records (review R3
+                            // finding 5).
+                            return Err(SyncError::MalformedFrame(format!(
+                                "vector key of {} bytes exceeds limit {MAX_KEY_BYTES}",
+                                key.len()
+                            )));
+                        }
                     }
                     merged.entry(kv.kind).or_default().extend(kv.entries);
                 }
@@ -1703,35 +1815,45 @@ impl OwnerSyncService {
         Some((owner, self.agent.machine_id()))
     }
 
-    /// Spawn the inbound acceptor drain loop. Each accepted stream is
-    /// enrollment-gated, then runs one session under a concurrency permit.
+    /// Spawn the inbound acceptor drain loop. A session permit is acquired
+    /// IN THE LOOP, BEFORE the per-stream task is spawned (review R3
+    /// finding 5): the permit moves into the task, so the set of live
+    /// session tasks is bounded by the semaphore — a flood of inbound
+    /// streams cannot spawn unbounded tasks. Without a permit the stream
+    /// is dropped (reset) right there.
     async fn spawn_acceptor_loop(self: &Arc<Self>, mut acceptor: crate::streams::StreamAcceptor) {
         let service = Arc::clone(self);
         let task = tokio::spawn(async move {
             while let Some(stream) = acceptor.next().await {
+                let permit = match service.session_permits.clone().try_acquire_owned() {
+                    Ok(permit) => permit,
+                    Err(_) => {
+                        tracing::warn!(
+                            target: "x0x::owner_sync",
+                            "SyncV1 stream dropped: session limit reached"
+                        );
+                        continue; // drop => reset, fail closed and bounded
+                    }
+                };
                 let service = Arc::clone(&service);
-                tokio::spawn(async move { service.handle_inbound(stream).await });
+                tokio::spawn(async move { service.handle_inbound(stream, permit).await });
             }
         });
         self.tasks.lock().await.push(task);
     }
 
     /// Inbound path: the ADR-0022 machine identity gates have already
-    /// cleared in the shared accept loop; enforce the owner device set
-    /// (blocker 30) — an unenrolled machine's stream is dropped (reset)
-    /// with zero application bytes read. A session permit is REQUIRED
-    /// before any protocol byte: without one the stream is dropped, so a
-    /// flood of streams cannot wedge an unbounded task set.
-    async fn handle_inbound(&self, stream: crate::streams::PeerStream) {
+    /// cleared in the shared accept loop; the caller holds the session
+    /// permit (acquired before this task was spawned). Enforce the owner
+    /// device set (blocker 30) — an unenrolled machine's stream is dropped
+    /// (reset) with zero application bytes read.
+    async fn handle_inbound(
+        &self,
+        stream: crate::streams::PeerStream,
+        _permit: tokio::sync::OwnedSemaphorePermit,
+    ) {
         let Some(owner_kp) = self.owner_kp() else {
             return;
-        };
-        let Ok(permit) = self.session_permits.clone().try_acquire_owned() else {
-            tracing::warn!(
-                target: "x0x::owner_sync",
-                "SyncV1 stream dropped: session limit reached"
-            );
-            return; // drop => reset, fail closed and bounded
         };
         let local_machine = self.agent.machine_id();
         let peer = stream.peer();
@@ -1754,7 +1876,6 @@ impl OwnerSyncService {
             |record| self.apply_record(record),
         )
         .await;
-        drop(permit);
         match result {
             Ok(summary) => {
                 tracing::debug!(
@@ -2064,22 +2185,22 @@ impl Drop for OwnerSyncService {
 mod tests {
     use super::*;
 
-    fn owner_kp(seed: u8) -> UserKeypair {
+    pub(in crate::owner_sync) fn owner_kp(seed: u8) -> UserKeypair {
         UserKeypair::from_seed(&[seed; 32]).expect("deterministic keypair")
     }
 
-    fn machine(id: u8) -> MachineId {
+    pub(in crate::owner_sync) fn machine(id: u8) -> MachineId {
         MachineId([id; 32])
     }
 
-    fn names_value(display: &str) -> SyncValue {
+    pub(in crate::owner_sync) fn names_value(display: &str) -> SyncValue {
         SyncValue::MachineNames {
             display_name: Some(display.to_string()),
             machine_name: None,
         }
     }
 
-    fn clock(version: u64, ts: u64, writer: u8) -> RecordClock {
+    pub(in crate::owner_sync) fn clock(version: u64, ts: u64, writer: u8) -> RecordClock {
         RecordClock {
             version,
             signed_at_ms: ts,
@@ -2087,7 +2208,21 @@ mod tests {
         }
     }
 
-    fn sign_names(
+    /// Cross-enroll two machines under `owner` for r3 session tests.
+    pub(in crate::owner_sync) async fn cross_enroll_for_tests(
+        a: &OwnerSyncStore,
+        b: &OwnerSyncStore,
+        owner: &UserKeypair,
+    ) {
+        a.enroll(OwnerEnrollment::sign(machine(2), owner, 1_000, None).unwrap())
+            .await
+            .unwrap();
+        b.enroll(OwnerEnrollment::sign(machine(1), owner, 1_000, None).unwrap())
+            .await
+            .unwrap();
+    }
+
+    pub(in crate::owner_sync) fn sign_names(
         key: &str,
         display: &str,
         clock: RecordClock,
@@ -2742,5 +2877,279 @@ mod tests {
         .expect_err("stalled peer must time out");
         assert_eq!(err, SyncError::SessionTimeout);
         peer_hello.abort();
+    }
+}
+
+#[cfg(test)]
+mod r3_tests {
+    use super::tests::{clock, machine, names_value, owner_kp, sign_names};
+    use super::*;
+
+    #[tokio::test]
+    async fn corrupt_or_unreadable_state_files_fail_loud() {
+        // WHY: review R3 finding 2 — a records/devices file that EXISTS
+        // but is corrupt or unreadable must be a hard error, never a
+        // silent fallback to an empty anti-rollback store. Only genuine
+        // absence (fresh install) is empty.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let sync_dir = dir.path().join(SYNC_DIR);
+        tokio::fs::create_dir_all(&sync_dir).await.unwrap();
+
+        // Fresh install (both files absent) → empty store, Ok.
+        let store = OwnerSyncStore::load(dir.path()).await.expect("fresh load");
+        assert!(store.records_snapshot().await.is_empty());
+        assert!(store.enrolled_devices().await.is_empty());
+
+        // Corrupt records.json → Err.
+        tokio::fs::write(sync_dir.join(RECORDS_FILE), b"{ not json")
+            .await
+            .unwrap();
+        let err = match OwnerSyncStore::load(dir.path()).await {
+            Err(e) => e,
+            Ok(_) => panic!("corrupt records must fail loud"),
+        };
+        assert!(err.to_string().contains("refusing to start"), "{err}");
+        tokio::fs::remove_file(sync_dir.join(RECORDS_FILE))
+            .await
+            .unwrap();
+
+        // Corrupt devices.json → Err.
+        tokio::fs::write(sync_dir.join(DEVICES_FILE), b"]]]")
+            .await
+            .unwrap();
+        assert!(OwnerSyncStore::load(dir.path()).await.is_err());
+
+        // Unreadable (permission-denied) records.json → Err (Unix only).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            tokio::fs::remove_file(sync_dir.join(DEVICES_FILE))
+                .await
+                .unwrap();
+            tokio::fs::write(sync_dir.join(RECORDS_FILE), b"{}")
+                .await
+                .unwrap();
+            std::fs::set_permissions(
+                sync_dir.join(RECORDS_FILE),
+                std::fs::Permissions::from_mode(0o000),
+            )
+            .unwrap();
+            let result = OwnerSyncStore::load(dir.path()).await;
+            std::fs::set_permissions(
+                sync_dir.join(RECORDS_FILE),
+                std::fs::Permissions::from_mode(0o644),
+            )
+            .unwrap();
+            assert!(result.is_err(), "unreadable state file must fail loud");
+        }
+    }
+
+    #[tokio::test]
+    async fn rollback_restores_pre_batch_value_not_first_replacement() {
+        // WHY: review R3 finding 4 — a batch that replaces the SAME key
+        // twice and then fails (persistence error here) must restore the
+        // PRE-BATCH value, not the first replacement.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let key = "double";
+        let pre = sign_names(key, "pre", clock(1, 1, 1), &owner);
+        store
+            .commit_batch(vec![pre.clone()], &owner_id)
+            .await
+            .expect("seed");
+
+        // Break persistence, then commit a batch replacing the key twice.
+        let sync_dir = dir.path().join(SYNC_DIR);
+        std::fs::remove_dir_all(&sync_dir).unwrap();
+        std::fs::write(&sync_dir, b"not a directory").unwrap();
+        let batch = vec![
+            sign_names(key, "first-replacement", clock(2, 2, 1), &owner),
+            sign_names(key, "second-replacement", clock(3, 3, 1), &owner),
+        ];
+        assert!(store.commit_batch(batch, &owner_id).await.is_err());
+
+        // The store holds the PRE-batch value, not the first replacement.
+        let snapshot = store.records_snapshot().await;
+        assert_eq!(snapshot.len(), 1, "one record");
+        assert_eq!(snapshot[0].value, names_value("pre"));
+        assert_eq!(snapshot[0].clock.version, 1, "pre-batch clock restored");
+    }
+
+    #[tokio::test]
+    async fn oversize_values_rejected_at_verify_and_mint() {
+        // WHY: review R3 finding 5 — values are bounded so no legal record
+        // or page can exceed the frame limit.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+
+        let huge = SyncValue::IssuanceJournal {
+            agent_id: "a".into(),
+            cert_digest: "x".repeat(MAX_VALUE_BYTES + 1024),
+            issued_at: 1,
+            not_after: None,
+        };
+        // mint refuses before signing.
+        let err = store
+            .mint(SyncKind::IssuanceJournal, "a", &huge, &owner, machine(1))
+            .await
+            .expect_err("oversize value must not mint");
+        assert!(matches!(err, SyncError::MalformedFrame(_)), "{err:?}");
+
+        // A hand-signed record with an oversize value fails verify (and
+        // therefore every merge/session path).
+        let record = VersionedRecord::sign(
+            SyncKind::IssuanceJournal,
+            "a",
+            &huge,
+            clock(1, 1, 1),
+            &owner,
+        )
+        .expect("sign (sign itself does not check size)");
+        let err = record.verify().expect_err("oversize value must not verify");
+        assert!(err.to_string().contains("exceeds limit"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn store_larger_than_old_session_cap_syncs_to_fresh_peer() {
+        // WHY: review R3 finding 5 — the session record cap must cover a
+        // FULL valid store (previously 1024 < 4096, so a fresh peer could
+        // never atomically sync a full store).
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+        let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
+        super::tests::cross_enroll_for_tests(&store_a, &store_b, &owner).await;
+
+        // 1_100 records — above the old 1_024 cap, one atomic commit (fast;
+        // per-record minting would re-write the file per record).
+        const N: usize = 1_100;
+        let owner_id = owner.user_id();
+        let batch: Vec<VersionedRecord> = (0..N)
+            .map(|i| {
+                VersionedRecord::sign(
+                    SyncKind::IssuanceJournal,
+                    &format!("agent-{i:04}"),
+                    &SyncValue::IssuanceJournal {
+                        agent_id: format!("agent-{i:04}"),
+                        cert_digest: format!("digest-{i:04}"),
+                        issued_at: i as u64,
+                        not_after: None,
+                    },
+                    clock(1, 1, 1),
+                    &owner,
+                )
+                .unwrap()
+            })
+            .collect();
+        store_a.commit_batch(batch, &owner_id).await.unwrap();
+        assert_eq!(store_a.records_snapshot().await.len(), N);
+
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (mut c_recv, mut c_send) = tokio::io::split(server);
+        let (mut r_recv, mut r_send) = tokio::io::split(client);
+        let responder_owner = UserKeypair::from_seed(&[7u8; 32]).expect("same owner keypair");
+        let b = Arc::clone(&store_b);
+        let responder = tokio::spawn(async move {
+            run_sync_session(
+                &mut r_send,
+                &mut r_recv,
+                &b,
+                &responder_owner,
+                &machine(2),
+                &machine(1),
+                |_| {},
+            )
+            .await
+            .expect("responder")
+        });
+        let summary = run_sync_session(
+            &mut c_send,
+            &mut c_recv,
+            &store_a,
+            &owner,
+            &machine(1),
+            &machine(2),
+            |_| {},
+        )
+        .await
+        .expect("initiator syncs a full store");
+        responder.await.unwrap();
+        assert_eq!(summary.shipped, N);
+        assert_eq!(
+            store_b.records_snapshot().await.len(),
+            N,
+            "fresh peer received the FULL store atomically"
+        );
+    }
+
+    #[tokio::test]
+    async fn large_values_page_by_bytes_and_converge() {
+        // WHY: review R3 finding 5 — pages split on a BYTE budget, not a
+        // fixed record count, so values near the (bounded) cap cannot push
+        // a 16-record page over the frame limit.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let owner = owner_kp(7);
+        let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+        let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
+        super::tests::cross_enroll_for_tests(&store_a, &store_b, &owner).await;
+
+        // 10 records × ~8 KiB values: under the 16-record page count but
+        // ~80 KiB total — the byte budget MUST split the pages.
+        const N: usize = 10;
+        let owner_id = owner.user_id();
+        let batch: Vec<VersionedRecord> = (0..N)
+            .map(|i| {
+                VersionedRecord::sign(
+                    SyncKind::IssuanceJournal,
+                    &format!("big-{i}"),
+                    &SyncValue::IssuanceJournal {
+                        agent_id: format!("big-{i}"),
+                        cert_digest: "d".repeat(8 * 1024),
+                        issued_at: i as u64,
+                        not_after: None,
+                    },
+                    clock(1, 1, 1),
+                    &owner,
+                )
+                .unwrap()
+            })
+            .collect();
+        store_a.commit_batch(batch, &owner_id).await.unwrap();
+
+        let (client, server) = tokio::io::duplex(256 * 1024);
+        let (mut c_recv, mut c_send) = tokio::io::split(server);
+        let (mut r_recv, mut r_send) = tokio::io::split(client);
+        let responder_owner = UserKeypair::from_seed(&[7u8; 32]).expect("same owner keypair");
+        let b = Arc::clone(&store_b);
+        let responder = tokio::spawn(async move {
+            run_sync_session(
+                &mut r_send,
+                &mut r_recv,
+                &b,
+                &responder_owner,
+                &machine(2),
+                &machine(1),
+                |_| {},
+            )
+            .await
+            .expect("responder")
+        });
+        let summary = run_sync_session(
+            &mut c_send,
+            &mut c_recv,
+            &store_a,
+            &owner,
+            &machine(1),
+            &machine(2),
+            |_| {},
+        )
+        .await
+        .expect("byte-paged session");
+        responder.await.unwrap();
+        assert_eq!(summary.shipped, N);
+        assert_eq!(store_b.records_snapshot().await.len(), N);
     }
 }
