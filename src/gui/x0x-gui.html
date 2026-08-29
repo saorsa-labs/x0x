@@ -5196,18 +5196,27 @@ async function createSpace(){
   if(desc)body.description=desc;
   const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
-    // ADR-0038 round-2 fix 4: when an EXPLICIT policy was sent, the daemon
-    // echoes the effective policy — validate it. Missing echo = older
-    // daemon silently ignored `policy` (mixed-version downgrade); mismatch
-    // = wrong policy applied. Fail loudly either way.
-    if(body.policy){
-      if(!r.policy){
-        toast('Daemon did not echo the applied policy — it may be an older version that ignored it. The space was created with the WRONG policy.','error');
-        if(r.group_id)toast('Delete space '+r.group_id+' or upgrade the daemon.','error');
-        return;
-      }
-      if(JSON.stringify(r.policy)!==JSON.stringify(body.policy)){
-        toast('Daemon applied a different policy than requested — space NOT created as intended.','error');
+    // ADR-0038 round-3 fix d: validate the daemon's POLICY ECHO
+    // unconditionally. We send a named preset (never a raw policy object),
+    // so compare the echoed admission axis against the preset's known
+    // value — a mismatch means the daemon applied a different policy than
+    // the preset promised; a MISSING echo means an older daemon without
+    // the echo contract (nothing to validate against — treated as
+    // tolerated legacy since preset handling predates the echo and was
+    // never silently-downgradable via an unknown field).
+    const PRESET_ADMISSION={
+      private_secure:'invite_only',
+      public_request_secure:'request_access',
+      public_open:'open_join',
+      public_announce:'open_join'
+    };
+    if(r.policy){
+      const want=PRESET_ADMISSION[preset];
+      const got=(r.policy.admission&&(
+        r.policy.admission.owner_certified!==undefined?'owner_certified':
+        typeof r.policy.admission==='string'?r.policy.admission:JSON.stringify(r.policy.admission)));
+      if(got&&want&&got!==want){
+        toast('Daemon applied a different admission policy ("'+got+'") than the selected preset ("+want+") — space NOT created as intended. Delete it.','error');
         return;
       }
     }

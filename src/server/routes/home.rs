@@ -231,6 +231,21 @@ async fn reseal_home(state: &Arc<AppState>, group_id: &str) -> Option<crate::gro
         groups.get(group_id).cloned()?
     };
     info.home.as_ref()?;
+    // Round-3 fix b: explicit Admin-role gate — resealing writes a signed
+    // commit for the group; only an active Admin (or better) of THIS group
+    // may author it. find_home guarantees it on the trusted path, but this
+    // function is also the chokepoint for any future caller.
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    if !info
+        .caller_role(&local_hex)
+        .is_some_and(|role| role.at_least(crate::groups::GroupRole::Admin))
+    {
+        tracing::warn!(
+            group_id,
+            "refusing to reseal Home metadata: local agent is not an active Admin"
+        );
+        return None;
+    }
     if seal_commit_owner_certified(state, &mut info, signing_kp, now_millis_u64())
         .await
         .is_err()
@@ -280,6 +295,64 @@ async fn repair_or_write_marker(
     }
 }
 
+/// Round-3 fix a: restore-side digest verification for EVERY group with
+/// nonempty `home` metadata (not just the trusted-Home pick). A record
+/// whose state hash does not commit to its digest is legacy-unsigned or
+/// tampered; reseal only when the group is OUR-owner Home policy with our
+/// active Admin seat, otherwise strip + warn.
+async fn verify_restored_home_records(state: &Arc<AppState>, owner: &crate::identity::UserId) {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let records: Vec<(String, bool, bool)> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| info.home.is_some() && !info.state_hash_is_current())
+            .map(|(id, info)| {
+                let ours = is_home_policy(&info.policy, owner);
+                let admin = info
+                    .caller_role(&local_hex)
+                    .is_some_and(|r| r.at_least(crate::groups::GroupRole::Admin));
+                (id.clone(), ours, admin)
+            })
+            .collect()
+    };
+    for (id, ours, admin) in records {
+        if ours && admin {
+            tracing::warn!(
+                group_id = %id,
+                "restored Home metadata is not covered by the sealed state hash; resealing"
+            );
+            if reseal_home(state, &id).await.is_some() {
+                tracing::info!(group_id = %id, "legacy Home metadata resealed");
+            } else {
+                tracing::warn!(
+                    group_id = %id,
+                    "reseal failed; stripping untrusted Home metadata"
+                );
+                strip_home_metadata(state, &id).await;
+            }
+        } else {
+            tracing::warn!(
+                group_id = %id,
+                "restored Home metadata is unsigned and the group is not ours to reseal \
+                 (foreign owner, non-Home policy, or no Admin seat); stripping"
+            );
+            strip_home_metadata(state, &id).await;
+        }
+    }
+}
+
+/// Strip untrusted Home metadata from a group (persisted).
+async fn strip_home_metadata(state: &AppState, group_id: &str) {
+    let _ = persist_named_groups_mutation(state, |groups| {
+        if let Some(info) = groups.get_mut(group_id) {
+            info.home = None;
+        }
+        true
+    })
+    .await;
+}
+
 /// Auto-provision the Home space for an owned install. Idempotent and
 /// best-effort: never fails startup — a provisioning failure logs loudly
 /// and retries on the next daemon start (no marker is written on failure).
@@ -298,6 +371,15 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     let owner = user_kp.user_id();
     let owner_hex = hex::encode(owner.as_bytes());
     let marker_path = state.data_dir.join(HOME_MARKER_FILE);
+
+    // 0) Round-3 fix a: verify EVERY restored nonempty `home` record —
+    //    BEFORE any trusted-Home filtering, so foreign-owner, inactive,
+    //    malformed, and unowned records cannot skip digest verification
+    //    just because find_home would reject them. Mismatch or
+    //    legacy-unsigned → reseal when this group is our-owner Home policy
+    //    AND we hold an active Admin seat; otherwise strip the metadata
+    //    with a warning (unsigned Home claims never survive restore).
+    verify_restored_home_records(state, &owner).await;
 
     // 1) Trusted Home already present (the marker is only advisory — the
     //    roster scan is authoritative). Repair a missing/stale marker.
@@ -1082,7 +1164,24 @@ mod round2_tests {
             !legacy.state_hash_is_current(),
             "legacy-unsigned metadata detected"
         );
+        // Round-3 fix c: REAL write-to-disk + reload through the restore
+        // path (not an in-memory swap) — persist the legacy roster, reload
+        // via load_named_groups exactly like a daemon restart, and swap the
+        // reloaded map into state.
         state.named_groups.write().await.insert(id.clone(), legacy);
+        assert!(
+            super::super::named_groups::save_named_groups(&state).await,
+            "legacy roster persisted to disk"
+        );
+        let reloaded =
+            super::super::named_groups::load_named_groups(&state.named_groups_path).await?;
+        assert!(
+            reloaded
+                .get(&id)
+                .is_some_and(|i| !i.state_hash_is_current()),
+            "the reloaded record decodes legacy-unsigned, as a restart would see"
+        );
+        *state.named_groups.write().await = reloaded;
 
         // Restore path: provision_home must reseal.
         provision_home(&state).await;
@@ -1099,8 +1198,8 @@ mod round2_tests {
     }
 
     /// WHY (round-2 fix 1, strip branch): when resealing is impossible the
-    /// untrusted metadata is STRIPPED and the group is re-stamped fresh —
-    /// unsigned claims never survive a restore.
+    /// untrusted metadata is STRIPPED — unsigned claims never survive a
+    /// restore.
     #[tokio::test]
     async fn unrestorable_home_metadata_is_stripped() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1109,15 +1208,34 @@ mod round2_tests {
         provision_home(&state).await;
         let (id, info) = find_home(&state, &owner).await.expect("home");
 
-        // Make resealing impossible: withdraw the group (the seal wrapper
-        // refuses withdrawn groups) while keeping the stale unsigned hash.
+        // Round-3 fix c: make resealing GENUINELY fail — demote our agent
+        // from Admin to Member. The reseal Admin gate refuses and the
+        // sweep's `ours && admin` condition is false, so the only remaining
+        // path is STRIP (this actually exercises the failure, unlike the
+        // previous withdrawn-flag trick which never reached the gate).
         let mut broken = info.clone();
-        broken.withdrawn = true;
-        broken.recompute_state_hash(); // withdrawn hash recomputed WITH digest…
-                                       // …then revert the withdrawn flag in-memory without resealing, so the
-                                       // stored hash no longer matches the current fields.
-        broken.withdrawn = false;
-        assert!(!broken.state_hash_is_current());
+        let meta = crate::groups::state_commit::GroupPublicMeta {
+            home_digest: None,
+            ..broken.public_meta()
+        };
+        let roster_root = crate::groups::compute_roster_root(&broken.members_v2);
+        let policy_hash = crate::groups::compute_policy_hash(&broken.policy);
+        let meta_hash = crate::groups::compute_public_meta_hash(&meta);
+        broken.state_hash = crate::groups::state_commit::compute_state_hash(
+            broken.stable_group_id(),
+            broken.state_revision,
+            broken.prev_state_hash.as_deref(),
+            &roster_root,
+            &policy_hash,
+            &meta_hash,
+            broken.security_binding.as_deref(),
+            broken.withdrawn,
+        );
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        if let Some(member) = broken.members_v2.get_mut(&local_hex) {
+            member.role = crate::groups::GroupRole::Member;
+        }
+        assert!(!broken.state_hash_is_current(), "unsigned condition holds");
         state.named_groups.write().await.insert(id.clone(), broken);
 
         provision_home(&state).await;

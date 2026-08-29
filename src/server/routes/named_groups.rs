@@ -19669,7 +19669,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
 
 #[must_use]
 #[cfg(test)]
-async fn save_named_groups(state: &AppState) -> bool {
+pub(in crate::server) async fn save_named_groups(state: &AppState) -> bool {
     match save_named_groups_checked(state).await {
         Ok(AtomicWriteOutcome::Durable) => true,
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
