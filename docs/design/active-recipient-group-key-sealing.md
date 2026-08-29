@@ -153,3 +153,122 @@ Until that reachability and closed outcome accounting exist, repository and CI
 status must describe the active-recipient property as not covered. Landing an
 ignored stub or CI-only job does not discharge ADR 0027 Validation and does not
 make its status a merge gate.
+
+---
+
+## Extracted from ADR-0027 (2026-08-29)
+
+> Relocated verbatim from the immutable ADR body per the 2026-08-23 ADR audit;
+> this chapter is the maintained home for it.
+
+### G-001 — Manual reseal selects a retained inactive roster entry
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Context and Decision.
+
+Removal marks Bob's `members_v2` entry `Removed` but retains the entry and KEM
+key (`src/groups/mod.rs:972-978`). `secure_group_reseal` requires the caller
+to be active but selects the recipient with a bare `members_v2.get`
+(`src/server/routes/named_groups.rs:12459-12466`). At this pin, Alice can
+therefore reseal her locally present current-epoch secret to removed Bob.
+
+The production `secure/open-envelope` route has no roster lookup and rejects
+only a withdrawn-group conflict before and after crypto
+(`src/server/routes/named_groups.rs:10107-10113,10159-10173,12548-12598`).
+An absent removed-self record is not withdrawn, so Bob can open that envelope
+after terminal 404 and use the recovered key against survivor content. This
+observation grounds the defect; the endpoint's product disposition remains
+deferred.
+
+---
+
+### G-002 — Current local state retains one logical secret and epoch pair
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: the current-epoch scope.
+
+`GroupInfo` retains one logical `shared_secret` / `secret_epoch` pair, not a
+previous-secret collection; `rotate_shared_secret` replaces that pair with
+the newly generated secret and incremented epoch
+(`src/groups/mod.rs:143-149,418-436`).
+
+Separately, the surveyed production GSS envelope producers expose no explicit
+previous-epoch selection surface: the admin-remove and ban producers seal a
+freshly rotated pair, while the approval and manual-reseal producers seal the
+daemon's one locally present pair
+(`src/server/routes/named_groups.rs:8595-8642,10499-10560,11050-11087,12472-12504`).
+None of those surveyed producers accepts a caller-selected secret or epoch or
+reads a historical-key source.
+
+Re-review this boundary for every new or changed recipient-selecting path and
+every new source of group key material, whether request input, persistence,
+cache, derivation, or otherwise. A `GroupInfo` schema change is one trigger,
+not the trigger.
+
+---
+
+### G-003 — The bounded survey does not establish global epoch currency
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: the current-epoch scope and Consequences.
+
+`secure_group_reseal` reads one daemon's local record under its local lock and
+does not consult a global-current oracle
+(`src/server/routes/named_groups.rs:12451-12480`). In an asynchronous
+multi-daemon system, its locally present pair may be older than another
+daemon's accepted state.
+
+A future explicit previous-epoch selector triggers the need for an
+epoch-relative entitlement decision. Policy for a locally
+stale-but-present pair is a separate consistency question that this
+active-member rule does not answer.
+
+---
+
+### G-004 — The call path, not the primitive, holds recipient authority
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Decision and the compile-time exception.
+
+Public `seal_group_secret_to_recipient` has no group or roster input
+(`src/groups/kem_envelope.rs:133-167`) and is called by the production manual
+reseal handler
+(`src/server/routes/named_groups.rs:12498-12504`). The primitive may therefore
+remain shared and compiled into production; each production call path that
+chooses its named recipient must establish active membership first.
+
+---
+
+### G-005 — Authentication does not erase the recipient-selection threat
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Context, Decision Drivers, and the threat boundary in Validation.
+
+The route sits behind router-wide authentication
+(`src/server/mod.rs:1252-1259,1370-1374`), which accepts a durable bearer or
+session token without a per-request agent identity
+(`src/server/auth.rs:54-73`; `src/server/routes/tasks.rs:24-31`). The reseal
+handler instead derives the acting member from the daemon's own agent
+identity.
+
+The guard therefore fails closed against accidental, buggy, and malicious
+authenticated product requests that try to select an inactive recipient,
+including an API client that does not possess the raw group secret. It does
+not contain daemon/host compromise or any principal able to extract the secret
+and invoke the roster-agnostic sealing primitive outside the guarded call
+path, as the current handler documentation acknowledges
+(`src/server/routes/named_groups.rs:12421-12424`).
+
+The function comment says "known member" and matches the current code, while
+the request-field comment says "active member." The implementation must remove
+that contradictory contract when this decision lands.

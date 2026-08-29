@@ -191,3 +191,144 @@ Resolves at: `e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
    preflight/postflight receipts. Retain `--name testnet`.
 7. Identify the exact Obsidian target and governing sync rule, then perform
    the `tests/CLAUDE.md` sync as post-merge housekeeping.
+
+---
+
+## Extracted from ADR-0026 (2026-08-29)
+
+> Relocated verbatim from the immutable ADR body per the 2026-08-23 ADR audit;
+> this chapter is the maintained home for it.
+
+### G-001 — Effective roots have load-bearing inputs outside explicit TOML
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Context, Decision 1, and Decision 2.
+
+Repository surfaces: `src/server/state.rs`, `src/bin/x0xd.rs`,
+`src/history/mod.rs`, `Cargo.toml`.
+
+Observed result: `data_dir` is a top-level `DaemonConfig` field with a
+default; the process environment participates in the platform default; named
+instances deliberately derive instance-scoped roots; and
+`HistoryConfig.db_path` may override only the history database. Therefore
+neither "explicit TOML only" nor an enumerated input-kind list is a sound
+architectural invariant.
+
+External evidence: Buzz events
+`d3766357fd854693454163a5e706e958810e3d7a0549b31a92be553f0011ab0e`
+and
+`175eb61f92cc87064bf7a898a5c72e397fd12e66a19ab1219a909034f6378fdd`.
+
+---
+
+### G-002 — Accepted decisions require separate state but do not govern the path
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Context, the additive relationship, and Decision 1.
+
+Repository surfaces:
+`docs/adr/0011-bootstrap-dual-listen-udp-443.md`,
+`docs/adr/0023-durable-local-history.md`,
+`src/history/mod.rs`.
+
+Observed result: ADR 0011 requires two bootstrap listeners and describes a
+separate state directory for the 443 instance. ADR 0023 binds ordinary
+history storage to the per-instance data directory. Neither decision defines
+one authoritative installation/configuration resolution path or a
+complete-running-set observation. The new decision is additive, not
+superseding.
+
+---
+
+### G-003 — The tracked production deployment paths contradict one another
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Context, Decision 2, and the known non-compliance consequence.
+
+Repository surfaces: `.deployment/deploy.sh`,
+`.deployment/x0xd.service`, `.deployment/systemd/x0xd.service`,
+`.deployment/README.md`, `.deployment/deploy-443.sh`.
+
+Observed result: `deploy.sh` uploads `/etc/x0x/bootstrap.toml` and installs a
+unit that reads `/etc/x0x/x0xd.toml`. The reproducible-bring-up section and
+the measured live unit instead identify a unit reading
+`/etc/x0x/config.toml`. `deploy-443.sh` also names one source path in its
+header and reads another in its executable body. The tree does not determine
+one reproducible production resolution path.
+
+External evidence: Buzz events
+`0f99a9f608ef80da00289525d74c6bbcab07a6b67c6c6bb452fb8b060e3893e7`
+and
+`2d230d6dfc9f32c7b0932acf93ab166c832e7c6127757f78c035a978653ee582`,
+with the current pinned-tree audit in
+`3a28517b1ef436f9a8e78b0b29372f7e0d07948995087698308e1f45de4035ed`.
+
+---
+
+### G-004 — Live configs omit `data_dir`; open files show current separation
+
+Observation date: 2026-07-29.
+
+Supports: Context, Decision 2, and standing runtime observation.
+
+External evidence: Buzz event
+`cb63c05940159ca1065bec1c12545251adbea879ce0ac3b2a6d1c35cb1c4c593`.
+
+Observed result: on the five requested reachable nodes
+`saorsa-2/3/6/8/9`, `/etc/x0x/config.toml` contained no `data_dir`, while
+read-only open-file observation showed production history under
+`/root/.local/share/x0x`, testnet under
+`/root/.local/share/x0x-testnet`, and the 443 listener under
+`/var/lib/x0x-443/data`. The open history files corroborate current
+separation but are not, alone, an effective-root authority because a
+subsystem override is possible. This is a dated, scoped fleet observation,
+not a timeless claim.
+
+---
+
+### G-005 — Running testnet daemons have no tracked authority
+
+Repository resolution:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Fleet observation date: 2026-07-29.
+
+Supports: Decision 3 and the known non-compliance consequence.
+
+Repository surface: `.deployment/**`.
+
+Observed result: the repository contains no testnet unit or installation
+path, while the measured fleet ran `x0xd-testnet` on all six nodes on
+2026-07-29. The processes are therefore not attributable to a tracked
+authoritative path even though their roots happened to be distinct.
+
+External evidence: Buzz events
+`175eb61f92cc87064bf7a898a5c72e397fd12e66a19ab1219a909034f6378fdd`
+and the exact six-node observation at
+`ed87f4ccfc934a1d34bf913ace7f6bacc56116ef1126be25defa7777be609448`
+(published 2026-07-29T08:24:11Z).
+
+---
+
+### G-006 — No required gate observes `.deployment/`
+
+Resolves at:
+`e04b73a73fd44ebeb7af661bcf623dbd20b2f88e`.
+
+Supports: Validation.
+
+Repository surfaces: `.github/**`, `justfile`, `.deployment/**`.
+
+Observed result: `.github/` contains no reference to `.deployment/`, and
+`just check` runs Rust formatting, lint, build, ordinary tests, and
+documentation only. The deployment scripts and unit files have no required
+static authority check or runtime observation.
+
+External evidence: Buzz event
+`737753aa4df467796a88638cdadbfeee937eed6e0620676febc0fd6f43424f30`.
