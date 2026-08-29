@@ -36,8 +36,10 @@ std thread** that survives a fully wedged async runtime
 1. The watchdog runs on its own std thread (`x0x-api-watchdog`) and probes
    with a raw loopback `GET /health HTTP/1.0` — no async, no client
    library (`src/server/api_watchdog.rs:209-235`); `ProbeOutcome`
-   distinguishes `Timeout` (TCP accepted, HTTP unanswered — the #384
-   signature) from `Refused`/`Io`/`Served`.
+   distinguishes `Timeout` — any of connect, write, or read timeout
+   (`src/server/api_watchdog.rs:220-247`) — from `Refused`/`Io`/`Served`.
+   #384's accepted-but-unanswered listener is one cause of a read
+   timeout, not the definition of the class.
 2. Defaults: 10 s interval, 3 s connect/read timeout, 3 consecutive
    misses, 90 s startup grace; one success resets the streak
    (`src/server/api_watchdog.rs:43-60,145-165`); shutdown disarms before
@@ -54,8 +56,7 @@ std thread** that survives a fully wedged async runtime
 ### Positive
 
 - Wedged-runtime detection independent of the runtime; crash evidence
-  (thread dump) lands in logs before death; unsupervised desktops are
-  never surprise-aborted.
+  (thread dump) lands in logs before death; unsupervised desktops are never surprise-aborted.
 
 ### Negative / Trade-offs
 

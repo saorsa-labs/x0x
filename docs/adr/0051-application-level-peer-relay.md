@@ -19,8 +19,8 @@ relay forwards the inner envelope verbatim, one hop only
 ## Decision Drivers
 
 - Symmetric-NAT/no-inbound peers still need DM delivery.
-- A relay must not be able to read, retarget, or substitute payload — and
-  must not become an open forwarder.
+- A relay must not read payload plaintext or retarget routing — and must
+  not become an open forwarder.
 - Shipping ahead of ADR-0035's role model must not pre-empt it.
 
 ## Considered Options
@@ -32,42 +32,41 @@ relay forwards the inner envelope verbatim, one hop only
 ## Decision
 
 1. Fallback triggers on direct-delivery failure — default 3 failures in
-   60 s — and relay envelopes older than 30 s are stale
-   (`src/peer_relay.rs:79-89`).
-2. A `RelayedDm` is `{header, inner: DmEnvelope}` — no nesting; the
-   ML-DSA-signed `RelayHeader` binds version, destination/source agents,
-   source public key, and timestamp, with full binding verification on
-   `verify()` (`src/peer_relay.rs:125-205,227-252`).
+   60 s — and relay envelopes older than 30 s are stale (`src/peer_relay.rs:79-89`).
+2. A `RelayedDm` is `{header, inner: DmEnvelope}` — no nesting, one hop
+   (`src/peer_relay.rs:227-252`). The ML-DSA-65-signed `RelayHeader`
+   binds version, destination/source agent IDs, sender public key, and
+   timestamp (`signing_bytes`, `src/peer_relay.rs:152-174`; verified on
+   receipt, `:197-224`). It signs **no digest of the inner envelope**, so
+   the header proves routing authenticity only — a malicious relay can substitute a different valid `DmEnvelope` (issue #437). Final
+   acceptance is gated end-to-end by the inner envelope's own recipient-bound crypto, not by the relay hop.
 3. Policy is fail-closed and **disabled by default**: enablement,
    contact-required forwarding, sender 10/min, global 100/min, 1 MiB/min
-   caps (`RelayPolicy`, `src/peer_relay.rs:317-365`); refusals are
-   explicit (`bad signature, stale, disabled, not contact, blocked,
+   caps (`RelayPolicy`, `src/peer_relay.rs:317-365`); refusals are explicit (`bad signature, stale, disabled, not contact, blocked,
    rate-limited, bandwidth exceeded`, `src/peer_relay.rs:255-283`) and
-   quotas are reserved atomically before send
-   (`src/peer_relay.rs:863-927,944-974`).
-4. `select_relay` picks the first eligible candidate from a
-   caller-prefiltered list (`src/peer_relay.rs:766-783`) — deliberately
-   simpler than ADR-0035's spread selection, which remains the target
-   model, not current behavior.
+   quotas are reserved atomically before send (`src/peer_relay.rs:863-927,944-974`).
+4. `select_relay` picks the first eligible candidate from a caller-prefiltered list (`src/peer_relay.rs:766-783`) — deliberately
+   simpler than ADR-0035's spread selection, which remains the target model, not current behavior.
 
 ## Consequences
 
 ### Positive
 
-- Reachability-challenged peers get DMs; the relay learns nothing and can
-  alter nothing; abuse is rate-bounded.
+- Reachability-challenged peers get DMs; the relay learns no payload
+  plaintext (it does see sender/destination agent IDs, sender public key,
+  and timestamp in the cleartext header) and cannot retarget routing; abuse is rate-bounded.
 
 ### Negative / Trade-offs
 
 - Default-off means the reachability win requires operator opt-in; relay
-  path adds one signed hop of metadata exposure to the relay peer.
+  path adds one signed hop of metadata exposure to the relay peer; the
+  header does not bind the inner payload — substitution is tracked as issue #437.
 
 ### Neutral / Operational
 
 - Terminology: ADR-0034's `--relay` couples Full gossip participation with
   relay advertisement; ADR-0035's promoted relay may stay gossip-Leaf.
-  This ADR concerns neither role policy — only the X0X-0070 fallback
-  mechanism.
+  This ADR concerns neither role policy — only the X0X-0070 fallback mechanism.
 
 ## Validation
 

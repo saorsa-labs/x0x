@@ -37,13 +37,13 @@ fills that gap for the two layers under ADR-0042's decision:
    (`src/streams.rs:377-384`); inside that prefix the link transport owns
    the first application byte (saorsa-webrtc `StreamType` 0x20–0x24) and
    repeated `u32`-BE length ‖ payload frames (`src/voice/link_transport.rs:1-12,382-414,773-829`), one stream per
-   (direction, lane) (`start_lane`, `src/voice/link_transport.rs:335-360`).
+   (direction, lane) (`src/voice/link_transport.rs:728-829`; acceptor
+   registration in `start_lane`, `src/voice/link_transport.rs:298-347`).
    Identity/trust/revocation/ACL gates apply with no voice bypass (`src/voice/link_transport.rs:20-31`).
 2. Audio may use the unreliable datagram lane when both peers advertise
    `x0x_datagram_cap` (old peers simply don't advertise,
    `src/voice/link_transport.rs:60-71`); one encoded frame per datagram,
-   with immediate reliable-stream fallback on failure
-   (`src/voice/link_transport.rs:835-875,1010-1025`). (ADR-0042
+   with immediate reliable-stream fallback on failure (`src/voice/link_transport.rs:835-875,1010-1025`). (ADR-0042
    documented this as follow-up; it is now implemented conservatively — mutual advert/proof required.)
 3. Signaling is DM-borne, not stream-nested: a three-message setup flow
    `CapabilityExchange → ConnectionConfirm → ConnectionReady` over
