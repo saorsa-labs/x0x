@@ -181,6 +181,12 @@ pub(super) struct RiderTokenRecord {
     /// The bound certificate's expiry — the token can never outlive
     /// its certificate even if `expires_at` is later.
     pub cert_not_after: Option<u64>,
+    /// The sub-agent-signed delegation capability bound at issuance
+    /// (review r3, option B). `None` only for records predating the
+    /// capability requirement — such tokens cannot produce a
+    /// receiver-verifiable rider send and are refused at the send path.
+    #[serde(default)]
+    pub delegation: Option<crate::groups::RiderDelegation>,
     /// Unix seconds when the token was revoked, if it was.
     #[serde(default)]
     pub revoked_at: Option<u64>,
@@ -297,6 +303,7 @@ impl RiderTokenStore {
         ttl_secs: u64,
         cert_digest: String,
         cert_not_after: Option<u64>,
+        delegation: Option<crate::groups::RiderDelegation>,
         now_unix: u64,
     ) -> std::io::Result<(String, RiderTokenRecord)> {
         use rand::RngCore;
@@ -315,6 +322,7 @@ impl RiderTokenStore {
             expires_at: now_unix.saturating_add(ttl_secs.max(1)),
             cert_digest,
             cert_not_after,
+            delegation,
             revoked_at: None,
         };
         self.records.insert(token_id, record.clone());
@@ -325,6 +333,17 @@ impl RiderTokenStore {
             return Err(e);
         }
         Ok((token, record))
+    }
+
+    /// The delegation capability stored for a live token (send path,
+    /// review r3). `None` when the token is unknown or predates the
+    /// capability requirement — the send handler refuses those.
+    pub(super) fn delegation_of(&self, token_id: u64) -> Option<crate::groups::RiderDelegation> {
+        let record = self.records.get(&token_id)?;
+        if record.revoked_at.is_some() {
+            return None;
+        }
+        record.delegation.clone()
     }
 
     /// Validate a presented bearer token. `None` for unknown, expired,
@@ -553,6 +572,7 @@ mod tests {
                 60,
                 "d1".repeat(32),
                 None,
+                None,
                 1_000,
             )
             .await
@@ -584,6 +604,7 @@ mod tests {
                 10,
                 "d2".repeat(32),
                 None,
+                None,
                 1_000,
             )
             .await
@@ -611,6 +632,7 @@ mod tests {
                 10_000,
                 "d3".repeat(32),
                 Some(1_500),
+                None,
                 1_000,
             )
             .await
@@ -642,6 +664,7 @@ mod tests {
                 60,
                 "d4".repeat(32),
                 None,
+                None,
                 1_000,
             )
             .await
@@ -672,6 +695,7 @@ mod tests {
                     60,
                     "d5".repeat(32),
                     None,
+                    None,
                     1_000,
                 )
                 .await
@@ -683,6 +707,7 @@ mod tests {
                     None,
                     60,
                     "d5".repeat(32),
+                    None,
                     None,
                     1_000,
                 )

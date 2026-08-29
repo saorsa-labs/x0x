@@ -9402,12 +9402,39 @@ pub(in crate::server) async fn send_group_public_message(
                         "rider token is not granted this group (ADR-0039 deny-by-default)",
                     );
                 }
-                Some(x0x::groups::RiderProvenance {
+                // Review r3: the sub-agent-SIGNED delegation must back
+                // the assertion — the daemon verifies the full chain
+                // (cert → sub-agent key → delegation → this daemon →
+                // scope → expiry) before it will sign, so it can never
+                // speak for a sub-agent that did not authorize it.
+                let delegation = state.rider_tokens.lock().await.delegation_of(*token_id);
+                let Some(delegation) = delegation else {
+                    return forbidden(
+                        "rider token has no sub-agent-signed delegation (re-issue it with a delegation capability)",
+                    );
+                };
+                let provenance = x0x::groups::RiderProvenance {
                     sub_agent_id: sub_agent_id.clone(),
                     rider_token_id: *token_id,
                     rider_token_hash: token_hash.clone(),
                     scope: info.stable_group_id().to_string(),
-                })
+                    delegation,
+                };
+                let now_unix = x0x::dm::now_unix_ms() / 1_000;
+                if let Err(reason) = x0x::groups::verify_rider_provenance(
+                    &provenance,
+                    &local_hex,
+                    info.stable_group_id(),
+                    now_unix,
+                ) {
+                    tracing::warn!(
+                        group_id = %info.stable_group_id(),
+                        sub_agent = %sub_agent_id,
+                        "rejected rider send: delegation verification failed: {reason}"
+                    );
+                    return forbidden("rider delegation does not verify");
+                }
+                Some(provenance)
             }
         };
 

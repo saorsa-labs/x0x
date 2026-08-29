@@ -207,10 +207,13 @@ one via the ADR-0018 owner revocation path.
 Harnesses that prefer to ride the **owner's** daemon instead of running
 their own instance use rider tokens (`POST /owner/riders`) — scoped,
 expiring bearer tokens confined to `POST /groups/:id/send`,
-`POST /groups/:id/secure/encrypt`, and a bounded `GET /history`. Rider
-sends are signed by the daemon with an attribution envelope binding the
-sub-agent inside the signed bytes; `/agent/sign` and every owner surface
-reject rider tokens outright.
+`POST /groups/:id/secure/encrypt`, and a bounded `GET /history`. At
+issuance the harness SIGNS a delegation capability with the sub-agent
+key (`x0x::groups::sign_rider_delegation`) naming the daemon and the
+granted groups; every rider message embeds that capability inside the
+signed bytes, and receivers verify the full owner-cert → sub-agent-key
+→ daemon chain before enforcing group policy against the sub-agent.
+`/agent/sign` and every owner surface reject rider tokens outright.
 
 
 ## Available Endpoints

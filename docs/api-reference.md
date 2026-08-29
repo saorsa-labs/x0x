@@ -230,10 +230,16 @@ authority evidence), and the response returns the certificate
 (`certificate.storage_b64`) for ACP-attached harness instances.
 
 **Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
-string, "ttl_secs"?: ≤ 90 days, default 7 }`) are stored hashed at rest
-(SHA-256), expire, and are revocable per-token or by revoking their
-sub-agent. A rider token authenticates as a distinct principal that may
-reach exactly:
+string, "ttl_secs"?: ≤ 90 days, default 7, "delegation": {
+"payload_b64", "signature" } }`) are stored hashed at rest (SHA-256),
+expire, and are revocable per-token or by revoking their sub-agent.
+The `delegation` capability is REQUIRED and is produced harness-side:
+the harness signs `rider_delegation_bytes(sub_agent_id,
+daemon_agent_id, groups, not_after)` with the sub-agent's OWN key
+(helper: `x0x::groups::sign_rider_delegation`); the daemon verifies it
+against the certified sub-agent key before minting, binds it into the
+token, and re-verifies it before every send. A rider token
+authenticates as a distinct principal that may reach exactly:
 
 - `POST /groups/:id/send` — `SignedPublic` groups in its grant list
 - `POST /groups/:id/secure/encrypt` — `MlsEncrypted` groups in its grant
@@ -242,11 +248,19 @@ reach exactly:
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
 and `/shutdown` — answers `403`. Rider sends are signed by the daemon's
-own agent key carrying a provenance envelope
-(`rider_provenance.sub_agent_id`, `rider_token_id`, `rider_token_hash`,
-`scope`) **inside the signed bytes**: attribution without ever exposing a
-sub-agent signing key or a signing oracle. Rider Home encrypts record the
-sub-agent id as the history row's author.
+own agent key carrying a provenance envelope **inside the signed
+bytes** — `sub_agent_id`, `rider_token_id`, `rider_token_hash`,
+`scope`, and the sub-agent-signed delegation capability itself. The
+delegation makes the attribution cryptographic instead of asserted:
+receivers verify the embedded owner certificate, the capability
+signature under the certified sub-agent key, that the capability names
+the actual message-signing daemon, the group scope, and the expiry —
+then enforce ban/write policy against the sub-agent. A daemon can
+therefore only speak for sub-agents that explicitly authorized it. The
+per-message envelope carries the certificate (~10 KB overhead) so
+verification is self-contained. `/agent/sign` stays owner-only. Rider
+Home encrypts record the sub-agent id as the history row's author.
+
 
 
 ## Network

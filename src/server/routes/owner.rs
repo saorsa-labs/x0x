@@ -306,6 +306,7 @@ pub(in crate::server) async fn owner_agents_revoke(
             "agent is not on this owner's issuance journal",
         );
     }
+
     let Some(record) = retained else {
         return api_error(
             StatusCode::CONFLICT,
@@ -393,6 +394,81 @@ pub(in crate::server) struct IssueRiderRequest {
     /// Token lifetime in seconds (default 7 days, max 90 days).
     #[serde(default)]
     ttl_secs: Option<u64>,
+    /// The sub-agent-signed delegation capability (review r3, option B)
+    /// — REQUIRED: without it the daemon could assert any sub-agent and
+    /// receivers would have no proof.
+    delegation: Option<DelegationWire>,
+}
+
+/// The harness-supplied delegation capability: canonical payload bytes
+/// plus the sub-agent key's signature. The daemon contributes the
+/// certificate bytes from its journal when storing.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct DelegationWire {
+    payload_b64: String,
+    signature: String,
+}
+
+/// Verify a harness-submitted delegation capability (review r3,
+/// option B) and assemble the storable [`RiderDelegation`] with the
+/// certificate bytes from the journal record.
+///
+/// Checks: payload parses; subject is the target sub-agent; delegate is
+/// THIS daemon; scopes are exactly the requested groups; the capability
+/// is unexpired; and the signature verifies under the sub-agent's
+/// certified agent key.
+#[allow(clippy::too_many_arguments)]
+fn verify_delegation_wire(
+    del: &DelegationWire,
+    cert: &crate::identity::AgentCertificate,
+    journal_record: &IssuedCertRecord,
+    target_hex: &str,
+    daemon_hex: &str,
+    groups: &[String],
+    now: u64,
+) -> Result<crate::groups::RiderDelegation, String> {
+    use base64::Engine as _;
+    let payload = BASE64
+        .decode(del.payload_b64.trim())
+        .map_err(|_| "delegation payload_b64 is invalid base64".to_string())?;
+    let claim = crate::groups::parse_rider_delegation(&payload)
+        .ok_or_else(|| "delegation payload does not parse".to_string())?;
+    if claim.sub_agent_id != target_hex {
+        return Err("delegation subject differs from sub_agent_id".to_string());
+    }
+    if claim.daemon_agent_id != daemon_hex {
+        return Err(format!(
+            "delegation names daemon {other} but this daemon is {daemon_hex}",
+            other = claim.daemon_agent_id
+        ));
+    }
+    let mut requested = groups.to_vec();
+    requested.sort();
+    let mut delegated = claim.scopes.clone();
+    delegated.sort();
+    if delegated != requested {
+        return Err("delegation scopes must equal the requested group grants".to_string());
+    }
+    if now >= claim.not_after {
+        return Err("delegation is already expired".to_string());
+    }
+    let sig_bytes = hex::decode(del.signature.trim())
+        .map_err(|_| "delegation signature is invalid hex".to_string())?;
+    let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        .map_err(|e| format!("delegation signature does not decode: {e:?}"))?;
+    let agent_pub = ant_quic::MlDsaPublicKey::from_bytes(cert.agent_public_key())
+        .map_err(|_| "certificate agent key does not parse".to_string())?;
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&agent_pub, &payload, &sig)
+        .map_err(|_| "delegation is not signed by the sub-agent's certified key".to_string())?;
+    let cert_b64 = journal_record
+        .cert_b64
+        .clone()
+        .ok_or_else(|| "journal record lacks retained certificate bytes".to_string())?;
+    Ok(crate::groups::RiderDelegation {
+        cert_b64,
+        payload_b64: del.payload_b64.trim().to_string(),
+        signature: del.signature.trim().to_string(),
+    })
 }
 
 /// POST /owner/riders — issue a scoped rider token for a registered
@@ -517,6 +593,29 @@ pub(in crate::server) async fn owner_riders_issue(
             );
         }
     }
+
+    // Review r3 (option B): verify the sub-agent-signed delegation and
+    // bind it into the token. The capability must name THIS daemon as
+    // the delegate, cover exactly the requested group scopes, be signed
+    // by the sub-agent's certified key, and expire in the future.
+    let Some(del) = req.delegation else {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "delegation is required: sign rider_delegation_bytes(sub, daemon, scopes, not_after) with the sub-agent key",
+        );
+    };
+    let delegation = match verify_delegation_wire(
+        &del,
+        &cert,
+        &record,
+        &target_hex,
+        &hex::encode(state.agent.agent_id().as_bytes()),
+        &groups,
+        now,
+    ) {
+        Ok(delegation) => delegation,
+        Err(reason) => return api_error(StatusCode::BAD_REQUEST, reason),
+    };
     let ttl = req
         .ttl_secs
         .unwrap_or(crate::server::rider_auth::RIDER_DEFAULT_TTL_SECS)
@@ -533,6 +632,7 @@ pub(in crate::server) async fn owner_riders_issue(
             ttl,
             cert_digest,
             cert_not_after,
+            Some(delegation),
             now,
         )
         .await;

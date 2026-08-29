@@ -134,6 +134,11 @@ async fn rider_json(
 }
 
 /// Issue a rider-mode sub-agent + rider token bound to `groups`.
+///
+/// Simulates the full harness side of the delegation flow (review r3):
+/// the harness generates + custodies the sub-agent key, and SIGNS a
+/// delegation capability naming this daemon and the granted groups —
+/// the daemon then verifies that capability before minting the token.
 /// Returns `(sub_agent_hex, rider_token)`.
 async fn issue_rider(d: &OwnedDaemon, label: &str, groups: Vec<String>) -> (String, String) {
     let kp = x0x::identity::AgentKeypair::generate().expect("sub-agent keypair");
@@ -148,11 +153,37 @@ async fn issue_rider(d: &OwnedDaemon, label: &str, groups: Vec<String>) -> (Stri
     assert_eq!(status, reqwest::StatusCode::OK, "issue: {body}");
     let sub_agent_id = body["agent_id"].as_str().expect("agent_id").to_string();
 
+    // Harness learns the daemon's agent id (public) and signs the
+    // delegation capability with ITS OWN key.
+    let (status, body) = owner_json(d, reqwest::Method::GET, "/agent", None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "agent info: {body}");
+    let daemon_hex = body["agent_id"]
+        .as_str()
+        .expect("daemon agent id")
+        .to_string();
+    let not_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let (payload_b64, signature) =
+        x0x::groups::sign_rider_delegation(&kp, &daemon_hex, &groups, not_after)
+            .expect("harness signs delegation");
+    let delegation = json!({
+        "payload_b64": payload_b64,
+        "signature": signature,
+    });
+
     let (status, body) = owner_json(
         d,
         reqwest::Method::POST,
         "/owner/riders",
-        Some(json!({ "sub_agent_id": sub_agent_id, "groups": groups, "label": label })),
+        Some(json!({
+            "sub_agent_id": sub_agent_id,
+            "groups": groups,
+            "label": label,
+            "delegation": delegation,
+        })),
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::OK, "rider issue: {body}");
@@ -313,6 +344,50 @@ async fn rider_issuance_journals_and_roster_lists() {
     assert_eq!(entry["from_journal"], true, "journal is authoritative");
     assert_eq!(entry["revoked"], false);
 
+    // Review r3: rider tokens require a sub-agent-SIGNED delegation.
+    // Without one → 400; with one signed by a DIFFERENT key → 400 (the
+    // daemon verifies the capability against the certified sub-agent
+    // key before minting).
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        "/owner/riders",
+        Some(json!({ "sub_agent_id": agent_id.clone(), "groups": [] })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "no delegation refused: {body}"
+    );
+    let (status, body) = owner_json(&d, reqwest::Method::GET, "/agent", None).await;
+    assert_eq!(status, reqwest::StatusCode::OK);
+    let daemon_hex = body["agent_id"].as_str().expect("daemon id").to_string();
+    let impostor = x0x::identity::AgentKeypair::generate().expect("impostor key");
+    let not_after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs()
+        + 3_600;
+    let (forged_b64, forged_sig) =
+        x0x::groups::sign_rider_delegation(&impostor, &daemon_hex, &[], not_after)
+            .expect("impostor signs");
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        "/owner/riders",
+        Some(json!({
+            "sub_agent_id": agent_id,
+            "groups": [],
+            "delegation": { "payload_b64": forged_b64, "signature": forged_sig },
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "forged delegation refused: {body}"
+    );
     // Anonymous (no owner key) installs refuse issuance with 409 —
     // covered by tests/profile_api.rs for GET; here the owned path is the
     // happy case and malformed keys are rejected:
