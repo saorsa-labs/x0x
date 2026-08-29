@@ -385,11 +385,18 @@ impl TaskListSync {
                                 .get(&peer_id)
                                 .copied();
                             if let Some(declared) = declared {
-                                let list_id = *list.id();
+                                // REVIEW r5: compare POST-ADMISSION state —
+                                // merge_delta (above) already purged forged
+                                // attestations into the local replica, so
+                                // digesting the LOCAL view of the served
+                                // tasks means an altered signature (which
+                                // admission dropped or which fails to match
+                                // the holder's declared digest) can never
+                                // adopt-truncate state.
+                                let served_ids: std::collections::HashSet<crate::crdt::TaskId> =
+                                    delta.added_tasks.keys().copied().collect();
                                 if delta.added_tasks.len() == declared.entry_count as usize
-                                    && delta
-                                        .served_digest(&list_id)
-                                        .is_some_and(|dg| dg == declared.digest)
+                                    && list.served_subset_digest(&served_ids) == declared.digest
                                 {
                                     let pruned = list.prune_to_served_set(&delta);
                                     if pruned > 0 {

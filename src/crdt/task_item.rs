@@ -2497,6 +2497,53 @@ mod tests {
     }
 
     #[test]
+    fn equivocating_owner_converges_identically_across_replicas() {
+        // REVIEW r5: A signs A→B and A→M, both at Genesis (equivocation).
+        // Replicas that received the edges in EITHER order — or hold only
+        // one until the merge — must resolve the SAME deterministic winner
+        // (lowest TO-agent identity), so ownership never forks across the
+        // mesh. A non-owner's edge (C→M at Genesis) stays inadmissible.
+        let (a, a_signing) = signing_for(1);
+        let (b, _) = signing_for(2);
+        let (m, _) = signing_for(9);
+        let (c, c_signing) = signing_for(3);
+
+        let mut replica1 = owned_task(&a);
+        replica1
+            .transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("a→b first on replica1");
+        replica1
+            .transfer_ownership(item_scope(), a, m, 50, &a_signing)
+            .expect("then a→m (fork at genesis — void at the head)");
+        let mut replica2 = owned_task(&a);
+        replica2
+            .transfer_ownership(item_scope(), a, m, 50, &a_signing)
+            .expect("a→m first on replica2");
+        replica2
+            .transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("then a→b (fork at genesis)");
+
+        // Both replicas converge to the same owner after merging views.
+        replica1.merge(item_scope(), &replica2).expect("merge");
+        replica2.merge(item_scope(), &replica1).expect("merge");
+        assert_eq!(
+            replica1.owner(),
+            replica2.owner(),
+            "equivocation resolves identically on every replica"
+        );
+        // And a non-owner's concurrent edge never participates.
+        let mut replica3 = replica1.clone();
+        replica3
+            .transfer_ownership(item_scope(), c, m, 999, &c_signing)
+            .expect("c signs although it never owned");
+        assert_eq!(replica3.owner(), replica1.owner());
+        // creator(a) is the starting point; the deterministic winner is
+        // whichever of b/m has the lower AgentId bytes.
+        let expected = if b.as_bytes() < m.as_bytes() { b } else { m };
+        assert_eq!(replica1.owner(), expected);
+    }
+
+    #[test]
     fn former_owner_transfer_is_inadmissible() {
         // REVIEW r3 (critical): after A→B@100 makes B the owner, A is a
         // FORMER owner. A's own key can still sign A→M@200 — signature

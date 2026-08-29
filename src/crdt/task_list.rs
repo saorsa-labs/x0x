@@ -320,6 +320,51 @@ impl TaskList {
         *h.finalize().as_bytes()
     }
 
+    /// Digest over the POST-ADMISSION local state restricted to the given
+    /// served task set (review r5): the bootstrap adopt path must compare
+    /// what actually SURVIVED admission (forged attestations purged), not
+    /// the raw serve bytes — an altered signature must not be able to
+    /// hash identically to the valid entry it replaced.
+    ///
+    /// Mirrors [`Self::served_digest`] exactly (same domain, same
+    /// encodings) but only over tasks in `served_ids`; tasks absent
+    /// locally are skipped (the adopt path prunes to the served set
+    /// separately).
+    pub(crate) fn served_subset_digest(
+        &self,
+        served_ids: &std::collections::HashSet<TaskId>,
+    ) -> [u8; 32] {
+        let mut h = blake3::Hasher::new();
+        h.update(SERVED_DIGEST_DOMAIN);
+        h.update(self.id.as_bytes());
+        let mut ids: Vec<&TaskId> = self
+            .task_data
+            .keys()
+            .filter(|id| served_ids.contains(*id))
+            .collect();
+        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+        for id in &ids {
+            h.update(id.as_bytes());
+            self.task_data[id].hash_resolved_fields(&mut h);
+        }
+        let chains: std::collections::HashMap<
+            TaskId,
+            std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
+        > = ids
+            .iter()
+            .filter_map(|id| {
+                let wire = self.task_data[id].owner_wire_map();
+                if wire.is_empty() {
+                    None
+                } else {
+                    Some((**id, wire))
+                }
+            })
+            .collect();
+        crate::crdt::delta::hash_owner_transfers_into(&mut h, &chains);
+        *h.finalize().as_bytes()
+    }
+
     /// Remove local tasks absent from a digest-verified full-state serve
     /// (`delta.added_tasks` is then the verified complete task set).
     ///

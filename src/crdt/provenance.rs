@@ -535,11 +535,19 @@ pub fn key_owner_chain(
 ///
 /// Walk: `owner = created_by`, `head = Genesis`. At each step, the
 /// admissible candidates are entries whose `supersedes == head` AND whose
-/// `from == owner` (the owner at that chain position). Concurrent edges
-/// extending the same head (a fork — both signed by the owner at that
-/// position) resolve by LOWEST EDGE DIGEST: deterministic on every
-/// replica and unbiasable by the signer (they cannot choose their edge's
-/// digest after signing). Advance and repeat; a `visited` set terminates
+/// `from == owner` (the owner at that chain position).
+///
+/// SECURITY SEMANTICS (stated honestly, review r5): a NON-OWNER cannot
+/// alter ownership — every edge must be signed by the owner at its chain
+/// position, verified structurally by the walk. A CURRENT owner that
+/// EQUIVOCATES (signs two edges at the same position) forks its own
+/// authority; no CRDT can causally order such edges, so the group
+/// converges deterministically on the candidate whose TO-agent identity
+/// (AgentId == hash of the registered public key) sorts lowest. That
+/// tiebreak is NOT grindable into new authority: the winner's identity is
+/// fixed bytes of a real registered agent — a destination the owner could
+/// have chosen legitimately — unlike timestamps or edge digests, which mix
+/// signer-controlled data. Advance and repeat; a `visited` set terminates
 /// the walk even on adversarial link cycles.
 ///
 /// Security properties:
@@ -576,7 +584,18 @@ pub fn resolve_owner(created_by: AgentId, chain: &OwnerChain) -> AgentId {
             })
             .map(|(d, e)| (*d, e))
             .collect();
-        let Some((digest, entry)) = candidates.into_iter().min_by_key(|(d, _)| *d) else {
+        // NON-GRINDABLE FORK TIEBREAK (review r5): order candidates by the
+        // TO-agent's identity — AgentId IS the hash of that agent's
+        // registered public key — not by the edge digest (which mixes the
+        // signer-controlled timestamp and could be ground). A can only
+        // pick among REAL registered agents, and whichever of them wins
+        // is a destination A could have transferred to legitimately. The
+        // edge digest is a final disambiguator for duplicate same-to
+        // edges (same outcome either way).
+        let Some((digest, entry)) = candidates
+            .into_iter()
+            .min_by_key(|(d, (t, _))| (t.to.as_bytes(), *d))
+        else {
             break;
         };
         visited.insert(digest);
@@ -604,7 +623,18 @@ pub fn chain_head(created_by: AgentId, chain: &OwnerChain) -> TransferLink {
             })
             .map(|(d, e)| (*d, e))
             .collect();
-        let Some((digest, entry)) = candidates.into_iter().min_by_key(|(d, _)| *d) else {
+        // NON-GRINDABLE FORK TIEBREAK (review r5): order candidates by the
+        // TO-agent's identity — AgentId IS the hash of that agent's
+        // registered public key — not by the edge digest (which mixes the
+        // signer-controlled timestamp and could be ground). A can only
+        // pick among REAL registered agents, and whichever of them wins
+        // is a destination A could have transferred to legitimately. The
+        // edge digest is a final disambiguator for duplicate same-to
+        // edges (same outcome either way).
+        let Some((digest, entry)) = candidates
+            .into_iter()
+            .min_by_key(|(d, (t, _))| (t.to.as_bytes(), *d))
+        else {
             return head;
         };
         visited.insert(digest);
@@ -692,24 +722,37 @@ mod ownership_resolution_tests {
     }
 
     #[test]
-    fn backdated_genesis_fork_resolves_by_lowest_digest_not_timestamps() {
-        // The attacker's remaining move: point the new edge at a position
-        // they signed (here Genesis). Both edges are legal forks at that
-        // position; the LOWEST EDGE DIGEST wins — timestamps (100 vs the
-        // backdated 50) are irrelevant, and the signer cannot bias the
-        // digest. Both replicas holding the union agree.
+    fn equivocating_owner_forks_converge_deterministically() {
+        // REVIEW r5 — the honest semantic: two edges signed by the SAME
+        // owner at the SAME chain position (here Genesis) are the owner
+        // EQUIVOCATING (double-transfer). No CRDT can causally order them;
+        // the group instead converges deterministically on the candidate
+        // whose TO-agent identity (AgentId == hash of the registered
+        // public key) sorts lowest — bytes the signer cannot grind without
+        // registering new agents, and a registered destination is one the
+        // owner could have transferred to legitimately. Timestamps and
+        // edge digests are irrelevant: agent(2) < agent(9), so A→B wins
+        // no matter which edge was signed or delivered "first".
         let ab = edge(1, 2, 100, TransferLink::Genesis);
         let am = edge(1, 9, 50, TransferLink::Genesis); // backdated fork
-        let winner_is_b = digest_of(&ab) < digest_of(&am);
         let chain = chain_of(&[ab.clone(), am.clone()]);
-        let expected = if winner_is_b { agent(2) } else { agent(9) };
-        assert_eq!(resolve_owner(agent(1), &chain), expected);
+        assert_eq!(
+            resolve_owner(agent(1), &chain),
+            agent(2),
+            "lowest TO-agent identity wins — deterministic and ungroundable"
+        );
 
-        // Order-independence: build the chain the other way, same result.
+        // Order-independence: build the chain the other way, same winner.
         let am2 = edge(1, 9, 50, TransferLink::Genesis);
         let ab2 = edge(1, 2, 100, TransferLink::Genesis);
         let chain2 = chain_of(&[am2, ab2]);
-        assert_eq!(resolve_owner(agent(1), &chain2), expected);
+        assert_eq!(resolve_owner(agent(1), &chain2), agent(2));
+
+        // NON-OWNER edge rejected outright: C never held Genesis but signs
+        // C→M at it — from C ≠ owner A, inadmissible at every position.
+        let cm = edge(3, 9, 999, TransferLink::Genesis);
+        let poisoned = chain_of(&[ab.clone(), am, cm]);
+        assert_eq!(resolve_owner(agent(1), &poisoned), agent(2));
     }
 
     #[test]

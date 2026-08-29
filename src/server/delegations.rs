@@ -229,10 +229,73 @@ pub(in crate::server) async fn committed_delegations(
         .collect();
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
-    entry.loaded = true;
+    // OVERLAP GUARD (review r5): a concurrent rescan can finish LATER
+    // with an OLDER snapshot (its pages were read before newer commits
+    // landed). Every successful scan reaches the true bottom of the
+    // scope, so the higher max-rowid scan is the more complete snapshot —
+    // only replace the map when this scan is at least as recent; the
+    // watermark always advances so the next staleness probe stays honest.
+    if !entry.loaded || max_row_id >= entry.max_row_id {
+        entry.loaded = true;
+        entry.by_digest = map;
+    }
     entry.max_row_id = entry.max_row_id.max(max_row_id);
-    entry.by_digest = map;
     entry.by_digest.values().cloned().collect()
+}
+
+/// Reconstruct the GLOBAL delegation-id registry from ALL groups' durable
+/// history at startup (review r5): one deterministic rowid-ordered pass
+/// over every scope, so cross-group id reuse is rejected from the first
+/// post-restart query rather than only for groups whose indexes happen to
+/// have been lazily rebuilt. Per-group indexes stay lazy caches; the
+/// registry is complete from boot.
+pub(in crate::server) async fn rebuild_global_delegation_registry(state: &AppState) {
+    let Some(history) = state.agent.history() else {
+        return;
+    };
+    let store = std::sync::Arc::clone(history.store());
+    let scanned = tokio::task::spawn_blocking(move || {
+        // Total-or-nothing, uncapped, across ALL scopes in rowid order.
+        let mut rows: Vec<x0x::history::StoredRecord> = Vec::new();
+        let mut before_id: Option<i64> = None;
+        loop {
+            let q = x0x::history::HistoryQuery {
+                limit: 500,
+                before_id,
+                ..Default::default()
+            };
+            let page = store.query(&q).ok()?;
+            if page.is_empty() {
+                break;
+            }
+            let next_cursor = page.last().map(|r| r.id);
+            let done = page.len() < 500;
+            rows.extend(page);
+            if done {
+                break;
+            }
+            before_id = next_cursor;
+        }
+        rows.sort_by_key(|r| r.id);
+        Some(rows)
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(rows) = scanned else {
+        tracing::warn!(
+            "delegation id registry rebuild incomplete — cross-group replay checks run lazily until a later rebuild"
+        );
+        return;
+    };
+    // Extract delegation envelopes across ALL groups (signature-verified),
+    // in commit order, and register their ids globally.
+    let envelopes = envelopes_from_rows(&rows);
+    let admitted = register_ids_globally(state, envelopes).await;
+    tracing::info!(
+        registered = admitted.len(),
+        "global delegation-id registry reconstructed from durable history"
+    );
 }
 
 /// Record a just-committed delegation into the index (called only after the

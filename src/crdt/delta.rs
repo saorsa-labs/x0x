@@ -12,7 +12,7 @@
 //!
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
-use crate::crdt::{OpAttestation, OwnerTransfer, Result, TaskId, TaskItem, TaskList, TaskListId};
+use crate::crdt::{OpAttestation, OwnerTransfer, Result, TaskId, TaskItem, TaskList};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
@@ -165,7 +165,8 @@ impl TaskListDelta {
     /// [`TaskItem::hash_resolved_fields`]) — identical to what
     /// [`TaskList::served_digest`] computes over local state, so a receiver
     /// holding exactly the served content produces the same digest.
-    pub(crate) fn served_digest(&self, list_id: &TaskListId) -> Option<[u8; 32]> {
+    #[cfg(test)]
+    pub(crate) fn served_digest(&self, list_id: &crate::crdt::TaskListId) -> Option<[u8; 32]> {
         self.ordering_update.as_ref()?;
         self.name_update.as_ref()?;
         let mut h = blake3::Hasher::new();
@@ -206,7 +207,7 @@ pub(crate) fn hash_owner_transfers_into(
         h.update(&(edges.len() as u64).to_le_bytes());
         // BTreeMap iterates in OwnerTransfer order (from, to, ts,
         // supersedes) — deterministic on every replica.
-        for edge in edges.keys() {
+        for (edge, att) in edges {
             h.update(edge.from.as_bytes());
             h.update(edge.to.as_bytes());
             h.update(&edge.timestamp_ms.to_le_bytes());
@@ -219,6 +220,15 @@ pub(crate) fn hash_owner_transfers_into(
                     h.update(&d);
                 }
             }
+            // REVIEW r5: hash the ATTESTATION VALUES too — author id,
+            // public key, signature — so an altered signature (which
+            // admission would purge) cannot hash identically to the valid
+            // entry it impersonates. Variable fields are length-prefixed.
+            h.update(att.author_agent_id.as_bytes());
+            h.update(&(att.author_public_key.len() as u64).to_le_bytes());
+            h.update(&att.author_public_key);
+            h.update(&(att.signature.len() as u64).to_le_bytes());
+            h.update(&att.signature);
         }
     }
 }
@@ -1227,6 +1237,72 @@ mod tests {
             bare_delta.served_digest(&scope),
             Some(bare.served_digest()),
             "empty transfer map keeps identical digests"
+        );
+    }
+
+    #[test]
+    fn altered_signature_cannot_hash_identically_post_admission() {
+        // REVIEW r5 (mechanical 2): the digest covers the attestation
+        // VALUES (author id, key, signature), and the full-serve adopt
+        // compares POST-ADMISSION state — so tampering a signature makes
+        // the serve's digest diverge AND gets the entry purged locally,
+        // either of which refuses the adopt. Pin both halves.
+        use crate::gossip::SigningContext;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let signing = SigningContext::from_keypair(&kp);
+        let creator = kp.agent_id();
+        let task_id = TaskId::from_bytes([3u8; 32]);
+        let scope = TaskListId::new([0x5c; 32]);
+
+        let mut holder = TaskList::new(scope, "L".into(), peer(1));
+        let mut task = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(1),
+        );
+        task.transfer_ownership(scope, creator, agent(9), 5_000, &signing)
+            .expect("transfer");
+        holder.add_task(task, peer(1), 1).expect("add");
+        let holder_digest = holder.served_digest();
+
+        // Serve of that state ACROSS THE WIRE: TaskItem's serde shape
+        // carries no ownership, so after the roundtrip only the delta-level
+        // map holds the chain (the in-memory clone would keep it inside
+        // added_tasks and bypass the tamper).
+        let wire_bytes = bincode::serialize(&(peer(1), holder.full_delta())).unwrap();
+        let (_, mut serve): (PeerId, TaskListDelta) = bincode::deserialize(&wire_bytes).unwrap();
+        assert!(
+            serve.added_tasks[&task_id].0.owner_transfers().is_empty(),
+            "wire-roundtripped TaskItems carry no chain"
+        );
+        let wire = serve.owner_transfers.get_mut(&task_id).expect("map");
+        for att in wire.values_mut() {
+            att.signature = vec![0xEE; att.signature.len().max(1)];
+        }
+        // (a) The serve's raw digest diverges (attestation values hashed).
+        assert_ne!(
+            serve.served_digest(&scope),
+            Some(holder_digest),
+            "tampered signature changes the digest"
+        );
+        // (b) Post-admission: a receiver merging the tampered serve purges
+        // the entry, so its local digest can never equal the holder's.
+        let mut receiver = TaskList::new(scope, "L".into(), peer(2));
+        let bare = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(2),
+        );
+        receiver.add_task(bare, peer(2), 1).expect("add");
+        receiver
+            .merge_delta(&serve, peer(1), Some(&creator))
+            .expect("merge");
+        let served_ids: std::collections::HashSet<TaskId> =
+            serve.added_tasks.keys().copied().collect();
+        assert_ne!(
+            receiver.served_subset_digest(&served_ids),
+            holder_digest,
+            "post-admission state diverges from the honest holder"
         );
     }
 }

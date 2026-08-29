@@ -1045,6 +1045,10 @@ pub async fn serve_with_options(
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
 
+    // ADR-0040 (review r5): reconstruct the global delegation-id
+    // registry from ALL groups' durable history at boot — cross-group
+    // id-replay rejection is deterministic from the first query.
+    delegations::rebuild_global_delegation_registry(&state).await;
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
     let discoverable_ids: Vec<String> = {
