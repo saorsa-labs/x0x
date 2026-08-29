@@ -882,6 +882,7 @@ pub async fn serve_with_options(
             rider_auth::RiderTokenStore::load(config.data_dir.join(rider_auth::RIDER_TOKENS_FILE))
                 .await,
         ),
+        cert_journal_lock: tokio::sync::Mutex::new(()),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         connect_diagnostics,

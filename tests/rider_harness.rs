@@ -359,6 +359,35 @@ async fn rider_send_carries_provenance_and_lands() {
 
     let (sub_agent, token) = issue_rider(&d, "provenance", vec![group_id.clone()]).await;
 
+    // Review fix #1 (CRITICAL regression): the sub-agent is NOT a
+    // member of this MembersOnly group — the rider send must be 403
+    // even though the DAEMON (the group creator/admin) is a member.
+    // Authorizing against the daemon's role would let a rider emit
+    // admin-authored messages; the grant alone must not suffice.
+    let (status, _) = rider_json(
+        &token,
+        reqwest::Method::POST,
+        d.url(&format!("/groups/{group_id}/send")),
+        Some(json!({ "body": "must be refused" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "non-member sub-agent must not send via the daemon's membership"
+    );
+
+    // Admit the sub-agent to the roster (OpenJoin admission) — the
+    // send is now authorized as the SUB-AGENT and carries provenance.
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        &format!("/groups/{group_id}/members"),
+        Some(json!({ "agent_id": sub_agent })),
+    )
+    .await;
+    assert!(status.is_success(), "add sub-agent member: {body}");
+
     // Granted send → 200 with msg_id.
     let (status, body) = rider_json(
         &token,
@@ -590,6 +619,141 @@ async fn rider_revoked_token_fails_on_next_request() {
     )
     .await;
     assert_eq!(status, reqwest::StatusCode::NOT_FOUND);
+}
+
+/// Review fix #4: a 10-minute browser session token is a read-only
+/// principal. It must NOT mint owner-signed certificates, rider
+/// tokens, or revoke anything — those owner-admin acts require the
+/// durable API token.
+#[tokio::test]
+#[ignore]
+async fn session_token_cannot_mint_owner_credentials() {
+    let d = owned_daemon().await;
+    let (status, body) = owner_json(&d, reqwest::Method::POST, "/auth/session", None).await;
+    assert_eq!(status, reqwest::StatusCode::OK, "session mint: {body}");
+    let session = body["session_token"]
+        .as_str()
+        .expect("session token")
+        .to_string();
+
+    let kp = x0x::identity::AgentKeypair::generate().expect("keypair");
+    let admin_acts: &[(reqwest::Method, &str, Option<Value>)] = &[
+        (
+            reqwest::Method::POST,
+            "/owner/agents/issue",
+            Some(json!({
+                "agent_public_key": hex::encode(kp.public_key().as_bytes()),
+                "mode": "rider"
+            })),
+        ),
+        (
+            reqwest::Method::POST,
+            "/owner/riders",
+            Some(json!({ "sub_agent_id": "ab".repeat(32) })),
+        ),
+        (reqwest::Method::GET, "/owner/riders", None),
+        (reqwest::Method::DELETE, "/owner/riders/1", None),
+        (
+            reqwest::Method::DELETE,
+            &format!("/owner/agents/{}", "cd".repeat(32)),
+            None,
+        ),
+    ];
+    for (method, path, body) in admin_acts {
+        let (status, resp) = rider_json(&session, method.clone(), d.url(path), body.clone()).await;
+        assert_eq!(
+            status,
+            reqwest::StatusCode::FORBIDDEN,
+            "session bearer {method} {path} must be 403: {resp}"
+        );
+    }
+    // Read-only owner surfaces remain session-accessible (GUI parity).
+    let (status, _) =
+        rider_json(&session, reqwest::Method::GET, d.url("/owner/agents"), None).await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::OK,
+        "session may read the roster"
+    );
+}
+
+/// Review fix #1 (CRITICAL): a rider must not inherit the daemon's
+/// ADMIN role. In an AdminOnly-write group where the daemon is the
+/// creator-admin, a rider whose sub-agent is a plain member (or not a
+/// member at all) is 403 — the provenance envelope names the
+/// authorization subject and receivers enforce against it.
+#[tokio::test]
+#[ignore]
+async fn rider_cannot_escalate_to_daemon_admin_role() {
+    let d = owned_daemon().await;
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        "/groups",
+        Some(json!({
+            "name": "admin-only-target",
+            "policy": {
+                "discoverability": "public_directory",
+                "admission": "open_join",
+                "confidentiality": "signed_public",
+                "read_access": "public",
+                "write_access": "admin_only"
+            }
+        })),
+    )
+    .await;
+    assert!(status.is_success(), "create admin-only group: {body}");
+    let group_id = body["group_id"].as_str().expect("group id").to_string();
+
+    let (sub_agent, token) = issue_rider(&d, "escalator", vec![group_id.clone()]).await;
+
+    // Non-member sub-agent: 403 despite the token grant.
+    let (status, _) = rider_json(
+        &token,
+        reqwest::Method::POST,
+        d.url(&format!("/groups/{group_id}/send")),
+        Some(json!({ "body": "admin voice" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "non-member in admin-only group"
+    );
+
+    // Plain-member sub-agent: still 403 — AdminOnly needs the
+    // sub-agent's OWN admin role, never the daemon's.
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        &format!("/groups/{group_id}/members"),
+        Some(json!({ "agent_id": sub_agent })),
+    )
+    .await;
+    assert!(status.is_success(), "add member: {body}");
+    let (status, resp) = rider_json(
+        &token,
+        reqwest::Method::POST,
+        d.url(&format!("/groups/{group_id}/send")),
+        Some(json!({ "body": "admin voice" })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::FORBIDDEN,
+        "plain-member sub-agent must not write to an admin-only group: {resp}"
+    );
+
+    // The daemon itself (owner bearer) still can — the policy works;
+    // only the rider's privilege ceiling changed.
+    let (status, resp) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        &format!("/groups/{group_id}/send"),
+        Some(json!({ "body": "owner announcement" })),
+    )
+    .await;
+    assert_eq!(status, reqwest::StatusCode::OK, "owner send: {resp}");
 }
 
 /// ACP-attached mode: a certificate issued over a submitted public key

@@ -875,6 +875,10 @@ pub(super) struct AppState {
     /// the auth middleware on every request after the owner-token
     /// checks fail.
     pub(super) rider_tokens: tokio::sync::Mutex<super::rider_auth::RiderTokenStore>,
+    /// Serializes ADR-0036 journal read-modify-write cycles performed
+    /// by the ADR-0039 owner routes (review fix #5: issuance appends
+    /// must not interleave).
+    pub(super) cert_journal_lock: tokio::sync::Mutex<()>,
     /// Tier-1 remote exec service.
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.

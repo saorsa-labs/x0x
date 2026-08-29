@@ -403,13 +403,25 @@ pub fn validate_public_message(
             field: "thread_parent",
         });
     }
-
     // 5. signature + author binding
     msg.verify_signature()
         .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
 
+    // Review fix #1 (receiver side): when a daemon-signed message
+    // carries rider provenance, the ACTING PRINCIPAL for ban and
+    // write-policy enforcement is the provenance sub-agent — NOT the
+    // daemon author. Without this, a rider message would inherit the
+    // daemon's admin role at every receiver and the provenance
+    // envelope would be cosmetic.
+    let acting_agent = msg
+        .rider_provenance
+        .as_ref()
+        .map_or(msg.author_agent_id.as_str(), |prov| {
+            prov.sub_agent_id.as_str()
+        });
+
     // 7. banned authors rejected
-    if let Some(member) = ctx.members_v2.get(&msg.author_agent_id) {
+    if let Some(member) = ctx.members_v2.get(acting_agent) {
         if member.state == GroupMemberState::Banned {
             return Err(IngestError::AuthorBanned);
         }
@@ -418,7 +430,7 @@ pub fn validate_public_message(
     // 8. write-access policy enforcement
     let author_role = ctx
         .members_v2
-        .get(&msg.author_agent_id)
+        .get(acting_agent)
         .filter(|m| m.state == GroupMemberState::Active)
         .map(|m| m.role);
 
@@ -687,6 +699,111 @@ mod tests {
         };
         let err = validate_public_message(&ctx, &msg).unwrap_err();
         assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
+    }
+
+    #[test]
+    fn ingest_enforces_policy_against_rider_provenance_sub_agent() {
+        // WHY (review fix #1, receiver side): a daemon-signed rider
+        // message must be authorized by the SUB-AGENT named in the
+        // provenance envelope, never by the daemon author. The daemon
+        // here IS an active member; the provenance sub-agent is not —
+        // ingest must reject. With the sub-agent admitted, it passes.
+        let daemon_kp = make_kp();
+        let sub_kp = make_kp();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "x".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: sub_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+            }),
+        )
+        .unwrap();
+        let policy = open_policy(); // MembersOnly write_access
+
+        // Daemon is a member, provenance sub-agent is NOT → reject.
+        let mut members = BTreeMap::new();
+        members.insert(
+            daemon_hex.clone(),
+            active_member(&daemon_hex, GroupRole::Admin),
+        );
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg),
+            Err(IngestError::WritePolicyViolation { .. })
+        ));
+
+        // Admit the sub-agent as a plain member → accept.
+        members.insert(sub_hex.clone(), active_member(&sub_hex, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        validate_public_message(&ctx, &msg).unwrap();
+    }
+
+    #[test]
+    fn ingest_admin_only_rider_provenance_needs_sub_agent_admin_role() {
+        // WHY: same principle under AdminOnly — the DAEMON author's
+        // admin role must not carry a rider whose sub-agent is a mere
+        // member.
+        let daemon_kp = make_kp();
+        let sub_kp = make_kp();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "x".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: sub_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+            }),
+        )
+        .unwrap();
+        let mut policy = open_policy();
+        policy.write_access = GroupWriteAccess::AdminOnly;
+        let mut members = BTreeMap::new();
+        members.insert(
+            daemon_hex.clone(),
+            active_member(&daemon_hex, GroupRole::Owner),
+        );
+        members.insert(sub_hex.clone(), active_member(&sub_hex, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg),
+            Err(IngestError::WritePolicyViolation { .. })
+        ));
     }
 
     #[test]

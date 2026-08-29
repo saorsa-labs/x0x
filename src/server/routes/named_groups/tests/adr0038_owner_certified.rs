@@ -779,7 +779,7 @@ async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()>
     let (status, json) = secure_group_encrypt(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
-        axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(req),
     )
     .await;
@@ -1343,7 +1343,7 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
     let (status, json) = secure_group_encrypt(
         State(Arc::clone(&state)),
         Path(group_id.clone()),
-        axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Json(req),
     )
     .await;

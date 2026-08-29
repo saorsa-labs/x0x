@@ -54,8 +54,20 @@ pub(in crate::server) struct IssueAgentRequest {
 /// registry writer), so a failed append fails the request.
 pub(in crate::server) async fn owner_agents_issue(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<IssueAgentRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Review fix #4: certifying a sub-agent is an owner-ADMIN act —
+    // the durable API token is required; a browser session bearer
+    // cannot mint owner-signed certificates.
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return owner_missing();
     };
@@ -111,12 +123,17 @@ pub(in crate::server) async fn owner_agents_issue(
             "no certificate journal configured for this install",
         );
     };
+    // Review fix #5: the journal append is a read-modify-write — hold
+    // the install-wide journal lock so concurrent issuances cannot
+    // interleave and lose lines.
+    let journal_guard = state.cert_journal_lock.lock().await;
     if let Err(e) = IssuedCertRecord::append(&journal_path, &record).await {
         return api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to append issuance journal: {e}"),
         );
     }
+    drop(journal_guard);
 
     let storage_b64 = cert
         .to_storage_bytes()
@@ -156,6 +173,72 @@ pub(in crate::server) struct RevokeAgentRequest {
     reason: Option<String>,
 }
 
+/// Decode a journal record's retained certificate bytes, if readable.
+fn decode_retained_cert(record: &IssuedCertRecord) -> Option<crate::identity::AgentCertificate> {
+    let bytes = record
+        .cert_b64
+        .as_deref()
+        .and_then(|b64| BASE64.decode(b64).ok())?;
+    crate::identity::AgentCertificate::from_storage_bytes(&bytes).ok()
+}
+
+/// Verify the sub-agent's admission evidence for an OwnerCertified
+/// group (review fix #1): the newest retained certificate must chain to
+/// the group's owner, verify, be unexpired, and the agent must not be
+/// ADR-0018-revoked. Returns `Err(reason)` for the 403 body.
+pub(in crate::server) async fn verify_rider_admission_cert(
+    state: &Arc<AppState>,
+    owner: &crate::identity::UserId,
+    sub_agent_hex: &str,
+) -> Result<(), String> {
+    let Some(journal_path) = state
+        .agent
+        .cert_journal_path()
+        .map(std::path::Path::to_path_buf)
+    else {
+        return Err("no certificate journal configured".to_string());
+    };
+    let owner_hex = hex::encode(owner.as_bytes());
+    let now = crate::server::rider_auth::unix_now_secs();
+    let records = IssuedCertRecord::load(&journal_path).await;
+    let best = records
+        .into_iter()
+        .filter(|record| {
+            record.user_id == owner_hex
+                && record.agent_id == sub_agent_hex
+                && record.cert_b64.is_some()
+        })
+        .max_by_key(|record| record.issued_at);
+    let Some(best) = best else {
+        return Err("sub-agent has no retained certificate for this owner".to_string());
+    };
+    let Some(cert) = decode_retained_cert(&best) else {
+        return Err("sub-agent certificate is unreadable".to_string());
+    };
+    let verdict = crate::groups::owner_cert::verify_cert_against_owner(
+        owner,
+        sub_agent_hex,
+        &cert,
+        false,
+        now,
+    );
+    if verdict.is_err() {
+        return Err(format!(
+            "sub-agent certificate fails OwnerCertified admission: {verdict:?}"
+        ));
+    }
+    if state
+        .agent
+        .revocation_records()
+        .await
+        .iter()
+        .any(|record| record.subject_kind() == "agent" && record.subject_hex() == sub_agent_hex)
+    {
+        return Err("sub-agent is revoked".to_string());
+    }
+    Ok(())
+}
+
 /// DELETE /owner/agents/:id — revoke a registered sub-agent (ADR-0018
 /// issuer-revocation path).
 ///
@@ -168,9 +251,18 @@ pub(in crate::server) struct RevokeAgentRequest {
 /// agent — use `/identity/revoke` — or pre-ADR-0039 lines).
 pub(in crate::server) async fn owner_agents_revoke(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(agent_id_hex): Path<String>,
     body: Option<Json<RevokeAgentRequest>>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return owner_missing();
     };
@@ -256,12 +348,26 @@ pub(in crate::server) async fn owner_agents_revoke(
             format!("owner revocation failed: {e}"),
         );
     }
-    let rider_tokens_revoked = state
+    // Review fix #3: the token sweep is persist-or-fail. The cert-level
+    // revocation above is already durable, and the middleware checks
+    // agent revocation on every rider request, so a failed sweep write
+    // is fenced twice over — surface it as 500 rather than reporting a
+    // success that did not happen.
+    let swept = state
         .rider_tokens
         .lock()
         .await
         .revoke_for_agent(&target_hex, crate::server::rider_auth::unix_now_secs())
         .await;
+    let rider_tokens_revoked = match swept {
+        Ok(n) => n,
+        Err(e) => {
+            return api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("agent revoked but rider-token sweep did not persist: {e}"),
+            );
+        }
+    };
 
     (
         StatusCode::OK,
@@ -294,11 +400,23 @@ pub(in crate::server) struct IssueRiderRequest {
 ///
 /// The token secret is returned exactly once; only its SHA-256 hash is
 /// stored. `404` when the sub-agent is not registered in rider mode;
-/// `409` when it has been revoked.
+/// `409` when it has been revoked. Review fix #2: the retained
+/// certificate is verified (signature, owner binding, expiry) at
+/// issuance and its digest + expiry are BOUND into the token, so a
+/// token can never precede or outlive its certificate.
 pub(in crate::server) async fn owner_riders_issue(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<IssueRiderRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return owner_missing();
     };
@@ -318,27 +436,60 @@ pub(in crate::server) async fn owner_riders_issue(
             "no certificate journal configured for this install",
         );
     };
-    let mut registered_rider = false;
-    for record in IssuedCertRecord::load(&journal_path).await {
-        if record.user_id == owner_hex
-            && record.agent_id == target_hex
-            && record.mode == CertMode::Rider
-        {
-            registered_rider = true;
+    // Locate the newest rider-mode record WITH retained certificate
+    // bytes, then verify the certificate itself.
+    let mut retained: Option<IssuedCertRecord> = None;
+    {
+        let _journal_guard = state.cert_journal_lock.lock().await;
+        for record in IssuedCertRecord::load(&journal_path).await {
+            if record.user_id == owner_hex
+                && record.agent_id == target_hex
+                && record.mode == CertMode::Rider
+                && record.cert_b64.is_some()
+                && retained
+                    .as_ref()
+                    .is_none_or(|best| record.issued_at >= best.issued_at)
+            {
+                retained = Some(record);
+            }
         }
     }
-    if !registered_rider {
+    let Some(record) = retained else {
         return api_error(
             StatusCode::NOT_FOUND,
-            "sub_agent_id is not a registered rider-mode agent (POST /owner/agents/issue first)",
+            "sub_agent_id is not a registered rider-mode agent with a retained certificate (POST /owner/agents/issue first)",
+        );
+    };
+    // Review fix #2: verify the bound certificate before minting.
+    let now = crate::server::rider_auth::unix_now_secs();
+    let cert = decode_retained_cert(&record);
+    let cert_ok = cert.as_ref().is_some_and(|cert| {
+        cert.verify().is_ok()
+            && cert.user_id().is_ok_and(|uid| uid == user_kp.user_id())
+            && cert.agent_id().is_ok_and(|aid| aid == sub_agent)
+            && !cert.is_expired(now)
+    });
+    let Some(cert) = cert else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "retained certificate bytes are unreadable",
+        );
+    };
+    if !cert_ok {
+        return api_error(
+            StatusCode::CONFLICT,
+            "retained certificate fails verification or has expired",
         );
     }
+    let cert_digest = record.cert_digest.clone();
+    let cert_not_after = cert.not_after();
+
     if state
         .agent
         .revocation_records()
         .await
         .iter()
-        .any(|record| record.subject_kind() == "agent" && record.subject_hex() == target_hex)
+        .any(|rec| rec.subject_kind() == "agent" && rec.subject_hex() == target_hex)
     {
         return api_error(StatusCode::CONFLICT, "sub-agent is revoked");
     }
@@ -371,7 +522,6 @@ pub(in crate::server) async fn owner_riders_issue(
         .unwrap_or(crate::server::rider_auth::RIDER_DEFAULT_TTL_SECS)
         .clamp(1, crate::server::rider_auth::RIDER_MAX_TTL_SECS);
 
-    let now = crate::server::rider_auth::unix_now_secs();
     let issued = state
         .rider_tokens
         .lock()
@@ -381,6 +531,8 @@ pub(in crate::server) async fn owner_riders_issue(
             groups.clone(),
             req.label.clone(),
             ttl,
+            cert_digest,
+            cert_not_after,
             now,
         )
         .await;
@@ -410,10 +562,21 @@ pub(in crate::server) async fn owner_riders_issue(
     )
 }
 
-/// GET /owner/riders — list rider-token records (no secrets).
+/// GET /owner/riders — list rider-token records (no secrets). Durable
+/// owner only (review fix #4): token ids and grant shapes are
+/// administrative metadata.
 pub(in crate::server) async fn owner_riders_list(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
     if state.agent.identity().user_keypair().is_none() {
         return owner_missing();
     }
@@ -429,6 +592,7 @@ pub(in crate::server) async fn owner_riders_list(
                 "label": record.label,
                 "issued_at_unix": record.issued_at,
                 "expires_at_unix": record.expires_at,
+                "cert_digest": record.cert_digest,
                 "revoked_at_unix": record.revoked_at,
             })).collect::<Vec<_>>(),
         })),
@@ -437,10 +601,22 @@ pub(in crate::server) async fn owner_riders_list(
 
 /// DELETE /owner/riders/:id — revoke one rider token. The token fails
 /// validation on the very next request (no restart, no cache).
+/// Review fix #3: revocation is persist-or-fail — `revoked: true` is
+/// only ever reported for a DURABLE revocation; a failed disk write
+/// yields `500` and the token stays live everywhere.
 pub(in crate::server) async fn owner_riders_revoke(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(token_id): Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "owner-admin endpoints require the durable API token (not a session token)",
+        );
+    }
     if state.agent.identity().user_keypair().is_none() {
         return owner_missing();
     }
@@ -456,15 +632,19 @@ pub(in crate::server) async fn owner_riders_revoke(
         .await
         .revoke(token_id, crate::server::rider_auth::unix_now_secs())
         .await;
-    if !revoked {
-        return api_error(StatusCode::NOT_FOUND, "unknown rider token id");
+    match revoked {
+        Ok(false) => api_error(StatusCode::NOT_FOUND, "unknown rider token id"),
+        Err(e) => api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("revocation did not persist: {e}"),
+        ),
+        Ok(true) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "token_id": token_id,
+                "revoked": true,
+            })),
+        ),
     }
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "token_id": token_id,
-            "revoked": true,
-        })),
-    )
 }

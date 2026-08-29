@@ -131,6 +131,14 @@ pub(super) async fn auth_middleware(
     let query_token = extract_query_token(req.uri().query());
     let now = Instant::now();
 
+    // Review fix #4: distinguish the DURABLE token (full authority,
+    // including owner-admin acts) from a short-lived browser session
+    // bearer (read-only principal). The durable check re-uses the same
+    // constant-time comparison as `authorize`.
+    let durable = header_token
+        .as_deref()
+        .is_some_and(|token| ct_eq(token, &state.api_token));
+
     let owner_ok = authorize(
         &path,
         &method,
@@ -145,17 +153,34 @@ pub(super) async fn auth_middleware(
     if owner_ok {
         let mut req = req;
         req.extensions_mut()
-            .insert(super::rider_auth::ActorContext::Owner);
+            .insert(super::rider_auth::ActorContext::Owner { durable });
         return next.run(req).await;
     }
 
     // Rider fallback: bearer header only, never a query string.
     if let Some(token) = header_token.as_deref() {
+        let now_unix = super::rider_auth::unix_now_secs();
         let rider = {
             let store = state.rider_tokens.lock().await;
-            store.validate(token, super::rider_auth::unix_now_secs())
+            store.validate(token, now_unix)
         };
         if let Some(rider) = rider {
+            // Review fix #2: the sub-agent's ADR-0018 revocation is
+            // checked on EVERY request, not only at token revocation
+            // time — a rider token cannot survive revocation of its
+            // agent even if the token-sweep write failed.
+            let agent_revoked = state.agent.revocation_records().await.iter().any(|record| {
+                record.subject_kind() == "agent" && record.subject_hex() == rider.sub_agent_id
+            });
+            if agent_revoked {
+                return (
+                    StatusCode::UNAUTHORIZED,
+                    Json(serde_json::json!({
+                        "error": "rider token rejected: sub-agent is revoked"
+                    })),
+                )
+                    .into_response();
+            }
             if !super::rider_auth::rider_route_allowed(&method, &path) {
                 return (
                     StatusCode::FORBIDDEN,

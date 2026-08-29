@@ -53,10 +53,15 @@ pub(super) const RIDER_TOKENS_FILE: &str = "rider-tokens.json";
 /// rest of the control plane.
 #[derive(Debug, Clone)]
 pub(super) enum ActorContext {
-    /// The durable API token or a browser session token — the human
-    /// owner's full control plane. Also the context for exempt paths
-    /// (`/health`, CORS preflights) where no principal authenticated.
-    Owner,
+    /// The durable API token (`durable: true`) or a browser session
+    /// token (`durable: false`) — the human owner's control plane.
+    /// Also the context for exempt paths (`/health`, CORS preflights)
+    /// with `durable: false`. Owner-ADMIN acts — certifying sub-agents
+    /// and minting/revoking rider tokens — require `durable: true`
+    /// (review fix: a 10-minute session bearer must not mint 90-day
+    /// credentials or owner-signed certificates); read-only surfaces
+    /// accept either.
+    Owner { durable: bool },
     /// A scoped rider token: acts as the registered `sub_agent_id`
     /// through this daemon. `groups` is the explicit named-group grant
     /// list (Home is additionally always permitted).
@@ -75,11 +80,20 @@ pub(super) enum ActorContext {
 impl ActorContext {
     pub(super) fn rider_allows_group(&self, is_home: bool, group_id: &str) -> bool {
         match self {
-            ActorContext::Owner => true,
+            ActorContext::Owner { .. } => true,
             ActorContext::Rider { groups, .. } => {
                 is_home || groups.iter().any(|g| g.as_str() == group_id)
             }
         }
+    }
+
+    /// `true` only for the durable API token — the authority required
+    /// for owner-admin acts (`/owner/agents/issue`, the rider-token
+    /// lifecycle, agent revocation). Session bearers are read-only
+    /// principals (review fix: no privilege amplification from a
+    /// 10-minute browser token).
+    pub(super) fn is_durable_owner(&self) -> bool {
+        matches!(self, ActorContext::Owner { durable: true })
     }
 }
 
@@ -160,6 +174,13 @@ pub(super) struct RiderTokenRecord {
     pub issued_at: u64,
     /// Unix seconds after which the token is invalid.
     pub expires_at: u64,
+    /// BLAKE3 hex of the sub-agent certificate this token was issued
+    /// against (review fix #2: the token is bound to the exact
+    /// issuance).
+    pub cert_digest: String,
+    /// The bound certificate's expiry — the token can never outlive
+    /// its certificate even if `expires_at` is later.
+    pub cert_not_after: Option<u64>,
     /// Unix seconds when the token was revoked, if it was.
     #[serde(default)]
     pub revoked_at: Option<u64>,
@@ -180,6 +201,20 @@ fn token_hash_hex(token: &str) -> String {
     use sha2::Digest;
     let digest = sha2::Sha256::digest(token.as_bytes());
     hex::encode(digest)
+}
+
+/// Constant-time equality of two SHA-256 hex digests (review fix #6:
+/// token matching must not leak digest bytes through early-exit string
+/// comparison). Both sides decode to fixed 32-byte buffers first; a
+/// malformed hex digest simply never matches.
+fn constant_time_hex_eq(a: &str, b: &str) -> bool {
+    match (hex::decode(a), hex::decode(b)) {
+        (Ok(a), Ok(b)) if a.len() == 32 && b.len() == 32 => {
+            use subtle::ConstantTimeEq;
+            a.ct_eq(&b).into()
+        }
+        _ => false,
+    }
 }
 
 /// Persists as the plain JSON map `{"next_id": u64, "tokens": {id: rec}}`.
@@ -253,12 +288,15 @@ impl RiderTokenStore {
 
     /// Issue a new rider token. Returns the one-time secret (shown to
     /// the caller exactly once) alongside its record.
+    #[allow(clippy::too_many_arguments)]
     pub(super) async fn issue(
         &mut self,
         sub_agent_id: String,
         groups: Vec<String>,
         label: Option<String>,
         ttl_secs: u64,
+        cert_digest: String,
+        cert_not_after: Option<u64>,
         now_unix: u64,
     ) -> std::io::Result<(String, RiderTokenRecord)> {
         use rand::RngCore;
@@ -275,6 +313,8 @@ impl RiderTokenStore {
             label,
             issued_at: now_unix,
             expires_at: now_unix.saturating_add(ttl_secs.max(1)),
+            cert_digest,
+            cert_not_after,
             revoked_at: None,
         };
         self.records.insert(token_id, record.clone());
@@ -288,11 +328,23 @@ impl RiderTokenStore {
     }
 
     /// Validate a presented bearer token. `None` for unknown, expired,
-    /// or revoked tokens — the middleware maps that to `401`.
+    /// or revoked tokens — and (review fix #2) for tokens whose bound
+    /// certificate has expired, so a token can never outlive its cert.
+    /// The middleware additionally checks ADR-0018 agent revocation on
+    /// every request.
     pub(super) fn validate(&self, token: &str, now_unix: u64) -> Option<ValidatedRider> {
         let hash = token_hash_hex(token);
-        let record = self.records.values().find(|r| r.token_hash == hash)?;
+        let record = self
+            .records
+            .values()
+            .find(|r| constant_time_hex_eq(&r.token_hash, &hash))?;
         if now_unix >= record.expires_at {
+            return None;
+        }
+        if record
+            .cert_not_after
+            .is_some_and(|not_after| now_unix >= not_after)
+        {
             return None;
         }
         if record.revoked_at.is_some() {
@@ -306,43 +358,66 @@ impl RiderTokenStore {
         })
     }
 
-    /// Revoke one token by id. Returns `false` when the id is unknown.
-    pub(super) async fn revoke(&mut self, token_id: u64, now_unix: u64) -> bool {
-        match self.records.get_mut(&token_id) {
-            Some(record) => {
-                if record.revoked_at.is_none() {
-                    record.revoked_at = Some(now_unix);
-                    if let Err(e) = self.persist().await {
-                        tracing::warn!(
-                            "failed to persist rider-token revocation: {e} — in-memory revocation stands"
-                        );
-                    }
-                }
-                true
-            }
-            None => false,
+    /// Revoke one token by id. `Ok(false)` when the id is unknown;
+    /// `Err` when the revocation could not be made DURABLE — the
+    /// in-memory mutation is rolled back so the token stays valid
+    /// everywhere and the caller reports failure (review fix #3:
+    /// revocation is persist-or-fail, never fail-open across a
+    /// restart).
+    pub(super) async fn revoke(
+        &mut self,
+        token_id: u64,
+        now_unix: u64,
+    ) -> Result<bool, std::io::Error> {
+        let Some(record) = self.records.get_mut(&token_id) else {
+            return Ok(false);
+        };
+        if record.revoked_at.is_some() {
+            return Ok(true);
         }
+        record.revoked_at = Some(now_unix);
+        if let Err(e) = self.persist().await {
+            // Roll back: on disk the token is still live, so it must
+            // remain live in memory too. The caller surfaces the error.
+            if let Some(record) = self.records.get_mut(&token_id) {
+                record.revoked_at = None;
+            }
+            return Err(e);
+        }
+        Ok(true)
     }
 
     /// Revoke every token bound to `sub_agent_id` (used when the
     /// sub-agent itself is revoked via `DELETE /owner/agents/:id`).
-    /// Returns the number of tokens revoked.
-    pub(super) async fn revoke_for_agent(&mut self, sub_agent_id: &str, now_unix: u64) -> usize {
-        let mut revoked = 0;
+    /// Same persist-or-fail contract as [`revoke`](Self::revoke): on a
+    /// persistence failure every in-memory mutation is rolled back and
+    /// the error is returned (the caller's cert-level revocation and
+    /// the middleware's per-request agent-revocation check still fence
+    /// the tokens).
+    pub(super) async fn revoke_for_agent(
+        &mut self,
+        sub_agent_id: &str,
+        now_unix: u64,
+    ) -> Result<usize, std::io::Error> {
+        let mut revoked_ids = Vec::new();
         for record in self.records.values_mut() {
             if record.sub_agent_id == sub_agent_id && record.revoked_at.is_none() {
                 record.revoked_at = Some(now_unix);
-                revoked += 1;
+                revoked_ids.push(record.token_id);
             }
         }
-        if revoked > 0 {
-            if let Err(e) = self.persist().await {
-                tracing::warn!(
-                    "failed to persist rider-token revocations: {e} — in-memory revocations stand"
-                );
-            }
+        if revoked_ids.is_empty() {
+            return Ok(0);
         }
-        revoked
+        if let Err(e) = self.persist().await {
+            for id in revoked_ids {
+                if let Some(record) = self.records.get_mut(&id) {
+                    record.revoked_at = None;
+                }
+            }
+            return Err(e);
+        }
+        Ok(revoked_ids.len())
     }
 
     /// All records, ordered by id (for `GET /owner/riders`). No secrets.
@@ -443,7 +518,7 @@ mod tests {
     fn rider_group_scope_home_or_granted_only() {
         // WHY: ADR-0039 — Home is the always-granted base scope; every
         // other group needs an explicit grant; owners are unrestricted.
-        let owner = ActorContext::Owner;
+        let owner = ActorContext::Owner { durable: true };
         let rider = ActorContext::Rider {
             sub_agent_id: "aa".repeat(32),
             token_id: 1,
@@ -476,16 +551,19 @@ mod tests {
                 vec!["g1".to_string()],
                 Some("ci-agent".into()),
                 60,
+                "d1".repeat(32),
+                None,
                 1_000,
             )
             .await
             .unwrap();
         assert_eq!(record.expires_at, 1_060);
+        assert_eq!(record.cert_digest, "d1".repeat(32));
         let ok = store.validate(&token, 1_050).unwrap();
         assert_eq!(ok.sub_agent_id, "ab".repeat(32));
         assert_eq!(ok.groups, vec!["g1".to_string()]);
 
-        assert!(store.revoke(record.token_id, 1_055).await);
+        assert!(store.revoke(record.token_id, 1_055).await.unwrap());
         assert!(
             store.validate(&token, 1_056).is_none(),
             "revoked token must fail closed"
@@ -499,7 +577,15 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut store = RiderTokenStore::load(dir.path().join(RIDER_TOKENS_FILE)).await;
         let (token, _) = store
-            .issue("cd".repeat(32), vec![], None, 10, 1_000)
+            .issue(
+                "cd".repeat(32),
+                vec![],
+                None,
+                10,
+                "d2".repeat(32),
+                None,
+                1_000,
+            )
             .await
             .unwrap();
         assert!(store.validate(&token, 1_009).is_some());
@@ -508,6 +594,64 @@ mod tests {
             "expired token must fail closed"
         );
         assert!(store.validate(&"0".repeat(64), 1_000).is_none());
+    }
+
+    #[tokio::test]
+    async fn rider_token_cannot_outlive_its_bound_certificate() {
+        // WHY (review fix #2): the token's TTL may outlast the
+        // sub-agent certificate; the store must refuse validation the
+        // moment the bound certificate expires.
+        let dir = tempfile::tempdir().unwrap();
+        let mut store = RiderTokenStore::load(dir.path().join(RIDER_TOKENS_FILE)).await;
+        let (token, _) = store
+            .issue(
+                "ee".repeat(32),
+                vec![],
+                None,
+                10_000,
+                "d3".repeat(32),
+                Some(1_500),
+                1_000,
+            )
+            .await
+            .unwrap();
+        assert!(store.validate(&token, 1_499).is_some());
+        assert!(
+            store.validate(&token, 1_500).is_none(),
+            "token must die with its certificate, not at its own TTL"
+        );
+    }
+
+    #[tokio::test]
+    async fn revocation_is_persist_or_fail_never_fail_open() {
+        // WHY (review fix #3): if the revocation cannot be made durable,
+        // the caller must see the error and the token must stay live
+        // EVERYWHERE (in-memory rollback) — a silent success would
+        // resurrect the token after a restart.
+        let dir = tempfile::tempdir().unwrap();
+        // The store file is a DIRECTORY: every write fails.
+        let broken = dir.path().join(RIDER_TOKENS_FILE);
+        std::fs::create_dir(&broken).unwrap();
+        let mut store = RiderTokenStore::load(dir.path().join("alt.json")).await;
+        // Issue through a working path, then swap in the broken one.
+        let (token, record) = store
+            .issue(
+                "aa".repeat(32),
+                vec![],
+                None,
+                60,
+                "d4".repeat(32),
+                None,
+                1_000,
+            )
+            .await
+            .unwrap();
+        store.path = broken;
+        assert!(store.revoke(record.token_id, 1_010).await.is_err());
+        assert!(
+            store.validate(&token, 1_020).is_some(),
+            "in-memory rollback keeps the token live until revocation is durable"
+        );
     }
 
     #[tokio::test]
@@ -521,14 +665,30 @@ mod tests {
         let (token_a, rec_a) = {
             let mut store = RiderTokenStore::load(path.clone()).await;
             let (ta, ra) = store
-                .issue(agent.clone(), vec![], None, 60, 1_000)
+                .issue(
+                    agent.clone(),
+                    vec![],
+                    None,
+                    60,
+                    "d5".repeat(32),
+                    None,
+                    1_000,
+                )
                 .await
                 .unwrap();
             let (_tb, rb) = store
-                .issue(agent.clone(), vec![], None, 60, 1_000)
+                .issue(
+                    agent.clone(),
+                    vec![],
+                    None,
+                    60,
+                    "d5".repeat(32),
+                    None,
+                    1_000,
+                )
                 .await
                 .unwrap();
-            store.revoke(rb.token_id, 1_001).await;
+            store.revoke(rb.token_id, 1_001).await.unwrap();
             (ta, ra)
         };
         // Simulated restart: reload from disk.
@@ -537,7 +697,7 @@ mod tests {
             store.validate(&token_a, 1_020).is_some(),
             "survives restart"
         );
-        assert_eq!(store.revoke_for_agent(&agent, 1_030).await, 1);
+        assert_eq!(store.revoke_for_agent(&agent, 1_030).await.unwrap(), 1);
         assert!(store.validate(&token_a, 1_031).is_none());
         assert_eq!(rec_a.token_id, 1);
     }

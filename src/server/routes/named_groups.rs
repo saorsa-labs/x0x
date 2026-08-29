@@ -17,6 +17,7 @@ use super::files::{
 };
 use super::groups::save_mls_groups;
 use super::identity::populate_invite_base_state_from_group_info;
+use super::owner::verify_rider_admission_cert;
 use super::public_group_bootstrap_outbox::{
     cancel_public_group_bootstrap_obligations_for_removal,
     persist_named_group_info_with_bootstrap_obligation, public_group_bootstrap_obligation_for_add,
@@ -9335,12 +9336,25 @@ pub(in crate::server) async fn send_group_public_message(
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
-        if info.is_banned(&local_hex) {
+        // Review fix #1 (CRITICAL): authorization uses the ACTING
+        // PRINCIPAL's identity. For the owner that is the daemon's own
+        // agent; for a rider it is the SUB-AGENT on whose behalf the
+        // daemon signs — ban state, membership, and role are checked
+        // against the sub-agent, so a rider can never inherit the
+        // daemon-admin's privileges and the provenance envelope is the
+        // authorization subject, not decoration.
+        let acting_hex = match &actor {
+            crate::server::rider_auth::ActorContext::Owner { .. } => local_hex.clone(),
+            crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
+                sub_agent_id.clone()
+            }
+        };
+        if info.is_banned(&acting_hex) {
             return forbidden("you are banned");
         }
         // Endpoint-side write-access enforcement. Mirror the ingest
         // validator so we reject locally rather than trust receivers.
-        let caller_role = info.caller_role(&local_hex);
+        let caller_role = info.caller_role(&acting_hex);
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
@@ -9349,7 +9363,7 @@ pub(in crate::server) async fn send_group_public_message(
                         .record_sender_write_policy_rejection(info.stable_group_id());
                     tracing::warn!(
                         group_id = %info.stable_group_id(),
-                        author = %local_hex,
+                        author = %acting_hex,
                         "rejected public group send: members-only write policy"
                     );
                     return forbidden("members-only write policy");
@@ -9371,20 +9385,18 @@ pub(in crate::server) async fn send_group_public_message(
             .map(|member| member.agent_id.clone())
             .collect::<Vec<_>>();
 
-        // ADR-0039 rider scope check: the daemon's own membership carries
-        // the send; a rider may only reach Home (not applicable on this
-        // SignedPublic-only surface) or an explicitly granted group.
+        // ADR-0039 rider scope check: even with membership satisfied,
+        // the send must be inside the token's explicit grant (Home is
+        // not applicable on this SignedPublic-only surface).
         let rider_provenance = match &actor {
-            crate::server::rider_auth::ActorContext::Owner => None,
+            crate::server::rider_auth::ActorContext::Owner { .. } => None,
             crate::server::rider_auth::ActorContext::Rider {
                 sub_agent_id,
                 token_id,
                 token_hash,
                 groups,
             } => {
-                let is_home = info.home.is_some();
-                let granted =
-                    is_home || groups.iter().any(|g| g.as_str() == info.stable_group_id());
+                let granted = groups.iter().any(|g| g.as_str() == info.stable_group_id());
                 if !granted {
                     return forbidden(
                         "rider token is not granted this group (ADR-0039 deny-by-default)",
@@ -16594,26 +16606,56 @@ pub(in crate::server) async fn secure_group_encrypt(
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
-    // ADR-0039: the DAEMON is the acting member; a rider reaches Home
-    // (and any granted MlsEncrypted group) through that membership, with
-    // the sub-agent attribution recorded in the local history row.
-    let rider_sub_agent_id = match &actor {
-        crate::server::rider_auth::ActorContext::Owner => None,
-        crate::server::rider_auth::ActorContext::Rider { .. } => {
-            let is_home = info.home.is_some();
-            if !actor.rider_allows_group(is_home, info.stable_group_id()) {
-                return forbidden(
-                    "rider token is not granted this group (ADR-0039 deny-by-default)",
-                );
-            }
-            match &actor {
-                crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
-                    Some(sub_agent_id.clone())
-                }
-                _ => None,
-            }
+    // ADR-0039 + review fix #1: the DAEMON carries the cryptography (it
+    // holds the group keys), but a rider's AUTHORIZATION is the
+    // SUB-AGENT's: ban, write policy, and — for OwnerCertified groups
+    // like Home, where admission is owner certification itself — the
+    // retained certificate must chain to the group's owner, be
+    // unexpired, and be unrevoked. Otherwise the rider send is 403.
+    let mut rider_sub_agent_id: Option<String> = None;
+    let mut cert_gate_owner: Option<crate::identity::UserId> = None;
+    if let crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } = &actor {
+        let is_home = info.home.is_some();
+        if !actor.rider_allows_group(is_home, info.stable_group_id()) {
+            return forbidden("rider token is not granted this group (ADR-0039 deny-by-default)");
         }
-    };
+        if info.is_banned(sub_agent_id) {
+            return forbidden("sub-agent is banned from this group");
+        }
+        let sub_role = info.caller_role(sub_agent_id);
+        match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly
+            | x0x::groups::GroupWriteAccess::AdminOnly => {
+                let ok = match info.policy.write_access {
+                    x0x::groups::GroupWriteAccess::AdminOnly => sub_role
+                        .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                        .unwrap_or(false),
+                    _ => sub_role.is_some(),
+                };
+                if !ok {
+                    // MembersOnly/AdminOnly with no roster role: still
+                    // admissible when the group's admission rule is
+                    // OwnerCertified AND the sub-agent presents a live
+                    // owner-chained certificate (ADR-0038: admission IS
+                    // the owner's certificate).
+                    cert_gate_owner = info.policy.admission.owner_certified_user_id().cloned();
+                    if cert_gate_owner.is_none() {
+                        return forbidden("sub-agent is not a member of this group (ADR-0039)");
+                    }
+                }
+            }
+            x0x::groups::GroupWriteAccess::ModeratedPublic => { /* any non-banned */ }
+        }
+        rider_sub_agent_id = Some(sub_agent_id.clone());
+    }
+    if let (Some(owner), Some(sub_hex)) = (cert_gate_owner, rider_sub_agent_id.as_deref()) {
+        // The named-groups read guard is held across this await: the
+        // verification touches only the journal and revocation set, so
+        // there is no lock recursion — just bounded contention.
+        if let Err(reason) = verify_rider_admission_cert(&state, &owner, sub_hex).await {
+            return forbidden(reason);
+        }
+    }
     if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
         return bad_request("group is not MlsEncrypted — use public send instead");
     }
@@ -21676,6 +21718,7 @@ pub(in crate::server) mod tests {
                 )
                 .await,
             ),
+            cert_journal_lock: tokio::sync::Mutex::new(()),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
@@ -22741,7 +22784,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -22767,7 +22810,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -24598,7 +24641,7 @@ pub(in crate::server) mod tests {
         let (enc_status, enc_body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(plaintext),
             }),
@@ -25540,7 +25583,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25560,7 +25603,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25687,7 +25730,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -27699,7 +27742,7 @@ pub(in crate::server) mod tests {
         let response = send_group_public_message(
             State(state),
             Path(group_id.to_string()),
-            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(req),
         )
         .await
