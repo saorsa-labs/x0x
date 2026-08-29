@@ -122,17 +122,15 @@ pub(in crate::server) async fn history_list(
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
     // ADR-0039 bounded rider read: a rider may list only `group:` scopes
-    // it is granted (Home always), and never more than
+    // EXPLICITLY granted to its token (review r4: no implicit Home —
+    // Home is delegated like any other group), and never more than
     // RIDER_HISTORY_MAX_LIMIT rows per request. The route itself is the
     // only history surface the deny-by-default predicate lets riders
     // reach — search/stats/message lookups stay owner-only.
     let mut params = params;
     if let crate::server::rider_auth::ActorContext::Rider { groups, .. } = &actor {
         let allowed = match &scope {
-            x0x::history::Scope::Group(gid) => {
-                let home_id = home_stable_group_id(&state).await;
-                home_id.as_deref() == Some(gid.as_str()) || groups.contains(gid)
-            }
+            x0x::history::Scope::Group(gid) => groups.contains(gid),
             _ => false,
         };
         if !allowed {
@@ -388,17 +386,6 @@ pub(in crate::server) async fn history_diagnostics(
         })),
     )
 }
-
-/// The stable group id of this install's Home group, when provisioned
-/// (ADR-0038). Home is the always-granted rider history scope.
-async fn home_stable_group_id(state: &Arc<AppState>) -> Option<String> {
-    let groups = state.named_groups.read().await;
-    groups
-        .values()
-        .find(|info| info.home.is_some())
-        .map(|info| info.stable_group_id().to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

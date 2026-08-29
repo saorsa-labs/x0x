@@ -78,12 +78,14 @@ pub(super) enum ActorContext {
 }
 
 impl ActorContext {
-    pub(super) fn rider_allows_group(&self, is_home: bool, group_id: &str) -> bool {
+    /// Whether this actor may operate on `group_id`. Owners are
+    /// unrestricted; a rider may only reach groups explicitly granted
+    /// to its token (review r4: the implicit Home grant is GONE — Home
+    /// is delegated like any other group, or not reachable at all).
+    pub(super) fn rider_allows_group(&self, group_id: &str) -> bool {
         match self {
             ActorContext::Owner { .. } => true,
-            ActorContext::Rider { groups, .. } => {
-                is_home || groups.iter().any(|g| g.as_str() == group_id)
-            }
+            ActorContext::Rider { groups, .. } => groups.iter().any(|g| g.as_str() == group_id),
         }
     }
 
@@ -534,9 +536,11 @@ mod tests {
     }
 
     #[test]
-    fn rider_group_scope_home_or_granted_only() {
-        // WHY: ADR-0039 — Home is the always-granted base scope; every
-        // other group needs an explicit grant; owners are unrestricted.
+    fn rider_group_scope_explicit_grants_only() {
+        // WHY (review r4): there is NO implicit Home grant — a rider
+        // reaches exactly the groups on its explicit grant list (which
+        // mirror the sub-agent-signed delegation scopes); owners are
+        // unrestricted.
         let owner = ActorContext::Owner { durable: true };
         let rider = ActorContext::Rider {
             sub_agent_id: "aa".repeat(32),
@@ -544,15 +548,11 @@ mod tests {
             token_hash: "deadbeef".to_string(),
             groups: vec!["group-b".to_string()],
         };
-        assert!(owner.rider_allows_group(false, "anything"));
+        assert!(owner.rider_allows_group("anything"));
+        assert!(rider.rider_allows_group("group-b"), "granted group");
         assert!(
-            rider.rider_allows_group(true, "group-a"),
-            "Home always allowed"
-        );
-        assert!(rider.rider_allows_group(false, "group-b"), "granted group");
-        assert!(
-            !rider.rider_allows_group(false, "group-a"),
-            "ungranted group must be denied"
+            !rider.rider_allows_group("group-a"),
+            "ungranted group must be denied — including Home unless delegated"
         );
     }
 

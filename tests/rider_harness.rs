@@ -209,7 +209,7 @@ async fn home_group_id(d: &OwnedDaemon) -> String {
 async fn rider_scope_matrix_ungranted_verbs_forbidden() {
     let d = owned_daemon().await;
     let home = home_group_id(&d).await;
-    let (_sub, token) = issue_rider(&d, "scope-matrix", vec![]).await;
+    let (_sub, token) = issue_rider(&d, "scope-matrix", vec![home.clone()]).await;
 
     let forbidden: &[(reqwest::Method, &str, Option<Value>)] = &[
         // The signing oracle (gapcheck blocker 21).
@@ -537,11 +537,13 @@ async fn rider_send_carries_provenance_and_lands() {
         "ungranted group send"
     );
 
-    // Home (MlsEncrypted): the rider encrypt surface lands attributed
-    // plaintext history in the Home scope.
+    // Review r4 item 1: there is NO implicit Home grant. This rider's
+    // delegation covers only `group_id`, so the Home encrypt is 403 —
+    // the previous behavior (any rider could reach Home) encoded the
+    // bug this round removes.
     use base64::Engine as _;
     let payload = base64::engine::general_purpose::STANDARD.encode(b"rider to home");
-    let (status, body) = rider_json(
+    let (status, _) = rider_json(
         &token,
         reqwest::Method::POST,
         d.url(&format!("/groups/{home}/secure/encrypt")),
@@ -550,24 +552,17 @@ async fn rider_send_carries_provenance_and_lands() {
     .await;
     assert_eq!(
         status,
-        reqwest::StatusCode::OK,
-        "rider Home encrypt must succeed (Home is always granted): {body}"
+        reqwest::StatusCode::FORBIDDEN,
+        "Home must be delegated explicitly — no implicit grant"
     );
-    let (status, body) = owner_json(
-        &d,
-        reqwest::Method::GET,
-        &format!("/history?scope=group:{home}&limit=10"),
-        None,
-    )
-    .await;
-    assert_eq!(status, reqwest::StatusCode::OK, "home history: {body}");
-    let records = body["records"].as_array().cloned().unwrap_or_default();
-    assert!(
-        records
-            .iter()
-            .any(|r| r["author_agent"].as_str() == Some(sub_agent.as_str())),
-        "Home history row attributed to the sub-agent: {body}"
-    );
+
+    // The MLS happy path (delegated member rider encrypts, signed
+    // attribution recorded in durable history) is proven in the
+    // unit suite — `rider_mls_encrypt_requires_delegation_and_records_
+    // signed_attribution` in src/server/routes/named_groups.rs — because
+    // REST-created MlsEncrypted groups are TreeKem-plane and a direct
+    // member add there requires a TreeKEM key package, which a
+    // harness-held sub-agent key cannot produce.
 
     // Rider history is bounded to granted scopes: dm scope → 403.
     let (status, _) = rider_json(
@@ -587,7 +582,7 @@ async fn rider_send_carries_provenance_and_lands() {
 async fn rider_revoked_token_fails_on_next_request() {
     let d = owned_daemon().await;
     let home = home_group_id(&d).await;
-    let (_sub_agent, token) = issue_rider(&d, "doomed", vec![]).await;
+    let (_sub_agent, token) = issue_rider(&d, "doomed", vec![home.clone()]).await;
 
     // Alive: the granted Home history read answers 200.
     let (status, _) = rider_json(
@@ -631,7 +626,7 @@ async fn rider_revoked_token_fails_on_next_request() {
 
     // Agent-level revocation (ADR-0018 issuer path) sweeps rider tokens
     // and marks the roster entry revoked; new token issuance is refused.
-    let (sub2, token2) = issue_rider(&d, "sweep-me", vec![]).await;
+    let (sub2, token2) = issue_rider(&d, "sweep-me", vec![home.clone()]).await;
     let (status, _) = rider_json(
         &token2,
         reqwest::Method::GET,

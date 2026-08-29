@@ -352,6 +352,120 @@ pub fn sign_rider_delegation(
     ))
 }
 
+/// Domain-separation tag for MLS-plane rider attribution artifacts
+/// (review r4): the MLS ciphertext itself is opaque, so the daemon
+/// signs a small artifact binding the rider provenance — including the
+/// sub-agent-signed delegation — to the concrete (group, epoch) it was
+/// encrypted under. The artifact is recorded in durable history, making
+/// Home attribution cryptographic instead of a local string.
+pub const RIDER_MLS_ATTRIBUTION_DOMAIN: &[u8] = b"x0x.rider.mls-attribution.v1";
+
+/// Canonical MLS attribution bytes:
+/// `domain || (len-prefixed) sub_agent_id, scope, delegation
+/// cert_b64/payload_b64/signature || token_id(LE) || epoch(LE)`.
+#[must_use]
+pub fn rider_mls_attribution_bytes(
+    provenance: &RiderProvenance,
+    group_id: &str,
+    epoch: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256 + provenance.delegation.cert_b64.len());
+    buf.extend_from_slice(RIDER_MLS_ATTRIBUTION_DOMAIN);
+    push_len_prefixed_str(&mut buf, &provenance.sub_agent_id);
+    push_len_prefixed_str(&mut buf, &provenance.scope);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.cert_b64);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.payload_b64);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.signature);
+    buf.extend_from_slice(&provenance.rider_token_id.to_le_bytes());
+    push_len_prefixed_str(&mut buf, group_id);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf
+}
+
+#[cfg(test)]
+mod mls_attribution_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::identity::AgentKeypair;
+
+    fn delegation_for(sub_kp: &AgentKeypair, daemon_hex: &str) -> RiderDelegation {
+        use base64::Engine as _;
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &owner,
+            sub_kp.public_key().as_bytes(),
+            None,
+        )
+        .unwrap();
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let scopes = vec!["mls-group".to_string()];
+        let not_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let payload = rider_delegation_bytes(&sub_hex, daemon_hex, &scopes, not_after);
+        let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload).unwrap();
+        RiderDelegation {
+            cert_b64: base64::engine::general_purpose::STANDARD
+                .encode(cert.to_storage_bytes().unwrap()),
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&payload),
+            signature: hex::encode(sig.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn rider_mls_attribution_is_daemon_signed_and_binds_group_and_epoch() {
+        // WHY (review r4 item 2): Home/MLS attribution must be
+        // cryptographic — a daemon signature over bytes that bind the
+        // provenance (and its sub-agent-signed delegation), the group,
+        // AND the epoch, so the artifact cannot be replayed across
+        // groups or epochs unnoticed.
+        let daemon_kp = AgentKeypair::generate().unwrap();
+        let sub_kp = AgentKeypair::generate().unwrap();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let prov = RiderProvenance {
+            sub_agent_id: hex::encode(sub_kp.agent_id().as_bytes()),
+            rider_token_id: 7,
+            rider_token_hash: "ab".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: delegation_for(&sub_kp, &daemon_hex),
+        };
+        let bytes = rider_mls_attribution_bytes(&prov, "mls-group", 42);
+        let sig = sign_with_ml_dsa(daemon_kp.secret_key(), &bytes).unwrap();
+        // The daemon's signature verifies over the exact bytes…
+        assert!(ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            daemon_kp.public_key(),
+            &bytes,
+            &sig
+        )
+        .is_ok());
+        // …and any (group, epoch) drift breaks verification — the
+        // artifact is bound, not a free-floating string.
+        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 43);
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "epoch drift must invalidate the attribution signature"
+        );
+        let tampered = rider_mls_attribution_bytes(&prov, "other-group", 42);
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "group drift must invalidate the attribution signature"
+        );
+    }
+}
+
 impl GroupPublicMessage {
     /// Canonical bytes signed by the author to produce `signature`.
     ///

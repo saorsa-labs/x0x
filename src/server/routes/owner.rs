@@ -182,63 +182,6 @@ fn decode_retained_cert(record: &IssuedCertRecord) -> Option<crate::identity::Ag
     crate::identity::AgentCertificate::from_storage_bytes(&bytes).ok()
 }
 
-/// Verify the sub-agent's admission evidence for an OwnerCertified
-/// group (review fix #1): the newest retained certificate must chain to
-/// the group's owner, verify, be unexpired, and the agent must not be
-/// ADR-0018-revoked. Returns `Err(reason)` for the 403 body.
-pub(in crate::server) async fn verify_rider_admission_cert(
-    state: &Arc<AppState>,
-    owner: &crate::identity::UserId,
-    sub_agent_hex: &str,
-) -> Result<(), String> {
-    let Some(journal_path) = state
-        .agent
-        .cert_journal_path()
-        .map(std::path::Path::to_path_buf)
-    else {
-        return Err("no certificate journal configured".to_string());
-    };
-    let owner_hex = hex::encode(owner.as_bytes());
-    let now = crate::server::rider_auth::unix_now_secs();
-    let records = IssuedCertRecord::load(&journal_path).await;
-    let best = records
-        .into_iter()
-        .filter(|record| {
-            record.user_id == owner_hex
-                && record.agent_id == sub_agent_hex
-                && record.cert_b64.is_some()
-        })
-        .max_by_key(|record| record.issued_at);
-    let Some(best) = best else {
-        return Err("sub-agent has no retained certificate for this owner".to_string());
-    };
-    let Some(cert) = decode_retained_cert(&best) else {
-        return Err("sub-agent certificate is unreadable".to_string());
-    };
-    let verdict = crate::groups::owner_cert::verify_cert_against_owner(
-        owner,
-        sub_agent_hex,
-        &cert,
-        false,
-        now,
-    );
-    if verdict.is_err() {
-        return Err(format!(
-            "sub-agent certificate fails OwnerCertified admission: {verdict:?}"
-        ));
-    }
-    if state
-        .agent
-        .revocation_records()
-        .await
-        .iter()
-        .any(|record| record.subject_kind() == "agent" && record.subject_hex() == sub_agent_hex)
-    {
-        return Err("sub-agent is revoked".to_string());
-    }
-    Ok(())
-}
-
 /// DELETE /owner/agents/:id — revoke a registered sub-agent (ADR-0018
 /// issuer-revocation path).
 ///
