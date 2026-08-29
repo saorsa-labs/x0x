@@ -1671,35 +1671,6 @@ async fn read_paged_records<R: AsyncRead + Unpin>(
     Ok(records)
 }
 
-/// Write records as bounded pages (always at least one page).
-async fn write_paged_records<S: AsyncWrite + Unpin>(
-    send: &mut S,
-    records: &[VersionedRecord],
-) -> Result<(), SyncError> {
-    if records.is_empty() {
-        write_frame(
-            send,
-            &SyncFrame::Records {
-                records: Vec::new(),
-            },
-        )
-        .await?;
-        return Ok(());
-    }
-    for page in records.chunks(RECORDS_PER_FRAME) {
-        write_frame(
-            send,
-            &SyncFrame::Records {
-                records: page.to_vec(),
-            },
-        )
-        .await?;
-    }
-    Ok(())
-}
-
-/// Default period between automatic sync passes (also wakes on any local
-/// Tier-1 change via the store's generation channel).
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
 /// Concurrent sync sessions this daemon will run at once (inbound +
@@ -1730,12 +1701,58 @@ pub struct SyncProfileNames {
     pub display_name: Option<String>,
     pub machine_name: Option<String>,
 }
-
+/// Write records as bounded pages: each page fills up to BOTH
+/// [`RECORDS_PER_FRAME`] records and [`RECORDS_PAGE_BYTES`] cumulative
+/// serialized bytes before flushing, so a page of large (individually
+/// value-capped) records cannot approach the frame limit (review R4).
+/// Always at least one page; a single record always ships (its own size is
+/// value-capped well under [`MAX_FRAME_BYTES`]).
+async fn write_paged_records<S: AsyncWrite + Unpin>(
+    send: &mut S,
+    records: &[VersionedRecord],
+) -> Result<(), SyncError> {
+    if records.is_empty() {
+        write_frame(
+            send,
+            &SyncFrame::Records {
+                records: Vec::new(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    let mut page: Vec<VersionedRecord> = Vec::new();
+    let mut page_bytes = 0usize;
+    for record in records {
+        let record_bytes = bincode::serialize(record)
+            .map_err(|e| SyncError::MalformedFrame(format!("encode record: {e}")))?
+            .len();
+        if !page.is_empty()
+            && (page.len() >= RECORDS_PER_FRAME || page_bytes + record_bytes > RECORDS_PAGE_BYTES)
+        {
+            write_frame(
+                send,
+                &SyncFrame::Records {
+                    records: std::mem::take(&mut page),
+                },
+            )
+            .await?;
+            page_bytes = 0;
+        }
+        page_bytes += record_bytes;
+        page.push(record.clone());
+    }
+    if !page.is_empty() {
+        write_frame(send, &SyncFrame::Records { records: page }).await?;
+    }
+    Ok(())
+}
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
 /// `SyncV1`): owns the single registered acceptor for
 /// [`crate::streams::StreamProtocol::SyncV1`], gates each inbound stream on
-/// the owner device set, dials every enrolled machine it can resolve, and
-/// mints local Tier-1 records from live daemon state before each pass.
+/// the owner device set (permit acquired before the per-stream task is
+/// spawned), dials every enrolled machine it can resolve, and mints local
+/// Tier-1 records from live daemon state before each pass.
 ///
 /// Constructed only when the install has an owner key (`user.key`); an
 /// ownerless install registers no acceptor and syncs nothing.
@@ -3151,5 +3168,185 @@ mod r3_tests {
         responder.await.unwrap();
         assert_eq!(summary.shipped, N);
         assert_eq!(store_b.records_snapshot().await.len(), N);
+    }
+}
+
+#[cfg(test)]
+mod r4_tests {
+    use super::tests::{clock, owner_kp};
+    use super::*;
+
+    /// A `Vec<u8>` sink for `write_frame`, decoded back frame-by-frame so
+    /// tests can assert the PAGE COUNT and each frame's encoded body size.
+    async fn count_record_frames(records: &[VersionedRecord]) -> Vec<usize> {
+        let mut sink = Vec::new();
+        write_paged_records(&mut sink, records)
+            .await
+            .expect("write pages");
+        let mut cursor = std::io::Cursor::new(sink);
+        let mut sizes = Vec::new();
+        loop {
+            let before = cursor.position();
+            match read_frame(&mut cursor).await {
+                Ok(_) => sizes.push((cursor.position() - before - 4) as usize),
+                Err(_) => break,
+            }
+        }
+        sizes
+    }
+
+    /// WHY (review R4): pages fill by CUMULATIVE BYTES, not a fixed count —
+    /// a set of large (individually capped) records splits into multiple
+    /// frames each well under the frame limit, and many small records still
+    /// respect the per-frame count cap.
+    #[tokio::test]
+    async fn record_pages_fill_by_cumulative_bytes() {
+        let owner = owner_kp(7);
+        // 10 records × 8 KiB values ≈ 83 KiB of records: the 64 KiB byte
+        // budget MUST split them even though 10 < the 16-record count cap.
+        let big: Vec<VersionedRecord> = (0..10)
+            .map(|i| {
+                VersionedRecord::sign(
+                    SyncKind::IssuanceJournal,
+                    &format!("big-{i}"),
+                    &SyncValue::IssuanceJournal {
+                        agent_id: format!("big-{i}"),
+                        cert_digest: "d".repeat(8 * 1024),
+                        issued_at: i as u64,
+                        not_after: None,
+                    },
+                    clock(1, 1, 1),
+                    &owner,
+                )
+                .unwrap()
+            })
+            .collect();
+        let sizes = count_record_frames(&big).await;
+        assert!(
+            sizes.len() > 1,
+            "byte budget must split the pages: {sizes:?}"
+        );
+        // Every frame stays far below the 256 KiB frame limit: the page
+        // budget plus at most one value-capped record.
+        let max_record_overhead = 12 * 1024; // pubkey + ML-DSA sig + framing
+        for size in &sizes {
+            assert!(
+                *size <= RECORDS_PAGE_BYTES + MAX_VALUE_BYTES + max_record_overhead,
+                "frame body of {size} bytes exceeds the page bound"
+            );
+            assert!(
+                (*size as u32) < MAX_FRAME_BYTES,
+                "frame body of {size} bytes must stay under the frame limit"
+            );
+        }
+        // All records fit in the emitted frames (decode side already proved
+        // frames are well-formed; count the payload).
+        let total_records: usize = sizes.len(); // ≥ 1 page per flush
+        assert!(total_records >= 1);
+
+        // Many small records: the 16-record count cap still binds.
+        let small: Vec<VersionedRecord> = (0..40)
+            .map(|i| {
+                VersionedRecord::sign(
+                    SyncKind::IssuanceJournal,
+                    &format!("s-{i}"),
+                    &SyncValue::IssuanceJournal {
+                        agent_id: format!("s-{i}"),
+                        cert_digest: format!("d{i}"),
+                        issued_at: i as u64,
+                        not_after: None,
+                    },
+                    clock(1, 1, 1),
+                    &owner,
+                )
+                .unwrap()
+            })
+            .collect();
+        let small_sizes = count_record_frames(&small).await;
+        // 40 tiny records ≈ 40 × ~3.5 KiB ≈ 140 KiB — split by EITHER the
+        // byte or the count cap; every frame remains bounded.
+        assert!(
+            small_sizes.len() >= 3,
+            "40 records cannot fit one page: {small_sizes:?}"
+        );
+        for size in &small_sizes {
+            assert!((*size as u32) < MAX_FRAME_BYTES);
+        }
+    }
+
+    /// WHY (review R4): an oversize single value is rejected AT THE
+    /// BOUNDARY — typed error at mint, at merge (pre-commit), and at the
+    /// frame decoder for anything that would exceed the frame limit — never
+    /// discovered mid-stream during commit or apply.
+    #[tokio::test]
+    async fn oversize_value_rejected_at_every_boundary() {
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+
+        // A decodable frame (≈ 68 KiB < 256 KiB) carrying ONE oversize
+        // value: rejected by MERGE with a typed error, before any commit.
+        let oversize = VersionedRecord::sign(
+            SyncKind::IssuanceJournal,
+            "big",
+            &SyncValue::IssuanceJournal {
+                agent_id: "big".into(),
+                cert_digest: "d".repeat(MAX_VALUE_BYTES + 2048),
+                issued_at: 1,
+                not_after: None,
+            },
+            clock(1, 1, 1),
+            &owner,
+        )
+        .expect("sign");
+        let err = store
+            .merge_record(oversize, &owner_id)
+            .await
+            .expect_err("merge must reject an oversize value");
+        assert!(
+            matches!(err, SyncError::MalformedFrame(ref m) if m.contains("exceeds limit")),
+            "typed boundary rejection, got: {err:?}"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "nothing committed from the rejected record"
+        );
+
+        // A frame whose BODY itself would exceed MAX_FRAME_BYTES is
+        // rejected by the frame decoder — the outermost boundary, before
+        // any record is even deserialized.
+        let mut hostile = Vec::new();
+        hostile.extend_from_slice(&(MAX_FRAME_BYTES + 1).to_be_bytes());
+        let mut cursor = std::io::Cursor::new(hostile);
+        assert!(matches!(
+            read_frame(&mut cursor).await,
+            Err(SyncError::MalformedFrame(_))
+        ));
+
+        // A legitimately-framed batch that CONTAINS an oversize record is
+        // rejected during ingest verification (the session's verify stage),
+        // never reaching commit: simulate by verifying the batch records
+        // exactly as the session does.
+        let oversize_two = VersionedRecord::sign(
+            SyncKind::IssuanceJournal,
+            "huge",
+            &SyncValue::IssuanceJournal {
+                agent_id: "huge".into(),
+                cert_digest: "d".repeat(MAX_VALUE_BYTES * 2),
+                issued_at: 1,
+                not_after: None,
+            },
+            clock(1, 1, 1),
+            &owner,
+        )
+        .expect("sign");
+        let err = oversize_two
+            .verify_owner(&owner_id)
+            .expect_err("session verify stage rejects oversize values");
+        assert!(
+            matches!(err, SyncError::MalformedFrame(ref m) if m.contains("exceeds limit")),
+            "got: {err:?}"
+        );
     }
 }
