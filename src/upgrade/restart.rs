@@ -653,24 +653,17 @@ fn pid_alive(_pid: u32) -> bool {
     false
 }
 
-/// Whether a loopback probe can bind the address right now. Unspecified IPs
-/// are probed on loopback. `AddrInUse` is the only "busy" answer; anything
-/// else (firewalled, unsupported family) reads as free so the wait cannot
+/// Whether the exact address can be bound right now. The probe binds the
+/// address verbatim — including unspecified wildcard binds — because that is
+/// precisely what the restarted daemon will attempt. BSD `SO_REUSEADDR`
+/// permits overlapping wildcard/specific binds, so substituting loopback for
+/// a wildcard address can report a held port as free; an exact-duplicate
+/// bind is refused on every platform (`SO_REUSEPORT` would be required to
+/// steal it). `AddrInUse` is the only "busy" answer; anything else
+/// (firewalled, unsupported family) reads as free so the wait cannot
 /// deadlock on exotic setups.
 fn addr_is_free(addr: SocketAddr) -> bool {
-    let probe = if addr.ip().is_unspecified() {
-        SocketAddr::new(
-            if addr.is_ipv4() {
-                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST)
-            } else {
-                std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST)
-            },
-            addr.port(),
-        )
-    } else {
-        addr
-    };
-    match TcpListener::bind(probe) {
+    match TcpListener::bind(addr) {
         Ok(listener) => {
             drop(listener);
             true
@@ -1074,11 +1067,18 @@ mod tests {
     }
 
     #[test]
-    fn addr_is_free_probes_loopback_for_unspecified_bind() {
+    fn addr_is_free_detects_wildcard_bound_port() {
         let listener = TcpListener::bind(("0.0.0.0", 0)).unwrap();
         let addr = listener.local_addr().unwrap();
         assert!(!addr_is_free(addr));
         drop(listener);
+        // Same small race window after drop as above; the wildcard address
+        // must read free again so the release wait cannot wedge.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !addr_is_free(addr) {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(addr_is_free(addr));
     }
 
     #[test]
