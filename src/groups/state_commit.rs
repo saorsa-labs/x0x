@@ -250,6 +250,31 @@ pub fn compute_public_meta_hash(meta: &GroupPublicMeta) -> String {
         &mut buf,
         meta.banner_url.as_deref().unwrap_or("").as_bytes(),
     );
+    // ADR-0038 review fix 1: Home metadata commitment. Absent (legacy and
+    // non-Home groups) hashes byte-identically to the pre-0038 form.
+    if let Some(home_digest) = meta.home_digest.as_deref() {
+        buf.push(b'#');
+        push_len_prefixed(&mut buf, home_digest.as_bytes());
+    }
+    blake3_hex(&buf)
+}
+
+/// Canonical BLAKE3-256 (hex) commitment over a group's Home metadata —
+/// the value [`GroupPublicMeta::home_digest`] carries into the signed
+/// state hash. Length-prefixed field encoding, stable across field order.
+#[must_use]
+pub fn compute_home_digest(home: &super::HomeMetadata) -> String {
+    let mut buf = Vec::with_capacity(128);
+    buf.extend_from_slice(b"x0x.home-meta.v1");
+    push_len_prefixed(&mut buf, home.primary_agent.as_bytes());
+    // Placements in BTreeMap (deterministic key order): agent, placement
+    // byte, all length-prefixed.
+    buf.extend_from_slice(&(home.placements.len() as u32).to_le_bytes());
+    for (agent, placement) in &home.placements {
+        push_len_prefixed(&mut buf, agent.as_bytes());
+        buf.push(u8::from(*placement == super::MemberPlacement::Roaming));
+    }
+    buf.extend_from_slice(&home.provisioned_at_ms.to_le_bytes());
     blake3_hex(&buf)
 }
 
@@ -383,6 +408,14 @@ pub struct GroupPublicMeta {
     pub avatar_url: Option<String>,
     #[serde(default)]
     pub banner_url: Option<String>,
+    /// ADR-0038 review fix 1: BLAKE3 commitment over the group's Home
+    /// metadata (`GroupInfo::home`), when present. Including this digest
+    /// in the signed state hash makes injected/forged Home metadata
+    /// (primary-agent claims) fail state-hash validation instead of
+    /// persisting unsigned. `None` (every legacy group and every non-Home
+    /// group) hashes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_digest: Option<String>,
 }
 
 /// A signed commitment to the current valid group state.
@@ -1183,6 +1216,7 @@ mod tests {
             tags: vec!["ai".into(), "rust".into()],
             avatar_url: None,
             banner_url: None,
+            home_digest: None,
         };
         let b = GroupPublicMeta {
             name: "N".into(),
@@ -1190,6 +1224,7 @@ mod tests {
             tags: vec!["rust".into(), "ai".into()],
             avatar_url: None,
             banner_url: None,
+            home_digest: None,
         };
         assert_eq!(compute_public_meta_hash(&a), compute_public_meta_hash(&b));
     }

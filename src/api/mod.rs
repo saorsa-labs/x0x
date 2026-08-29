@@ -165,6 +165,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Get,
+        path: "/home",
+        cli_name: "home",
+        description: "ADR-0038 Home space: group id, primary agent, members, warnings",
+        category: "groups",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/home/rename",
+        cli_name: "home rename",
+        description: "Rename the Home space (admin-gated, sealed)",
+        category: "groups",
+    },
+    EndpointDef {
+        method: Method::Get,
         path: "/owner/agents",
         cli_name: "owner agents",
         description: "Roster of agents certified by this install's owner (journal-backed; survives restarts)",

@@ -92,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<ProfileSub>,
     },
+    /// The owner's personal Home space (ADR-0038).
+    Home {
+        #[command(subcommand)]
+        sub: Option<HomeSub>,
+    },
     /// Owner-scoped views of this install (ADR-0036).
     Owner {
         #[command(subcommand)]
@@ -420,6 +425,17 @@ enum ProfileSub {
         /// Label for this machine.
         #[arg(long, value_name = "NAME")]
         machine_name: Option<String>,
+    },
+}
+
+/// `x0x home` subcommands (ADR-0038).
+#[derive(Subcommand)]
+enum HomeSub {
+    /// Rename the Home space (admin-gated sealed update).
+    Rename {
+        /// New display name for the Home space.
+        #[arg(value_name = "NAME")]
+        name: String,
     },
 }
 
@@ -955,6 +971,11 @@ enum GroupSub {
         /// Policy preset: private_secure | public_request_secure | public_open | public_announce.
         #[arg(long)]
         preset: Option<String>,
+        /// Explicit full policy as JSON (mutually exclusive with --preset).
+        /// The daemon echoes the effective policy back; a missing/mismatched
+        /// echo (older daemon silently ignoring the field) fails loudly.
+        #[arg(long)]
+        policy: Option<String>,
     },
     /// Get group details.
     Info {
@@ -1510,6 +1531,10 @@ async fn run(
                 .await
             }
         },
+        Commands::Home { sub } => match sub {
+            None => commands::identity::home(&client).await,
+            Some(HomeSub::Rename { name }) => commands::identity::home_rename(&client, &name).await,
+        },
         Commands::Owner { sub } => match sub {
             None | Some(OwnerSub::Agents) => commands::identity::owner_agents(&client).await,
         },
@@ -1809,6 +1834,7 @@ async fn run(
                 description,
                 display_name,
                 preset,
+                policy,
             }) => {
                 commands::group::create(
                     &client,
@@ -1816,6 +1842,7 @@ async fn run(
                     description.as_deref(),
                     display_name.as_deref(),
                     preset.as_deref(),
+                    policy.as_deref(),
                 )
                 .await
             }

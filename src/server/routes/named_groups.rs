@@ -357,16 +357,22 @@ pub(in crate::server) fn named_group_direct_delivery_config() -> x0x::dm::DmSend
 /// Request body for POST /groups.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateGroupRequest {
-    name: String,
+    pub(in crate::server) name: String,
     #[serde(default)]
-    description: String,
+    pub(in crate::server) description: String,
     /// Optional display name for the creator in this group.
     #[serde(default)]
-    display_name: Option<String>,
+    pub(in crate::server) display_name: Option<String>,
     /// Policy preset name (private_secure / public_request_secure / public_open /
     /// public_announce). Defaults to `private_secure`.
     #[serde(default)]
-    preset: Option<String>,
+    pub(in crate::server) preset: Option<String>,
+    /// ADR-0038: full explicit policy. When present it wins over `preset`
+    /// (passing both is a 400) — used by Home auto-provisioning to install
+    /// the OwnerCertified axis, whose owner id is install-specific and so
+    /// cannot be a named preset.
+    #[serde(default)]
+    pub(in crate::server) policy: Option<x0x::groups::GroupPolicy>,
 }
 
 /// Request body for POST /groups/join.
@@ -8419,14 +8425,37 @@ pub(in crate::server) async fn create_named_group(
     let agent_id = state.agent.agent_id();
 
     // Resolve policy preset (defaults to private_secure).
-    let policy = match req.preset.as_deref() {
-        Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
-            Some(preset) => preset.to_policy(),
-            None => {
-                return bad_request("unknown preset");
+    let policy = if let Some(explicit) = req.policy {
+        if req.preset.is_some() {
+            return bad_request("pass either `preset` or `policy`, not both");
+        }
+        // ADR-0038 review fix 2: an explicit OwnerCertified(owner) claim is
+        // only honored when THIS daemon's agent certificate actually chains
+        // to that owner — otherwise any token holder could mint and
+        // advertise `OwnerCertified(victim)` groups and seat itself Admin.
+        if let Some(owner) = explicit.admission.owner_certified_user_id() {
+            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+            let evidence = super::home::owner_chain_evidence(state.as_ref(), &[&local_hex]).await;
+            if x0x::groups::owner_cert::verify_owner_certified_member(owner, &local_hex, &evidence)
+                .is_err()
+            {
+                return forbidden(
+                    "cannot create an OwnerCertified group: this agent's certificate does \
+                     not chain to the requested owner",
+                );
             }
-        },
-        None => x0x::groups::GroupPolicy::default(),
+        }
+        explicit
+    } else {
+        match req.preset.as_deref() {
+            Some(name) => match x0x::groups::GroupPolicyPreset::from_name(name) {
+                Some(preset) => preset.to_policy(),
+                None => {
+                    return bad_request("unknown preset");
+                }
+            },
+            None => x0x::groups::GroupPolicy::default(),
+        }
     };
 
     // Create the legacy demo MLS group object (kept for the `/mls/groups/:id`
@@ -8716,6 +8745,14 @@ pub(in crate::server) async fn create_named_group(
                     "group_id": group_id_hex,
                     "name": info.name,
                     "chat_topic": chat_topic,
+                    // ADR-0038 review fix 2 (downgrade detection): echo
+                    // the EFFECTIVE policy. An older daemon that silently
+                    // ignored the unknown `policy` field returns no
+                    // `policy` echo — a caller that sent an explicit
+                    // policy treats the omission as a version downgrade
+                    // and can retry/fail loudly instead of trusting a
+                    // default-policy group it believes is OwnerCertified.
+                    "policy": info.policy,
                 })),
             )
         }
@@ -8779,6 +8816,16 @@ pub(in crate::server) async fn get_named_group(
             "roster_revision": info.roster_revision,
             "member_count": members.len(),
             "members": members,
+            "home": info.home.as_ref().map(|home| serde_json::json!({
+                "primary_agent": home.primary_agent,
+                "provisioned_at_ms": home.provisioned_at_ms,
+                "placements": home.placements.iter().map(|(agent, placement)| {
+                    (agent.clone(), serde_json::json!(if *placement == x0x::groups::MemberPlacement::Roaming { "roaming" } else { "pinned" }))
+                }).collect::<serde_json::Map<String, serde_json::Value>>(),
+            })),
+            "warnings": super::home::home_roaming_warning_for(info)
+                .map(|warning| vec![warning])
+                .unwrap_or_default(),
         })),
     )
 }
@@ -13344,8 +13391,8 @@ pub(in crate::server) async fn leave_group(
 
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct UpdateGroupRequest {
-    name: Option<String>,
-    description: Option<String>,
+    pub(in crate::server) name: Option<String>,
+    pub(in crate::server) description: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -13387,7 +13434,7 @@ pub(in crate::server) fn now_millis_u64() -> u64 {
 /// grow-only set. Agents whose hex does not parse produce no entry and so
 /// fail closed downstream (`NoCertificate`/not-revoked evidence still fails
 /// the chain check).
-async fn owner_cert_evidence_for(
+pub(in crate::server) async fn owner_cert_evidence_for(
     state: &AppState,
     agents: &[&str],
 ) -> x0x::groups::owner_cert::OwnerCertEvidence {
@@ -13488,7 +13535,7 @@ async fn owner_cert_seal_evidence(
 /// event, and would leave the GSS secret / TreeKEM leaves unrotated so the
 /// evicted member keeps decrypting). For every other admission axis — or a
 /// fully certified roster — this is exactly `seal_commit`.
-async fn seal_commit_owner_certified(
+pub(in crate::server) async fn seal_commit_owner_certified(
     state: &AppState,
     info: &mut x0x::groups::GroupInfo,
     signing_kp: &crate::identity::AgentKeypair,
@@ -19622,7 +19669,7 @@ pub(in crate::server) async fn load_predecessor_relay_outbox(
 
 #[must_use]
 #[cfg(test)]
-async fn save_named_groups(state: &AppState) -> bool {
+pub(in crate::server) async fn save_named_groups(state: &AppState) -> bool {
     match save_named_groups_checked(state).await {
         Ok(AtomicWriteOutcome::Durable) => true,
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
@@ -30068,6 +30115,8 @@ pub(in crate::server) mod tests {
                 description: String::new(),
                 display_name: None,
                 preset: Some("private_secure".to_string()),
+
+                policy: None,
             }),
         )
         .await

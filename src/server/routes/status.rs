@@ -33,6 +33,13 @@ pub(in crate::server) struct HealthData {
     uptime_secs: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     degraded_reason: Option<String>,
+    /// Structured advisory warnings (never liveness-affecting). ADR-0038
+    /// review fix: Home warnings live on AUTHED surfaces only (`GET /home`,
+    /// `GET /groups/:id`) — `/health` is auth-exempt and must not leak
+    /// Home/owner existence. Reserved (always empty) for future
+    /// non-sensitive advisories.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    warnings: Vec<serde_json::Value>,
 }
 
 /// Classify liveness for `GET /health` (issue #262).
@@ -128,6 +135,7 @@ pub(in crate::server) async fn health(
             send_ready_peers,
             uptime_secs,
             degraded_reason,
+            warnings: Vec::new(),
         },
     })
 }

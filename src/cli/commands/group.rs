@@ -26,6 +26,7 @@ pub async fn create(
     description: Option<&str>,
     display_name: Option<&str>,
     preset: Option<&str>,
+    policy_json: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "name": name });
@@ -38,7 +39,36 @@ pub async fn create(
     if let Some(p) = preset {
         body["preset"] = Value::String(p.to_string());
     }
+    if let Some(p) = policy_json {
+        let parsed: Value = serde_json::from_str(p)
+            .map_err(|e| anyhow::anyhow!("--policy must be a JSON GroupPolicy object: {e}"))?;
+        body["policy"] = parsed;
+    }
     let resp = client.post("/groups", &body).await?;
+    // ADR-0038 round-2 fix 4: when an EXPLICIT policy was sent, the daemon
+    // echoes the effective policy back — validate it. A missing echo means
+    // an older daemon silently ignored the unknown `policy` field (the
+    // mixed-version downgrade); a mismatching echo must never pass quietly.
+    if body.get("policy").is_some() {
+        match resp.get("policy") {
+            Some(echoed) => {
+                if echoed != &body["policy"] {
+                    anyhow::bail!(
+                        "daemon applied a DIFFERENT policy than requested \
+                         (requested {}, applied {}) — group NOT created as intended",
+                        body["policy"],
+                        echoed
+                    );
+                }
+            }
+            None => anyhow::bail!(
+                "daemon did not echo the effective policy — it is probably an \
+                 older version that silently ignored `policy` and applied the \
+                 default. The group was created with the WRONG policy; delete \
+                 it or upgrade the daemon."
+            ),
+        }
+    }
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -758,7 +788,7 @@ mod tests {
         let mock_resp = serde_json::json!({"id": "new-group", "name": "test"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = create(&client, "test-group", None, None, None).await;
+        let result = create(&client, "test-group", None, None, None, None).await;
         assert!(result.is_ok(), "create should succeed: {:?}", result);
     }
 
