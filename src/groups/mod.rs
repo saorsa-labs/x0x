@@ -48,9 +48,12 @@ pub use self::policy::{
     GroupPolicySummary, GroupReadAccess, GroupWriteAccess,
 };
 pub use self::public_message::{
-    public_topic_for, validate_public_message, GroupPublicMessage, GroupPublicMessageKind,
-    IngestError as PublicMessageIngestError, PublicIngestContext, MAX_PUBLIC_MESSAGE_BYTES,
-    PUBLIC_GROUP_TOPIC_PREFIX, PUBLIC_MESSAGE_DOMAIN,
+    parse_rider_delegation, public_topic_for, rider_delegation_bytes, rider_mls_attribution_bytes,
+    sign_rider_delegation, validate_public_message, validate_public_message_with_revocations,
+    verify_rider_provenance, GroupPublicMessage, GroupPublicMessageKind,
+    IngestError as PublicMessageIngestError, PublicIngestContext, RiderDelegation,
+    RiderDelegationClaim, RiderProvenance, MAX_PUBLIC_MESSAGE_BYTES, PUBLIC_GROUP_TOPIC_PREFIX,
+    PUBLIC_MESSAGE_DOMAIN, RIDER_MLS_ATTRIBUTION_DOMAIN,
 };
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{

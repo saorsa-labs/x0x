@@ -40,7 +40,7 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Domain-separation tag for public-message signatures (v1 — no thread fields).
 pub const PUBLIC_MESSAGE_DOMAIN: &[u8] = b"x0x.group.public-message.v1";
@@ -104,8 +104,478 @@ pub struct GroupPublicMessage {
     /// When present, `thread_root` must also be present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_parent: Option<String>,
+    /// ADR-0039 rider provenance: present only when this message was sent
+    /// through the owner's daemon by an API-key rider. The envelope rides
+    /// INSIDE `signable_bytes()` — the daemon-agent signature over the
+    /// message authenticates the attribution (gapcheck blocker 24: the
+    /// provenance marker must be covered by the signed bytes). Additive and
+    /// serde-defaulted, so pre-ADR-0039 messages (and older verifiers that
+    /// drop the field) see the exact v1/v2 encoding when it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rider_provenance: Option<RiderProvenance>,
     /// Hex ML-DSA-65 signature over `signable_bytes()`.
     pub signature: String,
+}
+
+/// Attribution envelope for a rider-sourced send (ADR-0039, review r3).
+///
+/// The daemon never holds the sub-agent's secret key, so it cannot — and
+/// must not — sign *as* the sub-agent. The daemon's agent key signs the
+/// message, and this envelope binds, inside those signed bytes, the
+/// registered sub-agent on whose behalf the send was made — **backed by
+/// a cryptographic delegation** ([`RiderDelegation`]) signed by the
+/// sub-agent's OWN key: the daemon may only speak for sub-agents that
+/// explicitly authorized THIS daemon, scoped to named groups and
+/// expiring. Receivers verify the whole chain; the asserted
+/// `sub_agent_id` string alone proves nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiderProvenance {
+    /// Hex `AgentId` of the registered sub-agent on whose behalf the
+    /// daemon sent (must match a `mode=rider` journal record and the
+    /// delegation's certified subject).
+    pub sub_agent_id: String,
+    /// Opaque numeric id of the rider token that authorized the send.
+    pub rider_token_id: u64,
+    /// SHA-256 hex of the rider token (the hashed-at-rest identifier;
+    /// the token secret is never placed on the wire).
+    pub rider_token_hash: String,
+    /// The granted scope this send used: the target group id.
+    pub scope: String,
+    /// The sub-agent-signed delegation authorizing THIS daemon. Required:
+    /// provenance without a verifiable delegation is exactly the forgery
+    /// vector and is rejected by receivers.
+    pub delegation: RiderDelegation,
+}
+
+/// A delegation-to-daemon capability signed by the SUB-AGENT's key
+/// (review r3, option B): `{sub_agent_id -> daemon_agent_id, scopes,
+/// not_after}`. The harness signs it once, locally, when the rider token
+/// is issued; the daemon stores it with the token and embeds it in every
+/// rider message. Receivers verify: (i) the embedded owner certificate
+/// is valid and binds the claimed `sub_agent_id`, (ii) the capability
+/// signature verifies under that certificate's agent key, (iii) the
+/// capability names the message's actual signer as the delegated
+/// daemon, (iv) the target group is in the capability scopes, and
+/// (v) the capability has not expired.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiderDelegation {
+    /// Base64 `AgentCertificate` storage bytes for the sub-agent — the
+    /// self-contained trust anchor so receivers that have never seen the
+    /// sub-agent can verify the chain without a blob-cache fetch
+    /// (gapcheck 13: cache misses must not become fail-open pressure).
+    pub cert_b64: String,
+    /// Base64 canonical delegation bytes ([`rider_delegation_bytes`]).
+    pub payload_b64: String,
+    /// Hex ML-DSA-65 signature by the sub-agent key over the payload.
+    pub signature: String,
+}
+
+/// Domain-separation tag for delegation capabilities.
+pub const RIDER_DELEGATION_DOMAIN: &[u8] = b"x0x.rider-delegation.v1";
+
+/// Canonical delegation bytes:
+/// `domain || len(sub_agent_id) || sub_agent_id || len(daemon_agent_id)
+/// || daemon_agent_id || scope_count(LE u32) || (len+id)* ||
+/// not_after(LE u64)`.
+///
+/// Public so harnesses build the exact bytes they sign.
+#[must_use]
+pub fn rider_delegation_bytes(
+    sub_agent_id: &str,
+    daemon_agent_id: &str,
+    scopes: &[String],
+    not_after: u64,
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(64 + sub_agent_id.len() + daemon_agent_id.len());
+    buf.extend_from_slice(RIDER_DELEGATION_DOMAIN);
+    push_len_prefixed_str(&mut buf, sub_agent_id);
+    push_len_prefixed_str(&mut buf, daemon_agent_id);
+    buf.extend_from_slice(&(scopes.len() as u32).to_le_bytes());
+    for scope in scopes {
+        push_len_prefixed_str(&mut buf, scope);
+    }
+    buf.extend_from_slice(&not_after.to_le_bytes());
+    buf
+}
+
+fn push_len_prefixed_str(buf: &mut Vec<u8>, s: &str) {
+    buf.extend_from_slice(&(s.len() as u32).to_le_bytes());
+    buf.extend_from_slice(s.as_bytes());
+}
+
+/// The parsed delegation claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RiderDelegationClaim {
+    pub sub_agent_id: String,
+    pub daemon_agent_id: String,
+    pub scopes: Vec<String>,
+    pub not_after: u64,
+}
+
+/// Parse canonical delegation bytes back into a claim (mirrors
+/// [`rider_delegation_bytes`]; rejects trailing garbage).
+#[must_use]
+pub fn parse_rider_delegation(payload: &[u8]) -> Option<RiderDelegationClaim> {
+    let mut rest = payload;
+    if rest.len() < RIDER_DELEGATION_DOMAIN.len()
+        || &rest[..RIDER_DELEGATION_DOMAIN.len()] != RIDER_DELEGATION_DOMAIN
+    {
+        return None;
+    }
+    rest = &rest[RIDER_DELEGATION_DOMAIN.len()..];
+    let sub_agent_id = take_len_prefixed_str(&mut rest)?;
+    let daemon_agent_id = take_len_prefixed_str(&mut rest)?;
+    let scope_count = u32::from_le_bytes(take_fixed(&mut rest, 4)?.try_into().ok()?) as usize;
+    if scope_count > 64 {
+        return None;
+    }
+    let mut scopes = Vec::with_capacity(scope_count);
+    for _ in 0..scope_count {
+        scopes.push(take_len_prefixed_str(&mut rest)?);
+    }
+    let not_after = u64::from_le_bytes(take_fixed(&mut rest, 8)?.try_into().ok()?);
+    if !rest.is_empty() {
+        return None;
+    }
+    Some(RiderDelegationClaim {
+        sub_agent_id,
+        daemon_agent_id,
+        scopes,
+        not_after,
+    })
+}
+
+fn take_fixed<'a>(rest: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
+    if rest.len() < n {
+        return None;
+    }
+    let (head, tail) = rest.split_at(n);
+    *rest = tail;
+    Some(head)
+}
+
+fn take_len_prefixed_str(rest: &mut &[u8]) -> Option<String> {
+    let len = u32::from_le_bytes(take_fixed(rest, 4)?.try_into().ok()?) as usize;
+    if len > 512 {
+        return None;
+    }
+    let bytes = take_fixed(rest, len)?;
+    std::str::from_utf8(bytes).ok().map(str::to_string)
+}
+
+/// Verify a rider provenance chain against the message's actual signer.
+///
+/// Returns the certified `sub_agent_id` on success. Checks, in order:
+/// certificate decodes + verifies + binds the claimed sub-agent;
+/// delegation payload parses and re-states the same subject; the
+/// delegation signature verifies under the certificate's agent key; the
+/// delegation names `author_agent_id` (the daemon that actually signed
+/// the message) as the delegate; the capability is unexpired at
+/// `now_unix`; and `scope` (the target group) is inside the capability
+/// scopes. Every failure is a string reason for logs/403 bodies.
+pub fn verify_rider_provenance(
+    provenance: &RiderProvenance,
+    author_agent_id: &str,
+    scope: &str,
+    agent_revoked: bool,
+    now_unix: u64,
+) -> Result<String, String> {
+    use base64::Engine as _;
+    let cert_bytes = base64::engine::general_purpose::STANDARD
+        .decode(&provenance.delegation.cert_b64)
+        .map_err(|_| "delegation certificate is not valid base64".to_string())?;
+    let cert = crate::identity::AgentCertificate::from_storage_bytes(&cert_bytes)
+        .map_err(|e| format!("delegation certificate does not decode: {e}"))?;
+    cert.verify()
+        .map_err(|_| "delegation certificate fails verification".to_string())?;
+    let certified_sub = cert
+        .agent_id()
+        .map(|id| hex::encode(id.as_bytes()))
+        .map_err(|_| "delegation certificate has no agent id".to_string())?;
+    if certified_sub != provenance.sub_agent_id {
+        return Err("provenance sub_agent_id does not match its certificate".to_string());
+    }
+    let payload = base64::engine::general_purpose::STANDARD
+        .decode(&provenance.delegation.payload_b64)
+        .map_err(|_| "delegation payload is not valid base64".to_string())?;
+    let claim = parse_rider_delegation(&payload)
+        .ok_or_else(|| "delegation payload does not parse".to_string())?;
+    if claim.sub_agent_id != provenance.sub_agent_id {
+        return Err("delegation subject differs from provenance".to_string());
+    }
+    if claim.daemon_agent_id != author_agent_id {
+        return Err(format!(
+            "delegation names daemon {daemon} but the message signer is {author_agent_id}",
+            daemon = claim.daemon_agent_id
+        ));
+    }
+    let sig_bytes = hex::decode(&provenance.delegation.signature)
+        .map_err(|_| "delegation signature is not valid hex".to_string())?;
+    let sig = MlDsaSignature::from_bytes(&sig_bytes)
+        .map_err(|e| format!("delegation signature does not decode: {e:?}"))?;
+    let agent_pub = MlDsaPublicKey::from_bytes(cert.agent_public_key())
+        .map_err(|_| "certificate agent key does not parse".to_string())?;
+    verify_with_ml_dsa(&agent_pub, &payload, &sig)
+        .map_err(|_| "delegation is not signed by the sub-agent's key".to_string())?;
+    if now_unix >= claim.not_after {
+        return Err("delegation has expired".to_string());
+    }
+    // Review r5 item 2: authorization lifetime at the RECEIVER. The
+    // certificate's own expiry (a signature-only `verify` says nothing
+    // about `not_after`) and the caller's ADR-0018 revocation view of
+    // the sub-agent are both enforced here, mirroring the sending
+    // daemon's middleware fence.
+    if cert.is_expired(now_unix) {
+        return Err("delegation certificate has expired".to_string());
+    }
+    if agent_revoked {
+        return Err("sub-agent is revoked (ADR-0018)".to_string());
+    }
+    if !claim.scopes.iter().any(|s| s == scope) {
+        return Err("target group is not in the delegation scopes".to_string());
+    }
+    Ok(certified_sub)
+}
+
+/// Harness-side helper for the delegation flow (review r3): builds the
+/// canonical capability bytes binding this keypair's agent id to
+/// `daemon_agent_id` for `scopes` until `not_after`, and signs them
+/// with the sub-agent key. Returns `(payload_b64, signature_hex)` for
+/// the `delegation` field of `POST /owner/riders`.
+///
+/// # Errors
+///
+/// Returns [`ApplyError::InvalidSignature`] when ML-DSA signing fails.
+pub fn sign_rider_delegation(
+    sub_kp: &AgentKeypair,
+    daemon_agent_id: &str,
+    scopes: &[String],
+    not_after: u64,
+) -> Result<(String, String), ApplyError> {
+    use base64::Engine as _;
+    let sub_agent_id = hex::encode(sub_kp.agent_id().as_bytes());
+    let payload = rider_delegation_bytes(&sub_agent_id, daemon_agent_id, scopes, not_after);
+    let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload)
+        .map_err(|e| ApplyError::InvalidSignature(format!("delegation sign: {e:?}")))?;
+    Ok((
+        base64::engine::general_purpose::STANDARD.encode(&payload),
+        hex::encode(sig.as_bytes()),
+    ))
+}
+
+/// Domain-separation tag for MLS-plane rider attribution artifacts
+/// (review r4): the MLS ciphertext itself is opaque, so the daemon
+/// signs a small artifact binding the rider provenance — including the
+/// sub-agent-signed delegation — to the concrete (group, epoch) it was
+/// encrypted under. The artifact is recorded in durable history, making
+/// Home attribution cryptographic instead of a local string.
+pub const RIDER_MLS_ATTRIBUTION_DOMAIN: &[u8] = b"x0x.rider.mls-attribution.v1";
+
+/// Canonical MLS attribution bytes:
+/// `domain || (len-prefixed) sub_agent_id, scope, delegation
+/// cert_b64/payload_b64/signature || token_id(LE) || group || epoch(LE)
+/// || blake3(ciphertext)`. The ciphertext digest (review r5) binds the
+/// signature to the ACTUAL encrypted message — without it the artifact
+/// attested provenance for a (group, epoch) but not for any concrete
+/// ciphertext.
+#[must_use]
+pub fn rider_mls_attribution_bytes(
+    provenance: &RiderProvenance,
+    group_id: &str,
+    epoch: u64,
+    ciphertext: &[u8],
+) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(256 + provenance.delegation.cert_b64.len());
+    buf.extend_from_slice(RIDER_MLS_ATTRIBUTION_DOMAIN);
+    push_len_prefixed_str(&mut buf, &provenance.sub_agent_id);
+    push_len_prefixed_str(&mut buf, &provenance.scope);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.cert_b64);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.payload_b64);
+    push_len_prefixed_str(&mut buf, &provenance.delegation.signature);
+    buf.extend_from_slice(&provenance.rider_token_id.to_le_bytes());
+    push_len_prefixed_str(&mut buf, group_id);
+    buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(blake3::hash(ciphertext).as_bytes());
+    buf
+}
+
+#[cfg(test)]
+mod mls_attribution_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::identity::AgentKeypair;
+
+    fn delegation_for(sub_kp: &AgentKeypair, daemon_hex: &str) -> RiderDelegation {
+        use base64::Engine as _;
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &owner,
+            sub_kp.public_key().as_bytes(),
+            None,
+        )
+        .unwrap();
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let scopes = vec!["mls-group".to_string()];
+        let not_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let payload = rider_delegation_bytes(&sub_hex, daemon_hex, &scopes, not_after);
+        let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload).unwrap();
+        RiderDelegation {
+            cert_b64: base64::engine::general_purpose::STANDARD
+                .encode(cert.to_storage_bytes().unwrap()),
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&payload),
+            signature: hex::encode(sig.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn rider_mls_attribution_is_daemon_signed_and_binds_group_and_epoch() {
+        // WHY (review r4 item 2): Home/MLS attribution must be
+        // cryptographic — a daemon signature over bytes that bind the
+        // provenance (and its sub-agent-signed delegation), the group,
+        // AND the epoch, so the artifact cannot be replayed across
+        // groups or epochs unnoticed.
+        let daemon_kp = AgentKeypair::generate().unwrap();
+        let sub_kp = AgentKeypair::generate().unwrap();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let prov = RiderProvenance {
+            sub_agent_id: hex::encode(sub_kp.agent_id().as_bytes()),
+            rider_token_id: 7,
+            rider_token_hash: "ab".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: delegation_for(&sub_kp, &daemon_hex),
+        };
+        let bytes = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"ciphertext");
+        let sig = sign_with_ml_dsa(daemon_kp.secret_key(), &bytes).unwrap();
+        // The daemon's signature verifies over the exact bytes…
+        assert!(ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            daemon_kp.public_key(),
+            &bytes,
+            &sig
+        )
+        .is_ok());
+        // …and any (group, epoch) drift breaks verification — the
+        // artifact is bound, not a free-floating string.
+        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 43, b"ciphertext");
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "epoch drift must invalidate the attribution signature"
+        );
+        let tampered = rider_mls_attribution_bytes(&prov, "other-group", 42, b"ciphertext");
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "group drift must invalidate the attribution signature"
+        );
+        // Review r5: ciphertext drift must also break the signature —
+        // the artifact authenticates the CONCRETE encrypted message.
+        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"other-ciphertext");
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "ciphertext drift must invalidate the attribution signature"
+        );
+    }
+
+    #[test]
+    fn rider_provenance_dies_with_cert_expiry_and_revocation() {
+        // WHY (review r5): a signature-valid delegation inside a
+        // signature-valid message must STILL be refused at receive time
+        // when the underlying certificate has expired or the sub-agent
+        // is ADR-0018-revoked — receivers enforce the authorization
+        // lifetime, not just the cryptography.
+        let daemon_kp = AgentKeypair::generate().unwrap();
+        let sub_kp = AgentKeypair::generate().unwrap();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let prov = RiderProvenance {
+            sub_agent_id: hex::encode(sub_kp.agent_id().as_bytes()),
+            rider_token_id: 7,
+            rider_token_hash: "ab".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: delegation_for(&sub_kp, &daemon_hex),
+        };
+        // Inside the delegation's validity window: the chain verifies;
+        // a revoked sub-agent is refused.
+        let in_window = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        assert!(verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, in_window).is_ok());
+        assert_eq!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", true, in_window).unwrap_err(),
+            "sub-agent is revoked (ADR-0018)"
+        );
+        // Delegation-expiry axis: a `now` past the capability's
+        // not_after must fail (the capability in `prov` expires at
+        // issuance + 3_600).
+        let after_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 4_000;
+        assert!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, after_expiry).is_err(),
+            "delegation expiry must be enforced"
+        );
+
+        // Expired CERTIFICATE with a still-valid delegation: refused —
+        // cert.verify() is signature-only; the not_after axis is
+        // enforced separately (review r5).
+        use base64::Engine as _;
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expired_cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &owner,
+            sub_kp.public_key().as_bytes(),
+            Some(now - 3_600),
+        )
+        .unwrap();
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let payload = rider_delegation_bytes(
+            &sub_hex,
+            &daemon_hex,
+            &["mls-group".to_string()],
+            now + 3_600,
+        );
+        let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload).unwrap();
+        let prov = RiderProvenance {
+            sub_agent_id: sub_hex,
+            rider_token_id: 8,
+            rider_token_hash: "cd".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: RiderDelegation {
+                cert_b64: base64::engine::general_purpose::STANDARD
+                    .encode(expired_cert.to_storage_bytes().unwrap()),
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(&payload),
+                signature: hex::encode(sig.as_bytes()),
+            },
+        };
+        assert_eq!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, now).unwrap_err(),
+            "delegation certificate has expired"
+        );
+    }
 }
 
 impl GroupPublicMessage {
@@ -152,6 +622,20 @@ impl GroupPublicMessage {
                 self.thread_parent.as_deref().unwrap_or("").as_bytes(),
             );
         }
+        // ADR-0039: rider provenance rides INSIDE the signed bytes (absent
+        // ⇒ byte-identical legacy encoding, preserving the ADR-0029 rule
+        // above). Review r3: the delegation capability (cert, payload,
+        // signature) is part of those signed bytes too — the daemon's
+        // signature authenticates the exact capability it acted on.
+        if let Some(prov) = &self.rider_provenance {
+            push_len_prefixed(&mut buf, prov.sub_agent_id.as_bytes());
+            buf.extend_from_slice(&prov.rider_token_id.to_le_bytes());
+            push_len_prefixed(&mut buf, prov.rider_token_hash.as_bytes());
+            push_len_prefixed(&mut buf, prov.scope.as_bytes());
+            push_len_prefixed(&mut buf, prov.delegation.cert_b64.as_bytes());
+            push_len_prefixed(&mut buf, prov.delegation.payload_b64.as_bytes());
+            push_len_prefixed(&mut buf, prov.delegation.signature.as_bytes());
+        }
         buf
     }
 
@@ -167,7 +651,10 @@ impl GroupPublicMessage {
     /// Build and sign a new public message.
     ///
     /// Pass `thread_root` / `thread_parent` to produce a v2-domain threaded
-    /// message (ADR-0029). Both `None` produces a v1-compatible message.
+    /// message (ADR-0029); both `None` produces a v1-compatible message.
+    /// Pass `rider_provenance` to stamp ADR-0039 attribution inside the
+    /// signed bytes (owner sends pass `None` and produce the exact legacy
+    /// encoding).
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         group_id: String,
@@ -180,6 +667,7 @@ impl GroupPublicMessage {
         timestamp: u64,
         thread_root: Option<String>,
         thread_parent: Option<String>,
+        rider_provenance: Option<RiderProvenance>,
     ) -> Result<Self, ApplyError> {
         let author_agent_id = hex::encode(keypair.agent_id().as_bytes());
         let author_public_key = hex::encode(keypair.public_key().as_bytes());
@@ -195,6 +683,7 @@ impl GroupPublicMessage {
             timestamp,
             thread_root,
             thread_parent,
+            rider_provenance,
             signature: String::new(),
         };
         let sig = sign_with_ml_dsa(keypair.secret_key(), &msg.signable_bytes())
@@ -302,9 +791,33 @@ pub struct PublicIngestContext<'a> {
 /// Returns `Ok(())` if the message should be accepted and cached;
 /// returns `Err` with a deterministic reason otherwise. The validator
 /// is pure and side-effect-free — it does not mutate any state.
+///
+/// This wrapper has no ADR-0018 revocation view (tests, offline
+/// replay); production ingest paths use
+/// [`validate_public_message_with_revocations`].
 pub fn validate_public_message(
     ctx: &PublicIngestContext<'_>,
     msg: &GroupPublicMessage,
+) -> Result<(), IngestError> {
+    validate_public_message_inner(ctx, msg, &BTreeSet::new())
+}
+
+/// [`validate_public_message`] with the receiver's ADR-0018 revocation
+/// view (review r5): hex agent ids the local revocation set covers.
+/// A rider message from a revoked sub-agent is rejected here, at
+/// receive time — mirroring the sending daemon's middleware fence.
+pub fn validate_public_message_with_revocations(
+    ctx: &PublicIngestContext<'_>,
+    msg: &GroupPublicMessage,
+    revoked_agents: &std::collections::BTreeSet<String>,
+) -> Result<(), IngestError> {
+    validate_public_message_inner(ctx, msg, revoked_agents)
+}
+
+fn validate_public_message_inner(
+    ctx: &PublicIngestContext<'_>,
+    msg: &GroupPublicMessage,
+    revoked_agents: &std::collections::BTreeSet<String>,
 ) -> Result<(), IngestError> {
     // 1. group_id match
     if msg.group_id != ctx.group_id {
@@ -356,13 +869,46 @@ pub fn validate_public_message(
             field: "thread_parent",
         });
     }
-
     // 5. signature + author binding
     msg.verify_signature()
         .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
 
+    // Review r3 (CRITICAL): rider provenance is only trustworthy behind
+    // a SUB-AGENT-SIGNED delegation. Before treating the asserted
+    // sub_agent_id as the acting principal, verify the full chain —
+    // owner cert → sub-agent key → delegation → THIS message's signer —
+    // or reject: any daemon can otherwise claim any member identity by
+    // fabricating a provenance string.
+    let acting_agent = match &msg.rider_provenance {
+        None => msg.author_agent_id.as_str(),
+        Some(prov) => {
+            if prov.scope != ctx.group_id {
+                return Err(IngestError::InvalidSignature(format!(
+                    "rider provenance scope {scope} does not match target group {group}",
+                    scope = prov.scope,
+                    group = ctx.group_id
+                )));
+            }
+            let now_unix = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0);
+            verify_rider_provenance(
+                prov,
+                &msg.author_agent_id,
+                &prov.scope,
+                revoked_agents.contains(&prov.sub_agent_id),
+                now_unix,
+            )
+            .map_err(IngestError::InvalidSignature)?;
+            // `verify_rider_provenance` proved the certified subject
+            // equals the asserted id, so the assertion is now trusted.
+            prov.sub_agent_id.as_str()
+        }
+    };
+
     // 7. banned authors rejected
-    if let Some(member) = ctx.members_v2.get(&msg.author_agent_id) {
+    if let Some(member) = ctx.members_v2.get(acting_agent) {
         if member.state == GroupMemberState::Banned {
             return Err(IngestError::AuthorBanned);
         }
@@ -371,7 +917,7 @@ pub fn validate_public_message(
     // 8. write-access policy enforcement
     let author_role = ctx
         .members_v2
-        .get(&msg.author_agent_id)
+        .get(acting_agent)
         .filter(|m| m.state == GroupMemberState::Active)
         .map(|m| m.role);
 
@@ -463,6 +1009,7 @@ mod tests {
             1_000,
             None,
             None,
+            None,
         )
         .unwrap()
     }
@@ -548,6 +1095,7 @@ mod tests {
             GroupPublicMessageKind::Chat,
             "x".into(),
             1_000,
+            None,
             None,
             None,
         )
@@ -638,6 +1186,292 @@ mod tests {
         };
         let err = validate_public_message(&ctx, &msg).unwrap_err();
         assert!(matches!(err, IngestError::WritePolicyViolation { .. }));
+    }
+
+    /// Build a REAL sub-agent-signed delegation (the harness's job in
+    /// production): owner cert over the sub key, capability signed by
+    /// the sub key.
+    fn make_delegation(
+        sub_kp: &AgentKeypair,
+        daemon_hex: &str,
+        scopes: &[&str],
+    ) -> RiderDelegation {
+        use base64::Engine as _;
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &owner,
+            sub_kp.public_key().as_bytes(),
+            None,
+        )
+        .unwrap();
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let scopes: Vec<String> = scopes.iter().map(|s| (*s).to_string()).collect();
+        let not_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 3_600;
+        let payload = rider_delegation_bytes(&sub_hex, daemon_hex, &scopes, not_after);
+        let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload).unwrap();
+        RiderDelegation {
+            cert_b64: base64::engine::general_purpose::STANDARD
+                .encode(cert.to_storage_bytes().unwrap()),
+            payload_b64: base64::engine::general_purpose::STANDARD.encode(&payload),
+            signature: hex::encode(sig.as_bytes()),
+        }
+    }
+
+    #[test]
+    fn ingest_enforces_policy_against_rider_provenance_sub_agent() {
+        // WHY (review fix #1, receiver side): a daemon-signed rider
+        // message must be authorized by the SUB-AGENT named in the
+        // provenance envelope, never by the daemon author. The daemon
+        // here IS an active member; the provenance sub-agent is not —
+        // ingest must reject. With the sub-agent admitted, it passes.
+        let daemon_kp = make_kp();
+        let sub_kp = make_kp();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let delegation = make_delegation(&sub_kp, &daemon_hex, &["g1"]);
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "x".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: sub_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation,
+            }),
+        )
+        .unwrap();
+        let policy = open_policy(); // MembersOnly write_access
+
+        // Daemon is a member, provenance sub-agent is NOT → reject.
+        let mut members = BTreeMap::new();
+        members.insert(
+            daemon_hex.clone(),
+            active_member(&daemon_hex, GroupRole::Admin),
+        );
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg),
+            Err(IngestError::WritePolicyViolation { .. })
+        ));
+
+        // Admit the sub-agent as a plain member → accept.
+        members.insert(sub_hex.clone(), active_member(&sub_hex, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        validate_public_message(&ctx, &msg).unwrap();
+    }
+
+    #[test]
+    fn ingest_admin_only_rider_provenance_needs_sub_agent_admin_role() {
+        // WHY: same principle under AdminOnly — the DAEMON author's
+        // admin role must not carry a rider whose sub-agent is a mere
+        // member.
+        let daemon_kp = make_kp();
+        let sub_kp = make_kp();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let delegation = make_delegation(&sub_kp, &daemon_hex, &["g1"]);
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "x".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: sub_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation,
+            }),
+        )
+        .unwrap();
+        let mut policy = open_policy();
+        policy.write_access = GroupWriteAccess::AdminOnly;
+        let mut members = BTreeMap::new();
+        members.insert(
+            daemon_hex.clone(),
+            active_member(&daemon_hex, GroupRole::Owner),
+        );
+        members.insert(sub_hex.clone(), active_member(&sub_hex, GroupRole::Member));
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg),
+            Err(IngestError::WritePolicyViolation { .. })
+        ));
+    }
+
+    #[test]
+    fn ingest_rejects_unauthenticated_rider_provenance_forgery() {
+        // WHY (review r3, the CRITICAL): a validly daemon-signed message
+        // whose provenance CLAIMS a member sub-agent but is NOT backed
+        // by that sub-agent's cryptographic delegation must be rejected.
+        // Otherwise ANY daemon could impersonate any member/admin by
+        // fabricating the provenance string. Three forgery shapes:
+        // no delegation bytes at all, a delegation signed by a DIFFERENT
+        // sub-agent's key, and a delegation naming another daemon.
+        let daemon_kp = make_kp();
+        let victim_kp = make_kp(); // the member identity being impersonated
+        let attacker_kp = make_kp(); // signs the delegation
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let victim_hex = hex::encode(victim_kp.agent_id().as_bytes());
+        let mut members = BTreeMap::new();
+        members.insert(
+            daemon_hex.clone(),
+            active_member(&daemon_hex, GroupRole::Member),
+        );
+        members.insert(
+            victim_hex.clone(),
+            active_member(&victim_hex, GroupRole::Admin),
+        );
+        let policy = open_policy();
+
+        // Forge 1: provenance with a delegation signed by the ATTACKER's
+        // key while claiming the VICTIM sub-agent id.
+        let attacker_delegation = make_delegation(&attacker_kp, &daemon_hex, &["g1"]);
+        let forged = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "forged".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: victim_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation: attacker_delegation,
+            }),
+        )
+        .unwrap();
+        // The daemon signature is genuinely valid…
+        forged.verify_signature().unwrap();
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &policy,
+            members_v2: &members,
+        };
+        // …but ingest must reject the unauthenticated provenance.
+        assert!(matches!(
+            validate_public_message(&ctx, &forged),
+            Err(IngestError::InvalidSignature(_))
+        ));
+
+        // Forge 2: a legitimate victim-signed delegation that names a
+        // DIFFERENT daemon — this daemon is not the delegated signer.
+        let other_daemon = make_kp();
+        let other_daemon_hex = hex::encode(other_daemon.agent_id().as_bytes());
+        let cross_delegation = make_delegation(&victim_kp, &other_daemon_hex, &["g1"]);
+        let forged = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "forged 2".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: victim_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation: cross_delegation,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_public_message(&ctx, &forged),
+            Err(IngestError::InvalidSignature(_))
+        ));
+
+        // Forge 3: victim-signed delegation scoped to a DIFFERENT group.
+        let other_scope_delegation = make_delegation(&victim_kp, &daemon_hex, &["g-other"]);
+        let forged = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "forged 3".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: victim_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation: other_scope_delegation,
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_public_message(&ctx, &forged),
+            Err(IngestError::InvalidSignature(_))
+        ));
+
+        // Control: a genuine victim-signed delegation to THIS daemon for
+        // THIS group passes ingest (victim is an admin member).
+        let genuine = make_delegation(&victim_kp, &daemon_hex, &["g1"]);
+        let legit = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &daemon_kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "legit".into(),
+            1_000,
+            None,
+            None,
+            Some(RiderProvenance {
+                sub_agent_id: victim_hex.clone(),
+                rider_token_id: 1,
+                rider_token_hash: "ab".repeat(32),
+                scope: "g1".into(),
+                delegation: genuine,
+            }),
+        )
+        .unwrap();
+        validate_public_message(&ctx, &legit).unwrap();
     }
 
     #[test]
@@ -797,6 +1631,7 @@ mod tests {
             2_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         let bytes = msg.signable_bytes();
@@ -824,6 +1659,7 @@ mod tests {
             3_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         // Simulate an old node by stripping thread fields AFTER signing —
@@ -866,6 +1702,7 @@ mod tests {
             4_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         msg.verify_signature().unwrap(); // baseline passes
@@ -948,6 +1785,7 @@ mod tests {
             5_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         // Strip root — now parent is present without root.
@@ -987,6 +1825,7 @@ mod tests {
             6_000,
             Some(fake_root),
             Some(fake_parent),
+            None,
         )
         .unwrap();
         let policy = open_policy();
@@ -1028,6 +1867,7 @@ mod tests {
             "self ref".into(),
             7_000,
             Some(base_id.clone()),
+            None,
             None,
         )
         .unwrap();

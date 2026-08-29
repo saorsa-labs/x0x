@@ -1707,6 +1707,11 @@ pub struct OwnerIssuedCert {
     /// journal (survives restarts); `false` when it came from live
     /// discovery only.
     pub from_journal: bool,
+    /// ADR-0039 hosting mode of the latest journal issuance (`Acp` for
+    /// live-discovery-only entries and legacy lines).
+    pub mode: profile::CertMode,
+    /// ADR-0039 operator label of the latest journal issuance.
+    pub label: Option<String>,
 }
 
 /// ADR-0038 round-2: hard cap on live identity-discovery cache entries.
@@ -1717,9 +1722,7 @@ const DISCOVERY_CACHE_MAX_ENTRIES: usize = 1024;
 /// Cached machine endpoint data derived from signed machine announcements.
 #[derive(Debug, Clone)]
 pub struct DiscoveredMachine {
-    /// Machine identity, identical to the ant-quic `PeerId`.
     pub machine_id: identity::MachineId,
-    /// Reachability hints for this machine.
     pub addresses: Vec<std::net::SocketAddr>,
     /// Announcement timestamp from the sender.
     pub announced_at: u64,
@@ -9302,6 +9305,51 @@ impl Agent {
         Ok(record)
     }
 
+    /// Path of the ADR-0036 owner certificate journal for this install,
+    /// when one is configured (sibling of the agent certificate). The
+    /// ADR-0039 owner routes read and append it as the authoritative
+    /// sub-agent registry.
+    #[must_use]
+    pub fn cert_journal_path(&self) -> Option<&std::path::Path> {
+        self.cert_journal_path.as_deref()
+    }
+
+    /// Revoke a sub-agent as the OWNER (ADR-0018 issuer-revocation,
+    /// ADR-0039 `DELETE /owner/agents/:id`).
+    ///
+    /// Signs the revocation with the owner user key — not the daemon
+    /// agent key — and supplies `subject_cert` (the exact certificate
+    /// the owner issued for the subject) so
+    /// [`revocation::RevocationRecord::verify_authority`] accepts the
+    /// issuer path on receipt and on every reload of `revocations.bin`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no owner key is loaded, signing fails, or
+    /// the authority check rejects the record.
+    pub async fn revoke_as_owner(
+        &self,
+        subject_cert: &identity::AgentCertificate,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let Some(user_kp) = self.identity.user_keypair() else {
+            return Err(error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            ));
+        };
+        let subject = revocation::RevokedSubject::Agent(subject_cert.agent_id()?);
+        let record = revocation::RevocationRecord::sign(
+            subject,
+            user_kp.public_key(),
+            user_kp.secret_key(),
+            Self::unix_timestamp_secs(),
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), Some(subject_cert))
+            .await?;
+        Ok(record)
+    }
+
     /// Apply a revocation record to the local set, persist, publish, and evict.
     ///
     /// Used both by [`revoke`](Agent::revoke) (self-issued) and the gossip
@@ -9790,6 +9838,8 @@ impl Agent {
                     not_after: record.not_after,
                     digest: record.cert_digest,
                     from_journal: true,
+                    mode: record.mode,
+                    label: record.label,
                 };
                 best.insert(record.agent_id, entry);
             }
@@ -9837,6 +9887,8 @@ impl Agent {
                             not_after: record.not_after,
                             digest: record.cert_digest,
                             from_journal: false,
+                            mode: profile::CertMode::Acp,
+                            label: None,
                         },
                     );
                 }

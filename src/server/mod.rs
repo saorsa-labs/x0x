@@ -14,6 +14,7 @@ pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
 pub mod config;
 mod crdt_subscriptions;
+mod rider_auth;
 mod routes;
 mod sse;
 mod state;
@@ -59,9 +60,10 @@ use routes::{
     list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
     load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
     mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, owner_agents, peer_health_handler, peers, pin_machine,
-    presence, presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler,
-    publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
+    network_status, now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke,
+    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
+    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
+    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
     recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
     relay_diagnostics, remove_mls_member, remove_named_group_member,
     replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
@@ -876,6 +878,11 @@ pub async fn serve_with_options(
         upgrade_apply_lock: Arc::new(Mutex::new(())),
         api_token,
         sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
+        rider_tokens: tokio::sync::Mutex::new(
+            rider_auth::RiderTokenStore::load(config.data_dir.join(rider_auth::RIDER_TOKENS_FILE))
+                .await,
+        ),
+        cert_journal_lock: tokio::sync::Mutex::new(()),
         exec_service: Arc::clone(&exec_service),
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         connect_diagnostics,
@@ -1644,6 +1651,13 @@ pub async fn serve_with_options(
         .route("/home", get(routes::home::get_home))
         .route("/home/rename", post(routes::home::rename_home))
         .route("/owner/agents", get(owner_agents))
+        .route("/owner/agents/issue", post(owner_agents_issue))
+        .route("/owner/agents/:id", delete(owner_agents_revoke))
+        .route(
+            "/owner/riders",
+            post(owner_riders_issue).get(owner_riders_list),
+        )
+        .route("/owner/riders/:id", delete(owner_riders_revoke))
         .route("/.well-known/agent-card.json", get(get_a2a_agent_card))
         .route("/agent/card/import", post(import_agent_card))
         .route("/agent/sign", post(agent_sign))

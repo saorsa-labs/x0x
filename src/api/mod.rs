@@ -184,6 +184,41 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Roster of agents certified by this install's owner (journal-backed; survives restarts)",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Post,
+        path: "/owner/agents/issue",
+        cli_name: "owner agents issue",
+        description: "Owner-sign an AgentCertificate over a harness-submitted agent public key (ADR-0039)",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/owner/agents/:id",
+        cli_name: "owner agents revoke",
+        description: "ADR-0018 owner issuer-revocation of a registered sub-agent",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/owner/riders",
+        cli_name: "owner riders issue",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039)",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/owner/riders",
+        cli_name: "owner riders",
+        description: "List rider-token records (no secrets; hashed identifiers only)",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/owner/riders/:id",
+        cli_name: "owner riders revoke",
+        description: "Revoke a rider token; it fails on the next request",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

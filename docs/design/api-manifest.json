@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 155,
+  "endpoint_count": 160,
   "endpoints": [
     {
       "category": "status",
@@ -133,6 +133,41 @@
       "description": "Roster of agents certified by this install's owner (journal-backed; survives restarts)",
       "method": "GET",
       "path": "/owner/agents"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner agents issue",
+      "description": "Owner-sign an AgentCertificate over a harness-submitted agent public key (ADR-0039)",
+      "method": "POST",
+      "path": "/owner/agents/issue"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner agents revoke",
+      "description": "ADR-0018 owner issuer-revocation of a registered sub-agent",
+      "method": "DELETE",
+      "path": "/owner/agents/:id"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner riders issue",
+      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039)",
+      "method": "POST",
+      "path": "/owner/riders"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner riders",
+      "description": "List rider-token records (no secrets; hashed identifiers only)",
+      "method": "GET",
+      "path": "/owner/riders"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner riders revoke",
+      "description": "Revoke a rider token; it fails on the next request",
+      "method": "DELETE",
+      "path": "/owner/riders/:id"
     },
     {
       "category": "network",

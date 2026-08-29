@@ -600,6 +600,66 @@ impl AgentCertificate {
         })
     }
 
+    /// Issue a certificate for an agent **public key** submitted by a
+    /// harness (ADR-0039 sub-agent issuance, `POST /owner/agents/issue`).
+    ///
+    /// The harness generates and custodies the fresh keypair; the daemon
+    /// only ever sees the public half — the secret never crosses the API
+    /// (gapcheck blocker 20). The returned certificate is signed by
+    /// `user_kp` with byte-identical message construction to
+    /// [`issue_with_expiry`](Self::issue_with_expiry), so it verifies
+    /// through the ordinary [`verify`](Self::verify) chain and satisfies
+    /// `GroupAdmission::OwnerCertified` (ADR-0038) like any other
+    /// owner-certified agent.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::IdentityError::CertificateVerification`] if
+    /// the submitted key does not parse as an ML-DSA-65 public key, the
+    /// system clock is before the Unix epoch, or signing fails.
+    pub fn issue_for_public_key(
+        user_kp: &UserKeypair,
+        agent_public_key_bytes: &[u8],
+        not_after: Option<u64>,
+    ) -> Result<Self, crate::error::IdentityError> {
+        // Fail closed on a malformed key rather than certifying garbage.
+        if MlDsaPublicKey::from_bytes(agent_public_key_bytes).is_err() {
+            return Err(crate::error::IdentityError::CertificateVerification(
+                "submitted agent public key is not a valid ML-DSA-65 key".to_string(),
+            ));
+        }
+        let issued_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| {
+                crate::error::IdentityError::CertificateVerification(format!(
+                    "system time error: {}",
+                    e
+                ))
+            })?
+            .as_secs();
+
+        let user_pub_bytes = user_kp.public_key().as_bytes().to_vec();
+        let agent_pub_bytes = agent_public_key_bytes.to_vec();
+
+        let message = Self::build_message(&user_pub_bytes, &agent_pub_bytes, issued_at, not_after);
+
+        let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            user_kp.secret_key(),
+            &message,
+        )
+        .map_err(|e| {
+            crate::error::IdentityError::CertificateVerification(format!("signing failed: {:?}", e))
+        })?;
+
+        Ok(Self {
+            user_public_key: user_pub_bytes,
+            agent_public_key: agent_pub_bytes,
+            signature: signature.as_bytes().to_vec(),
+            issued_at,
+            not_after,
+        })
+    }
+
     /// Verify the certificate signature.
     ///
     /// Reconstructs the signed message and verifies the ML-DSA-65 signature
@@ -667,6 +727,19 @@ impl AgentCertificate {
     #[must_use]
     pub fn agent_public_key(&self) -> &[u8] {
         &self.agent_public_key
+    }
+
+    /// Raw ML-DSA-65 owner (user) public key bytes stored in this
+    /// certificate (ADR-0039 REST surface).
+    #[must_use]
+    pub fn user_public_key_bytes(&self) -> &[u8] {
+        &self.user_public_key
+    }
+
+    /// Raw ML-DSA-65 signature bytes (ADR-0039 REST surface).
+    #[must_use]
+    pub fn signature_bytes(&self) -> &[u8] {
+        &self.signature
     }
 
     /// Get the issuance timestamp.

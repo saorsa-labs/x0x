@@ -281,6 +281,61 @@ pub async fn home_rename(client: &DaemonClient, name: &str) -> Result<()> {
     Ok(())
 }
 
+/// `x0x owner agents issue` — POST /owner/agents/issue (ADR-0039).
+pub async fn owner_agents_issue(
+    client: &DaemonClient,
+    public_key_hex: &str,
+    mode: &str,
+    label: Option<&str>,
+) -> Result<()> {
+    let mut body = serde_json::json!({ "agent_public_key": public_key_hex, "mode": mode });
+    if let Some(label) = label {
+        body["label"] = serde_json::json!(label);
+    }
+    let resp = client.post("/owner/agents/issue", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x owner agents revoke` — DELETE /owner/agents/:id (ADR-0039).
+pub async fn owner_agents_revoke(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    client
+        .run_delete(&format!("/owner/agents/{agent_id}"))
+        .await
+}
+
+/// `x0x owner riders` — GET /owner/riders (ADR-0039).
+pub async fn owner_riders_list(client: &DaemonClient) -> Result<()> {
+    client.run_get("/owner/riders").await
+}
+
+/// `x0x owner riders issue` — POST /owner/riders (ADR-0039).
+pub async fn owner_riders_issue(
+    client: &DaemonClient,
+    sub_agent_id: &str,
+    groups: &[String],
+    label: Option<&str>,
+    ttl_secs: Option<u64>,
+) -> Result<()> {
+    let mut body = serde_json::json!({ "sub_agent_id": sub_agent_id, "groups": groups });
+    if let Some(label) = label {
+        body["label"] = serde_json::json!(label);
+    }
+    if let Some(ttl) = ttl_secs {
+        body["ttl_secs"] = serde_json::json!(ttl);
+    }
+    let resp = client.post("/owner/riders", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x owner riders revoke` — DELETE /owner/riders/:id (ADR-0039).
+pub async fn owner_riders_revoke(client: &DaemonClient, token_id: u64) -> Result<()> {
+    client
+        .run_delete(&format!("/owner/riders/{token_id}"))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

@@ -56,6 +56,7 @@ fn sign_msg(
         1_000,
         None,
         None,
+        None,
     )
     .unwrap()
 }

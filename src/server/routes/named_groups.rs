@@ -9270,6 +9270,9 @@ pub(in crate::server) struct SendGroupMessageRequest {
 pub(in crate::server) async fn send_group_public_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SendGroupMessageRequest>,
 ) -> impl IntoResponse {
     let kind = match req.kind.as_deref().unwrap_or("chat") {
@@ -9332,12 +9335,25 @@ pub(in crate::server) async fn send_group_public_message(
         if info.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic {
             return bad_request("group is not SignedPublic — use /groups/:id/secure/encrypt");
         }
-        if info.is_banned(&local_hex) {
+        // Review fix #1 (CRITICAL): authorization uses the ACTING
+        // PRINCIPAL's identity. For the owner that is the daemon's own
+        // agent; for a rider it is the SUB-AGENT on whose behalf the
+        // daemon signs — ban state, membership, and role are checked
+        // against the sub-agent, so a rider can never inherit the
+        // daemon-admin's privileges and the provenance envelope is the
+        // authorization subject, not decoration.
+        let acting_hex = match &actor {
+            crate::server::rider_auth::ActorContext::Owner { .. } => local_hex.clone(),
+            crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
+                sub_agent_id.clone()
+            }
+        };
+        if info.is_banned(&acting_hex) {
             return forbidden("you are banned");
         }
         // Endpoint-side write-access enforcement. Mirror the ingest
         // validator so we reject locally rather than trust receivers.
-        let caller_role = info.caller_role(&local_hex);
+        let caller_role = info.caller_role(&acting_hex);
         match info.policy.write_access {
             x0x::groups::GroupWriteAccess::MembersOnly => {
                 if caller_role.is_none() {
@@ -9346,7 +9362,7 @@ pub(in crate::server) async fn send_group_public_message(
                         .record_sender_write_policy_rejection(info.stable_group_id());
                     tracing::warn!(
                         group_id = %info.stable_group_id(),
-                        author = %local_hex,
+                        author = %acting_hex,
                         "rejected public group send: members-only write policy"
                     );
                     return forbidden("members-only write policy");
@@ -9368,6 +9384,64 @@ pub(in crate::server) async fn send_group_public_message(
             .map(|member| member.agent_id.clone())
             .collect::<Vec<_>>();
 
+        // ADR-0039 rider scope check: even with membership satisfied,
+        // the send must be inside the token's explicit grant (Home is
+        // not applicable on this SignedPublic-only surface).
+        let rider_provenance = match &actor {
+            crate::server::rider_auth::ActorContext::Owner { .. } => None,
+            crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id,
+                token_id,
+                token_hash,
+                groups,
+            } => {
+                let granted = groups.iter().any(|g| g.as_str() == info.stable_group_id());
+                if !granted {
+                    return forbidden(
+                        "rider token is not granted this group (ADR-0039 deny-by-default)",
+                    );
+                }
+                // Review r3: the sub-agent-SIGNED delegation must back
+                // the assertion — the daemon verifies the full chain
+                // (cert → sub-agent key → delegation → this daemon →
+                // scope → expiry) before it will sign, so it can never
+                // speak for a sub-agent that did not authorize it.
+                let delegation = state.rider_tokens.lock().await.delegation_of(*token_id);
+                let Some(delegation) = delegation else {
+                    return forbidden(
+                        "rider token has no sub-agent-signed delegation (re-issue it with a delegation capability)",
+                    );
+                };
+                let provenance = x0x::groups::RiderProvenance {
+                    sub_agent_id: sub_agent_id.clone(),
+                    rider_token_id: *token_id,
+                    rider_token_hash: token_hash.clone(),
+                    scope: info.stable_group_id().to_string(),
+                    delegation,
+                };
+                let now_unix = x0x::dm::now_unix_ms() / 1_000;
+                let sub_revoked =
+                    state.agent.revocation_records().await.iter().any(|rec| {
+                        rec.subject_kind() == "agent" && rec.subject_hex() == *sub_agent_id
+                    });
+                if let Err(reason) = x0x::groups::verify_rider_provenance(
+                    &provenance,
+                    &local_hex,
+                    info.stable_group_id(),
+                    sub_revoked,
+                    now_unix,
+                ) {
+                    tracing::warn!(
+                        group_id = %info.stable_group_id(),
+                        sub_agent = %sub_agent_id,
+                        "rejected rider send: delegation verification failed: {reason}"
+                    );
+                    return forbidden("rider delegation does not verify");
+                }
+                Some(provenance)
+            }
+        };
+
         match x0x::groups::GroupPublicMessage::sign(
             info.stable_group_id().to_string(),
             info.state_hash.clone(),
@@ -9379,6 +9453,7 @@ pub(in crate::server) async fn send_group_public_message(
             now_ms,
             req.thread_root,
             req.thread_parent,
+            rider_provenance,
         ) {
             Ok(m) => (m, direct_recipients),
             Err(e) => {
@@ -9715,9 +9790,98 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
     });
 }
 
+/// Signed rider attribution for an MLS-plane send (review r4): the
+/// daemon's signature over [`x0x::groups::rider_mls_attribution_bytes`]
+/// — binding the rider provenance, its sub-agent-signed delegation, and
+/// the concrete (group, epoch) — so durable Home attribution is
+/// cryptographic, not a local string.
+#[derive(Debug)]
+pub(in crate::server) struct MlsRiderAttribution {
+    pub(in crate::server) sub_agent_id: String,
+    pub(in crate::server) artifact: Vec<u8>,
+    pub(in crate::server) signature: Vec<u8>,
+    /// The daemon agent public key that produced `signature` —
+    /// persisted with the history row (review r5) so the attribution
+    /// is independently verifiable after the fact.
+    pub(in crate::server) signing_pubkey: Vec<u8>,
+}
+
+/// Sign the MLS rider attribution for a completed encryption (reviews
+/// r5/r6): canonical bytes over the provenance (incl. delegation),
+/// group, epoch, and the CIPHERTEXT DIGEST, signed with the daemon
+/// agent key.
+///
+/// FAIL-CLOSED (r6 regression fix): a rider send whose attribution
+/// cannot be signed returns `Err` (a 500 response) — the callers abort
+/// BEFORE recording any history, so no unattributed rider message ever
+/// persists. `Ok(None)` means no rider provenance applied (owner send).
+fn sign_mls_rider_attribution(
+    state: &AppState,
+    provenance: Option<&x0x::groups::RiderProvenance>,
+    group_id: &str,
+    epoch: u64,
+    ciphertext: &[u8],
+) -> Result<Option<MlsRiderAttribution>, (StatusCode, Json<serde_json::Value>)> {
+    let signing_kp = state.agent.identity().agent_keypair();
+    sign_mls_rider_attribution_with(
+        provenance,
+        group_id,
+        epoch,
+        ciphertext,
+        signing_kp,
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa,
+    )
+}
+
+/// Injectable-signer core (review r6): the signer is a parameter so the
+/// FAIL-CLOSED contract is unit-testable — a rider send whose
+/// attribution cannot be signed yields `Err` (500), never
+/// `Ok(None)`-with-a-recorded-unattributed-row.
+#[allow(clippy::too_many_arguments)]
+fn sign_mls_rider_attribution_with<S>(
+    provenance: Option<&x0x::groups::RiderProvenance>,
+    group_id: &str,
+    epoch: u64,
+    ciphertext: &[u8],
+    signing_kp: &crate::identity::AgentKeypair,
+    signer: S,
+) -> Result<Option<MlsRiderAttribution>, (StatusCode, Json<serde_json::Value>)>
+where
+    S: FnOnce(
+        &ant_quic::MlDsaSecretKey,
+        &[u8],
+    ) -> Result<
+        ant_quic::crypto::pqc::types::MlDsaSignature,
+        ant_quic::crypto::pqc::types::PqcError,
+    >,
+{
+    let Some(provenance) = provenance else {
+        return Ok(None);
+    };
+    let artifact =
+        x0x::groups::rider_mls_attribution_bytes(provenance, group_id, epoch, ciphertext);
+    match signer(signing_kp.secret_key(), &artifact) {
+        Ok(sig) => Ok(Some(MlsRiderAttribution {
+            sub_agent_id: provenance.sub_agent_id.clone(),
+            artifact,
+            signature: sig.as_bytes().to_vec(),
+            signing_pubkey: signing_kp.public_key().as_bytes().to_vec(),
+        })),
+        Err(e) => {
+            tracing::error!("failed to sign rider MLS attribution: {e:?}");
+            Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to sign rider attribution",
+            ))
+        }
+    }
+}
+
 /// Record MLS-group plaintext obtained via a local secure-surface call
-/// (ADR-0023 §3/§4): unsigned, `provenance = LocalAppDecrypt`, author
-/// unattributed — no per-message author signature exists on this plane.
+/// (ADR-0023 §3/§4): `provenance = LocalAppDecrypt`, author
+/// unattributed for owner sends. Rider sends carry the signed
+/// [`MlsRiderAttribution`] (author = the certified sub-agent, signed
+/// artifact + signature + context stored for offline re-verification).
 /// `msg_id` is the v2 group+epoch helper so identical plaintext in two
 /// groups whose epochs coincide does not collide (#276).
 fn record_mls_history(
@@ -9726,6 +9890,7 @@ fn record_mls_history(
     plaintext: &[u8],
     direction: x0x::history::Direction,
     epoch: u64,
+    attribution: Option<&MlsRiderAttribution>,
 ) {
     let Some(history) = state.agent.history() else {
         return;
@@ -9739,28 +9904,45 @@ fn record_mls_history(
         "application/octet-stream"
     };
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
-    // Group+epoch-salted id: ciphertext replays within one group+epoch
-    // dedupe; identical plaintext across groups or epochs survives.
-    // Identical plaintext *within* one group+epoch still collapses —
-    // per-message MLS identity is a future wire-format change (ADR-0023 §3).
+    let (author_agent, signed_artifact, signature, sig_context, msg_id, author_pubkey) =
+        match attribution {
+            None => (None, None, None, None, None, None),
+            Some(att) => {
+                // With a signed rider attribution the row is NON-opaque (see
+                // `HistoryRecord::validate`) and the msg_id is the canonical
+                // BLAKE3(artifact || payload); without one it stays the
+                // epoch-salted id (dedupes identical plaintext per group+epoch).
+                let msg_id =
+                    x0x::history::HistoryRecord::compute_msg_id(Some(&att.artifact), plaintext);
+                (
+                    Some(att.sub_agent_id.clone()),
+                    Some(att.artifact.clone()),
+                    Some(att.signature.clone()),
+                    Some("x0x.rider.mls-attribution.v1".to_string()),
+                    Some(msg_id),
+                    // Review r5: persist the signing pubkey so the
+                    // attribution verifies after the fact.
+                    Some(att.signing_pubkey.clone()),
+                )
+            }
+        };
+    let msg_id = msg_id.unwrap_or_else(|| {
+        x0x::history::HistoryRecord::compute_epoch_msg_id(stable_group_id, epoch, plaintext)
+    });
     history.record(x0x::history::HistoryRecord {
-        msg_id: x0x::history::HistoryRecord::compute_epoch_msg_id(
-            stable_group_id,
-            epoch,
-            plaintext,
-        ),
+        msg_id,
         scope: x0x::history::Scope::Group(stable_group_id.to_string()),
-        author_agent: None,
+        author_agent,
         author_machine: None,
-        author_pubkey: None,
+        author_pubkey,
         sent_at_ms: now,
         seen_at_ms: now,
         direction,
         content_type: content_type.to_string(),
         payload: plaintext.to_vec(),
-        signed_artifact: None,
-        signature: None,
-        sig_context: None,
+        signed_artifact,
+        signature,
+        sig_context,
         provenance: x0x::history::Provenance::LocalAppDecrypt,
         replace_key: None,
         thread_root: None,
@@ -9769,8 +9951,6 @@ fn record_mls_history(
         logical_request_id: None,
     });
 }
-
-/// Append a validated message to the per-group ring buffer (capped).
 async fn cache_public_message(state: &AppState, msg: x0x::groups::GroupPublicMessage) {
     record_group_public_history(state, &msg);
     let mut all = state.public_messages.write().await;
@@ -10042,7 +10222,18 @@ pub(in crate::server) async fn ingest_public_message(
         policy: &policy,
         members_v2: &members,
     };
-    match x0x::groups::validate_public_message(&ctx, &msg) {
+    // Review r5: pass the receiver's ADR-0018 revocation view so a
+    // rider message from a revoked sub-agent is rejected at ingest —
+    // mirroring the sending daemon's middleware fence.
+    let revoked_agents: std::collections::BTreeSet<String> = state
+        .agent
+        .revocation_records()
+        .await
+        .iter()
+        .filter(|rec| rec.subject_kind() == "agent")
+        .map(|rec| rec.subject_hex())
+        .collect();
+    match x0x::groups::validate_public_message_with_revocations(&ctx, &msg, &revoked_agents) {
         Ok(()) => {
             state
                 .groups_diagnostics
@@ -16377,6 +16568,7 @@ async fn treekem_group_encrypt(
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     payload_b64: &str,
+    rider_provenance: Option<&x0x::groups::RiderProvenance>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let plaintext = match BASE64.decode(payload_b64) {
@@ -16433,12 +16625,29 @@ async fn treekem_group_encrypt(
     }
     let epoch = guard.epoch();
     drop(guard);
+    // Review r5: sign the attribution AFTER encryption over the
+    // ciphertext digest (the self-describing ApplicationCiphertext
+    // bytes). Review r6: a signing failure FAILS CLOSED — return the
+    // 500 BEFORE recording, so no unattributed rider row persists (a
+    // burned ratchet generation without a persisted message is
+    // harmless; an unattributed rider message is not).
+    let attribution = match sign_mls_rider_attribution(
+        state,
+        rider_provenance,
+        stable_group_id.unwrap_or(group_id_hex),
+        epoch,
+        &ciphertext,
+    ) {
+        Ok(attribution) => attribution,
+        Err(resp) => return resp,
+    };
     record_mls_history(
         state,
         stable_group_id.unwrap_or(group_id_hex),
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
+        attribution.as_ref(),
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -16521,6 +16730,7 @@ async fn treekem_group_decrypt(
         &plaintext,
         x0x::history::Direction::Inbound,
         epoch,
+        None,
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -16539,6 +16749,9 @@ async fn treekem_group_decrypt(
 pub(in crate::server) async fn secure_group_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SecureEncryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -16555,6 +16768,81 @@ pub(in crate::server) async fn secure_group_encrypt(
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
+    // ADR-0039 + reviews r2–r4: the DAEMON carries the cryptography (it
+    // holds the group keys), but a rider's AUTHORIZATION is exactly the
+    // SUB-AGENT's, mirroring the public-message path: explicit token
+    // grant (NO implicit Home), ban check, the group's write policy
+    // against the SUB-AGENT's roster role, and a valid sub-agent-signed
+    // delegation covering THIS group — verified against the same chain
+    // receivers verify. The provenance then produces the signed MLS
+    // attribution artifact below.
+    let mut rider_provenance: Option<x0x::groups::RiderProvenance> = None;
+    if let crate::server::rider_auth::ActorContext::Rider {
+        sub_agent_id,
+        token_id,
+        token_hash,
+        ..
+    } = &actor
+    {
+        if !actor.rider_allows_group(info.stable_group_id()) {
+            return forbidden(
+                "rider token is not granted this group (ADR-0039 deny-by-default; Home must be delegated explicitly)",
+            );
+        }
+        if info.is_banned(sub_agent_id) {
+            return forbidden("sub-agent is banned from this group");
+        }
+        let sub_role = info.caller_role(sub_agent_id);
+        let role_ok = match info.policy.write_access {
+            x0x::groups::GroupWriteAccess::MembersOnly => sub_role.is_some(),
+            x0x::groups::GroupWriteAccess::AdminOnly => sub_role
+                .map(|r| r.at_least(x0x::groups::GroupRole::Admin))
+                .unwrap_or(false),
+            x0x::groups::GroupWriteAccess::ModeratedPublic => true,
+        };
+        if !role_ok {
+            return forbidden("sub-agent lacks the required roster role in this group");
+        }
+        // Same capability check as the public-message path (review r4):
+        // the stored delegation must verify for this group.
+        let delegation = state.rider_tokens.lock().await.delegation_of(*token_id);
+        let Some(delegation) = delegation else {
+            return forbidden("rider token has no sub-agent-signed delegation covering this group");
+        };
+        let provenance = x0x::groups::RiderProvenance {
+            sub_agent_id: sub_agent_id.clone(),
+            rider_token_id: *token_id,
+            rider_token_hash: token_hash.clone(),
+            scope: info.stable_group_id().to_string(),
+            delegation,
+        };
+        let now_unix = x0x::dm::now_unix_ms() / 1_000;
+        let sub_revoked = state
+            .agent
+            .revocation_records()
+            .await
+            .iter()
+            .any(|rec| rec.subject_kind() == "agent" && rec.subject_hex() == *sub_agent_id);
+        if let Err(reason) = x0x::groups::verify_rider_provenance(
+            &provenance,
+            &caller_hex,
+            info.stable_group_id(),
+            sub_revoked,
+            now_unix,
+        ) {
+            tracing::warn!(
+                group_id = %info.stable_group_id(),
+                sub_agent = %sub_agent_id,
+                "rejected rider MLS send: delegation verification failed: {reason}"
+            );
+            return forbidden("rider delegation does not verify for this group");
+        }
+        // Review r5: the attribution is signed AFTER encryption, over
+        // bytes that include the CIPHERTEXT DIGEST, so it authenticates
+        // the concrete message — not just (group, epoch). The signing
+        // happens in both plane branches below.
+        rider_provenance = Some(provenance);
+    }
     if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
         return bad_request("group is not MlsEncrypted — use public send instead");
     }
@@ -16568,9 +16856,11 @@ pub(in crate::server) async fn secure_group_encrypt(
             &id,
             Some(&stable_group_id),
             &req.payload_b64,
+            rider_provenance.as_ref(),
         )
         .await;
     }
+
     let Some(key) = info.secure_message_key() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -16620,12 +16910,26 @@ pub(in crate::server) async fn secure_group_encrypt(
         }
     };
 
+    // Review r5: sign the attribution AFTER encryption over the
+    // ciphertext digest. Review r6: FAIL CLOSED — abort with the 500
+    // BEFORE recording, so no unattributed rider row ever persists.
+    let attribution = match sign_mls_rider_attribution(
+        state.as_ref(),
+        rider_provenance.as_ref(),
+        &group_id_clone,
+        epoch,
+        &ciphertext,
+    ) {
+        Ok(attribution) => attribution,
+        Err(resp) => return resp,
+    };
     record_mls_history(
         state.as_ref(),
         &group_id_clone,
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
+        attribution.as_ref(),
     );
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),
@@ -16749,6 +17053,7 @@ pub(in crate::server) async fn secure_group_decrypt(
                 &plaintext,
                 x0x::history::Direction::Inbound,
                 req.secret_epoch,
+                None,
             );
             secure_group_effect_response_after_terminality_recheck(
                 state.as_ref(),
@@ -21488,6 +21793,11 @@ pub(in crate::server) mod tests {
                 .with_agent_cert_path(data_dir.join("agent.cert"))
                 .with_peer_cache_disabled()
                 .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_history(x0x::history::HistoryConfig {
+                    enabled: true,
+                    db_path: Some(data_dir.join("history.db")),
+                    ..x0x::history::HistoryConfig::default()
+                })
                 .build()
                 .await?,
         );
@@ -21608,6 +21918,13 @@ pub(in crate::server) mod tests {
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             api_token: "test-token".to_string(),
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
+            rider_tokens: tokio::sync::Mutex::new(
+                crate::server::rider_auth::RiderTokenStore::load(
+                    data_dir.join(crate::server::rider_auth::RIDER_TOKENS_FILE),
+                )
+                .await,
+            ),
+            cert_journal_lock: tokio::sync::Mutex::new(()),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
@@ -22673,6 +22990,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -22698,6 +23016,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -24528,6 +24847,7 @@ pub(in crate::server) mod tests {
         let (enc_status, enc_body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(plaintext),
             }),
@@ -25433,6 +25753,39 @@ pub(in crate::server) mod tests {
         Ok(())
     }
 
+    /// Review r6 regression: an attribution signing FAILURE must
+    /// produce Err (a 500 the callers return BEFORE recording) — the
+    /// r5 regression swallowed it to `None`, letting both encryption
+    /// paths persist an UNATTRIBUTED rider row and still answer 200.
+    #[test]
+    fn rider_attribution_signing_failure_fails_closed() {
+        // Minimal provenance: content is irrelevant to the sign path.
+        let prov = x0x::groups::RiderProvenance {
+            sub_agent_id: "ab".repeat(32),
+            rider_token_id: 1,
+            rider_token_hash: "cd".repeat(32),
+            scope: "g".to_string(),
+            delegation: x0x::groups::RiderDelegation {
+                cert_b64: String::new(),
+                payload_b64: String::new(),
+                signature: String::new(),
+            },
+        };
+        let kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let failing = |_: &ant_quic::MlDsaSecretKey, _: &[u8]| {
+            Err(ant_quic::PqcError::SigningFailed("injected".to_string()))
+        };
+        let outcome = sign_mls_rider_attribution_with(Some(&prov), "g", 7, b"ct", &kp, failing);
+        let (status, body) = outcome.unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+        assert!(
+            body.0.get("error").is_some(),
+            "error body carried to the caller: {body:?}"
+        );
+        // Owner sends (no provenance) are unaffected: Ok(None).
+        assert!(sign_mls_rider_attribution_with(None, "g", 7, b"ct", &kp, failing).is_ok());
+    }
+
     async fn install_treekem_endpoint_group(
         state: &Arc<AppState>,
         group_id: &str,
@@ -25469,6 +25822,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25476,6 +25830,219 @@ pub(in crate::server) mod tests {
         .await;
 
         assert_lost_race_conflict_drops_fields(status, &body.0, &["ciphertext_b64"]);
+        Ok(())
+    }
+
+    /// Review r4: the MLS/Home rider path applies the SAME capability
+    /// check as public messages — explicit grant, sub-agent roster role,
+    /// and a sub-agent-SIGNED delegation covering the group — and the
+    /// durable attribution is a daemon-SIGNED artifact, not a string.
+    #[tokio::test]
+    async fn rider_mls_encrypt_requires_delegation_and_records_signed_attribution() -> Result<()> {
+        let (state, _dir) = secure_endpoint_test_state().await?;
+        let group_id = &"ab".repeat(16);
+        let stable_group_id = "rider-mls-stable";
+        install_secure_endpoint_group(
+            &state,
+            group_id,
+            stable_group_id,
+            x0x::mls::SecureGroupPlane::Gss,
+        )
+        .await;
+
+        // Harness side: sub-agent keypair, owner cert, delegation naming
+        // THIS daemon and covering the group.
+        let daemon_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let sub_kp = x0x::identity::AgentKeypair::generate()?;
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let owner_kp = x0x::identity::UserKeypair::generate()?;
+        let cert = x0x::identity::AgentCertificate::issue_for_public_key(
+            &owner_kp,
+            sub_kp.public_key().as_bytes(),
+            None,
+        )?;
+        let not_after = x0x::dm::now_unix_ms() / 1_000 + 3_600;
+        let scopes = vec![stable_group_id.to_string()];
+        let (payload_b64, signature) =
+            x0x::groups::sign_rider_delegation(&sub_kp, &daemon_hex, &scopes, not_after)?;
+        let delegation = x0x::groups::RiderDelegation {
+            cert_b64: BASE64.encode(cert.to_storage_bytes()?),
+            payload_b64,
+            signature,
+        };
+
+        // Sub-agent must hold the MembersOnly roster role.
+        {
+            let mut groups = state.named_groups.write().await;
+            let Some(info) = groups.get_mut(group_id) else {
+                anyhow::bail!("group missing");
+            };
+            info.add_member(
+                sub_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                Some(daemon_hex.clone()),
+                None,
+            );
+        }
+
+        // Token WITHOUT a delegation → 403 even with grant + role.
+        let now = x0x::dm::now_unix_ms() / 1_000;
+        let undel = state
+            .rider_tokens
+            .lock()
+            .await
+            .issue(
+                sub_hex.clone(),
+                vec![stable_group_id.to_string()],
+                None,
+                600,
+                "dd".repeat(32),
+                None,
+                None,
+                now,
+            )
+            .await?;
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id: sub_hex.clone(),
+                token_id: undel.1.token_id,
+                token_hash: undel.1.token_hash.clone(),
+                groups: vec![stable_group_id.to_string()],
+            }),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"no delegation"),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "no delegation: {body:?}");
+
+        // Token WITH the verified delegation → 200, and the history row
+        // carries the daemon-signed attribution artifact.
+        let del = state
+            .rider_tokens
+            .lock()
+            .await
+            .issue(
+                sub_hex.clone(),
+                vec![stable_group_id.to_string()],
+                None,
+                600,
+                "dd".repeat(32),
+                None,
+                Some(delegation),
+                now,
+            )
+            .await?;
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id: sub_hex.clone(),
+                token_id: del.1.token_id,
+                token_hash: del.1.token_hash.clone(),
+                groups: vec![stable_group_id.to_string()],
+            }),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"delegated rider plaintext"),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "delegated rider encrypt: {body:?}");
+
+        let Some(history) = state.agent.history() else {
+            anyhow::bail!("history store missing");
+        };
+        // The history writer is an async queue — poll briefly for the
+        // row to land.
+        let mut attributed = None;
+        for _ in 0..40 {
+            let rows = history
+                .store()
+                .query(&x0x::history::HistoryQuery {
+                    scope: Some(x0x::history::Scope::Group(stable_group_id.to_string())),
+                    ..Default::default()
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            if let Some(row) = rows
+                .iter()
+                .find(|r| r.record.author_agent.as_deref() == Some(sub_hex.as_str()))
+            {
+                attributed = Some((
+                    row.record.signature.is_some(),
+                    row.record.sig_context.clone(),
+                ));
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let Some((has_signature, sig_context)) = attributed else {
+            let rows = history
+                .store()
+                .query(&x0x::history::HistoryQuery {
+                    ..Default::default()
+                })
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            anyhow::bail!(
+                "sub-agent-attributed history row never appeared; all rows: {:?}",
+                rows.iter()
+                    .map(|r| (r.record.scope.canonical(), r.record.author_agent.clone()))
+                    .collect::<Vec<_>>()
+            );
+        };
+        assert!(has_signature, "attribution is signed, not a bare string");
+        assert_eq!(sig_context.as_deref(), Some("x0x.rider.mls-attribution.v1"));
+
+        // Non-member sub-agent (role gate) → 403 even with delegation:
+        // remove the roster role and re-send with a fresh token.
+        {
+            let mut groups = state.named_groups.write().await;
+            if let Some(info) = groups.get_mut(group_id) {
+                info.remove_member(&sub_hex, None);
+            }
+        }
+        let del2 = state
+            .rider_tokens
+            .lock()
+            .await
+            .issue(
+                sub_hex.clone(),
+                vec![stable_group_id.to_string()],
+                None,
+                600,
+                "dd".repeat(32),
+                None,
+                Some(x0x::groups::RiderDelegation {
+                    cert_b64: BASE64.encode(
+                        x0x::identity::AgentCertificate::issue_for_public_key(
+                            &owner_kp,
+                            sub_kp.public_key().as_bytes(),
+                            None,
+                        )?
+                        .to_storage_bytes()?,
+                    ),
+                    payload_b64: del.1.delegation.clone().expect("delegation").payload_b64,
+                    signature: del.1.delegation.clone().expect("delegation").signature,
+                }),
+                now,
+            )
+            .await?;
+        let (status, body) = secure_group_encrypt(
+            State(Arc::clone(&state)),
+            Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id: sub_hex.clone(),
+                token_id: del2.1.token_id,
+                token_hash: del2.1.token_hash.clone(),
+                groups: vec![stable_group_id.to_string()],
+            }),
+            Json(SecureEncryptRequest {
+                payload_b64: BASE64.encode(b"not a member"),
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "non-member: {body:?}");
         Ok(())
     }
 
@@ -25488,6 +26055,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25614,6 +26182,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -27486,6 +28055,7 @@ pub(in crate::server) mod tests {
             timestamp: 123,
             thread_root: None,
             thread_parent: None,
+            rider_provenance: None,
             signature: "cc".repeat(64),
         };
 
@@ -27522,6 +28092,7 @@ pub(in crate::server) mod tests {
             1_000,
             None,
             None,
+            None,
         )
         .expect("sign v1");
 
@@ -27538,6 +28109,7 @@ pub(in crate::server) mod tests {
             2_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .expect("sign v2");
 
@@ -27619,10 +28191,14 @@ pub(in crate::server) mod tests {
     ) -> Result<(StatusCode, serde_json::Value)> {
         let req =
             serde_json::from_value(serde_json::json!({ "body": body })).context("send request")?;
-        let response =
-            send_group_public_message(State(state), Path(group_id.to_string()), Json(req))
-                .await
-                .into_response();
+        let response = send_group_public_message(
+            State(state),
+            Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(req),
+        )
+        .await
+        .into_response();
         response_json(response).await
     }
 

@@ -19,6 +19,7 @@ mod machines;
 mod messaging;
 pub(crate) mod named_groups;
 mod network;
+mod owner;
 mod presence;
 mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
@@ -103,6 +104,10 @@ pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,
     gossip_diagnostics, groups_diagnostics, network_status, peer_health_handler, peers,
     probe_peer_handler, relay_diagnostics, transport_diagnostics,
+};
+pub(super) use owner::{
+    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
+    owner_riders_revoke,
 };
 pub(super) use presence::{
     presence, presence_find, presence_foaf, presence_online, presence_status,

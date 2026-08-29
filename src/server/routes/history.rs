@@ -109,6 +109,9 @@ fn group_history_message(
 /// paginated via `before_id`).
 pub(in crate::server) async fn history_list(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Query(params): Query<HistoryListParams>,
 ) -> impl IntoResponse {
     let Some(history) = state.agent.history() else {
@@ -118,6 +121,31 @@ pub(in crate::server) async fn history_list(
         Ok(s) => s,
         Err(e) => return api_error(StatusCode::BAD_REQUEST, e),
     };
+    // ADR-0039 bounded rider read: a rider may list only `group:` scopes
+    // EXPLICITLY granted to its token (review r4: no implicit Home —
+    // Home is delegated like any other group), and never more than
+    // RIDER_HISTORY_MAX_LIMIT rows per request. The route itself is the
+    // only history surface the deny-by-default predicate lets riders
+    // reach — search/stats/message lookups stay owner-only.
+    let mut params = params;
+    if let crate::server::rider_auth::ActorContext::Rider { groups, .. } = &actor {
+        let allowed = match &scope {
+            x0x::history::Scope::Group(gid) => groups.contains(gid),
+            _ => false,
+        };
+        if !allowed {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "rider tokens may only read history scopes they are granted (ADR-0039)",
+            );
+        }
+        params.limit = Some(
+            params
+                .limit
+                .unwrap_or(crate::server::rider_auth::RIDER_HISTORY_MAX_LIMIT)
+                .min(crate::server::rider_auth::RIDER_HISTORY_MAX_LIMIT),
+        );
+    }
     let store = Arc::clone(history.store());
     let q = query_from(&params, scope);
     match tokio::task::spawn_blocking(move || store.query(&q)).await {
@@ -358,7 +386,6 @@ pub(in crate::server) async fn history_diagnostics(
         })),
     )
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -380,6 +407,7 @@ mod tests {
             timestamp: 42,
             thread_root: Some(root.clone()),
             thread_parent: Some(root.clone()),
+            rider_provenance: None,
             signature: "signature-1".to_string(),
         };
         let artifact = serde_json::to_vec(&message).expect("serialize message");
