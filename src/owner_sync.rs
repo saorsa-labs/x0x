@@ -16,7 +16,7 @@
 //!    non-revoked) have already cleared — enforced by the shared accept loop
 //!    before this protocol's acceptor sees the stream;
 //! 2. the remote machine is in the local **owner device set**: an
-//!    [`OwnerEnrollment`] record signed by the owner key, whose public key
+//!    [`crate::owner_sync::OwnerEnrollment`] record signed by the owner key, whose public key
 //!    derives to this install's `UserId`, and whose optional expiry has not
 //!    elapsed (enrollment currency, not just signature validity). This is
 //!    the enrollment direction of ADR-0043, reused — not a rival scheme.
@@ -33,7 +33,7 @@
 //!
 //! # Object model (gapcheck blocker 31)
 //!
-//! Each Tier-1 object is an owner-signed [`VersionedRecord`]. Conflict rule
+//! Each Tier-1 object is an owner-signed [`crate::owner_sync::VersionedRecord`]. Conflict rule
 //! (deliberately decoupled from state-commit heights): highest `version`
 //! wins; tie → highest `signed_at_ms`; tie → lexicographically greatest
 //! `writer_machine`; **exact-clock tie with different signed content →
@@ -54,14 +54,14 @@
 //! side carrying a fresh nonce) → mutual `Proof` (owner-key possession) →
 //! per-kind **paged** version vectors → **paged** record batches both ways
 //! → `Done` → atomic local commit. The whole session runs under a total
-//! timeout ([`SESSION_TIMEOUT`]); a peer that stalls at any stage is
+//! timeout ([`crate::owner_sync::SESSION_TIMEOUT`]); a peer that stalls at any stage is
 //! dropped, never held. Sessions run periodically and are re-triggered on
 //! local change (the store's generation channel).
 //!
 //! # Tier-3 boundary (gapcheck blocker 32 scope note)
 //!
-//! The sync surface serializes ONLY the four Tier-1 kinds: [`SyncKind`] and
-//! [`SyncValue`] are closed enums with no catch-all. A record whose kind tag
+//! The sync surface serializes ONLY the four Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
+//! [`crate::owner_sync::SyncValue`] are closed enums with no catch-all. A record whose kind tag
 //! is not one of the four fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
