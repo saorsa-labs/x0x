@@ -570,6 +570,11 @@ pub enum SyncError {
     StoreLimit(String),
     /// Inbound batch/vector exceeded its session cap.
     TooManyRecords(String),
+    /// A durable write crossed the rename but could not be synced: disk
+    /// holds the NEW state while the caller saw an error. The store is
+    /// POISONED — every further mutation and session fails until the
+    /// process reloads state from disk (review R5 finding 2).
+    Poisoned(String),
 }
 
 impl std::fmt::Display for SyncError {
@@ -599,10 +604,27 @@ impl std::fmt::Display for SyncError {
             Self::UnknownKind { tag } => {
                 write!(f, "unknown sync kind tag 0x{tag:02x} (Tier-3 allowlist)")
             }
-            Self::StoreLimit(e) => write!(f, "sync store limit: {e}"),
+            Self::Poisoned(e) => write!(
+                f,
+                "sync store poisoned (state replaced but not durable): {e}"
+            ),
             Self::TooManyRecords(e) => write!(f, "sync session record cap: {e}"),
+            Self::StoreLimit(e) => write!(f, "sync store limit: {e}"),
         }
     }
+}
+
+/// Which half of a durable atomic write failed — the two halves have
+/// OPPOSITE rollback semantics (review R5 finding 2).
+#[derive(Debug)]
+enum DurableWriteError {
+    /// Failed before the rename: the OLD state is still on disk; callers
+    /// may safely roll in-memory state back.
+    BeforeRename(std::io::Error),
+    /// The rename happened but the post-rename sync failed: the NEW state
+    /// is already visible on disk; rolling memory back would leave memory
+    /// behind an advanced disk. The store must be poisoned instead.
+    AfterRename(std::io::Error),
 }
 
 impl std::error::Error for SyncError {}
@@ -746,17 +768,20 @@ pub struct SessionSummary {
     pub shipped: usize,
 }
 
-/// The local Tier-1 store: the owner device set plus the winning record for
-/// every `(kind, key)` this machine holds. Persisted as two small JSON files
-/// under `<data_dir>/sync/` (created at load), written atomically (temp
-/// file + rename). Every mutation PROPAGATES persistence errors — success
-/// is never reported on a swallowed write (review R2 finding 2).
 pub struct OwnerSyncStore {
     dir: PathBuf,
     records: tokio::sync::RwLock<BTreeMap<(SyncKind, String), VersionedRecord>>,
     devices: tokio::sync::RwLock<BTreeMap<[u8; 32], OwnerEnrollment>>,
     last_session: tokio::sync::RwLock<BTreeMap<[u8; 32], DeviceSyncStatus>>,
     generation_tx: tokio::sync::watch::Sender<u64>,
+    /// Set when a durable write crossed the rename but could not be
+    /// synced: memory/disk agreement is no longer reconstructable by
+    /// rollback, so every further mutation and session fails until the
+    /// process reloads from disk (review R5 finding 2).
+    poisoned: std::sync::Mutex<Option<String>>,
+    /// Test injection: make the next durable writes fail AFTER the rename
+    /// (simulates a post-rename fsync failure). Never set in production.
+    fail_after_rename: std::sync::atomic::AtomicBool,
 }
 
 /// Per-device sync status surfaced by `GET /sync/devices`.
@@ -822,6 +847,8 @@ impl OwnerSyncStore {
             devices: tokio::sync::RwLock::new(devices),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
+            poisoned: std::sync::Mutex::new(None),
+            fail_after_rename: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -851,64 +878,150 @@ impl OwnerSyncStore {
     /// fsync the target file and its parent directory (the rename entry
     /// durable). A crash after a successful persist can no longer lose the
     /// durable state the caller just verified (review R3 finding 2).
-    async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    ///
+    /// The error distinguishes the two transaction halves (review R5
+    /// finding 2): [`DurableWriteError::BeforeRename`] leaves the OLD
+    /// state on disk (callers may roll memory back); [`DurableWriteError::AfterRename`]
+    /// means the NEW state is already in place and the process can no
+    /// longer reconstruct memory/disk agreement by rolling back — the
+    /// store must be poisoned instead.
+    async fn write_atomically(
+        path: &Path,
+        bytes: &[u8],
+        fail_after_rename: bool,
+    ) -> Result<(), DurableWriteError> {
         use tokio::io::AsyncWriteExt as _;
         static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = path.with_extension(format!("tmp-{}-{unique}", std::process::id()));
-        let mut file = tokio::fs::File::create(&tmp).await?;
-        file.write_all(bytes).await?;
-        file.sync_all().await?;
+        let mut file = tokio::fs::File::create(&tmp)
+            .await
+            .map_err(DurableWriteError::BeforeRename)?;
+        file.write_all(bytes)
+            .await
+            .map_err(DurableWriteError::BeforeRename)?;
+        file.sync_all()
+            .await
+            .map_err(DurableWriteError::BeforeRename)?;
         drop(file);
-        tokio::fs::rename(&tmp, path).await?;
+        tokio::fs::rename(&tmp, path)
+            .await
+            .map_err(DurableWriteError::BeforeRename)?;
+        // Everything below runs with the NEW state already visible.
+        if fail_after_rename {
+            // Test injection: simulate a post-rename fsync failure.
+            return Err(DurableWriteError::AfterRename(std::io::Error::other(
+                "injected post-rename fsync failure",
+            )));
+        }
         // fsync the renamed file and the parent directory so the new name
         // survives a crash. (Directory fds support fsync on Unix.)
-        let target = tokio::fs::File::open(path).await?;
-        target.sync_all().await?;
+        let target = tokio::fs::File::open(path)
+            .await
+            .map_err(DurableWriteError::AfterRename)?;
+        target
+            .sync_all()
+            .await
+            .map_err(DurableWriteError::AfterRename)?;
         #[cfg(unix)]
         if let Some(parent) = path.parent() {
-            let dir = tokio::fs::File::open(parent).await?;
-            dir.sync_all().await?;
+            let dir = tokio::fs::File::open(parent)
+                .await
+                .map_err(DurableWriteError::AfterRename)?;
+            dir.sync_all()
+                .await
+                .map_err(DurableWriteError::AfterRename)?;
         }
         #[cfg(not(unix))]
         let _ = path.parent();
         Ok(())
     }
 
-    /// Persist the winning records. Errors PROPAGATE — callers never report
-    /// success on a swallowed write (review R2 finding 2).
+    /// Persist the winning records. `Poisoned` tells the caller the write
+    /// crossed the rename but could not be made durable — memory must NOT
+    /// be rolled back (disk already advanced); the store must be poisoned.
+    /// Errors PROPAGATE — callers never report success on a swallowed
+    /// write (review R2 finding 2).
     async fn persist_records(
+        &self,
         records: &BTreeMap<(SyncKind, String), VersionedRecord>,
-        dir: &Path,
     ) -> Result<(), SyncError> {
         let persisted = PersistedRecords {
             records: records.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
-        Self::write_atomically(&dir.join(RECORDS_FILE), &bytes)
-            .await
-            .map_err(|e| SyncError::Io(format!("persist records: {e}")))
+        Self::write_atomically(
+            &self.dir.join(RECORDS_FILE),
+            &bytes,
+            self.fail_after_rename_for_testing(),
+        )
+        .await
+        .map_err(|e| match e {
+            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist records: {io}")),
+            DurableWriteError::AfterRename(io) => {
+                SyncError::Poisoned(format!("records replaced but not durable: {io}"))
+            }
+        })
     }
 
     /// Persist the device set; errors propagate (see [`Self::persist_records`]).
     async fn persist_devices(
+        &self,
         devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
-        dir: &Path,
     ) -> Result<(), SyncError> {
         let persisted = PersistedDevices {
             devices: devices.values().cloned().collect(),
         };
         let bytes = serde_json::to_vec(&persisted)
             .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
-        Self::write_atomically(&dir.join(DEVICES_FILE), &bytes)
-            .await
-            .map_err(|e| SyncError::Io(format!("persist devices: {e}")))
+        Self::write_atomically(
+            &self.dir.join(DEVICES_FILE),
+            &bytes,
+            self.fail_after_rename_for_testing(),
+        )
+        .await
+        .map_err(|e| match e {
+            DurableWriteError::BeforeRename(io) => SyncError::Io(format!("persist devices: {io}")),
+            DurableWriteError::AfterRename(io) => {
+                SyncError::Poisoned(format!("devices replaced but not durable: {io}"))
+            }
+        })
     }
 
-    /// The enrollment gate (blocker 30): is `machine` enrolled for `owner`
-    /// AND is that enrollment current?
-    ///
+    /// Poison the store: a durable write crossed the rename but could not
+    /// be synced, so memory/disk agreement is not reconstructable — all
+    /// further mutations and sessions fail until a fresh `load` (review R5
+    /// finding 2).
+    fn poison(&self, reason: String) {
+        *self
+            .poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
+    }
+
+    /// Why the store is poisoned, if it is.
+    #[must_use]
+    pub fn poisoned_reason(&self) -> Option<String> {
+        self.poisoned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    fn fail_after_rename_for_testing(&self) -> bool {
+        self.fail_after_rename
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Test-only: make subsequent durable writes fail AFTER the rename,
+    /// simulating a post-rename fsync failure (review R5 finding 2).
+    #[doc(hidden)]
+    pub fn set_fail_after_rename_for_testing(&self, fail: bool) {
+        self.fail_after_rename
+            .store(fail, std::sync::atomic::Ordering::Relaxed);
+    }
+
     /// Every stored enrollment is (re-)verified against `owner` and its
     /// expiry checked here — a corrupt, foreign-key, or stale record fails
     /// closed, so persistence poison or an expired grant cannot wedge the
@@ -927,8 +1040,11 @@ impl OwnerSyncStore {
     ///
     /// # Errors
     ///
-    /// [`SyncError::Io`] when the device set cannot be persisted — the
-    /// caller must fail, not report success (review R2 finding 2).
+    /// [`SyncError::Io`] when persistence failed BEFORE the rename (the
+    /// in-memory set is rolled back); [`SyncError::Poisoned`] when the
+    /// write crossed the rename but was not durable — the mutation STAYS
+    /// (disk already advanced) and the store refuses further sync until
+    /// reload (review R5 finding 2).
     pub async fn enroll(&self, enrollment: OwnerEnrollment) -> Result<(), SyncError> {
         let mut devices = self.devices.write().await;
         let previous = devices.get(&enrollment.machine_id).cloned();
@@ -937,9 +1053,16 @@ impl OwnerSyncStore {
             .is_none_or(|old| enrollment.enrolled_at_ms >= old.enrolled_at_ms);
         if keep {
             devices.insert(enrollment.machine_id, enrollment.clone());
-            if let Err(e) = Self::persist_devices(&devices, &self.dir).await {
-                // Roll back so memory matches the failed disk write
-                // (review R2 finding 2).
+            if let Err(e) = self.persist_devices(&devices).await {
+                if matches!(e, SyncError::Poisoned(_)) {
+                    // Disk already holds the new device set: keep the
+                    // mutation (memory matches disk) and poison.
+                    drop(devices);
+                    self.poison(e.to_string());
+                    return Err(e);
+                }
+                // Pre-rename failure: roll back so memory matches the
+                // unchanged disk (review R2 finding 2).
                 match previous {
                     Some(old) => {
                         devices.insert(old.machine_id, old);
@@ -957,17 +1080,18 @@ impl OwnerSyncStore {
     }
 
     /// Remove a machine from the owner device set (the DELETE
-    /// `/sync/devices/:id` path; review R2 finding 1).
-    ///
-    /// # Errors
-    ///
-    /// [`SyncError::Io`] when the device set cannot be persisted (the
-    /// in-memory set is restored — removal never half-applies).
-    /// Returns `Ok(false)` when the machine was not enrolled.
+    /// `/sync/devices/:id` path; review R2 finding 1). Poisoning semantics
+    /// match [`Self::enroll`]. Returns `Ok(false)` when not enrolled.
     pub async fn unenroll(&self, machine: &MachineId) -> Result<bool, SyncError> {
         let mut devices = self.devices.write().await;
         if let Some(previous) = devices.remove(&machine.0) {
-            if let Err(e) = Self::persist_devices(&devices, &self.dir).await {
+            if let Err(e) = self.persist_devices(&devices).await {
+                if matches!(e, SyncError::Poisoned(_)) {
+                    // Disk already holds the removal: keep it and poison.
+                    drop(devices);
+                    self.poison(e.to_string());
+                    return Err(e);
+                }
                 devices.insert(previous.machine_id, previous);
                 return Err(e);
             }
@@ -995,20 +1119,21 @@ impl OwnerSyncStore {
     }
 
     /// Pure classification of `record` against `stored` under the full
-    /// conflict rule: `beats`, else equal-clock with identical content
-    /// (idempotent supersede), else equal-clock with different content
-    /// (deterministic greater-hash winner — convergence under
-    /// equivocation).
+    /// conflict rule: `beats`, else equal-clock resolved by the FULL
+    /// record hash (canonical signed bytes including the randomized
+    /// ML-DSA signature): an identical hash is an exact replay
+    /// (idempotent supersede); any difference under the same clock —
+    /// value OR signature-only — makes the greater hash the deterministic
+    /// winner on every peer (review R5 finding 1).
     fn classify(record: &VersionedRecord, stored: &VersionedRecord) -> MergeOutcome {
         if record.clock.beats(&stored.clock) {
             return MergeOutcome::Accepted;
         }
         if record.clock == stored.clock {
-            if record.value == stored.value {
-                return MergeOutcome::Superseded; // exact replay
-            }
-            // Equal clock, different signed content: the greater record
-            // hash wins on every peer.
+            // Signature-only differences (the same writer double-signing
+            // identical content) MUST also converge to one canonical
+            // record — deciding by value equality would leave replicas
+            // holding different records under the same clock forever.
             if record.record_hash() > stored.record_hash() {
                 return MergeOutcome::Accepted;
             }
@@ -1058,16 +1183,22 @@ impl OwnerSyncStore {
                 }
                 let key = (record.kind, record.key.clone());
                 let stored = records.get(&key);
-                // Equal clock with different signed content is an
+                // Equal clock with ANY differing signed bytes (different
+                // value, or the same value double-signed) is an
                 // equivocation whichever side wins the hash tie-break —
-                // surfaced, never silently merged (review R2 finding 3).
+                // surfaced, never silently merged (review R2 finding 3,
+                // extended in R5 to signature-only differences).
                 if let Some(existing) = stored {
-                    if existing.clock == record.clock && existing.value != record.value {
+                    if existing.clock == record.clock
+                        && existing.record_hash() != record.record_hash()
+                    {
                         outcome.equivocations += 1;
+                        let values_differ = existing.value != record.value;
                         tracing::warn!(
                             target: "x0x::owner_sync",
                             kind = ?existing.kind,
                             key = %existing.key,
+                            values_differ,
                             "equal-clock equivocation resolved deterministically by record hash"
                         );
                     }
@@ -1101,11 +1232,21 @@ impl OwnerSyncStore {
                 if outcome.accepted.is_empty() {
                     return Ok(outcome); // nothing new — no write needed
                 }
-                match Self::persist_records(&records, &self.dir).await {
+                match self.persist_records(&records).await {
                     Ok(()) => {
                         drop(records);
                         self.kick();
                         Ok(outcome)
+                    }
+                    Err(e) if matches!(e, SyncError::Poisoned(_)) => {
+                        // The batch crossed the rename but was not durable:
+                        // disk already holds it — KEEP the mutations (memory
+                        // matches the advanced disk) and poison the store;
+                        // never roll memory back below an advanced disk
+                        // (review R5 finding 2).
+                        drop(records);
+                        self.poison(e.to_string());
+                        Err(e)
                     }
                     Err(e) => {
                         Self::rollback(&mut records, &touched);
@@ -1195,14 +1336,21 @@ impl OwnerSyncStore {
         let record = VersionedRecord::sign(kind, key, desired, clock, owner)
             .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
         let previous = records.insert((kind, key.to_string()), record);
-        match Self::persist_records(&records, &self.dir).await {
+        match self.persist_records(&records).await {
             Ok(()) => {
                 drop(records);
                 self.kick();
                 Ok(())
             }
+            Err(e) if matches!(e, SyncError::Poisoned(_)) => {
+                // Disk already holds the minted record: keep it and poison.
+                drop(records);
+                self.poison(e.to_string());
+                Err(e)
+            }
             Err(e) => {
-                // Roll back so memory matches the failed disk write.
+                // Pre-rename failure: roll back so memory matches the
+                // unchanged disk.
                 match previous {
                     Some(prev) => {
                         records.insert((kind, key.to_string()), prev);
@@ -1304,7 +1452,7 @@ impl OwnerSyncStore {
     pub async fn records_insert_for_testing(&self, record: VersionedRecord) {
         let mut records = self.records.write().await;
         records.insert((record.kind, record.key.clone()), record);
-        let _ = Self::persist_records(&records, &self.dir).await;
+        let _ = self.persist_records(&records).await;
     }
 }
 
@@ -1440,6 +1588,11 @@ where
     let owner_id = owner.user_id();
     let mut summary = SessionSummary::default();
 
+    // A poisoned store never syncs: memory/disk agreement is unrecoverable
+    // until the process reloads state from disk (review R5 finding 2).
+    if let Some(reason) = store.poisoned_reason() {
+        return Err(SyncError::Poisoned(reason));
+    }
     // Same-owner gate: a peer machine that is not enrolled locally (and
     // current) never gets past the first byte (blocker 30).
     if peer_machine.0 == local_machine.0 {
@@ -3348,5 +3501,163 @@ mod r4_tests {
             matches!(err, SyncError::MalformedFrame(ref m) if m.contains("exceeds limit")),
             "got: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod r5_tests {
+    use super::tests::{clock, cross_enroll_for_tests, machine, names_value, owner_kp, sign_names};
+    use super::*;
+
+    /// WHY (review R5 finding 1): ML-DSA signatures are randomized, so the
+    /// same writer can produce two records with identical kind/key/value/
+    /// clock but different signatures. Equal-clock classification must
+    /// compare the FULL record hash (signature included) so every replica
+    /// converges on one canonical record — deciding by value equality left
+    /// replicas permanently split.
+    #[tokio::test]
+    async fn equal_clock_signature_only_records_converge() {
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let key = "same-value";
+        let same_clock = clock(4, 500, 1);
+        // Sign the SAME value twice: different signature bytes, identical
+        // content otherwise.
+        let first = VersionedRecord::sign(
+            SyncKind::MachineNames,
+            key,
+            &names_value("identical"),
+            same_clock,
+            &owner,
+        )
+        .unwrap();
+        let second = VersionedRecord::sign(
+            SyncKind::MachineNames,
+            key,
+            &names_value("identical"),
+            same_clock,
+            &owner,
+        )
+        .unwrap();
+        assert_eq!(first.value, second.value);
+        assert_ne!(
+            first.record_hash(),
+            second.record_hash(),
+            "randomized ML-DSA signatures must produce different record hashes"
+        );
+        let canonical = if first.record_hash() > second.record_hash() {
+            &first
+        } else {
+            &second
+        };
+
+        // Two stores, OPPOSITE arrival orders — both must hold the
+        // canonical record afterwards.
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let s1 = OwnerSyncStore::load(dir1.path()).await.unwrap();
+        let s2 = OwnerSyncStore::load(dir2.path()).await.unwrap();
+        s1.commit_batch(vec![first.clone()], &owner_id)
+            .await
+            .unwrap();
+        s1.commit_batch(vec![second.clone()], &owner_id)
+            .await
+            .unwrap();
+        s2.commit_batch(vec![second.clone()], &owner_id)
+            .await
+            .unwrap();
+        s2.commit_batch(vec![first.clone()], &owner_id)
+            .await
+            .unwrap();
+
+        for store in [&s1, &s2] {
+            let snapshot = store.records_snapshot().await;
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(
+                snapshot[0].record_hash(),
+                canonical.record_hash(),
+                "signature-only equal-clock divergence converges to the canonical record"
+            );
+        }
+    }
+
+    /// WHY (review R5 finding 2): when a durable write crosses the rename
+    /// but its post-rename sync fails, disk already holds the NEW state —
+    /// memory must NOT be rolled back (that would leave memory behind an
+    /// advanced disk); instead the store is poisoned and refuses every
+    /// further mutation and session until a reload.
+    #[tokio::test]
+    async fn post_rename_failure_keeps_memory_advanced_and_poisons() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = OwnerSyncStore::load(dir.path()).await.unwrap();
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+
+        // Inject a post-rename fsync failure for the next write.
+        store.set_fail_after_rename_for_testing(true);
+        let record = sign_names("k", "v", clock(1, 1, 1), &owner);
+        let err = store
+            .commit_batch(vec![record], &owner_id)
+            .await
+            .expect_err("post-rename failure must surface");
+        assert!(
+            matches!(err, SyncError::Poisoned(_)),
+            "typed poison error, got: {err:?}"
+        );
+        assert!(store.poisoned_reason().is_some(), "store is poisoned");
+
+        // Memory was NOT rolled back: it matches the advanced disk.
+        let snapshot = store.records_snapshot().await;
+        assert_eq!(snapshot.len(), 1, "memory keeps the crossed-rename batch");
+
+        // A fresh load over the same directory sees the same advanced state
+        // — memory and disk agree, just not durably.
+        let reloaded = OwnerSyncStore::load(dir.path()).await.unwrap();
+        assert_eq!(
+            reloaded.records_snapshot().await.len(),
+            1,
+            "disk holds the new batch the callers saw fail"
+        );
+
+        // Every further mutation refuses: poisoned.
+        let err = store
+            .mint(
+                SyncKind::OwnerProfile,
+                "owner",
+                &SyncValue::OwnerProfile {
+                    human_name: Some("X".into()),
+                },
+                &owner,
+                machine(1),
+            )
+            .await
+            .expect_err("poisoned store refuses mint");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+        let err = store
+            .enroll(OwnerEnrollment::sign(machine(9), &owner, 1, None).unwrap())
+            .await
+            .expect_err("poisoned store refuses enroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+
+        // Sessions refuse too — even with a fully enrolled peer.
+        cross_enroll_for_tests(
+            &Arc::new(OwnerSyncStore::load(dir.path()).await.unwrap()),
+            &Arc::new(OwnerSyncStore::load(dir.path()).await.unwrap()),
+            &owner,
+        )
+        .await;
+        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let err = run_sync_session(
+            &mut tx,
+            &mut rx,
+            &store,
+            &owner,
+            &machine(1),
+            &machine(2),
+            |_| {},
+        )
+        .await
+        .expect_err("poisoned store refuses sessions");
+        assert!(matches!(err, SyncError::Poisoned(_)));
     }
 }
