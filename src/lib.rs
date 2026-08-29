@@ -16243,6 +16243,17 @@ pub const NAME: &str = "x0x";
 /// check a revoked agent that cannot direct-connect (e.g. NAT-blocked)
 /// could still reach the recipient via a relay, bypassing revocation.
 /// A revoked origin is dropped and counted as `relay_dropped_revoked`.
+///
+/// # Inner-payload binding (#437)
+///
+/// `disposition_for` enforces `header.inner_digest == blake3(inner)`
+/// for headers that carry a digest **before** any sender gating or
+/// accounting is acted on: a relay (or on-path holder of a valid
+/// header) cannot substitute a different valid `DmEnvelope` under an
+/// unrelated header, because the refusal precedes the contact gate,
+/// `relay_received`/forward accounting, and quota admission. Legacy
+/// digest-less headers (pre-#437 senders) keep today's behavior per the
+/// documented transition.
 fn spawn_relay_dm_listener(
     network: std::sync::Arc<network::NetworkNode>,
     peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
@@ -20657,6 +20668,7 @@ mod tests {
                 // Empty pubkey + signature: header.verify() must fail.
                 sender_public_key: Vec::new(),
                 originated_at_unix_ms: dm::now_unix_ms(),
+                inner_digest: None,
                 signature: Vec::new(),
             },
             inner: dm::DmEnvelope {

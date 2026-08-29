@@ -131,6 +131,18 @@ any added body line in an Accepted ADR, so no in-file pointers):
 - **ADR 0030** — key-implementation-facts block and validation matrix → `docs/design/adr-0030-mechanics.md`
 - **ADR 0031** — validation/property-test inventory → `docs/design/adr-0031-mechanics.md`
 
+Post-acceptance correction, 2026-08-29:
+
+- **ADR 0051** — RESOLVED by #437: the header now binds the inner
+  envelope via `inner_digest` (blake3 over the canonical postcard bytes,
+  signed under the `x0x-relay-hdr-v2` domain and enforced by
+  `disposition_for` before any sender gating or accounting). The ADR's
+  "signs no digest of the inner envelope / substitution tracked as #437"
+  limitation no longer describes shipped behavior for #437+ senders;
+  legacy digest-less headers remain accepted per the documented
+  transition. Details:
+  [`docs/design/adr-0051-mechanics.md`](../design/adr-0051-mechanics.md).
+
 Not actioned from the audit, deliberately: ADR 0010's verdict is
 SUPERSEDED-BY-0012 (tombstone retained, nothing to relocate); the optional
 merges (0013 into 0009, 0022 into 0020) are forbidden as literal edits by

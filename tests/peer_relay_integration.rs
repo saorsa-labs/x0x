@@ -779,6 +779,7 @@ fn signed_relayed(origin: &AgentKeypair, dst: AgentId, inner: DmEnvelope) -> Rel
         &origin.agent_id().0,
         &pub_bytes,
         originated,
+        None,
     );
     let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         origin.secret_key(),
@@ -794,6 +795,10 @@ fn signed_relayed(origin: &AgentKeypair, dst: AgentId, inner: DmEnvelope) -> Rel
             sender_agent_id: origin.agent_id().0,
             sender_public_key: pub_bytes,
             originated_at_unix_ms: originated,
+            // Legacy (digest-less) header: these tests exercise the
+            // pre-#437 sender shape, which remains accepted per the
+            // documented transition.
+            inner_digest: None,
             signature,
         },
         inner,
@@ -1031,4 +1036,118 @@ async fn forged_inner_relayed_dm_is_never_a_verified_delivery() {
         attacker.agent_id(),
         "the wire sender is the attacker's self-asserted agent id"
     );
+}
+
+/// #437: a relay (or on-path holder of a valid header) cannot substitute a
+/// different valid inner envelope under a bound header. The origin signs a
+/// v2 (digest-bound) header over inner A; the carried inner is swapped for
+/// an unrelated but well-formed inner B. The listener's `disposition_for`
+/// gate must hard-drop the frame — `relay_refused_inner_digest_mismatch`
+/// advances, no receive accounting is attributed to the header's sender,
+/// and nothing is re-injected onto the direct channel.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn substituted_inner_under_bound_header_is_hard_dropped() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping substituted_inner: bind permission unavailable");
+            return;
+        }
+    };
+    charlie.join_network().await.expect("charlie join_network");
+
+    // Origin signs a bound header for inner A...
+    let origin = AgentKeypair::generate().expect("origin keypair");
+    let inner_a = opaque_inner(origin.agent_id().0, [0x22; 32], vec![0u8; 8]);
+    let digest = RelayedDm::inner_digest_of(&inner_a).expect("canonical encode inner A");
+    let (pub_bytes, _sec_bytes) = origin.to_bytes();
+    let originated = now_unix_ms();
+    let signing_bytes = RelayHeader::signing_bytes(
+        RelayHeader::VERSION,
+        &charlie.agent_id().0,
+        &origin.agent_id().0,
+        &pub_bytes,
+        originated,
+        Some(&digest),
+    );
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        origin.secret_key(),
+        &signing_bytes,
+    )
+    .expect("ml-dsa sign bound relay header");
+
+    // ...but the frame carries unrelated inner B — a well-formed envelope
+    // from a different origin, the exact #437 substitution.
+    let inner_b = opaque_inner([0x99; 32], [0x88; 32], vec![0xCD; 32]);
+    let relayed = RelayedDm {
+        header: RelayHeader {
+            version: RelayHeader::VERSION,
+            dst_agent_id: charlie.agent_id().0,
+            sender_agent_id: origin.agent_id().0,
+            sender_public_key: pub_bytes,
+            originated_at_unix_ms: originated,
+            inner_digest: Some(digest),
+            signature: signature.as_bytes().to_vec(),
+        },
+        inner: inner_b,
+    };
+
+    let pre_refusals = charlie
+        .peer_relay()
+        .stats()
+        .snapshot()
+        .relay_refused_inner_digest_mismatch;
+    let pre_received = charlie.peer_relay().stats().snapshot().relay_received;
+    let mut charlie_sub = charlie.subscribe_direct();
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), relayed)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+
+    // The digest gate must refuse the substituted frame...
+    let start = tokio::time::Instant::now();
+    loop {
+        if charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_inner_digest_mismatch
+            == pre_refusals + 1
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "relay_refused_inner_digest_mismatch never advanced — the substituted inner was NOT dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // ...with no receive accounting attributed to the header's sender...
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_received,
+        pre_received,
+        "a substituted envelope must not count as received"
+    );
+    // ...and nothing may reach Charlie's direct subscribers.
+    match tokio::time::timeout(Duration::from_millis(300), charlie_sub.recv()).await {
+        Err(_) => {}
+        Ok(msg) => panic!("substituted inner must NOT be delivered, got {msg:?}"),
+    }
 }
