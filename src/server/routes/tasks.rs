@@ -206,6 +206,11 @@ pub(in crate::server) struct UpdateTaskRequest {
     /// differs), closing the restart-ABA window.
     #[serde(default)]
     pub(in crate::server) fence_token: Option<String>,
+    /// Hex AgentId of the next owner; REQUIRED for `action:"transfer_owner"`.
+    /// Rejected for other actions (fail-closed: a transfer target on a
+    /// claim/complete would be silently ignored otherwise).
+    #[serde(default)]
+    pub(in crate::server) to_agent: Option<String>,
 }
 
 /// Task list entry.
@@ -234,6 +239,8 @@ pub(in crate::server) struct TaskEntry {
     pub(in crate::server) completed_by: Option<String>,
     /// Unix-ms timestamp of the winning completion; null unless done.
     pub(in crate::server) completed_at: Option<u64>,
+    /// Hex AgentId of the resolved task owner (ADR-0040 signed chain).
+    pub(in crate::server) owner_agent: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -371,6 +378,7 @@ pub(in crate::server) async fn list_tasks(
                     claimed_at: t.claimed_at,
                     completed_by: t.completed_by.map(|a| hex::encode(a.as_bytes())),
                     completed_at: t.completed_at,
+                    owner_agent: hex::encode(t.owner_agent.as_bytes()),
                 })
                 .collect();
             (
@@ -467,10 +475,39 @@ pub(in crate::server) async fn update_task(
     };
 
     let result = match req.action.as_str() {
-        "claim" => handle.claim_task_versioned(task_id, expected).await,
-        "complete" => handle.complete_task_versioned(task_id, expected).await,
+        "claim" => {
+            if req.to_agent.is_some() {
+                return bad_request("to_agent is only valid for action 'transfer_owner'");
+            }
+            handle.claim_task_versioned(task_id, expected).await
+        }
+        "complete" => {
+            if req.to_agent.is_some() {
+                return bad_request("to_agent is only valid for action 'transfer_owner'");
+            }
+            handle.complete_task_versioned(task_id, expected).await
+        }
+        "transfer_owner" => {
+            // ADR-0040: ownership transfer is a signed CRDT operation by the
+            // CURRENT owner. Target agent must be a valid hex AgentId; the
+            // current-owner check itself happens inside the handle (fail
+            // closed before signing).
+            let to_hex = req.to_agent.as_deref().unwrap_or_default();
+            let to_bytes = hex::decode(to_hex).ok().filter(|b| b.len() == 32);
+            let Some(to_bytes) = to_bytes else {
+                return bad_request(
+                    "transfer_owner requires to_agent (64 hex chars, the next owner's AgentId)",
+                );
+            };
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&to_bytes);
+            let to = x0x::identity::AgentId(arr);
+            handle
+                .transfer_ownership_versioned(task_id, to, expected)
+                .await
+        }
         _ => {
-            return bad_request("action must be 'claim' or 'complete'");
+            return bad_request("action must be 'claim', 'complete' or 'transfer_owner'");
         }
     };
 

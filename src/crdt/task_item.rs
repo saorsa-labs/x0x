@@ -35,8 +35,9 @@
 //! ```
 
 use crate::crdt::{
-    purge_unattested_elements, sign_attestation, CheckboxState, CrdtError, OpAttestation, OpKind,
-    Result, TaskId, TaskListId, TaskMetadata,
+    purge_unattested_elements, purge_unverified_owner_transfers, resolve_owner, sign_attestation,
+    sign_owner_transfer, CheckboxState, CrdtError, OpAttestation, OpKind, OwnerTransfer, Result,
+    TaskId, TaskListId, TaskMetadata,
 };
 use crate::gossip::SigningContext;
 use crate::identity::AgentId;
@@ -98,19 +99,40 @@ pub struct TaskItem {
     /// survive delta replication and historical (`full_delta`) state sync.
     /// Merged as a union (same key ⇒ content-addressed identical attestation).
     ///
-    /// This is the **trailing** serialized field. bincode (the wire and disk
-    /// format) is positional and non-self-describing, so `#[serde(default)]`
-    /// alone would not save a blob written without it — a mid-struct absence
-    /// misaligns every following field. Kept last with a tolerant deserializer
-    /// so a blob whose bytes END before this field (a pre-provenance /
-    /// differently-shaped TaskItem at the tail of the stream) decodes to an
-    /// empty map instead of an EOF error. An empty map resolves to
-    /// `current_state() == Empty`, i.e. no attested elements — fail-closed,
-    /// never fail-open. The tolerance is genuine only at stream-EOF: a fieldless
-    /// TaskItem nested mid-stream inside a larger bincode value cannot be
-    /// recovered positionally. New fields MUST be added after this one.
+    /// This is the first of the **trailing** serialized fields. bincode (the
+    /// wire and disk format) is positional and non-self-describing, so
+    /// `#[serde(default)]` alone would not save a blob written without it —
+    /// a mid-struct absence misaligns every following field. Kept trailing
+    /// with a tolerant deserializer so a blob whose bytes END before this
+    /// field (a pre-provenance / differently-shaped TaskItem at the tail of
+    /// the stream) decodes to an empty map instead of an EOF error. An
+    /// empty map resolves to `current_state() == Empty`, i.e. no attested
+    /// elements — fail-closed, never fail-open. The tolerance is genuine
+    /// only at stream-EOF: a fieldless TaskItem nested mid-stream inside a
+    /// larger bincode value cannot be recovered positionally. New fields
+    /// MUST be added after this one.
     #[serde(default, deserialize_with = "deserialize_attestations")]
     attestations: BTreeMap<CheckboxState, OpAttestation>,
+
+    /// Per-operation ownership-transfer attestations (ADR-0040, blocker 27),
+    /// keyed by the transfer operation itself.
+    ///
+    /// Ownership is a chain rooted at [`TaskItem::created_by`]; every entry
+    /// MUST carry an [`OpAttestation`] signed by the transfer's `from`
+    /// agent's own ML-DSA-65 key ([`crate::crdt::verify_owner_transfer`]).
+    /// Unsigned or wrong-signer transfers are dropped at admission
+    /// ([`crate::crdt::purge_unverified_owner_transfers`]) and can never
+    /// influence [`TaskItem::owner`]. Claiming does NOT touch this map —
+    /// a claim is an advisory candidate, not an ownership change.
+    ///
+    /// This is the **trailing** serialized field (see `attestations` above
+    /// for the rationale): bincode is positional, so the tolerant
+    /// deserializer lets a legacy blob whose bytes end before this field
+    /// decode to an empty map — ownership then resolves to `created_by`,
+    /// exactly the pre-ADR-0040 observable. New fields MUST be added after
+    /// this one.
+    #[serde(default, deserialize_with = "deserialize_owner_transfers")]
+    owner_transfers: BTreeMap<OwnerTransfer, OpAttestation>,
 }
 
 /// Deserialize the trailing per-element attestation map, tolerating its
@@ -129,6 +151,19 @@ where
 {
     use serde::Deserialize;
     Ok(BTreeMap::<CheckboxState, OpAttestation>::deserialize(deserializer).unwrap_or_default())
+}
+
+/// Deserialize the trailing ownership-transfer map, tolerating its absence —
+/// same stream-EOF rationale as [`deserialize_attestations`]. An empty map
+/// resolves ownership to `created_by`, the exact pre-ADR-0040 observable.
+fn deserialize_owner_transfers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<OwnerTransfer, OpAttestation>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(BTreeMap::<OwnerTransfer, OpAttestation>::deserialize(deserializer).unwrap_or_default())
 }
 
 impl TaskItem {
@@ -167,6 +202,7 @@ impl TaskItem {
             created_by: metadata.created_by,
             created_at: metadata.created_at,
             attestations: BTreeMap::new(),
+            owner_transfers: BTreeMap::new(),
         }
     }
 
@@ -458,6 +494,63 @@ impl TaskItem {
         self.priority.set(priority, peer_id);
     }
 
+    /// Transfer ownership of this task to another agent (ADR-0040).
+    ///
+    /// The transfer is recorded as a signed [`OwnerTransfer`] operation
+    /// attested by `from`'s OWN ML-DSA-65 key — the caller must hold that
+    /// key (`signing.agent_id == from`), which is what makes ownership
+    /// transfer cryptographic rather than a UI convention. `from` should be
+    /// the current resolved owner ([`TaskItem::owner`]); a transfer signed
+    /// by anyone else is inert at resolution time (see [`resolve_owner`]).
+    ///
+    /// Claiming does NOT transfer ownership — [`TaskItem::claim`] records an
+    /// advisory candidate only. Ownership starts at `created_by` and changes
+    /// exclusively through this signed chain.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::Gossip`] if `from != signing.agent_id` (the
+    /// caller tried to transfer a task they do not own) or signing fails.
+    pub fn transfer_ownership(
+        &mut self,
+        scope: TaskListId,
+        from: AgentId,
+        to: AgentId,
+        timestamp_ms: u64,
+        signing: &SigningContext,
+    ) -> Result<()> {
+        let transfer = OwnerTransfer {
+            from,
+            to,
+            timestamp_ms,
+        };
+        let att = sign_owner_transfer(signing, &scope, &self.id, &transfer)?;
+        self.owner_transfers.insert(transfer, att);
+        Ok(())
+    }
+
+    /// The resolved owner of this task.
+    ///
+    /// Deterministic pure function of the verified transfer set: starts at
+    /// `created_by` and advances along signature-valid transfers signed by
+    /// each intermediate owner (see [`resolve_owner`]). Concurrent transfers
+    /// by the same owner resolve to the `(timestamp, to)`-maximum, so every
+    /// replica converges on the same owner without coordination.
+    #[must_use]
+    pub fn owner(&self) -> AgentId {
+        resolve_owner(self.created_by, &self.owner_transfers)
+    }
+
+    /// All recorded ownership-transfer operations (verified survivors only
+    /// after admission). Order is unspecified.
+    #[must_use]
+    pub fn owner_transfers(&self) -> Vec<(OwnerTransfer, OpAttestation)> {
+        self.owner_transfers
+            .iter()
+            .map(|(t, a)| (*t, a.clone()))
+            .collect()
+    }
+
     /// Get the current checkbox state.
     ///
     /// Resolves the OR-Set to a single state by taking the maximum
@@ -664,6 +757,10 @@ impl TaskItem {
                 h.update(&[0u8]);
             }
         }
+        // Resolved owner (ADR-0040): two replicas converge on the same
+        // signed transfer chain ⇒ identical resolved owner bytes.
+        h.update(&[1u8]);
+        h.update(self.owner().as_bytes());
     }
 
     /// Merge another TaskItem into this one.
@@ -725,17 +822,29 @@ impl TaskItem {
 
         // created_by and created_at are immutable, no merge needed
 
+        // Union ownership transfers (same OwnerTransfer key ⇒
+        // content-addressed identical attestation, union is idempotent).
+        for (transfer, att) in &other.owner_transfers {
+            self.owner_transfers
+                .entry(*transfer)
+                .or_insert_with(|| att.clone());
+        }
+
         // Provenance admission gate (LAST step): drop every checkbox element
         // whose attestation is missing or fails verification. Keeps the OR-Set
         // invariant-pure (every element authenticated) so resolution operates
         // only over authenticated state; a forged/unattested element shipped in
         // a delta or full_delta is dropped before it can influence resolution.
-        let dropped =
+        let mut dropped =
             purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations);
+        // Ownership admission gate: drop transfers whose attestation is not a
+        // valid signature by their own `from` agent (ADR-0040 blocker 27).
+        // Unsigned or wrong-signer transfers shipped in a delta die here.
+        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
         if dropped > 0 {
             tracing::debug!(
                 dropped,
-                "purged unauthenticated task checkbox elements during merge"
+                "purged unauthenticated checkbox/ownership elements during merge"
             );
         }
 
@@ -774,13 +883,19 @@ impl TaskItem {
                 .entry(state.clone())
                 .or_insert_with(|| att.clone());
         }
+        for (transfer, att) in &other.owner_transfers {
+            self.owner_transfers
+                .entry(*transfer)
+                .or_insert_with(|| att.clone());
+        }
 
-        let dropped =
+        let mut dropped =
             purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations);
+        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
         if dropped > 0 {
             tracing::debug!(
                 dropped,
-                "purged unauthenticated task checkbox elements during checkbox-only merge"
+                "purged unauthenticated checkbox/ownership elements during checkbox-only merge"
             );
         }
 
@@ -804,10 +919,9 @@ impl TaskItem {
     /// internally as its last step; first-seen insertion paths that bypass
     /// `merge` MUST call this explicitly.
     ///
-    /// Returns the number of unauthenticated elements dropped.
-    #[must_use]
     pub fn admit(&mut self, scope: TaskListId) -> usize {
         purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations)
+            + purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers)
     }
 
     /// Drop checkbox elements whose attesting agent is not in `authorized`.
@@ -838,6 +952,20 @@ impl TaskItem {
                 self.attestations.remove(&state);
                 dropped += 1;
             }
+        }
+        // Ownership transfers (ADR-0040): a transfer touching a nonmember
+        // (either side) is dropped, so removing a member reverts ownership to
+        // the last fully-authorized holder — membership revocation auto-expires
+        // authority that flowed through the removed agent.
+        let nonmember: Vec<OwnerTransfer> = self
+            .owner_transfers
+            .keys()
+            .filter(|t| !authorized.contains(&t.from) || !authorized.contains(&t.to))
+            .copied()
+            .collect();
+        dropped += nonmember.len();
+        for key in nonmember {
+            self.owner_transfers.remove(&key);
         }
         dropped
     }
@@ -2166,5 +2294,233 @@ mod tests {
         );
         assert_eq!(order1.claims().len(), 1, "forged element purged in order1");
         assert_eq!(order2.claims().len(), 1, "forged element purged in order2");
+    }
+
+    // ── Ownership (ADR-0040, blocker 27) ────────────────────────────────────
+
+    /// Task with a REAL creator keypair, so `created_by` has a matching
+    /// signing context (ownership is rooted at the creator).
+    fn owned_task(creator: &AgentId) -> TaskItem {
+        let task_id = TaskId::new("owned", creator, 1000);
+        let metadata = TaskMetadata::new("T", "D", 1, *creator, 1000);
+        TaskItem::new(task_id, metadata, peer(1))
+    }
+
+    #[test]
+    fn owner_starts_at_creator_and_claim_does_not_transfer() {
+        // WHY: ADR-0040 makes claiming advisory — a claim must NOT imply
+        // ownership. If a claim flipped the owner, any member could seize
+        // tasks without the owner's signature.
+        let (creator, _creator_signing) = signing_for(1);
+        let (claimer, claimer_signing) = signing_for(2);
+        let mut task = owned_task(&creator);
+        assert_eq!(task.owner(), creator, "owner starts at created_by");
+
+        task.claim(item_scope(), claimer, peer(2), 1, &claimer_signing)
+            .expect("claim");
+        assert_eq!(
+            task.owner(),
+            creator,
+            "claiming does not transfer ownership"
+        );
+        assert_eq!(
+            task.assignee(),
+            Some(&claimer),
+            "assignee is still advisory metadata"
+        );
+    }
+
+    #[test]
+    fn owner_signed_transfer_resolves() {
+        // WHY: the happy path — the current owner signs, the chain advances.
+        let (creator, creator_signing) = signing_for(1);
+        let (bob, _) = signing_for(2);
+        let mut task = owned_task(&creator);
+        task.transfer_ownership(item_scope(), creator, bob, 5_000, &creator_signing)
+            .expect("creator transfers");
+        assert_eq!(task.owner(), bob, "signed transfer advances the chain");
+    }
+
+    #[test]
+    fn transfer_by_non_owner_is_rejected_at_signing() {
+        // WHY: blocker 25/27 — B must never be able to produce a transfer
+        // signed as A. The API refuses to sign a transfer whose `from` is not
+        // the local key holder, so no A-keyed signature ever exists from B.
+        let (creator, _creator_signing) = signing_for(1);
+        let (mallory, mallory_signing) = signing_for(2);
+        let mut task = owned_task(&creator);
+        let err = task.transfer_ownership(item_scope(), creator, mallory, 1, &mallory_signing);
+        assert!(err.is_err(), "signing as another agent must hard-fail");
+        assert_eq!(task.owner(), creator);
+    }
+
+    #[test]
+    fn non_owner_validly_signed_transfer_is_inert() {
+        // WHY: a member CAN validly sign {from: self, to: other} while not
+        // being the owner. Signature-valid but chain-orphaned: it must never
+        // influence resolution, or ownership could be stolen by any member.
+        let (creator, _creator_signing) = signing_for(1);
+        let (mallory, mallory_signing) = signing_for(2);
+        let (puppet, _) = signing_for(3);
+        let mut task = owned_task(&creator);
+        // Mallory legitimately signs her own transfer op (from == mallory).
+        task.transfer_ownership(item_scope(), mallory, puppet, 1, &mallory_signing)
+            .expect("self-signed op records");
+        assert_eq!(
+            task.owner(),
+            creator,
+            "orphan transfer must not resolve: mallory is not the owner"
+        );
+    }
+
+    #[test]
+    fn forged_transfer_is_purged_at_admission() {
+        // WHY: an attacker may craft a delta whose transfer op claims
+        // from=victim but carries the attacker's key/signature. The
+        // admission gate drops it before resolution — fail-closed.
+        let (creator, creator_signing) = signing_for(1);
+        let (mallory, mallory_signing) = signing_for(2);
+        let mut honest = owned_task(&creator);
+        honest
+            .transfer_ownership(item_scope(), creator, mallory, 10, &creator_signing)
+            .expect("creator legitimately transfers to mallory");
+
+        let mut hostile = owned_task(&creator);
+        // Mallory signs a second transfer op {from: mallory, to: mallory2}
+        // but we tamper the attested author so verification fails.
+        let (mallory2, _) = signing_for(3);
+        hostile
+            .transfer_ownership(item_scope(), mallory, mallory2, 20, &mallory_signing)
+            .expect("recorded");
+        // Corrupt: relabel the attestation author as the creator while the
+        // key still hashes to mallory ⇒ derived != author_agent_id.
+        for att in hostile.owner_transfers.values_mut() {
+            att.author_agent_id = creator;
+        }
+
+        honest.merge(item_scope(), &hostile).expect("merge");
+        assert_eq!(
+            honest.owner_transfers().len(),
+            1,
+            "only the creator-signed transfer survives; the tampered one is purged"
+        );
+        assert_eq!(honest.owner(), mallory, "legitimate chain still resolves");
+    }
+
+    #[test]
+    fn chained_transfer_converges_in_both_merge_orders() {
+        // WHY: CRDT replicas may receive A→B before or after B→C; both must
+        // resolve the same owner from the union (order independence).
+        let (a, a_signing) = signing_for(1);
+        let (b, b_signing) = signing_for(2);
+        let (c, _) = signing_for(3);
+        let mut first = owned_task(&a);
+        first
+            .transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("a→b");
+        let mut second = owned_task(&a);
+        second
+            .transfer_ownership(item_scope(), b, c, 200, &b_signing)
+            .expect("b→c (arrives first on this replica)");
+        // The orphan b→c must be inert on its own.
+        assert_eq!(second.owner(), a, "orphan chain does not resolve alone");
+
+        let mut order1 = first.clone();
+        order1.merge(item_scope(), &second).expect("merge");
+        let mut order2 = second.clone();
+        order2.merge(item_scope(), &first).expect("merge");
+        assert_eq!(order1.owner(), c, "order1 resolves the full chain");
+        assert_eq!(order2.owner(), c, "order2 resolves the full chain");
+    }
+
+    #[test]
+    fn concurrent_owner_transfers_resolve_deterministically() {
+        // WHY: the owner may sign two conflicting transfers (A→B, A→C);
+        // replicas holding the union must agree on ONE owner (max
+        // (timestamp, to)) or ownership forks across the mesh.
+        let (a, a_signing) = signing_for(1);
+        let (b, _) = signing_for(2);
+        let (c, _) = signing_for(3);
+        let mut with_b = owned_task(&a);
+        with_b
+            .transfer_ownership(item_scope(), a, b, 500, &a_signing)
+            .expect("a→b (later ts)");
+        let mut with_c = owned_task(&a);
+        with_c
+            .transfer_ownership(item_scope(), a, c, 100, &a_signing)
+            .expect("a→c (earlier ts)");
+
+        with_b.merge(item_scope(), &with_c).expect("merge");
+        with_c.merge(item_scope(), &with_b).expect("merge");
+        assert_eq!(with_b.owner(), b, "later timestamp wins");
+        assert_eq!(with_c.owner(), b, "same winner from either side");
+    }
+
+    #[test]
+    fn membership_removal_reverts_ownership_over_removed_agent() {
+        // WHY (ADR-0040): revoking an agent's membership must auto-expire
+        // authority that flowed through it. Transfers touching a nonmember
+        // are dropped, so ownership falls back to the last authorized holder.
+        let (a, a_signing) = signing_for(1);
+        let (b, b_signing) = signing_for(2);
+        let (c, _) = signing_for(3);
+        let mut task = owned_task(&a);
+        task.transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("a→b");
+        task.transfer_ownership(item_scope(), b, c, 200, &b_signing)
+            .expect("b→c");
+        assert_eq!(task.owner(), c);
+
+        let mut authorized = HashSet::new();
+        authorized.insert(a);
+        // b removed from the group; c remains.
+        authorized.insert(c);
+        let dropped = task.filter_unauthorized(&authorized);
+        assert!(dropped >= 1, "transfers touching b are dropped");
+        assert_eq!(
+            task.owner(),
+            a,
+            "ownership reverts to last authorized holder"
+        );
+    }
+
+    #[test]
+    fn legacy_taskitem_without_owner_transfers_decodes() {
+        // WHY: wire/disk compatibility — blobs written before ADR-0040 lack
+        // the trailing owner_transfers field entirely; they must decode
+        // unchanged with ownership resolving to created_by (blocker 27's
+        // "legacy deltas without the field decode unchanged").
+        let (creator, _) = signing_for(1);
+        let task = owned_task(&creator);
+
+        // Serialize the pre-0040 9-field shape by stripping the trailing map.
+        #[derive(serde::Serialize)]
+        struct LegacyTaskItemPre0040<'a> {
+            id: &'a TaskId,
+            checkbox: &'a OrSet<CheckboxState>,
+            title: &'a LwwRegister<String>,
+            description: &'a LwwRegister<String>,
+            assignee: &'a LwwRegister<Option<AgentId>>,
+            priority: &'a LwwRegister<u8>,
+            created_by: &'a AgentId,
+            created_at: &'a u64,
+            attestations: &'a BTreeMap<CheckboxState, OpAttestation>,
+        }
+        let legacy = LegacyTaskItemPre0040 {
+            id: &task.id,
+            checkbox: &task.checkbox,
+            title: &task.title,
+            description: &task.description,
+            assignee: &task.assignee,
+            priority: &task.priority,
+            created_by: &task.created_by,
+            created_at: &task.created_at,
+            attestations: &task.attestations,
+        };
+        let bytes = bincode::serialize(&legacy).expect("serialize legacy shape");
+        let decoded: TaskItem = bincode::deserialize(&bytes).expect("legacy blob decodes");
+        assert_eq!(decoded.owner(), creator);
+        assert!(decoded.owner_transfers().is_empty());
+        assert_eq!(decoded.title(), task.title());
     }
 }

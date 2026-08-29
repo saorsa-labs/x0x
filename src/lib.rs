@@ -132,6 +132,7 @@ pub mod mls;
 
 /// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
 pub mod a2a;
+pub mod delegation;
 
 /// Direct agent-to-agent messaging.
 ///
@@ -12953,6 +12954,82 @@ impl TaskListHandle {
         Ok(TaskMutationOutcome::Committed { fence, advisory })
     }
 
+    /// Transfer ownership of a task to another agent (ADR-0040).
+    ///
+    /// The transfer is signed by the LOCAL agent's key and is only accepted
+    /// when the local agent is the current resolved owner
+    /// (`task.owner() == self.agent_id`) — ownership transfer is
+    /// cryptographic, not a UI convention, and a claim never implies
+    /// ownership. The signed transfer rides the normal state-change delta so
+    /// remote replicas verify it at delta-apply and reject forgeries.
+    ///
+    /// `expected` is the same local-replica fence as
+    /// [`TaskListHandle::claim_task_versioned`].
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the task does not exist, the local agent is not
+    /// the current owner, or signing fails.
+    pub async fn transfer_ownership_versioned(
+        &self,
+        task_id: crdt::TaskId,
+        to: identity::AgentId,
+        expected: Option<FenceToken>,
+    ) -> error::Result<TaskMutationOutcome> {
+        let (fence, delta, advisory) = {
+            let mut list = self.sync.write().await;
+            if let Some(expected) = expected {
+                let current = list.current_version();
+                if expected.epoch != self.replica_epoch || expected.revision != current {
+                    return Ok(TaskMutationOutcome::StaleLocalVersion {
+                        current: self.current_fence(current),
+                    });
+                }
+            }
+            // Fail closed BEFORE signing: only the current owner may
+            // transfer. A signed transfer from a non-owner would replicate
+            // but stay inert at resolution; rejecting here keeps the API
+            // honest (blocker 27).
+            let current_owner = list.task_owner(&task_id).map_err(|e| {
+                error::IdentityError::Storage(std::io::Error::other(format!(
+                    "transfer_ownership: {}",
+                    e
+                )))
+            })?;
+            if current_owner != self.agent_id {
+                return Err(error::IdentityError::PeerIdMismatch);
+            }
+            list.transfer_task_ownership(&task_id, self.agent_id, to, &self.signing)
+                .map_err(|e| {
+                    error::IdentityError::Storage(std::io::Error::other(format!(
+                        "transfer_ownership failed: {}",
+                        e
+                    )))
+                })?;
+            let task = list.get_task(&task_id).ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "task disappeared after ownership transfer",
+                ))
+            })?;
+            let advisory = AdvisoryOwnership {
+                agent: self.agent_id,
+                locally_winning: task.owner() == to,
+                current_winner: task.claim_record(),
+            };
+            let full_task = task.clone();
+            let version = list.current_version();
+            (
+                self.current_fence(version),
+                crdt::TaskListDelta::for_state_change(task_id, full_task, version),
+                advisory,
+            )
+        };
+        if let Err(e) = self.sync.publish_delta(self.peer_id, delta).await {
+            tracing::warn!("failed to publish transfer_ownership delta: {}", e);
+        }
+        Ok(TaskMutationOutcome::Committed { fence, advisory })
+    }
+
     /// List all tasks in their current order.
     ///
     /// # Returns
@@ -12994,6 +13071,7 @@ impl TaskListHandle {
                     state: task.current_state(),
                     assignee: task.assignee().copied(),
                     owner: None,
+                    owner_agent: task.owner(),
                     priority: task.priority(),
                     claimed_by: claim.map(|(agent, _)| agent),
                     claimed_at: claim.map(|(_, ts)| ts),
@@ -13942,6 +14020,10 @@ pub struct TaskSnapshot {
     pub assignee: Option<identity::AgentId>,
     /// Human owner of the agent that created this task (if known).
     pub owner: Option<identity::UserId>,
+    /// Resolved task OWNER per ADR-0040: the `created_by` root advanced
+    /// along signature-valid transfers signed by each intermediate owner.
+    /// Distinct from `assignee` (advisory) and from `owner` (human).
+    pub owner_agent: identity::AgentId,
     /// Task priority (0-255, higher = more important).
     pub priority: u8,
     /// The agent whose claim won (deterministic OR-Set winner), if claimed.

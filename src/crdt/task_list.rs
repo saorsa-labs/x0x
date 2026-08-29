@@ -245,6 +245,7 @@ impl TaskList {
             task.claim_record().hash(&mut hasher);
             task.completion_record().hash(&mut hasher);
             task.assignee().hash(&mut hasher);
+            task.owner().hash(&mut hasher);
         }
         for tid in self.ordering.get() {
             hasher.write(tid.as_bytes());
@@ -611,6 +612,50 @@ impl TaskList {
         task.complete(self.id, agent_id, peer_id, seq, signing)?;
         self.version += 1;
         Ok(())
+    }
+
+    /// Transfer ownership of a task to another agent (ADR-0040).
+    ///
+    /// Delegates to [`TaskItem::transfer_ownership`]; the transfer is only
+    /// meaningful when `from` is the current resolved owner
+    /// ([`TaskList::task_owner`]) — a transfer signed by anyone else is
+    /// inert at resolution. Errors if the task doesn't exist or the caller
+    /// (via `signing`) is not `from`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::TaskNotFound`] or a signing error.
+    pub fn transfer_task_ownership(
+        &mut self,
+        task_id: &TaskId,
+        from: AgentId,
+        to: AgentId,
+        signing: &crate::gossip::SigningContext,
+    ) -> Result<()> {
+        let scope = self.id;
+        let task = self
+            .task_data
+            .get_mut(task_id)
+            .ok_or(CrdtError::TaskNotFound(*task_id))?;
+        let timestamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_err(|e| CrdtError::SystemClock(format!("clock before Unix epoch: {e}")))?
+            .as_millis() as u64;
+        task.transfer_ownership(scope, from, to, timestamp, signing)?;
+        self.version += 1;
+        Ok(())
+    }
+
+    /// The resolved owner of a task in this list.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CrdtError::TaskNotFound`] if the task is absent.
+    pub fn task_owner(&self, task_id: &TaskId) -> Result<AgentId> {
+        self.task_data
+            .get(task_id)
+            .map(TaskItem::owner)
+            .ok_or(CrdtError::TaskNotFound(*task_id))
     }
 
     /// Reorder the tasks in the list.

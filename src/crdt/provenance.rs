@@ -303,6 +303,208 @@ pub fn purge_unattested_elements(
     dropped
 }
 
+// ── Ownership transfer provenance (ADR-0040, blocker 27) ──────────────────
+
+/// Domain separator for ownership-transfer attestations.
+///
+/// A transfer is an operation ON a task BY the current owner, so its canonical
+/// bytes bind `(scope, task_id, from, to, timestamp)` — deliberately distinct
+/// from the claim/complete layout so a claim signature can never be replayed
+/// as a transfer and vice versa.
+pub const TRANSFER_OWNER_DOMAIN: &[u8] = b"x0x.task.transfer_owner.v1";
+
+/// One ownership-transfer operation: `from` (the current owner) hands the
+/// task to `to`. This is the CRDT operation key; the matching
+/// [`OpAttestation`] in `TaskItem::owner_transfers` MUST be signed by
+/// `from`'s own ML-DSA-65 key.
+///
+/// `Ord` is total and deterministic (agent bytes, then timestamp) so the map
+/// iteration in [`resolve_owner`] is replica-stable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OwnerTransfer {
+    /// The current owner authorizing the transfer. MUST equal
+    /// `AgentId::from_public_key(attestation.author_public_key)`.
+    pub from: AgentId,
+    /// The next owner.
+    pub to: AgentId,
+    /// Unix milliseconds at signing (LWW tiebreak, not an expiry).
+    pub timestamp_ms: u64,
+}
+
+impl Ord for OwnerTransfer {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.from
+            .as_bytes()
+            .cmp(other.from.as_bytes())
+            .then_with(|| self.to.as_bytes().cmp(other.to.as_bytes()))
+            .then_with(|| self.timestamp_ms.cmp(&other.timestamp_ms))
+    }
+}
+
+impl PartialOrd for OwnerTransfer {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Deterministic, fixed-width byte layout that is both signed and verified
+/// for an ownership transfer.
+///
+/// Layout:
+/// `domain || scope (32) || task_id (32) || from (32) || to (32) || timestamp_ms (8, BE)`.
+#[must_use]
+pub fn canonical_owner_transfer_bytes(
+    scope: &TaskListId,
+    task_id: &TaskId,
+    transfer: &OwnerTransfer,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(TRANSFER_OWNER_DOMAIN.len() + 32 * 4 + 8);
+    out.extend_from_slice(TRANSFER_OWNER_DOMAIN);
+    out.extend_from_slice(scope.as_bytes());
+    out.extend_from_slice(task_id.as_bytes());
+    out.extend_from_slice(transfer.from.as_bytes());
+    out.extend_from_slice(transfer.to.as_bytes());
+    out.extend_from_slice(&transfer.timestamp_ms.to_be_bytes());
+    out
+}
+
+/// Produce the attestation for an ownership transfer using the local agent's
+/// key material.
+///
+/// `from` MUST be the local agent (`signing.agent_id`): only the CURRENT
+/// owner can authorize a transfer, and the current owner is a key holder.
+/// Any other caller is attempting to transfer a task they do not own — a
+/// hard error, never a signature.
+///
+/// # Errors
+///
+/// Returns [`CrdtError::Gossip`] if `from != signing.agent_id` or signing
+/// fails.
+pub fn sign_owner_transfer(
+    signing: &SigningContext,
+    scope: &TaskListId,
+    task_id: &TaskId,
+    transfer: &OwnerTransfer,
+) -> Result<OpAttestation> {
+    if transfer.from != signing.agent_id {
+        return Err(CrdtError::Gossip(format!(
+            "ownership transfer signer mismatch: transfer is from {} but signing context is {} \
+             (only the current owner may transfer)",
+            hex::encode(transfer.from.as_bytes()),
+            hex::encode(signing.agent_id.as_bytes())
+        )));
+    }
+    let msg = canonical_owner_transfer_bytes(scope, task_id, transfer);
+    let signature = signing
+        .sign(&msg)
+        .map_err(|e| CrdtError::Gossip(format!("owner-transfer sign failed: {e:?}")))?;
+    Ok(OpAttestation {
+        author_agent_id: signing.agent_id,
+        author_public_key: signing.public_key_bytes.clone(),
+        signature,
+    })
+}
+
+/// Verify an ownership-transfer attestation against its operation.
+///
+/// Returns `true` only if ALL hold:
+/// 1. `author_public_key` parses as a valid ML-DSA-65 key,
+/// 2. `AgentId::from_public_key(author_public_key)` equals both
+///    `att.author_agent_id` and `transfer.from` (the signer IS the owner who
+///    authorizes the hand-off),
+/// 3. the signature verifies over [`canonical_owner_transfer_bytes`].
+///
+/// This authenticates the SIGNER only. Whether `from` actually IS the current
+/// owner is a chain property resolved by [`resolve_owner`]; an authenticated
+/// transfer from a non-owner is inert (never reachable from the
+/// `created_by` root), not an error.
+#[must_use]
+pub fn verify_owner_transfer(
+    att: &OpAttestation,
+    scope: &TaskListId,
+    task_id: &TaskId,
+    transfer: &OwnerTransfer,
+) -> bool {
+    let Ok(pubkey) = MlDsaPublicKey::from_bytes(&att.author_public_key) else {
+        return false;
+    };
+    let derived = AgentId::from_public_key(&pubkey);
+    if derived != att.author_agent_id || derived != transfer.from {
+        return false;
+    }
+    let Ok(sig) = MlDsaSignature::from_bytes(&att.signature) else {
+        return false;
+    };
+    let msg = canonical_owner_transfer_bytes(scope, task_id, transfer);
+    verify_with_ml_dsa(&pubkey, &msg, &sig).is_ok()
+}
+
+/// Admission gate for the ownership-transfer map: drop every entry whose
+/// attestation fails [`verify_owner_transfer`] for `scope`.
+///
+/// Fail-closed, mirroring [`purge_unattested_elements`]: unverifiable
+/// entries are dropped before they can influence resolution. Survivors are
+/// signature-valid; chain validity is applied at resolution.
+///
+/// Returns the number of entries dropped.
+#[must_use]
+pub fn purge_unverified_owner_transfers(
+    scope: &TaskListId,
+    task_id: &TaskId,
+    transfers: &mut BTreeMap<OwnerTransfer, OpAttestation>,
+) -> usize {
+    let forged: Vec<OwnerTransfer> = transfers
+        .iter()
+        .filter(|(t, att)| !verify_owner_transfer(att, scope, task_id, t))
+        .map(|(t, _)| *t)
+        .collect();
+    let dropped = forged.len();
+    for key in forged {
+        transfers.remove(&key);
+    }
+    dropped
+}
+
+/// Resolve the current owner of a task from its verified transfer set.
+///
+/// Ownership is a chain rooted at the task creator (`created_by`): the
+/// resolved owner starts there and advances along transfers whose `from`
+/// equals the current owner, always taking the maximum
+/// `(timestamp_ms, to)` among eligible transfers (deterministic LWW
+/// tiebreak, replica-stable because it is a pure function of the set).
+///
+/// Properties (ADR-0040, blocker 27):
+/// - A transfer signed by anyone other than its `from` is dropped at
+///   admission and never resolves.
+/// - A signature-valid transfer whose `from` is NOT the current owner is
+///   inert — it cannot participate in the chain from `created_by`. It may
+///   activate later if its prefix arrives (out-of-order CRDT delivery),
+///   which is convergence, not forgery.
+/// - Concurrent transfers by the same owner resolve deterministically to the
+///   `(ts, to)`-maximum, so all replicas converge on one owner.
+#[must_use]
+pub fn resolve_owner(
+    created_by: AgentId,
+    transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
+) -> AgentId {
+    let mut current = created_by;
+    // Each step consumes one transfer; the map is finite, so iterations are
+    // bounded by its size. A cycle (A→B, B→A) can only advance while it
+    // strictly increases (ts, to); the bound makes even pathological sets
+    // terminate.
+    for _ in 0..=transfers.len() {
+        let next = transfers
+            .keys()
+            .filter(|t| t.from == current)
+            .max_by_key(|t| (t.timestamp_ms, t.to.as_bytes()));
+        match next {
+            Some(t) if t.to != current => current = t.to,
+            _ => break,
+        }
+    }
+    current
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
