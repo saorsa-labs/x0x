@@ -1164,9 +1164,15 @@ pub(in crate::server) struct ServiceEntryData {
 /// `AgentCertificate` for that subject (user-authority revocation).
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct RevokeRequest {
-    /// Which subject to revoke. Exactly one field must be present.
+    /// Which subject to revoke. Exactly one field must be present for
+    /// Agent/Machine subjects; BOTH `agent_id` and `machine_id` (with
+    /// `move_epoch`) select the ADR-0043 binding form — an owner-key
+    /// issued, permanent `(agent, machine)` tombstone on the v2 carrier.
     agent_id: Option<String>,
     machine_id: Option<String>,
+    /// Binding form only: the move epoch ordering the tombstone against
+    /// placement records (§7.1). Required when both ids are present.
+    move_epoch: Option<u64>,
     /// Optional human-readable reason string (stored in the record).
     reason: Option<String>,
 }
@@ -1182,6 +1188,46 @@ pub(in crate::server) async fn identity_revoke(
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
+    // ADR-0043 both-fields form: owner-key issued binding tombstone.
+    if let (Some(agent_hex), Some(machine_hex)) =
+        (body.agent_id.as_deref(), body.machine_id.as_deref())
+    {
+        let Some(epoch) = body.move_epoch else {
+            return bad_request("binding revocation requires move_epoch");
+        };
+        let agent = hex::decode(agent_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(x0x::identity::AgentId);
+        let machine = hex::decode(machine_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(x0x::identity::MachineId);
+        let (Some(agent), Some(machine)) = (agent, machine) else {
+            return bad_request("agent_id and machine_id must be 32-byte hex");
+        };
+        return match state
+            .agent
+            .revoke_binding(&agent, &machine, epoch, body.reason.clone())
+            .await
+        {
+            Ok(record) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "subject": record.subject_hex(),
+                    "subject_kind": record.subject_kind(),
+                    "issuer": hex::encode(record.issuer_public_key_hash()),
+                    "revoked_at": record.revoked_at,
+                    "reason": record.reason,
+                })),
+            ),
+            Err(e) => api_error(
+                StatusCode::FORBIDDEN,
+                format!("binding revocation rejected (owner key + certificate required): {e}"),
+            ),
+        };
+    }
 
     let subject = match (body.agent_id.as_deref(), body.machine_id.as_deref()) {
         (Some(hex), None) => {

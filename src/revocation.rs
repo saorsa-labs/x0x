@@ -100,8 +100,8 @@ impl RevokedSubject {
             RevokedSubject::Machine(id) => id.as_bytes(),
             RevokedSubject::AgentMachineBinding(_) => {
                 // Unreachable in canonical construction: canonical_message
-        // dispatches bindings to binding_subject_bytes. The empty slice
-        // keeps callers that only match Agent/Machine total.
+                // dispatches bindings to binding_subject_bytes. The empty slice
+                // keeps callers that only match Agent/Machine total.
                 static EMPTY: [u8; 32] = [0u8; 32];
                 &EMPTY
             }
@@ -265,10 +265,8 @@ impl RevocationRecord {
         };
         if let Some(subject_agent) = subject_agent {
             if let Some(cert) = subject_cert {
-                let cert_binds_subject = cert
-                    .agent_id()
-                    .map(|a| a == subject_agent)
-                    .unwrap_or(false);
+                let cert_binds_subject =
+                    cert.agent_id().map(|a| a == subject_agent).unwrap_or(false);
                 let cert_is_valid = cert.verify().is_ok();
                 let issuer_is_certifier = cert
                     .user_id()
@@ -293,7 +291,10 @@ impl RevocationRecord {
     /// A malformed issuer key yields `false` (it will fail verification anyway).
     #[must_use]
     pub fn is_self_revocation(&self) -> bool {
-        match (&self.subject, MlDsaPublicKey::from_bytes(&self.issuer_public_key)) {
+        match (
+            &self.subject,
+            MlDsaPublicKey::from_bytes(&self.issuer_public_key),
+        ) {
             // Bindings have no single subject id — never self-revocable.
             (RevokedSubject::AgentMachineBinding(_), _) => false,
             (_, Ok(pk)) => &derive_peer_id_from_public_key(&pk).0 == self.subject.id_bytes(),
@@ -309,9 +310,7 @@ impl RevocationRecord {
     #[must_use]
     pub fn subject_hex(&self) -> String {
         match &self.subject {
-            RevokedSubject::AgentMachineBinding(binding) => {
-                hex::encode(binding.agent.as_bytes())
-            }
+            RevokedSubject::AgentMachineBinding(binding) => hex::encode(binding.agent.as_bytes()),
             _ => hex::encode(self.subject.id_bytes()),
         }
     }
@@ -620,12 +619,7 @@ impl RevocationSet {
     pub fn all_records(&self) -> Vec<RevocationRecord> {
         self.records_by_hash
             .values()
-            .filter(|p| {
-                !matches!(
-                    p.record.subject,
-                    RevokedSubject::AgentMachineBinding(_)
-                )
-            })
+            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .map(|p| p.record.clone())
             .collect()
     }
@@ -636,16 +630,10 @@ impl RevocationSet {
     pub fn binding_records(&self) -> Vec<RevocationRecord> {
         self.records_by_hash
             .values()
-            .filter(|p| {
-                matches!(
-                    p.record.subject,
-                    RevokedSubject::AgentMachineBinding(_)
-                )
-            })
+            .filter(|p| matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .map(|p| p.record.clone())
             .collect()
     }
-
 
     /// Encode the V1 set for on-disk persistence: `X0XR` magic + bincode of
     /// the legacy-subject (`Agent`/`Machine`) record list, each record
@@ -659,12 +647,7 @@ impl RevocationSet {
         let records: Vec<&PersistedRevocation> = self
             .records_by_hash
             .values()
-            .filter(|p| {
-                !matches!(
-                    p.record.subject,
-                    RevokedSubject::AgentMachineBinding(_)
-                )
-            })
+            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .collect();
         let body = bincode::serialize(&records)
             .map_err(|e| IdentityError::Serialization(e.to_string()))?;
@@ -687,12 +670,7 @@ impl RevocationSet {
         let records: Vec<&PersistedRevocation> = self
             .records_by_hash
             .values()
-            .filter(|p| {
-                matches!(
-                    p.record.subject,
-                    RevokedSubject::AgentMachineBinding(_)
-                )
-            })
+            .filter(|p| matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .collect();
         let body = bincode::serialize(&records)
             .map_err(|e| IdentityError::Serialization(e.to_string()))?;
@@ -1204,8 +1182,7 @@ mod tests {
 
         let owner = UserKeypair::generate().unwrap();
         let agent_kp = AgentKeypair::generate().unwrap();
-        let cert =
-            crate::identity::AgentCertificate::issue(&owner, &agent_kp).unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&owner, &agent_kp).unwrap();
         let machine = crate::identity::MachineId([7u8; 32]);
         let binding = AgentMachineBinding {
             agent: agent_kp.agent_id(),
@@ -1293,4 +1270,3 @@ mod tests {
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
     }
 }
-

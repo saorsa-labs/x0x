@@ -48,6 +48,16 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/status", daemon_api_status),
     covered!(Post, "/shutdown", daemon_api_shutdown_with_sse_client),
     covered!(Post, "/auth/session", daemon_api_auth_session_exchange),
+    // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
+    covered!(Post, "/agent/move", move_routes_wired),
+    covered!(Post, "/agent/move/export", move_routes_wired),
+    covered!(Post, "/agent/move/import", move_routes_wired),
+    covered!(Post, "/agent/move/activate", move_routes_wired),
+    covered!(Post, "/agent/move/abort", move_routes_wired),
+    covered!(Post, "/agent/move/retire", move_routes_wired),
+    covered!(Get, "/agent/moves", move_routes_wired),
+    covered!(Get, "/owner/placement", move_routes_wired),
+    covered!(Get, "/owner/agents/:id/placement", move_routes_wired),
     // ── Identity ────────────────────────────────────────────────────────
     covered!(Get, "/agent", daemon_api_agent),
     covered!(Post, "/announce", daemon_api_announce),
@@ -533,6 +543,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/home.rs",
         include_str!("../src/server/routes/home.rs"),
+    ),
+    (
+        "src/server/routes/key_move.rs",
+        include_str!("../src/server/routes/key_move.rs"),
     ),
     (
         "src/server/routes/sync.rs",

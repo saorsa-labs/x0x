@@ -4,9 +4,9 @@
 //!
 //! # One durable record; everything else derived
 //!
-//! The signed per-agent log ([`ChainedRecord`]s) is the only durable move
+//! The signed per-agent log (`ChainedRecord`s) is the only durable move
 //! state. It folds **totally** — for every legal shape (initial mint,
-//! mid-move, post-activation, post-abort) — to [`MoveFold`] carrying
+//! mid-move, post-activation, post-abort) — to `MoveFold` carrying
 //! `custodian`, `retired_bindings`, `placement`, and `phase`. Key
 //! possession is a gate INPUT, not log state:
 //!
@@ -24,14 +24,14 @@
 //! **Participants** (source/target/owner) hold the full log and accept a
 //! record iff signatures verify AND `prev` equals their head (CAS) AND the
 //! kind is a legal successor. **Mesh peers** never see pre-activation
-//! records; they accept a carried [`MoveRecord::ActivationBundle`] on
+//! records; they accept a carried `MoveRecord::ActivationBundle` on
 //! whole-record owner signature + cross-field coherence + placement-epoch
 //! monotonicity, while its cumulative tombstones union in unconditionally.
 //!
 //! # Enforcement (§9)
 //!
 //! Two checks wherever an `(agent, machine)` pairing is known:
-//! **B** — [`crate::revocation::RevocationSet::is_binding_revoked`]; and
+//! **B** — [`RevocationSet::is_binding_revoked`](crate::revocation::RevocationSet::is_binding_revoked); and
 //! **P** — a cached placement record at epoch ≥ the highest revoked
 //! binding epoch whose pin is a DIFFERENT machine denies the pairing.
 //! Absent evidence fails open (ADR-0043 §9.3).
@@ -260,7 +260,13 @@ impl MoveAuthorization {
 
 /// One record of a per-agent move log. Machine countersignatures live
 /// inside the receipt variants; the owner signature lives on the
-/// [`ChainedRecord`].
+/// [`ChainedRecord`]. The `ActivationBundle` variant deliberately carries
+/// its full self-contained payload (embedded authorization + cumulative
+/// tombstones + placement record + certificate — §7.5 r4-2: mesh coherence
+/// checks reference in-record fields ONLY); records append at ceremony
+/// cadence, never in hot loops, so the size difference is accepted
+/// (same call as `named_groups.rs`'s variant allow).
+#[allow(clippy::large_enum_variant)]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum MoveRecord {
     /// Genesis: owner-signed epoch-0 placement + initial custodian (§8.2).
@@ -357,15 +363,21 @@ impl MoveRecord {
     /// variants.
     fn receipt_message(&self) -> Option<Vec<u8>> {
         let (auth_hash, stamp, tag) = match self {
-            MoveRecord::ExportReceipt { auth_hash, sealed_at, .. } => {
-                (*auth_hash, *sealed_at, b"export")
-            }
-            MoveRecord::ImportReceipt { auth_hash, imported_at, .. } => {
-                (*auth_hash, *imported_at, b"import")
-            }
-            MoveRecord::RetireReceipt { auth_hash, retired_at, .. } => {
-                (*auth_hash, *retired_at, b"retire")
-            }
+            MoveRecord::ExportReceipt {
+                auth_hash,
+                sealed_at,
+                ..
+            } => (*auth_hash, *sealed_at, b"export"),
+            MoveRecord::ImportReceipt {
+                auth_hash,
+                imported_at,
+                ..
+            } => (*auth_hash, *imported_at, b"import"),
+            MoveRecord::RetireReceipt {
+                auth_hash,
+                retired_at,
+                ..
+            } => (*auth_hash, *retired_at, b"retire"),
             _ => return None,
         };
         let mut msg = Vec::with_capacity(MOVE_MSG_PREFIX.len() + 8 + 32 + 8);
@@ -458,9 +470,7 @@ impl ChainedRecord {
         let signature = MlDsaSignature::from_bytes(&self.owner_signature)
             .map_err(|e| IdentityError::Revocation(format!("invalid owner signature: {e:?}")))?;
         verify_with_ml_dsa(&owner, &self.signed_message(), &signature).map_err(|e| {
-            IdentityError::Revocation(format!(
-                "move-record signature verification failed: {e:?}"
-            ))
+            IdentityError::Revocation(format!("move-record signature verification failed: {e:?}"))
         })
     }
 
@@ -506,8 +516,9 @@ impl ChainedRecord {
             .ok_or_else(|| IdentityError::Revocation("receipt message unavailable".to_string()))?;
         let machine_sig = MlDsaSignature::from_bytes(signature)
             .map_err(|e| IdentityError::Revocation(format!("invalid machine signature: {e:?}")))?;
-        verify_with_ml_dsa(&machine_pub, &message, &machine_sig)
-            .map_err(|e| IdentityError::Revocation(format!("machine countersignature failed: {e:?}")))
+        verify_with_ml_dsa(&machine_pub, &message, &machine_sig).map_err(|e| {
+            IdentityError::Revocation(format!("machine countersignature failed: {e:?}"))
+        })
     }
 }
 
@@ -595,8 +606,7 @@ impl MoveFold {
     /// but the move has not been activated.
     #[must_use]
     pub fn quarantined(&self, machine: &MachineId, holds_key: bool) -> bool {
-        holds_key
-            && matches!(self.phase, MovePhase::MidMove { to, .. } if &to == machine)
+        holds_key && matches!(self.phase, MovePhase::MidMove { to, .. } if &to == machine)
     }
 }
 
@@ -648,10 +658,8 @@ pub fn fold_records(records: &[ChainedRecord]) -> MoveFold {
                 for binding in retired_bindings {
                     out.retired_bindings.insert(binding.clone());
                 }
-                out.placement = Some((
-                    placement_record.placement,
-                    placement_record.placement_epoch,
-                ));
+                out.placement =
+                    Some((placement_record.placement, placement_record.placement_epoch));
                 out.phase = MovePhase::RetirePending {
                     from: authorization.from_machine,
                 };
@@ -845,9 +853,7 @@ pub fn verify_chain(
             }
             MoveRecord::RetireReceipt { auth_hash, .. } => {
                 let bundle_auth = last_bundle.as_ref().ok_or_else(|| {
-                    IdentityError::Revocation(
-                        "retire receipt with no committed bundle".to_string(),
-                    )
+                    IdentityError::Revocation("retire receipt with no committed bundle".to_string())
                 })?;
                 if bundle_auth.auth_hash() != *auth_hash {
                     return Err(IdentityError::Revocation(
@@ -996,8 +1002,7 @@ pub fn verify_bundle_coherence_chained(
         Placement::Roaming => {
             if placement_record.placement != Placement::Roaming {
                 return Err(IdentityError::Revocation(
-                    "placement record is pinned but the authorization declares roaming"
-                        .to_string(),
+                    "placement record is pinned but the authorization declares roaming".to_string(),
                 ));
             }
         }
@@ -1327,7 +1332,10 @@ impl MoveState {
     ///
     /// Returns [`IdentityError::Revocation`] when the record's signature
     /// does not verify.
-    pub fn cache_placement(&mut self, record: PlacementRecord) -> std::result::Result<bool, IdentityError> {
+    pub fn cache_placement(
+        &mut self,
+        record: PlacementRecord,
+    ) -> std::result::Result<bool, IdentityError> {
         record.verify()?;
         match self.placements.get(&record.agent_id) {
             Some(current) if current.placement_epoch > record.placement_epoch => Ok(false),
@@ -1430,9 +1438,8 @@ impl MoveState {
     /// Returns [`IdentityError::Serialization`] on encode failure.
     pub fn bundles_to_bytes(&self) -> Result<Vec<u8>> {
         let list: Vec<(&AgentId, &ChainedRecord)> = self.bundles.iter().collect();
-        let body = bincode::serialize(&list).map_err(|e| {
-            IdentityError::Serialization(format!("move-bundles.bin encode: {e}"))
-        })?;
+        let body = bincode::serialize(&list)
+            .map_err(|e| IdentityError::Serialization(format!("move-bundles.bin encode: {e}")))?;
         let mut out = Vec::with_capacity(BUNDLES_FILE_MAGIC.len() + body.len());
         out.extend_from_slice(BUNDLES_FILE_MAGIC);
         out.extend_from_slice(&body);
@@ -1587,12 +1594,9 @@ mod tests {
             let target_machine = crate::identity::MachineKeypair::generate().unwrap();
             let agent = AgentKeypair::generate().unwrap();
             let target_kem = AgentKemKeypair::generate().unwrap();
-            let cert = AgentCertificate::issue_for_public_key(
-                &owner,
-                agent.public_key().as_bytes(),
-                None,
-            )
-            .unwrap();
+            let cert =
+                AgentCertificate::issue_for_public_key(&owner, agent.public_key().as_bytes(), None)
+                    .unwrap();
             Self {
                 owner,
                 source_machine,
@@ -2228,7 +2232,9 @@ mod tests {
             state.append(&agent, r.clone(), None).unwrap();
         }
         let mut revoked = RevocationSet::new();
-        state.ingest_bundle(&agent, &records[4], &mut revoked).unwrap();
+        state
+            .ingest_bundle(&agent, &records[4], &mut revoked)
+            .unwrap();
 
         let logs_bytes = state.logs_to_bytes().unwrap();
         let bundles_bytes = state.bundles_to_bytes().unwrap();

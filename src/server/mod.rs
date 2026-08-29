@@ -1703,6 +1703,19 @@ pub async fn serve_with_options(
         .route("/agent/sign", post(agent_sign))
         .route("/agent/verify", post(agent_verify))
         .route("/identity/revoke", post(identity_revoke))
+        // ADR-0043 agent key-move ceremony + placement ledger.
+        .route("/agent/move", post(routes::agent_move_authorize))
+        .route("/agent/move/export", post(routes::agent_move_export))
+        .route("/agent/move/import", post(routes::agent_move_import))
+        .route("/agent/move/activate", post(routes::agent_move_activate))
+        .route("/agent/move/abort", post(routes::agent_move_abort))
+        .route("/agent/move/retire", post(routes::agent_move_retire))
+        .route("/agent/moves", get(routes::agent_moves))
+        .route("/owner/placement", get(routes::owner_placement))
+        .route(
+            "/owner/agents/:id/placement",
+            get(routes::owner_agent_placement),
+        )
         .route("/identity/revocations", get(identity_revocations))
         .route("/announce", post(announce_identity))
         .route("/peers", get(peers))

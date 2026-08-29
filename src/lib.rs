@@ -1549,15 +1549,14 @@ impl MachineAnnouncementV3 {
                     "invalid machine public key in V3 announcement".to_string(),
                 )
             })?;
-        let signature =
-            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
-                &self.machine_signature_v3,
-            )
-            .map_err(|e| {
-                error::IdentityError::CertificateVerification(format!(
-                    "invalid V3 machine signature: {e:?}"
-                ))
-            })?;
+        let signature = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+            &self.machine_signature_v3,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "invalid V3 machine signature: {e:?}"
+            ))
+        })?;
         ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
             &machine_pub,
             &unsigned_bytes,
@@ -3173,10 +3172,7 @@ impl HeartbeatContext {
                     let _ = self
                         .runtime
                         .pubsub()
-                        .publish(
-                            MOVE_ACTIVATION_TOPIC.to_string(),
-                            bytes::Bytes::from(bytes),
-                        )
+                        .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
             }
@@ -9934,9 +9930,7 @@ impl Agent {
     /// Shared handle to the derived move state (participant logs, mesh
     /// bundles, placement cache). Gates read; ceremony steps append.
     #[must_use]
-    pub fn move_state(
-        &self,
-    ) -> std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>> {
+    pub fn move_state(&self) -> std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>> {
         std::sync::Arc::clone(&self.move_state)
     }
 
@@ -10040,9 +10034,7 @@ impl Agent {
     /// produce zero roaming agents.
     pub async fn move_mint_placements(&self) -> error::Result<usize> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         let owner_pk = user_kp.public_key().as_bytes();
         let roster = self.owner_issued_certificates().await;
@@ -10176,9 +10168,7 @@ impl Agent {
         placement: key_move::Placement,
     ) -> error::Result<key_move::TransferBundle> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         if let key_move::Placement::Pinned(pin) = placement {
             if &pin != to_machine {
@@ -10196,17 +10186,15 @@ impl Agent {
                 ));
             }
             if !matches!(fold.phase, key_move::MovePhase::Idle) {
-                return Err(error::IdentityError::Revocation(format!(
-                    "a move is already in flight (phase != Idle)"
-                )));
+                return Err(error::IdentityError::Revocation(
+                    "a move is already in flight (phase != Idle)".to_string(),
+                ));
             }
-            let from = fold
-                .custodian
-                .ok_or_else(|| {
-                    error::IdentityError::Revocation(
-                        "custodian lapsed with Idle phase — log is inconsistent".to_string(),
-                    )
-                })?;
+            let from = fold.custodian.ok_or_else(|| {
+                error::IdentityError::Revocation(
+                    "custodian lapsed with Idle phase — log is inconsistent".to_string(),
+                )
+            })?;
             let epoch = fold.placement.map_or(0, |(_, e)| e) + 1;
             (state.head_hash(agent_id), from, epoch)
         };
@@ -10283,9 +10271,7 @@ impl Agent {
             return Ok(bundle); // idempotent re-export
         }
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         // Target KEM key from the machine discovery cache (V3 announce).
         let target_kem = {
@@ -10304,13 +10290,17 @@ impl Agent {
         // Serialize the agent keypair: the daemon's own agent or an
         // imported foreign key.
         let keypair_bytes = self.export_agent_keypair_bytes(&auth.agent_id)?;
-        let envelope =
-            key_move::ExportEnvelope::seal(&target_kem, &auth, &keypair_bytes)?;
+        let envelope = key_move::ExportEnvelope::seal(&target_kem, &auth, &keypair_bytes)?;
         let receipt_inner = key_move::MoveRecord::ExportReceipt {
             auth_hash: auth.auth_hash(),
             envelope_digest: envelope.envelope_digest(),
             sealed_at: Self::unix_timestamp_secs(),
-            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_public_key: self
+                .identity
+                .machine_keypair()
+                .public_key()
+                .as_bytes()
+                .to_vec(),
             machine_signature: Vec::new(),
         };
         let machine_signature = key_move::sign_machine_receipt(
@@ -10345,7 +10335,11 @@ impl Agent {
         )?;
         {
             let mut state = self.move_state.write().await;
-            state.append(&auth.agent_id, receipt_record.clone(), Some(user_kp.public_key()))?;
+            state.append(
+                &auth.agent_id,
+                receipt_record.clone(),
+                Some(user_kp.public_key()),
+            )?;
         }
         self.persist_move_state().await;
         Ok(key_move::TransferBundle {
@@ -10450,18 +10444,25 @@ impl Agent {
         }
         // Store the key material (the payload form is exactly what export
         // wrote — length-prefixed public ‖ secret).
-        let path = self.imported_agent_key_path(&auth.agent_id).ok_or_else(|| {
-            error::IdentityError::Storage(std::io::Error::other(
-                "no identity directory for imported keys",
-            ))
-        })?;
+        let path = self
+            .imported_agent_key_path(&auth.agent_id)
+            .ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "no identity directory for imported keys",
+                ))
+            })?;
         storage::save_private_bytes_to(&path, opened).await?;
         // Countersign the ImportReceipt; chain it when the owner key is
         // local (co-resident owner+target), else hand it to the operator.
         let receipt_inner = key_move::MoveRecord::ImportReceipt {
             auth_hash: auth.auth_hash(),
             imported_at: Self::unix_timestamp_secs(),
-            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_public_key: self
+                .identity
+                .machine_keypair()
+                .public_key()
+                .as_bytes()
+                .to_vec(),
             machine_signature: Vec::new(),
         };
         let machine_signature = key_move::sign_machine_receipt(
@@ -10489,7 +10490,8 @@ impl Agent {
             {
                 let mut state = self.move_state.write().await;
                 if let Some(export_receipt) = bundle.export_receipt.clone() {
-                    let _ = state.append(&auth.agent_id, export_receipt, Some(user_kp.public_key()));
+                    let _ =
+                        state.append(&auth.agent_id, export_receipt, Some(user_kp.public_key()));
                 }
                 let head = state.head_hash(&auth.agent_id);
                 let receipt_record = key_move::ChainedRecord::sign(
@@ -10526,9 +10528,7 @@ impl Agent {
         move_epoch: u64,
     ) -> error::Result<key_move::ChainedRecord> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         let (head, auth, retired, cert) = {
             let state = self.move_state.read().await;
@@ -10580,14 +10580,11 @@ impl Agent {
             }
             retired.sort_by_key(|b| (b.agent.0, b.machine.0, b.move_epoch));
             // The certificate: journal/discovery evidence for coherence.
-            let cert = self
-                .agent_certificate_for(agent_id)
-                .await
-                .ok_or_else(|| {
-                    error::IdentityError::Revocation(
-                        "no certificate known for the agent — cannot activate".to_string(),
-                    )
-                })?;
+            let cert = self.agent_certificate_for(agent_id).await.ok_or_else(|| {
+                error::IdentityError::Revocation(
+                    "no certificate known for the agent — cannot activate".to_string(),
+                )
+            })?;
             (state.head_hash(agent_id), auth, retired, cert)
         };
         let placement_record = key_move::PlacementRecord::sign(
@@ -10667,9 +10664,7 @@ impl Agent {
         reason: String,
     ) -> error::Result<key_move::ChainedRecord> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         let (head, auth_hash) = {
             let state = self.move_state.read().await;
@@ -10682,8 +10677,8 @@ impl Agent {
                         Some(a.auth_hash())
                     }
                     key_move::MoveRecord::ActivationBundle { .. }
- | key_move::MoveRecord::AbortRecord { .. }
- | key_move::MoveRecord::PlacementMint { .. } => None,
+                    | key_move::MoveRecord::AbortRecord { .. }
+                    | key_move::MoveRecord::PlacementMint { .. } => None,
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -10692,12 +10687,9 @@ impl Agent {
                     ))
                 })?;
             // Terminated moves cannot abort.
-            let terminated = log.iter().any(|r| {
-                matches!(
-                    r.record,
-                    key_move::MoveRecord::ActivationBundle { .. }
-                )
-            });
+            let terminated = log
+                .iter()
+                .any(|r| matches!(r.record, key_move::MoveRecord::ActivationBundle { .. }));
             if terminated {
                 return Err(error::IdentityError::Revocation(
                     "move already activated — abort is a pre-activation terminator".to_string(),
@@ -10738,9 +10730,7 @@ impl Agent {
         move_epoch: u64,
     ) -> error::Result<key_move::ChainedRecord> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         let (head, auth_hash, from_machine) = {
             let state = self.move_state.read().await;
@@ -10764,7 +10754,11 @@ impl Agent {
                     "no committed activation bundle for epoch {move_epoch}"
                 ))
             })?;
-            (state.head_hash(agent_id), auth.auth_hash(), auth.from_machine)
+            (
+                state.head_hash(agent_id),
+                auth.auth_hash(),
+                auth.from_machine,
+            )
         };
         if from_machine != self.machine_id() {
             return Err(error::IdentityError::Revocation(
@@ -10774,7 +10768,12 @@ impl Agent {
         let receipt_inner = key_move::MoveRecord::RetireReceipt {
             auth_hash,
             retired_at: Self::unix_timestamp_secs(),
-            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_public_key: self
+                .identity
+                .machine_keypair()
+                .public_key()
+                .as_bytes()
+                .to_vec(),
             machine_signature: Vec::new(),
         };
         let machine_signature = key_move::sign_machine_receipt(
@@ -10850,22 +10849,19 @@ impl Agent {
         reason: Option<String>,
     ) -> error::Result<revocation::RevocationRecord> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
-            error::IdentityError::CertificateVerification(
-                "no owner user key loaded".to_string(),
-            )
+            error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
         let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
             error::IdentityError::Revocation(
                 "no certificate known for the agent — binding revocation requires it".to_string(),
             )
         })?;
-        let subject = revocation::RevokedSubject::AgentMachineBinding(
-            revocation::AgentMachineBinding {
+        let subject =
+            revocation::RevokedSubject::AgentMachineBinding(revocation::AgentMachineBinding {
                 agent: *agent,
                 machine: *machine,
                 move_epoch,
-            },
-        );
+            });
         let record = revocation::RevocationRecord::sign(
             subject,
             user_kp.public_key(),
@@ -10885,7 +10881,7 @@ impl Agent {
                         .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
                         .await;
                 }
-        }
+            }
         }
         if let Ok(v2) = self.revocation_set.read().await.to_bytes_v2() {
             if let Some(path) = self.move_file_path("revocations-v2.bin") {
@@ -12177,12 +12173,7 @@ impl Agent {
         let pairing = {
             let revoked = self.revocation_set.read().await;
             let placements = self.move_state.read().await;
-            key_move::enforce_pairing(
-                &revoked,
-                placements.placement_view(),
-                agent_id,
-                &machine_id,
-            )
+            key_move::enforce_pairing(&revoked, placements.placement_view(), agent_id, &machine_id)
         };
         if let Some(denial) = pairing {
             tracing::info!(
@@ -13313,7 +13304,6 @@ fn schedule_reconnect(
                 candidate_addrs = candidate_addrs.len(),
                 "proactive reconnect attempt",
             );
-
 
             let mut connected = false;
 
@@ -20625,16 +20615,23 @@ mod tests {
     /// unknown machine id classifies NoneAvailable.
     #[tokio::test]
     async fn selection_skew_classifies_bootstrap_community_and_unknown() {
-        let mkm = |id: u8, addr: &str| DiscoveredMachine { machine_id: identity::MachineId([id; 32]),
-        addresses: vec![addr.parse().unwrap()],
-        announced_at: 1,
-        last_seen: 1,
-        machine_public_key: vec![1],
-        nat_type: None,
-        can_receive_direct: Some(true),
-        is_relay: Some(true),
-        is_coordinator: Some(false),
-        reachable_via: vec![], relay_candidates: vec![], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![], user_ids: vec![], };
+        let mkm = |id: u8, addr: &str| DiscoveredMachine {
+            machine_id: identity::MachineId([id; 32]),
+            addresses: vec![addr.parse().unwrap()],
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: Some(true),
+            is_relay: Some(true),
+            is_coordinator: Some(false),
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
+            agent_ids: vec![],
+            user_ids: vec![],
+        };
         let cache: tokio::sync::RwLock<
             std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
         > = tokio::sync::RwLock::new(std::collections::HashMap::new());
@@ -22076,25 +22073,32 @@ async fn upsert_discovered_agent_preserves_known_user_id() {
 
 #[test]
 fn sort_discovered_machine_sorts_fields() {
-    let mut machine = DiscoveredMachine { machine_id: identity::MachineId([3u8; 32]),
-    addresses: vec![
-        "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
-        "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
-    ],
-    announced_at: 100,
-    last_seen: 100,
-    machine_public_key: vec![],
-    nat_type: None,
-    can_receive_direct: None,
-    is_relay: None,
-    is_coordinator: None,
-    reachable_via: vec![
-        identity::MachineId([2u8; 32]),
-        identity::MachineId([1u8; 32]),
-    ], relay_candidates: vec![
-        identity::MachineId([4u8; 32]),
-        identity::MachineId([3u8; 32]),
-    ], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![identity::AgentId([2u8; 32]), identity::AgentId([1u8; 32])], user_ids: vec![identity::UserId([2u8; 32]), identity::UserId([1u8; 32])], };
+    let mut machine = DiscoveredMachine {
+        machine_id: identity::MachineId([3u8; 32]),
+        addresses: vec![
+            "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
+            "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
+        ],
+        announced_at: 100,
+        last_seen: 100,
+        machine_public_key: vec![],
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: vec![
+            identity::MachineId([2u8; 32]),
+            identity::MachineId([1u8; 32]),
+        ],
+        relay_candidates: vec![
+            identity::MachineId([4u8; 32]),
+            identity::MachineId([3u8; 32]),
+        ],
+        machine_kem_public_key: None,
+        placement_digests: Vec::new(),
+        agent_ids: vec![identity::AgentId([2u8; 32]), identity::AgentId([1u8; 32])],
+        user_ids: vec![identity::UserId([2u8; 32]), identity::UserId([1u8; 32])],
+    };
     sort_discovered_machine(&mut machine);
     assert_eq!(
         machine.addresses[0],
@@ -22361,18 +22365,25 @@ mod candidate_address_retention_tests {
         addresses: Vec<std::net::SocketAddr>,
         last_seen: u64,
     ) -> DiscoveredMachine {
-        DiscoveredMachine { machine_id,
-        addresses,
-        // PeerConnected observations use announced_at: 0 so they add/refresh
-        // one addr and never LWW-wipe reachable_via / relay_candidates.
-        announced_at: 0,
-        last_seen,
-        machine_public_key: Vec::new(),
-        nat_type: None,
-        can_receive_direct: None,
-        is_relay: None,
-        is_coordinator: None,
-        reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), }
+        DiscoveredMachine {
+            machine_id,
+            addresses,
+            // PeerConnected observations use announced_at: 0 so they add/refresh
+            // one addr and never LWW-wipe reachable_via / relay_candidates.
+            announced_at: 0,
+            last_seen,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(),
+            relay_candidates: Vec::new(),
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
+            agent_ids: Vec::new(),
+            user_ids: Vec::new(),
+        }
     }
 
     /// Verify that upsert_discovered_machine with a connection-derived record
@@ -22400,16 +22411,23 @@ mod candidate_address_retention_tests {
         let now_s = crate::dm::now_unix_ms() / 1000;
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine { machine_id,
-            addresses: vec![address],
-            announced_at: now_s,
-            last_seen: now_s,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: None,
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![address],
+                announced_at: now_s,
+                last_seen: now_s,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
         )
         .await;
 
@@ -22451,16 +22469,23 @@ mod candidate_address_retention_tests {
             let now_s = crate::dm::now_unix_ms() / 1000;
             upsert_discovered_machine(
                 &cache,
-                DiscoveredMachine { machine_id,
-                addresses: vec![zero_addr],
-                announced_at: now_s,
-                last_seen: now_s,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+                DiscoveredMachine {
+                    machine_id,
+                    addresses: vec![zero_addr],
+                    announced_at: now_s,
+                    last_seen: now_s,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    machine_kem_public_key: None,
+                    placement_digests: Vec::new(),
+                    agent_ids: Vec::new(),
+                    user_ids: Vec::new(),
+                },
             )
             .await;
         }
@@ -22501,16 +22526,23 @@ mod candidate_address_retention_tests {
         for _ in 0..2 {
             upsert_discovered_machine(
                 &cache,
-                DiscoveredMachine { machine_id,
-                addresses: vec![address],
-                announced_at: now_s,
-                last_seen: now_s,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+                DiscoveredMachine {
+                    machine_id,
+                    addresses: vec![address],
+                    announced_at: now_s,
+                    last_seen: now_s,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    machine_kem_public_key: None,
+                    placement_digests: Vec::new(),
+                    agent_ids: Vec::new(),
+                    user_ids: Vec::new(),
+                },
             )
             .await;
         }
@@ -22578,16 +22610,23 @@ mod candidate_address_retention_tests {
 
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine { machine_id,
-            addresses: vec![announced],
-            announced_at: 1_700_000_000,
-            last_seen: 1_700_000_000,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: Some(false),
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: vec![coord], relay_candidates: vec![relay], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at: 1_700_000_000,
+                last_seen: 1_700_000_000,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: vec![coord],
+                relay_candidates: vec![relay],
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
         )
         .await;
 
@@ -22637,16 +22676,23 @@ mod candidate_address_retention_tests {
 
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine { machine_id,
-            addresses: vec![announced],
-            announced_at,
-            last_seen: announced_at,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: Some(false),
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
         )
         .await;
 
@@ -22659,16 +22705,23 @@ mod candidate_address_retention_tests {
         // Replay the original announcement at the same timestamp.
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine { machine_id,
-            addresses: vec![announced],
-            announced_at,
-            last_seen: announced_at + 2,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: Some(false),
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
+            DiscoveredMachine {
+                machine_id,
+                addresses: vec![announced],
+                announced_at,
+                last_seen: announced_at + 2,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: Some(false),
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(),
+                relay_candidates: Vec::new(),
+                machine_kem_public_key: None,
+                placement_digests: Vec::new(),
+                agent_ids: Vec::new(),
+                user_ids: Vec::new(),
+            },
         )
         .await;
 

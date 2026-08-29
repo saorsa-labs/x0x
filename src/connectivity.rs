@@ -646,16 +646,23 @@ mod tests {
 
     #[test]
     fn reachability_info_from_discovered_machine() {
-        let machine = DiscoveredMachine { machine_id: MachineId([1u8; 32]),
-        addresses: vec!["10.0.0.1:5483".parse().unwrap()],
-        announced_at: 100,
-        last_seen: 200,
-        machine_public_key: vec![],
-        nat_type: Some("FullCone".to_string()),
-        can_receive_direct: Some(true),
-        is_relay: Some(false),
-        is_coordinator: Some(true),
-        reachable_via: vec![MachineId([2u8; 32])], relay_candidates: vec![], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![], user_ids: vec![], };
+        let machine = DiscoveredMachine {
+            machine_id: MachineId([1u8; 32]),
+            addresses: vec!["10.0.0.1:5483".parse().unwrap()],
+            announced_at: 100,
+            last_seen: 200,
+            machine_public_key: vec![],
+            nat_type: Some("FullCone".to_string()),
+            can_receive_direct: Some(true),
+            is_relay: Some(false),
+            is_coordinator: Some(true),
+            reachable_via: vec![MachineId([2u8; 32])],
+            relay_candidates: vec![],
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
+            agent_ids: vec![],
+            user_ids: vec![],
+        };
         let info = ReachabilityInfo::from_discovered_machine(&machine);
         assert_eq!(info.addresses.len(), 1);
         assert_eq!(info.nat_type, Some("FullCone".to_string()));
@@ -668,16 +675,23 @@ mod tests {
 
     #[test]
     fn reachability_info_from_discovered_machine_empty() {
-        let machine = DiscoveredMachine { machine_id: MachineId([3u8; 32]),
-        addresses: vec![],
-        announced_at: 0,
-        last_seen: 0,
-        machine_public_key: vec![],
-        nat_type: None,
-        can_receive_direct: None,
-        is_relay: None,
-        is_coordinator: None,
-        reachable_via: vec![], relay_candidates: vec![], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![], user_ids: vec![], };
+        let machine = DiscoveredMachine {
+            machine_id: MachineId([3u8; 32]),
+            addresses: vec![],
+            announced_at: 0,
+            last_seen: 0,
+            machine_public_key: vec![],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
+            agent_ids: vec![],
+            user_ids: vec![],
+        };
         let info = ReachabilityInfo::from_discovered_machine(&machine);
         assert!(info.addresses.is_empty());
         assert!(info.nat_type.is_none());

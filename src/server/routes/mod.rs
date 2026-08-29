@@ -15,6 +15,7 @@ mod groups;
 mod history;
 pub mod home;
 mod identity;
+mod key_move;
 mod machines;
 mod messaging;
 pub(crate) mod named_groups;
@@ -61,6 +62,10 @@ pub(super) use identity::{
     agent_info, agent_sign, agent_user_id_handler, agent_verify, announce_identity,
     get_a2a_agent_card, get_agent_card, identity_revocations, identity_revoke, import_agent_card,
     introduction,
+};
+pub(super) use key_move::{
+    agent_move_abort, agent_move_activate, agent_move_authorize, agent_move_export,
+    agent_move_import, agent_move_retire, agent_moves, owner_agent_placement, owner_placement,
 };
 pub(super) use machines::{
     add_machine, delete_machine, discovered_machine, discovered_machines, list_machines,

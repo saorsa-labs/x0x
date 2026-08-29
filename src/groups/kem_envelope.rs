@@ -433,7 +433,8 @@ mod tests {
         let target = AgentKemKeypair::generate().expect("target");
         let other = AgentKemKeypair::generate().expect("other");
         let (kem_ct, nonce, aead_ct) =
-            seal_bytes_to_recipient(&target.public_bytes, b"aad", b"agent-key-bytes").expect("seal");
+            seal_bytes_to_recipient(&target.public_bytes, b"aad", b"agent-key-bytes")
+                .expect("seal");
         assert!(
             open_sealed_bytes(&other, b"aad", &kem_ct, &nonce, &aead_ct).is_err(),
             "non-recipient machine must not unwrap the export envelope"

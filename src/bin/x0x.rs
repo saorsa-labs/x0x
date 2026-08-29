@@ -102,6 +102,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<OwnerSub>,
     },
+    /// Agent key-move ceremony (ADR-0043 placement + commit-then-activate).
+    Move {
+        #[command(subcommand)]
+        sub: MoveSub,
+    },
     /// Cross-machine owner-state sync (ADR-0041 Tier-1).
     Sync {
         #[command(subcommand)]
@@ -457,6 +462,68 @@ enum OwnerSub {
         #[command(subcommand)]
         sub: Option<OwnerRidersSub>,
     },
+    /// Derived placement ledger (ADR-0043 Pinned/Roaming + mint status).
+    Placement,
+}
+
+/// `x0x move` subcommands (ADR-0043 agent key-move ceremony).
+#[derive(Subcommand)]
+enum MoveSub {
+    /// Owner step 1: authorize a move (chains the MoveAuthorization; the
+    /// source machine seals when run there).
+    Authorize {
+        /// Hex agent id from the roster.
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+        /// Hex target machine id (must have an enrolled ML-KEM key).
+        #[arg(value_name = "TO_MACHINE")]
+        to_machine: String,
+        /// Placement outcome: `roaming` or `pinned`.
+        #[arg(value_name = "PLACEMENT")]
+        placement: String,
+    },
+    /// Source step: seal the export envelope + ExportReceipt.
+    Export {
+        /// Transfer bundle JSON (from `move authorize`) via file or stdin.
+        #[arg(value_name = "BUNDLE_JSON")]
+        bundle: String,
+    },
+    /// Target step: import a transfer bundle (unwrap + store + receipt).
+    Import {
+        /// Transfer bundle JSON (operator-carried from the source).
+        #[arg(value_name = "BUNDLE_JSON")]
+        bundle: String,
+    },
+    /// Owner step 2: activate a committed move (publishes the bundle).
+    Activate {
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+        #[arg(value_name = "EPOCH")]
+        move_epoch: u64,
+    },
+    /// Owner rollback: abort an un-activated move (burns the epoch).
+    Abort {
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+        #[arg(value_name = "EPOCH")]
+        move_epoch: u64,
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
+    },
+    /// Source step after activation: retire (delete local key + receipt).
+    Retire {
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+        #[arg(value_name = "EPOCH")]
+        move_epoch: u64,
+    },
+    /// Log view + derived state (custodian / quiesced / placement).
+    #[command(name = "list")]
+    List {
+        /// Restrict to one hex agent id.
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: Option<String>,
+    },
 }
 
 /// `x0x owner agents` subcommands (ADR-0039).
@@ -477,6 +544,12 @@ enum OwnerAgentsSub {
     },
     /// Revoke a registered sub-agent (ADR-0018 owner issuer-revocation).
     Revoke {
+        /// Hex agent id from the roster.
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+    },
+    /// Show one agent's placement record + fold (ADR-0043).
+    Placement {
         /// Hex agent id from the roster.
         #[arg(value_name = "AGENT_ID")]
         agent_id: String,
@@ -1668,6 +1741,9 @@ async fn run(
             Some(OwnerSub::Agents {
                 sub: Some(OwnerAgentsSub::Revoke { agent_id }),
             }) => commands::identity::owner_agents_revoke(&client, &agent_id).await,
+            Some(OwnerSub::Agents {
+                sub: Some(OwnerAgentsSub::Placement { agent_id }),
+            }) => commands::identity::owner_agent_placement(&client, &agent_id).await,
             Some(OwnerSub::Riders { sub: None }) => {
                 commands::identity::owner_riders_list(&client).await
             }
@@ -1692,6 +1768,38 @@ async fn run(
             Some(OwnerSub::Riders {
                 sub: Some(OwnerRidersSub::Revoke { token_id }),
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
+            Some(OwnerSub::Placement) => commands::identity::owner_placement(&client).await,
+        },
+        Commands::Move { sub } => match sub {
+            MoveSub::Authorize {
+                agent_id,
+                to_machine,
+                placement,
+            } => {
+                commands::identity::move_authorize(&client, &agent_id, &to_machine, &placement)
+                    .await
+            }
+            MoveSub::Export { bundle } => commands::identity::move_export(&client, &bundle).await,
+            MoveSub::Import { bundle } => commands::identity::move_import(&client, &bundle).await,
+            MoveSub::Activate {
+                agent_id,
+                move_epoch,
+            } => commands::identity::move_activate(&client, &agent_id, move_epoch).await,
+            MoveSub::Abort {
+                agent_id,
+                move_epoch,
+                reason,
+            } => {
+                commands::identity::move_abort(&client, &agent_id, move_epoch, reason.as_deref())
+                    .await
+            }
+            MoveSub::Retire {
+                agent_id,
+                move_epoch,
+            } => commands::identity::move_retire(&client, &agent_id, move_epoch).await,
+            MoveSub::List { agent_id } => {
+                commands::identity::move_list(&client, agent_id.as_deref()).await
+            }
         },
         Commands::Sync { sub } => match sub {
             None | Some(SyncSub::Devices) => commands::identity::sync_devices(&client).await,
