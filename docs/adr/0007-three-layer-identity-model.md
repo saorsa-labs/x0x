@@ -2,7 +2,6 @@
 
 - Status: Accepted
 - Date: 2026-04-24
-- **Mechanics:** Operational Rules identity file layout and acceptance criteria are maintained in [`docs/design/adr-0007-mechanics.md`](../design/adr-0007-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

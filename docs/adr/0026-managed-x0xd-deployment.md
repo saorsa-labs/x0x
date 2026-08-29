@@ -10,7 +10,6 @@
 - **Superseded by:** none
 - **Related:** issue #281; ADR 0011; ADR 0023; ADR 0025; ADR 0027;
   `docs/design/managed-x0xd-deployment.md`
-- **Mechanics:** Grounding G-001–G-006 are maintained in [`docs/design/managed-x0xd-deployment.md`](../design/managed-x0xd-deployment.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Summary
 

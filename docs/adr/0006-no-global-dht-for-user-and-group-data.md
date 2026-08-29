@@ -2,7 +2,6 @@
 
 - Status: Accepted
 - Date: 2026-04-12
-- **Mechanics:** Practical partition-tolerance guidance, follow-up work, acceptance criteria are maintained in [`docs/design/adr-0006-mechanics.md`](../design/adr-0006-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

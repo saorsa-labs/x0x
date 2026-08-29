@@ -9,7 +9,6 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** ADR-0020 (tailnet Phase 1 epic), ADR-0019 (connect ACL), issue #132 (deliverable 1), #131 (connect ACL), #192 (multi-agent fail-closed), ant-quic #180 (`Node::open_bi`/`accept_bi`)
-- **Mechanics:** Validation test inventory and Phase 1 deferrals are maintained in [`docs/design/adr-0022-mechanics.md`](../design/adr-0022-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

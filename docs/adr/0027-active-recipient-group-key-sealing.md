@@ -11,7 +11,6 @@
 - **Superseded by:** none
 - **Related:** ADR 0024; ADR 0025;
   `docs/design/active-recipient-group-key-sealing.md`
-- **Mechanics:** Grounding G-001–G-005 are maintained in [`docs/design/active-recipient-group-key-sealing.md`](../design/active-recipient-group-key-sealing.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Summary
 

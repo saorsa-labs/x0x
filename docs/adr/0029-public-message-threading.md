@@ -16,7 +16,6 @@
 - **Related:** ADR 0023 (durable local history); ADR 0028 (delivery order is
   not an authorization signal); `docs/design/named-groups-full-model.md`
   §"Public groups"; x0x-nostr-bridge M1a thread-vector gate; Nostr NIP-10
-- **Mechanics:** Threading ingest rules, read filter, bridge mapping, tests are maintained in [`docs/design/adr-0029-mechanics.md`](../design/adr-0029-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

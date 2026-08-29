@@ -8,7 +8,6 @@
 - **Superseded by:** none
 - **Related:** PR #88 (encrypted KvStore design — explicitly scopes at-rest
   encryption out), PR #87 (KvStore `Encrypted` policy guardrail)
-- **Mechanics:** At-rest encryption considered options, validation checklist, AI-work notes are maintained in [`docs/design/adr-0015-mechanics.md`](../design/adr-0015-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

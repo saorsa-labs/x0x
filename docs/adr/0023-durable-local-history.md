@@ -7,7 +7,6 @@
 - **Supersedes:** none (extends the storage posture of ADR 0015)
 - **Superseded by:** none
 - **Related:** x0x-nostr-bridge spike (2026-07-21), ADR 0009/0013 (receive-pump shedding), ADR 0012 (TreeKEM), ADR 0015 (no app-layer at-rest encryption), issue #110 (embedded `serve()`), tic-tac-toe frontend (saorsa-labs/tic-tac-toe)
-- **Mechanics:** Considered-options rationale and validation inventory are maintained in [`docs/design/adr-0023-mechanics.md`](../design/adr-0023-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

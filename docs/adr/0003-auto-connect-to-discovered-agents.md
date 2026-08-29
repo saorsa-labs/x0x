@@ -4,8 +4,6 @@
 
 Accepted — The identity listener auto-connects to discovered agents via `connect_addr()` in `start_identity_listener()` (`src/lib.rs`). Guards prevent redundant connections using an `auto_connect_attempted` HashSet. HyParView membership also contributes to overlay routing, but the direct auto-connect mechanism described here is implemented and active.
 
-- **Mechanics:** Auto-connect rationale narrative and trade-off detail are maintained in [`docs/design/adr-0003-mechanics.md`](../design/adr-0003-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
-
 ## Context
 
 x0x agents discover each other through gossip identity announcements that propagate

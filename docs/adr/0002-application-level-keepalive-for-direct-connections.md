@@ -4,8 +4,6 @@
 
 Accepted
 
-- **Mechanics:** Keepalive rationale essays, alternatives detail, NAT-test evidence are maintained in [`docs/design/adr-0002-mechanics.md`](../design/adr-0002-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
-
 ## Context
 
 x0x agents discover each other via gossip identity announcements propagated through

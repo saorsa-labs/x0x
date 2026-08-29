@@ -10,7 +10,6 @@
 - **Related:** issue #369 (sole-member group undeletable), PR #370, issue #372
   (concurrent last-two-leaves race), ant-quic #244/#305 (stream reset / close-by-address
   lessons, cited for future work)
-- **Mechanics:** Leave-disposition test inventory: unit/handler/property/integration are maintained in [`docs/design/adr-0031-mechanics.md`](../design/adr-0031-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

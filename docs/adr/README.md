@@ -93,9 +93,10 @@ Audit-trim relocations, 2026-08-29. Per the 2026-08-23 ADR audit, the
 mutable mechanics named below were relocated **verbatim** from the
 immutable ADR bodies into maintained design-doc homes (new
 `docs/design/adr-NNNN-mechanics.md` files, or `## Extracted from ADR-NNNN`
-appendices in the already-governed chapters the audit named). Each ADR
-gained a single errata-class `- **Mechanics:**` header pointer; the bodies
-are otherwise unchanged and remain the authoritative decision records:
+appendices in the already-governed chapters the audit named). The ADR
+bodies are byte-identical to their accepted snapshots — this README is
+the only place the relocations are recorded (the governance gate rejects
+any added body line in an Accepted ADR, so no in-file pointers):
 
 - **ADR 0001** — Phases 2–5 roadmap and acceptance criteria → `docs/design/adr-0001-mechanics.md`
 - **ADR 0002** — keepalive rationale essays, alternatives, NAT-test evidence → `docs/design/adr-0002-mechanics.md`

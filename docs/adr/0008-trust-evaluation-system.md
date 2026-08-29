@@ -2,7 +2,6 @@
 
 - Status: Accepted
 - Date: 2026-04-24
-- **Mechanics:** Pinned/AcceptWithFlag design rationale and acceptance criteria are maintained in [`docs/design/adr-0008-mechanics.md`](../design/adr-0008-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

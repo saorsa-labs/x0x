@@ -2,7 +2,6 @@
 
 - Status: Accepted
 - Date: 2026-05-30
-- **Mechanics:** Implementation note and ops/self-update caveats for dual-listen are maintained in [`docs/design/adr-0011-mechanics.md`](../design/adr-0011-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

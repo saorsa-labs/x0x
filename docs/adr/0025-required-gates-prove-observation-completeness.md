@@ -6,7 +6,6 @@
 - **Reviewers:** Sam (author); Dario; Watson. Kimi did not review; his ruling was waived (see Status).
 - **Supersedes:** none
 - **Superseded by:** none
-- **Mechanics:** Grounding G-001–G-006 are maintained in [`docs/design/required-gates-observation-completeness.md`](../design/required-gates-observation-completeness.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Summary
 
