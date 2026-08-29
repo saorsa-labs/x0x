@@ -102,10 +102,10 @@ impl TaskListDelta {
     #[must_use]
     pub fn for_add(task_id: TaskId, task: TaskItem, tag: UniqueTag, version: u64) -> Self {
         let mut delta = Self::new(version);
-        if !task.owner_transfers_map().is_empty() {
+        if !task.owner_wire_map().is_empty() {
             delta
                 .owner_transfers
-                .insert(task_id, task.owner_transfers_map().clone());
+                .insert(task_id, task.owner_wire_map().clone());
         }
         delta.added_tasks.insert(task_id, (task, tag));
         delta
@@ -121,10 +121,10 @@ impl TaskListDelta {
     #[must_use]
     pub fn for_state_change(task_id: TaskId, full_task: TaskItem, version: u64) -> Self {
         let mut delta = Self::new(version);
-        if !full_task.owner_transfers_map().is_empty() {
+        if !full_task.owner_wire_map().is_empty() {
             delta
                 .owner_transfers
-                .insert(task_id, full_task.owner_transfers_map().clone());
+                .insert(task_id, full_task.owner_wire_map().clone());
         }
         delta.task_updates.insert(task_id, full_task);
         delta
@@ -177,7 +177,49 @@ impl TaskListDelta {
             h.update(id.as_bytes());
             self.added_tasks[id].0.hash_resolved_fields(&mut h);
         }
+        // REVIEW r4 (finding 2): the digest MUST cover the carried
+        // ownership transfers — a serve whose embedded tasks carry no
+        // chain (TaskItem's wire shape is ownership-free) would otherwise
+        // digest identically to a holder with a fully-resolved owner,
+        // letting a receiver silently adopt creator-rooted state. Empty
+        // map ⇒ no extra bytes (legacy digest unchanged).
+        hash_owner_transfers_into(&mut h, &self.owner_transfers);
         Some(*h.finalize().as_bytes())
+    }
+}
+
+/// Canonical transfer-map hashing shared by the delta-side and
+/// local-side served digests so both ends agree byte-for-byte: per task
+/// (sorted by task id), the sorted sequence of canonical edge bytes.
+pub(crate) fn hash_owner_transfers_into(
+    h: &mut blake3::Hasher,
+    transfers: &HashMap<TaskId, std::collections::BTreeMap<OwnerTransfer, OpAttestation>>,
+) {
+    if transfers.is_empty() {
+        return;
+    }
+    let mut ids: Vec<&TaskId> = transfers.keys().collect();
+    ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
+    for id in ids {
+        h.update(id.as_bytes());
+        let edges = &transfers[id];
+        h.update(&(edges.len() as u64).to_le_bytes());
+        // BTreeMap iterates in OwnerTransfer order (from, to, ts,
+        // supersedes) — deterministic on every replica.
+        for edge in edges.keys() {
+            h.update(edge.from.as_bytes());
+            h.update(edge.to.as_bytes());
+            h.update(&edge.timestamp_ms.to_le_bytes());
+            match edge.supersedes {
+                crate::crdt::TransferLink::Genesis => {
+                    h.update(&[0u8]);
+                }
+                crate::crdt::TransferLink::Prior(d) => {
+                    h.update(&[1u8]);
+                    h.update(&d);
+                }
+            }
+        }
     }
 }
 
@@ -219,10 +261,10 @@ impl TaskList {
         for task in &ordered {
             let task_id = *task.id();
             let tag = (PeerId::new([0u8; 32]), self.next_seq());
-            if !task.owner_transfers_map().is_empty() {
+            if !task.owner_wire_map().is_empty() {
                 delta
                     .owner_transfers
-                    .insert(task_id, task.owner_transfers_map().clone());
+                    .insert(task_id, task.owner_wire_map().clone());
             }
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
@@ -359,9 +401,14 @@ impl TaskList {
 
         // Ownership transfers (ADR-0040): SELF-AUTHENTICATING ops — like
         // checkbox attestations they apply regardless of the Layer A
-        // envelope-writer gate, because each entry carries its own
-        // current-owner signature that the admission gate verifies (forged
-        // entries are purged, never applied).
+        // envelope-writer gate, but they run the SAME admission path as
+        // every other transfer source (review r4 finding 1): the signature
+        // purge inside `ingest_owner_transfers`, then chain-position
+        // admissibility inside `resolve_owner` — one oracle for local
+        // mutations and remote maps alike. A remote edge with a bad
+        // signature dies in the purge; a well-signed edge at a wrong chain
+        // position (former owner, stale head, unreachable link) is inert
+        // in resolution.
         for (task_id, transfers) in &delta.owner_transfers {
             self.delta_apply_owner_transfers(task_id, transfers);
         }
@@ -1116,6 +1163,70 @@ mod tests {
             list.task_owner(&task_id).expect("owner"),
             agent(9),
             "signed transfer converges on the replica via the delta map"
+        );
+    }
+
+    #[test]
+    fn served_digest_covers_ownership_transfers() {
+        // REVIEW r4 (finding 2): a full-state serve whose embedded tasks
+        // carry no ownership (TaskItem's wire shape is ownership-free)
+        // must NOT digest-match a holder whose resolved owner advanced —
+        // otherwise a receiver silently adopts creator-rooted state. The
+        // delta digest covers the transfer map; the local digest covers
+        // the same canonical encoding; empty map keeps the legacy digest.
+        use crate::gossip::SigningContext;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let signing = SigningContext::from_keypair(&kp);
+        let creator = kp.agent_id();
+        let task_id = TaskId::from_bytes([3u8; 32]);
+        let scope = TaskListId::new([0x5c; 32]);
+
+        let mut list = TaskList::new(scope, "L".into(), peer(1));
+        let mut task = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(1),
+        );
+        task.transfer_ownership(scope, creator, agent(9), 5_000, &signing)
+            .expect("transfer");
+        list.add_task(task, peer(1), 1).expect("add");
+
+        // Full delta carries the map ⇒ digests MATCH (fix verified).
+        let delta = list.full_delta();
+        assert!(
+            delta.owner_transfers.contains_key(&task_id),
+            "full delta carries the chain"
+        );
+        assert_eq!(
+            delta.served_digest(&scope),
+            Some(list.served_digest()),
+            "carried chain and local chain digest identically"
+        );
+
+        // Serve with the map STRIPPED (the pre-fix wire shape) ⇒ digests
+        // DIVERGE — the regression this test pins.
+        let mut stripped = delta.clone();
+        stripped.owner_transfers.clear();
+        assert_ne!(
+            stripped.served_digest(&scope),
+            Some(list.served_digest()),
+            "a serve missing its transfer map can never digest-match a resolved holder"
+        );
+
+        // Empty-map identity: a chain-less list and a chain-less serve
+        // still match (legacy behavior preserved).
+        let mut bare = TaskList::new(scope, "L".into(), peer(1));
+        let bare_task = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(1),
+        );
+        bare.add_task(bare_task, peer(1), 1).expect("add");
+        let bare_delta = bare.full_delta();
+        assert_eq!(
+            bare_delta.served_digest(&scope),
+            Some(bare.served_digest()),
+            "empty transfer map keeps identical digests"
         );
     }
 }

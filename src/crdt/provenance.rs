@@ -308,27 +308,46 @@ pub fn purge_unattested_elements(
 /// Domain separator for ownership-transfer attestations.
 ///
 /// A transfer is an operation ON a task BY the current owner, so its canonical
-/// bytes bind `(scope, task_id, from, to, timestamp)` — deliberately distinct
-/// from the claim/complete layout so a claim signature can never be replayed
-/// as a transfer and vice versa.
-pub const TRANSFER_OWNER_DOMAIN: &[u8] = b"x0x.task.transfer_owner.v1";
+/// bytes bind `(scope, task_id, from, to, timestamp, supersedes)` —
+/// deliberately distinct from the claim/complete layout so a claim
+/// signature can never be replayed as a transfer and vice versa.
+pub const TRANSFER_OWNER_DOMAIN: &[u8] = b"x0x.task.transfer_owner.v2";
 
-/// One ownership-transfer operation: `from` (the current owner) hands the
-/// task to `to`. This is the CRDT operation key; the matching
-/// [`OpAttestation`] in `TaskItem::owner_transfers` MUST be signed by
-/// `from`'s own ML-DSA-65 key.
+/// Which chain state an [`OwnerTransfer`] extends. `Genesis` is the task
+/// creator's initial ownership (no prior edge); `Prior(digest)` names the
+/// exact edge this transfer supersedes — the hash chain that makes
+/// authority ordering signer-independent (review r4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum TransferLink {
+    /// Extends the creator's initial ownership.
+    Genesis,
+    /// Supersedes the edge with this [`owner_transfer_digest`].
+    Prior([u8; 32]),
+}
+
+/// One ownership-transfer operation: `from` (the owner at the parent
+/// link) hands the task to `to`, superseding the `supersedes` edge. The
+/// matching [`OpAttestation`] in `TaskItem::owner_transfers` MUST be
+/// signed by `from`'s own ML-DSA-65 key.
 ///
-/// `Ord` is total and deterministic (agent bytes, then timestamp) so the map
-/// iteration in [`resolve_owner`] is replica-stable.
+/// HASH CHAIN (review r4): the signer commits to the exact prior edge
+/// being replaced. `timestamp_ms` is informational metadata only — it
+/// NEVER orders authority (a signer controls their clock and could
+/// backdate). Ordering is the chain topology plus, for concurrent forks
+/// at the same parent, the LOWEST EDGE DIGEST — neither of which the
+/// signer can bias after signing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OwnerTransfer {
-    /// The current owner authorizing the transfer. MUST equal
+    /// The owner authorizing the transfer. MUST equal the owner resolved
+    /// at `supersedes` AND
     /// `AgentId::from_public_key(attestation.author_public_key)`.
     pub from: AgentId,
     /// The next owner.
     pub to: AgentId,
-    /// Unix milliseconds at signing (LWW tiebreak, not an expiry).
+    /// Unix milliseconds at signing. METADATA ONLY — never order by this.
     pub timestamp_ms: u64,
+    /// The chain position this transfer extends.
+    pub supersedes: TransferLink,
 }
 
 impl Ord for OwnerTransfer {
@@ -338,6 +357,7 @@ impl Ord for OwnerTransfer {
             .cmp(other.from.as_bytes())
             .then_with(|| self.to.as_bytes().cmp(other.to.as_bytes()))
             .then_with(|| self.timestamp_ms.cmp(&other.timestamp_ms))
+            .then_with(|| self.supersedes.cmp(&other.supersedes))
     }
 }
 
@@ -351,21 +371,44 @@ impl PartialOrd for OwnerTransfer {
 /// for an ownership transfer.
 ///
 /// Layout:
-/// `domain || scope (32) || task_id (32) || from (32) || to (32) || timestamp_ms (8, BE)`.
+/// `domain || scope (32) || task_id (32) || from (32) || to (32) ||
+/// timestamp_ms (8, BE) || supersedes (1 + 32)`.
+///
+/// `supersedes` is INSIDE the signed bytes: the signer commits to the
+/// exact chain position being extended, which is what makes backdating
+/// structurally detectable (review r4).
 #[must_use]
 pub fn canonical_owner_transfer_bytes(
     scope: &TaskListId,
     task_id: &TaskId,
     transfer: &OwnerTransfer,
 ) -> Vec<u8> {
-    let mut out = Vec::with_capacity(TRANSFER_OWNER_DOMAIN.len() + 32 * 4 + 8);
+    let mut out = Vec::with_capacity(TRANSFER_OWNER_DOMAIN.len() + 32 * 5 + 9);
     out.extend_from_slice(TRANSFER_OWNER_DOMAIN);
     out.extend_from_slice(scope.as_bytes());
     out.extend_from_slice(task_id.as_bytes());
     out.extend_from_slice(transfer.from.as_bytes());
     out.extend_from_slice(transfer.to.as_bytes());
     out.extend_from_slice(&transfer.timestamp_ms.to_be_bytes());
+    match transfer.supersedes {
+        TransferLink::Genesis => out.push(0),
+        TransferLink::Prior(digest) => {
+            out.push(1);
+            out.extend_from_slice(&digest);
+        }
+    }
     out
+}
+
+/// BLAKE3 digest of the canonical transfer bytes — the edge identity by
+/// which `supersedes` links the chain and forks resolve (lowest wins).
+#[must_use]
+pub fn owner_transfer_digest(
+    scope: &TaskListId,
+    task_id: &TaskId,
+    transfer: &OwnerTransfer,
+) -> [u8; 32] {
+    *blake3::hash(&canonical_owner_transfer_bytes(scope, task_id, transfer)).as_bytes()
 }
 
 /// Produce the attestation for an ownership transfer using the local agent's
@@ -439,84 +482,135 @@ pub fn verify_owner_transfer(
     verify_with_ml_dsa(&pubkey, &msg, &sig).is_ok()
 }
 
-/// Admission gate for the ownership-transfer map: drop every entry whose
+/// Admission gate for the ownership chain: drop every entry whose
 /// attestation fails [`verify_owner_transfer`] for `scope`.
 ///
-/// Fail-closed, mirroring [`purge_unattested_elements`]: unverifiable
-/// entries are dropped before they can influence resolution. Survivors are
-/// signature-valid; chain validity is applied at resolution.
+/// Fail-closed: an unverifiable entry is dropped before it can influence
+/// resolution. Survivors are signature-valid; CHAIN-POSITION validity
+/// (admissibility) is applied by [`resolve_owner`], uniformly on every
+/// path.
 ///
 /// Returns the number of entries dropped.
 #[must_use]
 pub fn purge_unverified_owner_transfers(
     scope: &TaskListId,
     task_id: &TaskId,
-    transfers: &mut BTreeMap<OwnerTransfer, OpAttestation>,
+    chain: &mut OwnerChain,
 ) -> usize {
-    let forged: Vec<OwnerTransfer> = transfers
+    let forged: Vec<[u8; 32]> = chain
         .iter()
-        .filter(|(t, att)| !verify_owner_transfer(att, scope, task_id, t))
-        .map(|(t, _)| *t)
+        .filter(|(_, (t, att))| !verify_owner_transfer(att, scope, task_id, t))
+        .map(|(d, _)| *d)
         .collect();
     let dropped = forged.len();
     for key in forged {
-        transfers.remove(&key);
+        chain.remove(&key);
     }
     dropped
 }
 
-/// Resolve the current owner of a task from its verified transfer set.
-///
-/// Ownership is a chain rooted at the task creator (`created_by`): the
-/// resolved owner starts there and advances along transfers whose `from`
-/// equals the current owner, always taking the maximum
-/// `(timestamp_ms, to)` among eligible transfers (deterministic LWW
-/// tiebreak, replica-stable because it is a pure function of the set).
-///
-/// Properties (ADR-0040, blocker 27):
-/// - A transfer signed by anyone other than its `from` is dropped at
-///   admission and never resolves.
-/// - A signature-valid transfer whose `from` is NOT the current owner is
-///   inert — it can never be followed by the walk (which only advances
-///   along `from == current` edges) and, because termination is
-///   content-based (each step CONSUMES a transfer and the timestamp must
-///   STRICTLY increase), an unrelated transfer can never influence the
-///   outcome. It may activate later if its prefix arrives (out-of-order
-///   CRDT delivery), which is convergence, not forgery.
-/// - Concurrent transfers by the same owner resolve deterministically: the
-///   fold's (timestamp, to, from) order binds the earliest valid handover;
-///   later siblings from the same now-former owner are void.
+/// A verified chain entry keyed by its edge digest
+/// ([`owner_transfer_digest`]).
+pub type ChainEntry = (OwnerTransfer, OpAttestation);
+/// The ownership hash chain: edge digest → entry.
+pub type OwnerChain = BTreeMap<[u8; 32], ChainEntry>;
+
+/// Key a wire-shaped transfer map into a digest-keyed chain. Callers hold
+/// the list scope and task id (needed to recompute each edge digest).
 #[must_use]
-pub fn resolve_owner(
-    created_by: AgentId,
+pub fn key_owner_chain(
+    scope: &TaskListId,
+    task_id: &TaskId,
     transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
-) -> AgentId {
-    // STRICT TIMESTAMP-ORDERED FOLD (review r3): every edge in the map is
-    // signature-verified (the admission purge dropped forgeries), but a
-    // valid signature alone is NOT authority. Edges are folded in
-    // (timestamp, to, from) order; an edge is ADMISSIBLE only if its
-    // `from` equals the owner resolved from all STRICTLY-EARLIER
-    // admissible edges. A transfer signed by a FORMER owner (A→M@200
-    // arriving after A→B@100 made B the owner) is therefore inert: at
-    // ts=200 the running owner is B, not A. Concurrent same-owner edges
-    // resolve deterministically: the earliest (then tie-break by `to`
-    // bytes) binds, later siblings from the same now-former owner are
-    // void — first valid transfer wins, exactly like a signed handover
-    // in time.
-    let mut edges: Vec<&OwnerTransfer> = transfers.keys().collect();
-    edges.sort_by(|a, b| {
-        a.timestamp_ms
-            .cmp(&b.timestamp_ms)
-            .then_with(|| a.to.as_bytes().cmp(b.to.as_bytes()))
-            .then_with(|| a.from.as_bytes().cmp(b.from.as_bytes()))
-    });
-    let mut current = created_by;
-    for edge in edges {
-        if edge.from == current && edge.to != current {
-            current = edge.to;
-        }
+) -> OwnerChain {
+    transfers
+        .iter()
+        .map(|(t, a)| (owner_transfer_digest(scope, task_id, t), (*t, a.clone())))
+        .collect()
+}
+
+/// Resolve the current owner of a task by WALKING THE HASH CHAIN from
+/// genesis (review r4). Timestamps NEVER order authority — a signer
+/// controls their clock and can backdate.
+///
+/// Walk: `owner = created_by`, `head = Genesis`. At each step, the
+/// admissible candidates are entries whose `supersedes == head` AND whose
+/// `from == owner` (the owner at that chain position). Concurrent edges
+/// extending the same head (a fork — both signed by the owner at that
+/// position) resolve by LOWEST EDGE DIGEST: deterministic on every
+/// replica and unbiasable by the signer (they cannot choose their edge's
+/// digest after signing). Advance and repeat; a `visited` set terminates
+/// the walk even on adversarial link cycles.
+///
+/// Security properties:
+/// - **Backdating is structurally dead.** A former owner A (after A→B
+///   advanced the head) can still SIGN a new edge, but to land on the
+///   current head it must supersede A→B — where the owner is B, so
+///   `from A ≠ owner B` is inadmissible. Pointing it at Genesis (or any
+///   earlier position A signed) makes it a FORK at that position,
+///   resolved by lowest digest — A's chosen timestamp is irrelevant.
+/// - **No mid-chain injection.** An edge only participates where its
+///   signed `supersedes` digest places it; edges hanging off positions
+///   the walk never reaches (including self-referential cycles) are
+///   inert.
+/// - Signature forgeries are purged at admission; this walk is the single
+///   admissibility oracle for chain position, applied identically on
+///   local mutations and remote delta-carried maps.
+#[must_use]
+pub fn resolve_owner(created_by: AgentId, chain: &OwnerChain) -> AgentId {
+    let mut owner = created_by;
+    let mut head = TransferLink::Genesis;
+    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    loop {
+        // Fork resolution: among admissible edges at the current head
+        // (correct position, correct from-owner), the LOWEST KEY DIGEST
+        // wins. `visited` both terminates adversarial cycles and makes
+        // each step consume its edge.
+        let candidates: Vec<([u8; 32], &ChainEntry)> = chain
+            .iter()
+            .filter(|(digest, (t, _))| {
+                t.supersedes == head
+                    && t.from == owner
+                    && t.to != owner
+                    && !visited.contains(*digest)
+            })
+            .map(|(d, e)| (*d, e))
+            .collect();
+        let Some((digest, entry)) = candidates.into_iter().min_by_key(|(d, _)| *d) else {
+            break;
+        };
+        visited.insert(digest);
+        head = TransferLink::Prior(digest);
+        owner = entry.0.to;
     }
-    current
+    owner
+}
+
+/// The chain's current HEAD link (the last followed edge's digest, or
+/// Genesis) — what a new transfer must supersede to extend the chain.
+#[must_use]
+pub fn chain_head(created_by: AgentId, chain: &OwnerChain) -> TransferLink {
+    let mut owner = created_by;
+    let mut head = TransferLink::Genesis;
+    let mut visited: std::collections::HashSet<[u8; 32]> = std::collections::HashSet::new();
+    loop {
+        let candidates: Vec<([u8; 32], &ChainEntry)> = chain
+            .iter()
+            .filter(|(digest, (t, _))| {
+                t.supersedes == head
+                    && t.from == owner
+                    && t.to != owner
+                    && !visited.contains(*digest)
+            })
+            .map(|(d, e)| (*d, e))
+            .collect();
+        let Some((digest, entry)) = candidates.into_iter().min_by_key(|(d, _)| *d) else {
+            return head;
+        };
+        visited.insert(digest);
+        head = TransferLink::Prior(digest);
+        owner = entry.0.to;
+    }
 }
 
 #[cfg(test)]
@@ -528,82 +622,134 @@ mod ownership_resolution_tests {
         AgentId([n; 32])
     }
 
-    fn map(entries: &[(u8, u8, u64)]) -> BTreeMap<OwnerTransfer, OpAttestation> {
-        let mut out = BTreeMap::new();
-        for (from, to, ts) in entries {
-            let t = OwnerTransfer {
-                from: agent(*from),
-                to: agent(*to),
-                timestamp_ms: *ts,
-            };
-            // Attestation content is irrelevant to resolution — admission
-            // has already verified it; a placeholder keeps the map shape.
-            out.insert(
-                t,
-                OpAttestation {
-                    author_agent_id: agent(*from),
-                    author_public_key: Vec::new(),
-                    signature: Vec::new(),
-                },
-            );
+    fn scope() -> TaskListId {
+        TaskListId::new([0x5c; 32])
+    }
+
+    fn task() -> TaskId {
+        TaskId::new("chain-test", &agent(1), 1)
+    }
+
+    fn edge(from: u8, to: u8, ts: u64, supersedes: TransferLink) -> ChainEntry {
+        let t = OwnerTransfer {
+            from: agent(from),
+            to: agent(to),
+            timestamp_ms: ts,
+            supersedes,
+        };
+        // Attestation content is irrelevant to resolution — admission
+        // already verified signatures; a placeholder keeps the shape.
+        (
+            t,
+            OpAttestation {
+                author_agent_id: agent(from),
+                author_public_key: Vec::new(),
+                signature: Vec::new(),
+            },
+        )
+    }
+
+    fn digest_of(entry: &ChainEntry) -> [u8; 32] {
+        owner_transfer_digest(&scope(), &task(), &entry.0)
+    }
+
+    fn chain_of(entries: &[ChainEntry]) -> OwnerChain {
+        entries
+            .iter()
+            .map(|e| (owner_transfer_digest(&scope(), &task(), &e.0), e.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn chain_walks_to_its_end() {
+        // Genesis A, A→B, B→C, C→D: each edge supersedes its predecessor
+        // by digest; the walk reaches D regardless of timestamps.
+        let ab = edge(1, 2, 100, TransferLink::Genesis);
+        let bc = edge(2, 3, 50, TransferLink::Prior(digest_of(&ab))); // even "backdated" ts is fine
+        let cd = edge(3, 4, 300, TransferLink::Prior(digest_of(&bc)));
+        let chain = chain_of(&[ab, bc, cd]);
+        assert_eq!(
+            resolve_owner(agent(1), &chain),
+            agent(4),
+            "chain topology, not timestamps, orders authority"
+        );
+    }
+
+    #[test]
+    fn former_owner_cannot_extend_the_head() {
+        // REVIEW r4 (critical): after A→B the head is A→B where the owner
+        // is B. A (former owner) signs a NEW edge superseding the head —
+        // valid signature, but from A ≠ owner B: inadmissible. A backdated
+        // variant is covered by the genesis-fork test below.
+        let ab = edge(1, 2, 100, TransferLink::Genesis);
+        let am = edge(1, 9, 50, TransferLink::Prior(digest_of(&ab)));
+        let chain = chain_of(&[ab.clone(), am.clone()]);
+        assert_eq!(
+            resolve_owner(agent(1), &chain),
+            agent(2),
+            "former-owner edge at the current head is inadmissible"
+        );
+    }
+
+    #[test]
+    fn backdated_genesis_fork_resolves_by_lowest_digest_not_timestamps() {
+        // The attacker's remaining move: point the new edge at a position
+        // they signed (here Genesis). Both edges are legal forks at that
+        // position; the LOWEST EDGE DIGEST wins — timestamps (100 vs the
+        // backdated 50) are irrelevant, and the signer cannot bias the
+        // digest. Both replicas holding the union agree.
+        let ab = edge(1, 2, 100, TransferLink::Genesis);
+        let am = edge(1, 9, 50, TransferLink::Genesis); // backdated fork
+        let winner_is_b = digest_of(&ab) < digest_of(&am);
+        let chain = chain_of(&[ab.clone(), am.clone()]);
+        let expected = if winner_is_b { agent(2) } else { agent(9) };
+        assert_eq!(resolve_owner(agent(1), &chain), expected);
+
+        // Order-independence: build the chain the other way, same result.
+        let am2 = edge(1, 9, 50, TransferLink::Genesis);
+        let ab2 = edge(1, 2, 100, TransferLink::Genesis);
+        let chain2 = chain_of(&[am2, ab2]);
+        assert_eq!(resolve_owner(agent(1), &chain2), expected);
+    }
+
+    #[test]
+    fn unreachable_and_cyclic_edges_are_inert() {
+        // Parity/cycle hardening (r2) carries over: edges hanging off
+        // positions the walk never reaches — Mallory's M→N at Genesis
+        // (from M ≠ creator A) or a self-referential link cycle — never
+        // influence resolution, in any number.
+        let ab = edge(1, 2, 100, TransferLink::Genesis);
+        let baseline = resolve_owner(agent(1), &chain_of(std::slice::from_ref(&ab)));
+        assert_eq!(baseline, agent(2));
+
+        let mut poisoned = chain_of(std::slice::from_ref(&ab));
+        for i in 0..10u64 {
+            let e = edge(9, 8, 500 + i, TransferLink::Genesis); // from != creator
+            let d = owner_transfer_digest(&scope(), &task(), &e.0);
+            poisoned.insert(d, e);
         }
-        out
-    }
-
-    #[test]
-    fn cycle_resolves_by_strictly_increasing_timestamps() {
-        // A→B at ts=100 with a B→A back-edge at ts=50: the walk follows
-        // A→B and stops at B — the back-edge is older, so the cycle cannot
-        // continue. Deterministic on every replica.
-        let transfers = map(&[(1, 2, 100), (2, 1, 50)]);
-        assert_eq!(resolve_owner(agent(1), &transfers), agent(2));
-        // A longer increasing chain walks to its end.
-        let chain = map(&[(1, 2, 100), (2, 3, 200), (3, 4, 300)]);
-        assert_eq!(resolve_owner(agent(1), &chain), agent(4));
-    }
-
-    #[test]
-    fn injected_transfer_cannot_flip_ownership_by_parity() {
-        // REVIEW FIX (critical): the previous implementation bounded the
-        // walk by a 0..=len loop WITHOUT consuming followed transfers, so a
-        // cycle's final owner depended on iteration parity — and any
-        // unrelated signature-valid transfer (here: Mallory M→N, never
-        // reachable from the created_by root) changed the parity and FLIPPED
-        // the resolved owner. Content-based termination (consume each
-        // followed transfer + strictly increasing timestamps) makes
-        // unrelated transfers irrelevant.
-        let cycle = map(&[(1, 2, 100), (2, 1, 50)]);
-        let baseline = resolve_owner(agent(1), &cycle);
-        assert_eq!(baseline, agent(2), "older back-edge cannot win");
-
-        // Inject Mallory's own validly-signed M→N transfer at a HIGHER
-        // timestamp: it must not change the resolution by any mechanism.
-        let mut poisoned = cycle.clone();
-        for (t, att) in map(&[(9, 8, 500)]) {
-            poisoned.insert(t, att);
+        // A cycle X↔Y not rooted at genesis.
+        let x = edge(5, 6, 1, TransferLink::Genesis);
+        let x_digest = digest_of(&x);
+        let y = edge(6, 5, 2, TransferLink::Prior(x_digest));
+        for e in [x, y] {
+            let d = owner_transfer_digest(&scope(), &task(), &e.0);
+            poisoned.insert(d, e);
         }
         assert_eq!(
             resolve_owner(agent(1), &poisoned),
             baseline,
-            "unrelated transfer must not flip ownership resolution"
+            "unreachable edges must not flip ownership resolution"
         );
-
-        // Also with a huge number of injected inert transfers.
-        let mut poisoned_many = cycle.clone();
-        for i in 0..10u64 {
-            for (t, att) in map(&[(9, 8, 500 + i)]) {
-                poisoned_many.insert(t, att);
-            }
-        }
-        assert_eq!(resolve_owner(agent(1), &poisoned_many), baseline);
     }
 
     #[test]
-    fn each_transfer_is_consumed_once() {
-        // A→B(100), then B→A(200) (a LEGAL return transfer), then the walk
-        // cannot reuse A→B(100): consumed + ts must strictly increase.
-        let transfers = map(&[(1, 2, 100), (2, 1, 200)]);
-        assert_eq!(resolve_owner(agent(1), &transfers), agent(1));
+    fn legal_return_transfer_walks_back() {
+        // A→B then B→A (superseding A→B): the owner legally returns to A.
+        let ab = edge(1, 2, 100, TransferLink::Genesis);
+        let ba = edge(2, 1, 200, TransferLink::Prior(digest_of(&ab)));
+        let chain = chain_of(&[ab, ba]);
+        assert_eq!(resolve_owner(agent(1), &chain), agent(1));
     }
 }
 #[cfg(test)]

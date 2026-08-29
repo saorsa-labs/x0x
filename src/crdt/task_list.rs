@@ -296,6 +296,27 @@ impl TaskList {
             h.update(id.as_bytes());
             self.task_data[id].hash_resolved_fields(&mut h);
         }
+        // REVIEW r4 (finding 2): cover the LOCAL ownership chains with the
+        // same canonical encoding the delta-side digest uses, so a serve
+        // missing its transfer map can never digest-match a holder whose
+        // resolved owner has advanced. Empty maps are omitted on BOTH
+        // sides, keeping empty-chain digests byte-identical to legacy.
+        let local_chains: std::collections::HashMap<
+            TaskId,
+            std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
+        > = self
+            .task_data
+            .iter()
+            .filter_map(|(id, task)| {
+                let wire = task.owner_wire_map();
+                if wire.is_empty() {
+                    None // delta-side omits empty maps — keep encodings identical
+                } else {
+                    Some((*id, wire))
+                }
+            })
+            .collect();
+        crate::crdt::delta::hash_owner_transfers_into(&mut h, &local_chains);
         *h.finalize().as_bytes()
     }
 

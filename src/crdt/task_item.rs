@@ -35,9 +35,9 @@
 //! ```
 
 use crate::crdt::{
-    purge_unattested_elements, purge_unverified_owner_transfers, resolve_owner, sign_attestation,
-    sign_owner_transfer, CheckboxState, CrdtError, OpAttestation, OpKind, OwnerTransfer, Result,
-    TaskId, TaskListId, TaskMetadata,
+    chain_head, key_owner_chain, purge_unattested_elements, purge_unverified_owner_transfers,
+    resolve_owner, sign_attestation, sign_owner_transfer, CheckboxState, CrdtError, OpAttestation,
+    OpKind, OwnerTransfer, Result, TaskId, TaskListId, TaskMetadata,
 };
 use crate::gossip::SigningContext;
 use crate::identity::AgentId;
@@ -134,7 +134,7 @@ pub struct TaskItem {
     /// to the pre-0040 shape so legacy deltas decode unchanged. In-memory
     /// merge paths union it through the admission gate as usual.
     #[serde(skip)]
-    owner_transfers: BTreeMap<OwnerTransfer, OpAttestation>,
+    owner_chain: crate::crdt::provenance::OwnerChain,
 }
 
 /// Deserialize the trailing per-element attestation map, tolerating its
@@ -191,7 +191,7 @@ impl TaskItem {
             created_by: metadata.created_by,
             created_at: metadata.created_at,
             attestations: BTreeMap::new(),
-            owner_transfers: BTreeMap::new(),
+            owner_chain: BTreeMap::new(),
         }
     }
 
@@ -508,13 +508,19 @@ impl TaskItem {
         timestamp_ms: u64,
         signing: &SigningContext,
     ) -> Result<()> {
+        // HASH CHAIN (review r4): the new edge extends the CURRENT chain
+        // head — the signer commits to the exact position being superseded,
+        // which is what makes backdating structurally detectable.
+        let supersedes = chain_head(self.created_by, &self.owner_chain);
         let transfer = OwnerTransfer {
             from,
             to,
             timestamp_ms,
+            supersedes,
         };
         let att = sign_owner_transfer(signing, &scope, &self.id, &transfer)?;
-        self.owner_transfers.insert(transfer, att);
+        let digest = crate::crdt::owner_transfer_digest(&scope, &self.id, &transfer);
+        self.owner_chain.insert(digest, (transfer, att));
         Ok(())
     }
 
@@ -527,15 +533,15 @@ impl TaskItem {
     /// replica converges on the same owner without coordination.
     #[must_use]
     pub fn owner(&self) -> AgentId {
-        resolve_owner(self.created_by, &self.owner_transfers)
+        resolve_owner(self.created_by, &self.owner_chain)
     }
 
     /// All recorded ownership-transfer operations (verified survivors only
     /// after admission). Order is unspecified.
     #[must_use]
     pub fn owner_transfers(&self) -> Vec<(OwnerTransfer, OpAttestation)> {
-        self.owner_transfers
-            .iter()
+        self.owner_chain
+            .values()
             .map(|(t, a)| (*t, a.clone()))
             .collect()
     }
@@ -543,8 +549,8 @@ impl TaskItem {
     /// Crate-internal view of the ownership-transfer map (delta wiring:
     /// `TaskListDelta::for_add`/`for_state_change` lift it to the
     /// delta-level trailing field).
-    pub(crate) fn owner_transfers_map(&self) -> &BTreeMap<OwnerTransfer, OpAttestation> {
-        &self.owner_transfers
+    pub(crate) fn owner_wire_map(&self) -> BTreeMap<OwnerTransfer, OpAttestation> {
+        self.owner_chain.values().cloned().collect()
     }
 
     /// Union a remote ownership-transfer map into this task and run the
@@ -555,12 +561,11 @@ impl TaskItem {
         scope: TaskListId,
         transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
     ) {
-        for (transfer, att) in transfers {
-            self.owner_transfers
-                .entry(*transfer)
-                .or_insert_with(|| att.clone());
+        let incoming = key_owner_chain(&scope, &self.id, transfers);
+        for (digest, entry) in incoming {
+            self.owner_chain.entry(digest).or_insert(entry);
         }
-        let dropped = purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
+        let dropped = purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_chain);
         if dropped > 0 {
             tracing::debug!(
                 dropped,
@@ -842,10 +847,8 @@ impl TaskItem {
 
         // Union ownership transfers (same OwnerTransfer key ⇒
         // content-addressed identical attestation, union is idempotent).
-        for (transfer, att) in &other.owner_transfers {
-            self.owner_transfers
-                .entry(*transfer)
-                .or_insert_with(|| att.clone());
+        for (digest, entry) in &other.owner_chain {
+            self.owner_chain.entry(*digest).or_insert(entry.clone());
         }
 
         // Provenance admission gate (LAST step): drop every checkbox element
@@ -858,7 +861,7 @@ impl TaskItem {
         // Ownership admission gate: drop transfers whose attestation is not a
         // valid signature by their own `from` agent (ADR-0040 blocker 27).
         // Unsigned or wrong-signer transfers shipped in a delta die here.
-        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
+        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_chain);
         if dropped > 0 {
             tracing::debug!(
                 dropped,
@@ -901,15 +904,13 @@ impl TaskItem {
                 .entry(state.clone())
                 .or_insert_with(|| att.clone());
         }
-        for (transfer, att) in &other.owner_transfers {
-            self.owner_transfers
-                .entry(*transfer)
-                .or_insert_with(|| att.clone());
+        for (digest, entry) in &other.owner_chain {
+            self.owner_chain.entry(*digest).or_insert(entry.clone());
         }
 
         let mut dropped =
             purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations);
-        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
+        dropped += purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_chain);
         if dropped > 0 {
             tracing::debug!(
                 dropped,
@@ -939,7 +940,7 @@ impl TaskItem {
     ///
     pub fn admit(&mut self, scope: TaskListId) -> usize {
         purge_unattested_elements(&scope, &self.id, &mut self.checkbox, &mut self.attestations)
-            + purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers)
+            + purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_chain)
     }
 
     /// Drop checkbox elements whose attesting agent is not in `authorized`.
@@ -975,15 +976,15 @@ impl TaskItem {
         // (either side) is dropped, so removing a member reverts ownership to
         // the last fully-authorized holder — membership revocation auto-expires
         // authority that flowed through the removed agent.
-        let nonmember: Vec<OwnerTransfer> = self
-            .owner_transfers
-            .keys()
-            .filter(|t| !authorized.contains(&t.from) || !authorized.contains(&t.to))
-            .copied()
+        let nonmember: Vec<[u8; 32]> = self
+            .owner_chain
+            .iter()
+            .filter(|(_, (t, _))| !authorized.contains(&t.from) || !authorized.contains(&t.to))
+            .map(|(d, _)| *d)
             .collect();
         dropped += nonmember.len();
         for key in nonmember {
-            self.owner_transfers.remove(&key);
+            self.owner_chain.remove(&key);
         }
         dropped
     }
@@ -2412,7 +2413,7 @@ mod tests {
             .expect("recorded");
         // Corrupt: relabel the attestation author as the creator while the
         // key still hashes to mallory ⇒ derived != author_agent_id.
-        for att in hostile.owner_transfers.values_mut() {
+        for (_, att) in hostile.owner_chain.values_mut() {
             att.author_agent_id = creator;
         }
 
@@ -2427,8 +2428,14 @@ mod tests {
 
     #[test]
     fn chained_transfer_converges_in_both_merge_orders() {
-        // WHY: CRDT replicas may receive A→B before or after B→C; both must
-        // resolve the same owner from the union (order independence).
+        // WHY (hash chain, review r4): to extend the chain a signer MUST
+        // reference the current head — a transfer signed against a STALE
+        // head (B signing B→C before learning A→B, so it points at
+        // Genesis where the owner is A, not B) is VOID FOREVER, even after
+        // its prefix arrives. That is the security property: pre-signed
+        // transfers at positions the signer no longer holds must never
+        // activate retroactively (the same class as backdating). Both
+        // merge orders must converge on the honest chain.
         let (a, a_signing) = signing_for(1);
         let (b, b_signing) = signing_for(2);
         let (c, _) = signing_for(3);
@@ -2439,42 +2446,54 @@ mod tests {
         let mut second = owned_task(&a);
         second
             .transfer_ownership(item_scope(), b, c, 200, &b_signing)
-            .expect("b→c (arrives first on this replica)");
-        // The orphan b→c must be inert on its own.
-        assert_eq!(second.owner(), a, "orphan chain does not resolve alone");
+            .expect("b signs against a stale head (void edge)");
+        // The stale-head edge is inert on its own.
+        assert_eq!(second.owner(), a, "stale-head chain does not resolve alone");
 
         let mut order1 = first.clone();
         order1.merge(item_scope(), &second).expect("merge");
         let mut order2 = second.clone();
         order2.merge(item_scope(), &first).expect("merge");
-        assert_eq!(order1.owner(), c, "order1 resolves the full chain");
-        assert_eq!(order2.owner(), c, "order2 resolves the full chain");
+        assert_eq!(order1.owner(), b, "order1 keeps the honest chain head");
+        assert_eq!(order2.owner(), b, "order2 converges identically");
+
+        // The LEGITIMATE continuation: B, now holding the converged chain,
+        // transfers onward — its edge references the real head and walks.
+        order1
+            .transfer_ownership(item_scope(), b, c, 300, &b_signing)
+            .expect("b→c from the converged head");
+        assert_eq!(order1.owner(), c, "head-referencing continuation resolves");
     }
 
     #[test]
     fn concurrent_owner_transfers_resolve_deterministically() {
-        // WHY: the owner may sign two conflicting transfers (A→B, A→C);
-        // replicas holding the union must agree on ONE owner. Under the
-        // strict timestamp-ordered fold (review r3) the EARLIEST valid
-        // transfer binds — once A hands over at ts=100, A is a former
-        // owner and the later A→B@500 is void. Deterministic on every
-        // replica from the same edge set.
+        // WHY (hash chain, review r4): the owner may sign two conflicting
+        // transfers (A→B, A→C), both legitimately extending Genesis (each
+        // replica signed against the head it saw). Replicas holding the
+        // union must agree on ONE owner: the fork resolves by LOWEST EDGE
+        // DIGEST — signer-independent, so neither timestamp nor signing
+        // order can bias it. The test asserts CONVERGENCE (both merge
+        // directions, same owner) rather than a specific winner.
         let (a, a_signing) = signing_for(1);
         let (b, _) = signing_for(2);
         let (c, _) = signing_for(3);
         let mut with_b = owned_task(&a);
         with_b
             .transfer_ownership(item_scope(), a, b, 500, &a_signing)
-            .expect("a→b (later ts)");
+            .expect("a→b (later ts — irrelevant under the chain)");
         let mut with_c = owned_task(&a);
         with_c
             .transfer_ownership(item_scope(), a, c, 100, &a_signing)
-            .expect("a→c (earlier ts)");
+            .expect("a→c (earlier ts — irrelevant under the chain)");
 
         with_b.merge(item_scope(), &with_c).expect("merge");
         with_c.merge(item_scope(), &with_b).expect("merge");
-        assert_eq!(with_b.owner(), c, "earliest valid transfer binds");
-        assert_eq!(with_c.owner(), c, "same winner from either side");
+        assert_ne!(b, c, "fixtures must differ");
+        assert_eq!(
+            with_b.owner(),
+            with_c.owner(),
+            "both replicas converge on the same fork winner (lowest edge digest)"
+        );
     }
 
     #[test]
@@ -2510,7 +2529,7 @@ mod tests {
             .transfer_ownership(item_scope(), a, mallory, 200, &a_signing)
             .expect("forged-later edge on remote");
         let mut local = owned_task(&a);
-        local.ingest_owner_transfers(item_scope(), remote.owner_transfers_map());
+        local.ingest_owner_transfers(item_scope(), &remote.owner_wire_map());
         assert_eq!(
             local.owner(),
             b,
