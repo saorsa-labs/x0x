@@ -75,6 +75,12 @@ pub mod storage;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+/// ADR-0043 agent key-move protocol: the per-agent signed move log, the
+/// total fold (custodian / retired bindings / placement / phase), the
+/// participant CAS and mesh verification rules, the ML-KEM export
+/// envelope, and the placement-ledger enforcement checks (B and P).
+pub mod key_move;
+
 /// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
 /// records over `SyncV1` streams between the owner's enrolled machines).
 pub mod owner_sync;
@@ -487,6 +493,39 @@ pub const USER_ANNOUNCE_TOPIC: &str = "x0x.user.announce.v2";
 /// [`revocation::RevocationSet`].  The full local set is re-broadcast on each identity
 /// heartbeat for partition-tolerant eventual convergence.
 pub const REVOCATION_TOPIC: &str = "x0x.revocation.v1";
+
+/// Reserved gossip topic for V3 machine announcements (ADR-0043 machine
+/// KEM enrollment).
+///
+/// Payload is a bincode `MachineAnnouncementV3`: every V2 field plus the
+/// machine's ML-KEM-768 public key and per-resident-agent placement
+/// digests, all inside the machine signature. Topic-versioned exactly as
+/// `x0x.machine.announce.v2` versioned v1 — pre-0043 peers are not
+/// subscribed and decode nothing.
+pub const MACHINE_ANNOUNCE_V3_TOPIC: &str = "x0x.machine.announce.v3";
+
+/// Reserved gossip topic for ADR-0043 binding-revocation records
+/// (`Vec<RevocationRecord>` of `AgentMachineBinding` subjects only).
+///
+/// The v1 topic stays byte-identical with Agent/Machine subjects (a
+/// `0x03` variant would poison the whole v1 batch for old peers, §7.4);
+/// ad-hoc tombstones ride here, move tombstones ride
+/// [`ActivationBundle`](key_move::MoveRecord::ActivationBundle)s on
+/// [`MOVE_ACTIVATION_TOPIC`].
+pub const REVOCATION_V2_TOPIC: &str = "x0x.revocation.v2";
+
+/// Reserved gossip topic for ADR-0043 move activation bundles.
+///
+/// Payload is exactly one `ChainedRecord { ActivationBundle }`, published
+/// on activation and republished on-change + periodically for late
+/// joiners; the latest bundle alone reconstructs both the placement and
+/// the full cumulative tombstone history.
+pub const MOVE_ACTIVATION_TOPIC: &str = "x0x.move.activation.v1";
+
+/// Reserved gossip topic for the kind-tagged ADR-0043 blob protocol v2
+/// (placement records + historical activation bundles). The certificate
+/// blob path stays on the v1 topic.
+pub const ANNOUNCE_BLOB_V2_TOPIC: &str = "x0x/announce/v2/blob";
 
 /// Return the shard-specific gossip topic for the given `agent_id`.
 ///
@@ -7790,6 +7829,20 @@ impl Agent {
                                             "evicted revoked machine (received via gossip)"
                                         );
                                     }
+                                    // Binding tombstones evict nothing (§7):
+                                    // the pairing dies at the B/P gates.
+                                    revocation::RevokedSubject::AgentMachineBinding(
+                                        binding,
+                                    ) => {
+                                        tracing::info!(
+                                            agent = %hex::encode(binding.agent.as_bytes()),
+                                            machine = %hex::encode(
+                                                binding.machine.as_bytes()
+                                            ),
+                                            move_epoch = binding.move_epoch,
+                                            "binding tombstone received via gossip — pairing retired"
+                                        );
+                                    }
                                 }
                             }
                         }
@@ -9470,6 +9523,18 @@ impl Agent {
                 tracing::info!(
                     machine = %hex::encode(machine_id.as_bytes()),
                     "evicted revoked machine from discovery cache"
+                );
+            }
+            // ADR-0043: a binding tombstone retires ONE (agent, machine)
+            // pairing — the agent identity and the machine both stay
+            // (co-resident agents unaffected). Pairing-level denial is
+            // enforced per-message at the B/P gates; nothing to evict.
+            revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                tracing::info!(
+                    agent = %hex::encode(binding.agent.as_bytes()),
+                    machine = %hex::encode(binding.machine.as_bytes()),
+                    move_epoch = binding.move_epoch,
+                    "binding tombstone applied — pairing dead, identities retained"
                 );
             }
         }
