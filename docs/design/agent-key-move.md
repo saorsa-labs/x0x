@@ -102,8 +102,9 @@ pub fn open_sealed_bytes(kp: &AgentKemKeypair, aad: &[u8],
 
 ```rust
 enum MoveRecord {
-    // genesis: owner-signed epoch-0 placement for the agent (§8)
-    PlacementMint   { agent_id, placement: Placement, issued_at },
+    // genesis: owner-signed epoch-0 placement + initial custodian (§8)
+    PlacementMint   { agent_id, placement: Placement,
+                      custodian_machine: MachineId, issued_at },
     // owner-signed; authorizes ONE move; contains NO envelope digest
     MoveAuthorization { agent_id, move_epoch: u64, from_machine,
                         to_machine, placement: Placement, issued_at },
@@ -111,9 +112,14 @@ enum MoveRecord {
     ExportReceipt   { auth_hash: [u8;32], envelope_digest: [u8;32], sealed_at },
     // target-machine-signed, owner-countersigned
     ImportReceipt   { auth_hash: [u8;32], imported_at },
-    // owner-signed; COMMIT-terminator of a move
-    ActivationBundle { auth_hash: [u8;32],
-                       binding_revocation: RevocationRecord,   // §7
+    // owner-signed; COMMIT-terminator of a move. SELF-CONTAINED (r4-2):
+    // the canonical MoveAuthorization rides INSIDE — mesh peers never
+    // see pre-activation records, so every field coherence checks must
+    // live in the signed bundle. retired_bindings is CUMULATIVE (r4-3):
+    // every binding retired by moves 1..n — grow-only at the owner, so
+    // any single later bundle reconstructs the full history.
+    ActivationBundle { authorization: MoveAuthorization,   // canonical, embedded
+                       retired_bindings: Vec<AgentMachineBinding>, // §7, cumulative
                        placement_record: PlacementRecord,      // §8
                        agent_certificate: AgentCertificate },  // §7.2
     // source-machine-signed, owner-countersigned; bookkeeping only
@@ -137,45 +143,67 @@ Terminators: `ActivationBundle` commits a move; `AbortRecord` rolls one
 back and burns its epoch. `RetireReceipt` is bookkeeping after commitment
 — it changes no derived security state.
 
-### 3.2 THE CONSTRUCTION: one durable record, everything else derived (r3 core)
-
-**The signed log is the only durable state.** Tombstones, current
-placement, source quiesce, and target quarantine are **derived — pure
-functions of the log, evaluated at read time**:
+The log folds to THREE total values — defined for **every legal log
+shape** (initial, mid-move, post-activation, post-abort), never
+undefined (r4-1):
 
 ```rust
-// Derivation over the participant-verified local log for agent A:
-active_move(A)    = the trailing MoveAuthorization..(no terminator yet), if any
-quiesced(M, A)    = active_move(A) exists ∧ its from_machine == M
-quarantined(M, A) = M holds A's imported key ∧ ¬live_signer(M, A)
-live_signer(M, A) = ∃ ActivationBundle B terminating the last move of A
-                    ∧ B.to_machine == M ∧ no later terminator
-tombstone(A)      = { (B.from_machine, B.move_epoch) | B committed }   // permanent
-placement(A)      = payload of the LAST placement-bearing record
-                    (PlacementMint, or the newest committed bundle)
+// ONE total fold over the participant-verified local log for agent A:
+fold(log(A)) = {
+  custodian(A): MachineId,          // who is authorized to sign as A
+  retired_bindings(A): Set<(MachineId, u64)>,  // grow-only, never pruned
+  placement(A): (Placement, u64),   // current placement + epoch
+}
+// fold rules, applied in log order; total by cases on the LAST record:
+//   log = PlacementMint only                      → custodian = mint.custodian_machine
+//                                                    placement = (mint.placement, 0)
+//   last = MoveAuthorization|ExportReceipt|
+//          ImportReceipt  (active move, no
+//          terminator yet)                         → custodian = ⊥  (NOBODY may sign —
+//                                                    zero live signers during transfer)
+//                                                    retired/placement unchanged
+//   last = ActivationBundle (terminating move n)   → custodian = bundle.authorization.to_machine
+//                                                    retired ∪= bundle.retired_bindings (cumulative)
+//                                                    placement = (bundle.placement_record, epoch n)
+//   last = AbortRecord (terminated move n)         → custodian = that move's from_machine
+//                                                    retired/placement unchanged
+//   last = RetireReceipt (post-bundle bookkeeping) → all values unchanged
 ```
+
+**Key possession is an INPUT, not part of the fold** (r4-1): `holds_key(M, A)`
+is machine-local durable fact (the key file exists). The signing gate is
+exactly:
+
+```rust
+may_sign(M, A) = holds_key(M, A) ∧ custodian(A) == M
+quiesced(M, A)   = holds_key(M, A) ∧ ¬may_sign(M, A) ∧ active move names M as from
+quarantined(M, A) = holds_key(M, A) ∧ ¬may_sign(M, A) ∧ active move names M as to
+```
+
+`quiesced`/`quarantined` are labels over the same two inputs — the log
+fold and key possession — never independent state. Every crash matrix
+row in §5.3 is one row of this table: initial state (mint custodian
+signs), mid-move (custodian = ⊥ — source and target both hold but
+neither signs), post-activation (target), post-abort (source restored).
 
 Consequences, all by construction rather than by argued ordering:
 
 - **No ordered mutations exist to crash between.** A receiver of a bundle
   durably stores the verified record — one append — and every gate reads
-  the derivation above (memoization is an optimization; a stale cache can
-  only lag the log, never diverge from it).
+  the fold (memoization is an optimization; a stale cache can only lag
+  the log, never diverge from it).
 - **Partial application is impossible, not merely mitigated**: there is
-  no "tombstone applied but placement not" state, because both are the
-  same function of the same record. r2/r3 ordered-mutation arguments
-  (including the "tombstone-first" apply order and the crash-matrix row
-  "target (legitimately — committed)" at old design line 251) are
-  deleted.
+  no "tombstone known but placement not" state, because both are the
+  same function of the same stored records. r2/r3 ordered-mutation
+  arguments (including the "tombstone-first" apply order) are deleted.
 - **Replay is trivially idempotent**: re-delivering a record changes
-  nothing (identical bytes → identical derivation).
-- **Un-quarantine is one rule (r3 b)**: the target may sign as A the
-  moment its local log verifies a bundle making it the live signer
-  (§3.2). There is no separate "flip the gate" transition to crash
-  before/after.
-- **Abort (r3 d)**: an `AbortRecord` terminator makes `active_move(A)`
-  empty — the derivation yields no quiesce, no quarantine, no tombstone,
-  no placement change. Rollback = append one record.
+  nothing (identical bytes → identical fold).
+- **Un-quarantine is one rule (r3 b)**: the target may sign as A exactly
+  when it holds the key and its local log's `custodian(A)` is it. No
+  separate "flip the gate" transition exists to crash before/after.
+- **Abort (r3 d)**: an `AbortRecord` restores `custodian(A)` to the
+  move's `from_machine`; `retired_bindings` and `placement` are
+  untouched. Rollback = append one record.
 
 ### 3.3 Verification rules: participants vs mesh (r3 a)
 
@@ -194,21 +222,34 @@ drop-and-alert the challenger. r1's "reject epoch ≤ highest seen" rule is
 gone — ordering is the chain.
 
 **Mesh rule** (no head, no pre-activation records): an
-`ActivationBundle` (or `PlacementMint` via the blob path, §8.2) is
-accepted for agent A iff
+`ActivationBundle` is accepted for agent A iff
 (1) the owner signature over the whole record verifies;
-(2) cross-field coherence holds (§7.5 — every referenced field is inside
-the record itself);
-(3) **epoch monotonicity**: `record.move_epoch >` the epoch of the
-current derived state for A (or equal epoch with identical digest —
-a replay no-op). Lower-epoch records are stale and dropped.
-The peer durably stores the highest-epoch verified records; its
-`tombstone`/`placement` derivations read them. The bundle is carried on
-the mesh (§7.5 topic; republished on-change + periodically for late
-joiners, the heartbeat piggyback pattern `src/lib.rs:2937-2965`).
+(2) cross-field coherence holds (§7.5 — the embedded authorization makes
+the record self-contained; nothing is recomputed from elsewhere);
+(3) **placement epoch monotonicity**: the bundle's `move_epoch` ≥ the
+epoch of the peer's current `placement(A)` (equal epoch with identical
+digest is a replay no-op; a lower-epoch bundle's PLACEMENT is stale).
 
-Both rules feed the same derivation; a participant's view is strictly
-more informed (it also knows pre-activation state), never contradictory.
+**Tombstone accumulation is a separate, order-independent union (r4-3):**
+every accepted bundle merges its `retired_bindings` into the peer's
+grow-only set — REGARDLESS of epoch. Because the owner's set is
+cumulative, any single bundle (and a fortiori the highest-epoch one)
+reconstructs the full history: a peer that first sees epoch 2 still
+learns epoch 1's retired binding from epoch 2's embedded set. Dropping a
+lower-epoch bundle's placement therefore never discards an unseen
+historical revocation. `PlacementMint` records ride the blob path
+(§8.2) under the same signature + coherence rule with epoch 0.
+
+The peer durably stores verified bundles; its fold reads them. Transport
+(aligned with blob-v2's actual capabilities, §8.2): the activation topic
+`x0x.move.activation.v1` carries each bundle on-change + periodic
+republish (heartbeat piggyback pattern, `src/lib.rs:2937-2965`) — the
+latest bundle alone suffices for both tombstones and placement — and
+blob-v2's `Bundle` kind fetches any specific historical bundle by digest
+on demand (e.g. audit).
+
+Both rules feed the same fold; a participant's view is strictly more
+informed (it also knows pre-activation state), never contradictory.
 
 ### 3.4 Chain growth
 
@@ -261,13 +302,13 @@ envelope exists yet.
 
 | Log state for the agent (participant view) | Source derives | Target derives | Mesh derives | Re-entry |
 |---|---|---|---|---|
-| (no log) / `PlacementMint` | may sign | — | mint placement (via blob) | begin a move |
-| + `MoveAuthorization` (no terminator) | **quiesced**; seal (or abort) | — | nothing (not replicated) | seal; or abort |
+| `PlacementMint` (genesis) | `custodian` = mint machine — may sign | — | mint placement (via blob) | begin a move |
+| + `MoveAuthorization` (no terminator) | holds key, **quiesced** (`custodian`=⊥); seal (or abort) | — | nothing (not replicated) | seal; or abort |
 | + `ExportReceipt` | quiesced; envelope durable | — | nothing | transfer envelope |
-| + `ImportReceipt` | quiesced | holds key, **quarantined** | nothing | owner verifies, then activate; or abort |
-| + `ActivationBundle` | quiesced, retire-pending (holds dead key) | **live signer** (un-quarantined by the same verified record) | tombstone + placement (mesh rule) | source retires |
-| + `RetireReceipt` | move closed | live signer | unchanged | none |
-| `AbortRecord` from any pre-activation head | may sign again (nothing derived) | discards key | unchanged (abort is not mesh-carried) | next move = epoch+1 |
+| + `ImportReceipt` | quiesced | holds key, **quarantined** (`custodian`=⊥) | nothing | owner verifies, then activate; or abort |
+| + `ActivationBundle` | quiesced, retire-pending (holds dead key) | **`custodian`** — may sign (same verified record) | `retired_bindings` ∪= cumulative set; placement (mesh rule) | source retires |
+| + `RetireReceipt` | move closed (key deleted → `holds_key`=false) | may sign | unchanged | none |
+| `AbortRecord` from any pre-activation head | **`custodian` restored** — may sign again | discards key | unchanged (abort is not mesh-carried) | next move = epoch+1 |
 
 Operator/file-level states (not log states): crash before the envelope
 reaches the operator → re-transfer (envelope + receipt are on the source
@@ -275,8 +316,9 @@ disk); crash before import → import at leisure; the bundle handed to the
 operator is self-contained. Torn log tail → discarded, re-append.
 
 The signer invariant: **at most one** live signer at every instant —
-zero during transfer, exactly one after completion or abort — because
-`live_signer` and `quiesced` are non-overlapping derivations of one log.
+zero during transfer (`custodian` = ⊥), exactly one after completion or
+abort — because `custodian(A)` is single-valued at every legal log shape
+and the gate conjoins it with key possession (§3.2).
 The key never exists solely on a machine that acknowledged deletion: the
 envelope persists until `RetireReceipt`, and deletion follows the bundle.
 
