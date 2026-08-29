@@ -1009,6 +1009,15 @@ impl OwnerSyncStore {
             .clone()
     }
 
+    /// The typed refusal for a poisoned store, if it is poisoned. Every
+    /// state-mutating entry point checks this FIRST (review R6): after a
+    /// post-rename durability failure, no mutation may proceed against
+    /// state whose memory/disk agreement is unrecoverable — even after the
+    /// underlying fault clears — until an explicit reload.
+    fn poison_refusal(&self) -> Option<SyncError> {
+        self.poisoned_reason().map(SyncError::Poisoned)
+    }
+
     fn fail_after_rename_for_testing(&self) -> bool {
         self.fail_after_rename
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -1046,6 +1055,9 @@ impl OwnerSyncStore {
     /// (disk already advanced) and the store refuses further sync until
     /// reload (review R5 finding 2).
     pub async fn enroll(&self, enrollment: OwnerEnrollment) -> Result<(), SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
         let mut devices = self.devices.write().await;
         let previous = devices.get(&enrollment.machine_id).cloned();
         let keep = previous
@@ -1083,6 +1095,9 @@ impl OwnerSyncStore {
     /// `/sync/devices/:id` path; review R2 finding 1). Poisoning semantics
     /// match [`Self::enroll`]. Returns `Ok(false)` when not enrolled.
     pub async fn unenroll(&self, machine: &MachineId) -> Result<bool, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
         let mut devices = self.devices.write().await;
         if let Some(previous) = devices.remove(&machine.0) {
             if let Err(e) = self.persist_devices(&devices).await {
@@ -1165,6 +1180,9 @@ impl OwnerSyncStore {
         batch: Vec<VersionedRecord>,
         owner: &UserId,
     ) -> Result<CommitOutcome, SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
         let mut records = self.records.write().await;
         // (kind, key) → the value held BEFORE this batch first touched it.
         let mut touched: BTreeMap<(SyncKind, String), Option<VersionedRecord>> = BTreeMap::new();
@@ -1313,6 +1331,9 @@ impl OwnerSyncStore {
         owner: &UserKeypair,
         writer_machine: MachineId,
     ) -> Result<(), SyncError> {
+        if let Some(err) = self.poison_refusal() {
+            return Err(err);
+        }
         let value_bytes = bincode::serialize(desired)
             .map_err(|e| SyncError::BadSignature(format!("value encode: {e}")))?;
         if value_bytes.len() > MAX_VALUE_BYTES {
@@ -1450,6 +1471,9 @@ impl OwnerSyncStore {
     /// every real path (`mint`, `commit_batch`) verifies signatures.
     #[doc(hidden)]
     pub async fn records_insert_for_testing(&self, record: VersionedRecord) {
+        if self.poison_refusal().is_some() {
+            return; // test helper respects poison too
+        }
         let mut records = self.records.write().await;
         records.insert((record.kind, record.key.clone()), record);
         let _ = self.persist_records(&records).await;
@@ -3619,7 +3643,14 @@ mod r5_tests {
             "disk holds the new batch the callers saw fail"
         );
 
-        // Every further mutation refuses: poisoned.
+        // Disable the fault injector FIRST (review R6): with it left on,
+        // the refusals below could come from the injector firing again
+        // rather than the poison flag. With it off, a refusal can ONLY
+        // come from the poison check at the mutator entry points.
+        store.set_fail_after_rename_for_testing(false);
+
+        // Every further mutation refuses BECAUSE the store is poisoned —
+        // the transient fault has cleared, the flag has not.
         let err = store
             .mint(
                 SyncKind::OwnerProfile,
@@ -3637,6 +3668,19 @@ mod r5_tests {
             .enroll(OwnerEnrollment::sign(machine(9), &owner, 1, None).unwrap())
             .await
             .expect_err("poisoned store refuses enroll");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+        let err = store
+            .commit_batch(
+                vec![sign_names("post", "v", clock(9, 9, 1), &owner)],
+                &owner_id,
+            )
+            .await
+            .expect_err("poisoned store refuses commit_batch");
+        assert!(matches!(err, SyncError::Poisoned(_)));
+        let err = store
+            .unenroll(&machine(9))
+            .await
+            .expect_err("poisoned store refuses unenroll");
         assert!(matches!(err, SyncError::Poisoned(_)));
 
         // Sessions refuse too — even with a fully enrolled peer.
