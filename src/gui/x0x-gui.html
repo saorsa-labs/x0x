@@ -5196,27 +5196,24 @@ async function createSpace(){
   if(desc)body.description=desc;
   const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
-    // ADR-0038 round-3 fix d: validate the daemon's POLICY ECHO
-    // unconditionally. We send a named preset (never a raw policy object),
-    // so compare the echoed admission axis against the preset's known
-    // value — a mismatch means the daemon applied a different policy than
-    // the preset promised; a MISSING echo means an older daemon without
-    // the echo contract (nothing to validate against — treated as
-    // tolerated legacy since preset handling predates the echo and was
-    // never silently-downgradable via an unknown field).
-    const PRESET_ADMISSION={
-      private_secure:'invite_only',
-      public_request_secure:'request_access',
-      public_open:'open_join',
-      public_announce:'open_join'
+    // Full-policy echo guard (codex r4/r5): compare EVERY axis, not just
+    // admission — public_open vs public_announce share open_join but differ
+    // in write access. A missing echo on a PRESET create is tolerated only
+    // because presets predate the echo and are interpreted identically by
+    // older daemons; any raw-policy create must fail closed on a missing
+    // echo (the GUI sends presets only).
+    const PRESET_POLICY={
+      private_secure:{discoverability:'hidden',admission:'invite_only',confidentiality:'mls_encrypted',read_access:'members_only',write_access:'members_only'},
+      public_request_secure:{discoverability:'public_directory',admission:'request_access',confidentiality:'mls_encrypted',read_access:'members_only',write_access:'members_only'},
+      public_open:{discoverability:'public_directory',admission:'open_join',confidentiality:'signed_public',read_access:'public',write_access:'members_only'},
+      public_announce:{discoverability:'public_directory',admission:'open_join',confidentiality:'signed_public',read_access:'public',write_access:'admin_only'}
     };
     if(r.policy){
-      const want=PRESET_ADMISSION[preset];
-      const got=(r.policy.admission&&(
-        r.policy.admission.owner_certified!==undefined?'owner_certified':
-        typeof r.policy.admission==='string'?r.policy.admission:JSON.stringify(r.policy.admission)));
-      if(got&&want&&got!==want){
-        toast('Daemon applied a different admission policy ("'+got+'") than the selected preset ("+want+") — space NOT created as intended. Delete it.','error');
+      const want=PRESET_POLICY[preset];
+      const norm=v=>typeof v==='string'?v:JSON.stringify(v);
+      const bad=want&&Object.keys(want).find(k=>norm(r.policy[k])!==want[k]);
+      if(bad){
+        toast('Daemon applied a different policy ('+bad+': "'+norm(r.policy[bad])+'" vs expected "'+want[bad]+'") than the selected preset — space NOT created as intended. Delete it.','error');
         return;
       }
     }

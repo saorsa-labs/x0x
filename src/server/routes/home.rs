@@ -295,12 +295,17 @@ async fn repair_or_write_marker(
     }
 }
 
-/// Round-3 fix a: restore-side digest verification for EVERY group with
-/// nonempty `home` metadata (not just the trusted-Home pick). A record
-/// whose state hash does not commit to its digest is legacy-unsigned or
-/// tampered; reseal only when the group is OUR-owner Home policy with our
-/// active Admin seat, otherwise strip + warn.
-async fn verify_restored_home_records(state: &Arc<AppState>, owner: &crate::identity::UserId) {
+/// Round-3/4 fix a: restore-side digest verification for EVERY group with
+/// nonempty `home` metadata (not just the trusted-Home pick), running
+/// BEFORE any owned-install guard so un-owned and cert-less installs are
+/// covered too. A record whose state hash does not commit to its digest is
+/// legacy-unsigned or tampered; reseal only when the group is OUR-owner
+/// Home policy with our active Admin seat, otherwise strip + warn (with no
+/// owner at all there is nobody entitled to reseal — everything strips).
+async fn verify_restored_home_records(
+    state: &Arc<AppState>,
+    owner: Option<&crate::identity::UserId>,
+) {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     let records: Vec<(String, bool, bool)> = {
         let groups = state.named_groups.read().await;
@@ -308,7 +313,7 @@ async fn verify_restored_home_records(state: &Arc<AppState>, owner: &crate::iden
             .iter()
             .filter(|(_, info)| info.home.is_some() && !info.state_hash_is_current())
             .map(|(id, info)| {
-                let ours = is_home_policy(&info.policy, owner);
+                let ours = owner.is_some_and(|owner| is_home_policy(&info.policy, owner));
                 let admin = info
                     .caller_role(&local_hex)
                     .is_some_and(|r| r.at_least(crate::groups::GroupRole::Admin));
@@ -357,6 +362,13 @@ async fn strip_home_metadata(state: &AppState, group_id: &str) {
 /// best-effort: never fails startup — a provisioning failure logs loudly
 /// and retries on the next daemon start (no marker is written on failure).
 pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
+    // Round-4 fix 1: the restore sweep runs FIRST, before ANY owned-install
+    // guard — EVERY restored nonempty `home` record is digest-verified even
+    // on un-owned installs or installs without an agent certificate (there
+    // is simply nobody entitled to reseal, so unsigned records strip).
+    let owner_opt = state.agent.identity().user_keypair().map(|kp| kp.user_id());
+    verify_restored_home_records(state, owner_opt.as_ref()).await;
+
     // Only an OWNED install provisions: user key + builder-issued
     // certificate must both be live (OwnerCertified admission needs a
     // certifiable founding member).
@@ -371,15 +383,6 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     let owner = user_kp.user_id();
     let owner_hex = hex::encode(owner.as_bytes());
     let marker_path = state.data_dir.join(HOME_MARKER_FILE);
-
-    // 0) Round-3 fix a: verify EVERY restored nonempty `home` record —
-    //    BEFORE any trusted-Home filtering, so foreign-owner, inactive,
-    //    malformed, and unowned records cannot skip digest verification
-    //    just because find_home would reject them. Mismatch or
-    //    legacy-unsigned → reseal when this group is our-owner Home policy
-    //    AND we hold an active Admin seat; otherwise strip the metadata
-    //    with a warning (unsigned Home claims never survive restore).
-    verify_restored_home_records(state, &owner).await;
 
     // 1) Trusted Home already present (the marker is only advisory — the
     //    roster scan is authoritative). Repair a missing/stale marker.
@@ -1208,11 +1211,13 @@ mod round2_tests {
         provision_home(&state).await;
         let (id, info) = find_home(&state, &owner).await.expect("home");
 
-        // Round-3 fix c: make resealing GENUINELY fail — demote our agent
-        // from Admin to Member. The reseal Admin gate refuses and the
-        // sweep's `ours && admin` condition is false, so the only remaining
-        // path is STRIP (this actually exercises the failure, unlike the
-        // previous withdrawn-flag trick which never reached the gate).
+        // Round-5 fix (codex r4/r5): exercise the reseal-FAILURE branch
+        // itself. The caller STAYS Admin (admin gate passes, reseal_home is
+        // genuinely invoked); the seal then fails because a SECOND member's
+        // evidence is missing with the grace window long expired (verdict =
+        // Failed → the owner-certified seal wrapper refuses with the typed
+        // eviction-required error), driving the "reseal failed; stripping"
+        // path — not the non-admin strip branch.
         let mut broken = info.clone();
         let meta = crate::groups::state_commit::GroupPublicMeta {
             home_digest: None,
@@ -1231,9 +1236,20 @@ mod round2_tests {
             broken.security_binding.as_deref(),
             broken.withdrawn,
         );
-        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-        if let Some(member) = broken.members_v2.get_mut(&local_hex) {
-            member.role = crate::groups::GroupRole::Member;
+        // A second member whose certificate never resolved and whose grace
+        // window expired long ago: the seal verdict is Failed for it, so
+        // reseal_home's seal refuses (ordinary seals refuse on non-clean
+        // verdicts; the eviction path is not taken inside reseal).
+        let stranger = crate::identity::AgentKeypair::generate()?;
+        let stranger_hex = hex::encode(stranger.agent_id().as_bytes());
+        broken.add_member(
+            stranger_hex,
+            crate::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        if let Some(member) = broken.members_v2.get_mut(&stranger_hex) {
+            member.certificate_missing_since_ms = Some(0); // grace expired long ago
         }
         assert!(!broken.state_hash_is_current(), "unsigned condition holds");
         state.named_groups.write().await.insert(id.clone(), broken);
