@@ -4162,6 +4162,15 @@ function renderSettings(){
     <div class="row"><input id="set-name" value="${esc(LS.get('display_name',''))}" placeholder="Your name"><button class="pri" onclick="saveName()">Save</button></div>
     <div style="font-size:11px;color:var(--tx3);margin-top:4px">Shown in chat messages and your identity card.</div>
   </div>
+  <div class="card mb2" id="sync-panel">
+    <h3 style="margin-top:0">Cross-Machine Sync (Tier 1)</h3>
+    <p style="font-size:11px;color:var(--tx3);margin:0 0 var(--sp2)">Owner-enrolled devices replicate names, the Home roster, and the agent issuance journal between your machines (ADR-0041).</p>
+    <div id="sync-devices" style="font-size:12px;color:var(--tx2)">Loading devices…</div>
+    <div class="row" style="gap:var(--sp2);margin-top:var(--sp2)">
+      <button class="pri" onclick="enrollThisMachine()">&#128279; Enroll This Machine</button>
+      <button onclick="loadSyncDevices()">Refresh</button>
+    </div>
+  </div>
   <div class="card mb2">
     <h3 style="margin-top:0">Symphony Daemon</h3>
     <div class="row" style="gap:var(--sp2);flex-wrap:wrap">
@@ -4191,7 +4200,33 @@ function renderSettings(){
   </div>`;
 }
 
-function mountSettings(){}
+function mountSettings(){loadSyncDevices();}
+
+async function loadSyncDevices(){
+  const el=document.getElementById('sync-devices');
+  if(!el)return;
+  const r=await api('/sync/devices');
+  if(!r||!r._http_ok){
+    el.innerHTML=r&&r.error?esc(r.error):'Sync unavailable (no owner identity configured).';
+    return;
+  }
+  const devices=r.devices||[];
+  if(!devices.length){el.innerHTML='No devices enrolled yet.';return;}
+  el.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:12px">'+
+    '<tr style="color:var(--tx3);text-align:left"><th style="padding:2px 6px">Machine</th><th style="padding:2px 6px">Enrolled</th><th style="padding:2px 6px">Last sync</th></tr>'+
+    devices.map(d=>{
+      const mid=String(d.machine_id||'').slice(0,12)+'…';
+      const enrolled=d.enrolled_at_ms?new Date(d.enrolled_at_ms).toLocaleString():'—';
+      const last=d.last_session_ms?(new Date(d.last_session_ms).toLocaleString()+(d.last_session_ok?'':' (failed)')):'never';
+      return `<tr><td style="padding:2px 6px">${esc(mid)}${d.is_this_machine?' <span style="color:var(--lv)">(this machine)</span>':''}</td><td style="padding:2px 6px">${esc(enrolled)}</td><td style="padding:2px 6px">${esc(last)}</td></tr>`;
+    }).join('')+'</table>';
+}
+
+async function enrollThisMachine(){
+  const r=await api('/sync/devices/enroll',{method:'POST',body:JSON.stringify({})});
+  if(r&&r._http_ok){toast('Machine enrolled into the owner device set','success');loadSyncDevices();}
+  else{toast(r&&r.error?r.error:'Enroll failed','error');}
+}
 
 function setTheme(theme){
   LS.set('theme',theme);

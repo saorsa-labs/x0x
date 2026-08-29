@@ -217,6 +217,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/owner/riders/:id",
         cli_name: "owner riders revoke",
         description: "Revoke a rider token; it fails on the next request",
+        method: Method::Get,
+        path: "/sync/devices",
+        cli_name: "sync devices",
+        description: "ADR-0041 Tier-1: enrolled owner devices + last-sync status",
+        category: "identity",
+    },
+    EndpointDef {
+        method: Method::Post,
+        path: "/sync/devices/enroll",
+        cli_name: "sync enroll",
+        description: "Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)",
         category: "identity",
     },
     // ── Network ─────────────────────────────────────────────────────────

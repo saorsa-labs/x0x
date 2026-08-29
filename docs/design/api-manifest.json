@@ -170,6 +170,20 @@
       "path": "/owner/riders/:id"
     },
     {
+      "category": "identity",
+      "cli_name": "sync devices",
+      "description": "ADR-0041 Tier-1: enrolled owner devices + last-sync status",
+      "method": "GET",
+      "path": "/sync/devices"
+    },
+    {
+      "category": "identity",
+      "cli_name": "sync enroll",
+      "description": "Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)",
+      "method": "POST",
+      "path": "/sync/devices/enroll"
+    },
+    {
       "category": "network",
       "cli_name": "peers",
       "description": "Connected gossip peers",

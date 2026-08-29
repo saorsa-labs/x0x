@@ -75,6 +75,10 @@ pub mod storage;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+/// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
+/// records over `SyncV1` streams between the owner's enrolled machines).
+pub mod owner_sync;
+
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
 pub mod announce_v3;
@@ -3353,6 +3357,18 @@ impl Agent {
     #[must_use]
     pub fn user_id(&self) -> Option<identity::UserId> {
         self.identity.user_id()
+    }
+
+    /// Path of the owner certificate journal (`owner-cert-journal.jsonl`)
+    /// this agent appends to at certificate-issue time, if any.
+    ///
+    /// `None` when no user identity is configured. Exposed for ADR-0041
+    /// Tier-1 sync, which mirrors journal lines across the owner's
+    /// machines.
+    #[inline]
+    #[must_use]
+    pub fn cert_journal_path(&self) -> Option<&std::path::Path> {
+        self.cert_journal_path.as_deref()
     }
 
     /// Get the agent certificate, if one exists.

@@ -293,6 +293,16 @@ pub async fn owner_agents_issue(
         body["label"] = serde_json::json!(label);
     }
     let resp = client.post("/owner/agents/issue", &body).await?;
+/// `x0x sync` / `x0x sync devices` — GET /sync/devices (ADR-0041 Tier-1).
+pub async fn sync_devices(client: &DaemonClient) -> Result<()> {
+    client.run_get("/sync/devices").await
+}
+
+/// `x0x sync enroll [MACHINE_ID]` — POST /sync/devices/enroll. Omitting
+/// the id enrolls THIS machine into the owner device set.
+pub async fn sync_enroll(client: &DaemonClient, machine_id: Option<&str>) -> Result<()> {
+    let body = serde_json::json!({ "machine_id": machine_id });
+    let resp = client.post("/sync/devices/enroll", &body).await?;
     print_value(client.format(), &resp);
     Ok(())
 }
@@ -335,7 +345,6 @@ pub async fn owner_riders_revoke(client: &DaemonClient, token_id: u64) -> Result
         .run_delete(&format!("/owner/riders/{token_id}"))
         .await
 }
-
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

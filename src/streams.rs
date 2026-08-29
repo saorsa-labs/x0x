@@ -379,6 +379,13 @@ pub enum StreamProtocol {
     /// gate apply exactly as for every other protocol; there is no
     /// voice-specific bypass.
     WebRtcV1 = 0x04,
+    /// ADR-0041 Tier-1 owner-state sync (`src/owner_sync.rs`). Carries
+    /// owner-signed versioned records between the owner's enrolled
+    /// machines. The ADR-0022 identity gates apply exactly as for every
+    /// other protocol; the sync acceptor additionally fails closed unless
+    /// the remote machine is in the local owner device set (owner-key
+    /// signed enrollment).
+    SyncV1 = 0x05,
 }
 
 impl StreamProtocol {
@@ -391,6 +398,7 @@ impl StreamProtocol {
             0x02 => Some(Self::SocksV1),
             0x03 => Some(Self::ForwardV2),
             0x04 => Some(Self::WebRtcV1),
+            0x05 => Some(Self::SyncV1),
             _ => None,
         }
     }
@@ -552,7 +560,7 @@ mod tests {
         for byte in 0x00u8..=0xFF {
             let parsed = StreamProtocol::from_u8(byte);
             match byte {
-                0x01..=0x04 => {
+                0x01..=0x05 => {
                     assert!(parsed.is_some(), "byte {byte:#x} should parse")
                 }
                 _ => assert_eq!(parsed, None, "byte {byte:#x} must be unknown"),

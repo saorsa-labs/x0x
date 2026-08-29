@@ -71,6 +71,8 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Put, "/profile", daemon_api_profile_round_trip),
     covered!(Get, "/home", home_routes_wired),
     covered!(Post, "/home/rename", home_rename_round_trips),
+    covered!(Get, "/sync/devices", sync_routes_wired),
+    covered!(Post, "/sync/devices/enroll", sync_routes_wired),
     covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
     covered!(
         Post,
@@ -520,6 +522,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/home.rs",
         include_str!("../src/server/routes/home.rs"),
+    ),
+    (
+        "src/server/routes/sync.rs",
+        include_str!("../src/server/routes/sync.rs"),
     ),
     (
         "tests/peer_lifecycle_integration.rs",
