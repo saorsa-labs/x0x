@@ -51,6 +51,13 @@ pub const PUBLIC_MESSAGE_DOMAIN: &[u8] = b"x0x.group.public-message.v1";
 /// fields sign under `PUBLIC_MESSAGE_DOMAIN` and are byte-identical to v1.
 pub const PUBLIC_MESSAGE_DOMAIN_V2: &[u8] = b"x0x.group.public-message.v2";
 
+/// Domain-separation tag for attributed public-message signatures (v3).
+///
+/// Used when `mentions` is non-empty or `delegation_digest` is set
+/// (ADR-0040). Messages without either field sign under the v1/v2 domains
+/// and stay byte-identical to their pre-0040 encodings.
+pub const PUBLIC_MESSAGE_DOMAIN_V3: &[u8] = b"x0x.group.public-message.v3";
+
 /// Topic-string prefix for public-group chat.
 pub const PUBLIC_GROUP_TOPIC_PREFIX: &str = "x0x.groups.public";
 
@@ -74,6 +81,11 @@ pub enum GroupPublicMessageKind {
     Chat,
     /// Announcement (intended for `AdminOnly` write-access groups).
     Announcement,
+    /// Delegation grant (ADR-0040). The body carries the JSON serialization
+    /// of a [`crate::delegation::SignedDelegation`] which is independently
+    /// signed by the delegator's own key; this message is the group-bus
+    /// carrier that lands the envelope in durable history.
+    Delegation,
 }
 
 /// Signed, state-bound public-group message.
@@ -104,6 +116,18 @@ pub struct GroupPublicMessage {
     /// When present, `thread_root` must also be present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_parent: Option<String>,
+    /// Structured mentions (ADR-0040): hex AgentIds of mentioned agents.
+    /// Replaces GUI string-matching — daemon-side routing uses this field.
+    /// Absent/empty ⇒ v1/v2 signed bytes are unchanged.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mentions: Vec<String>,
+    /// Hex BLAKE3 digest of the delegation authorizing `send_as`
+    /// attribution (ADR-0040 blocker 25): the AUTHOR signs with its own key;
+    /// receivers resolve actor=author, delegator=from_agent via the
+    /// delegation this digest names in durable history. Absent ⇒ normal
+    /// self-authored message.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub delegation_digest: Option<String>,
     /// ADR-0039 rider provenance: present only when this message was sent
     /// through the owner's daemon by an API-key rider. The envelope rides
     /// INSIDE `signable_bytes()` — the daemon-agent signature over the
@@ -592,8 +616,15 @@ impl GroupPublicMessage {
     #[must_use]
     pub fn signable_bytes(&self) -> Vec<u8> {
         let threaded = self.thread_root.is_some() || self.thread_parent.is_some();
+        let attributed = !self.mentions.is_empty()
+            || self
+                .delegation_digest
+                .as_deref()
+                .is_some_and(|d| !d.is_empty());
         let mut buf = Vec::with_capacity(512 + self.body.len());
-        buf.extend_from_slice(if threaded {
+        buf.extend_from_slice(if attributed {
+            PUBLIC_MESSAGE_DOMAIN_V3
+        } else if threaded {
             PUBLIC_MESSAGE_DOMAIN_V2
         } else {
             PUBLIC_MESSAGE_DOMAIN
@@ -621,6 +652,19 @@ impl GroupPublicMessage {
                 &mut buf,
                 self.thread_parent.as_deref().unwrap_or("").as_bytes(),
             );
+        }
+        // v3 attribution suffix (ADR-0040): delegation digest then mentions.
+        // Only present when attributed — this is exactly what keeps v1/v2
+        // bytes identical for pre-0040 shapes.
+        if attributed {
+            push_len_prefixed(
+                &mut buf,
+                self.delegation_digest.as_deref().unwrap_or("").as_bytes(),
+            );
+            buf.extend_from_slice(&(self.mentions.len() as u32).to_le_bytes());
+            for mention in &self.mentions {
+                push_len_prefixed(&mut buf, mention.as_bytes());
+            }
         }
         // ADR-0039: rider provenance rides INSIDE the signed bytes (absent
         // ⇒ byte-identical legacy encoding, preserving the ADR-0029 rule
@@ -669,6 +713,46 @@ impl GroupPublicMessage {
         thread_parent: Option<String>,
         rider_provenance: Option<RiderProvenance>,
     ) -> Result<Self, ApplyError> {
+        Self::sign_with_attribution(
+            group_id,
+            state_hash_at_send,
+            revision_at_send,
+            keypair,
+            author_user_id,
+            kind,
+            body,
+            timestamp,
+            thread_root,
+            thread_parent,
+            Vec::new(),
+            None,
+            rider_provenance,
+        )
+    }
+
+    /// Build and sign a public message with structured attribution
+    /// (ADR-0040).
+    ///
+    /// `mentions` carries hex AgentIds for daemon-side mention routing;
+    /// `delegation_digest` (hex) marks the message as sent under a
+    /// delegation's `send_as` authority. Either being non-empty selects the
+    /// v3 signing domain; both empty yields a byte-identical v1/v2 message.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sign_with_attribution(
+        group_id: String,
+        state_hash_at_send: String,
+        revision_at_send: u64,
+        keypair: &AgentKeypair,
+        author_user_id: Option<String>,
+        kind: GroupPublicMessageKind,
+        body: String,
+        timestamp: u64,
+        thread_root: Option<String>,
+        thread_parent: Option<String>,
+        mentions: Vec<String>,
+        delegation_digest: Option<String>,
+        rider_provenance: Option<RiderProvenance>,
+    ) -> Result<Self, ApplyError> {
         let author_agent_id = hex::encode(keypair.agent_id().as_bytes());
         let author_public_key = hex::encode(keypair.public_key().as_bytes());
         let mut msg = Self {
@@ -683,6 +767,8 @@ impl GroupPublicMessage {
             timestamp,
             thread_root,
             thread_parent,
+            mentions,
+            delegation_digest,
             rider_provenance,
             signature: String::new(),
         };
@@ -775,6 +861,17 @@ pub enum IngestError {
     /// A thread field references the message's own `msg_id`.
     #[error("thread field '{field}' must not equal the message's own msg_id")]
     ThreadSelfReference { field: &'static str },
+    /// A delegation-carrier message also carried send-as attribution.
+    #[error("delegation-kind messages must not carry delegation_digest")]
+    DelegationKindMismatch,
+    /// The body of a delegation-kind message is not a valid signed
+    /// delegation envelope (bad JSON or failed verification).
+    #[error("delegation envelope invalid: {0}")]
+    InvalidDelegationEnvelope(String),
+    /// A send-as message's delegation reference did not authorize it
+    /// (missing, not effective, wrong delegate, wrong scope, or expired).
+    #[error("send-as authorization failed: {0}")]
+    SendAsUnauthorized(String),
 }
 
 /// Context passed to the ingest validator. Receivers build this from
@@ -869,10 +966,57 @@ fn validate_public_message_inner(
             field: "thread_parent",
         });
     }
+
+    // 4b. attribution structural checks (ADR-0040): mentions are hex
+    //     AgentIds (64 lowercase hex) and a delegation digest is 64
+    //     lowercase hex. Cheap rejects before ML-DSA verify.
+    for mention in &msg.mentions {
+        validate_thread_hex("mentions", mention)?;
+    }
+    if let Some(digest) = &msg.delegation_digest {
+        validate_thread_hex("delegation_digest", digest)?;
+    }
+    // Kind/field consistency: a delegation-kind message is the group-bus
+    // carrier for a SignedDelegation envelope; attribution (send-as) is a
+    // chat concern and must not ride a delegation grant.
+    if matches!(msg.kind, GroupPublicMessageKind::Delegation) && msg.delegation_digest.is_some() {
+        return Err(IngestError::DelegationKindMismatch);
+    }
+
     // 5. signature + author binding
     msg.verify_signature()
         .map_err(|e| IngestError::InvalidSignature(format!("{e}")))?;
 
+    // 5b. delegation-carrier body check (ADR-0040): the envelope inside a
+    //     delegation-kind message must verify against the DELEGATOR's own
+    //     key and bind to this group. The message signature alone only
+    //     proves the publisher; the envelope proves the authority.
+    if matches!(msg.kind, GroupPublicMessageKind::Delegation) {
+        let sd: crate::delegation::SignedDelegation =
+            serde_json::from_str(&msg.body).map_err(|e| {
+                IngestError::InvalidDelegationEnvelope(format!(
+                    "body is not a signed delegation: {e}"
+                ))
+            })?;
+        crate::delegation::verify_delegation(&sd)
+            .map_err(|e| IngestError::InvalidDelegationEnvelope(format!("{e}")))?;
+        if sd.delegation.group_id != msg.group_id {
+            return Err(IngestError::InvalidDelegationEnvelope(format!(
+                "envelope group {} does not match carrier group {}",
+                sd.delegation.group_id, msg.group_id
+            )));
+        }
+        // The delegator must be a current member: a removed delegator's
+        // grants auto-expire with their membership (ADR-0040).
+        if !ctx
+            .members_v2
+            .contains_key(&hex::encode(sd.delegation.from_agent.as_bytes()))
+        {
+            return Err(IngestError::InvalidDelegationEnvelope(
+                "delegator is not a member of this group".into(),
+            ));
+        }
+    }
     // Review r3 (CRITICAL): rider provenance is only trustworthy behind
     // a SUB-AGENT-SIGNED delegation. Before treating the asserted
     // sub_agent_id as the acting principal, verify the full chain —
@@ -1891,6 +2035,246 @@ mod tests {
         assert!(matches!(
             validate_public_message(&ctx, &msg).unwrap_err(),
             IngestError::InvalidSignature(_)
+        ));
+    }
+
+    // ── ADR-0040: structured mentions + send-as attribution ────────────────
+
+    #[test]
+    fn attribution_fields_preserve_v1_byte_identity() {
+        // WHY: absent mentions/delegation_digest must sign EXACTLY the
+        // pre-0040 v1 bytes, or every legacy message would need re-signing
+        // and old peers would reject new v1-shaped traffic. The expected
+        // bytes are hand-rolled from the documented v1 layout — a genuine
+        // pin, not a restatement of the implementation.
+        let kp = make_kp();
+        let msg = build_signed_msg(&kp, "g1", "hello", GroupPublicMessageKind::Chat);
+        assert!(
+            msg.mentions.is_empty() && msg.delegation_digest.is_none(),
+            "plain sign() produces no attribution"
+        );
+        let bytes = msg.signable_bytes();
+        assert!(bytes.starts_with(PUBLIC_MESSAGE_DOMAIN));
+
+        let mut expected = Vec::new();
+        expected.extend_from_slice(PUBLIC_MESSAGE_DOMAIN);
+        let lp = |v: &mut Vec<u8>, field: &str| {
+            v.extend_from_slice(&(field.len() as u32).to_le_bytes());
+            v.extend_from_slice(field.as_bytes());
+        };
+        lp(&mut expected, "g1");
+        lp(&mut expected, "state-hash-1");
+        expected.extend_from_slice(&1u64.to_le_bytes());
+        lp(&mut expected, &msg.author_agent_id);
+        lp(&mut expected, &msg.author_public_key);
+        lp(&mut expected, "");
+        let kind_bytes = bincode::serialize(&msg.kind).unwrap();
+        expected.extend_from_slice(&(kind_bytes.len() as u32).to_le_bytes());
+        expected.extend_from_slice(&kind_bytes);
+        lp(&mut expected, "hello");
+        expected.extend_from_slice(&1_000u64.to_le_bytes());
+
+        assert_eq!(
+            hex::encode(&bytes),
+            hex::encode(&expected),
+            "unattributed v1 message must be byte-identical to the pre-0040 layout"
+        );
+    }
+
+    #[test]
+    fn threaded_message_still_uses_v2_domain_without_attribution() {
+        // WHY: attribution fields must not disturb the ADR-0029 thread
+        // shape either — v2 bytes for threaded messages stay identical.
+        let kp = make_kp();
+        let root = "a".repeat(64);
+        let msg = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "reply".into(),
+            1_000,
+            Some(root.clone()),
+            Some(root),
+            None,
+        )
+        .unwrap();
+        assert!(msg.signable_bytes().starts_with(PUBLIC_MESSAGE_DOMAIN_V2));
+    }
+
+    #[test]
+    fn mentions_and_digest_select_v3_domain_and_verify() {
+        // WHY: tamper-evidence — mentions and the send-as reference are
+        // covered by the author's signature, so neither can be injected or
+        // stripped by a relay.
+        let kp = make_kp();
+        let mentioned = make_kp();
+        let mention_hex = hex::encode(mentioned.agent_id().as_bytes());
+        let msg = GroupPublicMessage::sign_with_attribution(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &kp,
+            None,
+            GroupPublicMessageKind::Chat,
+            "you up?".into(),
+            1_000,
+            None,
+            None,
+            vec![mention_hex.clone()],
+            Some("f".repeat(64)),
+            None,
+        )
+        .unwrap();
+        assert!(msg.signable_bytes().starts_with(PUBLIC_MESSAGE_DOMAIN_V3));
+        assert!(msg.verify_signature().is_ok());
+
+        // Stripping the mentions changes the bytes ⇒ signature fails.
+        let mut stripped = msg.clone();
+        stripped.mentions = Vec::new();
+        stripped.delegation_digest = None;
+        assert!(
+            stripped.verify_signature().is_err(),
+            "an attributed message cannot be downgraded to unattributed bytes"
+        );
+
+        // Mutating a mention ⇒ signature fails.
+        let mut tampered = msg.clone();
+        tampered.mentions = vec![hex::encode([9u8; 32])];
+        assert!(tampered.verify_signature().is_err());
+        let _ = mention_hex;
+    }
+
+    #[test]
+    fn bad_mention_and_digest_shapes_are_rejected_before_crypto() {
+        // WHY: hex AgentIds and digests must be well-formed or the routing
+        // layer would match on garbage; cheap structural reject first.
+        let kp = make_kp();
+        let mut msg = build_signed_msg(&kp, "g1", "hi", GroupPublicMessageKind::Chat);
+        msg.mentions = vec!["not-hex".into()];
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &open_policy(),
+            members_v2: &BTreeMap::new(),
+        };
+        assert!(matches!(
+            validate_public_message(&ctx, &msg),
+            Err(IngestError::InvalidThreadField {
+                field: "mentions",
+                ..
+            })
+        ));
+
+        let mut msg2 = build_signed_msg(&kp, "g1", "hi", GroupPublicMessageKind::Chat);
+        msg2.delegation_digest = Some("ZZ".into());
+        assert!(matches!(
+            validate_public_message(&ctx, &msg2),
+            Err(IngestError::InvalidThreadField {
+                field: "delegation_digest",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn delegation_kind_body_must_be_valid_envelope() {
+        // WHY: the carrier's signature only proves who PUBLISHED it; the
+        // envelope inside must independently prove the delegator's own key
+        // signed the grant, and the grant must name this group.
+        let delegator = make_kp();
+        let delegate = make_kp();
+        let members = BTreeMap::from([(
+            hex::encode(delegator.agent_id().as_bytes()),
+            active_member(
+                &hex::encode(delegator.agent_id().as_bytes()),
+                GroupRole::Member,
+            ),
+        )]);
+        let ctx = PublicIngestContext {
+            group_id: "g1",
+            policy: &open_policy(),
+            members_v2: &members,
+        };
+
+        let sd = crate::delegation::sign_delegation(
+            &delegator,
+            &crate::delegation::Delegation {
+                delegation_id: [1; 16],
+                issued_at_ms: 1_000,
+                task_ref: Some([9; 32]),
+                from_agent: delegator.agent_id(),
+                to_agent: delegate.agent_id(),
+                authority_scope: crate::delegation::AuthorityScope::SendAs,
+                verbs: vec![crate::delegation::DelegationVerb::SendPublicMessage],
+                expiry_ms: 60_000,
+                parent_delegation: None,
+                depth: 1,
+                group_id: "g1".into(),
+            },
+        )
+        .unwrap();
+        let carrier = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &delegator,
+            None,
+            GroupPublicMessageKind::Delegation,
+            serde_json::to_string(&sd).unwrap(),
+            1_000,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(validate_public_message(&ctx, &carrier).is_ok());
+
+        // Tampered envelope body inside a VALIDLY-SIGNED carrier (a relay
+        // can publish any bytes it likes; only the inner envelope check
+        // catches the forgery) ⇒ rejected.
+        let mut bad = sd.clone();
+        bad.delegation.expiry_ms = 90_000;
+        let rej = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &delegator,
+            None,
+            GroupPublicMessageKind::Delegation,
+            serde_json::to_string(&bad).unwrap(),
+            1_000,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_public_message(&ctx, &rej),
+            Err(IngestError::InvalidDelegationEnvelope(_))
+        ));
+
+        // Envelope for a different group ⇒ rejected.
+        let mut other = sd;
+        other.delegation.group_id = "g2".into();
+        let rej2 = GroupPublicMessage::sign(
+            "g1".into(),
+            "state-hash-1".into(),
+            1,
+            &delegator,
+            None,
+            GroupPublicMessageKind::Delegation,
+            serde_json::to_string(&other).unwrap(),
+            1_000,
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        assert!(matches!(
+            validate_public_message(&ctx, &rej2),
+            Err(IngestError::InvalidDelegationEnvelope(_))
         ));
     }
 }

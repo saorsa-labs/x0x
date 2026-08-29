@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 163,
+  "endpoint_count": 165,
   "endpoints": [
     {
       "category": "status",
@@ -735,6 +735,20 @@
       "description": "Retrieve cached public messages (non-members on Public read)",
       "method": "GET",
       "path": "/groups/:id/messages"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group delegate",
+      "description": "Issue a signed delegation (effective on durable history commit)",
+      "method": "POST",
+      "path": "/groups/:id/delegate"
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group delegations",
+      "description": "List effective delegations re-derived from durable history",
+      "method": "GET",
+      "path": "/groups/:id/delegations"
     },
     {
       "category": "named-groups",

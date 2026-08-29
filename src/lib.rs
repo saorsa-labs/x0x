@@ -132,6 +132,7 @@ pub mod mls;
 
 /// A2A (Agent2Agent) interoperability — Agent Card adapter (ADR-0017).
 pub mod a2a;
+pub mod delegation;
 
 /// Direct agent-to-agent messaging.
 ///

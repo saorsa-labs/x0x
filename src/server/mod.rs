@@ -14,6 +14,7 @@ pub(crate) use api_watchdog::ApiWatchdogConfig;
 mod auth;
 pub mod config;
 mod crdt_subscriptions;
+mod delegations;
 mod rider_auth;
 mod routes;
 mod sse;
@@ -846,6 +847,8 @@ pub async fn serve_with_options(
             .unwrap_or(DIRECTORY_RESUBSCRIBE_JITTER_MS),
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
+        delegation_index: RwLock::new(HashMap::new()),
+        delegation_ids: RwLock::new(std::collections::HashMap::new()),
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),
@@ -1042,6 +1045,10 @@ pub async fn serve_with_options(
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
 
+    // ADR-0040 (review r5): reconstruct the global delegation-id
+    // registry from ALL groups' durable history at boot — cross-group
+    // id-replay rejection is deterministic from the first query.
+    delegations::rebuild_global_delegation_registry(&state).await;
     // Re-publish our own discoverable group cards after startup so late joiners
     // pick them up.
     let discoverable_ids: Vec<String> = {
@@ -1799,6 +1806,15 @@ pub async fn serve_with_options(
         // Phase E: public-group messaging.
         .route("/groups/:id/send", post(send_group_public_message))
         .route("/groups/:id/messages", get(get_group_public_messages))
+        // ADR-0040 — agent-to-agent delegation.
+        .route(
+            "/groups/:id/delegate",
+            post(delegations::delegate_group_authority),
+        )
+        .route(
+            "/groups/:id/delegations",
+            get(delegations::list_group_delegations),
+        )
         .route("/groups/:id/invite", post(create_group_invite))
         .route("/groups/:id/display-name", put(set_group_display_name))
         // Phase D.3 — state-commit chain endpoints.

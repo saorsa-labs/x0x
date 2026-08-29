@@ -917,4 +917,82 @@ mod tests {
         );
         assert_eq!(member_list.name(), "Pwned", "member rename applies");
     }
+
+    // ── wire byte-compatibility pin (ADR-0040 review chain) ──────────────
+
+    /// TaskItem and TaskListDelta wire shapes are byte-identical to main
+    /// (the signed owner-transfer experiment was descoped — review r7,
+    /// Option B). Pin that a main-shaped (PeerId, TaskListDelta) blob
+    /// decodes unchanged under this branch's codec, so mixed-version
+    /// fleets interoperate exactly as before.
+    #[test]
+    fn legacy_delta_bytes_decode_unchanged() {
+        // Option B descope (review r7): signed owner-transfer removed —
+        // TaskItem and TaskListDelta wire shapes are byte-identical to
+        // main. Pin that a main-shaped (PeerId, TaskListDelta) blob decodes
+        // unchanged under this branch's codec.
+        #[derive(serde::Serialize)]
+        struct MainTaskItem {
+            id: TaskId,
+            checkbox: saorsa_gossip_crdt_sync::OrSet<crate::crdt::CheckboxState>,
+            title: LwwRegister<String>,
+            description: LwwRegister<String>,
+            assignee: LwwRegister<Option<AgentId>>,
+            priority: LwwRegister<u8>,
+            created_by: AgentId,
+            created_at: u64,
+            attestations:
+                std::collections::BTreeMap<crate::crdt::CheckboxState, crate::crdt::OpAttestation>,
+        }
+        #[derive(serde::Serialize)]
+        struct MainDelta {
+            added_tasks: HashMap<TaskId, (MainTaskItem, UniqueTag)>,
+            removed_tasks: HashMap<TaskId, HashSet<UniqueTag>>,
+            task_updates: HashMap<TaskId, MainTaskItem>,
+            ordering_update: Option<LwwRegister<Vec<TaskId>>>,
+            name_update: Option<LwwRegister<String>>,
+            version: u64,
+        }
+        let task_id = TaskId::from_bytes([7u8; 32]);
+        let creator = agent(1);
+        let item = MainTaskItem {
+            id: task_id,
+            checkbox: saorsa_gossip_crdt_sync::OrSet::new(),
+            title: LwwRegister::new("Task 7".to_string()),
+            description: LwwRegister::new("Description 7".to_string()),
+            assignee: LwwRegister::new(None),
+            priority: LwwRegister::new(128),
+            created_by: creator,
+            created_at: 1000,
+            attestations: std::collections::BTreeMap::new(),
+        };
+        let mut added = HashMap::new();
+        added.insert(task_id, (item, (peer(2), 1u64)));
+        let main_delta = MainDelta {
+            added_tasks: added,
+            removed_tasks: HashMap::new(),
+            task_updates: HashMap::new(),
+            ordering_update: None,
+            name_update: None,
+            version: 3,
+        };
+        let blob = bincode::serialize(&(peer(9), main_delta)).expect("main blob");
+        use bincode::Options;
+        let opts = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(8 * 1024 * 1024);
+        let (decoded_peer, decoded): (PeerId, TaskListDelta) = opts
+            .deserialize(&blob)
+            .expect("main delta decodes unchanged");
+        assert_eq!(decoded_peer, peer(9));
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.added_tasks.len(), 1);
+        let restored = decoded
+            .added_tasks
+            .get(&task_id)
+            .map(|(t, _)| t)
+            .expect("task present");
+        assert_eq!(restored.title(), "Task 7");
+    }
 }

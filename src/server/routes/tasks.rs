@@ -206,6 +206,12 @@ pub(in crate::server) struct UpdateTaskRequest {
     /// differs), closing the restart-ABA window.
     #[serde(default)]
     pub(in crate::server) fence_token: Option<String>,
+    /// Hex delegation digest (ADR-0040): authorization evidence for a
+    /// `task_execute` claim/complete performed under a delegation. Validated
+    /// against the group's durably-committed delegation set before the
+    /// mutation runs; invalid ⇒ 403 and nothing changes.
+    #[serde(default)]
+    pub(in crate::server) delegation: Option<String>,
 }
 
 /// Task list entry.
@@ -466,6 +472,55 @@ pub(in crate::server) async fn update_task(
         },
     };
 
+    // ADR-0040 task-execute authorization (review r2): when the caller
+    // cites a delegation on claim/complete, it must be durably committed
+    // in the GROUP's history, grant this verb, target THIS task, name the
+    // local agent as delegate, and be unexpired with its whole chain still
+    // membered. The mutation itself is still self-signed by the local
+    // agent (blocker 25); the delegation is the authorization evidence,
+    // surfaced as `authorized_via` in the response.
+    let mut authorized_via: Option<String> = None;
+    if req.delegation.is_some() {
+        let digest = req.delegation.clone().unwrap_or_default();
+        let Some(scoped) = parse_group_scoped_task_list_id(&id) else {
+            return bad_request(
+                "delegation requires a group-scoped task list (x0x.group.<id>.symphony.<list>)",
+            );
+        };
+        let verb = if req.action == "claim" {
+            x0x::delegation::DelegationVerb::Claim
+        } else {
+            x0x::delegation::DelegationVerb::Complete
+        };
+        let committed =
+            crate::server::delegations::committed_delegations(&state, &scoped.group_id).await;
+        let sd = committed
+            .iter()
+            .find(|sd| hex::encode(x0x::delegation::signed_delegation_digest(sd)) == digest);
+        let Some(sd) = sd else {
+            return forbidden("delegation is not durably committed in this group's history");
+        };
+        if sd.delegation.task_ref.as_ref() != Some(task_id.as_bytes()) {
+            return forbidden("delegation does not target this task");
+        }
+        if let Err(why) = crate::server::delegations::authorize(
+            sd,
+            &state.agent.agent_id(),
+            verb,
+            &scoped.group_id,
+            crate::server::now_millis_u64(),
+            &committed,
+        ) {
+            return forbidden(format!("delegation does not authorize this action: {why}"));
+        }
+        let active = crate::server::delegations::active_members_of(&state, &scoped.group_id).await;
+        if let Err(why) = crate::server::delegations::chain_members_active(sd, &committed, &active)
+        {
+            return forbidden(format!("delegation chain no longer active: {why}"));
+        }
+        authorized_via = Some(hex::encode(sd.delegation.from_agent.as_bytes()));
+    }
+
     let result = match req.action.as_str() {
         "claim" => handle.claim_task_versioned(task_id, expected).await,
         "complete" => handle.complete_task_versioned(task_id, expected).await,
@@ -491,21 +546,31 @@ pub(in crate::server) async fn update_task(
             });
             (
                 StatusCode::OK,
-                Json(serde_json::json!({
-                    "ok": true,
-                    "version": fence.revision,
-                    "fence_token": fence.to_wire(),
-                    "committed": "local",
-                    "resolution": {
-                        "agent_id": hex::encode(advisory.agent.as_bytes()),
-                        "locally_winning": advisory.locally_winning,
-                        "current_winner": current_winner,
-                        "pending_convergence": true,
-                    },
-                    "cas": { "scope": "local_replica" },
-                    "execution": { "authorization": "advisory" },
-                    "exclusive": false,
-                })),
+                Json({
+                    // ADR-0040: authorization evidence when the caller
+                    // cited a task-execute delegation (absent otherwise).
+                    let mut body = serde_json::json!({
+                        "ok": true,
+                        "version": fence.revision,
+                        "fence_token": fence.to_wire(),
+                        "committed": "local",
+                        "resolution": {
+                            "agent_id": hex::encode(advisory.agent.as_bytes()),
+                            "locally_winning": advisory.locally_winning,
+                            "current_winner": current_winner,
+                            "pending_convergence": true,
+                        },
+                        "cas": { "scope": "local_replica" },
+                        "execution": { "authorization": "advisory" },
+                        "exclusive": false,
+                    });
+                    if let Some(delegator) = &authorized_via {
+                        body["authorized_via"] = serde_json::json!({
+                            "delegator_agent_id": delegator,
+                        });
+                    }
+                    body
+                }),
             )
         }
         Ok(x0x::TaskMutationOutcome::StaleLocalVersion { current }) => (

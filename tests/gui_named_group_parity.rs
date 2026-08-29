@@ -40,6 +40,21 @@ const DEFERRED: &[(Method, &str, &str)] = &[
         "/groups/:id/state/commits",
         "verification/audit read surface; exposed via CLI + REST, GUI viewer deferred",
     ),
+    // ADR-0040 delegation is an agent-to-agent authority surface: agents
+    // (and their harnesses) delegate via the CLI/REST, not a routine
+    // browser action. A GUI delegation manager (issue + list + revoke) is
+    // deferred until there is a product need; the WS mention event it
+    // would consume is already emitted daemon-side.
+    (
+        Method::Post,
+        "/groups/:id/delegate",
+        "agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred",
+    ),
+    (
+        Method::Get,
+        "/groups/:id/delegations",
+        "agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred",
+    ),
     // The adversarial test endpoint is only meaningful as a CLI /
     // harness probe; exposing it in the browser UI would be confusing
     // and has no product use case.
