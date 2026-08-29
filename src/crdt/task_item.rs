@@ -125,13 +125,15 @@ pub struct TaskItem {
     /// influence [`TaskItem::owner`]. Claiming does NOT touch this map —
     /// a claim is an advisory candidate, not an ownership change.
     ///
-    /// This is the **trailing** serialized field (see `attestations` above
-    /// for the rationale): bincode is positional, so the tolerant
-    /// deserializer lets a legacy blob whose bytes end before this field
-    /// decode to an empty map — ownership then resolves to `created_by`,
-    /// exactly the pre-ADR-0040 observable. New fields MUST be added after
-    /// this one.
-    #[serde(default, deserialize_with = "deserialize_owner_transfers")]
+    /// WIRE FORMAT (review r2): this field is NOT serialized on TaskItem.
+    /// As a trailing tolerant field it only decoded at stream EOF — nested
+    /// inside a `TaskListDelta`, a legacy delta's following bytes would
+    /// misalign (broken legacy-delta decode). Ownership instead rides the
+    /// DELTA as its own trailing EOF-tolerant map
+    /// (`TaskListDelta::owner_transfers`), keeping TaskItem bytes identical
+    /// to the pre-0040 shape so legacy deltas decode unchanged. In-memory
+    /// merge paths union it through the admission gate as usual.
+    #[serde(skip)]
     owner_transfers: BTreeMap<OwnerTransfer, OpAttestation>,
 }
 
@@ -151,19 +153,6 @@ where
 {
     use serde::Deserialize;
     Ok(BTreeMap::<CheckboxState, OpAttestation>::deserialize(deserializer).unwrap_or_default())
-}
-
-/// Deserialize the trailing ownership-transfer map, tolerating its absence —
-/// same stream-EOF rationale as [`deserialize_attestations`]. An empty map
-/// resolves ownership to `created_by`, the exact pre-ADR-0040 observable.
-fn deserialize_owner_transfers<'de, D>(
-    deserializer: D,
-) -> std::result::Result<BTreeMap<OwnerTransfer, OpAttestation>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    use serde::Deserialize;
-    Ok(BTreeMap::<OwnerTransfer, OpAttestation>::deserialize(deserializer).unwrap_or_default())
 }
 
 impl TaskItem {
@@ -549,6 +538,35 @@ impl TaskItem {
             .iter()
             .map(|(t, a)| (*t, a.clone()))
             .collect()
+    }
+
+    /// Crate-internal view of the ownership-transfer map (delta wiring:
+    /// `TaskListDelta::for_add`/`for_state_change` lift it to the
+    /// delta-level trailing field).
+    pub(crate) fn owner_transfers_map(&self) -> &BTreeMap<OwnerTransfer, OpAttestation> {
+        &self.owner_transfers
+    }
+
+    /// Union a remote ownership-transfer map into this task and run the
+    /// ownership admission gate (delta wiring — TaskItem's wire shape
+    /// carries no ownership; it rides `TaskListDelta::owner_transfers`).
+    pub(crate) fn ingest_owner_transfers(
+        &mut self,
+        scope: TaskListId,
+        transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
+    ) {
+        for (transfer, att) in transfers {
+            self.owner_transfers
+                .entry(*transfer)
+                .or_insert_with(|| att.clone());
+        }
+        let dropped = purge_unverified_owner_transfers(&scope, &self.id, &mut self.owner_transfers);
+        if dropped > 0 {
+            tracing::debug!(
+                dropped,
+                "purged unverified owner transfers during delta apply"
+            );
+        }
     }
 
     /// Get the current checkbox state.

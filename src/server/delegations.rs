@@ -22,31 +22,45 @@ use crate::server::state::AppState;
 /// Prefix marking a delegation-handoff DM payload (ADR-0040 notification).
 pub(crate) const DELEGATION_DM_PREFIX: &[u8] = b"x0x-delegation:v1:";
 
-/// Per-group view of durably-committed delegation envelopes.
+/// Per-group cache over durably-committed delegation envelopes. Durable
+/// history is the source of truth; this index is ONLY a cache with a
+/// rowid freshness probe (review r2): any use first checks the group's
+/// newest history rowid and rescans when history has grown, so an
+/// already-committed delegation is never rejected because of a stale
+/// warmed index.
 #[derive(Debug, Default)]
 pub(crate) struct DelegationIndex {
-    /// True once the index has been (re)built from durable history. A
-    /// restarted daemon starts empty+unloaded and rebuilds on first use.
+    /// True once the index has been (re)built from durable history.
     loaded: bool,
+    /// Highest history rowid observed at build/rescan time. The freshness
+    /// probe compares the group's current newest rowid against this.
+    max_row_id: i64,
     /// Verified envelopes keyed by delegation digest. Presence == the
     /// carrier is durably committed locally.
     by_digest: HashMap<[u8; 32], x0x::delegation::SignedDelegation>,
+    /// Per-group seen delegation ids — the uniqueness registry (review r2):
+    /// one issuance id may ever name one envelope here. A second envelope
+    /// reusing an id (replay/forge) is rejected, keeping ADR-0040's
+    /// unique-issuance audit property honest.
+    seen_ids: std::collections::HashSet<[u8; 16]>,
 }
 
-/// Extract + verify every delegation envelope from a group's durable
-/// history rows.
-///
-/// Pure function over rows: parse the carrier artifact, keep only
-/// `kind == "delegation"` messages, decode the
-/// [`x0x::delegation::SignedDelegation`] body, verify it against the
-/// delegator's own key, and key it by digest. Invalid carriers are skipped
-/// (fail-closed): a malformed row means the envelope never becomes
-/// effective here until a valid copy arrives.
+/// Build the digest map + seen-id registry from history rows in COMMIT
+/// order (ascending rowid). First-seen delegation_id wins; a different
+/// envelope reusing the id is dropped (never enters the digest map, so it
+/// can never authorize).
 fn index_from_rows(
     rows: &[x0x::history::StoredRecord],
-) -> HashMap<[u8; 32], x0x::delegation::SignedDelegation> {
+) -> (
+    HashMap<[u8; 32], x0x::delegation::SignedDelegation>,
+    std::collections::HashSet<[u8; 16]>,
+) {
     let mut map = HashMap::new();
-    for row in rows {
+    let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
+    // Query pages arrive newest-first; commit order is ascending rowid.
+    let mut ordered: Vec<&x0x::history::StoredRecord> = rows.iter().collect();
+    ordered.sort_by_key(|r| r.id);
+    for row in ordered {
         let Some(artifact) = row.record.signed_artifact.as_deref() else {
             continue;
         };
@@ -64,56 +78,125 @@ fn index_from_rows(
         else {
             continue;
         };
-        if x0x::delegation::verify_delegation(&sd).is_ok() {
-            map.insert(x0x::delegation::signed_delegation_digest(&sd), sd);
+        if x0x::delegation::verify_delegation(&sd).is_err() {
+            continue;
         }
+        // Uniqueness registry: a replayed/modified envelope reusing an
+        // already-seen delegation_id is rejected outright.
+        if !seen.insert(sd.delegation.delegation_id) {
+            tracing::warn!(
+                group_id = %sd.delegation.group_id,
+                "dropping delegation carrier: delegation_id already issued (replay)"
+            );
+            continue;
+        }
+        map.insert(x0x::delegation::signed_delegation_digest(&sd), sd);
     }
-    map
+    (map, seen)
 }
 
-/// Ensure the per-group index is loaded from durable history, then return a
-/// snapshot of every durably-committed envelope.
+/// Newest rowid for the group's history scope, if any row exists.
+fn newest_row_id(store: &x0x::history::Store, group_id: &str) -> Option<i64> {
+    let q = x0x::history::HistoryQuery {
+        scope: Some(x0x::history::Scope::Group(group_id.to_string())),
+        limit: 1,
+        ..Default::default()
+    };
+    store.query(&q).ok()?.first().map(|r| r.id)
+}
+
+/// Full paginated rescan of the group's durable history (review r2: no
+/// newest-N cap — every committed row is visible, keyed by rowid cursor).
+fn scan_group_history(
+    store: &x0x::history::Store,
+    group_id: &str,
+) -> (Vec<x0x::history::StoredRecord>, i64) {
+    let mut rows = Vec::new();
+    let mut before_id: Option<i64> = None;
+    let mut max_row_id = 0i64;
+    loop {
+        let q = x0x::history::HistoryQuery {
+            scope: Some(x0x::history::Scope::Group(group_id.to_string())),
+            limit: 500,
+            before_id,
+            ..Default::default()
+        };
+        let Ok(page) = store.query(&q) else { break };
+        if page.is_empty() {
+            break;
+        }
+        if let Some(newest) = page.first().map(|r| r.id) {
+            max_row_id = max_row_id.max(newest);
+        }
+        let next_cursor = page.last().map(|r| r.id);
+        let done = page.len() < 500;
+        rows.extend(page);
+        if done {
+            break;
+        }
+        before_id = next_cursor;
+    }
+    (rows, max_row_id)
+}
+
+/// Ensure the per-group index is FRESH against durable history, then return
+/// a snapshot of every durably-committed envelope.
+///
+/// The freshness probe queries the group's newest history rowid on every
+/// call: durable history stays the single source of truth, the in-memory
+/// map is only a cache, and a warmed-but-stale index can never cause a
+/// false rejection of an already-committed delegation.
 pub(in crate::server) async fn committed_delegations(
     state: &AppState,
     group_id: &str,
 ) -> Vec<x0x::delegation::SignedDelegation> {
-    // Fast path: already loaded.
-    {
-        let index = state.delegation_index.read().await;
-        if let Some(loaded) = index.get(group_id) {
-            if loaded.loaded {
-                return loaded.by_digest.values().cloned().collect();
-            }
-        }
-    }
-    // Slow path: rebuild from THIS daemon's durable history (blocker 28:
-    // crash/restart re-derives from the store).
-    let mut map = HashMap::new();
+    // Freshness probe (cheap: limit-1 query).
+    let mut newest: Option<i64> = None;
     if let Some(history) = state.agent.history() {
         let store = std::sync::Arc::clone(history.store());
         let scope = group_id.to_string();
-        let queried = tokio::task::spawn_blocking(move || {
-            let q = x0x::history::HistoryQuery {
-                scope: Some(x0x::history::Scope::Group(scope)),
-                limit: 1000,
-                ..Default::default()
-            };
-            store.query(&q)
-        })
-        .await;
-        if let Ok(Ok(rows)) = queried {
-            map = index_from_rows(&rows);
+        newest = tokio::task::spawn_blocking(move || newest_row_id(&store, &scope))
+            .await
+            .ok()
+            .flatten();
+    }
+    {
+        let index = state.delegation_index.read().await;
+        if let Some(entry) = index.get(group_id) {
+            if entry.loaded && newest.is_none_or(|id| id <= entry.max_row_id) {
+                return entry.by_digest.values().cloned().collect();
+            }
+        }
+    }
+    // Slow path: full rescan from THIS daemon's durable history (blocker
+    // 28: crash/restart re-derives from the store; r2: complete, uncapped).
+    let mut map = HashMap::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut max_row_id = 0i64;
+    if let Some(history) = state.agent.history() {
+        let store = std::sync::Arc::clone(history.store());
+        let scope = group_id.to_string();
+        let scanned = tokio::task::spawn_blocking(move || scan_group_history(&store, &scope)).await;
+        if let Ok((rows, scanned_max)) = scanned {
+            max_row_id = scanned_max;
+            let (m, s) = index_from_rows(&rows);
+            map = m;
+            seen = s;
         }
     }
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
     entry.loaded = true;
+    entry.max_row_id = entry.max_row_id.max(max_row_id);
     entry.by_digest = map;
+    entry.seen_ids = seen;
     entry.by_digest.values().cloned().collect()
 }
 
 /// Record a just-committed delegation into the index (called only after the
-/// carrier's SQLite transaction committed).
+/// carrier's SQLite transaction committed). Fast path only — the next
+/// freshness probe still verifies against history (rowid watermark is NOT
+/// bumped here, so a subsequent committed row triggers a proper rescan).
 pub(in crate::server) async fn index_committed(
     state: &AppState,
     group_id: &str,
@@ -122,9 +205,12 @@ pub(in crate::server) async fn index_committed(
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
     entry.loaded = true;
-    entry
-        .by_digest
-        .insert(x0x::delegation::signed_delegation_digest(&sd), sd);
+    // Uniqueness registry holds even on the fast path.
+    if entry.seen_ids.insert(sd.delegation.delegation_id) {
+        entry
+            .by_digest
+            .insert(x0x::delegation::signed_delegation_digest(&sd), sd);
+    }
 }
 
 /// Is `sd` an effective authorization for `actor` to exercise `verb` in
@@ -165,9 +251,10 @@ pub(in crate::server) fn authorize(
         return Err("delegation has expired".into());
     }
     if d.depth > 1 {
-        // Re-delegation: the parent must also be durably committed and the
-        // chain must verify. Authority that cannot be traced to a committed
-        // root is not authority.
+        // Re-delegation: the parent must also be durably committed, the
+        // chain must verify, the child must be ATTENUATED by the parent
+        // (review r2 — no authority escalation), and the PARENT must still
+        // be effective: removing or expiring the root stops the whole chain.
         let Some(parent_digest) = d.parent_delegation else {
             return Err("re-delegation without a parent digest".into());
         };
@@ -179,6 +266,51 @@ pub(in crate::server) fn authorize(
         };
         if let Err(e) = x0x::delegation::verify_chain(parent, sd) {
             return Err(format!("chain verification failed: {e}"));
+        }
+        if let Err(e) = x0x::delegation::is_attenuated_by(&parent.delegation, d) {
+            return Err(format!("re-delegation is not bounded by its parent: {e}"));
+        }
+        if !x0x::delegation::is_effective_time(&parent.delegation, now_ms) {
+            return Err("parent delegation has expired".into());
+        }
+        // The PARENT's delegate (this chain's delegator) must still be the
+        // actor of the parent link — verify_chain proved it — and the
+        // parent's own parties must still be members; the caller supplies
+        // the roster view (chain_members_active).
+    }
+    Ok(())
+}
+
+/// Membership of every agent in the delegation chain (review r2): removing
+/// the ROOT delegator (or any intermediate) must stop use of a depth-2
+/// grant, not just removal of the child's own parties.
+pub(in crate::server) fn chain_members_active(
+    sd: &x0x::delegation::SignedDelegation,
+    committed: &[x0x::delegation::SignedDelegation],
+    active_hex: &std::collections::HashSet<String>,
+) -> Result<(), String> {
+    let mut chain = vec![sd.delegation.from_agent, sd.delegation.to_agent];
+    let mut current = sd;
+    while current.delegation.depth > 1 {
+        let Some(parent_digest) = current.delegation.parent_delegation else {
+            return Err("re-delegation without a parent digest".into());
+        };
+        let Some(parent) = committed
+            .iter()
+            .find(|p| x0x::delegation::signed_delegation_digest(p) == parent_digest)
+        else {
+            return Err("parent delegation is not durably committed here".into());
+        };
+        chain.push(parent.delegation.from_agent);
+        chain.push(parent.delegation.to_agent);
+        current = parent;
+    }
+    for agent in chain {
+        if !active_hex.contains(&hex::encode(agent.as_bytes())) {
+            return Err(format!(
+                "delegation chain touches a removed member ({}) — authority auto-expired",
+                hex::encode(agent.as_bytes())
+            ));
         }
     }
     Ok(())
@@ -218,8 +350,36 @@ pub(in crate::server) async fn authorize_send_as(
         group_id,
         now_ms,
         &committed,
-    )
-    .map(|()| sd.clone())
+    )?;
+    // Chain-wide membership (review r2): every agent in the delegation
+    // chain must still be an active member — removing the root delegator
+    // stops the child grant's use.
+    let active_hex = active_member_hex(state, group_id).await;
+    chain_members_active(sd, &committed, &active_hex)?;
+    Ok(sd.clone())
+}
+
+/// Snapshot of the group's active-member hex ids (lowercase).
+async fn active_member_hex(state: &AppState, group_id: &str) -> std::collections::HashSet<String> {
+    let groups = state.named_groups.read().await;
+    groups
+        .get(group_id)
+        .map(|info| {
+            info.members_v2
+                .values()
+                .filter(|m| m.state == x0x::groups::GroupMemberState::Active)
+                .map(|m| m.agent_id.to_lowercase())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Roster snapshot for cross-module authorization checks (task-execute).
+pub(in crate::server) async fn active_members_of(
+    state: &AppState,
+    group_id: &str,
+) -> std::collections::HashSet<String> {
+    active_member_hex(state, group_id).await
 }
 
 // ───────────────────────────── REST handlers ─────────────────────────────
@@ -371,9 +531,10 @@ pub(in crate::server) async fn delegate_group_authority(
     let (stable_id, state_hash, state_revision) = snapshot;
 
     // Depth/parent: a re-delegation must chain off a delegation held by the
-    // local agent (to_agent == local) that is effective NOW.
-    let (parent, depth) = match &req.parent {
-        None => (None, 1u8),
+    // local agent (to_agent == local) that is effective NOW, and the child
+    // must be ATTENUATED by it (review r2 — no authority escalation).
+    let (parent, parent_sd) = match &req.parent {
+        None => (None, None),
         Some(parent_hex) => {
             let digest = hex::decode(parent_hex)
                 .ok()
@@ -399,14 +560,15 @@ pub(in crate::server) async fn delegate_group_authority(
             if parent.delegation.depth >= x0x::delegation::MAX_DELEGATION_DEPTH {
                 return conflict("parent is already at the depth cap (A→B→C, not further)");
             }
-            (Some(digest), parent.delegation.depth + 1)
+            (Some(digest), Some(parent.clone()))
         }
     };
+    let depth = parent_sd.as_ref().map_or(1u8, |p| p.delegation.depth + 1);
 
     // Build + sign the envelope with the LOCAL agent's key (blocker 25: the
     // delegator's own key; the delegate never holds it).
     let delegation = x0x::delegation::Delegation {
-        delegation_id: rand_delegation_id(),
+        delegation_id: fresh_delegation_id(&state, &stable_id).await,
         issued_at_ms: now_ms,
         task_ref,
         from_agent: local,
@@ -418,6 +580,12 @@ pub(in crate::server) async fn delegate_group_authority(
         depth,
         group_id: stable_id.to_string(),
     };
+    // Issue-side attenuation (review r2): reject escalation BEFORE signing.
+    if let Some(parent_sd) = &parent_sd {
+        if let Err(e) = x0x::delegation::is_attenuated_by(&parent_sd.delegation, &delegation) {
+            return conflict(format!("re-delegation exceeds its parent grant: {e}"));
+        }
+    }
     let signing_kp = state.agent.identity().agent_keypair();
     let signed = match x0x::delegation::sign_delegation(signing_kp, &delegation) {
         Ok(sd) => sd,
@@ -527,14 +695,34 @@ async fn notify_delegate(
     }
 }
 
-/// Random 128-bit delegation id. Uniqueness, not unpredictability, is the
-/// requirement (the digest binds the grant); time-seeded BLAKE3 is ample.
+/// Fresh, registry-checked delegation id (review r2): the id must be unique
+/// within the group's seen-issuance registry — the ADR's unique-issuance
+/// audit claim is enforced, not assumed from a hash.
+async fn fresh_delegation_id(state: &AppState, group_id: &str) -> [u8; 16] {
+    for _ in 0..8 {
+        let candidate = rand_delegation_id();
+        let seen = state
+            .delegation_index
+            .read()
+            .await
+            .get(group_id)
+            .is_some_and(|entry| entry.seen_ids.contains(&candidate));
+        if !seen {
+            return candidate;
+        }
+    }
+    // Practically unreachable (128-bit space); last resort still unique-ish
+    // by time and the registry will reject a true collision at commit.
+    rand_delegation_id()
+}
+
 fn rand_delegation_id() -> [u8; 16] {
     let mut id = [0u8; 16];
-    let seed = std::time::SystemTime::now()
+    let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
+    let seed = nanos ^ ((std::process::id() as u128) << 96);
     let h = blake3::hash(&seed.to_le_bytes());
     id.copy_from_slice(&h.as_bytes()[..16]);
     id

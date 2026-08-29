@@ -12,7 +12,7 @@
 //!
 //! This significantly reduces bandwidth usage in collaborative scenarios.
 
-use crate::crdt::{Result, TaskId, TaskItem, TaskList, TaskListId};
+use crate::crdt::{OpAttestation, OwnerTransfer, Result, TaskId, TaskItem, TaskList, TaskListId};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{DeltaCrdt, LwwRegister};
 use saorsa_gossip_types::PeerId;
@@ -51,6 +51,36 @@ pub struct TaskListDelta {
 
     /// Version number of this delta
     pub version: u64,
+
+    /// Ownership transfers (ADR-0040, blocker 27), keyed by task. This is
+    /// the delta's ABSOLUTE trailing field with a stream-EOF-tolerant
+    /// deserializer: a legacy delta blob (pre-0040, bytes ending after
+    /// `version`) decodes with an empty map — TaskItem's own wire shape is
+    /// byte-identical to pre-0040, so nothing nested ever misaligns
+    /// (review r2 fix). Each entry merges through the ownership admission
+    /// gate at apply time. MUST remain the last field.
+    #[serde(default, deserialize_with = "deserialize_owner_transfers")]
+    pub owner_transfers: HashMap<TaskId, std::collections::BTreeMap<OwnerTransfer, OpAttestation>>,
+}
+
+/// Tolerant trailing decode of the ownership map: absent (stream EOF right
+/// after `version`) ⇒ empty map, exactly the pre-ADR-0040 observable.
+fn deserialize_owner_transfers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<
+    HashMap<TaskId, std::collections::BTreeMap<OwnerTransfer, OpAttestation>>,
+    D::Error,
+>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(
+        HashMap::<TaskId, std::collections::BTreeMap<OwnerTransfer, OpAttestation>>::deserialize(
+            deserializer,
+        )
+        .unwrap_or_default(),
+    )
 }
 
 impl TaskListDelta {
@@ -63,6 +93,7 @@ impl TaskListDelta {
             task_updates: HashMap::new(),
             ordering_update: None,
             name_update: None,
+            owner_transfers: HashMap::new(),
             version,
         }
     }
@@ -71,17 +102,30 @@ impl TaskListDelta {
     #[must_use]
     pub fn for_add(task_id: TaskId, task: TaskItem, tag: UniqueTag, version: u64) -> Self {
         let mut delta = Self::new(version);
+        if !task.owner_transfers_map().is_empty() {
+            delta
+                .owner_transfers
+                .insert(task_id, task.owner_transfers_map().clone());
+        }
         delta.added_tasks.insert(task_id, (task, tag));
         delta
     }
 
-    /// Create a delta for a state change (claim or complete).
+    /// Create a delta for a state change (claim, complete, or ownership
+    /// transfer).
     ///
     /// Includes the full TaskItem so receivers can upsert if they
-    /// haven't received the add delta yet (out-of-order delivery).
+    /// haven't received the add delta yet (out-of-order delivery). The
+    /// task's ownership transfers ride the delta-level map (TaskItem's
+    /// wire shape carries no ownership — see struct docs).
     #[must_use]
     pub fn for_state_change(task_id: TaskId, full_task: TaskItem, version: u64) -> Self {
         let mut delta = Self::new(version);
+        if !full_task.owner_transfers_map().is_empty() {
+            delta
+                .owner_transfers
+                .insert(task_id, full_task.owner_transfers_map().clone());
+        }
         delta.task_updates.insert(task_id, full_task);
         delta
     }
@@ -105,6 +149,7 @@ impl TaskListDelta {
             && self.task_updates.is_empty()
             && self.ordering_update.is_none()
             && self.name_update.is_none()
+            && self.owner_transfers.is_empty()
     }
 
     /// Digest over the full-state content this delta serves, when the delta
@@ -174,6 +219,11 @@ impl TaskList {
         for task in &ordered {
             let task_id = *task.id();
             let tag = (PeerId::new([0u8; 32]), self.next_seq());
+            if !task.owner_transfers_map().is_empty() {
+                delta
+                    .owner_transfers
+                    .insert(task_id, task.owner_transfers_map().clone());
+            }
             delta.added_tasks.insert(task_id, ((*task).clone(), tag));
         }
 
@@ -305,6 +355,15 @@ impl TaskList {
                 // Task not yet known — insert it (admit runs inside).
                 self.delta_upsert_task(updated_task.clone(), peer_id, 0)?;
             }
+        }
+
+        // Ownership transfers (ADR-0040): SELF-AUTHENTICATING ops — like
+        // checkbox attestations they apply regardless of the Layer A
+        // envelope-writer gate, because each entry carries its own
+        // current-owner signature that the admission gate verifies (forged
+        // entries are purged, never applied).
+        for (task_id, transfers) in &delta.owner_transfers {
+            self.delta_apply_owner_transfers(task_id, transfers);
         }
 
         // Apply ordering update via LWW (vector-clock) merge. The merged
@@ -916,5 +975,147 @@ mod tests {
             "member remove applies"
         );
         assert_eq!(member_list.name(), "Pwned", "member rename applies");
+    }
+
+    // ── ADR-0040 (review r2): legacy-DELTA byte compatibility ────────────
+
+    /// Pre-0040 wire shapes: TaskItem had NO owner_transfers field and
+    /// TaskListDelta had no trailing ownership map. Bincode is positional,
+    /// so a tolerant field NESTED inside a delta cannot be told apart from
+    /// the next value's bytes — the original trailing-field-on-TaskItem
+    /// approach broke legacy-delta decode. The fix moves ownership to the
+    /// delta's own trailing map; these tests pin the compat both ways.
+    #[test]
+    fn legacy_delta_bytes_decode_unchanged() {
+        // WHY: an old binary's published (PeerId, TaskListDelta) blob must
+        // decode under the new code with full content and empty ownership.
+        #[derive(serde::Serialize)]
+        struct LegacyTaskItem {
+            id: TaskId,
+            checkbox: saorsa_gossip_crdt_sync::OrSet<crate::crdt::CheckboxState>,
+            title: LwwRegister<String>,
+            description: LwwRegister<String>,
+            assignee: LwwRegister<Option<AgentId>>,
+            priority: LwwRegister<u8>,
+            created_by: AgentId,
+            created_at: u64,
+            attestations: std::collections::BTreeMap<crate::crdt::CheckboxState, OpAttestation>,
+        }
+        #[derive(serde::Serialize)]
+        struct LegacyDelta {
+            added_tasks: HashMap<TaskId, (LegacyTaskItem, UniqueTag)>,
+            removed_tasks: HashMap<TaskId, HashSet<UniqueTag>>,
+            task_updates: HashMap<TaskId, LegacyTaskItem>,
+            ordering_update: Option<LwwRegister<Vec<TaskId>>>,
+            name_update: Option<LwwRegister<String>>,
+            version: u64,
+        }
+
+        let task_id = TaskId::from_bytes([7u8; 32]);
+        let creator = agent(1);
+        let legacy_item = LegacyTaskItem {
+            id: task_id,
+            checkbox: saorsa_gossip_crdt_sync::OrSet::new(),
+            title: LwwRegister::new("Task 7".to_string()),
+            description: LwwRegister::new("Description 7".to_string()),
+            assignee: LwwRegister::new(None),
+            priority: LwwRegister::new(128),
+            created_by: creator,
+            created_at: 1000,
+            attestations: std::collections::BTreeMap::new(),
+        };
+        let mut added = HashMap::new();
+        added.insert(task_id, (legacy_item, (peer(2), 1u64)));
+        let legacy = LegacyDelta {
+            added_tasks: added,
+            removed_tasks: HashMap::new(),
+            task_updates: HashMap::new(),
+            ordering_update: None,
+            name_update: None,
+            version: 3,
+        };
+        let blob = bincode::serialize(&(peer(9), legacy)).expect("legacy blob");
+
+        // Decode with the CURRENT wire codec (same options as
+        // gossip::wire::decode_delta: fixint + trailing tolerance).
+        use bincode::Options;
+        let opts = bincode::options()
+            .with_fixint_encoding()
+            .allow_trailing_bytes()
+            .with_limit(8 * 1024 * 1024);
+        let (decoded_peer, decoded): (PeerId, TaskListDelta) =
+            opts.deserialize(&blob).expect("legacy delta must decode");
+        assert_eq!(decoded_peer, peer(9));
+        assert_eq!(decoded.version, 3);
+        assert_eq!(decoded.added_tasks.len(), 1, "task content survives");
+        assert!(
+            decoded.owner_transfers.is_empty(),
+            "no ownership on the wire for a legacy delta"
+        );
+        let restored = decoded
+            .added_tasks
+            .get(&task_id)
+            .map(|(t, _)| t)
+            .expect("task present");
+        assert_eq!(restored.title(), "Task 7");
+        assert_eq!(
+            restored.owner(),
+            creator,
+            "ownership resolves to created_by exactly as pre-0040"
+        );
+    }
+
+    #[test]
+    fn new_delta_carries_ownership_and_merges() {
+        // WHY: the delta-level map is not just compat scaffolding — a
+        // signed transfer must reach a replica through a real delta and
+        // resolve there after the admission gate.
+        use crate::gossip::SigningContext;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let signing = SigningContext::from_keypair(&kp);
+        let creator = kp.agent_id();
+
+        let task_id = TaskId::from_bytes([3u8; 32]);
+        let mut owned = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(1),
+        );
+        owned
+            .transfer_ownership(
+                TaskListId::new([0x5c; 32]),
+                creator,
+                agent(9),
+                5_000,
+                &signing,
+            )
+            .expect("transfer signs");
+
+        let delta = TaskListDelta::for_state_change(task_id, owned, 4);
+        assert!(
+            delta.owner_transfers.contains_key(&task_id),
+            "transfers ride the delta-level map"
+        );
+
+        // Wire roundtrip then merge into a fresh replica holding the task.
+        let blob = bincode::serialize(&(peer(1), delta)).expect("blob");
+        let (_, decoded): (PeerId, TaskListDelta) =
+            bincode::deserialize(&blob).expect("new delta decodes");
+        // The receiving list's id is the SIGNING SCOPE — scope binding
+        // (v2 canonical bytes) must match or the admission gate drops it.
+        let mut list = TaskList::new(TaskListId::new([0x5c; 32]), "L".into(), peer(1));
+        let fresh = TaskItem::new(
+            task_id,
+            TaskMetadata::new("T", "D", 1, creator, 1_000),
+            peer(1),
+        );
+        list.add_task(fresh, peer(1), 1).expect("add");
+        list.merge_delta(&decoded, peer(2), Some(&creator))
+            .expect("merge");
+        assert_eq!(
+            list.task_owner(&task_id).expect("owner"),
+            agent(9),
+            "signed transfer converges on the replica via the delta map"
+        );
     }
 }

@@ -14,7 +14,9 @@
 //!
 //! This provides eventual consistency with deterministic conflict resolution.
 
-use crate::crdt::{CrdtError, Result, TaskId, TaskItem, TaskListDelta};
+use crate::crdt::{
+    CrdtError, OpAttestation, OwnerTransfer, Result, TaskId, TaskItem, TaskListDelta,
+};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
@@ -540,6 +542,25 @@ impl TaskList {
 
         self.version += 1;
         Ok(())
+    }
+
+    /// Union a delta-carried ownership-transfer map into a known task and
+    /// run the ownership admission + membership gates (ADR-0040). No-op if
+    /// the task is unknown locally — a transfer without its task resolves
+    /// against nothing and is re-carried by a later delta or full serve.
+    pub(crate) fn delta_apply_owner_transfers(
+        &mut self,
+        task_id: &TaskId,
+        transfers: &std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
+    ) {
+        let scope = self.id;
+        let authorized = self.authorized_agents.clone();
+        if let Some(task) = self.task_data.get_mut(task_id) {
+            task.ingest_owner_transfers(scope, transfers);
+            if let Some(members) = &authorized {
+                let _dropped = task.filter_unauthorized(members);
+            }
+        }
     }
 
     /// Claim a task in the list.

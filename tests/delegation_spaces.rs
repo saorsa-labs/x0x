@@ -321,7 +321,7 @@ async fn delegation_sendas_positive_and_forges_cross_daemon() {
     let bob = &pair.bob;
     let proof = AssertUnwindSafe(async {
         mesh_pair(alice, bob).await;
-        let (alice_local, _stable) = create_signed_public_group(alice, "adr0040-forges").await;
+        let (alice_local, stable) = create_signed_public_group(alice, "adr0040-forges").await;
         let bob_id = bob.agent_id().await;
         let alice_id = alice.agent_id().await;
 
@@ -624,6 +624,149 @@ async fn delegation_sendas_positive_and_forges_cross_daemon() {
             .as_str()
             .unwrap_or_default();
         assert_eq!(owner_hex, bob_id, "resolved owner advanced to bob");
+
+        // ── task-exercise delegation (review r2): claim under authority ──
+        // A group-scoped task list, a task_execute delegation from alice
+        // to bob for THAT task, and bob claiming it citing the digest.
+        // An unknown digest or wrong-task digest must be refused (403).
+        let scoped_topic = format!("x0x.group.{stable}.symphony.t{}", rand_val());
+        let created_scoped: Value = authed_client(alice)
+            .post(alice.url("/task-lists"))
+            .json(&serde_json::json!({
+                "name": "adr0040-scoped",
+                "topic": scoped_topic,
+            }))
+            .send()
+            .await
+            .expect("scoped task list create")
+            .json()
+            .await
+            .expect("scoped task list json");
+        assert_eq!(created_scoped["ok"], true, "{created_scoped:?}");
+        let scoped_task: Value = authed_client(alice)
+            .post(alice.url(&format!("/task-lists/{scoped_topic}/tasks")))
+            .json(&serde_json::json!({"title": "delegated work"}))
+            .send()
+            .await
+            .expect("scoped add task")
+            .json()
+            .await
+            .expect("scoped add task json");
+        assert_eq!(scoped_task["ok"], true, "{scoped_task:?}");
+        let scoped_task_id = scoped_task["task_id"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        let te = delegate(
+            alice,
+            &alice_local,
+            &bob_id,
+            "task_execute",
+            now + 60_000,
+            Some(&scoped_task_id),
+            None,
+        )
+        .await;
+        assert_eq!(te.status(), 200, "task_execute delegation issues: {te:?}");
+        let te_json: Value = te.json().await.expect("te json");
+        let te_digest = te_json["delegation_digest"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+
+        // Bob's replica must learn the group-scoped list (same invite-free
+        // trick as above: create a list on the same topic, then wait for
+        // the late-joiner bootstrap to sync alice's task).
+        let bob_scoped: Value = authed_client(bob)
+            .post(bob.url("/task-lists"))
+            .json(&serde_json::json!({
+                "name": "adr0040-scoped-bob",
+                "topic": scoped_topic,
+            }))
+            .send()
+            .await
+            .expect("bob scoped task list join")
+            .json()
+            .await
+            .expect("bob scoped task list json");
+        assert_eq!(bob_scoped["ok"], true, "{bob_scoped:?}");
+        let scoped_synced = wait_until(Duration::from_secs(15), || async {
+            let tasks: Value = authed_client(bob)
+                .get(bob.url(&format!("/task-lists/{scoped_topic}/tasks")))
+                .send()
+                .await
+                .expect("bob scoped tasks read")
+                .json()
+                .await
+                .expect("bob scoped tasks json");
+            tasks["tasks"].as_array().is_some_and(|ts| {
+                ts.iter()
+                    .any(|t| t["id"].as_str() == Some(scoped_task_id.as_str()))
+            })
+        })
+        .await;
+        assert!(scoped_synced, "bob's replica never learned the scoped task");
+
+        // Bob claims the task citing the delegation: 200 + authorized_via.
+        let claimed = authed_client(bob)
+            .patch(bob.url(&format!(
+                "/task-lists/{scoped_topic}/tasks/{scoped_task_id}"
+            )))
+            .json(&serde_json::json!({
+                "action": "claim",
+                "delegation": te_digest,
+            }))
+            .send()
+            .await
+            .expect("delegated claim request");
+        assert_eq!(
+            claimed.status(),
+            200,
+            "delegated claim authorized: {claimed:?}"
+        );
+        let claimed_json: Value = claimed.json().await.expect("claim json");
+        assert_eq!(
+            claimed_json["authorized_via"]["delegator_agent_id"].as_str(),
+            Some(alice_id.as_str()),
+            "response carries the delegator attribution"
+        );
+
+        // Wrong-task digest: the send_as grant does not target this task.
+        let wrong = authed_client(bob)
+            .patch(bob.url(&format!(
+                "/task-lists/{scoped_topic}/tasks/{scoped_task_id}"
+            )))
+            .json(&serde_json::json!({
+                "action": "complete",
+                "delegation": digest, // the send_as grant — wrong scope/task
+            }))
+            .send()
+            .await
+            .expect("wrong delegation complete");
+        assert_eq!(
+            wrong.status(),
+            403,
+            "wrong-scope delegation must be refused: {wrong:?}"
+        );
+
+        // Unknown digest: refused.
+        let unknown_d = authed_client(bob)
+            .patch(bob.url(&format!(
+                "/task-lists/{scoped_topic}/tasks/{scoped_task_id}"
+            )))
+            .json(&serde_json::json!({
+                "action": "complete",
+                "delegation": "e".repeat(64),
+            }))
+            .send()
+            .await
+            .expect("unknown delegation complete");
+        assert_eq!(
+            unknown_d.status(),
+            403,
+            "uncommitted delegation must be refused: {unknown_d:?}"
+        );
     })
     .catch_unwind()
     .await;

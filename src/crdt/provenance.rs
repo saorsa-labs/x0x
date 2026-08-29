@@ -477,9 +477,12 @@ pub fn purge_unverified_owner_transfers(
 /// - A transfer signed by anyone other than its `from` is dropped at
 ///   admission and never resolves.
 /// - A signature-valid transfer whose `from` is NOT the current owner is
-///   inert — it cannot participate in the chain from `created_by`. It may
-///   activate later if its prefix arrives (out-of-order CRDT delivery),
-///   which is convergence, not forgery.
+///   inert — it can never be followed by the walk (which only advances
+///   along `from == current` edges) and, because termination is
+///   content-based (each step CONSUMES a transfer and the timestamp must
+///   STRICTLY increase), an unrelated transfer can never influence the
+///   outcome. It may activate later if its prefix arrives (out-of-order
+///   CRDT delivery), which is convergence, not forgery.
 /// - Concurrent transfers by the same owner resolve deterministically to the
 ///   `(ts, to)`-maximum, so all replicas converge on one owner.
 #[must_use]
@@ -488,23 +491,118 @@ pub fn resolve_owner(
     transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
 ) -> AgentId {
     let mut current = created_by;
-    // Each step consumes one transfer; the map is finite, so iterations are
-    // bounded by its size. A cycle (A→B, B→A) can only advance while it
-    // strictly increases (ts, to); the bound makes even pathological sets
-    // terminate.
-    for _ in 0..=transfers.len() {
+    let mut last_ts = 0u64;
+    let mut used: Vec<OwnerTransfer> = Vec::new();
+    loop {
+        // Follow ONLY an edge from the CURRENT owner that has not been
+        // consumed and whose timestamp STRICTLY increases. Consumption +
+        // monotonic timestamps terminate the walk content-bounded: a cycle
+        // (A→B ts=100, B→A ts=50) stops at B because the back-edge is older.
         let next = transfers
             .keys()
-            .filter(|t| t.from == current)
-            .max_by_key(|t| (t.timestamp_ms, t.to.as_bytes()));
-        match next {
-            Some(t) if t.to != current => current = t.to,
-            _ => break,
-        }
+            .filter(|t| {
+                t.from == current
+                    && t.to != current
+                    && t.timestamp_ms > last_ts
+                    && !used.contains(t)
+            })
+            .max_by_key(|t| (t.timestamp_ms, t.to.as_bytes()))
+            .cloned();
+        let Some(next) = next else { break };
+        used.push(next);
+        last_ts = next.timestamp_ms;
+        current = next.to;
     }
     current
 }
 
+#[cfg(test)]
+mod ownership_resolution_tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn agent(n: u8) -> AgentId {
+        AgentId([n; 32])
+    }
+
+    fn map(entries: &[(u8, u8, u64)]) -> BTreeMap<OwnerTransfer, OpAttestation> {
+        let mut out = BTreeMap::new();
+        for (from, to, ts) in entries {
+            let t = OwnerTransfer {
+                from: agent(*from),
+                to: agent(*to),
+                timestamp_ms: *ts,
+            };
+            // Attestation content is irrelevant to resolution — admission
+            // has already verified it; a placeholder keeps the map shape.
+            out.insert(
+                t,
+                OpAttestation {
+                    author_agent_id: agent(*from),
+                    author_public_key: Vec::new(),
+                    signature: Vec::new(),
+                },
+            );
+        }
+        out
+    }
+
+    #[test]
+    fn cycle_resolves_by_strictly_increasing_timestamps() {
+        // A→B at ts=100 with a B→A back-edge at ts=50: the walk follows
+        // A→B and stops at B — the back-edge is older, so the cycle cannot
+        // continue. Deterministic on every replica.
+        let transfers = map(&[(1, 2, 100), (2, 1, 50)]);
+        assert_eq!(resolve_owner(agent(1), &transfers), agent(2));
+        // A longer increasing chain walks to its end.
+        let chain = map(&[(1, 2, 100), (2, 3, 200), (3, 4, 300)]);
+        assert_eq!(resolve_owner(agent(1), &chain), agent(4));
+    }
+
+    #[test]
+    fn injected_transfer_cannot_flip_ownership_by_parity() {
+        // REVIEW FIX (critical): the previous implementation bounded the
+        // walk by a 0..=len loop WITHOUT consuming followed transfers, so a
+        // cycle's final owner depended on iteration parity — and any
+        // unrelated signature-valid transfer (here: Mallory M→N, never
+        // reachable from the created_by root) changed the parity and FLIPPED
+        // the resolved owner. Content-based termination (consume each
+        // followed transfer + strictly increasing timestamps) makes
+        // unrelated transfers irrelevant.
+        let cycle = map(&[(1, 2, 100), (2, 1, 50)]);
+        let baseline = resolve_owner(agent(1), &cycle);
+        assert_eq!(baseline, agent(2), "older back-edge cannot win");
+
+        // Inject Mallory's own validly-signed M→N transfer at a HIGHER
+        // timestamp: it must not change the resolution by any mechanism.
+        let mut poisoned = cycle.clone();
+        for (t, att) in map(&[(9, 8, 500)]) {
+            poisoned.insert(t, att);
+        }
+        assert_eq!(
+            resolve_owner(agent(1), &poisoned),
+            baseline,
+            "unrelated transfer must not flip ownership resolution"
+        );
+
+        // Also with a huge number of injected inert transfers.
+        let mut poisoned_many = cycle.clone();
+        for i in 0..10u64 {
+            for (t, att) in map(&[(9, 8, 500 + i)]) {
+                poisoned_many.insert(t, att);
+            }
+        }
+        assert_eq!(resolve_owner(agent(1), &poisoned_many), baseline);
+    }
+
+    #[test]
+    fn each_transfer_is_consumed_once() {
+        // A→B(100), then B→A(200) (a LEGAL return transfer), then the walk
+        // cannot reuse A→B(100): consumed + ts must strictly increase.
+        let transfers = map(&[(1, 2, 100), (2, 1, 200)]);
+        assert_eq!(resolve_owner(agent(1), &transfers), agent(1));
+    }
+}
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]

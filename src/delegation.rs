@@ -312,6 +312,57 @@ pub fn sign_delegation(
     })
 }
 
+/// Re-delegation attenuation (review r2): the child grant must be BOUNDED
+/// by the parent — same group, same scope, verb subset, no later expiry,
+/// and (for `task_execute`) the same concrete task. Without this, B could
+/// re-delegate broader powers than A granted (e.g. mint a longer-lived or
+/// verb-superset grant), turning delegation into authority escalation.
+///
+/// Enforced BOTH at issue (the delegate endpoint checks the parent before
+/// signing) and at use (`authorize` re-checks against the committed parent)
+/// — a stored child that somehow violates attenuation never authorizes.
+///
+/// # Errors
+///
+/// Returns [`DelegationError::Invalid`] naming the violated bound.
+pub fn is_attenuated_by(parent: &Delegation, child: &Delegation) -> Result<(), DelegationError> {
+    if parent.group_id != child.group_id {
+        return Err(DelegationError::Invalid(
+            "re-delegation must stay in the parent's group".into(),
+        ));
+    }
+    if parent.authority_scope != child.authority_scope {
+        return Err(DelegationError::Invalid(
+            "re-delegation must not widen the authority scope".into(),
+        ));
+    }
+    for verb in &child.verbs {
+        if !parent.verbs.contains(verb) {
+            return Err(DelegationError::Invalid(format!(
+                "re-delegation adds verb {verb:?} the parent does not grant"
+            )));
+        }
+    }
+    if child.expiry_ms > parent.expiry_ms {
+        return Err(DelegationError::Invalid(
+            "re-delegation must not outlive the parent grant".into(),
+        ));
+    }
+    if let (Some(parent_task), Some(child_task)) = (parent.task_ref, child.task_ref) {
+        if parent_task != child_task {
+            return Err(DelegationError::Invalid(
+                "re-delegation must not retarget task_execute to another task".into(),
+            ));
+        }
+    }
+    if parent.task_ref.is_none() && child.task_ref.is_some() {
+        return Err(DelegationError::Invalid(
+            "re-delegation must not narrow a group-wide grant onto a task".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Verify a signed delegation: key parses, key hashes to BOTH the embedded
 /// author and `from_agent`, signature checks over the canonical bytes, and
 /// the structural policy holds.
@@ -571,6 +622,62 @@ mod tests {
             sign_delegation(&a, &d),
             Err(DelegationError::Invalid(_))
         ));
+    }
+
+    #[test]
+    fn attenuation_rejects_escalation() {
+        // WHY (review r2): re-delegation must shrink, never widen. Each
+        // violated bound names its own error.
+        let a = keypair();
+        let b = keypair();
+        let c = keypair();
+        let parent_d = root_delegation(&a, b.agent_id()); // task_execute, claim+complete, g1, exp 60k
+        let parent = sign_delegation(&a, &parent_d).unwrap();
+
+        // Legal child: subset verbs, earlier-or-equal expiry, same task.
+        let mut ok_child = root_delegation(&b, c.agent_id());
+        ok_child.depth = 2;
+        ok_child.parent_delegation = Some(signed_delegation_digest(&parent));
+        ok_child.verbs = vec![DelegationVerb::Claim];
+        ok_child.expiry_ms = 50_000;
+        let child = sign_delegation(&b, &ok_child).unwrap();
+        assert!(is_attenuated_by(&parent.delegation, &child.delegation).is_ok());
+
+        // Longer-lived child ⇒ rejected.
+        let mut long = ok_child.clone();
+        long.expiry_ms = 70_000;
+        let long_child = sign_delegation(&b, &long).unwrap();
+        assert!(is_attenuated_by(&parent.delegation, &long_child.delegation).is_err());
+
+        // Verb superset under send_as parent ⇒ rejected (scope mismatch).
+        let mut sa_parent_d = root_delegation(&a, b.agent_id());
+        sa_parent_d.authority_scope = AuthorityScope::SendAs;
+        sa_parent_d.verbs = vec![DelegationVerb::SendPublicMessage];
+        sa_parent_d.task_ref = None;
+        let sa_parent = sign_delegation(&a, &sa_parent_d).unwrap();
+        let mut esc = root_delegation(&b, c.agent_id());
+        esc.depth = 2;
+        esc.parent_delegation = Some(signed_delegation_digest(&sa_parent));
+        esc.verbs = vec![DelegationVerb::SendPublicMessage, DelegationVerb::Claim];
+        // scope must match parent's; giving it task_execute verbs triggers
+        // the scope bound first.
+        esc.authority_scope = AuthorityScope::TaskExecute;
+        let esc_child = sign_delegation(&b, &esc);
+        if let Ok(esc_child) = esc_child {
+            assert!(is_attenuated_by(&sa_parent.delegation, &esc_child.delegation).is_err());
+        }
+
+        // Retargeted task ⇒ rejected.
+        let mut retarget = ok_child.clone();
+        retarget.task_ref = Some([7u8; 32]);
+        let retarget_child = sign_delegation(&b, &retarget).unwrap();
+        assert!(is_attenuated_by(&parent.delegation, &retarget_child.delegation).is_err());
+
+        // Different group ⇒ rejected.
+        let mut other_group = ok_child;
+        other_group.group_id = "space-9".into();
+        let og_child = sign_delegation(&b, &other_group).unwrap();
+        assert!(is_attenuated_by(&parent.delegation, &og_child.delegation).is_err());
     }
 
     #[test]
