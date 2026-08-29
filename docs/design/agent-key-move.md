@@ -1,11 +1,18 @@
-# Agent Key-Move Protocol — Design Mechanics (r4)
+# Agent Key-Move Protocol — Design Mechanics (r5)
 
 Companion to [ADR 0043](../adr/0043-agent-key-move-protocol.md), which
 **amends [ADR 0037](../adr/0037-agent-placement-and-key-custody.md)**.
-r4 adopts the round-3 reviewer's construction: **the signed log is the
-only durable record; every other state is derived**. r3 responded to the
-round-2 review, r2 to the round-1 review. Every citation was verified
-against `origin/main@ccb288e` in the worktree.
+r5 completes the round-3 construction per the round-4 review; r4 adopted
+derived state; r3/r2 answered earlier rounds. Citations verified against
+`origin/main@ccb288e` in the worktree.
+
+Round-4 findings → sections:
+
+| Finding | Section |
+|---|---|
+| 1. Predicates must be a single total fold over every legal log shape; key possession is gate input, not log state; quiesce must hold through activation; initial signer and post-abort restoration must be defined | §3.2 (fold), §5.3, §6 |
+| 2. ActivationBundle must EMBED the canonical MoveAuthorization — mesh coherence checks reference in-record fields only | §3.1, §7.5 |
+| 3. Mesh tombstone loss on out-of-order arrival — cumulative tombstones per bundle; monotonicity applies to placement only; transport aligned with blob-v2 (Bundle kind) | §3.3, §7.5, §8.2 |
 
 Round-3 findings → sections:
 
@@ -319,6 +326,7 @@ The signer invariant: **at most one** live signer at every instant —
 zero during transfer (`custodian` = ⊥), exactly one after completion or
 abort — because `custodian(A)` is single-valued at every legal log shape
 and the gate conjoins it with key possession (§3.2).
+
 The key never exists solely on a machine that acknowledged deletion: the
 envelope persists until `RetireReceipt`, and deletion follows the bundle.
 
@@ -348,13 +356,13 @@ forward headers (`src/forward.rs:195` region), gossip signing contexts,
 group operations, announce building. Therefore:
 
 - One `AgentSigningGate` service owns all agent signing. Every production
-  path calls `gate.sign(agent_id, bytes)`; the gate evaluates the §3.2
-  derivations over the local log — refuse when `quiesced(this machine,
-  agent)` or when the key is held but `¬live_signer(this machine, agent)`
-  (quarantine) — and otherwise signs through the existing ML-DSA call.
-  Direct `agent_keypair()` access moves behind the gate for signing
-  callers (read-only public-key access stays). There is no separate
-  gate-state to maintain or crash between.
+  path calls `gate.sign(agent_id, bytes)`; the gate evaluates exactly
+  `may_sign` (§3.2) = `holds_key(this machine, agent) ∧ custodian(agent)
+  == this machine` — the log fold and local key possession, nothing
+  else — and signs through the existing ML-DSA call. Direct
+  `agent_keypair()` access moves behind the gate for signing callers
+  (read-only public-key access stays). There is no separate gate-state
+  to maintain or crash between.
 - Scope, honestly: single-live-signer **among cooperating daemons**. An
   offline copy of a stolen key still produces cryptographically valid
   agent signatures; those are rejected only at gates that carry machine
@@ -435,32 +443,46 @@ legacy record in it for old peers. Therefore:
   `is_agent_revoked`/`is_machine_revoked` (`src/revocation.rs:318`,
   `:324`) — thin reads over the derived tombstone set.
 
-### 7.5 The ActivationBundle on the mesh — verification and coherence (r3 a/c)
+### 7.5 The ActivationBundle on the mesh — self-contained and cumulative (r4-2/3)
 
+- **Self-contained (r4-2):** the canonical `MoveAuthorization` rides
+  INSIDE the signed bundle (`authorization` field, §3.1) — mesh peers
+  never see pre-activation records, so nothing is recomputed from
+  elsewhere: `agent_id`, `move_epoch`, `from_machine`, `to_machine`, and
+  the declared placement are all in-record. Participants additionally
+  check the embedded authorization equals their log's record (the chain
+  already links them; the embedding makes the bundle verifiable
+  standalone).
 - **Topic** `x0x.move.activation.v1`. **Payload:** exactly one
   `ChainedRecord { prev, ActivationBundle }`, republished on-change and
-  periodically for late joiners.
+  periodically for late joiners; blob-v2's `Bundle` kind fetches any
+  specific historical bundle by digest (§8.2).
 - **Verification** is §3.3's mesh rule: whole-record owner signature,
-  cross-field coherence, epoch monotonicity. Accepted bundles are
-  durably stored; nothing is "applied" — gates read the derivation.
+  cross-field coherence, placement-epoch monotonicity, cumulative
+  tombstone union. Accepted bundles are durably stored; nothing is
+  "applied" — gates read the fold.
 - **Cross-field coherence (r3 c)** — one record, one move, checked as a
-  unit against the embedded authorization:
+  unit against the EMBEDDED authorization `auth` (all fields in-record):
   1. owner signature over the whole chained record verifies;
-  2. `agent_certificate.verify()` ∧ `cert.agent_id() == agent_id` ∧ the
-     certificate's issuer (user key) == the record's owner signer;
-  3. `binding_revocation.subject == AgentMachineBinding { agent_id,
-     from_machine, move_epoch }` as named in the authorization the
-     `auth_hash` commits to, and its issuer is the same owner key;
-  4. `placement_record.agent_id == agent_id` ∧
-     `placement_record.placement_epoch == move_epoch` ∧ placement is
-     `Pinned(to_machine)` or `Roaming` (consistent with the
-     authorization's declared placement) ∧ same owner issuer;
-  5. `auth_hash == blake3(canonical(MoveAuthorization))` — the
-     authorization itself travels pre-activation only, but its hash binds
-     the bundle's fields to it (participants re-verify the full rule).
+  2. `agent_certificate.verify()` ∧ `cert.agent_id() == auth.agent_id` ∧
+     the certificate's issuer (user key) == the record's owner signer;
+  3. `retired_bindings` is exactly the grow-only history to date:
+     non-empty, superset of every previously committed bundle's set,
+     and contains `AgentMachineBinding { auth.agent_id,
+     auth.from_machine, auth.move_epoch }` (this move's tombstone),
+     each entry owner-covered by the bundle signature;
+  4. `placement_record.agent_id == auth.agent_id` ∧
+     `placement_record.placement_epoch == auth.move_epoch` ∧ placement
+     is `Pinned(auth.to_machine)` or `Roaming` (matching the declared
+     placement) ∧ same owner issuer;
+  5. for a `Pinned` authorization: `auth.to_machine` equals the
+     placement pin (a move may only pin to its target).
   A record failing any clause is dropped whole; there is no partially
   accepted bundle because there is no application step — only
-  store-if-coherent.
+  store-if-coherent. Clause 3's supersets are monotone by construction
+  at the owner (the owner folds its own log to build the set), so
+  accepting an older owner-signed bundle's set is the same trust as
+  accepting any owner-signed revocation — union is safe in any order.
 
 ## 8. Placement ledger
 
@@ -492,9 +514,10 @@ state introduced by this ADR**, owner-key-signed, living in the log:
 - **Mint**: the per-agent log's genesis record is a `PlacementMint`
   (epoch 0), lazily appended at first move or first
   `GET /owner/placement`. Default `Pinned(machine where last
-  certified/seen)`. **Exception:** the mint must satisfy ADR-0038's
-  ≥1-Roaming Home requirement from birth — the mint designates the
-  install's local agent (or an explicit operator choice) as `Roaming`
+  certified/seen)` with `custodian_machine` = that machine. **Exception:**
+  the mint must satisfy ADR-0038's ≥1-Roaming Home requirement from
+  birth — the mint designates the install's local agent (or an explicit
+  operator choice) as `Roaming` (custodian = its generating machine)
   and refuses to mint all-Pinned.
 - **Ongoing rule:** activation refuses any move whose placement outcome
   would leave zero `Roaming` among the owner's certificated agents.
@@ -505,10 +528,12 @@ state introduced by this ADR**, owner-key-signed, living in the log:
   placement-bearing record (mint or newest committed bundle, §3.2).
 - Distribution: mint and bundle placement digests ride
   `MachineAnnouncementV3.placement_digests` (§2.1); records fetch via
-  **blob protocol v2** — kind-tagged
-  `AnnounceBlobRequestV2 {kind: CertPair|Placement, digest, requester}`
-  on `x0x/announce/v2/blob` with v2 response domains. The shipped v1
-  cert path (`src/announce_blob.rs:49-54`, `:98`, `:506`) is untouched.
+  `AnnounceBlobRequestV2 {kind: CertPair|Placement|Bundle, digest,
+  requester}` on `x0x/announce/v2/blob` with v2 response domains — the
+  `Bundle` kind (r4-3) fetches a specific historical
+  `ActivationBundle` by `blake3(chained-record bytes)` on demand, so
+  mesh history is fetchable and verifiable, not just push-replicated.
+  The shipped v1 cert path (`src/announce_blob.rs:49-54`, `:98`, `:506`) is untouched.
   The v2 placement cache has its own disk file and verify-before-cache
   gate (owner signature, owner = cert issuer, `agent_id` match, digest
   match, mesh-rule epoch monotonicity). Old peers keep serving v1 cert
@@ -519,8 +544,8 @@ state introduced by this ADR**, owner-key-signed, living in the log:
 Two checks, evaluated wherever `(agent, machine)` is known, both reading
 the derived state:
 
-- **B** — `is_binding_revoked(agent, machine)` (tombstones: bundle-derived
-  + ad-hoc v2);
+- **B** — `is_binding_revoked(agent, machine)` reads the grow-only
+  union of cumulative bundle `retired_bindings` + ad-hoc v2 tombstones;
 - **P** — if a placement record is cached for the agent and
   `placement_epoch >= max_revoked_binding_epoch(agent)` (vacuously true
   when no tombstone exists) and placement is `Pinned(X)` with
@@ -598,14 +623,21 @@ deny-by-default scope.
 1. Participant chain CAS: legal orderings accepted; illegal kinds
    rejected; fork challenger dropped; replay no-op; burned epoch never
    re-extendable.
-2. Derivation (§3.2): for every log shape in §5.3, `quiesced`,
-   `quarantined`, `live_signer`, `tombstone`, `placement` take exactly
-   the tabulated values — the derivation IS the spec.
-3. Mesh rule: bundle accepted on higher epoch, no-op on equal digest,
-   dropped on lower epoch; no head required.
+2. Total fold (§3.2): for EVERY legal log shape — mint-only (initial
+   signer), mid-move (custodian = ⊥), post-bundle, post-abort (source
+   restored), post-retire — `custodian`, `retired_bindings`,
+   `placement` take exactly the tabulated values and are never
+   undefined; `may_sign` = `holds_key ∧ custodian==M` with `holds_key`
+   supplied as an input, including the cases key-present-but-not-
+   custodian (quiesced/quarantined) and custodian-but-key-deleted.
+3. Mesh rule: placement accepted on ≥ epoch, no-op on equal digest,
+   stale placement dropped on lower epoch; **tombstones union in every
+   acceptance order** — a peer seeing epoch 2 first still holds epoch
+   1's retired binding from the cumulative set; no head required.
 4. Cross-field coherence (§7.5): each clause violated in isolation
-   (swapped cert, mismatched from/to/epoch, foreign placement payload,
-   wrong auth_hash) drops the record whole.
+   (swapped cert, mismatched from/to/epoch, non-cumulative
+   `retired_bindings`, foreign placement payload, pin ≠ target) drops
+   the record whole.
 5. Acyclicity: `ExportReceipt` verifies only against the auth in its
    `auth_hash`; envelope AAD substitution (other move, other target)
    fails AEAD.
@@ -624,10 +656,13 @@ deny-by-default scope.
    mint rejected.
 10. Signing gate: quiesced and quarantined agents refused on
     `/agent/sign`, DM sign, forward sign; public-key reads unaffected;
-    un-quarantine occurs exactly when a coherent bundle verifies locally.
-11. Blob v2: kind framing; placement verify-before-cache rejects
-    wrong-owner, wrong-agent, digest-mismatch, stale-epoch; v1 cert path
-    byte-identical.
+    un-quarantine occurs exactly when the local fold's custodian is this
+    machine and the key is held.
+11. Blob v2: kind framing (CertPair/Placement/Bundle); placement
+    verify-before-cache rejects wrong-owner, wrong-agent,
+    digest-mismatch, stale-epoch; Bundle fetch returns a historical
+    bundle that verifies standalone (embedded authorization) and merges
+    its cumulative tombstones; v1 cert path byte-identical.
 
 **Integration / E2E**
 
