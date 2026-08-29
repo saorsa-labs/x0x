@@ -9397,10 +9397,7 @@ pub(in crate::server) async fn send_group_public_message(
         // signs with its own key; only the digest references A. Riders
         // do not combine send-as with their own provenance envelope.
         if let Some(digest) = &req.delegation_digest {
-            if !matches!(
-                actor,
-                crate::server::rider_auth::ActorContext::Owner { .. }
-            ) {
+            if !matches!(actor, crate::server::rider_auth::ActorContext::Owner { .. }) {
                 return forbidden("send_as attribution is an owner-daemon action");
             }
             let now = now_millis_u64();
