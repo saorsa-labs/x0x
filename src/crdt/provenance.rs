@@ -468,6 +468,14 @@ pub fn verify_owner_transfer(
     task_id: &TaskId,
     transfer: &OwnerTransfer,
 ) -> bool {
+    // REGISTRATION FLOOR (review r6): all-zero endpoints are not real
+    // agents — no registered public key hashes to the zero AgentId — so
+    // reject them before any cryptographic work. (Full registration is
+    // the roster gate at sign time and admission; this is the structural
+    // floor inside the verifier.)
+    if transfer.from.as_bytes() == &[0u8; 32] || transfer.to.as_bytes() == &[0u8; 32] {
+        return false;
+    }
     let Ok(pubkey) = MlDsaPublicKey::from_bytes(&att.author_public_key) else {
         return false;
     };
@@ -537,18 +545,22 @@ pub fn key_owner_chain(
 /// admissible candidates are entries whose `supersedes == head` AND whose
 /// `from == owner` (the owner at that chain position).
 ///
-/// SECURITY SEMANTICS (stated honestly, review r5): a NON-OWNER cannot
-/// alter ownership — every edge must be signed by the owner at its chain
-/// position, verified structurally by the walk. A CURRENT owner that
-/// EQUIVOCATES (signs two edges at the same position) forks its own
+/// SECURITY SEMANTICS (stated honestly, reviews r5+r6): a NON-OWNER
+/// cannot alter ownership — every edge must be signed by the owner at its
+/// chain position, verified structurally by the walk. A CURRENT owner
+/// that EQUIVOCATES (signs two edges at the same position) forks its own
 /// authority; no CRDT can causally order such edges, so the group
 /// converges deterministically on the candidate whose TO-agent identity
-/// (AgentId == hash of the registered public key) sorts lowest. That
-/// tiebreak is NOT grindable into new authority: the winner's identity is
-/// fixed bytes of a real registered agent — a destination the owner could
-/// have chosen legitimately — unlike timestamps or edge digests, which mix
-/// signer-controlled data. Advance and repeat; a `visited` set terminates
-/// the walk even on adversarial link cycles.
+/// sorts lowest. That tiebreak is NOT grindable into new authority
+/// (review r6, Option A): the roster gates at SIGN TIME and ADMISSION
+/// restrict every edge's endpoints to REGISTERED agents, and an AgentId
+/// IS the hash of the registered public key — so ranking by `to` bytes
+/// ranks by fixed bytes of real agents, and the winner is a destination
+/// the owner could have transferred to legitimately. Grinding a new
+/// low-identity keypair requires REGISTERING it (a visible membership
+/// act), which is exactly a legitimate transfer target. Advance and
+/// repeat; a `visited` set terminates the walk even on adversarial link
+/// cycles.
 ///
 /// Security properties:
 /// - **Backdating is structurally dead.** A former owner A (after A→B

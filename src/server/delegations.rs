@@ -297,11 +297,10 @@ pub(in crate::server) async fn rebuild_global_delegation_registry(state: &AppSta
         "global delegation-id registry reconstructed from durable history"
     );
 }
-
 /// Record a just-committed delegation into the index (called only after the
-/// carrier's SQLite transaction committed). Fast path only — the next
-/// freshness probe still verifies against history (rowid watermark is NOT
-/// bumped here, so a subsequent committed row triggers a proper rescan).
+/// carrier's SQLite transaction committed). Fast path: registers the id
+/// globally, bumps the rowid watermark past the commit, and inserts the
+/// envelope — an in-flight older rescan can no longer overwrite it away.
 pub(in crate::server) async fn index_committed(
     state: &AppState,
     group_id: &str,
@@ -316,8 +315,26 @@ pub(in crate::server) async fn index_committed(
         );
         return;
     };
+    // WATERMARK BUMP (review r6): advance the rowid watermark past this
+    // commit so an in-flight OLDER rescan cannot overwrite the map (the
+    // overlap guard compares max-rowids). Without this, a scan whose
+    // pages predate the commit could finish later and replace the map
+    // without the just-committed entry while the watermark implied
+    // freshness.
+    let mut newest: Option<i64> = None;
+    if let Some(history) = state.agent.history() {
+        let store = std::sync::Arc::clone(history.store());
+        let scope = group_id.to_string();
+        newest = tokio::task::spawn_blocking(move || newest_row_id(&store, &scope))
+            .await
+            .ok()
+            .flatten();
+    }
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
+    if let Some(newest) = newest {
+        entry.max_row_id = entry.max_row_id.max(newest);
+    }
     entry.loaded = true;
     entry
         .by_digest

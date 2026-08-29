@@ -395,7 +395,14 @@ impl TaskListSync {
                                 // adopt-truncate state.
                                 let served_ids: std::collections::HashSet<crate::crdt::TaskId> =
                                     delta.added_tasks.keys().copied().collect();
+                                // Full-state SHAPE required (as before):
+                                // only a delta carrying BOTH registers can
+                                // be a serve — a plain state-change delta
+                                // (added_tasks empty) must never match an
+                                // empty-holder marker and prune everything.
                                 if delta.added_tasks.len() == declared.entry_count as usize
+                                    && delta.ordering_update.is_some()
+                                    && delta.name_update.is_some()
                                     && list.served_subset_digest(&served_ids) == declared.digest
                                 {
                                     let pruned = list.prune_to_served_set(&delta);

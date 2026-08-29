@@ -582,49 +582,6 @@ async fn delegation_sendas_positive_and_forges_cross_daemon() {
         .await;
         assert!(synced, "bob's replica never learned alice's task");
 
-        let non_owner = authed_client(bob)
-            .patch(bob.url(&format!("/task-lists/{topic}/tasks/{task_id}")))
-            .json(&serde_json::json!({
-                "action": "transfer_owner",
-                "to_agent": bob_id,
-            }))
-            .send()
-            .await
-            .expect("non-owner transfer request");
-        assert_eq!(
-            non_owner.status(),
-            403,
-            "non-owner transfer must be refused: {non_owner:?}"
-        );
-
-        // Honest transfer: alice (creator/owner) transfers to bob.
-        let owner_transfer = authed_client(alice)
-            .patch(alice.url(&format!("/task-lists/{topic}/tasks/{task_id}")))
-            .json(&serde_json::json!({
-                "action": "transfer_owner",
-                "to_agent": bob_id,
-            }))
-            .send()
-            .await
-            .expect("owner transfer request");
-        assert_eq!(
-            owner_transfer.status(),
-            200,
-            "owner-signed transfer succeeds: {owner_transfer:?}"
-        );
-        let tasks: Value = authed_client(alice)
-            .get(alice.url(&format!("/task-lists/{topic}/tasks")))
-            .send()
-            .await
-            .expect("tasks read")
-            .json()
-            .await
-            .expect("tasks json");
-        let owner_hex = tasks["tasks"][0]["owner_agent"]
-            .as_str()
-            .unwrap_or_default();
-        assert_eq!(owner_hex, bob_id, "resolved owner advanced to bob");
-
         // ── task-exercise delegation (review r2): claim under authority ──
         // A group-scoped task list, a task_execute delegation from alice
         // to bob for THAT task, and bob claiming it citing the digest.
@@ -767,6 +724,55 @@ async fn delegation_sendas_positive_and_forges_cross_daemon() {
             403,
             "uncommitted delegation must be refused: {unknown_d:?}"
         );
+
+        // ── registered ownership transfer on the ROSTER-BACKED scoped list
+        // (review r6): ownership may only move to registered (roster)
+        // agents — bob is a member. Bob (non-owner) is refused 403;
+        // alice (owner) succeeds and the resolved owner advances.
+        let non_owner = authed_client(bob)
+            .patch(bob.url(&format!(
+                "/task-lists/{scoped_topic}/tasks/{scoped_task_id}"
+            )))
+            .json(&serde_json::json!({
+                "action": "transfer_owner",
+                "to_agent": bob_id,
+            }))
+            .send()
+            .await
+            .expect("non-owner transfer request");
+        assert_eq!(
+            non_owner.status(),
+            403,
+            "non-owner transfer must be refused: {non_owner:?}"
+        );
+        let owner_transfer = authed_client(alice)
+            .patch(alice.url(&format!(
+                "/task-lists/{scoped_topic}/tasks/{scoped_task_id}"
+            )))
+            .json(&serde_json::json!({
+                "action": "transfer_owner",
+                "to_agent": bob_id,
+            }))
+            .send()
+            .await
+            .expect("owner transfer request");
+        assert_eq!(
+            owner_transfer.status(),
+            200,
+            "owner-signed transfer to a registered agent succeeds: {owner_transfer:?}"
+        );
+        let tasks: Value = authed_client(alice)
+            .get(alice.url(&format!("/task-lists/{scoped_topic}/tasks")))
+            .send()
+            .await
+            .expect("tasks read")
+            .json()
+            .await
+            .expect("tasks json");
+        let owner_hex = tasks["tasks"][0]["owner_agent"]
+            .as_str()
+            .unwrap_or_default();
+        assert_eq!(owner_hex, bob_id, "resolved owner advanced to bob");
     })
     .catch_unwind()
     .await;

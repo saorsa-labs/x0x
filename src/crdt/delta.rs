@@ -1161,6 +1161,9 @@ mod tests {
         // The receiving list's id is the SIGNING SCOPE — scope binding
         // (v2 canonical bytes) must match or the admission gate drops it.
         let mut list = TaskList::new(TaskListId::new([0x5c; 32]), "L".into(), peer(1));
+        // Ownership requires a REGISTERED roster (review r6): register
+        // creator and the transfer target before applying.
+        list.set_authorized_agents(std::collections::HashSet::from([creator, agent(9)]));
         let fresh = TaskItem::new(
             task_id,
             TaskMetadata::new("T", "D", 1, creator, 1_000),
@@ -1288,6 +1291,7 @@ mod tests {
         // (b) Post-admission: a receiver merging the tampered serve purges
         // the entry, so its local digest can never equal the holder's.
         let mut receiver = TaskList::new(scope, "L".into(), peer(2));
+        receiver.set_authorized_agents(std::collections::HashSet::from([creator, agent(9)]));
         let bare = TaskItem::new(
             task_id,
             TaskMetadata::new("T", "D", 1, creator, 1_000),

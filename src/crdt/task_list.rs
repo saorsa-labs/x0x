@@ -619,6 +619,14 @@ impl TaskList {
         task_id: &TaskId,
         transfers: &std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
     ) {
+        // ADMISSION REGISTRATION GATE (review r6, Option A): ownership
+        // transfers are only admissible on lists with a REGISTERED roster;
+        // and every edge must touch roster members (filter_unauthorized
+        // drops the rest). A roster-less list drops all remote transfers —
+        // the same rule the sign-time gate enforces locally.
+        if self.authorized_agents.is_none() {
+            return;
+        }
         let scope = self.id;
         let authorized = self.authorized_agents.clone();
         if let Some(task) = self.task_data.get_mut(task_id) {
@@ -628,17 +636,6 @@ impl TaskList {
             }
         }
     }
-
-    /// Claim a task in the list.
-    ///
-    /// Delegates to the TaskItem's claim method.
-    ///
-    /// # Arguments
-    ///
-    /// * `task_id` - ID of the task to claim
-    /// * `agent_id` - Agent claiming the task
-    /// * `peer_id` - Peer making this change
-    /// * `seq` - Sequence number
     ///
     /// # Returns
     ///
@@ -719,6 +716,27 @@ impl TaskList {
         to: AgentId,
         signing: &crate::gossip::SigningContext,
     ) -> Result<()> {
+        // REGISTRATION GATE (review r6, Option A): ownership may only move
+        // to a REGISTERED agent — a member of this list's authorized
+        // roster — and only from one. This is what makes the fork
+        // tiebreak non-grindable: ranking by the target's AgentId (the
+        // hash of its registered public key) only ever selects among real
+        // agents, so an equivocating owner gains nothing it could not
+        // have done with a legitimate transfer. Lists without a roster
+        // cannot transfer ownership at all.
+        let authorized = self.authorized_agents.as_ref().ok_or_else(|| {
+            CrdtError::Gossip(
+                "ownership transfer requires a group-authorized task list (no registered roster)"
+                    .to_string(),
+            )
+        })?;
+        if !authorized.contains(&from) || !authorized.contains(&to) {
+            return Err(CrdtError::Gossip(format!(
+                "ownership transfer requires registered agents: from {} / to {} not on the roster",
+                hex::encode(from.as_bytes()),
+                hex::encode(to.as_bytes())
+            )));
+        }
         let scope = self.id;
         let task = self
             .task_data
@@ -1552,5 +1570,47 @@ mod tests {
             50,
             "all 50 tasks must survive; duplicate OR-Set tags would drop some"
         );
+    }
+
+    #[test]
+    fn ownership_transfer_requires_registered_roster_and_members() {
+        // REVIEW r6 (Option A): ownership may only move between REGISTERED
+        // agents — roster members — and only on lists that HAVE a roster.
+        // This is what makes the fork tiebreak non-grindable: targets are
+        // real registered agents, and ranking by AgentId (the hash of the
+        // registered public key) can only select among them.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let signing = crate::gossip::SigningContext::from_keypair(&kp);
+        let creator = kp.agent_id();
+        let outsider = agent(9);
+        let task_id = TaskId::new("owned", &creator, 1);
+        let mut list = TaskList::new(
+            crate::crdt::TaskListId::new([0x5c; 32]),
+            "L".into(),
+            peer(1),
+        );
+        list.add_task(
+            TaskItem::new(task_id, TaskMetadata::new("T", "D", 1, creator, 1), peer(1)),
+            peer(1),
+            1,
+        )
+        .expect("add");
+
+        // No roster: rejected outright.
+        assert!(list
+            .transfer_task_ownership(&task_id, creator, outsider, &signing)
+            .is_err());
+
+        // Roster without the target: rejected (unregistered destination).
+        list.set_authorized_agents(std::collections::HashSet::from([creator]));
+        assert!(list
+            .transfer_task_ownership(&task_id, creator, outsider, &signing)
+            .is_err());
+
+        // Registered target: succeeds and resolves.
+        list.set_authorized_agents(std::collections::HashSet::from([creator, outsider]));
+        list.transfer_task_ownership(&task_id, creator, outsider, &signing)
+            .expect("registered transfer signs");
+        assert_eq!(list.task_owner(&task_id).expect("owner"), outsider);
     }
 }
