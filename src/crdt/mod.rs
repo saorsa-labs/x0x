@@ -47,11 +47,8 @@ pub use encrypted::EncryptedTaskListDelta;
 pub use error::{CrdtError, Result};
 pub use persistence::TaskListStorage;
 pub use provenance::{
-    canonical_op_bytes, canonical_owner_transfer_bytes, chain_head, key_owner_chain,
-    owner_transfer_digest, purge_unattested_elements, purge_unverified_owner_transfers,
-    resolve_owner, sign_attestation, sign_owner_transfer, verify_attestation,
-    verify_owner_transfer, ChainEntry, OpAttestation, OpKind, OwnerChain, OwnerTransfer,
-    TransferLink, CLAIM_DOMAIN, COMPLETE_DOMAIN, TRANSFER_OWNER_DOMAIN,
+    canonical_op_bytes, purge_unattested_elements, sign_attestation, verify_attestation,
+    OpAttestation, OpKind, CLAIM_DOMAIN, COMPLETE_DOMAIN,
 };
 pub use sync::TaskListSync;
 pub use task::{TaskId, TaskMetadata};

@@ -14,9 +14,7 @@
 //!
 //! This provides eventual consistency with deterministic conflict resolution.
 
-use crate::crdt::{
-    CrdtError, OpAttestation, OwnerTransfer, Result, TaskId, TaskItem, TaskListDelta,
-};
+use crate::crdt::{CrdtError, Result, TaskId, TaskItem, TaskListDelta};
 use crate::identity::AgentId;
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
@@ -247,7 +245,6 @@ impl TaskList {
             task.claim_record().hash(&mut hasher);
             task.completion_record().hash(&mut hasher);
             task.assignee().hash(&mut hasher);
-            task.owner().hash(&mut hasher);
         }
         for tid in self.ordering.get() {
             hasher.write(tid.as_bytes());
@@ -296,72 +293,6 @@ impl TaskList {
             h.update(id.as_bytes());
             self.task_data[id].hash_resolved_fields(&mut h);
         }
-        // REVIEW r4 (finding 2): cover the LOCAL ownership chains with the
-        // same canonical encoding the delta-side digest uses, so a serve
-        // missing its transfer map can never digest-match a holder whose
-        // resolved owner has advanced. Empty maps are omitted on BOTH
-        // sides, keeping empty-chain digests byte-identical to legacy.
-        let local_chains: std::collections::HashMap<
-            TaskId,
-            std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
-        > = self
-            .task_data
-            .iter()
-            .filter_map(|(id, task)| {
-                let wire = task.owner_wire_map();
-                if wire.is_empty() {
-                    None // delta-side omits empty maps — keep encodings identical
-                } else {
-                    Some((*id, wire))
-                }
-            })
-            .collect();
-        crate::crdt::delta::hash_owner_transfers_into(&mut h, &local_chains);
-        *h.finalize().as_bytes()
-    }
-
-    /// Digest over the POST-ADMISSION local state restricted to the given
-    /// served task set (review r5): the bootstrap adopt path must compare
-    /// what actually SURVIVED admission (forged attestations purged), not
-    /// the raw serve bytes — an altered signature must not be able to
-    /// hash identically to the valid entry it replaced.
-    ///
-    /// Mirrors [`Self::served_digest`] exactly (same domain, same
-    /// encodings) but only over tasks in `served_ids`; tasks absent
-    /// locally are skipped (the adopt path prunes to the served set
-    /// separately).
-    pub(crate) fn served_subset_digest(
-        &self,
-        served_ids: &std::collections::HashSet<TaskId>,
-    ) -> [u8; 32] {
-        let mut h = blake3::Hasher::new();
-        h.update(SERVED_DIGEST_DOMAIN);
-        h.update(self.id.as_bytes());
-        let mut ids: Vec<&TaskId> = self
-            .task_data
-            .keys()
-            .filter(|id| served_ids.contains(*id))
-            .collect();
-        ids.sort_by(|a, b| a.as_bytes().cmp(b.as_bytes()));
-        for id in &ids {
-            h.update(id.as_bytes());
-            self.task_data[id].hash_resolved_fields(&mut h);
-        }
-        let chains: std::collections::HashMap<
-            TaskId,
-            std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
-        > = ids
-            .iter()
-            .filter_map(|id| {
-                let wire = self.task_data[id].owner_wire_map();
-                if wire.is_empty() {
-                    None
-                } else {
-                    Some((**id, wire))
-                }
-            })
-            .collect();
-        crate::crdt::delta::hash_owner_transfers_into(&mut h, &chains);
         *h.finalize().as_bytes()
     }
 
@@ -610,32 +541,16 @@ impl TaskList {
         Ok(())
     }
 
-    /// Union a delta-carried ownership-transfer map into a known task and
-    /// run the ownership admission + membership gates (ADR-0040). No-op if
-    /// the task is unknown locally — a transfer without its task resolves
-    /// against nothing and is re-carried by a later delta or full serve.
-    pub(crate) fn delta_apply_owner_transfers(
-        &mut self,
-        task_id: &TaskId,
-        transfers: &std::collections::BTreeMap<OwnerTransfer, OpAttestation>,
-    ) {
-        // ADMISSION REGISTRATION GATE (review r6, Option A): ownership
-        // transfers are only admissible on lists with a REGISTERED roster;
-        // and every edge must touch roster members (filter_unauthorized
-        // drops the rest). A roster-less list drops all remote transfers —
-        // the same rule the sign-time gate enforces locally.
-        if self.authorized_agents.is_none() {
-            return;
-        }
-        let scope = self.id;
-        let authorized = self.authorized_agents.clone();
-        if let Some(task) = self.task_data.get_mut(task_id) {
-            task.ingest_owner_transfers(scope, transfers);
-            if let Some(members) = &authorized {
-                let _dropped = task.filter_unauthorized(members);
-            }
-        }
-    }
+    /// Claim a task in the list.
+    ///
+    /// Delegates to the TaskItem's claim method.
+    ///
+    /// # Arguments
+    ///
+    /// * `task_id` - ID of the task to claim
+    /// * `agent_id` - Agent claiming the task
+    /// * `peer_id` - Peer making this change
+    /// * `seq` - Sequence number
     ///
     /// # Returns
     ///
@@ -696,71 +611,6 @@ impl TaskList {
         task.complete(self.id, agent_id, peer_id, seq, signing)?;
         self.version += 1;
         Ok(())
-    }
-
-    /// Transfer ownership of a task to another agent (ADR-0040).
-    ///
-    /// Delegates to [`TaskItem::transfer_ownership`]; the transfer is only
-    /// meaningful when `from` is the current resolved owner
-    /// ([`TaskList::task_owner`]) — a transfer signed by anyone else is
-    /// inert at resolution. Errors if the task doesn't exist or the caller
-    /// (via `signing`) is not `from`.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CrdtError::TaskNotFound`] or a signing error.
-    pub fn transfer_task_ownership(
-        &mut self,
-        task_id: &TaskId,
-        from: AgentId,
-        to: AgentId,
-        signing: &crate::gossip::SigningContext,
-    ) -> Result<()> {
-        // REGISTRATION GATE (review r6, Option A): ownership may only move
-        // to a REGISTERED agent — a member of this list's authorized
-        // roster — and only from one. This is what makes the fork
-        // tiebreak non-grindable: ranking by the target's AgentId (the
-        // hash of its registered public key) only ever selects among real
-        // agents, so an equivocating owner gains nothing it could not
-        // have done with a legitimate transfer. Lists without a roster
-        // cannot transfer ownership at all.
-        let authorized = self.authorized_agents.as_ref().ok_or_else(|| {
-            CrdtError::Gossip(
-                "ownership transfer requires a group-authorized task list (no registered roster)"
-                    .to_string(),
-            )
-        })?;
-        if !authorized.contains(&from) || !authorized.contains(&to) {
-            return Err(CrdtError::Gossip(format!(
-                "ownership transfer requires registered agents: from {} / to {} not on the roster",
-                hex::encode(from.as_bytes()),
-                hex::encode(to.as_bytes())
-            )));
-        }
-        let scope = self.id;
-        let task = self
-            .task_data
-            .get_mut(task_id)
-            .ok_or(CrdtError::TaskNotFound(*task_id))?;
-        let timestamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map_err(|e| CrdtError::SystemClock(format!("clock before Unix epoch: {e}")))?
-            .as_millis() as u64;
-        task.transfer_ownership(scope, from, to, timestamp, signing)?;
-        self.version += 1;
-        Ok(())
-    }
-
-    /// The resolved owner of a task in this list.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`CrdtError::TaskNotFound`] if the task is absent.
-    pub fn task_owner(&self, task_id: &TaskId) -> Result<AgentId> {
-        self.task_data
-            .get(task_id)
-            .map(TaskItem::owner)
-            .ok_or(CrdtError::TaskNotFound(*task_id))
     }
 
     /// Reorder the tasks in the list.
@@ -1570,47 +1420,5 @@ mod tests {
             50,
             "all 50 tasks must survive; duplicate OR-Set tags would drop some"
         );
-    }
-
-    #[test]
-    fn ownership_transfer_requires_registered_roster_and_members() {
-        // REVIEW r6 (Option A): ownership may only move between REGISTERED
-        // agents — roster members — and only on lists that HAVE a roster.
-        // This is what makes the fork tiebreak non-grindable: targets are
-        // real registered agents, and ranking by AgentId (the hash of the
-        // registered public key) can only select among them.
-        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
-        let signing = crate::gossip::SigningContext::from_keypair(&kp);
-        let creator = kp.agent_id();
-        let outsider = agent(9);
-        let task_id = TaskId::new("owned", &creator, 1);
-        let mut list = TaskList::new(
-            crate::crdt::TaskListId::new([0x5c; 32]),
-            "L".into(),
-            peer(1),
-        );
-        list.add_task(
-            TaskItem::new(task_id, TaskMetadata::new("T", "D", 1, creator, 1), peer(1)),
-            peer(1),
-            1,
-        )
-        .expect("add");
-
-        // No roster: rejected outright.
-        assert!(list
-            .transfer_task_ownership(&task_id, creator, outsider, &signing)
-            .is_err());
-
-        // Roster without the target: rejected (unregistered destination).
-        list.set_authorized_agents(std::collections::HashSet::from([creator]));
-        assert!(list
-            .transfer_task_ownership(&task_id, creator, outsider, &signing)
-            .is_err());
-
-        // Registered target: succeeds and resolves.
-        list.set_authorized_agents(std::collections::HashSet::from([creator, outsider]));
-        list.transfer_task_ownership(&task_id, creator, outsider, &signing)
-            .expect("registered transfer signs");
-        assert_eq!(list.task_owner(&task_id).expect("owner"), outsider);
     }
 }
