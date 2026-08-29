@@ -198,7 +198,7 @@ impl SelfProfile {
 /// Write `bytes` to `path` via a unique temp file + rename (atomic on both
 /// unix and windows for same-directory renames). The temp name embeds the
 /// pid + a counter so concurrent writers never collide.
-async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+pub(crate) async fn write_atomically(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let dir = path
@@ -251,6 +251,38 @@ pub struct IssuedCertRecord {
     pub issued_at: u64,
     /// Certificate expiry (unix seconds); `None` = no expiry.
     pub not_after: Option<u64>,
+    /// Hosting mode of the certified agent (ADR-0039). Defaults to `Acp`
+    /// for pre-existing lines and the daemon's own self-issuance; rider
+    /// mode is written by `POST /owner/agents/issue` only.
+    #[serde(default)]
+    pub mode: CertMode,
+    /// Operator-assigned label for the certified agent (ADR-0039).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Base64 of the certificate's storage bytes. Retained ONLY for
+    /// sub-agents issued via `POST /owner/agents/issue`: ADR-0018
+    /// issuer-revocation (`DELETE /owner/agents/:id`) must re-present the
+    /// exact certificate binding that owner to the agent, and no other
+    /// durable copy of an offline sub-agent's certificate exists. The
+    /// daemon's own self-issuance keeps the journal lean (`agent.cert` is
+    /// the durable copy).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert_b64: Option<String>,
+}
+
+/// Hosting mode of a certified sub-agent (ADR-0039): an ACP-attached
+/// harness instance running its own key file, or an API-key rider sending
+/// through the owner's daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CertMode {
+    /// Harness-attached instance owning its key (also the mode of the
+    /// daemon's own certificate and of pre-ADR-0039 journal lines).
+    #[default]
+    Acp,
+    /// API-key rider: scoped token authenticates to the owner's daemon,
+    /// which signs on the sub-agent's behalf with provenance marks.
+    Rider,
 }
 
 /// File name of the owner certificate journal, in the instance data dir
@@ -279,6 +311,38 @@ impl IssuedCertRecord {
             cert_digest: cert_storage_digest(cert),
             issued_at: cert.issued_at(),
             not_after: cert.not_after(),
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
+        })
+    }
+
+    /// Build a sub-agent issuance record (ADR-0039) scoped to the issuing
+    /// owner, carrying the hosting `mode`, optional `label`, and the full
+    /// certificate bytes (base64) so a later
+    /// `DELETE /owner/agents/:id` can present the exact certificate the
+    /// ADR-0018 issuer-revocation authority check requires.
+    #[must_use]
+    pub fn from_cert_with_mode(
+        owner: &crate::identity::UserId,
+        cert: &crate::identity::AgentCertificate,
+        mode: CertMode,
+        label: Option<String>,
+    ) -> Option<Self> {
+        let agent_id = cert.agent_id().ok()?;
+        let cert_b64 = cert.to_storage_bytes().ok().map(|bytes| {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        });
+        Some(Self {
+            user_id: hex::encode(owner.as_bytes()),
+            agent_id: hex::encode(agent_id.as_bytes()),
+            cert_digest: cert_storage_digest(cert),
+            issued_at: cert.issued_at(),
+            not_after: cert.not_after(),
+            mode,
+            label,
+            cert_b64,
         })
     }
 
@@ -442,6 +506,9 @@ mod tests {
             cert_digest: "cd".repeat(32),
             issued_at: 100,
             not_after: None,
+            mode: CertMode::Acp,
+            label: None,
+            cert_b64: None,
         };
         let r2 = IssuedCertRecord {
             user_id: "07".repeat(32),
@@ -449,6 +516,9 @@ mod tests {
             cert_digest: "12".repeat(32),
             issued_at: 200,
             not_after: Some(300),
+            mode: CertMode::Rider,
+            label: Some("ci-agent".into()),
+            cert_b64: None,
         };
         IssuedCertRecord::append(&path, &r1).await.unwrap();
         IssuedCertRecord::append(&path, &r2).await.unwrap();
@@ -460,6 +530,23 @@ mod tests {
         tokio::fs::write(&path, text).await.unwrap();
         let loaded = IssuedCertRecord::load(&path).await;
         assert_eq!(loaded.len(), 2, "corrupt line skipped, records kept");
+        assert_eq!(
+            loaded[1].mode,
+            CertMode::Rider,
+            "ADR-0039 mode/label round-trip through the journal"
+        );
+        assert_eq!(loaded[1].label.as_deref(), Some("ci-agent"));
+        // Pre-ADR-0039 lines (no mode/label/cert_b64 keys) parse as ACP defaults.
+        let legacy_line = format!(
+            "{{\"user_id\":\"{}\",\"agent_id\":\"{}\",\"cert_digest\":\"{}\",\"issued_at\":300,\"not_after\":null}}",
+            "07".repeat(32),
+            "ab".repeat(32),
+            "cd".repeat(32)
+        );
+        let legacy: IssuedCertRecord = serde_json::from_str(&legacy_line).unwrap();
+        assert_eq!(legacy.mode, CertMode::Acp);
+        assert_eq!(legacy.label, None);
+        assert_eq!(legacy.cert_b64, None);
 
         // Missing file is an empty journal, not an error.
         assert!(IssuedCertRecord::load(&dir.path().join("nope.jsonl"))

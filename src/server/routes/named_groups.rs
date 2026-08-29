@@ -9270,6 +9270,9 @@ pub(in crate::server) struct SendGroupMessageRequest {
 pub(in crate::server) async fn send_group_public_message(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SendGroupMessageRequest>,
 ) -> impl IntoResponse {
     let kind = match req.kind.as_deref().unwrap_or("chat") {
@@ -9368,6 +9371,34 @@ pub(in crate::server) async fn send_group_public_message(
             .map(|member| member.agent_id.clone())
             .collect::<Vec<_>>();
 
+        // ADR-0039 rider scope check: the daemon's own membership carries
+        // the send; a rider may only reach Home (not applicable on this
+        // SignedPublic-only surface) or an explicitly granted group.
+        let rider_provenance = match &actor {
+            crate::server::rider_auth::ActorContext::Owner => None,
+            crate::server::rider_auth::ActorContext::Rider {
+                sub_agent_id,
+                token_id,
+                token_hash,
+                groups,
+            } => {
+                let is_home = info.home.is_some();
+                let granted =
+                    is_home || groups.iter().any(|g| g.as_str() == info.stable_group_id());
+                if !granted {
+                    return forbidden(
+                        "rider token is not granted this group (ADR-0039 deny-by-default)",
+                    );
+                }
+                Some(x0x::groups::RiderProvenance {
+                    sub_agent_id: sub_agent_id.clone(),
+                    rider_token_id: *token_id,
+                    rider_token_hash: token_hash.clone(),
+                    scope: info.stable_group_id().to_string(),
+                })
+            }
+        };
+
         match x0x::groups::GroupPublicMessage::sign(
             info.stable_group_id().to_string(),
             info.state_hash.clone(),
@@ -9379,6 +9410,7 @@ pub(in crate::server) async fn send_group_public_message(
             now_ms,
             req.thread_root,
             req.thread_parent,
+            rider_provenance,
         ) {
             Ok(m) => (m, direct_recipients),
             Err(e) => {
@@ -9726,6 +9758,7 @@ fn record_mls_history(
     plaintext: &[u8],
     direction: x0x::history::Direction,
     epoch: u64,
+    author_agent: Option<&str>,
 ) {
     let Some(history) = state.agent.history() else {
         return;
@@ -9750,7 +9783,7 @@ fn record_mls_history(
             plaintext,
         ),
         scope: x0x::history::Scope::Group(stable_group_id.to_string()),
-        author_agent: None,
+        author_agent: author_agent.map(str::to_string),
         author_machine: None,
         author_pubkey: None,
         sent_at_ms: now,
@@ -16377,6 +16410,7 @@ async fn treekem_group_encrypt(
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     payload_b64: &str,
+    author_agent: Option<&str>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let plaintext = match BASE64.decode(payload_b64) {
@@ -16439,6 +16473,7 @@ async fn treekem_group_encrypt(
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
+        author_agent,
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -16521,6 +16556,7 @@ async fn treekem_group_decrypt(
         &plaintext,
         x0x::history::Direction::Inbound,
         epoch,
+        None,
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -16539,6 +16575,9 @@ async fn treekem_group_decrypt(
 pub(in crate::server) async fn secure_group_encrypt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<SecureEncryptRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
@@ -16555,6 +16594,26 @@ pub(in crate::server) async fn secure_group_encrypt(
     if !info.has_active_member(&caller_hex) {
         return forbidden("not a member");
     }
+    // ADR-0039: the DAEMON is the acting member; a rider reaches Home
+    // (and any granted MlsEncrypted group) through that membership, with
+    // the sub-agent attribution recorded in the local history row.
+    let rider_sub_agent_id = match &actor {
+        crate::server::rider_auth::ActorContext::Owner => None,
+        crate::server::rider_auth::ActorContext::Rider { .. } => {
+            let is_home = info.home.is_some();
+            if !actor.rider_allows_group(is_home, info.stable_group_id()) {
+                return forbidden(
+                    "rider token is not granted this group (ADR-0039 deny-by-default)",
+                );
+            }
+            match &actor {
+                crate::server::rider_auth::ActorContext::Rider { sub_agent_id, .. } => {
+                    Some(sub_agent_id.clone())
+                }
+                _ => None,
+            }
+        }
+    };
     if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
         return bad_request("group is not MlsEncrypted — use public send instead");
     }
@@ -16568,6 +16627,7 @@ pub(in crate::server) async fn secure_group_encrypt(
             &id,
             Some(&stable_group_id),
             &req.payload_b64,
+            rider_sub_agent_id.as_deref(),
         )
         .await;
     }
@@ -16626,6 +16686,7 @@ pub(in crate::server) async fn secure_group_encrypt(
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
+        rider_sub_agent_id.as_deref(),
     );
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),
@@ -16749,6 +16810,7 @@ pub(in crate::server) async fn secure_group_decrypt(
                 &plaintext,
                 x0x::history::Direction::Inbound,
                 req.secret_epoch,
+                None,
             );
             secure_group_effect_response_after_terminality_recheck(
                 state.as_ref(),
@@ -21608,6 +21670,12 @@ pub(in crate::server) mod tests {
             upgrade_apply_lock: Arc::new(Mutex::new(())),
             api_token: "test-token".to_string(),
             sessions: auth::SessionStore::new(auth::SESSION_TOKEN_TTL),
+            rider_tokens: tokio::sync::Mutex::new(
+                crate::server::rider_auth::RiderTokenStore::load(
+                    data_dir.join(crate::server::rider_auth::RIDER_TOKENS_FILE),
+                )
+                .await,
+            ),
             exec_service,
             groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
             connect_diagnostics: Arc::new(x0x::connect::ConnectDiagnostics::new(
@@ -22673,6 +22741,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -22698,6 +22767,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -24528,6 +24598,7 @@ pub(in crate::server) mod tests {
         let (enc_status, enc_body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.clone()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(plaintext),
             }),
@@ -25469,6 +25540,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25488,6 +25560,7 @@ pub(in crate::server) mod tests {
         let (encrypt_status, encrypted) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -25614,6 +25687,7 @@ pub(in crate::server) mod tests {
         let (status, body) = secure_group_encrypt(
             State(Arc::clone(&state)),
             Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
             Json(SecureEncryptRequest {
                 payload_b64: BASE64.encode(b"secret"),
             }),
@@ -27486,6 +27560,7 @@ pub(in crate::server) mod tests {
             timestamp: 123,
             thread_root: None,
             thread_parent: None,
+            rider_provenance: None,
             signature: "cc".repeat(64),
         };
 
@@ -27522,6 +27597,7 @@ pub(in crate::server) mod tests {
             1_000,
             None,
             None,
+            None,
         )
         .expect("sign v1");
 
@@ -27538,6 +27614,7 @@ pub(in crate::server) mod tests {
             2_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .expect("sign v2");
 
@@ -27619,10 +27696,14 @@ pub(in crate::server) mod tests {
     ) -> Result<(StatusCode, serde_json::Value)> {
         let req =
             serde_json::from_value(serde_json::json!({ "body": body })).context("send request")?;
-        let response =
-            send_group_public_message(State(state), Path(group_id.to_string()), Json(req))
-                .await
-                .into_response();
+        let response = send_group_public_message(
+            State(state),
+            Path(group_id.to_string()),
+            axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+            Json(req),
+        )
+        .await
+        .into_response();
         response_json(response).await
     }
 

@@ -240,6 +240,7 @@ async fn test_group_public_message_gossip_round_trip() -> Result<(), Box<dyn std
         1_000,
         None,
         None,
+        None,
     )
     .unwrap();
 
@@ -282,6 +283,7 @@ async fn test_group_public_message_gossip_round_trip() -> Result<(), Box<dyn std
         GroupPublicMessageKind::Chat,
         "reply from bob".into(),
         2_000,
+        None,
         None,
         None,
     )
@@ -358,6 +360,7 @@ async fn test_adr0029_threaded_message_delivery() -> Result<(), Box<dyn std::err
         1_000,
         None,
         None,
+        None,
     )
     .unwrap();
     let root_msg_id = root.msg_id();
@@ -374,6 +377,7 @@ async fn test_adr0029_threaded_message_delivery() -> Result<(), Box<dyn std::err
         2_000,
         Some(root_msg_id.clone()),
         Some(root_msg_id.clone()),
+        None,
     )
     .unwrap();
     let reply_msg_id = reply.msg_id();

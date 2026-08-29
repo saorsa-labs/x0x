@@ -205,6 +205,50 @@ Notes:
   explicit rather than silent.
 - Response: `ok`, `valid` (boolean), `algorithm`.
 
+### Sub-agent harness boundary (ADR-0039)
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/owner/agents` | `x0x owner agents` | Roster of owner-certified agents (journal-backed) |
+| POST | `/owner/agents/issue` | `x0x owner agents issue <PUB_HEX>` | Owner-sign an `AgentCertificate` over a harness-submitted agent **public** key |
+| DELETE | `/owner/agents/:id` | `x0x owner agents revoke <AGENT_ID>` | ADR-0018 owner issuer-revocation of a registered sub-agent |
+| POST | `/owner/riders` | `x0x owner riders issue <AGENT_ID>` | Mint a scoped rider token for a registered rider-mode sub-agent |
+| GET | `/owner/riders` | `x0x owner riders` | List rider-token records (no secrets) |
+| DELETE | `/owner/riders/:id` | `x0x owner riders revoke <TOKEN_ID>` | Revoke a rider token (fails on next request) |
+
+All six are owner-only: every `/owner/*` route rejects a rider token with
+`403` in the auth middleware before any handler runs. `409` when the
+daemon has no owner user key.
+
+**Issuance** takes `{ "agent_public_key": <hex ML-DSA-65 public key>,
+"mode": "acp"|"rider", "label"?: string, "not_after"?: unix-seconds }`.
+The harness generates and custodies the keypair; the daemon never sees
+the secret. The record lands in the owner-scoped ADR-0036 issuance
+journal (`owner-cert-journal.jsonl`) with the mode, label, and the full
+certificate bytes (retained so revocation can present the exact ADR-0018
+authority evidence), and the response returns the certificate
+(`certificate.storage_b64`) for ACP-attached harness instances.
+
+**Rider tokens** (`{ "sub_agent_id": <hex>, "groups": [gid…], "label"?:
+string, "ttl_secs"?: ≤ 90 days, default 7 }`) are stored hashed at rest
+(SHA-256), expire, and are revocable per-token or by revoking their
+sub-agent. A rider token authenticates as a distinct principal that may
+reach exactly:
+
+- `POST /groups/:id/send` — `SignedPublic` groups in its grant list
+- `POST /groups/:id/secure/encrypt` — `MlsEncrypted` groups in its grant
+  list plus Home (always granted)
+- `GET /history` — `group:` scopes it is granted, limit clamped to 100
+
+Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
+and `/shutdown` — answers `403`. Rider sends are signed by the daemon's
+own agent key carrying a provenance envelope
+(`rider_provenance.sub_agent_id`, `rider_token_id`, `rider_token_hash`,
+`scope`) **inside the signed bytes**: attribution without ever exposing a
+sub-agent signing key or a signing oracle. Rider Home encrypts record the
+sub-agent id as the history row's author.
+
+
 ## Network
 
 | Method | Endpoint | CLI | Purpose |

@@ -145,6 +145,13 @@ pub(in crate::server) struct OwnerAgentEntry {
     /// True when the entry comes from the persisted issuance journal
     /// (survives restarts) rather than live discovery only.
     pub(in crate::server) from_journal: bool,
+    /// ADR-0039 hosting mode of the latest journal issuance
+    /// (`"acp"` or `"rider"`).
+    pub(in crate::server) mode: &'static str,
+    /// ADR-0039 operator label of the latest journal issuance.
+    pub(in crate::server) journal_label: Option<String>,
+    /// True when the agent has an ADR-0018 revocation on record.
+    pub(in crate::server) revoked: bool,
 }
 
 /// GET /owner/agents — the roster of agents certified by this install's
@@ -169,6 +176,14 @@ pub(in crate::server) async fn owner_agents(
     };
     let roster = state.agent.owner_issued_certificates().await;
     let contacts = state.contacts.read().await;
+    let revoked_ids: std::collections::HashSet<String> = state
+        .agent
+        .revocation_records()
+        .await
+        .iter()
+        .filter(|record| record.subject_kind() == "agent")
+        .map(|record| record.subject_hex())
+        .collect();
     let local_agent_id = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent_id.as_bytes());
     let mut entries = Vec::with_capacity(roster.len());
@@ -197,6 +212,12 @@ pub(in crate::server) async fn owner_agents(
                 .map(|d| hex::encode(d.machine_id.as_bytes())),
             is_local: record.agent_id == local_agent_hex,
             from_journal: record.from_journal,
+            mode: match record.mode {
+                crate::profile::CertMode::Acp => "acp",
+                crate::profile::CertMode::Rider => "rider",
+            },
+            journal_label: record.label.clone(),
+            revoked: revoked_ids.contains(&record.agent_id),
         });
     }
     entries.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));
@@ -516,6 +537,9 @@ mod tests {
             cert_digest: "77".repeat(32),
             issued_at: 9_999,
             not_after: None,
+            mode: crate::profile::CertMode::Acp,
+            label: None,
+            cert_b64: None,
         };
         // Higher issued_at than the real record: only the owner filter can
         // keep it out of the roster.

@@ -104,8 +104,40 @@ pub struct GroupPublicMessage {
     /// When present, `thread_root` must also be present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub thread_parent: Option<String>,
+    /// ADR-0039 rider provenance: present only when this message was sent
+    /// through the owner's daemon by an API-key rider. The envelope rides
+    /// INSIDE `signable_bytes()` — the daemon-agent signature over the
+    /// message authenticates the attribution (gapcheck blocker 24: the
+    /// provenance marker must be covered by the signed bytes). Additive and
+    /// serde-defaulted, so pre-ADR-0039 messages (and older verifiers that
+    /// drop the field) see the exact v1/v2 encoding when it is `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rider_provenance: Option<RiderProvenance>,
     /// Hex ML-DSA-65 signature over `signable_bytes()`.
     pub signature: String,
+}
+
+/// Attribution envelope for a rider-sourced send (ADR-0039).
+///
+/// The daemon never holds the sub-agent's secret key, so it cannot — and
+/// must not — sign *as* the sub-agent (that would make `/agent/sign`-style
+/// oracle abuse trivial). Instead the DAEMON's agent key signs the message
+/// and this envelope binds, inside those signed bytes, the identity of the
+/// registered sub-agent on whose behalf the send was made plus the rider
+/// token that authorized it (identified by opaque id and SHA-256 hash —
+/// never the token secret itself).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiderProvenance {
+    /// Hex `AgentId` of the registered sub-agent on whose behalf the
+    /// daemon sent (must match a `mode=rider` journal record).
+    pub sub_agent_id: String,
+    /// Opaque numeric id of the rider token that authorized the send.
+    pub rider_token_id: u64,
+    /// SHA-256 hex of the rider token (the hashed-at-rest identifier;
+    /// the token secret is never placed on the wire).
+    pub rider_token_hash: String,
+    /// The granted scope this send used: the target group id.
+    pub scope: String,
 }
 
 impl GroupPublicMessage {
@@ -152,6 +184,16 @@ impl GroupPublicMessage {
                 self.thread_parent.as_deref().unwrap_or("").as_bytes(),
             );
         }
+        // ADR-0039: rider provenance rides INSIDE the signed bytes (absent
+        // ⇒ byte-identical legacy encoding, preserving the ADR-0029 rule
+        // above; present ⇒ the attribution is authenticated by the
+        // author's signature and covered by `msg_id`).
+        if let Some(prov) = &self.rider_provenance {
+            push_len_prefixed(&mut buf, prov.sub_agent_id.as_bytes());
+            buf.extend_from_slice(&prov.rider_token_id.to_le_bytes());
+            push_len_prefixed(&mut buf, prov.rider_token_hash.as_bytes());
+            push_len_prefixed(&mut buf, prov.scope.as_bytes());
+        }
         buf
     }
 
@@ -167,7 +209,10 @@ impl GroupPublicMessage {
     /// Build and sign a new public message.
     ///
     /// Pass `thread_root` / `thread_parent` to produce a v2-domain threaded
-    /// message (ADR-0029). Both `None` produces a v1-compatible message.
+    /// message (ADR-0029); both `None` produces a v1-compatible message.
+    /// Pass `rider_provenance` to stamp ADR-0039 attribution inside the
+    /// signed bytes (owner sends pass `None` and produce the exact legacy
+    /// encoding).
     #[allow(clippy::too_many_arguments)]
     pub fn sign(
         group_id: String,
@@ -180,6 +225,7 @@ impl GroupPublicMessage {
         timestamp: u64,
         thread_root: Option<String>,
         thread_parent: Option<String>,
+        rider_provenance: Option<RiderProvenance>,
     ) -> Result<Self, ApplyError> {
         let author_agent_id = hex::encode(keypair.agent_id().as_bytes());
         let author_public_key = hex::encode(keypair.public_key().as_bytes());
@@ -195,6 +241,7 @@ impl GroupPublicMessage {
             timestamp,
             thread_root,
             thread_parent,
+            rider_provenance,
             signature: String::new(),
         };
         let sig = sign_with_ml_dsa(keypair.secret_key(), &msg.signable_bytes())
@@ -463,6 +510,7 @@ mod tests {
             1_000,
             None,
             None,
+            None,
         )
         .unwrap()
     }
@@ -548,6 +596,7 @@ mod tests {
             GroupPublicMessageKind::Chat,
             "x".into(),
             1_000,
+            None,
             None,
             None,
         )
@@ -797,6 +846,7 @@ mod tests {
             2_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         let bytes = msg.signable_bytes();
@@ -824,6 +874,7 @@ mod tests {
             3_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         // Simulate an old node by stripping thread fields AFTER signing —
@@ -866,6 +917,7 @@ mod tests {
             4_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         msg.verify_signature().unwrap(); // baseline passes
@@ -948,6 +1000,7 @@ mod tests {
             5_000,
             Some(fake_root.clone()),
             Some(fake_root),
+            None,
         )
         .unwrap();
         // Strip root — now parent is present without root.
@@ -987,6 +1040,7 @@ mod tests {
             6_000,
             Some(fake_root),
             Some(fake_parent),
+            None,
         )
         .unwrap();
         let policy = open_policy();
@@ -1028,6 +1082,7 @@ mod tests {
             "self ref".into(),
             7_000,
             Some(base_id.clone()),
+            None,
             None,
         )
         .unwrap();

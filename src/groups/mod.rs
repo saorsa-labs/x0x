@@ -49,8 +49,8 @@ pub use self::policy::{
 };
 pub use self::public_message::{
     public_topic_for, validate_public_message, GroupPublicMessage, GroupPublicMessageKind,
-    IngestError as PublicMessageIngestError, PublicIngestContext, MAX_PUBLIC_MESSAGE_BYTES,
-    PUBLIC_GROUP_TOPIC_PREFIX, PUBLIC_MESSAGE_DOMAIN,
+    IngestError as PublicMessageIngestError, PublicIngestContext, RiderProvenance,
+    MAX_PUBLIC_MESSAGE_BYTES, PUBLIC_GROUP_TOPIC_PREFIX, PUBLIC_MESSAGE_DOMAIN,
 };
 pub use self::request::{JoinRequest, JoinRequestStatus};
 pub use self::state_commit::{

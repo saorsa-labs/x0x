@@ -104,6 +104,22 @@ fn extract_query_token(query: Option<&str>) -> Option<String> {
 /// owned strings (no request borrows survive across `next.run(req).await`),
 /// delegates the decision, and maps the result to either the next layer or a
 /// 401 JSON error.
+///
+/// # ADR-0039 actor resolution
+///
+/// After the owner-token checks fail, the presented **bearer** token is
+/// matched against the rider-token store (blocker 21/22). A live rider
+/// token becomes [`ActorContext::Rider`] — but only on the
+/// deny-by-default rider route set; every other route answers `403`
+/// before any handler runs. Riders are bearer-only: a rider token in a
+/// `?token=` query string is rejected exactly like any other non-session
+/// query token. Unknown/expired/revoked tokens stay `401`.
+///
+/// The resolved [`ActorContext`] is inserted into the request extensions
+/// so rider-aware handlers (`/groups/:id/send`,
+/// `/groups/:id/secure/encrypt`, `GET /history`) can consult it; every
+/// other handler ignores it and keeps deriving identity from
+/// `state.agent` as before.
 pub(super) async fn auth_middleware(
     State(state): State<Arc<AppState>>,
     req: axum::http::Request<axum::body::Body>,
@@ -115,7 +131,7 @@ pub(super) async fn auth_middleware(
     let query_token = extract_query_token(req.uri().query());
     let now = Instant::now();
 
-    match authorize(
+    let owner_ok = authorize(
         &path,
         &method,
         header_token.as_deref(),
@@ -123,16 +139,51 @@ pub(super) async fn auth_middleware(
         &state.api_token,
         &state.sessions,
         now,
-    ) {
-        Ok(()) => next.run(req).await,
-        Err(status) => (
-            status,
-            Json(serde_json::json!({
-                "error": "missing or invalid Authorization: Bearer token"
-            })),
-        )
-            .into_response(),
+    )
+    .is_ok();
+
+    if owner_ok {
+        let mut req = req;
+        req.extensions_mut()
+            .insert(super::rider_auth::ActorContext::Owner);
+        return next.run(req).await;
     }
+
+    // Rider fallback: bearer header only, never a query string.
+    if let Some(token) = header_token.as_deref() {
+        let rider = {
+            let store = state.rider_tokens.lock().await;
+            store.validate(token, super::rider_auth::unix_now_secs())
+        };
+        if let Some(rider) = rider {
+            if !super::rider_auth::rider_route_allowed(&method, &path) {
+                return (
+                    StatusCode::FORBIDDEN,
+                    Json(serde_json::json!({
+                        "error": "rider tokens are denied on this route (ADR-0039 deny-by-default)"
+                    })),
+                )
+                    .into_response();
+            }
+            let actor = super::rider_auth::ActorContext::Rider {
+                sub_agent_id: rider.sub_agent_id,
+                token_id: rider.token_id,
+                token_hash: rider.token_hash,
+                groups: rider.groups,
+            };
+            let mut req = req;
+            req.extensions_mut().insert(actor);
+            return next.run(req).await;
+        }
+    }
+
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(serde_json::json!({
+            "error": "missing or invalid Authorization: Bearer token"
+        })),
+    )
+        .into_response()
 }
 
 /// `POST /auth/session` — exchange the durable API token for a short-lived

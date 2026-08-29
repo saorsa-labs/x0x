@@ -870,6 +870,11 @@ pub(super) struct AppState {
     /// Short-lived browser session tokens (#127 / WS1.6). The only tokens
     /// accepted via `?token=` query strings on WS/SSE endpoints.
     pub(super) sessions: SessionStore,
+    /// ADR-0039 rider-token store: scoped sub-agent bearer tokens
+    /// (hashed at rest, persisted in `rider-tokens.json`). Consulted by
+    /// the auth middleware on every request after the owner-token
+    /// checks fail.
+    pub(super) rider_tokens: tokio::sync::Mutex<super::rider_auth::RiderTokenStore>,
     /// Tier-1 remote exec service.
     pub(super) exec_service: Arc<x0x::exec::ExecService>,
     /// Per-group ingest diagnostics surfaced via `/diagnostics/groups`.

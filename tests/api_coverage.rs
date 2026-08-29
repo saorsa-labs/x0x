@@ -72,7 +72,31 @@ const COVERED: &[CoveredEndpoint] = &[
     covered!(Get, "/home", home_routes_wired),
     covered!(Post, "/home/rename", home_rename_round_trips),
     covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
-    // ── Network ─────────────────────────────────────────────────────────
+    covered!(
+        Post,
+        "/owner/agents/issue",
+        rider_issuance_journals_and_roster_lists
+    ),
+    covered!(
+        Delete,
+        "/owner/agents/:id",
+        rider_revoked_token_fails_on_next_request
+    ),
+    covered!(
+        Post,
+        "/owner/riders",
+        rider_scope_matrix_ungranted_verbs_forbidden
+    ),
+    covered!(
+        Get,
+        "/owner/riders",
+        rider_revoked_token_fails_on_next_request
+    ),
+    covered!(
+        Delete,
+        "/owner/riders/:id",
+        rider_revoked_token_fails_on_next_request
+    ),
     covered!(Get, "/peers", daemon_api_peers),
     // ── Presence ────────────────────────────────────────────────────────
     covered!(Get, "/presence", "GET /presence"),
@@ -487,6 +511,7 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         include_str!("daemon_api_integration.rs"),
     ),
     ("tests/history_api.rs", include_str!("history_api.rs")),
+    ("tests/rider_harness.rs", include_str!("rider_harness.rs")),
     (
         "tests/history_point_lookup_wiring.rs",
         include_str!("history_point_lookup_wiring.rs"),

@@ -776,8 +776,13 @@ async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()>
     // Secure encrypt refuses while quarantined.
     let req: SecureEncryptRequest =
         serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
-    let (status, json) =
-        secure_group_encrypt(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+        Json(req),
+    )
+    .await;
     let body: serde_json::Value = json.0;
     assert_eq!(status, StatusCode::CONFLICT, "quarantined encrypt must 409");
     assert!(
@@ -1335,8 +1340,13 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
     // Secure ops work again (no 409 quarantine).
     let req: SecureEncryptRequest =
         serde_json::from_value(serde_json::json!({ "payload_b64": "aGVsbG8=" }))?;
-    let (status, json) =
-        secure_group_encrypt(State(Arc::clone(&state)), Path(group_id.clone()), Json(req)).await;
+    let (status, json) = secure_group_encrypt(
+        State(Arc::clone(&state)),
+        Path(group_id.clone()),
+        axum::Extension(crate::server::rider_auth::ActorContext::Owner),
+        Json(req),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::OK,

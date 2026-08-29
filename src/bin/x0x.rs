@@ -439,11 +439,69 @@ enum HomeSub {
     },
 }
 
-/// `x0x owner` subcommands (ADR-0036).
+/// `x0x owner` subcommands (ADR-0036 registry, ADR-0039 harness boundary).
 #[derive(Subcommand)]
 enum OwnerSub {
-    /// List agents certified by this install's owner (the "my agents" roster).
-    Agents,
+    /// Agents certified by this install's owner (the "my agents" roster).
+    Agents {
+        #[command(subcommand)]
+        sub: Option<OwnerAgentsSub>,
+    },
+    /// Rider-token lifecycle (ADR-0039 API-key riders).
+    Riders {
+        #[command(subcommand)]
+        sub: Option<OwnerRidersSub>,
+    },
+}
+
+/// `x0x owner agents` subcommands (ADR-0039).
+#[derive(Subcommand)]
+enum OwnerAgentsSub {
+    /// Certify a harness-submitted agent public key (the daemon never
+    /// sees the secret key).
+    Issue {
+        /// Hex ML-DSA-65 public key of the harness-generated keypair.
+        #[arg(value_name = "PUBLIC_KEY_HEX")]
+        public_key: String,
+        /// Hosting mode: `acp` (default) or `rider`.
+        #[arg(long, value_name = "MODE")]
+        mode: Option<String>,
+        /// Operator label for the roster.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+    },
+    /// Revoke a registered sub-agent (ADR-0018 owner issuer-revocation).
+    Revoke {
+        /// Hex agent id from the roster.
+        #[arg(value_name = "AGENT_ID")]
+        agent_id: String,
+    },
+}
+
+/// `x0x owner riders` subcommands (ADR-0039).
+#[derive(Subcommand)]
+enum OwnerRidersSub {
+    /// Mint a scoped rider token for a registered rider-mode sub-agent.
+    Issue {
+        /// Hex agent id of the registered sub-agent.
+        #[arg(value_name = "AGENT_ID")]
+        agent: String,
+        /// Granted named-group id (repeatable; Home is always granted).
+        #[arg(long = "group", value_name = "GROUP_ID")]
+        groups: Vec<String>,
+        /// Operator label.
+        #[arg(long, value_name = "LABEL")]
+        label: Option<String>,
+        /// Token lifetime seconds (default 7 days, max 90 days).
+        #[arg(long, value_name = "SECS")]
+        ttl_secs: Option<u64>,
+    },
+    /// Revoke a rider token by id; it fails on the next request.
+    Revoke {
+        /// Numeric rider-token id from `x0x owner riders`.
+        #[arg(value_name = "TOKEN_ID")]
+        token_id: u64,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1536,7 +1594,51 @@ async fn run(
             Some(HomeSub::Rename { name }) => commands::identity::home_rename(&client, &name).await,
         },
         Commands::Owner { sub } => match sub {
-            None | Some(OwnerSub::Agents) => commands::identity::owner_agents(&client).await,
+            None => commands::identity::owner_agents(&client).await,
+            Some(OwnerSub::Agents { sub: None }) => commands::identity::owner_agents(&client).await,
+            Some(OwnerSub::Agents {
+                sub:
+                    Some(OwnerAgentsSub::Issue {
+                        public_key,
+                        mode,
+                        label,
+                    }),
+            }) => {
+                commands::identity::owner_agents_issue(
+                    &client,
+                    &public_key,
+                    mode.as_deref().unwrap_or("acp"),
+                    label.as_deref(),
+                )
+                .await
+            }
+            Some(OwnerSub::Agents {
+                sub: Some(OwnerAgentsSub::Revoke { agent_id }),
+            }) => commands::identity::owner_agents_revoke(&client, &agent_id).await,
+            Some(OwnerSub::Riders { sub: None }) => {
+                commands::identity::owner_riders_list(&client).await
+            }
+            Some(OwnerSub::Riders {
+                sub:
+                    Some(OwnerRidersSub::Issue {
+                        agent,
+                        groups,
+                        label,
+                        ttl_secs,
+                    }),
+            }) => {
+                commands::identity::owner_riders_issue(
+                    &client,
+                    &agent,
+                    &groups,
+                    label.as_deref(),
+                    ttl_secs,
+                )
+                .await
+            }
+            Some(OwnerSub::Riders {
+                sub: Some(OwnerRidersSub::Revoke { token_id }),
+            }) => commands::identity::owner_riders_revoke(&client, token_id).await,
         },
         Commands::Health => commands::network::health(&client).await,
         Commands::Status => commands::network::status(&client).await,
