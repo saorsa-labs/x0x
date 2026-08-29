@@ -9420,10 +9420,15 @@ pub(in crate::server) async fn send_group_public_message(
                     delegation,
                 };
                 let now_unix = x0x::dm::now_unix_ms() / 1_000;
+                let sub_revoked =
+                    state.agent.revocation_records().await.iter().any(|rec| {
+                        rec.subject_kind() == "agent" && rec.subject_hex() == *sub_agent_id
+                    });
                 if let Err(reason) = x0x::groups::verify_rider_provenance(
                     &provenance,
                     &local_hex,
                     info.stable_group_id(),
+                    sub_revoked,
                     now_unix,
                 ) {
                     tracing::warn!(
@@ -9794,6 +9799,42 @@ pub(in crate::server) struct MlsRiderAttribution {
     pub(in crate::server) sub_agent_id: String,
     pub(in crate::server) artifact: Vec<u8>,
     pub(in crate::server) signature: Vec<u8>,
+    /// The daemon agent public key that produced `signature` —
+    /// persisted with the history row (review r5) so the attribution
+    /// is independently verifiable after the fact.
+    pub(in crate::server) signing_pubkey: Vec<u8>,
+}
+
+/// Sign the MLS rider attribution for a completed encryption (review
+/// r5): canonical bytes over the provenance (incl. delegation), group,
+/// epoch, and the CIPHERTEXT DIGEST, signed with the daemon agent key.
+/// `None` when no rider provenance applies (owner sends).
+fn sign_mls_rider_attribution(
+    state: &AppState,
+    provenance: Option<&x0x::groups::RiderProvenance>,
+    group_id: &str,
+    epoch: u64,
+    ciphertext: &[u8],
+) -> Option<MlsRiderAttribution> {
+    let provenance = provenance?;
+    let artifact =
+        x0x::groups::rider_mls_attribution_bytes(provenance, group_id, epoch, ciphertext);
+    let signing_kp = state.agent.identity().agent_keypair();
+    match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        signing_kp.secret_key(),
+        &artifact,
+    ) {
+        Ok(sig) => Some(MlsRiderAttribution {
+            sub_agent_id: provenance.sub_agent_id.clone(),
+            artifact,
+            signature: sig.as_bytes().to_vec(),
+            signing_pubkey: signing_kp.public_key().as_bytes().to_vec(),
+        }),
+        Err(e) => {
+            tracing::warn!("failed to sign rider MLS attribution: {e:?}");
+            None
+        }
+    }
 }
 
 /// Record MLS-group plaintext obtained via a local secure-surface call
@@ -9823,24 +9864,28 @@ fn record_mls_history(
         "application/octet-stream"
     };
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
-    // With a signed rider attribution the row is NON-opaque (see
-    // `HistoryRecord::validate`) and the msg_id is the canonical
-    // BLAKE3(artifact || payload); without one it stays the
-    // epoch-salted id (dedupes identical plaintext per group+epoch).
-    let (author_agent, signed_artifact, signature, sig_context, msg_id) = match attribution {
-        None => (None, None, None, None, None),
-        Some(att) => {
-            let msg_id =
-                x0x::history::HistoryRecord::compute_msg_id(Some(&att.artifact), plaintext);
-            (
-                Some(att.sub_agent_id.clone()),
-                Some(att.artifact.clone()),
-                Some(att.signature.clone()),
-                Some("x0x.rider.mls-attribution.v1".to_string()),
-                Some(msg_id),
-            )
-        }
-    };
+    let (author_agent, signed_artifact, signature, sig_context, msg_id, author_pubkey) =
+        match attribution {
+            None => (None, None, None, None, None, None),
+            Some(att) => {
+                // With a signed rider attribution the row is NON-opaque (see
+                // `HistoryRecord::validate`) and the msg_id is the canonical
+                // BLAKE3(artifact || payload); without one it stays the
+                // epoch-salted id (dedupes identical plaintext per group+epoch).
+                let msg_id =
+                    x0x::history::HistoryRecord::compute_msg_id(Some(&att.artifact), plaintext);
+                (
+                    Some(att.sub_agent_id.clone()),
+                    Some(att.artifact.clone()),
+                    Some(att.signature.clone()),
+                    Some("x0x.rider.mls-attribution.v1".to_string()),
+                    Some(msg_id),
+                    // Review r5: persist the signing pubkey so the
+                    // attribution verifies after the fact.
+                    Some(att.signing_pubkey.clone()),
+                )
+            }
+        };
     let msg_id = msg_id.unwrap_or_else(|| {
         x0x::history::HistoryRecord::compute_epoch_msg_id(stable_group_id, epoch, plaintext)
     });
@@ -9849,7 +9894,7 @@ fn record_mls_history(
         scope: x0x::history::Scope::Group(stable_group_id.to_string()),
         author_agent,
         author_machine: None,
-        author_pubkey: None,
+        author_pubkey,
         sent_at_ms: now,
         seen_at_ms: now,
         direction,
@@ -10137,7 +10182,18 @@ pub(in crate::server) async fn ingest_public_message(
         policy: &policy,
         members_v2: &members,
     };
-    match x0x::groups::validate_public_message(&ctx, &msg) {
+    // Review r5: pass the receiver's ADR-0018 revocation view so a
+    // rider message from a revoked sub-agent is rejected at ingest —
+    // mirroring the sending daemon's middleware fence.
+    let revoked_agents: std::collections::BTreeSet<String> = state
+        .agent
+        .revocation_records()
+        .await
+        .iter()
+        .filter(|rec| rec.subject_kind() == "agent")
+        .map(|rec| rec.subject_hex())
+        .collect();
+    match x0x::groups::validate_public_message_with_revocations(&ctx, &msg, &revoked_agents) {
         Ok(()) => {
             state
                 .groups_diagnostics
@@ -16472,7 +16528,7 @@ async fn treekem_group_encrypt(
     group_id_hex: &str,
     stable_group_id: Option<&str>,
     payload_b64: &str,
-    attribution: Option<&MlsRiderAttribution>,
+    rider_provenance: Option<&x0x::groups::RiderProvenance>,
 ) -> (StatusCode, Json<serde_json::Value>) {
     use base64::Engine as _;
     let plaintext = match BASE64.decode(payload_b64) {
@@ -16529,13 +16585,23 @@ async fn treekem_group_encrypt(
     }
     let epoch = guard.epoch();
     drop(guard);
+    // Review r5: sign the attribution AFTER encryption over the
+    // ciphertext digest (the self-describing ApplicationCiphertext
+    // bytes), then record.
+    let attribution = sign_mls_rider_attribution(
+        state,
+        rider_provenance,
+        stable_group_id.unwrap_or(group_id_hex),
+        epoch,
+        &ciphertext,
+    );
     record_mls_history(
         state,
         stable_group_id.unwrap_or(group_id_hex),
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
-        attribution,
+        attribution.as_ref(),
     );
     secure_group_effect_response_after_terminality_recheck(
         state,
@@ -16664,7 +16730,7 @@ pub(in crate::server) async fn secure_group_encrypt(
     // delegation covering THIS group — verified against the same chain
     // receivers verify. The provenance then produces the signed MLS
     // attribution artifact below.
-    let mut rider_attribution: Option<MlsRiderAttribution> = None;
+    let mut rider_provenance: Option<x0x::groups::RiderProvenance> = None;
     if let crate::server::rider_auth::ActorContext::Rider {
         sub_agent_id,
         token_id,
@@ -16705,10 +16771,17 @@ pub(in crate::server) async fn secure_group_encrypt(
             delegation,
         };
         let now_unix = x0x::dm::now_unix_ms() / 1_000;
+        let sub_revoked = state
+            .agent
+            .revocation_records()
+            .await
+            .iter()
+            .any(|rec| rec.subject_kind() == "agent" && rec.subject_hex() == *sub_agent_id);
         if let Err(reason) = x0x::groups::verify_rider_provenance(
             &provenance,
             &caller_hex,
             info.stable_group_id(),
+            sub_revoked,
             now_unix,
         ) {
             tracing::warn!(
@@ -16718,33 +16791,11 @@ pub(in crate::server) async fn secure_group_encrypt(
             );
             return forbidden("rider delegation does not verify for this group");
         }
-        // Review r4 item 2: the attribution is CRYPTOGRAPHIC — the
-        // daemon signs an artifact binding the provenance (with its
-        // sub-agent-signed delegation) to this (group, epoch), recorded
-        // as the history row's signed artifact.
-        let epoch = info.secret_epoch;
-        let artifact =
-            x0x::groups::rider_mls_attribution_bytes(&provenance, info.stable_group_id(), epoch);
-        let signing_kp = state.agent.identity().agent_keypair();
-        match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-            signing_kp.secret_key(),
-            &artifact,
-        ) {
-            Ok(sig) => {
-                rider_attribution = Some(MlsRiderAttribution {
-                    sub_agent_id: sub_agent_id.clone(),
-                    artifact,
-                    signature: sig.as_bytes().to_vec(),
-                });
-            }
-            Err(e) => {
-                tracing::warn!("failed to sign rider MLS attribution: {e:?}");
-                return api_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "failed to sign rider attribution",
-                );
-            }
-        }
+        // Review r5: the attribution is signed AFTER encryption, over
+        // bytes that include the CIPHERTEXT DIGEST, so it authenticates
+        // the concrete message — not just (group, epoch). The signing
+        // happens in both plane branches below.
+        rider_provenance = Some(provenance);
     }
     if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
         return bad_request("group is not MlsEncrypted — use public send instead");
@@ -16759,10 +16810,11 @@ pub(in crate::server) async fn secure_group_encrypt(
             &id,
             Some(&stable_group_id),
             &req.payload_b64,
-            rider_attribution.as_ref(),
+            rider_provenance.as_ref(),
         )
         .await;
     }
+
     let Some(key) = info.secure_message_key() else {
         return api_error(
             StatusCode::FAILED_DEPENDENCY,
@@ -16812,13 +16864,22 @@ pub(in crate::server) async fn secure_group_encrypt(
         }
     };
 
+    // Review r5: sign the attribution AFTER encryption over the
+    // ciphertext digest, then record.
+    let attribution = sign_mls_rider_attribution(
+        state.as_ref(),
+        rider_provenance.as_ref(),
+        &group_id_clone,
+        epoch,
+        &ciphertext,
+    );
     record_mls_history(
         state.as_ref(),
         &group_id_clone,
         &plaintext,
         x0x::history::Direction::Outbound,
         epoch,
-        rider_attribution.as_ref(),
+        attribution.as_ref(),
     );
     secure_group_effect_response_after_terminality_recheck(
         state.as_ref(),

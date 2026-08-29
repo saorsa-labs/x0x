@@ -564,6 +564,23 @@ pub(in crate::server) async fn owner_riders_issue(
         .unwrap_or(crate::server::rider_auth::RIDER_DEFAULT_TTL_SECS)
         .clamp(1, crate::server::rider_auth::RIDER_MAX_TTL_SECS);
 
+    // Review r5: the delegation must not outlive its certificate or its
+    // token — cap not_after at min(cert.not_after, token expiry) and
+    // refuse longer capabilities.
+    let token_expires_at = now.saturating_add(ttl);
+    let cap = cert_not_after.unwrap_or(u64::MAX).min(token_expires_at);
+    if let Some(claim) = parse_delegation_claim(&delegation) {
+        if claim.not_after > cap {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "delegation not_after ({}) outlives min(cert expiry, token expiry) ({cap}) — sign a shorter capability",
+                    claim.not_after
+                ),
+            );
+        }
+    }
+
     let issued = state
         .rider_tokens
         .lock()
@@ -603,6 +620,17 @@ pub(in crate::server) async fn owner_riders_issue(
             "expires_at_unix": record.expires_at,
         })),
     )
+}
+
+/// Parse the claim back out of an assembled delegation (issuance-cap
+/// check, review r5). `None` if the stored payload does not parse —
+/// impossible for a just-verified delegation, but refuse silently-safe.
+fn parse_delegation_claim(
+    delegation: &crate::groups::RiderDelegation,
+) -> Option<crate::groups::RiderDelegationClaim> {
+    use base64::Engine as _;
+    let payload = BASE64.decode(&delegation.payload_b64).ok()?;
+    crate::groups::parse_rider_delegation(&payload)
 }
 
 /// GET /owner/riders — list rider-token records (no secrets). Durable

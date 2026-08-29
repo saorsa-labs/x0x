@@ -40,7 +40,7 @@ use ant_quic::crypto::raw_public_keys::pqc::{
 };
 use ant_quic::MlDsaPublicKey;
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// Domain-separation tag for public-message signatures (v1 — no thread fields).
 pub const PUBLIC_MESSAGE_DOMAIN: &[u8] = b"x0x.group.public-message.v1";
@@ -277,7 +277,7 @@ pub fn verify_rider_provenance(
     provenance: &RiderProvenance,
     author_agent_id: &str,
     scope: &str,
-
+    agent_revoked: bool,
     now_unix: u64,
 ) -> Result<String, String> {
     use base64::Engine as _;
@@ -319,6 +319,17 @@ pub fn verify_rider_provenance(
         .map_err(|_| "delegation is not signed by the sub-agent's key".to_string())?;
     if now_unix >= claim.not_after {
         return Err("delegation has expired".to_string());
+    }
+    // Review r5 item 2: authorization lifetime at the RECEIVER. The
+    // certificate's own expiry (a signature-only `verify` says nothing
+    // about `not_after`) and the caller's ADR-0018 revocation view of
+    // the sub-agent are both enforced here, mirroring the sending
+    // daemon's middleware fence.
+    if cert.is_expired(now_unix) {
+        return Err("delegation certificate has expired".to_string());
+    }
+    if agent_revoked {
+        return Err("sub-agent is revoked (ADR-0018)".to_string());
     }
     if !claim.scopes.iter().any(|s| s == scope) {
         return Err("target group is not in the delegation scopes".to_string());
@@ -362,12 +373,17 @@ pub const RIDER_MLS_ATTRIBUTION_DOMAIN: &[u8] = b"x0x.rider.mls-attribution.v1";
 
 /// Canonical MLS attribution bytes:
 /// `domain || (len-prefixed) sub_agent_id, scope, delegation
-/// cert_b64/payload_b64/signature || token_id(LE) || epoch(LE)`.
+/// cert_b64/payload_b64/signature || token_id(LE) || group || epoch(LE)
+/// || blake3(ciphertext)`. The ciphertext digest (review r5) binds the
+/// signature to the ACTUAL encrypted message — without it the artifact
+/// attested provenance for a (group, epoch) but not for any concrete
+/// ciphertext.
 #[must_use]
 pub fn rider_mls_attribution_bytes(
     provenance: &RiderProvenance,
     group_id: &str,
     epoch: u64,
+    ciphertext: &[u8],
 ) -> Vec<u8> {
     let mut buf = Vec::with_capacity(256 + provenance.delegation.cert_b64.len());
     buf.extend_from_slice(RIDER_MLS_ATTRIBUTION_DOMAIN);
@@ -379,6 +395,7 @@ pub fn rider_mls_attribution_bytes(
     buf.extend_from_slice(&provenance.rider_token_id.to_le_bytes());
     push_len_prefixed_str(&mut buf, group_id);
     buf.extend_from_slice(&epoch.to_le_bytes());
+    buf.extend_from_slice(blake3::hash(ciphertext).as_bytes());
     buf
 }
 
@@ -432,7 +449,7 @@ mod mls_attribution_tests {
             scope: "mls-group".to_string(),
             delegation: delegation_for(&sub_kp, &daemon_hex),
         };
-        let bytes = rider_mls_attribution_bytes(&prov, "mls-group", 42);
+        let bytes = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"ciphertext");
         let sig = sign_with_ml_dsa(daemon_kp.secret_key(), &bytes).unwrap();
         // The daemon's signature verifies over the exact bytes…
         assert!(ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
@@ -443,7 +460,7 @@ mod mls_attribution_tests {
         .is_ok());
         // …and any (group, epoch) drift breaks verification — the
         // artifact is bound, not a free-floating string.
-        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 43);
+        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 43, b"ciphertext");
         assert!(
             ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
                 daemon_kp.public_key(),
@@ -453,7 +470,7 @@ mod mls_attribution_tests {
             .is_err(),
             "epoch drift must invalidate the attribution signature"
         );
-        let tampered = rider_mls_attribution_bytes(&prov, "other-group", 42);
+        let tampered = rider_mls_attribution_bytes(&prov, "other-group", 42, b"ciphertext");
         assert!(
             ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
                 daemon_kp.public_key(),
@@ -462,6 +479,101 @@ mod mls_attribution_tests {
             )
             .is_err(),
             "group drift must invalidate the attribution signature"
+        );
+        // Review r5: ciphertext drift must also break the signature —
+        // the artifact authenticates the CONCRETE encrypted message.
+        let tampered = rider_mls_attribution_bytes(&prov, "mls-group", 42, b"other-ciphertext");
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                daemon_kp.public_key(),
+                &tampered,
+                &sig
+            )
+            .is_err(),
+            "ciphertext drift must invalidate the attribution signature"
+        );
+    }
+
+    #[test]
+    fn rider_provenance_dies_with_cert_expiry_and_revocation() {
+        // WHY (review r5): a signature-valid delegation inside a
+        // signature-valid message must STILL be refused at receive time
+        // when the underlying certificate has expired or the sub-agent
+        // is ADR-0018-revoked — receivers enforce the authorization
+        // lifetime, not just the cryptography.
+        let daemon_kp = AgentKeypair::generate().unwrap();
+        let sub_kp = AgentKeypair::generate().unwrap();
+        let daemon_hex = hex::encode(daemon_kp.agent_id().as_bytes());
+        let prov = RiderProvenance {
+            sub_agent_id: hex::encode(sub_kp.agent_id().as_bytes()),
+            rider_token_id: 7,
+            rider_token_hash: "ab".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: delegation_for(&sub_kp, &daemon_hex),
+        };
+        // Inside the delegation's validity window: the chain verifies;
+        // a revoked sub-agent is refused.
+        let in_window = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 60;
+        assert!(verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, in_window).is_ok());
+        assert_eq!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", true, in_window).unwrap_err(),
+            "sub-agent is revoked (ADR-0018)"
+        );
+        // Delegation-expiry axis: a `now` past the capability's
+        // not_after must fail (the capability in `prov` expires at
+        // issuance + 3_600).
+        let after_expiry = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 4_000;
+        assert!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, after_expiry).is_err(),
+            "delegation expiry must be enforced"
+        );
+
+        // Expired CERTIFICATE with a still-valid delegation: refused —
+        // cert.verify() is signature-only; the not_after axis is
+        // enforced separately (review r5).
+        use base64::Engine as _;
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let expired_cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &owner,
+            sub_kp.public_key().as_bytes(),
+            Some(now - 3_600),
+        )
+        .unwrap();
+        let sub_hex = hex::encode(sub_kp.agent_id().as_bytes());
+        let payload = rider_delegation_bytes(
+            &sub_hex,
+            &daemon_hex,
+            &["mls-group".to_string()],
+            now + 3_600,
+        );
+        let sig = sign_with_ml_dsa(sub_kp.secret_key(), &payload).unwrap();
+        let prov = RiderProvenance {
+            sub_agent_id: sub_hex,
+            rider_token_id: 8,
+            rider_token_hash: "cd".repeat(32),
+            scope: "mls-group".to_string(),
+            delegation: RiderDelegation {
+                cert_b64: base64::engine::general_purpose::STANDARD
+                    .encode(expired_cert.to_storage_bytes().unwrap()),
+                payload_b64: base64::engine::general_purpose::STANDARD.encode(&payload),
+                signature: hex::encode(sig.as_bytes()),
+            },
+        };
+        assert_eq!(
+            verify_rider_provenance(&prov, &daemon_hex, "mls-group", false, now).unwrap_err(),
+            "delegation certificate has expired"
         );
     }
 }
@@ -679,9 +791,33 @@ pub struct PublicIngestContext<'a> {
 /// Returns `Ok(())` if the message should be accepted and cached;
 /// returns `Err` with a deterministic reason otherwise. The validator
 /// is pure and side-effect-free — it does not mutate any state.
+///
+/// This wrapper has no ADR-0018 revocation view (tests, offline
+/// replay); production ingest paths use
+/// [`validate_public_message_with_revocations`].
 pub fn validate_public_message(
     ctx: &PublicIngestContext<'_>,
     msg: &GroupPublicMessage,
+) -> Result<(), IngestError> {
+    validate_public_message_inner(ctx, msg, &BTreeSet::new())
+}
+
+/// [`validate_public_message`] with the receiver's ADR-0018 revocation
+/// view (review r5): hex agent ids the local revocation set covers.
+/// A rider message from a revoked sub-agent is rejected here, at
+/// receive time — mirroring the sending daemon's middleware fence.
+pub fn validate_public_message_with_revocations(
+    ctx: &PublicIngestContext<'_>,
+    msg: &GroupPublicMessage,
+    revoked_agents: &std::collections::BTreeSet<String>,
+) -> Result<(), IngestError> {
+    validate_public_message_inner(ctx, msg, revoked_agents)
+}
+
+fn validate_public_message_inner(
+    ctx: &PublicIngestContext<'_>,
+    msg: &GroupPublicMessage,
+    revoked_agents: &std::collections::BTreeSet<String>,
 ) -> Result<(), IngestError> {
     // 1. group_id match
     if msg.group_id != ctx.group_id {
@@ -757,8 +893,14 @@ pub fn validate_public_message(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
                 .unwrap_or(0);
-            verify_rider_provenance(prov, &msg.author_agent_id, &prov.scope, now_unix)
-                .map_err(IngestError::InvalidSignature)?;
+            verify_rider_provenance(
+                prov,
+                &msg.author_agent_id,
+                &prov.scope,
+                revoked_agents.contains(&prov.sub_agent_id),
+                now_unix,
+            )
+            .map_err(IngestError::InvalidSignature)?;
             // `verify_rider_provenance` proved the certified subject
             // equals the asserted id, so the assertion is now trusted.
             prov.sub_agent_id.as_str()

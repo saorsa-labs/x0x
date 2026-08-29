@@ -388,7 +388,39 @@ async fn rider_issuance_journals_and_roster_lists() {
         reqwest::StatusCode::BAD_REQUEST,
         "forged delegation refused: {body}"
     );
-    // Anonymous (no owner key) installs refuse issuance with 409 —
+
+    // Review r5: a delegation that outlives min(cert expiry, token
+    // expiry) is refused — here a 90-day capability against a 60-second
+    let long_b64 = {
+        // Same sub-agent key that owns `agent_id`: the delegation is
+        // fully valid EXCEPT for outliving the token TTL — so a 400
+        // here proves the CAP, not the subject/scope checks.
+        let not_after = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 90 * 24 * 60 * 60;
+        let (b64, sig) =
+            x0x::groups::sign_rider_delegation(&kp, &daemon_hex, &[], not_after).expect("sign");
+        json!({ "payload_b64": b64, "signature": sig })
+    };
+    let (status, body) = owner_json(
+        &d,
+        reqwest::Method::POST,
+        "/owner/riders",
+        Some(json!({
+            "sub_agent_id": agent_id,
+            "groups": [],
+            "ttl_secs": 60,
+            "delegation": long_b64,
+        })),
+    )
+    .await;
+    assert_eq!(
+        status,
+        reqwest::StatusCode::BAD_REQUEST,
+        "delegation outliving the token must be refused: {body}"
+    );
     // covered by tests/profile_api.rs for GET; here the owned path is the
     // happy case and malformed keys are rejected:
     let (status, body) = owner_json(
