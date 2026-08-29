@@ -309,9 +309,10 @@ async fn get_messages(d: &AgentInstance, group_id: &str) -> Value {
 // ─────────────────── 1. send-as + forge rejections ───────────────────────
 
 /// Positive send-as flow plus every REST-exercisable forge from the ADR-0040
-/// validation list: expired delegation, non-delegate digest, depth-3 chain,
-/// and non-owner task ownership transfer — all rejected, while the honest
-/// paths succeed.
+/// validation list: expired delegation, non-delegate digest, and depth-3
+/// chain — all rejected — while the honest paths (including a task-execute
+/// claim under a delegation) succeed. Signed owner-transfer was descoped
+/// from v1 (see docs/design/adr-0040-mechanics.md).
 #[tokio::test]
 #[ignore]
 async fn delegation_sendas_positive_and_forges_cross_daemon() {
@@ -498,88 +499,6 @@ async fn delegation_sendas_positive_and_forges_cross_daemon() {
             409,
             "depth-3 delegation must be refused at the cap: {depth3:?}"
         );
-
-        // ── forge: non-owner task ownership transfer ──────────────────────
-        // Bob (not the owner) cannot transfer alice's task: the REST action
-        // refuses because only the current owner's key may sign.
-        let list: Value = authed_client(alice)
-            .post(alice.url("/task-lists"))
-            .json(&serde_json::json!({
-                "name": "adr0040",
-                "topic": format!("x0x.task.{}", std::process::id()),
-            }))
-            .send()
-            .await
-            .expect("task list create")
-            .json()
-            .await
-            .expect("task list json");
-        assert_eq!(list["ok"], true, "{list:?}");
-        let topic = list["task_lists"][0]["topic"]
-            .as_str()
-            .or_else(|| list["topic"].as_str())
-            .unwrap_or_default()
-            .to_string();
-        // The create response shape may differ; fall back to listing.
-        let topic = if topic.is_empty() {
-            let lists: Value = authed_client(alice)
-                .get(alice.url("/task-lists"))
-                .send()
-                .await
-                .expect("list task lists")
-                .json()
-                .await
-                .expect("list task lists json");
-            lists["task_lists"]
-                .as_array()
-                .and_then(|e| e.iter().find(|_| true))
-                .and_then(|e| e["topic"].as_str())
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            topic
-        };
-        assert!(!topic.is_empty(), "task list topic resolved");
-        let task: Value = authed_client(alice)
-            .post(alice.url(&format!("/task-lists/{topic}/tasks")))
-            .json(&serde_json::json!({"title": "owned by alice"}))
-            .send()
-            .await
-            .expect("add task")
-            .json()
-            .await
-            .expect("add task json");
-        assert_eq!(task["ok"], true, "{task:?}");
-        let task_id = task["task_id"].as_str().unwrap_or_default().to_string();
-
-        // Sync: bob joins the SAME topic so his replica learns alice's task
-        // (late-joiner bootstrap — replica convergence proof).
-        let bob_joined: Value = authed_client(bob)
-            .post(bob.url("/task-lists"))
-            .json(&serde_json::json!({ "name": "adr0040-bob", "topic": topic }))
-            .send()
-            .await
-            .expect("bob task list join")
-            .json()
-            .await
-            .expect("bob task list json");
-        assert_eq!(bob_joined["ok"], true, "{bob_joined:?}");
-        let synced = wait_until(Duration::from_secs(15), || async {
-            let tasks: Value = authed_client(bob)
-                .get(bob.url(&format!("/task-lists/{topic}/tasks")))
-                .send()
-                .await
-                .expect("bob tasks read")
-                .json()
-                .await
-                .expect("bob tasks json");
-            tasks["tasks"].as_array().is_some_and(|ts| {
-                ts.iter()
-                    .any(|t| t["id"].as_str() == Some(task_id.as_str()))
-            })
-        })
-        .await;
-        assert!(synced, "bob's replica never learned alice's task");
 
         // ── task-exercise delegation (review r2): claim under authority ──
         // A group-scoped task list, a task_execute delegation from alice

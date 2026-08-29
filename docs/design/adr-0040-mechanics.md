@@ -28,8 +28,11 @@ grindable or incomplete under signer-controlled ranking bytes:
   time and admission on every path, and rollback grinding against
   registered keys remained reachable.
 
-**Signed task-ownership transfer is deferred — it needs a non-grindable
-equivocation-resolution scheme (candidate: registered-target hash-chain
-with an enrollment-bound key directory), tracked as follow-up.** The
-`TaskItem`/`TaskListDelta` wire formats are byte-identical to pre-ADR-0040;
-claim/complete attestations and the advisory assignee are unchanged.
+**v1 ships without signed owner-transfer; ADR-0040 as accepted described
+it — deferred pending a non-grindable equivocation-resolution scheme;
+tracked as follow-up** (candidate: registered-target hash-chain with an
+enrollment-bound key directory). Recorded in the `docs/adr/README.md`
+Errata; the Accepted ADR body is untouched per the immutability policy.
+The `TaskItem`/`TaskListDelta` wire formats are byte-identical to
+pre-ADR-0040; claim/complete attestations and the advisory assignee are
+unchanged.

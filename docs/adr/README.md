@@ -88,6 +88,11 @@ correct stale facts and pointers:
   `self_leave_auth`, same file).
 - **ADR 0017** — the Related link `./0011-multi-port-bootstrap.md` should be
   `./0011-bootstrap-dual-listen-udp-443.md`.
+- **ADR 0040** — v1 ships **without** the signed task-ownership transfer
+  the ADR describes (decision bullet 2); every equivocation-resolution
+  scheme tried in review proved grindable. Deferred pending a
+  non-grindable scheme — see
+  [`docs/design/adr-0040-mechanics.md`](../design/adr-0040-mechanics.md).
 
 Audit-trim relocations, 2026-08-29. Per the 2026-08-23 ADR audit, the
 mutable mechanics named below were relocated **verbatim** from the
