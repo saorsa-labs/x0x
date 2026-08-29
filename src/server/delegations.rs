@@ -731,6 +731,7 @@ pub(in crate::server) async fn delegate_group_authority(
         now_ms,
         None,
         None,
+        None,
     ) {
         Ok(m) => m,
         Err(e) => {
