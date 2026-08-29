@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 153,
+  "endpoint_count": 155,
   "endpoints": [
     {
       "category": "status",
@@ -112,6 +112,20 @@
       "description": "Update stored self-profile names (partial update)",
       "method": "PUT",
       "path": "/profile"
+    },
+    {
+      "category": "groups",
+      "cli_name": "home",
+      "description": "ADR-0038 Home space: group id, primary agent, members, warnings",
+      "method": "GET",
+      "path": "/home"
+    },
+    {
+      "category": "groups",
+      "cli_name": "home rename",
+      "description": "Rename the Home space (admin-gated, sealed)",
+      "method": "POST",
+      "path": "/home/rename"
     },
     {
       "category": "identity",

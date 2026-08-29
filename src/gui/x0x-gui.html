@@ -5197,25 +5197,28 @@ async function createSpace(){
   const r=await api('/groups',{method:'POST',body:JSON.stringify(body)});
   if(r&&r.ok){
     // Full-policy echo guard (codex r4/r5): compare EVERY axis, not just
-    // admission — public_open vs public_announce share open_join but differ
-    // in write access. A missing echo on a PRESET create is tolerated only
-    // because presets predate the echo and are interpreted identically by
-    // older daemons; any raw-policy create must fail closed on a missing
-    // echo (the GUI sends presets only).
+    // admission — public_open vs public_announce share open_join but
+    // differ in write access. FAIL-CLOSED on a missing echo too: an older
+    // daemon without the echo contract is a downgrade signal — the space
+    // was still created, so tell the user to delete it rather than trust
+    // an unverifiable policy.
     const PRESET_POLICY={
       private_secure:{discoverability:'hidden',admission:'invite_only',confidentiality:'mls_encrypted',read_access:'members_only',write_access:'members_only'},
       public_request_secure:{discoverability:'public_directory',admission:'request_access',confidentiality:'mls_encrypted',read_access:'members_only',write_access:'members_only'},
       public_open:{discoverability:'public_directory',admission:'open_join',confidentiality:'signed_public',read_access:'public',write_access:'members_only'},
       public_announce:{discoverability:'public_directory',admission:'open_join',confidentiality:'signed_public',read_access:'public',write_access:'admin_only'}
     };
-    if(r.policy){
-      const want=PRESET_POLICY[preset];
-      const norm=v=>typeof v==='string'?v:JSON.stringify(v);
-      const bad=want&&Object.keys(want).find(k=>norm(r.policy[k])!==want[k]);
-      if(bad){
-        toast('Daemon applied a different policy ('+bad+': "'+norm(r.policy[bad])+'" vs expected "'+want[bad]+'") than the selected preset — space NOT created as intended. Delete it.','error');
-        return;
-      }
+    if(!r.policy){
+      toast('Daemon did not echo the applied policy (older version?) — cannot verify the space was created with the selected preset. Delete it and retry against an updated daemon.','error');
+      if(r.group_id)toast('Space id to delete: '+r.group_id,'error');
+      return;
+    }
+    const want=PRESET_POLICY[preset];
+    const norm=v=>typeof v==='string'?v:JSON.stringify(v);
+    const bad=want&&Object.keys(want).find(k=>norm(r.policy[k])!==want[k]);
+    if(bad){
+      toast('Daemon applied a different policy ('+bad+': "'+norm(r.policy[bad])+'" vs expected "'+want[bad]+'") than the selected preset — space NOT created as intended. Delete it.','error');
+      return;
     }
     document.querySelector('.modal-overlay').remove();
     toast('Space "'+name+'" created','success');

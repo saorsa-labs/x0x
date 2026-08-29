@@ -92,6 +92,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<ProfileSub>,
     },
+    /// The owner's personal Home space (ADR-0038).
+    Home {
+        #[command(subcommand)]
+        sub: Option<HomeSub>,
+    },
     /// Owner-scoped views of this install (ADR-0036).
     Owner {
         #[command(subcommand)]
@@ -420,6 +425,17 @@ enum ProfileSub {
         /// Label for this machine.
         #[arg(long, value_name = "NAME")]
         machine_name: Option<String>,
+    },
+}
+
+/// `x0x home` subcommands (ADR-0038).
+#[derive(Subcommand)]
+enum HomeSub {
+    /// Rename the Home space (admin-gated sealed update).
+    Rename {
+        /// New display name for the Home space.
+        #[arg(value_name = "NAME")]
+        name: String,
     },
 }
 
@@ -1514,6 +1530,10 @@ async fn run(
                 )
                 .await
             }
+        },
+        Commands::Home { sub } => match sub {
+            None => commands::identity::home(&client).await,
+            Some(HomeSub::Rename { name }) => commands::identity::home_rename(&client, &name).await,
         },
         Commands::Owner { sub } => match sub {
             None | Some(OwnerSub::Agents) => commands::identity::owner_agents(&client).await,

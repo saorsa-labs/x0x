@@ -1243,7 +1243,7 @@ mod round2_tests {
         let stranger = crate::identity::AgentKeypair::generate()?;
         let stranger_hex = hex::encode(stranger.agent_id().as_bytes());
         broken.add_member(
-            stranger_hex,
+            stranger_hex.clone(),
             crate::groups::GroupRole::Member,
             None,
             None,
