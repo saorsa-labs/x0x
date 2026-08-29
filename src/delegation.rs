@@ -348,17 +348,25 @@ pub fn is_attenuated_by(parent: &Delegation, child: &Delegation) -> Result<(), D
             "re-delegation must not outlive the parent grant".into(),
         ));
     }
-    if let (Some(parent_task), Some(child_task)) = (parent.task_ref, child.task_ref) {
-        if parent_task != child_task {
+    // Task binding (review r3 — intersection semantics): the child's task
+    // scope must be a SUBSET of the parent's. Narrowing a group-wide
+    // parent (task_ref None) onto one task is VALID attenuation; WIDENING
+    // a task-bound parent (Some → None) or retargeting (Some ≠ Some) is
+    // escalation and rejected.
+    match (parent.task_ref, child.task_ref) {
+        (None, _) => {} // group-wide parent: any child scope ⊆ parent
+        (Some(parent_task), Some(child_task)) => {
+            if parent_task != child_task {
+                return Err(DelegationError::Invalid(
+                    "re-delegation must not retarget task_execute to another task".into(),
+                ));
+            }
+        }
+        (Some(_), None) => {
             return Err(DelegationError::Invalid(
-                "re-delegation must not retarget task_execute to another task".into(),
+                "re-delegation must not widen a task-bound grant to group-wide".into(),
             ));
         }
-    }
-    if parent.task_ref.is_none() && child.task_ref.is_some() {
-        return Err(DelegationError::Invalid(
-            "re-delegation must not narrow a group-wide grant onto a task".into(),
-        ));
     }
     Ok(())
 }
@@ -678,6 +686,51 @@ mod tests {
         other_group.group_id = "space-9".into();
         let og_child = sign_delegation(&b, &other_group).unwrap();
         assert!(is_attenuated_by(&parent.delegation, &og_child.delegation).is_err());
+    }
+
+    #[test]
+    fn attenuation_allows_narrowing_but_not_widening() {
+        // REVIEW r3: child authority must be the INTERSECTION of parent
+        // and request — narrower is safe, wider is escalation.
+        let a = keypair();
+        let b = keypair();
+        let c = keypair();
+        // Group-wide send_as parent (task_ref None).
+        let mut parent_d = root_delegation(&a, b.agent_id());
+        parent_d.authority_scope = AuthorityScope::SendAs;
+        parent_d.verbs = vec![DelegationVerb::SendPublicMessage];
+        parent_d.task_ref = None;
+        let parent = sign_delegation(&a, &parent_d).unwrap();
+
+        // NARROWING (parent None → child Some) is VALID attenuation.
+        let mut narrowed = root_delegation(&b, c.agent_id());
+        narrowed.depth = 2;
+        narrowed.parent_delegation = Some(signed_delegation_digest(&parent));
+        narrowed.authority_scope = AuthorityScope::SendAs;
+        narrowed.verbs = vec![DelegationVerb::SendPublicMessage];
+        narrowed.task_ref = Some([9u8; 32]); // narrowed onto one task
+        narrowed.expiry_ms = 50_000;
+        let child = sign_delegation(&b, &narrowed).unwrap();
+        assert!(
+            is_attenuated_by(&parent.delegation, &child.delegation).is_ok(),
+            "narrowing a group-wide grant onto one task is valid attenuation"
+        );
+
+        // WIDENING (parent Some → child None) is escalation; task_execute
+        // children require a task_ref at signing, so exercise the pure
+        // function with a hand-shaped child.
+        let tp_d = root_delegation(&a, b.agent_id()); // task-bound parent
+        let tp = sign_delegation(&a, &tp_d).unwrap();
+        let mut widened = root_delegation(&b, c.agent_id());
+        widened.depth = 2;
+        widened.parent_delegation = Some(signed_delegation_digest(&tp));
+        widened.expiry_ms = 50_000;
+        let mut hand = widened;
+        hand.task_ref = None;
+        assert!(
+            is_attenuated_by(&tp.delegation, &hand).is_err(),
+            "widening a task-bound grant to group-wide is escalation"
+        );
     }
 
     #[test]

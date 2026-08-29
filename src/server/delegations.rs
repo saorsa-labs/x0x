@@ -38,28 +38,65 @@ pub(crate) struct DelegationIndex {
     /// Verified envelopes keyed by delegation digest. Presence == the
     /// carrier is durably committed locally.
     by_digest: HashMap<[u8; 32], x0x::delegation::SignedDelegation>,
-    /// Per-group seen delegation ids — the uniqueness registry (review r2):
-    /// one issuance id may ever name one envelope here. A second envelope
-    /// reusing an id (replay/forge) is rejected, keeping ADR-0040's
-    /// unique-issuance audit property honest.
-    seen_ids: std::collections::HashSet<[u8; 16]>,
+}
+
+/// Register delegation ids GLOBALLY (review r3): an issuance id names at
+/// most ONE envelope, across all groups. Re-admitting the SAME envelope
+/// (digest) is idempotent — rescans re-run this filter — while a DIFFERENT
+/// envelope carrying a known id (cross-group replay/forge) is rejected.
+async fn register_ids_globally(
+    state: &AppState,
+    envelopes: Vec<x0x::delegation::SignedDelegation>,
+) -> Vec<x0x::delegation::SignedDelegation> {
+    let mut registry = state.delegation_ids.write().await;
+    admit_by_id(&mut registry, envelopes)
+}
+
+/// Pure core of the global registry: id → digest map; first-seen-wins in
+/// the given order; same-id-same-digest is idempotent.
+fn admit_by_id(
+    registry: &mut std::collections::HashMap<[u8; 16], [u8; 32]>,
+    envelopes: Vec<x0x::delegation::SignedDelegation>,
+) -> Vec<x0x::delegation::SignedDelegation> {
+    envelopes
+        .into_iter()
+        .filter(|sd| {
+            let id = sd.delegation.delegation_id;
+            let digest = x0x::delegation::signed_delegation_digest(sd);
+            match registry.get(&id) {
+                None => {
+                    registry.insert(id, digest);
+                    true
+                }
+                Some(prev) if *prev == digest => true, // same envelope re-scanned
+                Some(_) => {
+                    tracing::warn!(
+                        group_id = %sd.delegation.group_id,
+                        "rejecting delegation: delegation_id already names a different envelope (global replay)"
+                    );
+                    false
+                }
+            }
+        })
+        .collect()
 }
 
 /// Build the digest map + seen-id registry from history rows in COMMIT
 /// order (ascending rowid). First-seen delegation_id wins; a different
 /// envelope reusing the id is dropped (never enters the digest map, so it
 /// can never authorize).
-fn index_from_rows(
+/// Extract + verify every delegation envelope from a group's durable
+/// history rows, in COMMIT order (ascending rowid). Pure: parse the
+/// carrier artifact, keep only `kind == "delegation"` messages, decode +
+/// verify the envelope against the delegator's own key. Invalid carriers
+/// are skipped (fail-closed). The GLOBAL id-registry filter runs in the
+/// caller (it needs the cross-group lock).
+fn envelopes_from_rows(
     rows: &[x0x::history::StoredRecord],
-) -> (
-    HashMap<[u8; 32], x0x::delegation::SignedDelegation>,
-    std::collections::HashSet<[u8; 16]>,
-) {
-    let mut map = HashMap::new();
-    let mut seen: std::collections::HashSet<[u8; 16]> = std::collections::HashSet::new();
-    // Query pages arrive newest-first; commit order is ascending rowid.
+) -> Vec<x0x::delegation::SignedDelegation> {
     let mut ordered: Vec<&x0x::history::StoredRecord> = rows.iter().collect();
     ordered.sort_by_key(|r| r.id);
+    let mut out = Vec::new();
     for row in ordered {
         let Some(artifact) = row.record.signed_artifact.as_deref() else {
             continue;
@@ -78,21 +115,11 @@ fn index_from_rows(
         else {
             continue;
         };
-        if x0x::delegation::verify_delegation(&sd).is_err() {
-            continue;
+        if x0x::delegation::verify_delegation(&sd).is_ok() {
+            out.push(sd);
         }
-        // Uniqueness registry: a replayed/modified envelope reusing an
-        // already-seen delegation_id is rejected outright.
-        if !seen.insert(sd.delegation.delegation_id) {
-            tracing::warn!(
-                group_id = %sd.delegation.group_id,
-                "dropping delegation carrier: delegation_id already issued (replay)"
-            );
-            continue;
-        }
-        map.insert(x0x::delegation::signed_delegation_digest(&sd), sd);
     }
-    (map, seen)
+    out
 }
 
 /// Newest rowid for the group's history scope, if any row exists.
@@ -106,11 +133,14 @@ fn newest_row_id(store: &x0x::history::Store, group_id: &str) -> Option<i64> {
 }
 
 /// Full paginated rescan of the group's durable history (review r2: no
-/// newest-N cap — every committed row is visible, keyed by rowid cursor).
+/// newest-N cap; review r3: TOTAL-OR-NOTHING).
+/// TOTAL-OR-NOTHING (review r3): any page failure returns None — a
+/// partial scan is never handed back, so the caller cannot mark the index
+/// loaded/authoritative over incomplete data.
 fn scan_group_history(
     store: &x0x::history::Store,
     group_id: &str,
-) -> (Vec<x0x::history::StoredRecord>, i64) {
+) -> Option<(Vec<x0x::history::StoredRecord>, i64)> {
     let mut rows = Vec::new();
     let mut before_id: Option<i64> = None;
     let mut max_row_id = 0i64;
@@ -121,7 +151,7 @@ fn scan_group_history(
             before_id,
             ..Default::default()
         };
-        let Ok(page) = store.query(&q) else { break };
+        let page = store.query(&q).ok()?;
         if page.is_empty() {
             break;
         }
@@ -136,7 +166,7 @@ fn scan_group_history(
         }
         before_id = next_cursor;
     }
-    (rows, max_row_id)
+    Some((rows, max_row_id))
 }
 
 /// Ensure the per-group index is FRESH against durable history, then return
@@ -170,26 +200,38 @@ pub(in crate::server) async fn committed_delegations(
     }
     // Slow path: full rescan from THIS daemon's durable history (blocker
     // 28: crash/restart re-derives from the store; r2: complete, uncapped).
-    let mut map = HashMap::new();
-    let mut seen = std::collections::HashSet::new();
-    let mut max_row_id = 0i64;
+    // TOTAL-OR-NOTHING (review r3): a scan that fails on ANY page must not
+    // mark the index loaded — a partial map served as complete could
+    // authorize on stale data or falsely reject a committed delegation.
+    // Fail closed (empty answer, index untouched) and retry on next use.
+    let mut scanned: Option<(Vec<x0x::history::StoredRecord>, i64)> = None;
     if let Some(history) = state.agent.history() {
         let store = std::sync::Arc::clone(history.store());
         let scope = group_id.to_string();
-        let scanned = tokio::task::spawn_blocking(move || scan_group_history(&store, &scope)).await;
-        if let Ok((rows, scanned_max)) = scanned {
-            max_row_id = scanned_max;
-            let (m, s) = index_from_rows(&rows);
-            map = m;
-            seen = s;
-        }
+        scanned = tokio::task::spawn_blocking(move || scan_group_history(&store, &scope))
+            .await
+            .ok()
+            .flatten();
     }
+    let Some((rows, max_row_id)) = scanned else {
+        tracing::warn!(
+            group_id = %group_id,
+            "delegation index rescan incomplete — serving empty (fail closed), index not marked loaded"
+        );
+        return Vec::new();
+    };
+    // GLOBAL id registry (review r3): filter in commit order — a reused
+    // delegation_id (including cross-group) never enters the digest map.
+    let admitted = register_ids_globally(state, envelopes_from_rows(&rows)).await;
+    let map: HashMap<[u8; 32], x0x::delegation::SignedDelegation> = admitted
+        .into_iter()
+        .map(|sd| (x0x::delegation::signed_delegation_digest(&sd), sd))
+        .collect();
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
     entry.loaded = true;
     entry.max_row_id = entry.max_row_id.max(max_row_id);
     entry.by_digest = map;
-    entry.seen_ids = seen;
     entry.by_digest.values().cloned().collect()
 }
 
@@ -202,18 +244,22 @@ pub(in crate::server) async fn index_committed(
     group_id: &str,
     sd: x0x::delegation::SignedDelegation,
 ) {
+    // GLOBAL registry first (review r3): a reused id never indexes.
+    let fresh = register_ids_globally(state, vec![sd]).await;
+    let Some(sd) = fresh.first() else {
+        tracing::warn!(
+            group_id = %group_id,
+            "just-committed delegation carries a reused delegation_id — not indexed"
+        );
+        return;
+    };
     let mut index = state.delegation_index.write().await;
     let entry = index.entry(group_id.to_string()).or_default();
     entry.loaded = true;
-    // Uniqueness registry holds even on the fast path.
-    if entry.seen_ids.insert(sd.delegation.delegation_id) {
-        entry
-            .by_digest
-            .insert(x0x::delegation::signed_delegation_digest(&sd), sd);
-    }
+    entry
+        .by_digest
+        .insert(x0x::delegation::signed_delegation_digest(sd), sd.clone());
 }
-
-/// Is `sd` an effective authorization for `actor` to exercise `verb` in
 /// `group_id` at `now_ms`?
 ///
 /// Checks (in order): `to_agent == actor` (only the delegate may act —
@@ -568,7 +614,7 @@ pub(in crate::server) async fn delegate_group_authority(
     // Build + sign the envelope with the LOCAL agent's key (blocker 25: the
     // delegator's own key; the delegate never holds it).
     let delegation = x0x::delegation::Delegation {
-        delegation_id: fresh_delegation_id(&state, &stable_id).await,
+        delegation_id: fresh_delegation_id(&state).await,
         issued_at_ms: now_ms,
         task_ref,
         from_agent: local,
@@ -695,18 +741,13 @@ async fn notify_delegate(
     }
 }
 
-/// Fresh, registry-checked delegation id (review r2): the id must be unique
-/// within the group's seen-issuance registry — the ADR's unique-issuance
-/// audit claim is enforced, not assumed from a hash.
-async fn fresh_delegation_id(state: &AppState, group_id: &str) -> [u8; 16] {
+/// Fresh, registry-checked delegation id (review r3): the id must be unique
+/// in the GLOBAL seen-issuance registry — cross-group reuse is rejected at
+/// generation, not just at ingest.
+async fn fresh_delegation_id(state: &AppState) -> [u8; 16] {
     for _ in 0..8 {
         let candidate = rand_delegation_id();
-        let seen = state
-            .delegation_index
-            .read()
-            .await
-            .get(group_id)
-            .is_some_and(|entry| entry.seen_ids.contains(&candidate));
+        let seen = state.delegation_ids.read().await.contains_key(&candidate);
         if !seen {
             return candidate;
         }
@@ -848,4 +889,57 @@ fn not_found(msg: impl std::fmt::Display) -> axum::response::Response {
         Json(serde_json::json!({ "ok": false, "error": msg.to_string() })),
     )
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used)]
+    use super::*;
+
+    fn envelope(id: [u8; 16], group: &str) -> x0x::delegation::SignedDelegation {
+        let kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let to = x0x::identity::AgentKeypair::generate().unwrap();
+        let d = x0x::delegation::Delegation {
+            delegation_id: id,
+            issued_at_ms: 1_000,
+            task_ref: None,
+            from_agent: kp.agent_id(),
+            to_agent: to.agent_id(),
+            authority_scope: x0x::delegation::AuthorityScope::SendAs,
+            verbs: vec![x0x::delegation::DelegationVerb::SendPublicMessage],
+            expiry_ms: 60_000,
+            parent_delegation: None,
+            depth: 1,
+            group_id: group.to_string(),
+        };
+        x0x::delegation::sign_delegation(&kp, &d).unwrap()
+    }
+
+    #[test]
+    fn cross_group_delegation_id_reuse_is_rejected() {
+        // REVIEW r3: the registry is GLOBAL — an id issued in group A may
+        // never name a different envelope in group B (cross-group replay
+        // or forge). First-seen-wins in admission order.
+        let id = [0xAB; 16];
+        let first = envelope(id, "group-a");
+        let replay = envelope(id, "group-b");
+        let mut registry = std::collections::HashMap::new();
+        let admitted = admit_by_id(&mut registry, vec![first.clone(), replay]);
+        assert_eq!(admitted.len(), 1, "only the first issuance is admitted");
+        assert_eq!(
+            admitted[0].delegation.group_id, "group-a",
+            "first-seen (commit order) wins"
+        );
+        // The SAME envelope re-scanned (idempotent rescan path) admits.
+        let admitted_again = admit_by_id(&mut registry, vec![first]);
+        assert_eq!(
+            admitted_again.len(),
+            1,
+            "same envelope re-scan is idempotent"
+        );
+        // A later DISTINCT id still admits.
+        let other = envelope([0xCD; 16], "group-b");
+        let admitted2 = admit_by_id(&mut registry, vec![other]);
+        assert_eq!(admitted2.len(), 1);
+    }
 }

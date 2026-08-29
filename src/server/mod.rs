@@ -848,6 +848,7 @@ pub async fn serve_with_options(
         public_messages: RwLock::new(HashMap::new()),
         public_message_tasks: RwLock::new(HashMap::new()),
         delegation_index: RwLock::new(HashMap::new()),
+        delegation_ids: RwLock::new(std::collections::HashMap::new()),
         agent_kem_keypair: Arc::clone(&agent_kem_keypair),
         contacts,
         mls_groups: RwLock::new(mls_groups),

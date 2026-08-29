@@ -22088,6 +22088,7 @@ pub(in crate::server) mod tests {
             directory_digest_interval_secs: DIRECTORY_DIGEST_INTERVAL_SECS,
             directory_resubscribe_jitter_ms: DIRECTORY_RESUBSCRIBE_JITTER_MS,
             delegation_index: RwLock::new(HashMap::new()),
+            delegation_ids: RwLock::new(std::collections::HashMap::new()),
             public_messages: RwLock::new(HashMap::new()),
             public_message_tasks: RwLock::new(HashMap::new()),
             agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),

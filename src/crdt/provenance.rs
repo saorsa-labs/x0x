@@ -483,35 +483,38 @@ pub fn purge_unverified_owner_transfers(
 ///   STRICTLY increase), an unrelated transfer can never influence the
 ///   outcome. It may activate later if its prefix arrives (out-of-order
 ///   CRDT delivery), which is convergence, not forgery.
-/// - Concurrent transfers by the same owner resolve deterministically to the
-///   `(ts, to)`-maximum, so all replicas converge on one owner.
+/// - Concurrent transfers by the same owner resolve deterministically: the
+///   fold's (timestamp, to, from) order binds the earliest valid handover;
+///   later siblings from the same now-former owner are void.
 #[must_use]
 pub fn resolve_owner(
     created_by: AgentId,
     transfers: &BTreeMap<OwnerTransfer, OpAttestation>,
 ) -> AgentId {
+    // STRICT TIMESTAMP-ORDERED FOLD (review r3): every edge in the map is
+    // signature-verified (the admission purge dropped forgeries), but a
+    // valid signature alone is NOT authority. Edges are folded in
+    // (timestamp, to, from) order; an edge is ADMISSIBLE only if its
+    // `from` equals the owner resolved from all STRICTLY-EARLIER
+    // admissible edges. A transfer signed by a FORMER owner (A→M@200
+    // arriving after A→B@100 made B the owner) is therefore inert: at
+    // ts=200 the running owner is B, not A. Concurrent same-owner edges
+    // resolve deterministically: the earliest (then tie-break by `to`
+    // bytes) binds, later siblings from the same now-former owner are
+    // void — first valid transfer wins, exactly like a signed handover
+    // in time.
+    let mut edges: Vec<&OwnerTransfer> = transfers.keys().collect();
+    edges.sort_by(|a, b| {
+        a.timestamp_ms
+            .cmp(&b.timestamp_ms)
+            .then_with(|| a.to.as_bytes().cmp(b.to.as_bytes()))
+            .then_with(|| a.from.as_bytes().cmp(b.from.as_bytes()))
+    });
     let mut current = created_by;
-    let mut last_ts = 0u64;
-    let mut used: Vec<OwnerTransfer> = Vec::new();
-    loop {
-        // Follow ONLY an edge from the CURRENT owner that has not been
-        // consumed and whose timestamp STRICTLY increases. Consumption +
-        // monotonic timestamps terminate the walk content-bounded: a cycle
-        // (A→B ts=100, B→A ts=50) stops at B because the back-edge is older.
-        let next = transfers
-            .keys()
-            .filter(|t| {
-                t.from == current
-                    && t.to != current
-                    && t.timestamp_ms > last_ts
-                    && !used.contains(t)
-            })
-            .max_by_key(|t| (t.timestamp_ms, t.to.as_bytes()))
-            .cloned();
-        let Some(next) = next else { break };
-        used.push(next);
-        last_ts = next.timestamp_ms;
-        current = next.to;
+    for edge in edges {
+        if edge.from == current && edge.to != current {
+            current = edge.to;
+        }
     }
     current
 }

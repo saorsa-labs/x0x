@@ -2454,8 +2454,11 @@ mod tests {
     #[test]
     fn concurrent_owner_transfers_resolve_deterministically() {
         // WHY: the owner may sign two conflicting transfers (A→B, A→C);
-        // replicas holding the union must agree on ONE owner (max
-        // (timestamp, to)) or ownership forks across the mesh.
+        // replicas holding the union must agree on ONE owner. Under the
+        // strict timestamp-ordered fold (review r3) the EARLIEST valid
+        // transfer binds — once A hands over at ts=100, A is a former
+        // owner and the later A→B@500 is void. Deterministic on every
+        // replica from the same edge set.
         let (a, a_signing) = signing_for(1);
         let (b, _) = signing_for(2);
         let (c, _) = signing_for(3);
@@ -2470,8 +2473,49 @@ mod tests {
 
         with_b.merge(item_scope(), &with_c).expect("merge");
         with_c.merge(item_scope(), &with_b).expect("merge");
-        assert_eq!(with_b.owner(), b, "later timestamp wins");
-        assert_eq!(with_c.owner(), b, "same winner from either side");
+        assert_eq!(with_b.owner(), c, "earliest valid transfer binds");
+        assert_eq!(with_c.owner(), c, "same winner from either side");
+    }
+
+    #[test]
+    fn former_owner_transfer_is_inadmissible() {
+        // REVIEW r3 (critical): after A→B@100 makes B the owner, A is a
+        // FORMER owner. A's own key can still sign A→M@200 — signature
+        // valid, signer==from — but at ts=200 the running owner (folded
+        // from strictly-earlier admissible edges) is B, not A, so the edge
+        // is inadmissible and ownership must stay with B. This kills the
+        // former-owner root-edge takeover.
+        let (a, a_signing) = signing_for(1);
+        let (b, _) = signing_for(2);
+        let (mallory, _) = signing_for(3);
+        let mut task = owned_task(&a);
+        task.transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("a→b");
+        // A (former owner) signs a NEWER root edge to mallory.
+        task.transfer_ownership(item_scope(), a, mallory, 200, &a_signing)
+            .expect("a signs as former owner (signature is valid)");
+        assert_eq!(
+            task.owner(),
+            b,
+            "former-owner edge at a later timestamp must be inadmissible"
+        );
+
+        // Same attack arriving via a REMOTE delta map (ingest path) — the
+        // identical fold resolves it, no writer-gate reliance.
+        let mut remote = owned_task(&a);
+        remote
+            .transfer_ownership(item_scope(), a, b, 100, &a_signing)
+            .expect("a→b on remote");
+        remote
+            .transfer_ownership(item_scope(), a, mallory, 200, &a_signing)
+            .expect("forged-later edge on remote");
+        let mut local = owned_task(&a);
+        local.ingest_owner_transfers(item_scope(), remote.owner_transfers_map());
+        assert_eq!(
+            local.owner(),
+            b,
+            "remote-carried former-owner edge is inadmissible on every path"
+        );
     }
 
     #[test]

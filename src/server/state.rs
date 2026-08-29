@@ -714,6 +714,10 @@ pub(super) struct AppState {
     /// the durable store — the single effectiveness rule, blocker 28).
     pub(super) delegation_index:
         RwLock<HashMap<String, crate::server::delegations::DelegationIndex>>,
+    /// ADR-0040 GLOBAL delegation-id registry (review r3): one issuance id
+    /// may name one envelope, ever, across ALL groups — keyed globally so
+    /// cross-group id reuse is rejected, not just within-group replay.
+    pub(super) delegation_ids: RwLock<std::collections::HashMap<[u8; 16], [u8; 32]>>,
     /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
     /// envelopes addressed to this agent. Public half is published in the
     /// `/agent` response and in `JoinRequestCreated` so other daemons can
