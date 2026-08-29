@@ -160,6 +160,9 @@ fold(log(A)) = {
   custodian(A): MachineId,          // who is authorized to sign as A
   retired_bindings(A): Set<(MachineId, u64)>,  // grow-only, never pruned
   placement(A): (Placement, u64),   // current placement + epoch
+  phase(A): Idle                     // no move in flight, no retire pending
+          | MidMove   { from, to }   // auth/export/import seen, no terminator
+          | RetirePending { from },  // ActivationBundle seen, RetireReceipt not
 }
 // fold rules, applied in log order; total by cases on the LAST record:
 //   log = PlacementMint only                      → custodian = mint.custodian_machine
@@ -175,6 +178,9 @@ fold(log(A)) = {
 //   last = AbortRecord (terminated move n)         → custodian = that move's from_machine
 //                                                    retired/placement unchanged
 //   last = RetireReceipt (post-bundle bookkeeping) → all values unchanged
+// phase, by the same cases: mint/AbortRecord/RetireReceipt → Idle;
+// MoveAuthorization|ExportReceipt|ImportReceipt → MidMove{from,to};
+// ActivationBundle → RetirePending{from}. Total: one arm per record kind.
 ```
 
 **Key possession is an INPUT, not part of the fold** (r4-1): `holds_key(M, A)`
@@ -182,13 +188,21 @@ is machine-local durable fact (the key file exists). The signing gate is
 exactly:
 
 ```rust
-may_sign(M, A) = holds_key(M, A) ∧ custodian(A) == M
-quiesced(M, A)   = holds_key(M, A) ∧ ¬may_sign(M, A) ∧ active move names M as from
-quarantined(M, A) = holds_key(M, A) ∧ ¬may_sign(M, A) ∧ active move names M as to
+may_sign(M, A)    = holds_key(M, A) ∧ custodian(A) == M
+quiesced(M, A)    = holds_key(M, A) ∧ (phase(A) == MidMove{from: M, ..}
+                                     ∨ phase(A) == RetirePending{from: M})
+quarantined(M, A) = holds_key(M, A) ∧ phase(A) == MidMove{to: M, ..}
 ```
 
-`quiesced`/`quarantined` are labels over the same two inputs — the log
-fold and key possession — never independent state. Every crash matrix
+All four predicates are pure functions of the SAME two inputs — the
+four-value fold and `holds_key` — with no reference to any state outside
+them; "active move" appears nowhere as a free-standing notion. The
+post-activation source is `RetirePending{from}` and therefore *quiesced*
+exactly as the crash matrix (§5.3) tabulates, until `RetireReceipt`
+deletes the key (`holds_key` false → no label applies).
+
+`quiesced`/`quarantined` derive from the fold's `phase` — never
+independent state. Every crash matrix
 row in §5.3 is one row of this table: initial state (mint custodian
 signs), mid-move (custodian = ⊥ — source and target both hold but
 neither signs), post-activation (target), post-abort (source restored).
@@ -466,11 +480,18 @@ legacy record in it for old peers. Therefore:
   1. owner signature over the whole chained record verifies;
   2. `agent_certificate.verify()` ∧ `cert.agent_id() == auth.agent_id` ∧
      the certificate's issuer (user key) == the record's owner signer;
-  3. `retired_bindings` is exactly the grow-only history to date:
-     non-empty, superset of every previously committed bundle's set,
-     and contains `AgentMachineBinding { auth.agent_id,
-     auth.from_machine, auth.move_epoch }` (this move's tombstone),
-     each entry owner-covered by the bundle signature;
+  3. `retired_bindings` is non-empty, contains `AgentMachineBinding {
+     auth.agent_id, auth.from_machine, auth.move_epoch }` (this move's
+     tombstone), and every entry is owner-covered by the bundle
+     signature. Cumulative completeness (superset of every earlier
+     committed bundle's set) is a CONSTRUCTION invariant: the owner
+     builds the set by folding its own full log and participants —
+     which hold the full log — verify it at signing time. Mesh peers
+     do NOT check supersetness (they may lack earlier bundles and must
+     accept out-of-order arrivals); they union every verified bundle's
+     set regardless of order, so a peer seeing epoch 2 first still
+     gains epoch 1's tombstones from the cumulative set, and a
+     later-arriving epoch-1 bundle only ever adds entries;
   4. `placement_record.agent_id == auth.agent_id` ∧
      `placement_record.placement_epoch == auth.move_epoch` ∧ placement
      is `Pinned(auth.to_machine)` or `Roaming` (matching the declared
@@ -626,8 +647,8 @@ deny-by-default scope.
 2. Total fold (§3.2): for EVERY legal log shape — mint-only (initial
    signer), mid-move (custodian = ⊥), post-bundle, post-abort (source
    restored), post-retire — `custodian`, `retired_bindings`,
-   `placement` take exactly the tabulated values and are never
-   undefined; `may_sign` = `holds_key ∧ custodian==M` with `holds_key`
+   `placement`, and `phase` take exactly the tabulated values and are
+   never undefined; `may_sign` = `holds_key ∧ custodian==M` with `holds_key`
    supplied as an input, including the cases key-present-but-not-
    custodian (quiesced/quarantined) and custodian-but-key-deleted.
 3. Mesh rule: placement accepted on ≥ epoch, no-op on equal digest,
