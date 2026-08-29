@@ -9795,6 +9795,7 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
 /// — binding the rider provenance, its sub-agent-signed delegation, and
 /// the concrete (group, epoch) — so durable Home attribution is
 /// cryptographic, not a local string.
+#[derive(Debug)]
 pub(in crate::server) struct MlsRiderAttribution {
     pub(in crate::server) sub_agent_id: String,
     pub(in crate::server) artifact: Vec<u8>,
@@ -9805,34 +9806,73 @@ pub(in crate::server) struct MlsRiderAttribution {
     pub(in crate::server) signing_pubkey: Vec<u8>,
 }
 
-/// Sign the MLS rider attribution for a completed encryption (review
-/// r5): canonical bytes over the provenance (incl. delegation), group,
-/// epoch, and the CIPHERTEXT DIGEST, signed with the daemon agent key.
-/// `None` when no rider provenance applies (owner sends).
+/// Sign the MLS rider attribution for a completed encryption (reviews
+/// r5/r6): canonical bytes over the provenance (incl. delegation),
+/// group, epoch, and the CIPHERTEXT DIGEST, signed with the daemon
+/// agent key.
+///
+/// FAIL-CLOSED (r6 regression fix): a rider send whose attribution
+/// cannot be signed returns `Err` (a 500 response) — the callers abort
+/// BEFORE recording any history, so no unattributed rider message ever
+/// persists. `Ok(None)` means no rider provenance applied (owner send).
 fn sign_mls_rider_attribution(
     state: &AppState,
     provenance: Option<&x0x::groups::RiderProvenance>,
     group_id: &str,
     epoch: u64,
     ciphertext: &[u8],
-) -> Option<MlsRiderAttribution> {
-    let provenance = provenance?;
+) -> Result<Option<MlsRiderAttribution>, (StatusCode, Json<serde_json::Value>)> {
+    let signing_kp = state.agent.identity().agent_keypair();
+    sign_mls_rider_attribution_with(
+        provenance,
+        group_id,
+        epoch,
+        ciphertext,
+        signing_kp,
+        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa,
+    )
+}
+
+/// Injectable-signer core (review r6): the signer is a parameter so the
+/// FAIL-CLOSED contract is unit-testable — a rider send whose
+/// attribution cannot be signed yields `Err` (500), never
+/// `Ok(None)`-with-a-recorded-unattributed-row.
+#[allow(clippy::too_many_arguments)]
+fn sign_mls_rider_attribution_with<S>(
+    provenance: Option<&x0x::groups::RiderProvenance>,
+    group_id: &str,
+    epoch: u64,
+    ciphertext: &[u8],
+    signing_kp: &crate::identity::AgentKeypair,
+    signer: S,
+) -> Result<Option<MlsRiderAttribution>, (StatusCode, Json<serde_json::Value>)>
+where
+    S: FnOnce(
+        &ant_quic::MlDsaSecretKey,
+        &[u8],
+    ) -> Result<
+        ant_quic::crypto::pqc::types::MlDsaSignature,
+        ant_quic::crypto::pqc::types::PqcError,
+    >,
+{
+    let Some(provenance) = provenance else {
+        return Ok(None);
+    };
     let artifact =
         x0x::groups::rider_mls_attribution_bytes(provenance, group_id, epoch, ciphertext);
-    let signing_kp = state.agent.identity().agent_keypair();
-    match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-        signing_kp.secret_key(),
-        &artifact,
-    ) {
-        Ok(sig) => Some(MlsRiderAttribution {
+    match signer(signing_kp.secret_key(), &artifact) {
+        Ok(sig) => Ok(Some(MlsRiderAttribution {
             sub_agent_id: provenance.sub_agent_id.clone(),
             artifact,
             signature: sig.as_bytes().to_vec(),
             signing_pubkey: signing_kp.public_key().as_bytes().to_vec(),
-        }),
+        })),
         Err(e) => {
-            tracing::warn!("failed to sign rider MLS attribution: {e:?}");
-            None
+            tracing::error!("failed to sign rider MLS attribution: {e:?}");
+            Err(api_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to sign rider attribution",
+            ))
         }
     }
 }
@@ -16587,14 +16627,20 @@ async fn treekem_group_encrypt(
     drop(guard);
     // Review r5: sign the attribution AFTER encryption over the
     // ciphertext digest (the self-describing ApplicationCiphertext
-    // bytes), then record.
-    let attribution = sign_mls_rider_attribution(
+    // bytes). Review r6: a signing failure FAILS CLOSED — return the
+    // 500 BEFORE recording, so no unattributed rider row persists (a
+    // burned ratchet generation without a persisted message is
+    // harmless; an unattributed rider message is not).
+    let attribution = match sign_mls_rider_attribution(
         state,
         rider_provenance,
         stable_group_id.unwrap_or(group_id_hex),
         epoch,
         &ciphertext,
-    );
+    ) {
+        Ok(attribution) => attribution,
+        Err(resp) => return resp,
+    };
     record_mls_history(
         state,
         stable_group_id.unwrap_or(group_id_hex),
@@ -16865,14 +16911,18 @@ pub(in crate::server) async fn secure_group_encrypt(
     };
 
     // Review r5: sign the attribution AFTER encryption over the
-    // ciphertext digest, then record.
-    let attribution = sign_mls_rider_attribution(
+    // ciphertext digest. Review r6: FAIL CLOSED — abort with the 500
+    // BEFORE recording, so no unattributed rider row ever persists.
+    let attribution = match sign_mls_rider_attribution(
         state.as_ref(),
         rider_provenance.as_ref(),
         &group_id_clone,
         epoch,
         &ciphertext,
-    );
+    ) {
+        Ok(attribution) => attribution,
+        Err(resp) => return resp,
+    };
     record_mls_history(
         state.as_ref(),
         &group_id_clone,
@@ -25701,6 +25751,39 @@ pub(in crate::server) mod tests {
             "withdrawn same-stable alias should remain terminal"
         );
         Ok(())
+    }
+
+    /// Review r6 regression: an attribution signing FAILURE must
+    /// produce Err (a 500 the callers return BEFORE recording) — the
+    /// r5 regression swallowed it to `None`, letting both encryption
+    /// paths persist an UNATTRIBUTED rider row and still answer 200.
+    #[test]
+    fn rider_attribution_signing_failure_fails_closed() {
+        // Minimal provenance: content is irrelevant to the sign path.
+        let prov = x0x::groups::RiderProvenance {
+            sub_agent_id: "ab".repeat(32),
+            rider_token_id: 1,
+            rider_token_hash: "cd".repeat(32),
+            scope: "g".to_string(),
+            delegation: x0x::groups::RiderDelegation {
+                cert_b64: String::new(),
+                payload_b64: String::new(),
+                signature: String::new(),
+            },
+        };
+        let kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let failing = |_: &ant_quic::MlDsaSecretKey, _: &[u8]| {
+            Err(ant_quic::PqcError::SigningFailed("injected".to_string()))
+        };
+        let outcome = sign_mls_rider_attribution_with(Some(&prov), "g", 7, b"ct", &kp, failing);
+        let (status, body) = outcome.unwrap_err();
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR, "{body:?}");
+        assert!(
+            body.0.get("error").is_some(),
+            "error body carried to the caller: {body:?}"
+        );
+        // Owner sends (no provenance) are unaffected: Ok(None).
+        assert!(sign_mls_rider_attribution_with(None, "g", 7, b"ct", &kp, failing).is_ok());
     }
 
     async fn install_treekem_endpoint_group(
