@@ -21818,6 +21818,15 @@ pub(in crate::server) mod tests {
             &named_groups,
         )
         .await?;
+        // ADR-0041 Tier-1: mirror daemon startup — owned agents get the
+        // SyncV1 acceptor + store under `<data_dir>/sync`.
+        let owner_sync = if agent.identity().user_keypair().is_some() {
+            x0x::owner_sync::OwnerSyncService::new(Arc::clone(&agent), data_dir)
+                .await
+                .ok()
+        } else {
+            None
+        };
         let contacts = Arc::clone(agent.contacts());
         agent.set_contacts(Arc::clone(&contacts));
 
@@ -21931,6 +21940,7 @@ pub(in crate::server) mod tests {
                 x0x::connect::ConnectPolicy::default().summary(),
             )),
             forward_service: None,
+            owner_sync,
         }))
     }
 

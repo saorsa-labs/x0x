@@ -892,6 +892,11 @@ pub(super) struct AppState {
     /// consumer + outbound local-port listeners. `None` when connect is
     /// disabled (no policy) so the daemon runs zero forwarder tasks.
     pub(super) forward_service: Option<Arc<x0x::forward::ForwardService>>,
+    /// ADR-0041 Tier-1 owner-state sync service: owns the `SyncV1` stream
+    /// acceptor, the owner device set, and the winning versioned records.
+    /// `None` when the install has no owner key (ownerless installs sync
+    /// nothing and register no acceptor).
+    pub(super) owner_sync: Option<Arc<x0x::owner_sync::OwnerSyncService>>,
 }
 
 #[derive(Clone)]

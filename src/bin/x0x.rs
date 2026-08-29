@@ -102,6 +102,11 @@ enum Commands {
         #[command(subcommand)]
         sub: Option<OwnerSub>,
     },
+    /// Cross-machine owner-state sync (ADR-0041 Tier-1).
+    Sync {
+        #[command(subcommand)]
+        sub: Option<SyncSub>,
+    },
     /// Manage user identity.
     UserId {
         #[command(subcommand)]
@@ -504,6 +509,28 @@ enum OwnerRidersSub {
     },
 }
 
+/// `x0x sync` subcommands (ADR-0041 Tier-1).
+#[derive(Subcommand)]
+enum SyncSub {
+    /// List the owner device set with last-sync status per device.
+    Devices,
+    /// Enroll a machine into the owner device set (owner-key-signed).
+    Enroll {
+        /// Machine id (64 hex chars). Defaults to THIS machine.
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: Option<String>,
+        /// Enrollment lifetime in seconds; omit for until-revoked.
+        #[arg(long, value_name = "SECS")]
+        ttl_secs: Option<u64>,
+    },
+    /// Remove a machine from the owner device set (refused at the next
+    /// stream accept).
+    Revoke {
+        /// Machine id (64 hex chars).
+        #[arg(value_name = "MACHINE_ID")]
+        machine_id: String,
+    },
+}
 #[derive(Subcommand)]
 enum UserIdSub {
     /// Create a new user identity keypair (ML-DSA-65). Defaults to ~/.x0x/user.key.
@@ -1640,6 +1667,16 @@ async fn run(
                 sub: Some(OwnerRidersSub::Revoke { token_id }),
             }) => commands::identity::owner_riders_revoke(&client, token_id).await,
         },
+        Commands::Sync { sub } => match sub {
+            None | Some(SyncSub::Devices) => commands::identity::sync_devices(&client).await,
+            Some(SyncSub::Enroll {
+                machine_id,
+                ttl_secs,
+            }) => commands::identity::sync_enroll(&client, machine_id.as_deref(), ttl_secs).await,
+            Some(SyncSub::Revoke { machine_id }) => {
+                commands::identity::sync_revoke(&client, &machine_id).await
+            }
+        },
         Commands::Health => commands::network::health(&client).await,
         Commands::Status => commands::network::status(&client).await,
         Commands::Agent { sub } => match sub {
@@ -2274,7 +2311,9 @@ x0x (v{VERSION})
 |   +-- profile           Show stored self-profile names
 |   +-- profile set       Update self-profile names (partial update)
 |   +-- owner agents      List agents certified by this install's owner
-|   +-- announce           Announce identity to network
+|   +-- sync devices      List enrolled owner devices + last-sync status
+|   +-- sync enroll       Enroll a machine into the owner device set
+|   +-- sync revoke       Remove a machine from the owner device set
 |
 +-- Network
 |   +-- health             Health check

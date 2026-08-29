@@ -297,6 +297,25 @@ pub async fn owner_agents_issue(
     Ok(())
 }
 
+/// `x0x sync` / `x0x sync devices` — GET /sync/devices (ADR-0041 Tier-1).
+pub async fn sync_devices(client: &DaemonClient) -> Result<()> {
+    client.run_get("/sync/devices").await
+}
+
+/// `x0x sync enroll [MACHINE_ID]` — POST /sync/devices/enroll. Omitting
+/// the id enrolls THIS machine into the owner device set; `--ttl-secs`
+/// bounds the enrollment's lifetime.
+pub async fn sync_enroll(
+    client: &DaemonClient,
+    machine_id: Option<&str>,
+    ttl_secs: Option<u64>,
+) -> Result<()> {
+    let body = serde_json::json!({ "machine_id": machine_id, "ttl_secs": ttl_secs });
+    let resp = client.post("/sync/devices/enroll", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x owner agents revoke` — DELETE /owner/agents/:id (ADR-0039).
 pub async fn owner_agents_revoke(client: &DaemonClient, agent_id: &str) -> Result<()> {
     client
@@ -329,16 +348,23 @@ pub async fn owner_riders_issue(
     Ok(())
 }
 
+/// `x0x sync revoke MACHINE_ID` — DELETE /sync/devices/:machine_id.
+pub async fn sync_revoke(client: &DaemonClient, machine_id: &str) -> Result<()> {
+    let resp = client
+        .delete(&format!("/sync/devices/{machine_id}"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x owner riders revoke` — DELETE /owner/riders/:id (ADR-0039).
 pub async fn owner_riders_revoke(client: &DaemonClient, token_id: u64) -> Result<()> {
     client
         .run_delete(&format!("/owner/riders/{token_id}"))
         .await
 }
-
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used)]
     use super::*;
     use crate::cli::{DaemonClient, OutputFormat};
 

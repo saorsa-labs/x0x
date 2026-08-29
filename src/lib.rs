@@ -75,6 +75,10 @@ pub mod storage;
 /// gossip-fed set consulted at every trust gate.
 pub mod revocation;
 
+/// ADR-0041 Tier-1 cross-machine owner-state sync (owner-signed versioned
+/// records over `SyncV1` streams between the owner's enrolled machines).
+pub mod owner_sync;
+
 pub mod announce_blob;
 /// V3 identity announcement (L3 slimming — merged + digest, self-verifying).
 pub mod announce_v3;

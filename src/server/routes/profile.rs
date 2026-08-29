@@ -114,6 +114,11 @@ pub(in crate::server) async fn update_profile(
             })),
         );
     }
+    // ADR-0041 Tier-1: names are synced state — kick an early sync pass so
+    // the owner's other machines learn the change before the next period.
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.kick();
+    }
     (
         StatusCode::OK,
         Json(serde_json::json!({

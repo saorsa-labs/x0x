@@ -43,14 +43,14 @@ use routes::{
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
-    discovered_machines, dm_diagnostics, ensure_named_group_listeners, evaluate_trust, exec_cancel,
-    exec_diagnostics, exec_run, exec_sessions, file_accept_handler, file_reject_handler,
-    file_send_handler, file_transfer_status_handler, file_transfers_handler, find_agent,
-    forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
+    discovered_machines, dm_diagnostics, enroll_device, ensure_named_group_listeners,
+    evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
+    file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
+    find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
     get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
     get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, get_profile, gossip_diagnostics, group_membership_lock,
-    groups_diagnostics, handle_file_message, handle_join_result_message,
+    get_named_group_members, get_profile, get_sync_devices, gossip_diagnostics,
+    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
     handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
     health, history_diagnostics, history_list, history_message, history_purge, history_search,
     history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
@@ -75,16 +75,17 @@ use routes::{
     spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
-    unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
-    update_member_role, update_named_group, update_profile, update_task, withdraw_group_state,
-    AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
-    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    unban_group_member, unenroll_device, unpin_machine, unsubscribe, update_contact,
+    update_group_policy, update_member_role, update_named_group, update_profile, update_task,
+    withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
+    PublicGroupBootstrap, SelfPublishedReleaseManifests, TreeKemCatchupRequest,
+    TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -796,6 +797,20 @@ pub async fn serve_with_options(
         .unwrap_or_default();
     agent.set_self_name(profile.display_name.clone());
 
+    // ADR-0041 Tier-1: cross-machine owner-state sync. Only an install
+    // with an owner key can own or receive Tier-1 state; ownerless
+    // installs register no SyncV1 acceptor and answer 409 on the sync
+    // routes. The acceptor registration follows the single-acceptor rule
+    // (a conflict aborts startup).
+    let owner_sync = if agent.identity().user_keypair().is_some() {
+        let service = x0x::owner_sync::OwnerSyncService::new(Arc::clone(&agent), &config.data_dir)
+            .await
+            .context("failed to register SyncV1 stream acceptor")?;
+        Some(service)
+    } else {
+        None
+    };
+
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
         history_record_topics: config.history.record_topics.clone(),
@@ -887,6 +902,7 @@ pub async fn serve_with_options(
         groups_diagnostics: Arc::new(x0x::groups::GroupsDiagnostics::new()),
         connect_diagnostics,
         forward_service,
+        owner_sync,
     });
 
     let port_file = config.data_dir.join("api.port");
@@ -897,6 +913,17 @@ pub async fn serve_with_options(
     // are owned by the Agent/ExecService and stopped by their own `shutdown()`
     // calls in the shutdown tail — issue #116 — not collected here.)
     let mut bg_tasks: Vec<tokio::task::JoinHandle<()>> = Vec::new();
+
+    // ADR-0041 Tier-1: bridge the sync service to live daemon state and
+    // start the periodic + on-change pass loop (shuts down with the watch).
+    if let Some(sync) = state.owner_sync.as_ref() {
+        sync.attach_view(Arc::new(routes::DaemonView::new(Arc::clone(&state))));
+        let service = Arc::clone(sync);
+        let shutdown_rx = state.shutdown_notify.subscribe();
+        bg_tasks.push(tokio::spawn(async move {
+            service.spawn_periodic(shutdown_rx).await;
+        }));
+    }
 
     // A previous daemon instance may have left an API advertisement behind.
     // Remove it before any fallible causal-state loader runs so a rejected
@@ -1647,6 +1674,12 @@ pub async fn serve_with_options(
         .route("/agent", get(agent_info))
         .route("/introduction", get(introduction))
         .route("/agent/card", get(get_agent_card))
+        .route("/sync/devices", get(get_sync_devices))
+        .route("/sync/devices/enroll", post(enroll_device))
+        .route(
+            "/sync/devices/:machine_id",
+            axum::routing::delete(unenroll_device),
+        )
         .route("/profile", get(get_profile).put(update_profile))
         .route("/home", get(routes::home::get_home))
         .route("/home/rename", post(routes::home::rename_home))

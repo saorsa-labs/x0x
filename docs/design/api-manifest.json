@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 160,
+  "endpoint_count": 163,
   "endpoints": [
     {
       "category": "status",
@@ -168,6 +168,27 @@
       "description": "Revoke a rider token; it fails on the next request",
       "method": "DELETE",
       "path": "/owner/riders/:id"
+    },
+    {
+      "category": "identity",
+      "cli_name": "sync devices",
+      "description": "ADR-0041 Tier-1: enrolled owner devices + last-sync status",
+      "method": "GET",
+      "path": "/sync/devices"
+    },
+    {
+      "category": "identity",
+      "cli_name": "sync enroll",
+      "description": "Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)",
+      "method": "POST",
+      "path": "/sync/devices/enroll"
+    },
+    {
+      "category": "identity",
+      "cli_name": "sync revoke",
+      "description": "Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)",
+      "method": "DELETE",
+      "path": "/sync/devices/:machine_id"
     },
     {
       "category": "network",

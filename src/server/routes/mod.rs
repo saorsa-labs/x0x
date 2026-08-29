@@ -25,6 +25,7 @@ mod profile;
 pub(crate) mod public_group_bootstrap_outbox;
 mod status;
 mod stores;
+mod sync;
 mod tasks;
 mod trust;
 mod upgrade;
@@ -120,6 +121,7 @@ pub(super) use stores::{
     apply_direct_kv_store_delta, create_kv_store, delete_kv_value, get_kv_value, join_kv_store,
     list_kv_keys, list_kv_stores, put_kv_value, KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
 };
+pub(super) use sync::{enroll_device, get_sync_devices, unenroll_device, DaemonView};
 pub(super) use tasks::{
     add_task, apply_group_authorization, create_task_list, list_task_lists, list_tasks, update_task,
 };
