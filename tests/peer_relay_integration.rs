@@ -1038,15 +1038,32 @@ async fn forged_inner_relayed_dm_is_never_a_verified_delivery() {
     );
 }
 
-/// #437: a relay (or on-path holder of a valid header) cannot substitute a
-/// different valid inner envelope under a bound header. The origin signs a
-/// v2 (digest-bound) header over inner A; the carried inner is swapped for
-/// an unrelated but well-formed inner B. The listener's `disposition_for`
-/// gate must hard-drop the frame — `relay_refused_inner_digest_mismatch`
-/// advances, no receive accounting is attributed to the header's sender,
-/// and nothing is re-injected onto the direct channel.
+/// #437 — the RELAY-HOP attack, end to end through the real listener.
+///
+/// Threat model: Bob's end-to-end integrity never depended on the relay
+/// header (the inner `DmEnvelope` carries its own ML-DSA-65 signature —
+/// a substituted envelope is attributable to *its* real author, never a
+/// forgery of the original sender). What #437 closes is the relay hop:
+/// Charlie-the-relay's contact gate (#193) and forward rate/bandwidth
+/// accounting act on the HEADER's authenticated sender. Here Alice
+/// (the header sender, a passing contact on a contact-gated relay —
+/// equivalently any sender on this open-relay config) signs a bound
+/// header for inner A addressed to Bob; an on-path holder swaps in an
+/// unrelated well-formed inner B and hands the frame to Charlie for
+/// forwarding. Pre-fix, Charlie would classify Forward — spending its
+/// uplink and quota on bytes authored by someone else, attributed to
+/// Alice. Post-fix the digest gate refuses BEFORE the contact gate or
+/// any quota admission.
+///
+/// Assertions target Charlie's relay-hop decision: the mismatch refusal
+/// counter advances, `relay_forwarded` and `relay_received` stay flat
+/// (no accounting attributed to Alice), and nothing is re-injected
+/// locally (dst is Bob, not Charlie). Bob-side header↔inner
+/// verification is out of scope by construction — the forward arm
+/// delivers only the inner envelope; the header never travels past the
+/// relay hop.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn substituted_inner_under_bound_header_is_hard_dropped() {
+async fn relay_hop_substituted_inner_is_refused_before_forward_accounting() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let charlie = match build_agent(
         &dir,
@@ -1071,34 +1088,40 @@ async fn substituted_inner_under_bound_header_is_hard_dropped() {
     };
     charlie.join_network().await.expect("charlie join_network");
 
-    // Origin signs a bound header for inner A...
-    let origin = AgentKeypair::generate().expect("origin keypair");
-    let inner_a = opaque_inner(origin.agent_id().0, [0x22; 32], vec![0u8; 8]);
+    // Bob is the final recipient; Charlie is the intermediate relay the
+    // frame is handed to for forwarding (dst != Charlie → forward arm).
+    let bob = AgentId([0x55; 32]);
+
+    // Alice signs a bound header for inner A, addressed to Bob.
+    let alice = AgentKeypair::generate().expect("alice keypair");
+    let inner_a = opaque_inner(alice.agent_id().0, [0x22; 32], vec![0u8; 8]);
     let digest = RelayedDm::inner_digest_of(&inner_a).expect("canonical encode inner A");
-    let (pub_bytes, _sec_bytes) = origin.to_bytes();
+    let (pub_bytes, _sec_bytes) = alice.to_bytes();
     let originated = now_unix_ms();
     let signing_bytes = RelayHeader::signing_bytes(
         RelayHeader::VERSION,
-        &charlie.agent_id().0,
-        &origin.agent_id().0,
+        &bob.0,
+        &alice.agent_id().0,
         &pub_bytes,
         originated,
         Some(&digest),
     );
     let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
-        origin.secret_key(),
+        alice.secret_key(),
         &signing_bytes,
     )
     .expect("ml-dsa sign bound relay header");
 
     // ...but the frame carries unrelated inner B — a well-formed envelope
-    // from a different origin, the exact #437 substitution.
+    // from a different origin, the exact relay-hop substitution. Pre-fix
+    // this classifies Forward (spending Charlie's uplink/quota on
+    // Mallory's bytes, attributed to Alice).
     let inner_b = opaque_inner([0x99; 32], [0x88; 32], vec![0xCD; 32]);
     let relayed = RelayedDm {
         header: RelayHeader {
             version: RelayHeader::VERSION,
-            dst_agent_id: charlie.agent_id().0,
-            sender_agent_id: origin.agent_id().0,
+            dst_agent_id: bob.0,
+            sender_agent_id: alice.agent_id().0,
             sender_public_key: pub_bytes,
             originated_at_unix_ms: originated,
             inner_digest: Some(digest),
@@ -1112,6 +1135,7 @@ async fn substituted_inner_under_bound_header_is_hard_dropped() {
         .stats()
         .snapshot()
         .relay_refused_inner_digest_mismatch;
+    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
     let pre_received = charlie.peer_relay().stats().snapshot().relay_received;
     let mut charlie_sub = charlie.subscribe_direct();
     assert!(
@@ -1139,11 +1163,18 @@ async fn substituted_inner_under_bound_header_is_hard_dropped() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    // ...with no receive accounting attributed to the header's sender...
+    // ...with no forward accounting attributed to the header's sender
+    // (the relay-hop decision this test exists to measure)...
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded,
+        pre_forwarded,
+        "no forward may be spent on a substituted envelope — quota stays unattributed to Alice"
+    );
+    // ...no receive accounting (the frame is addressed to Bob)...
     assert_eq!(
         charlie.peer_relay().stats().snapshot().relay_received,
         pre_received,
-        "a substituted envelope must not count as received"
+        "a frame addressed to Bob must not count as received by Charlie"
     );
     // ...and nothing may reach Charlie's direct subscribers.
     match tokio::time::timeout(Duration::from_millis(300), charlie_sub.recv()).await {

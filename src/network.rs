@@ -4095,9 +4095,10 @@ impl NetworkNode {
                             let mut relay_sender_agent_id = [0u8; 32];
                             relay_sender_agent_id.copy_from_slice(&data[1..33]);
                             let body = &data[33..];
-                            let relayed = match postcard::from_bytes::<crate::peer_relay::RelayedDm>(
-                                body,
-                            ) {
+                            // #437: two-stage decode — v2 (digest-bound)
+                            // first, then the byte-exact v1 legacy shape,
+                            // so pre-#437 senders' frames still parse.
+                            let relayed = match crate::peer_relay::RelayedDm::from_postcard(body) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     warn!(

@@ -35,11 +35,26 @@
 //!   tricked into relaying for a forged origin, and a tampered
 //!   `dst` / `originated_at` is rejected. Since #437 the signature also
 //!   covers `blake3` of the inner envelope's canonical wire bytes
-//!   (`inner_digest`, v2 signing domain), so a relay cannot substitute
-//!   a different valid `DmEnvelope` under a captured header — the
-//!   header's sender gating and forward accounting bind to the exact
-//!   payload that travels. See [`RelayedDm::inner_digest_matches`] for
-//!   the legacy (digest-less) transition rule.
+//!   (`inner_digest`, v2 signing domain).
+//!
+//!   Threat model (#437): the final recipient's end-to-end integrity
+//!   never depended on the header — the inner `DmEnvelope` carries its
+//!   own ML-DSA-65 origin signature, so even a substituted envelope is
+//!   only ever delivered as a message validly authored by *its* real
+//!   author, never as a forgery of the original sender. What the
+//!   digest closes is the **relay hop**: an intermediate node's contact
+//!   gate (#193) and forward rate/bandwidth accounting act on the
+//!   header's authenticated sender, and without the binding a relay or
+//!   on-path holder could spend the relay's uplink and quota carrying a
+//!   payload authored by anyone while attributing it to the header's
+//!   sender. With the binding, the authenticated sender is accountable
+//!   for the exact payload that travels, so gating and accounting
+//!   attribute to the true author. Recipient-side header↔inner
+//!   verification is out of scope by construction: the forward arm
+//!   delivers only the inner envelope to the final recipient — the
+//!   header never travels past the relay hop. See
+//!   [`crate::peer_relay::RelayedDm::inner_digest_matches`] for the legacy (digest-less)
+//!   transition rule.
 //! - **Forward-path hardening (#193).** Even with `enabled = true`, the
 //!   forward arm is not an open relay by default: `require_contact_to_relay`
 //!   (default `true`) refuses to forward on behalf of any sender not in
@@ -156,8 +171,12 @@ pub struct RelayHeader {
     /// #437 inner-payload binding: `blake3` over the canonical (postcard)
     /// wire bytes of the carried `DmEnvelope`, signed as part of the
     /// header (v2 signing domain). `None` = legacy pre-#437 header (see
-    /// [`RelayedDm::inner_digest_matches`] for the transition rule).
-    #[serde(default)]
+    /// [`crate::peer_relay::RelayedDm::inner_digest_matches`] for the transition rule).
+    ///
+    /// Wire note: postcard is positional, so this field's presence
+    /// changes the byte layout — v1 (field absent) and v2 (field
+    /// present) frames are distinguished by the two-stage decode in
+    /// [`RelayedDm::from_postcard`], **not** by a serde default.
     pub inner_digest: Option<[u8; 32]>,
     /// ML-DSA-65 signature over the domain-separated header bytes
     /// (everything above, see [`RelayHeader::signing_bytes`] — including
@@ -228,7 +247,7 @@ impl RelayHeader {
     ///
     /// Returns `true` only when all three hold. Does **not** check that
     /// the carried inner envelope matches `inner_digest` — that binding
-    /// is enforced by [`RelayedDm::inner_digest_matches`] /
+    /// is enforced by [`crate::peer_relay::RelayedDm::inner_digest_matches`] /
     /// [`PeerRelay::disposition_for`] — nor freshness or whether *we*
     /// are the intended relay; those remain the caller's job.
     pub fn verify(&self) -> bool {
@@ -274,6 +293,45 @@ pub struct RelayedDm {
     pub inner: DmEnvelope,
 }
 
+/// Legacy (pre-#437) wire shape of [`RelayHeader`] — the exact v1
+/// field sequence old senders emit on the wire (no `inner_digest`).
+/// Postcard is positional, so inserting a field into [`RelayHeader`]
+/// would break v1 decode; this mirror preserves the old byte layout.
+/// Used only by the two-stage decode in [`RelayedDm::from_postcard`];
+/// this node never emits it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RelayHeaderV1Wire {
+    version: u16,
+    dst_agent_id: [u8; 32],
+    sender_agent_id: [u8; 32],
+    sender_public_key: Vec<u8>,
+    originated_at_unix_ms: u64,
+    signature: Vec<u8>,
+}
+/// Legacy (pre-#437) wire shape of [`RelayedDm`].
+#[derive(Debug, Serialize, Deserialize)]
+struct RelayedDmV1Wire {
+    header: RelayHeaderV1Wire,
+    inner: DmEnvelope,
+}
+
+impl From<RelayedDmV1Wire> for RelayedDm {
+    fn from(v1: RelayedDmV1Wire) -> Self {
+        Self {
+            header: RelayHeader {
+                version: v1.header.version,
+                dst_agent_id: v1.header.dst_agent_id,
+                sender_agent_id: v1.header.sender_agent_id,
+                sender_public_key: v1.header.sender_public_key,
+                originated_at_unix_ms: v1.header.originated_at_unix_ms,
+                inner_digest: None,
+                signature: v1.header.signature,
+            },
+            inner: v1.inner,
+        }
+    }
+}
+
 impl RelayedDm {
     /// #437 canonical inner bytes: the postcard wire encoding of the
     /// inner `DmEnvelope` — exactly the form a relay forwards verbatim
@@ -283,6 +341,32 @@ impl RelayedDm {
     /// everywhere it is consumed).
     fn canonical_inner_bytes(inner: &DmEnvelope) -> Option<Vec<u8>> {
         postcard::to_allocvec(inner).ok()
+    }
+
+    /// Two-stage postcard decode for the #437 wire transition.
+    ///
+    /// Postcard encodes structs **positionally** — adding
+    /// `inner_digest` to [`RelayHeader`] changes the byte layout, so a
+    /// naive single-struct decode would reject every v1 frame from a
+    /// pre-#437 sender (the `inner_digest` Option tag would be parsed
+    /// from the signature's length bytes). Instead: try the v2
+    /// (digest-bearing) shape first; on failure, fall back to the
+    /// byte-exact v1 legacy shape (`RelayedDmV1Wire`) and lift it
+    /// with `inner_digest: None`.
+    ///
+    /// Ambiguity is fail-closed: a v1 frame that misparses as v2 (or
+    /// vice versa) necessarily splits the byte stream at the wrong
+    /// field boundary, which invalidates the ML-DSA-65 signature —
+    /// `RelayHeader::verify` drops it. This node always **emits** v2
+    /// (see [`PeerRelay::build_relayed_dm`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns the v2 decode error when the bytes parse as neither
+    /// shape.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes::<Self>(bytes)
+            .or_else(|_| postcard::from_bytes::<RelayedDmV1Wire>(bytes).map(Self::from))
     }
 
     /// Compute the #437 inner-payload digest a sender must place in
@@ -295,19 +379,28 @@ impl RelayedDm {
     /// #437 binding check between the signed header and the carried
     /// inner envelope.
     ///
+    /// Threat model: end-to-end integrity of the delivered message
+    /// rests on the inner envelope's own ML-DSA-65 signature — a
+    /// substituted envelope is attributable to *its* real author, not
+    /// forged. This check protects the **relay hop**: the header's
+    /// authenticated sender drives the #193 contact gate and forward
+    /// rate/bandwidth accounting, so the sender must be bound to the
+    /// exact payload those decisions are made about.
+    ///
     /// - `None` — legacy header (no `inner_digest`, pre-#437 sender):
     ///   accepted per the documented transition (see
     ///   `docs/design/adr-0051-mechanics.md`), keeping exactly today's
-    ///   guarantees until a `DmCapabilities`-style advert confirms
-    ///   peer support, at which point absence becomes rejectable
-    ///   (mirrors ADR-0021's attestation transition).
+    ///   guarantees. Absence stays fail-open until the
+    ///   `DmCapabilities` digest-support flag lands (issue #442) and
+    ///   confirms peer support — mirrors ADR-0021's attestation
+    ///   transition shape.
     /// - `Some(true)` — bound and matching.
     /// - `Some(false)` — the header was signed for a **different**
-    ///   inner payload (substitution, issue #437) or the inner envelope
-    ///   cannot be canonically encoded — hard-drop either way. A
-    ///   mismatch means the header's authenticated sender did not sign
-    ///   *this* envelope, so header-sender gating/accounting must not
-    ///   be trusted for it.
+    ///   inner payload (relay-hop substitution, issue #437) or the
+    ///   inner envelope cannot be canonically encoded — hard-drop
+    ///   either way: the header's authenticated sender did not sign
+    ///   *this* envelope, so relay-hop gating/accounting must not
+    ///   apply to it.
     #[must_use]
     pub fn inner_digest_matches(&self) -> Option<bool> {
         let expected = self.header.inner_digest?;
@@ -336,10 +429,12 @@ pub enum RelayRefusal {
     /// The [`RelayHeader`] signature or self-consistency check failed.
     BadSignature,
     /// #437: the header carries an `inner_digest` that does not match
-    /// the carried inner envelope — a substituted payload under an
+    /// the carried inner envelope — a relay-hop substitution under an
     /// otherwise valid header. Hard-drop: the header's authenticated
-    /// sender did not sign this inner envelope, so sender gating and
-    /// forward accounting must not apply to it.
+    /// sender did not sign this inner envelope, so the #193 contact
+    /// gate and forward accounting must not attribute to that sender.
+    /// (Final-recipient integrity is unaffected — the inner envelope's
+    /// own signature attributes it to its real author.)
     InnerDigestMismatch,
     /// `originated_at_unix_ms` is older than the freshness budget — a
     /// likely replay of a captured relay envelope.
@@ -884,7 +979,7 @@ impl PeerRelay {
     /// `inner_digest = blake3(postcard(inner))` is signed under the v2
     /// header domain, so a relay cannot substitute a different valid
     /// `DmEnvelope` under this header without failing
-    /// [`RelayedDm::inner_digest_matches`] at every enforcing node.
+    /// [`crate::peer_relay::RelayedDm::inner_digest_matches`] at every enforcing node.
     ///
     /// # Errors
     ///
@@ -1564,6 +1659,170 @@ mod tests {
             relay.disposition_for(&legacy, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally,
             "legacy digest-less headers keep today's acceptance"
+        );
+    }
+
+    #[test]
+    fn legacy_v1_wire_decodes_via_two_stage_and_verifies() {
+        // Why (#437 wire compat): postcard is positional — inserting
+        // `inner_digest` into `RelayHeader` changes the byte layout, so
+        // a naive single-struct decode REJECTS every v1 frame from a
+        // pre-#437 sender (the Option tag would be parsed from the
+        // signature's length bytes; an ML-DSA-65 signature is ~3309
+        // bytes, whose varint length prefix decodes as an invalid
+        // variant index). The two-stage `from_postcard` must recover
+        // the frame byte-for-byte from the v1 mirror, and a genuinely
+        // signed legacy header must still verify afterwards.
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let local = aid(75);
+        let now_ms = 1_700_000_000_000u64;
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+
+        // A pre-#437 sender signs the v1 layout and emits v1 bytes.
+        let signing_bytes = RelayHeader::signing_bytes(
+            RelayHeader::VERSION,
+            &local.0,
+            &sender.0,
+            &pub_bytes,
+            now_ms,
+            None,
+        );
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, &signing_bytes)
+                .expect("legacy sign");
+        let v1_wire = postcard::to_allocvec(&RelayedDmV1Wire {
+            header: RelayHeaderV1Wire {
+                version: RelayHeader::VERSION,
+                dst_agent_id: local.0,
+                sender_agent_id: sender.0,
+                sender_public_key: pub_bytes,
+                originated_at_unix_ms: now_ms,
+                signature: signature.as_bytes().to_vec(),
+            },
+            inner: dummy_inner(),
+        })
+        .expect("v1 encode");
+
+        // The break this test pins: the v2 struct alone cannot parse
+        // v1 bytes...
+        assert!(
+            postcard::from_bytes::<RelayedDm>(&v1_wire).is_err(),
+            "v1 wire bytes must NOT parse as the v2 struct — positional layouts differ"
+        );
+        // ...but the two-stage decode recovers it, unbound, verifiable.
+        let decoded = RelayedDm::from_postcard(&v1_wire).expect("two-stage decode");
+        assert_eq!(decoded.header.inner_digest, None);
+        assert_eq!(decoded.header.sender_agent_id, sender.0);
+        assert_eq!(
+            RelayedDm::inner_digest_of(&decoded.inner),
+            RelayedDm::inner_digest_of(&dummy_inner()),
+            "inner envelope must round-trip byte-exactly (canonical digest equality)"
+        );
+        assert!(
+            decoded.header.verify(),
+            "a v1-signed header must still verify after the v1-wire decode"
+        );
+        assert_eq!(decoded.inner_digest_matches(), None);
+    }
+
+    #[test]
+    fn v2_wire_round_trips_through_two_stage_decode() {
+        // Why (#437): new frames carry the digest; the two-stage decode
+        // must take the v2 branch on the first try (no fallback), so
+        // bound frames never depend on the legacy path.
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let built = relay
+            .build_relayed_dm(
+                &aid(76),
+                &sender,
+                pub_bytes,
+                1_700_000_000_000,
+                dummy_inner(),
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build");
+
+        let wire = postcard::to_allocvec(&built).expect("v2 encode");
+        let decoded = RelayedDm::from_postcard(&wire).expect("v2 decode");
+        assert_eq!(decoded.header.inner_digest, built.header.inner_digest);
+        assert_eq!(decoded.inner_digest_matches(), Some(true));
+        assert!(decoded.header.verify());
+    }
+
+    #[test]
+    fn frozen_v1_wire_vector_still_decodes() {
+        // Why (#437 wire compat): a FROZEN v1 frame — captured field
+        // values, exact pre-#437 byte layout — must decode via
+        // `from_postcard` with `inner_digest: None`. This vector is the
+        // compat contract: if the v1 mirror struct (or the field order
+        // it pins) ever drifts, this test fails before any peer does.
+        // Crypto values are placeholders — decode compat is positional,
+        // not cryptographic; signature verification of real v1 headers
+        // is pinned by `legacy_v1_wire_decodes_via_two_stage_and_verifies`.
+        // Byte-level construction: every length prefix and varint is an
+        // explicit literal transcribed from a real canonical encoding —
+        // fixed-value runs are spelled as runs, but the field ORDER and
+        // varint SHAPES are frozen by hand, so any layout drift in the
+        // v1 mirror breaks the equality assert below.
+        let frozen: Vec<u8> = [
+            &[1u8][..],                                                 // version (varint u16)
+            &[0x11; 32][..],                                            // dst_agent_id
+            &[0x22; 32][..],                                            // sender_agent_id
+            &[8u8, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB, 0xAB][..], // sender_public_key
+            &[0x80, 0xD0, 0x95, 0xFF, 0xBC, 0x31][..], // originated_at varint (1.7e12)
+            &[4u8, 0xCD, 0xCD, 0xCD, 0xCD][..],        // signature
+            // inner: DmEnvelope (dummy_inner shape)
+            &[1u8][..],                         // protocol_version
+            &[7u8; 16][..],                     // request_id
+            &[1u8; 32][..],                     // inner sender_agent_id
+            &[2u8; 32][..],                     // inner sender_machine_id
+            &[3u8; 32][..],                     // inner recipient_agent_id
+            &[0xE8, 0x07][..],                  // created_at varint (1000)
+            &[0xE0, 0xD4, 0x03][..],            // expires_at varint (60000)
+            &[0u8][..],                         // body: DmBody::Payload
+            &[8u8, 0, 0, 0, 0, 0, 0, 0, 0][..], // kem_ciphertext
+            &[0u8; 12][..],                     // body_nonce
+            &[8u8, 0, 0, 0, 0, 0, 0, 0, 0][..], // body_ciphertext
+            &[8u8, 0, 0, 0, 0, 0, 0, 0, 0][..], // inner signature
+            &[0u8][..],                         // origin_attestation: None
+        ]
+        .concat();
+        // Pin the vector's own integrity first — hand-maintained varints
+        // are exactly where drift hides.
+        let expected_v1 = postcard::to_allocvec(&RelayedDmV1Wire {
+            header: RelayHeaderV1Wire {
+                version: 1,
+                dst_agent_id: [0x11; 32],
+                sender_agent_id: [0x22; 32],
+                sender_public_key: vec![0xAB; 8],
+                originated_at_unix_ms: 1_700_000_000_000,
+                signature: vec![0xCD; 4],
+            },
+            inner: dummy_inner(),
+        })
+        .expect("canonical v1 encode");
+        assert_eq!(
+            frozen, expected_v1,
+            "frozen vector must match the mirror-struct encoding exactly"
+        );
+
+        let decoded = RelayedDm::from_postcard(&frozen).expect("frozen v1 decodes");
+        assert_eq!(decoded.header.inner_digest, None);
+        assert_eq!(decoded.header.originated_at_unix_ms, 1_700_000_000_000);
+        assert_eq!(
+            RelayedDm::inner_digest_of(&decoded.inner),
+            RelayedDm::inner_digest_of(&dummy_inner()),
+            "inner envelope must decode byte-exactly from the frozen vector"
         );
     }
 
