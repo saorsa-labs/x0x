@@ -415,6 +415,17 @@ pub struct Agent {
     /// [`Agent::set_connect_policy`]. `std` RwLock: gate reads are a brief
     /// clone of the inner `Arc`, never held across an await.
     connect_policy: std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
+    /// ADR-0043 §2.1: this machine's ML-KEM-768 enrollment keypair — the
+    /// export-envelope recipient key. Generated at first start, persisted
+    /// beside the machine key (`machine-kem.key`); `None` when no
+    /// identity directory is resolvable (library embeds without one).
+    machine_kem: Option<groups::kem_envelope::AgentKemKeypair>,
+    /// ADR-0043 derived move state: per-agent participant logs
+    /// (`moves.bin`), mesh-verified activation bundles
+    /// (`move-bundles.bin`), and the owner-verified placement cache
+    /// (`placement-blobs.bin`). Every B/P enforcement gate reads this;
+    /// writers append one verified record and readers fold.
+    move_state: std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -1461,6 +1472,105 @@ impl MachineAnnouncement {
     }
 }
 
+/// Unsigned body of [`MachineAnnouncementV3`] — the V2 unsigned fields
+/// plus the ADR-0043 enrollment fields, all inside the machine signature.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct MachineAnnouncementV3Unsigned {
+    base: MachineAnnouncementUnsigned,
+    /// ML-KEM-768 public key (~1184 B) — the export-envelope recipient
+    /// key. Machines without an enrolled KEM key (pre-0043 library
+    /// embeds) publish an empty vector.
+    machine_kem_public_key: Vec<u8>,
+    /// Current owner-signed placement-record digest per resident agent
+    /// (§8.2). The machine is not the placement authority — it advertises
+    /// pointers; every fetched record is owner-verified before caching.
+    placement_digests: Vec<(identity::AgentId, [u8; 32])>,
+    /// ADR-0043 protocol capability advert: `1` = machine-announce v3 +
+    /// revocation v2 + activation topics + blob v2. `0` would be absent
+    /// (never published).
+    move_protocol: u8,
+}
+
+/// Signed V3 machine endpoint announcement (ADR-0043 §2.1).
+///
+/// Carries every V2 field plus the machine's ML-KEM-768 enrollment key
+/// and per-agent placement digests. Published on
+/// [`MACHINE_ANNOUNCE_V3_TOPIC`] — a NEW topic, exactly the
+/// topic-versioning precedent of v2-over-v1; pre-0043 peers are not
+/// subscribed and never decode it, so the V2 wire stays byte-identical.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct MachineAnnouncementV3 {
+    /// The verified V2 announcement (its own machine signature intact).
+    pub base: MachineAnnouncement,
+    /// ML-KEM-768 public key bytes (empty when not enrolled).
+    pub machine_kem_public_key: Vec<u8>,
+    /// Placement-record digests per resident agent.
+    pub placement_digests: Vec<(identity::AgentId, [u8; 32])>,
+    /// Move-protocol capability advert (currently `1`).
+    pub move_protocol: u8,
+    /// Machine ML-DSA-65 signature over the V3 unsigned body.
+    pub machine_signature_v3: Vec<u8>,
+}
+
+impl MachineAnnouncementV3 {
+    fn to_unsigned(&self) -> MachineAnnouncementV3Unsigned {
+        MachineAnnouncementV3Unsigned {
+            base: self.base.to_unsigned(),
+            machine_kem_public_key: self.machine_kem_public_key.clone(),
+            placement_digests: self.placement_digests.clone(),
+            move_protocol: self.move_protocol,
+        }
+    }
+
+    /// Verify both signatures: the embedded V2 attestation (unchanged
+    /// rules) and the V3 signature over `base_unsigned ‖ kem ‖ digests ‖
+    /// protocol`. A malformed KEM key length fails closed — an export
+    /// sealed to a bogus key would be unrecoverable ciphertext.
+    pub fn verify(&self) -> error::Result<()> {
+        self.base.verify()?;
+        if !self.machine_kem_public_key.is_empty()
+            && self.machine_kem_public_key.len()
+                != groups::kem_envelope::KEM_VARIANT.public_key_size()
+        {
+            return Err(error::IdentityError::CertificateVerification(format!(
+                "machine KEM public key has {} bytes, expected {}",
+                self.machine_kem_public_key.len(),
+                groups::kem_envelope::KEM_VARIANT.public_key_size()
+            )));
+        }
+        let unsigned_bytes = bincode::serialize(&self.to_unsigned()).map_err(|e| {
+            error::IdentityError::Serialization(format!(
+                "failed to serialize V3 machine announcement for verification: {e}"
+            ))
+        })?;
+        let machine_pub = ant_quic::MlDsaPublicKey::from_bytes(&self.base.machine_public_key)
+            .map_err(|_| {
+                error::IdentityError::CertificateVerification(
+                    "invalid machine public key in V3 announcement".to_string(),
+                )
+            })?;
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(
+                &self.machine_signature_v3,
+            )
+            .map_err(|e| {
+                error::IdentityError::CertificateVerification(format!(
+                    "invalid V3 machine signature: {e:?}"
+                ))
+            })?;
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &machine_pub,
+            &unsigned_bytes,
+            &signature,
+        )
+        .map_err(|e| {
+            error::IdentityError::CertificateVerification(format!(
+                "V3 machine announcement signature verification failed: {e:?}"
+            ))
+        })
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct UserAnnouncementUnsigned {
     user_id: identity::UserId,
@@ -1787,6 +1897,15 @@ pub struct DiscoveredMachine {
     pub reachable_via: Vec<identity::MachineId>,
     /// Relay machines this machine proposes as fallback paths.
     pub relay_candidates: Vec<identity::MachineId>,
+    /// ADR-0043 §2.1: the machine's enrolled ML-KEM-768 public key (the
+    /// export-envelope recipient key), from `MachineAnnouncementV3`.
+    /// `None` when only V2 announcements were seen. Cache merge never
+    /// erases a known KEM key with an absent one.
+    pub machine_kem_public_key: Option<Vec<u8>>,
+    /// ADR-0043 §8.2: current owner-signed placement-record digest per
+    /// resident agent — pointers only; every fetched record is
+    /// owner-verified before caching.
+    pub placement_digests: Vec<(identity::AgentId, [u8; 32])>,
     /// Agent identities currently linked to this machine.
     pub agent_ids: Vec<identity::AgentId>,
     /// Human identities currently linked to this machine by consented agent
@@ -1835,6 +1954,8 @@ impl DiscoveredMachine {
             is_coordinator: announcement.is_coordinator,
             reachable_via: announcement.reachable_via.clone(),
             relay_candidates: announcement.relay_candidates.clone(),
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
             agent_ids: Vec::new(),
             user_ids: Vec::new(),
         }
@@ -1853,6 +1974,8 @@ impl DiscoveredMachine {
             is_coordinator: agent.is_coordinator,
             reachable_via: agent.reachable_via.clone(),
             relay_candidates: agent.relay_candidates.clone(),
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
             agent_ids: vec![agent.agent_id],
             user_ids: agent.user_id.into_iter().collect(),
         }
@@ -2179,6 +2302,16 @@ async fn upsert_discovered_machine(
                 // (e.g. a coordinator peer just disconnected).
                 existing.reachable_via = incoming.reachable_via;
                 existing.relay_candidates = incoming.relay_candidates;
+                // ADR-0043 §2.1 merge rules: a known KEM key is never
+                // erased by an announcement that lacks one (V2-only
+                // announce during transition), and placement digests are
+                // LWW (the newest machine beat knows the current record).
+                if incoming.machine_kem_public_key.is_some() {
+                    existing.machine_kem_public_key = incoming.machine_kem_public_key;
+                }
+                if !incoming.placement_digests.is_empty() {
+                    existing.placement_digests = incoming.placement_digests;
+                }
             }
             existing.last_seen = existing.last_seen.max(incoming.last_seen);
             for agent_id in incoming.agent_ids {
@@ -2541,6 +2674,13 @@ pub struct AgentBuilder {
 
 /// Context captured by the background identity heartbeat task.
 struct HeartbeatContext {
+    /// ADR-0043: this machine's enrolled ML-KEM public bytes (publishes
+    /// on the V3 machine announce); `None` disables V3 publication.
+    machine_kem_public: Option<Vec<u8>>,
+    /// ADR-0043 derived move state — the heartbeat's V3 announce reads
+    /// the placement digests and republishes the latest activation
+    /// bundles (on-change + periodic fallback).
+    move_state: std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
     identity: std::sync::Arc<identity::Identity>,
     runtime: std::sync::Arc<gossip::GossipRuntime>,
     network: std::sync::Arc<network::NetworkNode>,
@@ -2946,6 +3086,102 @@ impl HeartbeatContext {
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
         upsert_discovered_agent(&self.cache, discovered_agent).await;
 
+        // ADR-0043 §2.1: publish the V3 machine announcement (enrollment
+        // KEM key + placement digests + capability advert) on its own
+        // topic. Published regardless of `legacy_announce` — this IS the
+        // new path; pre-0043 peers are simply not subscribed. Placement
+        // digests advertise the owner-verified record per resident agent
+        // so peers can fetch-on-miss via blob v2.
+        if self.machine_kem_public.is_some() {
+            let placement_digests = {
+                let state = self.move_state.read().await;
+                let local_agent = unsigned.agent_id;
+                state
+                    .placement(&local_agent)
+                    .map(|record| vec![(local_agent, record.digest())])
+                    .unwrap_or_default()
+            };
+            let unsigned_v3 = MachineAnnouncementV3Unsigned {
+                base: machine_announcement.to_unsigned(),
+                machine_kem_public_key: self.machine_kem_public.clone().unwrap_or_default(),
+                placement_digests,
+                move_protocol: 1,
+            };
+            match bincode::serialize(&unsigned_v3) {
+                Ok(body) => {
+                    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                        self.identity.machine_keypair().secret_key(),
+                        &body,
+                    );
+                    match signature {
+                        Ok(sig) => {
+                            let v3 = MachineAnnouncementV3 {
+                                base: machine_announcement.clone(),
+                                machine_kem_public_key: unsigned_v3.machine_kem_public_key,
+                                placement_digests: unsigned_v3.placement_digests,
+                                move_protocol: unsigned_v3.move_protocol,
+                                machine_signature_v3: sig.as_bytes().to_vec(),
+                            };
+                            match bincode::serialize(&v3) {
+                                Ok(bytes) => {
+                                    if let Err(e) = self
+                                        .runtime
+                                        .pubsub()
+                                        .publish(
+                                            MACHINE_ANNOUNCE_V3_TOPIC.to_string(),
+                                            bytes::Bytes::from(bytes),
+                                        )
+                                        .await
+                                    {
+                                        tracing::debug!(
+                                            "heartbeat: V3 machine publish failed: {e}"
+                                        );
+                                    }
+                                }
+                                Err(e) => {
+                                    tracing::debug!("heartbeat: V3 machine encode failed: {e}")
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            tracing::debug!("heartbeat: V3 machine signing failed: {e:?}")
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::debug!("heartbeat: V3 machine unsigned encode failed: {e}")
+                }
+            }
+        }
+
+        // ADR-0043 §3.3: activation-bundle republication for late joiners
+        // — the latest bundle alone suffices for tombstones + placement.
+        // On-change (generation) + periodic fallback, exactly the
+        // revocation piggyback pattern; the v2 revocation carrier rides
+        // the same block below.
+        {
+            let bundles = {
+                let state = self.move_state.read().await;
+                state
+                    .known_agents()
+                    .into_iter()
+                    .filter_map(|agent| state.bundle(&agent).cloned())
+                    .collect::<Vec<_>>()
+            };
+            for bundle in bundles {
+                if let Ok(bytes) = bincode::serialize(&bundle) {
+                    let _ = self
+                        .runtime
+                        .pubsub()
+                        .publish(
+                            MOVE_ACTIVATION_TOPIC.to_string(),
+                            bytes::Bytes::from(bytes),
+                        )
+                        .await;
+                }
+            }
+        }
+
         // Revocation re-broadcast: ON-CHANGE with a periodic fallback,
         // not every heartbeat. The every-beat full-set publish cost 222
         // KB/s fleet-wide (2 stale July test records × 19 KB × every node
@@ -2993,6 +3229,21 @@ impl HeartbeatContext {
 
             if !changed && !is_fallback {
                 return Ok(());
+            }
+
+            // ADR-0043 §7.4: ad-hoc binding tombstones ride the v2
+            // topic (binding records only — the v1 batch stays
+            // byte-identical for old peers). Same on-change + fallback
+            // gating as the v1 arm.
+            let binding_records = self.revocation_set.read().await.binding_records();
+            if !binding_records.is_empty() {
+                if let Ok(bytes) = bincode::serialize(&binding_records) {
+                    let _ = self
+                        .runtime
+                        .pubsub()
+                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
             }
 
             let records = self.revocation_set.read().await.all_records();
@@ -7504,6 +7755,22 @@ impl Agent {
         // blocking the discovery pipeline.
         let announce_blob_cache = std::sync::Arc::clone(&self.announce_blob_cache);
         let blob_pubsub = std::sync::Arc::clone(runtime.pubsub());
+        // ADR-0043 subscriptions: V3 machine announces (KEM enrollment +
+        // placement digests), the binding-revocation v2 carrier, and
+        // activation bundles (mesh rule).
+        let mut sub_machine_v3 = runtime
+            .pubsub()
+            .subscribe(MACHINE_ANNOUNCE_V3_TOPIC.to_string())
+            .await;
+        let mut sub_revocation_v2 = runtime
+            .pubsub()
+            .subscribe(REVOCATION_V2_TOPIC.to_string())
+            .await;
+        let mut sub_move_activation = runtime
+            .pubsub()
+            .subscribe(MOVE_ACTIVATION_TOPIC.to_string())
+            .await;
+        let move_state_for_listener = std::sync::Arc::clone(&self.move_state);
 
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
@@ -7511,6 +7778,9 @@ impl Agent {
                 Machine(crate::gossip::PubSubMessage),
                 User(crate::gossip::PubSubMessage),
                 Revocation(crate::gossip::PubSubMessage),
+                MachineV3(crate::gossip::PubSubMessage),
+                RevocationV2(crate::gossip::PubSubMessage),
+                MoveActivation(crate::gossip::PubSubMessage),
             }
 
             // Track when we last initiated an auto-connect dial per agent.
@@ -7567,6 +7837,9 @@ impl Agent {
                         }
                     } => DiscoveryMessage::User(m),
                     Some(m) = sub_revocation.recv() => DiscoveryMessage::Revocation(m),
+                    Some(m) = sub_machine_v3.recv() => DiscoveryMessage::MachineV3(m),
+                    Some(m) = sub_revocation_v2.recv() => DiscoveryMessage::RevocationV2(m),
+                    Some(m) = sub_move_activation.recv() => DiscoveryMessage::MoveActivation(m),
                     // Required for PROMPT shutdown: without this arm the listener
                     // only exits when every gossip subscription closes (the
                     // `else => break` path), forcing shutdown() to wait out its
@@ -7848,6 +8121,180 @@ impl Agent {
                         }
                         continue;
                     }
+                    // ADR-0043 §2.1: V3 machine announce — verify both
+                    // signatures, then merge the enrollment KEM key and
+                    // placement digests into the machine cache (the merge
+                    // never erases a known KEM key with an absent one).
+                    DiscoveryMessage::MachineV3(msg) => {
+                        let Ok(announcement) =
+                            bincode::deserialize::<MachineAnnouncementV3>(&msg.payload)
+                        else {
+                            tracing::debug!(
+                                "ignoring invalid V3 machine announcement payload"
+                            );
+                            continue;
+                        };
+                        if let Err(e) = announcement.verify() {
+                            tracing::debug!(
+                                "ignoring unverifiable V3 machine announcement: {e}"
+                            );
+                            continue;
+                        }
+                        let now = Agent::unix_timestamp_secs();
+                        let mut incoming = DiscoveredMachine::from_machine_announcement(
+                            &announcement.base,
+                            announcement.base.addresses.clone(),
+                            now,
+                        );
+                        incoming.machine_kem_public_key = if announcement
+                            .machine_kem_public_key
+                            .is_empty()
+                        {
+                            None
+                        } else {
+                            Some(announcement.machine_kem_public_key.clone())
+                        };
+                        incoming.placement_digests = announcement.placement_digests.clone();
+                        upsert_discovered_machine(&machine_cache, incoming).await;
+                        tracing::debug!(
+                            target: "x0x::discovery",
+                            machine_prefix = %network::hex_prefix(
+                                &announcement.base.machine_id.0,
+                                4
+                            ),
+                            kem_enrolled = !announcement.machine_kem_public_key.is_empty(),
+                            placement_digests = announcement.placement_digests.len(),
+                            "cached verified V3 machine announcement"
+                        );
+                        continue;
+                    }
+                    // ADR-0043 §7.4: binding tombstones on the v2
+                    // carrier. Owner-key issued; authority verified with
+                    // the subject cert resolved from the discovery cache
+                    // (fail-closed without it, exactly the v1 rule).
+                    DiscoveryMessage::RevocationV2(msg) => {
+                        const MAX_V2_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+                        if msg.payload.len() > MAX_V2_PAYLOAD_BYTES {
+                            continue;
+                        }
+                        let Ok(records) =
+                            bincode::deserialize::<Vec<revocation::RevocationRecord>>(
+                                &msg.payload,
+                            )
+                        else {
+                            continue;
+                        };
+                        let subject_certs = collect_subject_certs(&*cache.read().await);
+                        let mut inserted = false;
+                        {
+                            let mut set = revocation_set.write().await;
+                            for record in records {
+                                if set.contains_hash(&record.record_hash()) {
+                                    continue;
+                                }
+                                let subject_cert = match &record.subject {
+                                    revocation::RevokedSubject::AgentMachineBinding(binding) => {
+                                        subject_certs.get(&binding.agent)
+                                    }
+                                    _ => None,
+                                };
+                                match set.verify_and_insert(record, subject_cert) {
+                                    Ok(true) => inserted = true,
+                                    Ok(false) => {}
+                                    Err(e) => {
+                                        tracing::debug!(
+                                            "v2 binding revocation rejected: {e}"
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        if inserted {
+                            let persisted = revocation_set.read().await.to_bytes_v2();
+                            let id_dir = identity_dir_for_listener.clone();
+                            tokio::spawn(async move {
+                                if let Ok(bytes) = persisted {
+                                    if let Some(dir) = id_dir {
+                                        let _ = storage::save_private_bytes_to(
+                                            &dir.join("revocations-v2.bin"),
+                                            bytes,
+                                        )
+                                        .await;
+                                    }
+                                }
+                            });
+                        }
+                        continue;
+                    }
+                    // ADR-0043 §3.3: a carried ActivationBundle under the
+                    // MESH rule — whole-record owner signature + coherence
+                    // + epoch monotonicity; cumulative tombstones union in
+                    // unconditionally. Nothing is "applied": gates read
+                    // the fold.
+                    DiscoveryMessage::MoveActivation(msg) => {
+                        const MAX_BUNDLE_PAYLOAD_BYTES: usize = 2 * 1024 * 1024;
+                        if msg.payload.len() > MAX_BUNDLE_PAYLOAD_BYTES {
+                            continue;
+                        }
+                        let Ok(record) =
+                            bincode::deserialize::<key_move::ChainedRecord>(&msg.payload)
+                        else {
+                            continue;
+                        };
+                        let agent = match &record.record {
+                            key_move::MoveRecord::ActivationBundle {
+                                authorization, ..
+                            } => authorization.agent_id,
+                            _ => {
+                                tracing::debug!(
+                                    "ignoring non-bundle payload on activation topic"
+                                );
+                                continue;
+                            }
+                        };
+                        let changed = {
+                            let mut state = move_state_for_listener.write().await;
+                            let mut revoked = revocation_set.write().await;
+                            match state.ingest_bundle(&agent, &record, &mut revoked) {
+                                Ok(changed) => changed,
+                                Err(e) => {
+                                    tracing::debug!(
+                                        agent = %hex::encode(agent.as_bytes()),
+                                        "activation bundle rejected by mesh rule: {e}"
+                                    );
+                                    continue;
+                                }
+                            }
+                        };
+                        if changed {
+                            let state = move_state_for_listener.read().await;
+                            let bytes = (
+                                state.bundles_to_bytes(),
+                                state.placements_to_bytes(),
+                            );
+                            let id_dir = identity_dir_for_listener.clone();
+                            drop(state);
+                            tokio::spawn(async move {
+                                let (bundles, placements) = bytes;
+                                let Some(dir) = id_dir else { return };
+                                if let Ok(bytes) = bundles {
+                                    let _ = storage::save_private_bytes_to(
+                                        &dir.join("move-bundles.bin"),
+                                        bytes,
+                                    )
+                                    .await;
+                                }
+                                if let Ok(bytes) = placements {
+                                    let _ = storage::save_private_bytes_to(
+                                        &dir.join("placement-blobs.bin"),
+                                        bytes,
+                                    )
+                                    .await;
+                                }
+                            });
+                        }
+                        continue;
+                    }
                 };
                 let raw_payload = msg.payload.clone();
                 let already_verified =
@@ -8020,6 +8467,32 @@ impl Agent {
                         tracing::debug!(
                             "Dropping identity announcement from revoked machine {:?}",
                             hex::encode(&announcement.machine_id.0[..8]),
+                        );
+                        continue;
+                    }
+                }
+
+                // ADR-0043 §9 (announce ingest/eviction): a cached
+                // placement record satisfying the P epoch rule with
+                // `Pinned(X)`, `X ≠ announce.machine` ⇒ drop — a pinned
+                // agent announcing from a non-pinned machine is rejected
+                // at ingest. The check reads already-local derived state
+                // and triggers no fetch (absent evidence fails open).
+                {
+                    let revoked = revocation_set.read().await;
+                    let placements = move_state_for_listener.read().await;
+                    if key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &announcement.agent_id,
+                        &announcement.machine_id,
+                    )
+                    .is_some()
+                    {
+                        tracing::debug!(
+                            agent = %hex::encode(&announcement.agent_id.0[..8]),
+                            machine = %hex::encode(&announcement.machine_id.0[..8]),
+                            "dropping identity announcement denied by ADR-0043 B/P pairing gate"
                         );
                         continue;
                     }
@@ -8716,7 +9189,6 @@ impl Agent {
             tracing::warn!("Failed to start discovery cache reaper: {e}");
         }
 
-        // Schedule a fresh re-announcement after gossip topology stabilizes.
         // The initial publish fires before PlumTree has formed eager-push links,
         // so peers that connected after the first announce won't see it.
         // A fresh announcement (new message ID) is required because PlumTree
@@ -8736,6 +9208,8 @@ impl Agent {
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+                machine_kem_public: self.machine_kem_public_key(),
+                move_state: std::sync::Arc::clone(&self.move_state),
                 legacy_announce: self.legacy_announce,
                 self_name: std::sync::Arc::clone(&self.self_name),
                 self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
@@ -8907,6 +9381,7 @@ impl Agent {
             std::sync::Arc::clone(&self.recent_delivery_cache),
             config,
             std::sync::Arc::clone(&self.revocation_set),
+            std::sync::Arc::clone(&self.move_state),
             std::sync::Arc::clone(&self.authenticated_machine_bindings),
             self.history_handle.clone(),
             direct_hedge,
@@ -9452,6 +9927,1014 @@ impl Agent {
         }
 
         Ok(())
+    }
+
+    // === ADR-0043: agent key-move ceremony ===
+
+    /// Shared handle to the derived move state (participant logs, mesh
+    /// bundles, placement cache). Gates read; ceremony steps append.
+    #[must_use]
+    pub fn move_state(
+        &self,
+    ) -> std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>> {
+        std::sync::Arc::clone(&self.move_state)
+    }
+
+    /// This machine's enrolled ML-KEM-768 public key bytes, when present.
+    #[must_use]
+    pub fn machine_kem_public_key(&self) -> Option<Vec<u8>> {
+        self.machine_kem.as_ref().map(|kp| kp.public_bytes.clone())
+    }
+
+    /// Resolve a file name under this install's ADR-0043 state directory
+    /// (identity dir with the `~/.x0x` fallback, same rule as
+    /// revocations).
+    fn move_file_path(&self, name: &str) -> Option<std::path::PathBuf> {
+        self.identity_dir
+            .clone()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+            .map(|dir| dir.join(name))
+    }
+
+    /// Import-store path for a foreign agent's imported key material.
+    fn imported_agent_key_path(&self, agent: &identity::AgentId) -> Option<std::path::PathBuf> {
+        self.move_file_path("imported")
+            .map(|dir| dir.join(format!("{}.key", hex::encode(agent.as_bytes()))))
+    }
+
+    /// Whether this machine holds the agent's signing key — the gate
+    /// INPUT (§3.2): the local daemon agent always holds; a foreign agent
+    /// holds iff an imported key file exists.
+    #[must_use]
+    pub fn holds_agent_key(&self, agent: &identity::AgentId) -> bool {
+        if *agent == self.agent_id() {
+            return true;
+        }
+        self.imported_agent_key_path(agent)
+            .is_some_and(|path| std::path::Path::exists(&path))
+    }
+
+    /// The AgentSigningGate decision (§6): `may_sign = holds_key ∧
+    /// custodian == this machine`. Agents with NO move log fail open —
+    /// pre-0043 behavior is unchanged until a mint exists.
+    #[must_use]
+    pub async fn signing_gate_allows(&self, agent: &identity::AgentId) -> bool {
+        let state = self.move_state.read().await;
+        if state.log(agent).is_empty() {
+            return true;
+        }
+        let fold = state.fold(agent);
+        fold.may_sign(&self.machine_id(), self.holds_agent_key(agent))
+    }
+
+    /// Persist the three ADR-0043 state files + the v2 revocation file.
+    /// Best-effort per file: a failed write logs and continues (the
+    /// in-memory state stays authoritative for this run), mirroring the
+    /// revocation-set persistence posture.
+    async fn persist_move_state(&self) {
+        let (logs, bundles, placements, v2) = {
+            let state = self.move_state.read().await;
+            let v2 = self.revocation_set.read().await.to_bytes_v2();
+            (
+                state.logs_to_bytes(),
+                state.bundles_to_bytes(),
+                state.placements_to_bytes(),
+                v2,
+            )
+        };
+        // Encode failures degrade to a warn (state stays in-memory
+        // authoritative); files whose encode failed are skipped.
+        let encodable = |res: error::Result<Vec<u8>>| res.map_err(|e| e.to_string()).ok();
+        let entries: Vec<(&str, Option<Vec<u8>>)> = [
+            ("moves.bin", encodable(logs)),
+            ("move-bundles.bin", encodable(bundles)),
+            ("placement-blobs.bin", encodable(placements)),
+            ("revocations-v2.bin", encodable(v2)),
+        ]
+        .into_iter()
+        .filter(|(_, bytes)| bytes.is_some())
+        .collect();
+        for (name, bytes) in entries {
+            let Some(path) = self.move_file_path(name) else {
+                continue;
+            };
+            let Some(bytes) = bytes else { continue };
+            if let Err(e) = storage::save_private_bytes_to(&path, bytes).await {
+                tracing::warn!(path = %path.display(), error = %e, "move-state persist failed");
+            }
+        }
+    }
+
+    /// Mint epoch-0 `PlacementMint` records for every certificated agent
+    /// on this owner's roster that has no move state yet (ADR-0043 §8.2).
+    ///
+    /// Default placement is `Pinned(machine where last seen)`, falling
+    /// back to THIS machine when discovery has never observed the agent.
+    /// The mint must satisfy ADR-0038's ≥1-Roaming Home invariant from
+    /// birth: the install's LOCAL agent is minted `Roaming` (custodian =
+    /// its generating machine), and an all-Pinned mint is refused.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no owner key is loaded or the mint would
+    /// produce zero roaming agents.
+    pub async fn move_mint_placements(&self) -> error::Result<usize> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        let owner_pk = user_kp.public_key().as_bytes();
+        let roster = self.owner_issued_certificates().await;
+        let local_agent = self.agent_id();
+        let local_machine = self.machine_id();
+        let now = Self::unix_timestamp_secs();
+
+        // Resolve each roster agent's machine from discovery (best-effort,
+        // one read of the cache — this machine is the fallback pin).
+        let machine_of: std::collections::HashMap<identity::AgentId, identity::MachineId> = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache
+                .values()
+                .map(|entry| (entry.agent_id, entry.machine_id))
+                .collect()
+        };
+
+        let mut mints = Vec::new();
+        for record in &roster {
+            let Ok(bytes) = hex::decode(&record.agent_id) else {
+                continue;
+            };
+            let Ok(id_bytes) = <[u8; 32]>::try_from(bytes.as_slice()) else {
+                continue;
+            };
+            let agent_id = identity::AgentId(id_bytes);
+            {
+                let state = self.move_state.read().await;
+                if !state.log(&agent_id).is_empty() || state.placement(&agent_id).is_some() {
+                    continue; // already minted (idempotent)
+                }
+            }
+            let is_local = agent_id == local_agent;
+            let placement = if is_local {
+                key_move::Placement::Roaming
+            } else {
+                key_move::Placement::Pinned(
+                    machine_of.get(&agent_id).copied().unwrap_or(local_machine),
+                )
+            };
+            let custodian = match placement {
+                key_move::Placement::Pinned(machine) => machine,
+                key_move::Placement::Roaming => local_machine,
+            };
+            let mint = key_move::ChainedRecord::sign(
+                key_move::GENESIS_PREV,
+                key_move::MoveRecord::PlacementMint {
+                    agent_id,
+                    placement,
+                    custodian_machine: custodian,
+                    issued_at: now,
+                },
+                owner_pk,
+                user_kp.secret_key(),
+            )?;
+            mints.push(mint);
+        }
+        if mints.is_empty() {
+            return Ok(0);
+        }
+        // Refuse an all-Pinned mint (the local-agent exception above makes
+        // this reachable only when the local agent is not on the roster).
+        let any_roaming = mints.iter().any(|m| {
+            matches!(
+                m.record,
+                key_move::MoveRecord::PlacementMint {
+                    placement: key_move::Placement::Roaming,
+                    ..
+                }
+            )
+        });
+        if !any_roaming {
+            return Err(error::IdentityError::CertificateVerification(
+                "mint refused: no Roaming agent among the owner's placements (ADR-0038 ≥1-Roaming)"
+                    .to_string(),
+            ));
+        }
+
+        let mut minted = 0usize;
+        for mint in mints {
+            let agent_id = match &mint.record {
+                key_move::MoveRecord::PlacementMint { agent_id, .. } => *agent_id,
+                _ => continue,
+            };
+            let expected_owner = Some(user_kp.public_key());
+            {
+                let mut state = self.move_state.write().await;
+                state.append(&agent_id, mint.clone(), expected_owner)?;
+                // The mint's placement record feeds the P check locally
+                // and advertises the digest on the machine announce.
+                let (placement, epoch) = match state.fold(&agent_id).placement {
+                    Some(value) => value,
+                    None => continue,
+                };
+                let record = key_move::PlacementRecord::sign(
+                    agent_id,
+                    owner_pk,
+                    placement,
+                    epoch,
+                    now,
+                    user_kp.secret_key(),
+                )?;
+                let _ = state.cache_placement(record);
+            }
+            minted += 1;
+        }
+        if minted > 0 {
+            self.persist_move_state().await;
+        }
+        Ok(minted)
+    }
+
+    /// Owner step 1: chain a `MoveAuthorization` for one move (§5.1).
+    ///
+    /// When this machine IS the source and holds the agent key and the
+    /// target's enrolled KEM key is known, the export (seal +
+    /// `ExportReceipt`) runs immediately and the returned
+    /// [`key_move::TransferBundle`] carries the envelope for the
+    /// operator; otherwise only the authorization rides and the source
+    /// machine's `/agent/move/export` completes the seal.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when no owner key is loaded, the agent has no
+    /// mint, a move is already active, or the placement is not a legal
+    /// outcome (`Pinned` must target `to_machine`).
+    pub async fn move_authorize(
+        &self,
+        agent_id: &identity::AgentId,
+        to_machine: &identity::MachineId,
+        placement: key_move::Placement,
+    ) -> error::Result<key_move::TransferBundle> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        if let key_move::Placement::Pinned(pin) = placement {
+            if &pin != to_machine {
+                return Err(error::IdentityError::CertificateVerification(
+                    "a move may only pin to its target (§7.5 clause 5)".to_string(),
+                ));
+            }
+        }
+        let (head, from_machine, epoch) = {
+            let state = self.move_state.read().await;
+            let fold = state.fold(agent_id);
+            if state.log(agent_id).is_empty() {
+                return Err(error::IdentityError::Revocation(
+                    "no placement mint — run the mint first".to_string(),
+                ));
+            }
+            if !matches!(fold.phase, key_move::MovePhase::Idle) {
+                return Err(error::IdentityError::Revocation(format!(
+                    "a move is already in flight (phase != Idle)"
+                )));
+            }
+            let from = fold
+                .custodian
+                .ok_or_else(|| {
+                    error::IdentityError::Revocation(
+                        "custodian lapsed with Idle phase — log is inconsistent".to_string(),
+                    )
+                })?;
+            let epoch = fold.placement.map_or(0, |(_, e)| e) + 1;
+            (state.head_hash(agent_id), from, epoch)
+        };
+        let auth = key_move::MoveAuthorization {
+            agent_id: *agent_id,
+            move_epoch: epoch,
+            from_machine,
+            to_machine: *to_machine,
+            placement,
+            issued_at: Self::unix_timestamp_secs(),
+        };
+        let auth_record = key_move::ChainedRecord::sign(
+            head,
+            key_move::MoveRecord::MoveAuthorization(auth.clone()),
+            user_kp.public_key().as_bytes(),
+            user_kp.secret_key(),
+        )?;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(agent_id, auth_record.clone(), Some(user_kp.public_key()))?;
+        }
+        self.persist_move_state().await;
+        let mut bundle = key_move::TransferBundle {
+            authorization: auth_record,
+            export_receipt: None,
+            envelope: None,
+        };
+        // Same-machine fast path: this daemon is the source.
+        if from_machine == self.machine_id() && self.holds_agent_key(agent_id) {
+            bundle = self.move_export_inner(bundle).await?;
+        }
+        Ok(bundle)
+    }
+
+    /// Source step: seal the agent keypair to the target machine's KEM
+    /// key and chain the `ExportReceipt` (§4). Completes a transfer
+    /// bundle produced by [`move_authorize`](Self::move_authorize).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this machine is not the source, the target's
+    /// KEM key is unknown (not enrolled / not seen), or the key material
+    /// is unavailable.
+    pub async fn move_export(
+        &self,
+        bundle: key_move::TransferBundle,
+    ) -> error::Result<key_move::TransferBundle> {
+        self.move_export_inner(bundle).await
+    }
+
+    async fn move_export_inner(
+        &self,
+        bundle: key_move::TransferBundle,
+    ) -> error::Result<key_move::TransferBundle> {
+        let auth = match &bundle.authorization.record {
+            key_move::MoveRecord::MoveAuthorization(auth) => auth.clone(),
+            _ => {
+                return Err(error::IdentityError::Revocation(
+                    "transfer bundle carries no authorization".to_string(),
+                ));
+            }
+        };
+        if auth.from_machine != self.machine_id() {
+            return Err(error::IdentityError::Revocation(
+                "export must run on the move's source machine".to_string(),
+            ));
+        }
+        if !self.holds_agent_key(&auth.agent_id) {
+            return Err(error::IdentityError::Revocation(
+                "source machine does not hold the agent key".to_string(),
+            ));
+        }
+        if bundle.export_receipt.is_some() {
+            return Ok(bundle); // idempotent re-export
+        }
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        // Target KEM key from the machine discovery cache (V3 announce).
+        let target_kem = {
+            let machines = self.machine_discovery_cache.read().await;
+            machines
+                .get(&auth.to_machine)
+                .and_then(|m| m.machine_kem_public_key.clone())
+                .filter(|key| !key.is_empty())
+        };
+        let target_kem = target_kem.ok_or_else(|| {
+            error::IdentityError::Revocation(format!(
+                "target machine {} has no enrolled ML-KEM key (V3 announce not received)",
+                hex::encode(auth.to_machine.as_bytes())
+            ))
+        })?;
+        // Serialize the agent keypair: the daemon's own agent or an
+        // imported foreign key.
+        let keypair_bytes = self.export_agent_keypair_bytes(&auth.agent_id)?;
+        let envelope =
+            key_move::ExportEnvelope::seal(&target_kem, &auth, &keypair_bytes)?;
+        let receipt_inner = key_move::MoveRecord::ExportReceipt {
+            auth_hash: auth.auth_hash(),
+            envelope_digest: envelope.envelope_digest(),
+            sealed_at: Self::unix_timestamp_secs(),
+            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_signature: Vec::new(),
+        };
+        let machine_signature = key_move::sign_machine_receipt(
+            &receipt_inner,
+            self.identity.machine_keypair().secret_key(),
+        )?;
+        let receipt = match receipt_inner {
+            key_move::MoveRecord::ExportReceipt {
+                auth_hash,
+                envelope_digest,
+                sealed_at,
+                machine_public_key,
+                ..
+            } => key_move::MoveRecord::ExportReceipt {
+                auth_hash,
+                envelope_digest,
+                sealed_at,
+                machine_public_key,
+                machine_signature,
+            },
+            _ => unreachable!("receipt_inner is an ExportReceipt"),
+        };
+        let head = {
+            let state = self.move_state.read().await;
+            state.head_hash(&auth.agent_id)
+        };
+        let receipt_record = key_move::ChainedRecord::sign(
+            head,
+            receipt,
+            user_kp.public_key().as_bytes(),
+            user_kp.secret_key(),
+        )?;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(&auth.agent_id, receipt_record.clone(), Some(user_kp.public_key()))?;
+        }
+        self.persist_move_state().await;
+        Ok(key_move::TransferBundle {
+            authorization: bundle.authorization,
+            export_receipt: Some(receipt_record),
+            envelope: Some(envelope),
+        })
+    }
+
+    /// Serialize the held agent keypair for export: length-prefixed
+    /// `public ‖ secret`.
+    fn export_agent_keypair_bytes(&self, agent: &identity::AgentId) -> error::Result<Vec<u8>> {
+        let (public, secret) = if *agent == self.agent_id() {
+            self.identity.agent_keypair().to_bytes()
+        } else {
+            let path = self.imported_agent_key_path(agent).ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "no identity directory for imported keys",
+                ))
+            })?;
+            let bytes = tokio::task::block_in_place(|| std::fs::read(path))
+                .map_err(error::IdentityError::from)?;
+            return Ok(bytes);
+        };
+        let mut out = Vec::with_capacity(8 + public.len() + secret.len());
+        out.extend_from_slice(&(public.len() as u64).to_le_bytes());
+        out.extend_from_slice(&public);
+        out.extend_from_slice(&secret);
+        Ok(out)
+    }
+
+    /// Target step: verify the transfer bundle, unwrap the envelope with
+    /// THIS machine's KEM key, store the key material, and countersign
+    /// the `ImportReceipt` (§5). Quarantine is derived (the fold's
+    /// custodian stays ⊥ until activation) — there is no flag to crash
+    /// between.
+    ///
+    /// When this daemon also holds the owner key, the receipt chains into
+    /// the log immediately; otherwise the returned record rides back to
+    /// the owner with the operator (the owner's `/agent/move/activate`
+    /// accepts it as optional evidence).
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when this machine is not the move target, the
+    /// envelope fails to unwrap, or the unwrapped key does not hash to
+    /// the agent id.
+    pub async fn move_import(&self, bundle: key_move::TransferBundle) -> error::Result<()> {
+        let auth = match &bundle.authorization.record {
+            key_move::MoveRecord::MoveAuthorization(auth) => auth.clone(),
+            _ => {
+                return Err(error::IdentityError::Revocation(
+                    "transfer bundle carries no authorization".to_string(),
+                ));
+            }
+        };
+        bundle.authorization.verify_owner_signature()?;
+        if auth.to_machine != self.machine_id() {
+            return Err(error::IdentityError::Revocation(
+                "import must run on the move's target machine".to_string(),
+            ));
+        }
+        let machine_kem = self.machine_kem.as_ref().ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "this machine has no ML-KEM enrollment key".to_string(),
+            )
+        })?;
+        let envelope = bundle.envelope.ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "transfer bundle carries no envelope — run the export first".to_string(),
+            )
+        })?;
+        // Verify the export receipt matches the envelope before trusting
+        // the ciphertext.
+        if let Some(receipt) = &bundle.export_receipt {
+            match &receipt.record {
+                key_move::MoveRecord::ExportReceipt {
+                    envelope_digest, ..
+                } => {
+                    if *envelope_digest != envelope.envelope_digest() {
+                        return Err(error::IdentityError::Revocation(
+                            "export receipt does not commit to the carried envelope".to_string(),
+                        ));
+                    }
+                }
+                _ => {
+                    return Err(error::IdentityError::Revocation(
+                        "transfer bundle's receipt is not an ExportReceipt".to_string(),
+                    ));
+                }
+            }
+        }
+        let opened = envelope.open(machine_kem, &auth)?;
+        // §4: the target verifies SHA-256(pub) == agent_id before
+        // trusting anything.
+        let (public, secret) = split_export_payload(&opened)?;
+        let agent_kp = identity::AgentKeypair::from_bytes(&public, &secret)?;
+        if agent_kp.agent_id() != auth.agent_id {
+            return Err(error::IdentityError::Revocation(
+                "unwrapped key does not hash to the authorized agent".to_string(),
+            ));
+        }
+        // Store the key material (the payload form is exactly what export
+        // wrote — length-prefixed public ‖ secret).
+        let path = self.imported_agent_key_path(&auth.agent_id).ok_or_else(|| {
+            error::IdentityError::Storage(std::io::Error::other(
+                "no identity directory for imported keys",
+            ))
+        })?;
+        storage::save_private_bytes_to(&path, opened).await?;
+        // Countersign the ImportReceipt; chain it when the owner key is
+        // local (co-resident owner+target), else hand it to the operator.
+        let receipt_inner = key_move::MoveRecord::ImportReceipt {
+            auth_hash: auth.auth_hash(),
+            imported_at: Self::unix_timestamp_secs(),
+            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_signature: Vec::new(),
+        };
+        let machine_signature = key_move::sign_machine_receipt(
+            &receipt_inner,
+            self.identity.machine_keypair().secret_key(),
+        )?;
+        let receipt = match receipt_inner {
+            key_move::MoveRecord::ImportReceipt {
+                auth_hash,
+                imported_at,
+                machine_public_key,
+                ..
+            } => key_move::MoveRecord::ImportReceipt {
+                auth_hash,
+                imported_at,
+                machine_public_key,
+                machine_signature,
+            },
+            _ => unreachable!("receipt_inner is an ImportReceipt"),
+        };
+        if let Some(user_kp) = self.identity.user_keypair() {
+            // Chain the operator-carried records onto the local log when
+            // they are ahead of it (co-resident case: auth + export
+            // already chained; the receipt chains now).
+            {
+                let mut state = self.move_state.write().await;
+                if let Some(export_receipt) = bundle.export_receipt.clone() {
+                    let _ = state.append(&auth.agent_id, export_receipt, Some(user_kp.public_key()));
+                }
+                let head = state.head_hash(&auth.agent_id);
+                let receipt_record = key_move::ChainedRecord::sign(
+                    head,
+                    receipt,
+                    user_kp.public_key().as_bytes(),
+                    user_kp.secret_key(),
+                )?;
+                state.append(&auth.agent_id, receipt_record, Some(user_kp.public_key()))?;
+            }
+            self.persist_move_state().await;
+        }
+        tracing::info!(
+            agent = %hex::encode(auth.agent_id.as_bytes()),
+            move_epoch = auth.move_epoch,
+            "import complete — key stored, quarantined until activation (derived)"
+        );
+        Ok(())
+    }
+
+    /// Owner step 2: verify coherence, chain the `ActivationBundle`
+    /// (commit-terminator), ingest it locally, and publish it on
+    /// [`MOVE_ACTIVATION_TOPIC`] (§7.5).
+    ///
+    /// Refuses any activation whose placement outcome would leave zero
+    /// `Roaming` among the owner's certificated agents (§8.2).
+    ///
+    /// # Errors
+    /// Returns an error when no owner key is loaded, the log is not at an
+    /// import head, coherence fails, or the Home invariant would break.
+    pub async fn move_activate(
+        &self,
+        agent_id: &identity::AgentId,
+        move_epoch: u64,
+    ) -> error::Result<key_move::ChainedRecord> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        let (head, auth, retired, cert) = {
+            let state = self.move_state.read().await;
+            let log = state.log(agent_id);
+            let fold = state.fold(agent_id);
+            let auth = match &log.last().map(|r| &r.record) {
+                Some(key_move::MoveRecord::ImportReceipt { auth_hash, .. }) => {
+                    // The ACTIVE authorization referenced by the receipt.
+                    log.iter()
+                        .rev()
+                        .find_map(|r| match &r.record {
+                            key_move::MoveRecord::MoveAuthorization(a)
+                                if a.auth_hash() == *auth_hash =>
+                            {
+                                Some(a.clone())
+                            }
+                            _ => None,
+                        })
+                        .ok_or_else(|| {
+                            error::IdentityError::Revocation(
+                                "import receipt references an unknown authorization".to_string(),
+                            )
+                        })?
+                }
+                _ => {
+                    return Err(error::IdentityError::Revocation(format!(
+                        "activation requires an import-receipt head (phase {:?})",
+                        fold.phase
+                    )));
+                }
+            };
+            if auth.move_epoch != move_epoch {
+                return Err(error::IdentityError::Revocation(format!(
+                    "log is at move epoch {}, activation requested for {move_epoch}",
+                    auth.move_epoch
+                )));
+            }
+            // Cumulative retired set: fold of everything so far + this
+            // move's tombstone (§7.5 clause 3 — grow-only at the owner).
+            let mut retired: Vec<revocation::AgentMachineBinding> =
+                fold.retired_bindings.iter().cloned().collect();
+            let this_move = revocation::AgentMachineBinding {
+                agent: auth.agent_id,
+                machine: auth.from_machine,
+                move_epoch: auth.move_epoch,
+            };
+            if !retired.contains(&this_move) {
+                retired.push(this_move);
+            }
+            retired.sort_by_key(|b| (b.agent.0, b.machine.0, b.move_epoch));
+            // The certificate: journal/discovery evidence for coherence.
+            let cert = self
+                .agent_certificate_for(agent_id)
+                .await
+                .ok_or_else(|| {
+                    error::IdentityError::Revocation(
+                        "no certificate known for the agent — cannot activate".to_string(),
+                    )
+                })?;
+            (state.head_hash(agent_id), auth, retired, cert)
+        };
+        let placement_record = key_move::PlacementRecord::sign(
+            *agent_id,
+            user_kp.public_key().as_bytes(),
+            auth.placement,
+            auth.move_epoch,
+            Self::unix_timestamp_secs(),
+            user_kp.secret_key(),
+        )?;
+        let bundle = key_move::MoveRecord::ActivationBundle {
+            authorization: auth,
+            retired_bindings: retired,
+            placement_record,
+            agent_certificate: cert,
+        };
+        let bundle_record = key_move::ChainedRecord::sign(
+            head,
+            bundle,
+            user_kp.public_key().as_bytes(),
+            user_kp.secret_key(),
+        )?;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(agent_id, bundle_record.clone(), Some(user_kp.public_key()))?;
+            // Ingest through the same mesh rule every peer applies — one
+            // rule, no divergent local application path.
+            let mut revoked = self.revocation_set.write().await;
+            state.ingest_bundle(agent_id, &bundle_record, &mut revoked)?;
+        }
+        // Home invariant (§8.2): refuse to strand the fleet with zero
+        // roaming agents. Checked AFTER ingest so the check sees the
+        // post-move view — but the append already happened; on refusal
+        // the operator must abort (the bundle is not yet published).
+        let roaming_after = {
+            let state = self.move_state.read().await;
+            state
+                .placement_view()
+                .values()
+                .filter(|p| p.placement == key_move::Placement::Roaming)
+                .count()
+        };
+        if roaming_after == 0 {
+            return Err(error::IdentityError::Revocation(format!(
+                "activation would leave zero Roaming agents — abort this move (epoch {move_epoch}) and retry with placement=Roaming"
+            )));
+        }
+        self.persist_move_state().await;
+        // Eviction semantics: nothing to evict for a bundle (the pairing
+        // dies at B/P gates); republish the latest bundle on the
+        // activation topic.
+        if let Some(rt) = &self.gossip_runtime {
+            let latest = self.move_state.read().await.bundle(agent_id).cloned();
+            if let Some(latest) = latest {
+                if let Ok(bytes) = bincode::serialize(&latest) {
+                    let _ = rt
+                        .pubsub()
+                        .publish(MOVE_ACTIVATION_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
+            }
+        }
+        Ok(bundle_record)
+    }
+
+    /// Owner rollback: chain an `AbortRecord` for the active move — legal
+    /// from any pre-activation head; burns the epoch (§5.1). Not
+    /// mesh-carried.
+    ///
+    /// # Errors
+    /// Returns an error when no owner key is loaded or no active move
+    /// matches the epoch.
+    pub async fn move_abort(
+        &self,
+        agent_id: &identity::AgentId,
+        move_epoch: u64,
+        reason: String,
+    ) -> error::Result<key_move::ChainedRecord> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        let (head, auth_hash) = {
+            let state = self.move_state.read().await;
+            let log = state.log(agent_id);
+            let auth_hash = log
+                .iter()
+                .rev()
+                .find_map(|r| match &r.record {
+                    key_move::MoveRecord::MoveAuthorization(a) if a.move_epoch == move_epoch => {
+                        Some(a.auth_hash())
+                    }
+                    key_move::MoveRecord::ActivationBundle { .. }
+ | key_move::MoveRecord::AbortRecord { .. }
+ | key_move::MoveRecord::PlacementMint { .. } => None,
+                    _ => None,
+                })
+                .ok_or_else(|| {
+                    error::IdentityError::Revocation(format!(
+                        "no active authorization for move epoch {move_epoch}"
+                    ))
+                })?;
+            // Terminated moves cannot abort.
+            let terminated = log.iter().any(|r| {
+                matches!(
+                    r.record,
+                    key_move::MoveRecord::ActivationBundle { .. }
+                )
+            });
+            if terminated {
+                return Err(error::IdentityError::Revocation(
+                    "move already activated — abort is a pre-activation terminator".to_string(),
+                ));
+            }
+            (state.head_hash(agent_id), auth_hash)
+        };
+        let abort = key_move::ChainedRecord::sign(
+            head,
+            key_move::MoveRecord::AbortRecord { auth_hash, reason },
+            user_kp.public_key().as_bytes(),
+            user_kp.secret_key(),
+        )?;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(agent_id, abort.clone(), Some(user_kp.public_key()))?;
+        }
+        self.persist_move_state().await;
+        Ok(abort)
+    }
+
+    /// Source step after activation: chain the `RetireReceipt` and
+    /// securely delete the local copy of the key material (§5.2). The
+    /// receipt is bookkeeping — the derived state already quiesced this
+    /// machine at activation.
+    ///
+    /// The daemon's OWN agent key is never deleted here (it is the
+    /// install's bootstrap identity — moving it away and retiring is an
+    /// explicit operator file action recorded in the report); imported
+    /// foreign keys ARE deleted.
+    ///
+    /// # Errors
+    /// Returns an error when no owner key is loaded or the move is not
+    /// committed.
+    pub async fn move_retire(
+        &self,
+        agent_id: &identity::AgentId,
+        move_epoch: u64,
+    ) -> error::Result<key_move::ChainedRecord> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        let (head, auth_hash, from_machine) = {
+            let state = self.move_state.read().await;
+            let log = state.log(agent_id);
+            let fold = state.fold(agent_id);
+            if !matches!(fold.phase, key_move::MovePhase::RetirePending { .. }) {
+                return Err(error::IdentityError::Revocation(
+                    "retire requires a committed (activated) move".to_string(),
+                ));
+            }
+            let bundle_auth = log.iter().rev().find_map(|r| match &r.record {
+                key_move::MoveRecord::ActivationBundle { authorization, .. }
+                    if authorization.move_epoch == move_epoch =>
+                {
+                    Some(authorization.clone())
+                }
+                _ => None,
+            });
+            let auth = bundle_auth.ok_or_else(|| {
+                error::IdentityError::Revocation(format!(
+                    "no committed activation bundle for epoch {move_epoch}"
+                ))
+            })?;
+            (state.head_hash(agent_id), auth.auth_hash(), auth.from_machine)
+        };
+        if from_machine != self.machine_id() {
+            return Err(error::IdentityError::Revocation(
+                "retire runs on the move's source machine".to_string(),
+            ));
+        }
+        let receipt_inner = key_move::MoveRecord::RetireReceipt {
+            auth_hash,
+            retired_at: Self::unix_timestamp_secs(),
+            machine_public_key: self.identity.machine_keypair().public_key().as_bytes().to_vec(),
+            machine_signature: Vec::new(),
+        };
+        let machine_signature = key_move::sign_machine_receipt(
+            &receipt_inner,
+            self.identity.machine_keypair().secret_key(),
+        )?;
+        let receipt = match receipt_inner {
+            key_move::MoveRecord::RetireReceipt {
+                auth_hash,
+                retired_at,
+                machine_public_key,
+                ..
+            } => key_move::MoveRecord::RetireReceipt {
+                auth_hash,
+                retired_at,
+                machine_public_key,
+                machine_signature,
+            },
+            _ => unreachable!("receipt_inner is a RetireReceipt"),
+        };
+        let receipt_record = key_move::ChainedRecord::sign(
+            head,
+            receipt,
+            user_kp.public_key().as_bytes(),
+            user_kp.secret_key(),
+        )?;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(agent_id, receipt_record.clone(), Some(user_kp.public_key()))?;
+        }
+        // Secure deletion of the source copy: imported keys are deleted;
+        // the daemon's own agent key is the install bootstrap identity
+        // and stays (holds_key remains true — the fold's custodian is
+        // already the target, so may_sign stays false).
+        if *agent_id != self.agent_id() {
+            if let Some(path) = self.imported_agent_key_path(agent_id) {
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {
+                        tracing::info!(
+                            path = %path.display(),
+                            "retired agent key deleted (single-live-copy invariant)"
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "failed to delete retired agent key"
+                        );
+                    }
+                }
+            }
+        }
+        self.persist_move_state().await;
+        Ok(receipt_record)
+    }
+
+    /// Owner-issued ad-hoc binding revocation (ADR-0043 §7): retire an
+    /// `(agent, machine)` pairing outside any move — e.g. a stolen
+    /// machine discovered later. Owner-key signed (issuer-revocation via
+    /// the retained certificate), applied locally, persisted to
+    /// `revocations-v2.bin`, and published on [`REVOCATION_V2_TOPIC`].
+    ///
+    /// # Errors
+    /// Returns an error when no owner key is loaded or the authority
+    /// check rejects the record.
+    pub async fn revoke_binding(
+        &self,
+        agent: &identity::AgentId,
+        machine: &identity::MachineId,
+        move_epoch: u64,
+        reason: Option<String>,
+    ) -> error::Result<revocation::RevocationRecord> {
+        let user_kp = self.identity.user_keypair().ok_or_else(|| {
+            error::IdentityError::CertificateVerification(
+                "no owner user key loaded".to_string(),
+            )
+        })?;
+        let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
+            error::IdentityError::Revocation(
+                "no certificate known for the agent — binding revocation requires it".to_string(),
+            )
+        })?;
+        let subject = revocation::RevokedSubject::AgentMachineBinding(
+            revocation::AgentMachineBinding {
+                agent: *agent,
+                machine: *machine,
+                move_epoch,
+            },
+        );
+        let record = revocation::RevocationRecord::sign(
+            subject,
+            user_kp.public_key(),
+            user_kp.secret_key(),
+            Self::unix_timestamp_secs(),
+            reason,
+        )?;
+        self.apply_and_publish_revocation(record.clone(), Some(&cert))
+            .await?;
+        // v2 carrier: binding records ride their own topic + file.
+        if let Some(rt) = &self.gossip_runtime {
+            let records = self.revocation_set.read().await.binding_records();
+            if let Ok(bytes) = bincode::serialize(&records) {
+                if !bytes.is_empty() {
+                    let _ = rt
+                        .pubsub()
+                        .publish(REVOCATION_V2_TOPIC.to_string(), bytes::Bytes::from(bytes))
+                        .await;
+                }
+        }
+        }
+        if let Ok(v2) = self.revocation_set.read().await.to_bytes_v2() {
+            if let Some(path) = self.move_file_path("revocations-v2.bin") {
+                if let Err(e) = storage::save_private_bytes_to(&path, v2).await {
+                    tracing::warn!("revocations-v2 persist failed: {e}");
+                }
+            }
+        }
+        Ok(record)
+    }
+
+    /// The newest certificate known for an agent: discovery cache first,
+    /// then the owner journal's retained bytes.
+    async fn agent_certificate_for(
+        &self,
+        agent: &identity::AgentId,
+    ) -> Option<identity::AgentCertificate> {
+        if let Ok(Some(entry)) = self.discovered_agent(*agent).await {
+            if let Some(cert) = entry.agent_certificate {
+                return Some(cert);
+            }
+        }
+        let journal_path = self.cert_journal_path()?;
+        let target_hex = hex::encode(agent.as_bytes());
+        let user_hex = self
+            .identity
+            .user_keypair()
+            .map(|kp| hex::encode(kp.user_id().as_bytes()))?;
+        let records = profile::IssuedCertRecord::load(journal_path).await;
+        let mut retained: Option<profile::IssuedCertRecord> = None;
+        for record in records {
+            if record.user_id != user_hex || record.agent_id != target_hex {
+                continue;
+            }
+            if record.cert_b64.is_some()
+                && retained
+                    .as_ref()
+                    .is_none_or(|best| record.issued_at >= best.issued_at)
+            {
+                retained = Some(record);
+            }
+        }
+        let record = retained?;
+        use base64::Engine as _;
+        let bytes = record
+            .cert_b64
+            .as_deref()
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())?;
+        identity::AgentCertificate::from_storage_bytes(&bytes).ok()
     }
 
     /// Evict a revoked subject from all discovery caches.
@@ -10179,6 +11662,8 @@ impl Agent {
                                     is_coordinator: None,
                                     reachable_via: Vec::new(),
                                     relay_candidates: Vec::new(),
+                                    machine_kem_public_key: None,
+                                    placement_digests: Vec::new(),
                                     agent_ids: Vec::new(),
                                     user_ids: Vec::new(),
                                 },
@@ -10322,6 +11807,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let move_state_direct = std::sync::Arc::clone(&self.move_state);
         let history_handle = self.history_handle.clone();
         let token = self.shutdown_token.clone();
         let observed_prefix_enabled = self.observed_prefix_enabled;
@@ -10445,6 +11931,33 @@ impl Agent {
                         machine_prefix = %network::hex_prefix(&machine_id.0, 4),
                         outcome = "drop_revoked",
                         "direct message from revoked sender dropped (direct-path revocation gate, mirrors EP3)"
+                    );
+                    continue;
+                }
+
+                // ADR-0043 §9: B and P for the (sender, machine) pairing.
+                // Present evidence fails closed; absent evidence fails
+                // open (§9.3).
+                let pairing_denied = {
+                    let revoked = revocation_set.read().await;
+                    let placements = move_state_direct.read().await;
+                    key_move::enforce_pairing(
+                        &revoked,
+                        placements.placement_view(),
+                        &sender,
+                        &machine_id,
+                    )
+                };
+                if let Some(denial) = pairing_denied {
+                    dm.record_incoming_dropped_revoked();
+                    tracing::info!(
+                        target: "x0x::direct",
+                        stage = "recv",
+                        sender_prefix = %network::hex_prefix(&sender.0, 4),
+                        machine_prefix = %network::hex_prefix(&machine_id.0, 4),
+                        outcome = "drop_pairing",
+                        reason = ?denial,
+                        "direct message dropped at ADR-0043 B/P pairing gate"
                     );
                     continue;
                 }
@@ -10657,6 +12170,33 @@ impl Agent {
             revoked_machine,
             expired,
         )?;
+        // ADR-0043 §9 checks B and P for the resolved pairing — evaluated
+        // wherever `(agent, machine)` is known. Present evidence fails
+        // closed (retired binding / pin mismatch); absent evidence fails
+        // open (§9.3) until a bundle or placement record arrives.
+        let pairing = {
+            let revoked = self.revocation_set.read().await;
+            let placements = self.move_state.read().await;
+            key_move::enforce_pairing(
+                &revoked,
+                placements.placement_view(),
+                agent_id,
+                &machine_id,
+            )
+        };
+        if let Some(denial) = pairing {
+            tracing::info!(
+                target: "x0x::streams",
+                agent = %hex::encode(agent_id.as_bytes()),
+                machine = %hex::encode(machine_id.as_bytes()),
+                outcome = "deny_pairing",
+                reason = ?denial,
+                "outbound pairing denied (ADR-0043 B/P gate)"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
         Ok(machine_id)
     }
 
@@ -10682,6 +12222,7 @@ impl Agent {
         >,
         contact_store: &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
         revocation_set: &std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
+        move_state: &std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
         connect_policy: &std::sync::Arc<std::sync::RwLock<std::sync::Arc<connect::ConnectPolicy>>>,
         machine_id: &identity::MachineId,
     ) -> error::NetworkResult<Vec<identity::AgentId>> {
@@ -10749,6 +12290,33 @@ impl Agent {
                 );
                 return Err(e);
             }
+            // ADR-0043 §9: B and P per (agent, machine) pairing — the
+            // source pairing of an activated move dies here, permanently,
+            // while co-resident agents pass.
+            let pairing = {
+                let revoked = revocation_set.read().await;
+                let placements = move_state.read().await;
+                key_move::enforce_pairing(
+                    &revoked,
+                    placements.placement_view(),
+                    agent_id,
+                    machine_id,
+                )
+            };
+            if let Some(denial) = pairing {
+                tracing::info!(
+                    target: "x0x::streams",
+                    agent = %hex::encode(agent_id.as_bytes()),
+                    machine = %hex::encode(machine_id.as_bytes()),
+                    agent_count = agents.len(),
+                    outcome = "deny_pairing",
+                    reason = ?denial,
+                    "inbound traffic denied at ADR-0043 B/P pairing gate"
+                );
+                return Err(error::NetworkError::PeerNotVerified {
+                    agent_id: agent_id.0,
+                });
+            }
         }
 
         // Gate cleared for every agent — drop the expiry metadata and
@@ -10815,6 +12383,7 @@ impl Agent {
             &self.identity_discovery_cache,
             &self.contact_store,
             &self.revocation_set,
+            &self.move_state,
             &self.connect_policy,
             &machine_id,
         )
@@ -10927,6 +12496,7 @@ impl Agent {
         let discovery_cache = std::sync::Arc::clone(&self.identity_discovery_cache);
         let contact_store = std::sync::Arc::clone(&self.contact_store);
         let revocation_set = std::sync::Arc::clone(&self.revocation_set);
+        let move_state = std::sync::Arc::clone(&self.move_state);
         let connect_policy = std::sync::Arc::clone(&self.connect_policy);
         let incoming = std::sync::Arc::clone(&self.stream_accept);
         let token = self.shutdown_token.clone();
@@ -10959,6 +12529,7 @@ impl Agent {
                     &discovery_cache,
                     &contact_store,
                     &revocation_set,
+                    &move_state,
                     &connect_policy,
                     &machine_id,
                 )
@@ -11073,6 +12644,8 @@ impl Agent {
             last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
             heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
             legacy_announce: self.legacy_announce,
+            machine_kem_public: self.machine_kem_public_key(),
+            move_state: std::sync::Arc::clone(&self.move_state),
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
         };
@@ -11740,6 +13313,7 @@ fn schedule_reconnect(
                 candidate_addrs = candidate_addrs.len(),
                 "proactive reconnect attempt",
             );
+
 
             let mut connected = false;
 
@@ -12456,6 +14030,67 @@ impl AgentBuilder {
             storage::load_revocation_set(self.identity_dir.as_deref()).await,
         ));
 
+        // ADR-0043: load-or-generate this machine's ML-KEM-768 enrollment
+        // key (beside the machine key) and load the derived move state
+        // from its three files (each re-verified on load; corrupt or
+        // absent files degrade to empty state). Both resolve through the
+        // identity dir with the same `~/.x0x` fallback as revocations.
+        let identity_dir_or_home = self
+            .identity_dir
+            .clone()
+            .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")));
+        let machine_kem = match &identity_dir_or_home {
+            Some(dir) => {
+                let path = dir.join("machine-kem.key");
+                match groups::kem_envelope::AgentKemKeypair::load_or_generate(&path).await {
+                    Ok(kp) => Some(kp),
+                    Err(e) => {
+                        tracing::warn!(
+                            path = %path.display(),
+                            error = %e,
+                            "machine KEM enrollment key unavailable — export/import disabled"
+                        );
+                        None
+                    }
+                }
+            }
+            None => None,
+        };
+        let move_state = {
+            let dir = identity_dir_or_home.as_deref();
+            let mut revoked_for_load = tokio::sync::RwLock::write(&revocation_set).await;
+            let logs = read_move_file(dir, "moves.bin", |b| {
+                key_move::MoveState::logs_from_bytes(b)
+            })
+            .await;
+            let bundles = read_move_file(dir, "move-bundles.bin", |b| {
+                key_move::MoveState::bundles_from_bytes(b, &mut revoked_for_load)
+            })
+            .await;
+            let placements = read_move_file(dir, "placement-blobs.bin", |b| {
+                key_move::MoveState::placements_from_bytes(b)
+            })
+            .await;
+            let mut state = logs.unwrap_or_default();
+            if let Ok(bundles) = bundles {
+                state.merge_loaded(bundles);
+            }
+            if let Ok(placements) = placements {
+                state.merge_loaded(placements);
+            }
+            // Ad-hoc binding records (v2 file) merge into the same set.
+            if let Some(dir) = dir {
+                if let Ok(bytes) = tokio::fs::read(dir.join("revocations-v2.bin")).await {
+                    match revocation::RevocationSet::from_bytes_v2(&bytes) {
+                        Ok(v2) => revoked_for_load.merge_v2(v2),
+                        Err(e) => tracing::warn!("revocations-v2.bin unreadable: {e}"),
+                    }
+                }
+            }
+            state
+        };
+        let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
+
         // Initialise contact store now (hoisted before the relay-DM
         // listener spawn so the listener can resolve the #193 contact
         // gate against the same shared store the Agent mutates).
@@ -12598,6 +14233,8 @@ impl AgentBuilder {
             gossip_runtime,
             bootstrap_cache,
             gossip_cache_adapter,
+            machine_kem,
+            move_state,
             identity_discovery_cache,
             authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
                 dm_inbox::AuthenticatedMachineBindingCache::default(),
@@ -12657,6 +14294,52 @@ impl AgentBuilder {
             ))),
         })
     }
+}
+
+/// Read + decode one ADR-0043 state file. Absence is "no state yet"
+/// (Ok-side default handled by the caller); corruption logs and errors so
+/// the caller can degrade to empty rather than fail the build.
+async fn read_move_file<T, F>(
+    dir: Option<&std::path::Path>,
+    name: &str,
+    decode: F,
+) -> error::Result<T>
+where
+    F: FnOnce(&[u8]) -> error::Result<T>,
+{
+    let Some(dir) = dir else {
+        return Err(error::IdentityError::Storage(std::io::Error::other(
+            "no identity directory for move state",
+        )));
+    };
+    let bytes = tokio::fs::read(dir.join(name)).await?;
+    decode(&bytes)
+}
+
+/// Split an export payload (length-prefixed `public ‖ secret`) back into
+/// its halves. Any truncation or length overflow is a hard error — the
+/// importer must never guess at key-material boundaries.
+fn split_export_payload(payload: &[u8]) -> error::Result<(Vec<u8>, Vec<u8>)> {
+    if payload.len() < 8 {
+        return Err(error::IdentityError::Revocation(
+            "export payload too short for the length prefix".to_string(),
+        ));
+    }
+    let mut len_bytes = [0u8; 8];
+    len_bytes.copy_from_slice(&payload[..8]);
+    let public_len = u64::from_le_bytes(len_bytes) as usize;
+    let secret_start = 8usize.checked_add(public_len).ok_or_else(|| {
+        error::IdentityError::Revocation("export payload length overflow".to_string())
+    })?;
+    if payload.len() < secret_start {
+        return Err(error::IdentityError::Revocation(
+            "export payload truncated before the secret half".to_string(),
+        ));
+    }
+    Ok((
+        payload[8..secret_start].to_vec(),
+        payload[secret_start..].to_vec(),
+    ))
 }
 
 /// Handle for interacting with a collaborative task list.
@@ -18942,21 +20625,16 @@ mod tests {
     /// unknown machine id classifies NoneAvailable.
     #[tokio::test]
     async fn selection_skew_classifies_bootstrap_community_and_unknown() {
-        let mkm = |id: u8, addr: &str| DiscoveredMachine {
-            machine_id: identity::MachineId([id; 32]),
-            addresses: vec![addr.parse().unwrap()],
-            announced_at: 1,
-            last_seen: 1,
-            machine_public_key: vec![1],
-            nat_type: None,
-            can_receive_direct: Some(true),
-            is_relay: Some(true),
-            is_coordinator: Some(false),
-            reachable_via: vec![],
-            relay_candidates: vec![],
-            agent_ids: vec![],
-            user_ids: vec![],
-        };
+        let mkm = |id: u8, addr: &str| DiscoveredMachine { machine_id: identity::MachineId([id; 32]),
+        addresses: vec![addr.parse().unwrap()],
+        announced_at: 1,
+        last_seen: 1,
+        machine_public_key: vec![1],
+        nat_type: None,
+        can_receive_direct: Some(true),
+        is_relay: Some(true),
+        is_coordinator: Some(false),
+        reachable_via: vec![], relay_candidates: vec![], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![], user_ids: vec![], };
         let cache: tokio::sync::RwLock<
             std::collections::HashMap<identity::MachineId, DiscoveredMachine>,
         > = tokio::sync::RwLock::new(std::collections::HashMap::new());
@@ -20398,30 +22076,25 @@ async fn upsert_discovered_agent_preserves_known_user_id() {
 
 #[test]
 fn sort_discovered_machine_sorts_fields() {
-    let mut machine = DiscoveredMachine {
-        machine_id: identity::MachineId([3u8; 32]),
-        addresses: vec![
-            "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
-            "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
-        ],
-        announced_at: 100,
-        last_seen: 100,
-        machine_public_key: vec![],
-        nat_type: None,
-        can_receive_direct: None,
-        is_relay: None,
-        is_coordinator: None,
-        reachable_via: vec![
-            identity::MachineId([2u8; 32]),
-            identity::MachineId([1u8; 32]),
-        ],
-        relay_candidates: vec![
-            identity::MachineId([4u8; 32]),
-            identity::MachineId([3u8; 32]),
-        ],
-        agent_ids: vec![identity::AgentId([2u8; 32]), identity::AgentId([1u8; 32])],
-        user_ids: vec![identity::UserId([2u8; 32]), identity::UserId([1u8; 32])],
-    };
+    let mut machine = DiscoveredMachine { machine_id: identity::MachineId([3u8; 32]),
+    addresses: vec![
+        "10.0.0.2:5483".parse::<std::net::SocketAddr>().unwrap(),
+        "10.0.0.1:5483".parse::<std::net::SocketAddr>().unwrap(),
+    ],
+    announced_at: 100,
+    last_seen: 100,
+    machine_public_key: vec![],
+    nat_type: None,
+    can_receive_direct: None,
+    is_relay: None,
+    is_coordinator: None,
+    reachable_via: vec![
+        identity::MachineId([2u8; 32]),
+        identity::MachineId([1u8; 32]),
+    ], relay_candidates: vec![
+        identity::MachineId([4u8; 32]),
+        identity::MachineId([3u8; 32]),
+    ], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: vec![identity::AgentId([2u8; 32]), identity::AgentId([1u8; 32])], user_ids: vec![identity::UserId([2u8; 32]), identity::UserId([1u8; 32])], };
     sort_discovered_machine(&mut machine);
     assert_eq!(
         machine.addresses[0],
@@ -20688,23 +22361,18 @@ mod candidate_address_retention_tests {
         addresses: Vec<std::net::SocketAddr>,
         last_seen: u64,
     ) -> DiscoveredMachine {
-        DiscoveredMachine {
-            machine_id,
-            addresses,
-            // PeerConnected observations use announced_at: 0 so they add/refresh
-            // one addr and never LWW-wipe reachable_via / relay_candidates.
-            announced_at: 0,
-            last_seen,
-            machine_public_key: Vec::new(),
-            nat_type: None,
-            can_receive_direct: None,
-            is_relay: None,
-            is_coordinator: None,
-            reachable_via: Vec::new(),
-            relay_candidates: Vec::new(),
-            agent_ids: Vec::new(),
-            user_ids: Vec::new(),
-        }
+        DiscoveredMachine { machine_id,
+        addresses,
+        // PeerConnected observations use announced_at: 0 so they add/refresh
+        // one addr and never LWW-wipe reachable_via / relay_candidates.
+        announced_at: 0,
+        last_seen,
+        machine_public_key: Vec::new(),
+        nat_type: None,
+        can_receive_direct: None,
+        is_relay: None,
+        is_coordinator: None,
+        reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), }
     }
 
     /// Verify that upsert_discovered_machine with a connection-derived record
@@ -20732,21 +22400,16 @@ mod candidate_address_retention_tests {
         let now_s = crate::dm::now_unix_ms() / 1000;
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine {
-                machine_id,
-                addresses: vec![address],
-                announced_at: now_s,
-                last_seen: now_s,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: None,
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(),
-                relay_candidates: Vec::new(),
-                agent_ids: Vec::new(),
-                user_ids: Vec::new(),
-            },
+            DiscoveredMachine { machine_id,
+            addresses: vec![address],
+            announced_at: now_s,
+            last_seen: now_s,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
         )
         .await;
 
@@ -20788,21 +22451,16 @@ mod candidate_address_retention_tests {
             let now_s = crate::dm::now_unix_ms() / 1000;
             upsert_discovered_machine(
                 &cache,
-                DiscoveredMachine {
-                    machine_id,
-                    addresses: vec![zero_addr],
-                    announced_at: now_s,
-                    last_seen: now_s,
-                    machine_public_key: Vec::new(),
-                    nat_type: None,
-                    can_receive_direct: None,
-                    is_relay: None,
-                    is_coordinator: None,
-                    reachable_via: Vec::new(),
-                    relay_candidates: Vec::new(),
-                    agent_ids: Vec::new(),
-                    user_ids: Vec::new(),
-                },
+                DiscoveredMachine { machine_id,
+                addresses: vec![zero_addr],
+                announced_at: now_s,
+                last_seen: now_s,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
             )
             .await;
         }
@@ -20843,21 +22501,16 @@ mod candidate_address_retention_tests {
         for _ in 0..2 {
             upsert_discovered_machine(
                 &cache,
-                DiscoveredMachine {
-                    machine_id,
-                    addresses: vec![address],
-                    announced_at: now_s,
-                    last_seen: now_s,
-                    machine_public_key: Vec::new(),
-                    nat_type: None,
-                    can_receive_direct: None,
-                    is_relay: None,
-                    is_coordinator: None,
-                    reachable_via: Vec::new(),
-                    relay_candidates: Vec::new(),
-                    agent_ids: Vec::new(),
-                    user_ids: Vec::new(),
-                },
+                DiscoveredMachine { machine_id,
+                addresses: vec![address],
+                announced_at: now_s,
+                last_seen: now_s,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
             )
             .await;
         }
@@ -20925,21 +22578,16 @@ mod candidate_address_retention_tests {
 
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine {
-                machine_id,
-                addresses: vec![announced],
-                announced_at: 1_700_000_000,
-                last_seen: 1_700_000_000,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: Some(false),
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: vec![coord],
-                relay_candidates: vec![relay],
-                agent_ids: Vec::new(),
-                user_ids: Vec::new(),
-            },
+            DiscoveredMachine { machine_id,
+            addresses: vec![announced],
+            announced_at: 1_700_000_000,
+            last_seen: 1_700_000_000,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(false),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![coord], relay_candidates: vec![relay], machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
         )
         .await;
 
@@ -20989,21 +22637,16 @@ mod candidate_address_retention_tests {
 
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine {
-                machine_id,
-                addresses: vec![announced],
-                announced_at,
-                last_seen: announced_at,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: Some(false),
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(),
-                relay_candidates: Vec::new(),
-                agent_ids: Vec::new(),
-                user_ids: Vec::new(),
-            },
+            DiscoveredMachine { machine_id,
+            addresses: vec![announced],
+            announced_at,
+            last_seen: announced_at,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(false),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
         )
         .await;
 
@@ -21016,21 +22659,16 @@ mod candidate_address_retention_tests {
         // Replay the original announcement at the same timestamp.
         upsert_discovered_machine(
             &cache,
-            DiscoveredMachine {
-                machine_id,
-                addresses: vec![announced],
-                announced_at,
-                last_seen: announced_at + 2,
-                machine_public_key: Vec::new(),
-                nat_type: None,
-                can_receive_direct: Some(false),
-                is_relay: None,
-                is_coordinator: None,
-                reachable_via: Vec::new(),
-                relay_candidates: Vec::new(),
-                agent_ids: Vec::new(),
-                user_ids: Vec::new(),
-            },
+            DiscoveredMachine { machine_id,
+            addresses: vec![announced],
+            announced_at,
+            last_seen: announced_at + 2,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: Some(false),
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: Vec::new(), relay_candidates: Vec::new(), machine_kem_public_key: None, placement_digests: Vec::new(), agent_ids: Vec::new(), user_ids: Vec::new(), },
         )
         .await;
 

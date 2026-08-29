@@ -878,6 +878,20 @@ pub(in crate::server) async fn agent_sign(
         }
     };
 
+    // ADR-0043 AgentSigningGate (§6): `may_sign = holds_key ∧ custodian ==
+    // this machine`. This daemon's agent with NO move log fails open
+    // (pre-0043 behavior); once a log exists, quiesced (mid-move /
+    // retire-pending source) and quarantined (un-activated target) states
+    // refuse to sign — zero live signers during a transfer is derived, not
+    // tracked.
+    let signing_agent = state.agent.agent_id();
+    if !state.agent.signing_gate_allows(&signing_agent).await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate — quiesced or quarantined)",
+        );
+    }
+
     if payload.is_empty() {
         return bad_request("payload must be non-empty");
     }

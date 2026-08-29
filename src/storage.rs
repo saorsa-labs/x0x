@@ -717,6 +717,17 @@ pub async fn save_revocation_set_bytes(bytes: Vec<u8>, identity_dir: Option<&Pat
     write_private_file(&path, bytes).await
 }
 
+/// Write private bytes to an explicit path (atomic rename, mode 0600 on
+/// Unix). ADR-0043 callers persist move-log/bundle/placement/v2 files
+/// through this — same guarantees as the revocation set.
+///
+/// # Errors
+///
+/// Returns [`IdentityError::Storage`] on any filesystem failure.
+pub async fn save_private_bytes_to(path: &std::path::Path, bytes: Vec<u8>) -> Result<()> {
+    write_private_file(path, bytes).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

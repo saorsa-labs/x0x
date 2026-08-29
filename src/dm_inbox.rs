@@ -418,6 +418,7 @@ impl DmInboxService {
         cache: Arc<RecentDeliveryCache>,
         config: DmInboxConfig,
         revocation_set: Arc<RwLock<RevocationSet>>,
+        move_state: Arc<RwLock<crate::key_move::MoveState>>,
         authenticated_machine_bindings: AuthenticatedMachineBindings,
         history: Option<crate::history::HistoryHandle>,
     ) -> NetworkResult<Self> {
@@ -434,6 +435,7 @@ impl DmInboxService {
             cache,
             config,
             revocation_set,
+            move_state,
             authenticated_machine_bindings,
             history,
             None,
@@ -455,6 +457,7 @@ impl DmInboxService {
         cache: Arc<RecentDeliveryCache>,
         config: DmInboxConfig,
         revocation_set: Arc<RwLock<RevocationSet>>,
+        move_state: Arc<RwLock<crate::key_move::MoveState>>,
         authenticated_machine_bindings: AuthenticatedMachineBindings,
         history: Option<crate::history::HistoryHandle>,
         direct_hedge: Option<Arc<dyn DirectAckHedge>>,
@@ -481,6 +484,7 @@ impl DmInboxService {
             silent_reject: config.silent_reject,
             typed_payload_routes: config.typed_payload_routes,
             revocation_set,
+            move_state,
             authenticated_machine_bindings,
             history,
             ack_publisher,
@@ -870,6 +874,9 @@ struct InboxPipeline {
     typed_payload_routes: Vec<DmTypedPayloadRoute>,
     /// Shared revocation set for enforcement point 3.
     revocation_set: Arc<RwLock<RevocationSet>>,
+    /// ADR-0043 derived move state — the B/P pairing gate reads the
+    /// placement view beside the revocation set.
+    move_state: Arc<RwLock<crate::key_move::MoveState>>,
     /// Authenticated origin-machine bindings retained across discovery eviction.
     authenticated_machine_bindings: AuthenticatedMachineBindings,
     /// ADR-0023 history handle. Recording is `try_send`-only — this loop
@@ -1306,6 +1313,30 @@ impl InboxPipeline {
                     sender = %hex::encode(envelope.sender_agent_id),
                     machine = %hex::encode(sender_machine_id.as_bytes()),
                     "DM dropped: sender is revoked"
+                );
+                return;
+            }
+        }
+
+        // ADR-0043 §9: B and P on (sender, attested machine) — a moved
+        // agent's late DM from the retired source pairing dies here even
+        // with a fresh, valid attestation.
+        {
+            let revoked = self.revocation_set.read().await;
+            let placements = self.move_state.read().await;
+            if let Some(denial) = crate::key_move::enforce_pairing(
+                &revoked,
+                placements.placement_view(),
+                &sender_agent_id,
+                &sender_machine_id,
+            ) {
+                tracing::info!(
+                    target: "dm.trace",
+                    stage = "inbound_pairing_denied",
+                    sender = %hex::encode(envelope.sender_agent_id),
+                    machine = %hex::encode(sender_machine_id.as_bytes()),
+                    reason = ?denial,
+                    "DM dropped: ADR-0043 B/P pairing gate"
                 );
                 return;
             }
@@ -2334,6 +2365,7 @@ mod tests {
             silent_reject: true,
             typed_payload_routes: Vec::new(),
             revocation_set: Arc::new(RwLock::new(revocation_set)),
+            move_state: Arc::new(RwLock::new(crate::key_move::MoveState::new())),
             authenticated_machine_bindings,
             history: None,
             ack_publisher,
