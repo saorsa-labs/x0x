@@ -12,6 +12,7 @@
 - Origin: design proposal by @JimCollinson on #107 (comment 4682770966),
   ground-truthed against `main` @ `5f086cf`; adopted here with the
   refinements in "Decision".
+- **Mechanics:** Flat-admin rollout phases and validation checklist are maintained in [`docs/design/adr-0016-mechanics.md`](../design/adr-0016-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

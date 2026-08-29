@@ -9,6 +9,7 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** issue #131, PR #167 (PR1 — policy engine), PR2 (wiring + proptest + docs), issue #132 (T4 forwarder — runtime enforcement), ADR-0017 (x0x as agent transport layer)
+- **Mechanics:** Connect ACL considered options and validation test matrices are maintained in [`docs/design/adr-0019-mechanics.md`](../design/adr-0019-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

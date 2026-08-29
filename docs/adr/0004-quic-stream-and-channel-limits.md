@@ -4,6 +4,8 @@
 
 Accepted
 
+- **Mechanics:** Stream/channel limit sizing arithmetic and alternatives detail are maintained in [`docs/design/adr-0004-mechanics.md`](../design/adr-0004-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
+
 ## Context
 
 ant-quic opens a new QUIC unidirectional stream for every `send()` call. This is a

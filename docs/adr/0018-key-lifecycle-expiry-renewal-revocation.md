@@ -10,6 +10,7 @@
 - **Superseded by:** none
 - **Related:** [ADR 0012](./0012-treekem-default-secure-groups.md) (TreeKEM group encryption); [ADR 0014](./0014-treekem-self-leave-owner-driven-rekey.md) (self-leave / owner-driven rekey); [ADR 0016](./0016-role-based-group-authority-flat-admin.md) (flat Admin/Member authority); `src/revocation.rs`; `docs/trust-and-connectivity.md`
 - **Follow-up issues:** [#130](https://github.com/saorsa-labs/x0x/issues/130) (implementation ticket); [#127](https://github.com/saorsa-labs/x0x/issues/127) (cryptographic primitives)
+- **Mechanics:** Revocation enforcement validation test inventory (EP2/EP3/EP4, e2e) are maintained in [`docs/design/adr-0018-mechanics.md`](../design/adr-0018-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

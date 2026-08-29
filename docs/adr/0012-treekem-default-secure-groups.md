@@ -3,6 +3,7 @@
 - Status: Accepted — implemented; **single-member private secure groups work end-to-end** (invite → join → Welcome → bidirectional secure → ban/epoch-advance → forward secrecy, verified on testnet). **x0x 0.21.0** (2026-06-03) added owner-side **multi-member roster convergence** (serialized per group by `group_membership_lock`) plus the direct-delivery + bounded pending/replay + catch-up anti-entropy infrastructure. **Known limitation:** for a 2nd+ member the owner's roster converges but the joiner's `MemberAdded`+`Welcome` is not yet delivered (the joiner's anchor-poll times out), so multi-member *secure participation* is not yet functional — tracked follow-up. Public encrypted presets remain on the GSS plane (see ADR-0011 scope note and the 0.20.2 fix).
 - Date: 2026-05-30 (proposed); 2026-06-03 (accepted — shipped in 0.21.0)
 - Supersedes: ADR-0010 (GSS Before MLS TreeKEM for v1 Secure Groups) — see "Relationship to ADR-0010".
+- **Mechanics:** Six-phase TreeKEM staged plan and review-finding call-site checklist are maintained in [`docs/design/adr-0012-mechanics.md`](../design/adr-0012-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 > Numbering note: a pre-existing collision had TWO `0010-*` files. Resolved
 > 2026-05-30 by renumbering the pubsub one to

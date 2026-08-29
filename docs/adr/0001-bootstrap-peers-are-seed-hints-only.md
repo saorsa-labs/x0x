@@ -2,6 +2,7 @@
 
 - Status: Accepted (Phase 1 functionally complete — nomenclature rename deferred, Phases 2–5 future)
 - Date: 2026-03-11
+- **Mechanics:** Decentralization follow-up plan (Phases 2–5) and acceptance criteria are maintained in [`docs/design/adr-0001-mechanics.md`](../design/adr-0001-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

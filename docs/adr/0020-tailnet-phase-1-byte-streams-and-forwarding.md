@@ -9,6 +9,7 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** issue #132 (T1–T8), ant-quic #180 (`Node::open_bi`/`accept_bi`), #130 (key lifecycle), #131/ADR-0019 (connect ACL), #158/#177 (PeerRelay), #179 (direct-DM revocation gate)
+- **Mechanics:** Tailnet Phase 1 options, validation tests, Phase-2 deferral list are maintained in [`docs/design/adr-0020-mechanics.md`](../design/adr-0020-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

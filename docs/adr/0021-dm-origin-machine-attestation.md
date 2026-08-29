@@ -7,6 +7,7 @@
 - **Supersedes:** none
 - **Superseded by:** none
 - **Related:** issue #213; issue #184 (retained-binding mitigation); #204 ForwardV2 attestation (`src/forward.rs`); ADR 0018 (key lifecycle / revocation)
+- **Mechanics:** Attestation field table, signed bytes, verification steps, move policy are maintained in [`docs/design/adr-0021-mechanics.md`](../design/adr-0021-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

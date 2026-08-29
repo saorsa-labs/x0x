@@ -7,9 +7,11 @@
 
 This chapter owns the mutable implementation ordering, audit procedure, gate
 mechanics, receipt schema, and rollout constraints that implement ADR 0024.
-The ADR owns the stable architectural decision and its Grounding appendix owns
-the evidence supporting it. Changes here do not amend the ADR; a mechanism
-that cannot satisfy the ADR requires a superseding decision.
+The ADR owns the stable architectural decision and its body remains the
+immutable decision record; the Grounding evidence supporting it is maintained
+in the [Extracted from ADR-0024 section](#extracted-from-adr-0024-2026-08-29)
+below. Changes here do not amend the ADR; a mechanism that cannot satisfy the
+ADR requires a superseding decision.
 
 The chapter declares its governing ADR. ADR-to-chapter membership must be
 computed from that field; no ADR-side chapter allowlist is maintained.
@@ -448,9 +450,9 @@ before the worked example resolve at:
 `e3013710d7ed69077de9a799dffdbeb5ac80535a`.
 
 **Break disclosure is required of every control. The requirement is stated in
-[ADR 0024 `## Validation`](../adr/0024-gss-rotation-on-admin-remove-fail-closed.md#validation)
-and deliberately not restated here.** A mutable chapter cannot hold a normative requirement,
-and two copies of one rule diverge on their first edit. What follows is the worked example of
+the [Extracted from ADR-0024 section](#extracted-from-adr-0024-2026-08-29)
+below and deliberately not duplicated here.** Two copies of one rule diverge
+on their first edit. What follows is the worked example of
 applying it and the receipt mechanics the ADR delegates to this chapter.
 
 **Declaration for the worked example that follows: every line number in it resolves at
@@ -572,7 +574,8 @@ resolve only at the commit declared in that sub-item.
    and names no control of its own. This item was promoted into the governing ADR and is
    deliberately not restated here.
 2. Asserts each surviving member can **decrypt content published at the new epoch** — not
-   that its `state_hash` matches. Convergence is the wrong assertion (ADR Grounding G-002):
+   that its `state_hash` matches. Convergence is the wrong assertion (Grounding
+   G-002, in the [Extracted from ADR-0024 section](#extracted-from-adr-0024-2026-08-29)):
    it passes on the bug.
 3. Exercises both publish orderings, metadata-first and envelope-first, and asserts the new
    secret installs under each.
@@ -753,3 +756,95 @@ rules. Blank lines and headings travel with their enclosing range.
 The ranges are contiguous, non-overlapping, and cover source lines 1–745.
 Future edits update this chapter in place; they do not rewrite the source
 migration or amend the Proposed decision.
+
+## Extracted from ADR-0024 (2026-08-29)
+
+> Relocated verbatim from the immutable ADR body per the 2026-08-23 ADR audit;
+> this chapter is the maintained home for it.
+
+**Break disclosure — required of every control in this section.**
+
+Resolves at: `e3013710d7ed69077de9a799dffdbeb5ac80535a`
+
+A control is evidence only against the ways of breaking that someone named.
+Mutation-redness does not establish that a control observes its property: the
+metadata-first and envelope-first delivery controls are mutation-red on the
+`src/server/routes/named_groups.rs:5832` conjunct and were still blind to the
+survivor being removed alongside the victim, because that break was never on
+anyone's list. So each control must be accompanied by a list of the breaks
+considered, and for each either **the mutation that makes the control fail, an
+assertion or precondition in the control that refuses the path, or a statement
+that the control does not observe that break and why that is accepted.** A
+refusing precondition ranks with a mutation and is often the honest form: a
+control asserting an exact plaintext already cannot pass on any error exit,
+and demanding a bespoke mutation per exit would buy ceremony rather than
+evidence. This is a requirement to disclose, not a prohibition on assertions:
+a rule forbidding any assertion a broken property could still produce would
+forbid the length assertion on the rotated-secret producer, which still yields
+32 if rotation breaks by returning a constant.
+
+A list drawn from the author's imagination fails the same way the controls do
+— an author names the breaks their control already catches. The minimum content
+is therefore mechanical: **name the target operation and the observation the
+control makes of it, then enumerate from the source every control-flow exit or
+alternate dispatch between the control's entry point and that operation which
+could bypass or substitute for it — explicit returns, `?` propagation,
+`let`-`else` bindings, `match` and `if` arms, and returns from delegated
+handlers — and account for each.** A scan for `return` is a floor, not a
+completeness proof; the `secure_group_decrypt` handler ends in a tail `match`,
+whose arms exit the handler without an explicit `return`. The endpoint of that
+path is the code that performs the property, not the code that reads its
+inputs.
+
+---
+
+### G-001 — Remove and ban had different confidentiality outcomes
+
+Resolves at: `e3013710d7ed69077de9a799dffdbeb5ac80535a`
+
+Supports: Context and Decisions 1 through 3.
+
+In `src/server/routes/named_groups.rs`, ban seals its commit at `:10325`, stores
+the roster at `:10334`, persists at `:10338`, and only then attempts survivor
+envelopes at `:10349-10355`. The administrative remove path did not rotate and
+reseal. This establishes both the confidentiality gap and why ban's later
+ordering is not a fail-closed template.
+
+### G-002 — Convergence cannot detect a stranded secret holder
+
+Resolves at: `e3013710d7ed69077de9a799dffdbeb5ac80535a`
+
+Supports: Context and Decision 2.
+
+`src/groups/state_commit.rs:219-228` enumerates the state-hash inputs without
+`shared_secret`. A survivor can therefore retain a matching `state_hash` while
+lacking the new secret. Convergence is not a valid oracle for survivor
+decryptability.
+
+### G-003 — A keyless state is reachable and no contrary invariant was found
+
+Resolves at: `e3013710d7ed69077de9a799dffdbeb5ac80535a`
+
+Supports: Context and Decision 7.
+
+`GroupInfo::with_policy` creates a secret for encrypted groups
+(`src/groups/mod.rs:346-354`, installed at `src/groups/mod.rs:390`), while the
+non-TreeKEM invite path clears it only for TreeKEM
+(`src/server/routes/named_groups.rs:7632-7638` and `:7656-7658`) and the invite
+snapshot strips roster ML-KEM keys (`src/server/routes/identity.rs:382`, copied
+at `src/server/routes/named_groups.rs:7671-7672`). This proves that
+`shared_secret: Some(..)` and a missing roster KEM key can coexist; it does not
+prove that locally generated secret is the authority's live secret.
+
+### G-005 — The landed implementation demonstrates the preflight boundary
+
+Resolves at: `56d0c4bc61fbb649042aad8ea42d25d8f0c85c39`
+
+Supports: Decisions 2 through 6 and Consequences.
+
+In `src/server/routes/named_groups.rs`, the wrong-length conversion aborts at
+`:8590-8598` before `seal_commit` (`:8640`), map insertion (`:8651`),
+persistence (`:8667`), and publication (`:8688`). The survivor set is selected
+at `:8602-8606`, and preflight failures return before the sealed commit becomes
+live. These observations establish the boundary; they do not prove delivery
+after persistence.

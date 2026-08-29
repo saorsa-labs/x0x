@@ -7,6 +7,7 @@
 - Amends: [ADR 0012](./0012-treekem-default-secure-groups.md) — refines its
   acceptance criterion "a removed member provably cannot read the next epoch"
   for the **self-leave** sub-case.
+- **Mechanics:** Self-leave implementation status and owner-rekey acceptance criteria are maintained in [`docs/design/adr-0014-mechanics.md`](../design/adr-0014-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

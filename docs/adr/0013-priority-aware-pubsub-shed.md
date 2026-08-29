@@ -8,6 +8,8 @@
 
 Accepted
 
+- **Mechanics:** APAC soak narrative and pubsub-shed validation inventory are maintained in [`docs/design/adr-0013-mechanics.md`](../design/adr-0013-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
+
 ## Context
 
 ADR 0009 made the per-peer PubSub receive forward channel (`recv_pubsub_tx`)

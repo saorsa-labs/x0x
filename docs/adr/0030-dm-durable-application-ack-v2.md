@@ -12,6 +12,7 @@
   (delivery order ≠ authorization), ADR 0029 (public-message threading —
   group messages only, NOT DMs), `wip/codex-durable-app-ack` (`b60b995`,
   the campaign implementation this ADR governs)
+- **Mechanics:** Branch-verified DM-ACK implementation facts and validation matrix are maintained in [`docs/design/adr-0030-mechanics.md`](../design/adr-0030-mechanics.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Context
 

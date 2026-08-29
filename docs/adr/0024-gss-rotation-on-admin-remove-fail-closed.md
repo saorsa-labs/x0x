@@ -10,6 +10,7 @@
   default secure-group plane), ADR 0014 (self-leave is a roster removal), ADR
   0016 (flat Admin/Member authority), and the governed
   [GSS admin-remove reference chapter](../design/gss-admin-remove-fail-closed.md)
+- **Mechanics:** Validation break-disclosure essay and grounding G-001–G-003, G-005 are maintained in [`docs/design/gss-admin-remove-fail-closed.md`](../design/gss-admin-remove-fail-closed.md) (extracted 2026-08-29; ADR body unchanged)
 
 ## Summary
 
