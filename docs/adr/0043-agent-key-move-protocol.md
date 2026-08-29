@@ -1,6 +1,6 @@
 # ADR 0043: Agent Key-Move Protocol — Machine KEM Enrollment, Commit-then-Activate Moves, Binding Revocation
 
-- **Status:** Proposed
+- **Status:** Accepted (2026-08-29) — approved by David Irvine with the merge of PR #436
 - **Date:** 2026-08-28 (r5)
 - **Decision owners:** David Irvine (direction), omp (drafting)
 - **Reviewers:** pending human review
