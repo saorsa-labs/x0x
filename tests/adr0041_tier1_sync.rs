@@ -41,10 +41,12 @@ fn names_value(display: &str, machine_name: &str) -> SyncValue {
 /// Cross-enroll two machines into each other's device sets under `owner`
 /// (the minimum for bidirectional sync — blocker 30).
 async fn cross_enroll(a: &OwnerSyncStore, b: &OwnerSyncStore, owner: &UserKeypair) {
-    a.enroll(OwnerEnrollment::sign(machine(2), owner, 1_000).unwrap())
-        .await;
-    b.enroll(OwnerEnrollment::sign(machine(1), owner, 1_000).unwrap())
-        .await;
+    a.enroll(OwnerEnrollment::sign(machine(2), owner, 1_000, None).unwrap())
+        .await
+        .unwrap();
+    b.enroll(OwnerEnrollment::sign(machine(1), owner, 1_000, None).unwrap())
+        .await
+        .unwrap();
 }
 
 /// Run one session between two stores over a duplex pipe. Returns both
@@ -57,7 +59,8 @@ async fn session_between(
     x0x::owner_sync::SessionSummary,
     x0x::owner_sync::SessionSummary,
 ) {
-    let owner_id = owner.user_id();
+    // Deterministic seeds: both sides hold the SAME owner key (same seed).
+    let responder_owner = UserKeypair::from_seed(&[7u8; 32]).expect("owner keypair");
     let (client, server) = tokio::io::duplex(64 * 1024);
     let b_clone = Arc::clone(b);
     let responder = tokio::spawn(async move {
@@ -66,7 +69,7 @@ async fn session_between(
             &mut r_send,
             &mut r_recv,
             &b_clone,
-            &owner_id,
+            &responder_owner,
             &machine(2),
             &machine(1),
             |_| {},
@@ -79,7 +82,7 @@ async fn session_between(
         &mut c_send,
         &mut c_recv,
         a,
-        &owner_id,
+        owner,
         &machine(1),
         &machine(2),
         |_| {},
@@ -96,8 +99,8 @@ async fn session_between(
 async fn two_machines_converge_names_and_journal_both_ways() {
     let dir = tempfile::tempdir().unwrap();
     let owner = owner_kp(7);
-    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await);
-    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await);
+    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
     cross_enroll(&store_a, &store_b, &owner).await;
 
     // Machine 1: names + a journal line for agent X.
@@ -219,8 +222,8 @@ async fn forged_non_owner_record_aborts_session_fail_closed() {
     let dir = tempfile::tempdir().unwrap();
     let owner = owner_kp(7);
     let attacker = owner_kp(9);
-    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await);
-    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await);
+    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
     cross_enroll(&store_a, &store_b, &owner).await;
 
     // Plant a forged record IN A's store (as if a compromised machine had
@@ -241,7 +244,7 @@ async fn forged_non_owner_record_aborts_session_fail_closed() {
     .unwrap();
     store_a.records_insert_for_testing(forged).await;
 
-    let owner_id = owner.user_id();
+    let responder_owner = UserKeypair::from_seed(&[7u8; 32]).expect("owner keypair");
     let (client, server) = tokio::io::duplex(64 * 1024);
     let b_clone = Arc::clone(&store_b);
     let responder = tokio::spawn(async move {
@@ -250,7 +253,7 @@ async fn forged_non_owner_record_aborts_session_fail_closed() {
             &mut r_send,
             &mut r_recv,
             &b_clone,
-            &owner_id,
+            &responder_owner,
             &machine(2),
             &machine(1),
             |_| {},
@@ -258,32 +261,42 @@ async fn forged_non_owner_record_aborts_session_fail_closed() {
         .await
     });
     let (mut c_recv, mut c_send) = tokio::io::split(server);
-    let initiator_err = run_sync_session(
+    let initiator = run_sync_session(
         &mut c_send,
         &mut c_recv,
         &store_a,
-        &owner_id,
+        &owner,
         &machine(1),
         &machine(2),
         |_| {},
     )
-    .await
-    .expect_err("session with a forged record must fail");
-    assert!(
-        initiator_err.to_string().contains("not the same owner"),
-        "initiator must see the peer's fail-closed abort, got: {initiator_err:?}"
-    );
-    let responder_err = responder.await.unwrap().expect_err("responder aborts too");
+    .await;
+    let responder_err = responder
+        .await
+        .unwrap()
+        .expect_err("receiving side must fail closed on the forgery");
     assert!(
         matches!(responder_err, x0x::owner_sync::SyncError::OwnerMismatch),
-        "responder saw the forgery: {responder_err:?}"
+        "verifier rejected the forged record: {responder_err:?}"
     );
-
-    // B stored nothing from the poisoned batch.
+    // The RECEIVING side is the security boundary: nothing from the forged
+    // batch is stored, ever. (The shipping side may complete its own send
+    // cleanly — it committed nothing inbound; the forged record stays in
+    // its own store where the test planted it.)
     assert!(
         store_b.records_snapshot().await.is_empty(),
         "fail-closed: no record from a forged batch is stored"
     );
+    match initiator {
+        Ok(summary) => assert_eq!(
+            summary.accepted, 0,
+            "shipper committed nothing inbound: {summary:?}"
+        ),
+        Err(e) => assert!(
+            e.to_string().contains("not the same owner"),
+            "unexpected initiator error: {e:?}"
+        ),
+    }
 }
 
 /// WHY: rollback protection survives the wire — after B already holds a
@@ -293,8 +306,8 @@ async fn forged_non_owner_record_aborts_session_fail_closed() {
 async fn replayed_older_record_never_overwrites_winner_over_the_wire() {
     let dir = tempfile::tempdir().unwrap();
     let owner = owner_kp(7);
-    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await);
-    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await);
+    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
     cross_enroll(&store_a, &store_b, &owner).await;
 
     // B already holds version 5 for its own names record...
@@ -384,6 +397,105 @@ async fn build_owned_agent(
         Err(e) => panic!("agent build failed: {e}"),
     }
 }
+/// WHY (review R2 finding 3): two machines holding DIFFERENT records under
+/// the SAME clock converge over the wire to the deterministic hash winner
+/// — arrival order cannot split them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn equal_clock_records_converge_over_the_wire() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_kp(7);
+    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
+    cross_enroll(&store_a, &store_b, &owner).await;
+
+    let key = "shared";
+    let same_clock = x0x::owner_sync::RecordClock {
+        version: 4,
+        signed_at_ms: 500,
+        writer_machine: machine(1).0,
+    };
+    let record_a = VersionedRecord::sign(
+        SyncKind::MachineNames,
+        key,
+        &names_value("content-a", "m"),
+        same_clock,
+        &owner,
+    )
+    .unwrap();
+    let record_b = VersionedRecord::sign(
+        SyncKind::MachineNames,
+        key,
+        &names_value("content-b", "m"),
+        same_clock,
+        &owner,
+    )
+    .unwrap();
+    let winner_hash = if record_a.record_hash() > record_b.record_hash() {
+        record_a.record_hash()
+    } else {
+        record_b.record_hash()
+    };
+
+    store_a.records_insert_for_testing(record_a).await;
+    store_b.records_insert_for_testing(record_b).await;
+
+    let (summary_a, summary_b) = session_between(&store_a, &store_b, &owner).await;
+    assert!(
+        summary_a.equivocations >= 1 || summary_b.equivocations >= 1,
+        "equivocation surfaced: {summary_a:?} / {summary_b:?}"
+    );
+
+    let snap_a = store_a.records_snapshot().await;
+    let snap_b = store_b.records_snapshot().await;
+    assert_eq!(snap_a.len(), 1);
+    assert_eq!(snap_b.len(), 1);
+    assert_eq!(snap_a[0].record_hash(), winner_hash);
+    assert_eq!(snap_b[0].record_hash(), winner_hash);
+    assert_eq!(snap_a[0].value, snap_b[0].value, "converged values");
+}
+
+/// WHY (review R2 finding 5): a state set larger than one frame's entries
+/// syncs via PAGED version vectors and record batches — nothing wedges at
+/// the frame cap.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn large_state_syncs_via_paged_frames() {
+    let dir = tempfile::tempdir().unwrap();
+    let owner = owner_kp(7);
+    let store_a = Arc::new(OwnerSyncStore::load(&dir.path().join("a")).await.unwrap());
+    let store_b = Arc::new(OwnerSyncStore::load(&dir.path().join("b")).await.unwrap());
+    cross_enroll(&store_a, &store_b, &owner).await;
+
+    // 300 keys: the version vector exceeds VV_ENTRIES_PER_FRAME (256) and
+    // the record set exceeds RECORDS_PER_FRAME (16) — both must page.
+    const N: usize = 300;
+    for i in 0..N {
+        store_a
+            .mint(
+                SyncKind::IssuanceJournal,
+                &format!("agent-{i:03}"),
+                &SyncValue::IssuanceJournal {
+                    agent_id: format!("agent-{i:03}"),
+                    cert_digest: format!("digest-{i:03}"),
+                    issued_at: i as u64,
+                    not_after: None,
+                },
+                &owner,
+                machine(1),
+            )
+            .await
+            .unwrap();
+    }
+
+    let (summary_a, _) = session_between(&store_a, &store_b, &owner).await;
+    assert_eq!(summary_a.shipped, N, "all records paged out");
+
+    let snap_b = store_b.records_snapshot().await;
+    assert_eq!(snap_b.len(), N, "all records arrived through the pages");
+    // Convergence is exact: a second session ships nothing.
+    let (again_a, again_b) = session_between(&store_a, &store_b, &owner).await;
+    assert_eq!(again_a.accepted, 0);
+    assert_eq!(again_b.accepted, 0);
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // Transport tier (#[ignore]): real sockets, real SyncV1 streams, the
@@ -436,12 +548,14 @@ async fn two_agents_converge_over_real_syncv1_stream() {
     let owner_id = owner.user_id();
     service_a
         .store()
-        .enroll(OwnerEnrollment::sign(bob.machine_id(), &owner, 1_000).unwrap())
-        .await;
+        .enroll(OwnerEnrollment::sign(bob.machine_id(), &owner, 1_000, None).unwrap())
+        .await
+        .unwrap();
     service_b
         .store()
-        .enroll(OwnerEnrollment::sign(alice.machine_id(), &owner, 1_000).unwrap())
-        .await;
+        .enroll(OwnerEnrollment::sign(alice.machine_id(), &owner, 1_000, None).unwrap())
+        .await
+        .unwrap();
 
     // Local Tier-1 state: distinct names per machine.
     service_a

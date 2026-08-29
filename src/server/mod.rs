@@ -75,16 +75,17 @@ use routes::{
     spawn_directory_resubscribe, spawn_global_discovery_listener,
     spawn_global_public_message_listener, spawn_listed_to_contacts_listener, status,
     store_named_group_info, streams_diagnostics, subscribe, transport_diagnostics,
-    unban_group_member, unpin_machine, unsubscribe, update_contact, update_group_policy,
-    update_member_role, update_named_group, update_profile, update_task, withdraw_group_state,
-    AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta, NamedGroupMetadataEvent,
-    PendingListenerAdmission, PredecessorRelayObligation, PublicGroupBootstrap,
-    SelfPublishedReleaseManifests, TreeKemCatchupRequest, TreeKemCatchupResponse,
-    WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES, CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
-    CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
-    DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    unban_group_member, unenroll_device, unpin_machine, unsubscribe, update_contact,
+    update_group_policy, update_member_role, update_named_group, update_profile, update_task,
+    withdraw_group_state, AtomicWriteOutcome, JoinResultMessage, KvStoreDirectDelta,
+    NamedGroupMetadataEvent, PendingListenerAdmission, PredecessorRelayObligation,
+    PublicGroupBootstrap, SelfPublishedReleaseManifests, TreeKemCatchupRequest,
+    TreeKemCatchupResponse, WelcomeBlobMessage, CAUSAL_ENVELOPE_MAX_BYTES,
+    CAUSAL_RELAY_OUTBOX_PER_DAEMON_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP,
+    CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
+    CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
+    DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -1675,6 +1676,10 @@ pub async fn serve_with_options(
         .route("/agent/card", get(get_agent_card))
         .route("/sync/devices", get(get_sync_devices))
         .route("/sync/devices/enroll", post(enroll_device))
+        .route(
+            "/sync/devices/:machine_id",
+            axum::routing::delete(unenroll_device),
+        )
         .route("/profile", get(get_profile).put(update_profile))
         .route("/home", get(routes::home::get_home))
         .route("/home/rename", post(routes::home::rename_home))

@@ -4213,12 +4213,13 @@ async function loadSyncDevices(){
   const devices=r.devices||[];
   if(!devices.length){el.innerHTML='No devices enrolled yet.';return;}
   el.innerHTML='<table style="width:100%;border-collapse:collapse;font-size:12px">'+
-    '<tr style="color:var(--tx3);text-align:left"><th style="padding:2px 6px">Machine</th><th style="padding:2px 6px">Enrolled</th><th style="padding:2px 6px">Last sync</th></tr>'+
+    '<tr style="color:var(--tx3);text-align:left"><th style="padding:2px 6px">Machine</th><th style="padding:2px 6px">Enrolled</th><th style="padding:2px 6px">Last sync</th><th style="padding:2px 6px"></th></tr>'+
     devices.map(d=>{
       const mid=String(d.machine_id||'').slice(0,12)+'…';
       const enrolled=d.enrolled_at_ms?new Date(d.enrolled_at_ms).toLocaleString():'—';
+      const exp=d.expires_at_ms?(' · expires '+new Date(d.expires_at_ms).toLocaleString()):'';
       const last=d.last_session_ms?(new Date(d.last_session_ms).toLocaleString()+(d.last_session_ok?'':' (failed)')):'never';
-      return `<tr><td style="padding:2px 6px">${esc(mid)}${d.is_this_machine?' <span style="color:var(--lv)">(this machine)</span>':''}</td><td style="padding:2px 6px">${esc(enrolled)}</td><td style="padding:2px 6px">${esc(last)}</td></tr>`;
+      return `<tr><td style="padding:2px 6px">${esc(mid)}${d.is_this_machine?' <span style="color:var(--lv)">(this machine)</span>':''}</td><td style="padding:2px 6px">${esc(enrolled+exp)}</td><td style="padding:2px 6px">${esc(last)}</td><td style="padding:2px 6px"><button style="padding:2px 8px;font-size:11px" onclick="revokeSyncDevice('${escJs(String(d.machine_id||''))}')">Revoke</button></td></tr>`;
     }).join('')+'</table>';
 }
 
@@ -4226,6 +4227,12 @@ async function enrollThisMachine(){
   const r=await api('/sync/devices/enroll',{method:'POST',body:JSON.stringify({})});
   if(r&&r._http_ok){toast('Machine enrolled into the owner device set','success');loadSyncDevices();}
   else{toast(r&&r.error?r.error:'Enroll failed','error');}
+}
+
+async function revokeSyncDevice(machineId){
+  const r=await api('/sync/devices/'+encodeURIComponent(machineId),{method:'DELETE'});
+  if(r&&r._http_ok){toast('Machine revoked from the owner device set','success');loadSyncDevices();}
+  else{toast(r&&r.error?r.error:'Revoke failed','error');}
 }
 
 function setTheme(theme){

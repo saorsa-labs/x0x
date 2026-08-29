@@ -230,6 +230,13 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description: "Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)",
         category: "identity",
     },
+    EndpointDef {
+        method: Method::Delete,
+        path: "/sync/devices/:machine_id",
+        cli_name: "sync revoke",
+        description: "Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)",
+        category: "identity",
+    },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
         method: Method::Get,

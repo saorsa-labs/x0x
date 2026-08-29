@@ -185,6 +185,7 @@ impl SyncDaemonView for DaemonView {
 pub(in crate::server) struct SyncDeviceEntry {
     machine_id: String,
     enrolled_at_ms: u64,
+    expires_at_ms: Option<u64>,
     last_session_ms: Option<u64>,
     last_session_ok: Option<bool>,
     #[serde(rename = "is_this_machine")]
@@ -224,6 +225,7 @@ pub(in crate::server) async fn get_sync_devices(
             SyncDeviceEntry {
                 machine_id: hex::encode(enrollment.machine_id),
                 enrolled_at_ms: enrollment.enrolled_at_ms,
+                expires_at_ms: enrollment.expires_at_ms,
                 last_session_ms: status.map(|s| s.last_session_ms),
                 last_session_ok: status.map(|s| s.last_session_ok),
                 is_this_machine: enrollment.machine_id == this_machine.0,
@@ -246,10 +248,12 @@ pub(in crate::server) async fn get_sync_devices(
 }
 
 /// POST /sync/devices/enroll request body — `machine_id` optional;
-/// omitted = enroll THIS machine.
+/// omitted = enroll THIS machine. `ttl_secs` optional bounds the
+/// enrollment's lifetime (review R2 finding 1); omitted = until deleted.
 #[derive(Debug, Default, Deserialize)]
 pub(in crate::server) struct EnrollRequest {
     machine_id: Option<String>,
+    ttl_secs: Option<u64>,
 }
 
 /// POST /sync/devices/enroll response body.
@@ -257,6 +261,7 @@ pub(in crate::server) struct EnrollRequest {
 pub(in crate::server) struct EnrollData {
     machine_id: String,
     enrolled_at_ms: u64,
+    expires_at_ms: Option<u64>,
     device_count: usize,
 }
 
@@ -264,8 +269,10 @@ pub(in crate::server) struct EnrollData {
 /// machine and add it to the local owner device set (owner-gated: the
 /// daemon must hold the owner key; ADR-0043 enrollment direction).
 ///
-/// The signature is verified again at every stream accept, so a corrupt or
-/// foreign-key enrollment can never open the sync gate.
+/// The signature and the enrollment's currency (expiry) are verified again
+/// at every stream accept, so a corrupt, foreign-key, or stale enrollment
+/// can never open the sync gate. A persistence failure is a 500 — success
+/// is never reported on a swallowed write (review R2 finding 2).
 pub(in crate::server) async fn enroll_device(
     State(state): State<Arc<AppState>>,
     Json(req): Json<EnrollRequest>,
@@ -292,12 +299,21 @@ pub(in crate::server) async fn enroll_device(
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
-    let enrollment = match OwnerEnrollment::sign(machine, owner_kp, enrolled_at_ms) {
+    let expires_at_ms = req
+        .ttl_secs
+        .map(|ttl| enrolled_at_ms.saturating_add(ttl.saturating_mul(1000)));
+    let enrollment = match OwnerEnrollment::sign(machine, owner_kp, enrolled_at_ms, expires_at_ms) {
         Ok(enrollment) => enrollment,
         Err(e) => return error_response(StatusCode::INTERNAL_SERVER_ERROR, &e.to_string()),
     };
     let machine_hex = hex::encode(enrollment.machine_id);
-    sync.store().enroll(enrollment).await;
+    if let Err(e) = sync.store().enroll(enrollment).await {
+        // Never report success on a swallowed write (review R2 finding 2).
+        return error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to persist enrollment: {e}"),
+        );
+    }
     let device_count = sync.store().enrolled_devices().await.len();
     // Enrollment is Tier-1-relevant state: kick an early sync pass.
     sync.kick();
@@ -306,6 +322,7 @@ pub(in crate::server) async fn enroll_device(
         data: EnrollData {
             machine_id: machine_hex,
             enrolled_at_ms,
+            expires_at_ms,
             device_count,
         },
     };
@@ -313,6 +330,54 @@ pub(in crate::server) async fn enroll_device(
         StatusCode::OK,
         Json(serde_json::to_value(body).unwrap_or_default()),
     )
+}
+
+/// DELETE /sync/devices/:machine_id response body.
+#[derive(Debug, Serialize)]
+pub(in crate::server) struct UnenrollData {
+    machine_id: String,
+    device_count: usize,
+}
+
+/// DELETE /sync/devices/:machine_id — remove a machine from the owner
+/// device set (owner-gated). The very next inbound SyncV1 stream from that
+/// machine is refused at the enrollment gate; existing streams are not
+/// torn down mid-flight (per-accept gating, ADR-0022 posture).
+pub(in crate::server) async fn unenroll_device(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path(machine_hex): axum::extract::Path<String>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let Some(sync) = state.owner_sync.as_ref() else {
+        return error_response(StatusCode::CONFLICT, "no owner identity configured");
+    };
+    let Some(machine) = decode_machine_id(&machine_hex) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "machine_id must be 64 hex characters",
+        );
+    };
+    match sync.store().unenroll(&machine).await {
+        Ok(true) => {
+            let device_count = sync.store().enrolled_devices().await.len();
+            sync.kick();
+            let body = ApiResponse {
+                ok: true,
+                data: UnenrollData {
+                    machine_id: machine_hex,
+                    device_count,
+                },
+            };
+            (
+                StatusCode::OK,
+                Json(serde_json::to_value(body).unwrap_or_default()),
+            )
+        }
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "machine not enrolled"),
+        Err(e) => error_response(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &format!("failed to persist device set: {e}"),
+        ),
+    }
 }
 
 fn decode_machine_id(hex_id: &str) -> Option<crate::identity::MachineId> {
@@ -423,6 +488,10 @@ mod tests {
         let app = axum::Router::new()
             .route("/sync/devices", axum::routing::get(get_sync_devices))
             .route("/sync/devices/enroll", axum::routing::post(enroll_device))
+            .route(
+                "/sync/devices/:machine_id",
+                axum::routing::delete(unenroll_device),
+            )
             .with_state(Arc::clone(&state));
         let (status, body) = response_json(
             app.clone()
@@ -440,7 +509,8 @@ mod tests {
         assert_eq!(body["machine_id"].as_str(), Some(this_machine.as_str()));
 
         let (status, body) = response_json(
-            app.oneshot(axum::http::Request::get("/sync/devices").body(axum::body::Body::empty())?)
+            app.clone()
+                .oneshot(axum::http::Request::get("/sync/devices").body(axum::body::Body::empty())?)
                 .await?,
         )
         .await?;
@@ -451,7 +521,58 @@ mod tests {
             devices[0]["machine_id"].as_str(),
             Some(this_machine.as_str())
         );
-        assert!(devices[0]["is_this_machine"].as_bool().unwrap_or(false));
+        // Enroll with a TTL, then revoke it via the DELETE path: the list
+        // empties and a second revoke 404s (review R2 finding 1).
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::post("/sync/devices/enroll")
+                        .header("content-type", "application/json")
+                        .body(axum::body::Body::from(r#"{"ttl_secs":3600}"#))?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "enroll with ttl: {body:?}");
+        assert!(
+            body["expires_at_ms"].as_u64().is_some(),
+            "ttl produced an expiry"
+        );
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(
+                    axum::http::Request::delete(format!("/sync/devices/{this_machine}"))
+                        .body(axum::body::Body::empty())?,
+                )
+                .await?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK, "revoke: {body:?}");
+        let (status, body) = response_json(
+            app.clone()
+                .oneshot(axum::http::Request::get("/sync/devices").body(axum::body::Body::empty())?)
+                .await?,
+        )
+        .await?;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(
+            body["devices"].as_array().map(Vec::len),
+            Some(0),
+            "revoked machine gone from the device set"
+        );
+        let (status, body) = response_json(
+            app.oneshot(
+                axum::http::Request::delete(format!("/sync/devices/{this_machine}"))
+                    .body(axum::body::Body::empty())?,
+            )
+            .await?,
+        )
+        .await?;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "second revoke 404s: {body:?}"
+        );
 
         // Malformed machine id: 400, nothing enrolled.
         let dir3 = tempfile::tempdir()?;

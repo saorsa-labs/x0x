@@ -6,39 +6,57 @@
 //! policy pointer, and the sub-agent issuance journal. Tier 2 (history
 //! backfill) and Tier 3 (never-replicates state) are out of scope here.
 //!
-//! # Trust model — same-owner, enrolled machines only (gapcheck blocker 30)
+//! # Trust model — same-owner, enrolled machines, key possession
+//! (gapcheck blocker 30; review R2)
 //!
 //! A stream carrying [`crate::streams::StreamProtocol::SyncV1`] is accepted
-//! only when BOTH hold:
+//! only when ALL hold:
 //!
 //! 1. the ADR-0022 machine identity gates (transport-verified, trusted,
 //!    non-revoked) have already cleared — enforced by the shared accept loop
 //!    before this protocol's acceptor sees the stream;
 //! 2. the remote machine is in the local **owner device set**: an
 //!    [`OwnerEnrollment`] record signed by the owner key, whose public key
-//!    derives to this install's `UserId`. This is the enrollment direction
-//!    of ADR-0043 (owner-key-signed, machine-scoped), reused — not a rival
-//!    scheme.
+//!    derives to this install's `UserId`, and whose optional expiry has not
+//!    elapsed (enrollment currency, not just signature validity). This is
+//!    the enrollment direction of ADR-0043, reused — not a rival scheme.
+//!    Enrollments are removed with the DELETE `/sync/devices/:id` path.
+//! 3. the peer **proves possession of the owner key**: after the transport
+//!    handshake each side sends a random nonce and the peer must return an
+//!    ML-DSA signature over `nonce || both machine ids || owner_user_id`
+//!    under the owner key. Echoing the owner id (as the unsigned `Hello`
+//!    alone allowed) is worthless; a stale-but-enrolled machine that no
+//!    longer holds the owner key learns nothing.
 //!
-//! Fail closed: any signature or enrollment failure aborts the session and
-//! the peer learns nothing beyond the refusal.
+//! Fail closed: any signature, enrollment, or proof failure aborts the
+//! session, and the peer learns nothing beyond the refusal.
 //!
 //! # Object model (gapcheck blocker 31)
 //!
 //! Each Tier-1 object is an owner-signed [`VersionedRecord`]. Conflict rule
 //! (deliberately decoupled from state-commit heights): highest `version`
 //! wins; tie → highest `signed_at_ms`; tie → lexicographically greatest
-//! `writer_machine`. Anti-rollback: a record is accepted only when it
-//! *strictly beats* the stored clock under that ordering, so a replayed or
-//! stale record can never overwrite a newer one.
+//! `writer_machine`; **exact-clock tie with different signed content →
+//! greatest `record_hash`** (deterministic convergence under equal-clock
+//! equivocation; detected and surfaced). Anti-rollback: nothing ever
+//! replaces a stored record it does not strictly outrank.
+//!
+//! Durability (review R2): the store directory is created at load, and
+//! every mutating path propagates persistence errors — success is never
+//! reported on a swallowed write. Accepted batches are committed in ONE
+//! atomic file write only after the whole batch verified and the session
+//! reached a clean `Done`, so a forged tail cannot leave a partial batch
+//! committed and advertised.
 //!
 //! # Protocol
 //!
-//! On connect the two sides exchange a [`SyncFrame::Hello`] (same owner,
-//! same protocol version, non-self), then per-kind version vectors, then
-//! ship exactly the records the other side is missing or would accept.
-//! Sessions run periodically and are re-triggered on local change (the
-//! store's generation channel) — "periodic + on-change".
+//! On connect: `Hello` (same owner, same protocol version, non-self, each
+//! side carrying a fresh nonce) → mutual `Proof` (owner-key possession) →
+//! per-kind **paged** version vectors → **paged** record batches both ways
+//! → `Done` → atomic local commit. The whole session runs under a total
+//! timeout ([`SESSION_TIMEOUT`]); a peer that stalls at any stage is
+//! dropped, never held. Sessions run periodically and are re-triggered on
+//! local change (the store's generation channel).
 //!
 //! # Tier-3 boundary (gapcheck blocker 32 scope note)
 //!
@@ -50,6 +68,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use ant_quic::crypto::raw_public_keys::pqc::{
     sign_with_ml_dsa, verify_with_ml_dsa, MlDsaPublicKey, MlDsaSignature,
@@ -66,13 +85,46 @@ use crate::identity::{MachineId, UserId, UserKeypair};
 const ENROLL_MSG_PREFIX: &[u8] = b"x0x-adr0041-enroll-v1";
 /// Domain-separation prefix for the bytes a versioned record signs.
 const RECORD_MSG_PREFIX: &[u8] = b"x0x-adr0041-record-v1";
+/// Domain-separation prefix for the owner-key possession proof.
+const PROOF_MSG_PREFIX: &[u8] = b"x0x-adr0041-proof-v1";
 
-/// Wire protocol version for the SyncV1 handshake.
-pub const SYNC_PROTOCOL_VERSION: u32 = 1;
+/// Wire protocol version for the SyncV1 handshake. Bumped to 2 in review
+/// R2 (Hello carries a nonce; `Proof` frame added; vectors/records paged).
+pub const SYNC_PROTOCOL_VERSION: u32 = 2;
 
 /// Maximum size of one sync frame (length-prefixed payload). Tier-1 records
 /// are tiny; anything larger is hostile or corrupt — fail closed.
 pub const MAX_FRAME_BYTES: u32 = 256 * 1024;
+
+/// Version-vector entries per `VersionVector` frame (paging keeps any one
+/// frame far below [`MAX_FRAME_BYTES`] and the writer inside the QUIC
+/// stream window even when the peer has not started reading).
+pub const VV_ENTRIES_PER_FRAME: usize = 256;
+
+/// Records per `Records` frame.
+pub const RECORDS_PER_FRAME: usize = 16;
+
+/// Total version-vector entries a session will accept (both directions of
+/// the state space are bounded; beyond this the peer is hostile).
+pub const MAX_VECTOR_ENTRIES: usize = 4096;
+
+/// Total records a session will accept in one batch.
+pub const MAX_RECORDS_PER_SESSION: usize = 1024;
+
+/// Hard cap on stored (winning) records. Tier-1 state is small by design;
+/// exceeding this is a StoreLimit failure, never silent truncation.
+pub const MAX_STORED_RECORDS: usize = 4096;
+
+/// Maximum record key length in bytes.
+pub const MAX_KEY_BYTES: usize = 256;
+
+/// Enrollment expiry clock skew tolerance, in milliseconds (mirrors
+/// [`crate::identity::EXPIRY_CLOCK_SKEW_SECS`]).
+const ENROLL_EXPIRY_SKEW_MS: u64 = 300_000;
+
+/// Total session budget after the protocol prefix. A peer that stalls at
+/// any protocol stage holds no task beyond this.
+pub const SESSION_TIMEOUT: Duration = Duration::from_secs(60);
 
 /// File holding the owner device set, inside `<data_dir>/sync/`.
 const DEVICES_FILE: &str = "devices.json";
@@ -201,8 +253,9 @@ pub struct RecordClock {
 impl RecordClock {
     /// Whether `self` strictly beats `other` under the ADR-0041 rule:
     /// highest `version`, then highest `signed_at_ms`, then lexicographically
-    /// greatest `writer_machine`. Equal clocks beat nothing (idempotent
-    /// re-delivery), and a lower `version` never wins — rollback protection.
+    /// greatest `writer_machine`. Equal clocks beat nothing — the
+    /// equal-clock case is resolved by signed-content hash in
+    /// [`OwnerSyncStore`] so peers converge deterministically.
     #[must_use]
     pub fn beats(&self, other: &Self) -> bool {
         match self.version.cmp(&other.version) {
@@ -229,7 +282,7 @@ pub struct VersionedRecord {
     pub clock: RecordClock,
     /// Owner ML-DSA-65 public key bytes (self-authenticating record).
     pub owner_public_key: Vec<u8>,
-    /// ML-DSA-65 signature over [`VersionedRecord::canonical_message`].
+    /// ML-DSA-65 signature over the canonical message.
     pub signature: Vec<u8>,
 }
 
@@ -255,6 +308,23 @@ impl VersionedRecord {
         msg.extend_from_slice(&clock.writer_machine);
         msg.extend_from_slice(value_bytes);
         msg
+    }
+
+    /// The canonical bytes of this record (self-shaped).
+    fn canonical_bytes(&self) -> Vec<u8> {
+        let value_bytes = bincode::serialize(&self.value).unwrap_or_default();
+        Self::canonical_message(&self.kind, &self.key, &self.clock, &value_bytes)
+    }
+
+    /// BLAKE3 over the canonical bytes plus the signature — the
+    /// deterministic equal-clock tie-break. Two peers holding different
+    /// records under the same clock agree on the greater hash.
+    #[must_use]
+    pub fn record_hash(&self) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(&self.canonical_bytes());
+        hasher.update(&self.signature);
+        *hasher.finalize().as_bytes()
     }
 
     /// Sign a fresh record with the owner key.
@@ -288,16 +358,24 @@ impl VersionedRecord {
     }
 
     /// Verify the signature and that the record's kind matches its value
-    /// variant. Fail closed on any mismatch.
+    /// variant, plus structural bounds (key length). Fail closed on any
+    /// mismatch.
     ///
     /// # Errors
     ///
     /// [`SyncError::BadSignature`] on an invalid signature or malformed key
     /// material; [`SyncError::KindMismatch`] when the kind tag and value
-    /// variant disagree.
+    /// variant disagree; [`SyncError::MalformedFrame`] when the key exceeds
+    /// [`MAX_KEY_BYTES`].
     pub fn verify(&self) -> Result<(), SyncError> {
         if self.value.kind() != self.kind {
             return Err(SyncError::KindMismatch);
+        }
+        if self.key.len() > MAX_KEY_BYTES {
+            return Err(SyncError::MalformedFrame(format!(
+                "record key of {} bytes exceeds limit {MAX_KEY_BYTES}",
+                self.key.len()
+            )));
         }
         let owner_pubkey = MlDsaPublicKey::from_bytes(&self.owner_public_key)
             .map_err(|_| SyncError::BadSignature("invalid owner public key".into()))?;
@@ -335,6 +413,11 @@ pub struct OwnerEnrollment {
     pub machine_id: [u8; 32],
     /// Unix ms when the owner enrolled this machine.
     pub enrolled_at_ms: u64,
+    /// Optional expiry (Unix ms). `None` = until explicitly deleted.
+    /// [`OwnerSyncStore::is_enrolled`] checks currency, not just signature —
+    /// a stale enrollment must not keep the sync gate open (review R2).
+    #[serde(default)]
+    pub expires_at_ms: Option<u64>,
     /// Owner ML-DSA-65 public key bytes.
     pub owner_public_key: Vec<u8>,
     /// Signature over the canonical enrollment message.
@@ -342,16 +425,29 @@ pub struct OwnerEnrollment {
 }
 
 impl OwnerEnrollment {
-    fn canonical_message(machine_id: &[u8; 32], enrolled_at_ms: u64, owner_pub: &[u8]) -> Vec<u8> {
-        let mut msg = Vec::with_capacity(ENROLL_MSG_PREFIX.len() + 32 + 8 + owner_pub.len());
+    fn canonical_message(
+        machine_id: &[u8; 32],
+        enrolled_at_ms: u64,
+        expires_at_ms: Option<u64>,
+        owner_pub: &[u8],
+    ) -> Vec<u8> {
+        let mut msg = Vec::with_capacity(ENROLL_MSG_PREFIX.len() + 32 + 16 + owner_pub.len());
         msg.extend_from_slice(ENROLL_MSG_PREFIX);
         msg.extend_from_slice(machine_id);
         msg.extend_from_slice(&enrolled_at_ms.to_le_bytes());
+        match expires_at_ms {
+            Some(expiry) => {
+                msg.push(1);
+                msg.extend_from_slice(&expiry.to_le_bytes());
+            }
+            None => msg.push(0),
+        }
         msg.extend_from_slice(owner_pub);
         msg
     }
 
-    /// Sign an enrollment for `machine_id` with the owner key.
+    /// Sign an enrollment for `machine_id` with the owner key. `expires_at_ms`
+    /// bounds the enrollment's lifetime (`None` = until deleted).
     ///
     /// # Errors
     ///
@@ -360,15 +456,22 @@ impl OwnerEnrollment {
         machine_id: MachineId,
         owner: &UserKeypair,
         enrolled_at_ms: u64,
+        expires_at_ms: Option<u64>,
     ) -> Result<Self, IdentityError> {
         let owner_public_key = owner.public_key().as_bytes().to_vec();
-        let message = Self::canonical_message(&machine_id.0, enrolled_at_ms, &owner_public_key);
+        let message = Self::canonical_message(
+            &machine_id.0,
+            enrolled_at_ms,
+            expires_at_ms,
+            &owner_public_key,
+        );
         let signature = sign_with_ml_dsa(owner.secret_key(), &message).map_err(|e| {
             IdentityError::CertificateVerification(format!("enrollment signing failed: {e:?}"))
         })?;
         Ok(Self {
             machine_id: machine_id.0,
             enrolled_at_ms,
+            expires_at_ms,
             owner_public_key,
             signature: signature.as_bytes().to_vec(),
         })
@@ -391,11 +494,20 @@ impl OwnerEnrollment {
         let message = Self::canonical_message(
             &self.machine_id,
             self.enrolled_at_ms,
+            self.expires_at_ms,
             &self.owner_public_key,
         );
         verify_with_ml_dsa(&pubkey, &message, &signature)
             .map_err(|e| SyncError::BadSignature(format!("bad signature: {e:?}")))?;
         Ok(())
+    }
+
+    /// Whether the enrollment is still current at `now_ms` (expiry with
+    /// skew tolerance; `None` never expires).
+    #[must_use]
+    pub fn is_current_at(&self, now_ms: u64) -> bool {
+        self.expires_at_ms
+            .is_none_or(|expiry| now_ms <= expiry.saturating_add(ENROLL_EXPIRY_SKEW_MS))
     }
 }
 
@@ -403,7 +515,8 @@ impl OwnerEnrollment {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SyncError {
     Io(String),
-    /// Frame body exceeded [`MAX_FRAME_BYTES`] or a decode failed.
+    /// Frame body exceeded [`MAX_FRAME_BYTES`], a decode failed, or a
+    /// structural bound (key length) was violated.
     MalformedFrame(String),
     ProtocolVersion {
         local: u32,
@@ -414,6 +527,10 @@ pub enum SyncError {
     NotEnrolled {
         machine: [u8; 32],
     },
+    /// The peer's owner-key possession proof failed (challenge-response).
+    ChallengeFailed(String),
+    /// The session exceeded its total time budget.
+    SessionTimeout,
     /// A machine tried to sync with itself.
     SelfSync,
     BadSignature(String),
@@ -423,6 +540,10 @@ pub enum SyncError {
     UnknownKind {
         tag: u8,
     },
+    /// Store cardinality limit exceeded ([`MAX_STORED_RECORDS`]).
+    StoreLimit(String),
+    /// Inbound batch/vector exceeded its session cap.
+    TooManyRecords(String),
 }
 
 impl std::fmt::Display for SyncError {
@@ -437,19 +558,23 @@ impl std::fmt::Display for SyncError {
                 )
             }
             Self::OwnerMismatch => write!(f, "sync peer is not the same owner"),
-            Self::NotEnrolled { machine } => {
-                write!(
-                    f,
-                    "machine {} is not in the owner device set",
-                    hex::encode(machine)
-                )
+            Self::NotEnrolled { machine } => write!(
+                f,
+                "machine {} is not in the owner device set",
+                hex::encode(machine)
+            ),
+            Self::ChallengeFailed(e) => {
+                write!(f, "owner-key possession proof failed: {e}")
             }
+            Self::SessionTimeout => write!(f, "sync session timed out"),
             Self::SelfSync => write!(f, "refusing to sync with this machine itself"),
             Self::BadSignature(e) => write!(f, "sync signature failure: {e}"),
             Self::KindMismatch => write!(f, "record kind does not match its value variant"),
             Self::UnknownKind { tag } => {
                 write!(f, "unknown sync kind tag 0x{tag:02x} (Tier-3 allowlist)")
             }
+            Self::StoreLimit(e) => write!(f, "sync store limit: {e}"),
+            Self::TooManyRecords(e) => write!(f, "sync session record cap: {e}"),
         }
     }
 }
@@ -462,42 +587,78 @@ impl From<std::io::Error> for SyncError {
     }
 }
 
-/// Outcome of merging one inbound record.
+/// Outcome of classifying one inbound record against the stored winner.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MergeOutcome {
-    /// Stored — the record beat what we had.
+    /// Stored — the record outranks what we had.
     Accepted,
-    /// Not stored — did not beat the stored clock (stale, rollback, or
-    /// identical re-delivery). Never an error: partitions heal.
+    /// Not stored — the stored record outranks it (stale, rollback, exact
+    /// replay, or lost equal-clock hash tie-break). Never an error:
+    /// partitions heal.
     Superseded,
 }
 
-/// Per-kind version vector entry: the peer's clock for one key.
+/// Per-kind version vector entry: the peer's clock and record hash for one
+/// key. The hash makes equal-clock divergence visible so the tie-break can
+/// ship the deterministic winner (review R2 finding 3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct KindVersions {
     pub kind: SyncKind,
-    /// `(key, clock)` for every record the peer holds under the kind.
-    pub entries: Vec<(String, RecordClock)>,
+    /// `(key, clock, record_hash)` for every record the peer holds under
+    /// the kind.
+    pub entries: Vec<(String, RecordClock, [u8; 32])>,
 }
 
 /// One frame of the SyncV1 wire protocol. Length-prefixed bincode on the
 /// stream following the `SyncV1` protocol byte.
+///
+/// `VersionVector` and `Records` frames are **paged**: a session may carry
+/// several of each (bounded by [`MAX_VECTOR_ENTRIES`] /
+/// [`MAX_RECORDS_PER_SESSION`]) so a large state set never produces a frame
+/// over [`MAX_FRAME_BYTES`] (review R2 finding 5).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum SyncFrame {
-    /// Handshake: protocol version, sender machine, sender owner.
+    /// Handshake: protocol version, sender machine, sender owner, and a
+    /// fresh random nonce for the possession proof.
     Hello {
         protocol_version: u32,
         machine_id: [u8; 32],
         owner_user_id: [u8; 32],
+        nonce: [u8; 32],
     },
-    /// Per-kind version vectors (the sender's full Tier-1 clock table).
+    /// Owner-key signature over
+    /// `proof_prefix || peer_nonce || sender_machine || peer_machine || owner_user_id`
+    /// — proves the sender holds the owner key (review R2 finding 1).
+    Proof { signature: Vec<u8> },
+    /// One page of the sender's per-kind version table.
     VersionVector { kinds: Vec<KindVersions> },
-    /// Records the peer is missing or would accept.
+    /// End of the version-vector stage. The records stage follows. An
+    /// explicit terminator (rather than peeking the first records frame)
+    /// keeps both sides' write-then-read stages from deadlocking.
+    VectorEnd,
+    /// One page of records the peer is missing or would accept.
     Records { records: Vec<VersionedRecord> },
     /// Clean end of session.
     Done,
     /// Fail-closed abort with a reason (best-effort, one-way).
     Abort { reason: String },
+}
+
+/// Canonical proof message: prefix || the verifier's nonce (the nonce the
+/// PROVER is answering) || prover machine || verifier machine || owner id.
+fn proof_message(
+    nonce: &[u8; 32],
+    prover: &[u8; 32],
+    verifier: &[u8; 32],
+    owner: &[u8; 32],
+) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(PROOF_MSG_PREFIX.len() + 32 * 3 + 32);
+    msg.extend_from_slice(PROOF_MSG_PREFIX);
+    msg.extend_from_slice(nonce);
+    msg.extend_from_slice(prover);
+    msg.extend_from_slice(verifier);
+    msg.extend_from_slice(owner);
+    msg
 }
 
 /// Write one frame: `u32` big-endian length + bincode body.
@@ -552,12 +713,18 @@ pub async fn read_frame<R: AsyncRead + Unpin>(recv: &mut R) -> Result<SyncFrame,
 pub struct SessionSummary {
     pub accepted: usize,
     pub superseded: usize,
+    /// Equal-clock records with DIFFERENT signed content seen this session:
+    /// a writer equivocated (or forked). Resolved deterministically by
+    /// record hash and surfaced, never silently merged.
+    pub equivocations: usize,
     pub shipped: usize,
 }
 
 /// The local Tier-1 store: the owner device set plus the winning record for
 /// every `(kind, key)` this machine holds. Persisted as two small JSON files
-/// under `<data_dir>/sync/`, written atomically (temp file + rename).
+/// under `<data_dir>/sync/` (created at load), written atomically (temp
+/// file + rename). Every mutation PROPAGATES persistence errors — success
+/// is never reported on a swallowed write (review R2 finding 2).
 pub struct OwnerSyncStore {
     dir: PathBuf,
     records: tokio::sync::RwLock<BTreeMap<(SyncKind, String), VersionedRecord>>,
@@ -585,13 +752,30 @@ struct PersistedDevices {
     devices: Vec<OwnerEnrollment>,
 }
 
+/// Result of a batch commit: what the caller should apply/count.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommitOutcome {
+    pub accepted: Vec<VersionedRecord>,
+    pub superseded: usize,
+    pub equivocations: usize,
+}
+
 impl OwnerSyncStore {
-    /// Load (or start empty under) `<data_dir>/sync`. Corrupt or missing
-    /// files start empty — the next session re-derives Tier-1 state from a
-    /// live peer, and records are owner-signed so poison dies at verify.
-    #[must_use]
-    pub async fn load(data_dir: &Path) -> Self {
+    /// Load (or start empty under) `<data_dir>/sync`, creating the
+    /// directory. Corrupt or missing files start empty — the next session
+    /// re-derives Tier-1 state from a live peer, and records are
+    /// owner-signed so poison dies at verify.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the directory cannot be created — persistence
+    /// would silently fail forever, so construction fails instead
+    /// (review R2 finding 2).
+    pub async fn load(data_dir: &Path) -> Result<Self, SyncError> {
         let dir = data_dir.join(SYNC_DIR);
+        tokio::fs::create_dir_all(&dir).await.map_err(|e| {
+            SyncError::Io(format!("failed to create sync dir {}: {e}", dir.display()))
+        })?;
         let records = match tokio::fs::read(dir.join(RECORDS_FILE)).await {
             Ok(bytes) => serde_json::from_slice::<PersistedRecords>(&bytes)
                 .map(|p| {
@@ -615,13 +799,13 @@ impl OwnerSyncStore {
             Err(_) => BTreeMap::new(),
         };
         let (generation_tx, _) = tokio::sync::watch::channel(0);
-        Self {
+        Ok(Self {
             dir,
             records: tokio::sync::RwLock::new(records),
             devices: tokio::sync::RwLock::new(devices),
             last_session: tokio::sync::RwLock::new(BTreeMap::new()),
             generation_tx,
-        }
+        })
     }
 
     /// Write `bytes` to `path` via a unique temp file + rename (atomic for
@@ -634,54 +818,108 @@ impl OwnerSyncStore {
         tokio::fs::rename(&tmp, path).await
     }
 
-    async fn persist_records(records: &BTreeMap<(SyncKind, String), VersionedRecord>, dir: &Path) {
+    /// Persist the winning records. Errors PROPAGATE — callers never report
+    /// success on a swallowed write (review R2 finding 2).
+    async fn persist_records(
+        records: &BTreeMap<(SyncKind, String), VersionedRecord>,
+        dir: &Path,
+    ) -> Result<(), SyncError> {
         let persisted = PersistedRecords {
             records: records.values().cloned().collect(),
         };
-        if let Ok(bytes) = serde_json::to_vec(&persisted) {
-            if let Err(e) = Self::write_atomically(&dir.join(RECORDS_FILE), &bytes).await {
-                tracing::warn!("failed to persist sync records: {e}");
-            }
-        }
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|e| SyncError::Io(format!("encode records: {e}")))?;
+        Self::write_atomically(&dir.join(RECORDS_FILE), &bytes)
+            .await
+            .map_err(|e| SyncError::Io(format!("persist records: {e}")))
     }
 
-    async fn persist_devices(devices: &BTreeMap<[u8; 32], OwnerEnrollment>, dir: &Path) {
+    /// Persist the device set; errors propagate (see [`Self::persist_records`]).
+    async fn persist_devices(
+        devices: &BTreeMap<[u8; 32], OwnerEnrollment>,
+        dir: &Path,
+    ) -> Result<(), SyncError> {
         let persisted = PersistedDevices {
             devices: devices.values().cloned().collect(),
         };
-        if let Ok(bytes) = serde_json::to_vec(&persisted) {
-            if let Err(e) = Self::write_atomically(&dir.join(DEVICES_FILE), &bytes).await {
-                tracing::warn!("failed to persist sync device set: {e}");
-            }
-        }
+        let bytes = serde_json::to_vec(&persisted)
+            .map_err(|e| SyncError::Io(format!("encode devices: {e}")))?;
+        Self::write_atomically(&dir.join(DEVICES_FILE), &bytes)
+            .await
+            .map_err(|e| SyncError::Io(format!("persist devices: {e}")))
     }
 
-    /// The enrollment gate (blocker 30): is `machine` enrolled for `owner`?
+    /// The enrollment gate (blocker 30): is `machine` enrolled for `owner`
+    /// AND is that enrollment current?
     ///
-    /// Every stored enrollment is (re-)verified against `owner` here — a
-    /// corrupt or foreign-key record fails closed, so persistence poison
-    /// cannot wedge the gate open.
+    /// Every stored enrollment is (re-)verified against `owner` and its
+    /// expiry checked here — a corrupt, foreign-key, or stale record fails
+    /// closed, so persistence poison or an expired grant cannot wedge the
+    /// gate open (review R2 finding 1).
     #[must_use]
     pub async fn is_enrolled(&self, machine: &MachineId, owner: &UserId) -> bool {
         let devices = self.devices.read().await;
         devices
             .get(&machine.0)
-            .is_some_and(|e| e.verify_owner(owner).is_ok())
+            .is_some_and(|e| e.verify_owner(owner).is_ok() && e.is_current_at(now_unix_ms()))
     }
 
     /// Store a (verified-by-caller) enrollment, keeping the latest
     /// `enrolled_at_ms` per machine so a replayed older enrollment cannot
-    /// rewind the clock.
-    pub async fn enroll(&self, enrollment: OwnerEnrollment) {
+    /// rewind the clock. The new expiry replaces any previous one.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the device set cannot be persisted — the
+    /// caller must fail, not report success (review R2 finding 2).
+    pub async fn enroll(&self, enrollment: OwnerEnrollment) -> Result<(), SyncError> {
         let mut devices = self.devices.write().await;
-        let keep = devices
-            .get(&enrollment.machine_id)
+        let previous = devices.get(&enrollment.machine_id).cloned();
+        let keep = previous
+            .as_ref()
             .is_none_or(|old| enrollment.enrolled_at_ms >= old.enrolled_at_ms);
         if keep {
             devices.insert(enrollment.machine_id, enrollment.clone());
-            Self::persist_devices(&devices, &self.dir).await;
+            if let Err(e) = Self::persist_devices(&devices, &self.dir).await {
+                // Roll back so memory matches the failed disk write
+                // (review R2 finding 2).
+                match previous {
+                    Some(old) => {
+                        devices.insert(old.machine_id, old);
+                    }
+                    None => {
+                        devices.remove(&enrollment.machine_id);
+                    }
+                }
+                return Err(e);
+            }
         }
+        drop(devices);
         self.kick();
+        Ok(())
+    }
+
+    /// Remove a machine from the owner device set (the DELETE
+    /// `/sync/devices/:id` path; review R2 finding 1).
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::Io`] when the device set cannot be persisted (the
+    /// in-memory set is restored — removal never half-applies).
+    /// Returns `Ok(false)` when the machine was not enrolled.
+    pub async fn unenroll(&self, machine: &MachineId) -> Result<bool, SyncError> {
+        let mut devices = self.devices.write().await;
+        if let Some(previous) = devices.remove(&machine.0) {
+            if let Err(e) = Self::persist_devices(&devices, &self.dir).await {
+                devices.insert(previous.machine_id, previous);
+                return Err(e);
+            }
+        } else {
+            return Ok(false);
+        }
+        drop(devices);
+        self.kick();
+        Ok(true)
     }
 
     /// Enrolled machines (raw records, for surfaces).
@@ -699,27 +937,154 @@ impl OwnerSyncStore {
         self.generation_tx.subscribe()
     }
 
-    /// Merge one verified inbound record under the conflict rule.
+    /// Pure classification of `record` against `stored` under the full
+    /// conflict rule: `beats`, else equal-clock with identical content
+    /// (idempotent supersede), else equal-clock with different content
+    /// (deterministic greater-hash winner — convergence under
+    /// equivocation).
+    fn classify(record: &VersionedRecord, stored: &VersionedRecord) -> MergeOutcome {
+        if record.clock.beats(&stored.clock) {
+            return MergeOutcome::Accepted;
+        }
+        if record.clock == stored.clock {
+            if record.value == stored.value {
+                return MergeOutcome::Superseded; // exact replay
+            }
+            // Equal clock, different signed content: the greater record
+            // hash wins on every peer.
+            if record.record_hash() > stored.record_hash() {
+                return MergeOutcome::Accepted;
+            }
+        }
+        MergeOutcome::Superseded
+    }
+
+    /// Commit a verified batch atomically (review R2 finding 4): all
+    /// classification decisions are made against the live map, all accepted
+    /// records inserted, and ONE file write persists the result. On any
+    /// failure the in-memory map is rolled back and the error propagates —
+    /// a partial batch is never committed or advertised.
     ///
-    /// Verifies the owner signature first — fail closed (error, session
-    /// aborts) on any signature failure; a merely stale or replayed record is
-    /// [`MergeOutcome::Superseded`] (anti-rollback, not an error).
+    /// Records must have been verified (`verify_owner`) by the caller.
+    ///
+    /// # Errors
+    ///
+    /// [`SyncError::StoreLimit`] when the batch would exceed
+    /// [`MAX_STORED_RECORDS`]; [`SyncError::Io`] when persistence fails.
+    pub async fn commit_batch(
+        &self,
+        batch: Vec<VersionedRecord>,
+        owner: &UserId,
+    ) -> Result<CommitOutcome, SyncError> {
+        let mut records = self.records.write().await;
+        let mut touched: Vec<((SyncKind, String), Option<VersionedRecord>)> = Vec::new();
+        let mut outcome = CommitOutcome::default();
+        let result = (|| -> Result<(), SyncError> {
+            for record in batch {
+                // Re-verify inside the lock: the caller's verification and
+                // the commit must not be separated by a store mutation.
+                record.verify_owner(owner)?;
+                if records.len() >= MAX_STORED_RECORDS
+                    && !records.contains_key(&(record.kind, record.key.clone()))
+                {
+                    return Err(SyncError::StoreLimit(format!(
+                        "store at capacity ({MAX_STORED_RECORDS} records)"
+                    )));
+                }
+                let stored = records.get(&(record.kind, record.key.clone()));
+                // Equal clock with different signed content is an
+                // equivocation whichever side wins the hash tie-break —
+                // surfaced, never silently merged (review R2 finding 3).
+                if let Some(existing) = stored {
+                    if existing.clock == record.clock && existing.value != record.value {
+                        outcome.equivocations += 1;
+                        tracing::warn!(
+                            target: "x0x::owner_sync",
+                            kind = ?existing.kind,
+                            key = %existing.key,
+                            "equal-clock equivocation resolved deterministically by record hash"
+                        );
+                    }
+                }
+                let decision = stored.map(|existing| Self::classify(&record, existing));
+                match decision {
+                    None => {
+                        touched.push(((record.kind, record.key.clone()), None));
+                        records.insert((record.kind, record.key.clone()), record.clone());
+                        outcome.accepted.push(record);
+                    }
+                    Some(MergeOutcome::Accepted) => {
+                        if let Some(prev) =
+                            records.insert((record.kind, record.key.clone()), record.clone())
+                        {
+                            touched.push(((record.kind, record.key.clone()), Some(prev)));
+                        }
+                        outcome.accepted.push(record);
+                    }
+                    Some(MergeOutcome::Superseded) => {
+                        outcome.superseded += 1;
+                    }
+                }
+            }
+            Ok(())
+        })();
+        match result {
+            Ok(()) => {
+                if outcome.accepted.is_empty() {
+                    return Ok(outcome); // nothing new — no write needed
+                }
+                match Self::persist_records(&records, &self.dir).await {
+                    Ok(()) => {
+                        drop(records);
+                        self.kick();
+                        Ok(outcome)
+                    }
+                    Err(e) => {
+                        Self::rollback(&mut records, &touched);
+                        Err(e)
+                    }
+                }
+            }
+            Err(e) => {
+                Self::rollback(&mut records, &touched);
+                Err(e)
+            }
+        }
+    }
+
+    /// Restore the in-memory map to its pre-batch state.
+    fn rollback(
+        records: &mut BTreeMap<(SyncKind, String), VersionedRecord>,
+        touched: &[((SyncKind, String), Option<VersionedRecord>)],
+    ) {
+        for ((kind, key), previous) in touched {
+            match previous {
+                Some(prev) => {
+                    records.insert((*kind, key.clone()), prev.clone());
+                }
+                None => {
+                    records.remove(&(*kind, key.clone()));
+                }
+            }
+        }
+    }
+
+    /// Merge one verified inbound record — a single-record batch commit.
+    ///
+    /// # Errors
+    ///
+    /// See [`VersionedRecord::verify_owner`] and [`Self::commit_batch`].
     pub async fn merge_record(
         &self,
         record: VersionedRecord,
         owner: &UserId,
     ) -> Result<MergeOutcome, SyncError> {
-        record.verify_owner(owner)?;
-        let mut records = self.records.write().await;
-        let stored = records.get(&(record.kind, record.key.clone()));
-        match stored {
-            Some(existing) if !record.clock.beats(&existing.clock) => Ok(MergeOutcome::Superseded),
-            _ => {
-                records.insert((record.kind, record.key.clone()), record);
-                Self::persist_records(&records, &self.dir).await;
-                Ok(MergeOutcome::Accepted)
-            }
-        }
+        let outcome = self.commit_batch(vec![record], owner).await?;
+        Ok(if outcome.accepted.is_empty() {
+            MergeOutcome::Superseded
+        } else {
+            MergeOutcome::Accepted
+        })
     }
 
     /// Mint a local record for `(kind, key)` from `desired`: no-op when the
@@ -728,7 +1093,8 @@ impl OwnerSyncStore {
     ///
     /// # Errors
     ///
-    /// Propagates signing failures from [`VersionedRecord::sign`].
+    /// [`SyncError::BadSignature`] when signing fails; [`SyncError::Io`]
+    /// when persistence fails (never swallowed — review R2 finding 2).
     pub async fn mint(
         &self,
         kind: SyncKind,
@@ -736,7 +1102,7 @@ impl OwnerSyncStore {
         desired: &SyncValue,
         owner: &UserKeypair,
         writer_machine: MachineId,
-    ) -> Result<(), IdentityError> {
+    ) -> Result<(), SyncError> {
         let now_ms = now_unix_ms();
         let mut records = self.records.write().await;
         let stored = records.get(&(kind, key.to_string()));
@@ -749,23 +1115,28 @@ impl OwnerSyncStore {
             signed_at_ms: now_ms,
             writer_machine: writer_machine.0,
         };
-        let record = VersionedRecord::sign(kind, key, desired, clock, owner)?;
-        records.insert((kind, key.to_string()), record);
-        Self::persist_records(&records, &self.dir).await;
-        drop(records);
-        self.kick();
-        Ok(())
-    }
-
-    /// Test-only: insert a pre-built record WITHOUT verification, so
-    /// integration tests can simulate a compromised writer whose forgery
-    /// the receiving side must reject. Never call from production code —
-    /// every real path (`mint`, `merge_record`) verifies signatures.
-    #[doc(hidden)]
-    pub async fn records_insert_for_testing(&self, record: VersionedRecord) {
-        let mut records = self.records.write().await;
-        records.insert((record.kind, record.key.clone()), record);
-        Self::persist_records(&records, &self.dir).await;
+        let record = VersionedRecord::sign(kind, key, desired, clock, owner)
+            .map_err(|e| SyncError::BadSignature(format!("mint: {e}")))?;
+        let previous = records.insert((kind, key.to_string()), record);
+        match Self::persist_records(&records, &self.dir).await {
+            Ok(()) => {
+                drop(records);
+                self.kick();
+                Ok(())
+            }
+            Err(e) => {
+                // Roll back so memory matches the failed disk write.
+                match previous {
+                    Some(prev) => {
+                        records.insert((kind, key.to_string()), prev);
+                    }
+                    None => {
+                        records.remove(&(kind, key.to_string()));
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Full record snapshot (winners only), for surfaces and sessions.
@@ -773,15 +1144,16 @@ impl OwnerSyncStore {
         self.records.read().await.values().cloned().collect()
     }
 
-    /// The per-kind version vectors for the handshake.
+    /// The per-kind version table (with record hashes) for the handshake.
     pub async fn version_vector(&self) -> Vec<KindVersions> {
         let records = self.records.read().await;
-        let mut by_kind: BTreeMap<SyncKind, Vec<(String, RecordClock)>> = BTreeMap::new();
+        let mut by_kind: BTreeMap<SyncKind, Vec<(String, RecordClock, [u8; 32])>> = BTreeMap::new();
         for ((kind, key), record) in records.iter() {
-            by_kind
-                .entry(*kind)
-                .or_default()
-                .push((key.clone(), record.clock));
+            by_kind.entry(*kind).or_default().push((
+                key.clone(),
+                record.clock,
+                record.record_hash(),
+            ));
         }
         SyncKind::ALL
             .into_iter()
@@ -792,23 +1164,38 @@ impl OwnerSyncStore {
             .collect()
     }
 
-    /// Records the peer is missing or would accept under [`RecordClock`].
+    /// Records the peer is missing or would accept under the full conflict
+    /// rule (`beats`, or equal clock with a greater record hash — so the
+    /// deterministic equal-clock winner always ships; review R2 finding 3).
     pub async fn records_for_peer(&self, peer_vector: &[KindVersions]) -> Vec<VersionedRecord> {
-        let peer_clocks: BTreeMap<(SyncKind, String), RecordClock> = peer_vector
+        struct PeerEntry {
+            clock: RecordClock,
+            hash: [u8; 32],
+        }
+        let peer_entries: BTreeMap<(SyncKind, String), PeerEntry> = peer_vector
             .iter()
             .flat_map(|kv| {
-                kv.entries
-                    .iter()
-                    .map(move |(k, c)| ((kv.kind, k.clone()), *c))
+                kv.entries.iter().map(move |(k, c, h)| {
+                    (
+                        (kv.kind, k.clone()),
+                        PeerEntry {
+                            clock: *c,
+                            hash: *h,
+                        },
+                    )
+                })
             })
             .collect();
         let records = self.records.read().await;
         records
             .iter()
             .filter(
-                |((kind, key), record)| match peer_clocks.get(&(*kind, key.clone())) {
+                |((kind, key), record)| match peer_entries.get(&(*kind, key.clone())) {
                     None => true,
-                    Some(peer_clock) => record.clock.beats(peer_clock),
+                    Some(peer) => {
+                        record.clock.beats(&peer.clock)
+                            || (record.clock == peer.clock && record.record_hash() > peer.hash)
+                    }
                 },
             )
             .map(|(_, record)| record.clone())
@@ -831,6 +1218,17 @@ impl OwnerSyncStore {
     pub async fn session_statuses(&self) -> BTreeMap<[u8; 32], DeviceSyncStatus> {
         self.last_session.read().await.clone()
     }
+
+    /// Test-only: insert a pre-built record WITHOUT verification, so
+    /// integration tests can simulate a compromised writer whose forgery
+    /// the receiving side must reject. Never call from production code —
+    /// every real path (`mint`, `commit_batch`) verifies signatures.
+    #[doc(hidden)]
+    pub async fn records_insert_for_testing(&self, record: VersionedRecord) {
+        let mut records = self.records.write().await;
+        records.insert((record.kind, record.key.clone()), record);
+        let _ = Self::persist_records(&records, &self.dir).await;
+    }
 }
 
 /// Unix epoch milliseconds.
@@ -841,26 +1239,74 @@ fn now_unix_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Run one fail-closed sync session over the two halves of a SyncV1 stream.
-///
-/// Both sides run this same symmetric protocol: Hello → version vectors →
-/// records both ways → Done. The caller has already cleared the ADR-0022
-/// machine identity gates; this function enforces the same-owner +
-/// enrollment gates (blocker 30) and verifies EVERY record's owner signature
-/// (fail closed on any failure).
-///
-/// `on_accept` fires for each record this side stored, so callers can apply
-/// Tier-1 state to live daemon surfaces.
+/// A fresh random 32-byte nonce.
+fn fresh_nonce() -> [u8; 32] {
+    use rand::RngCore;
+    let mut nonce = [0u8; 32];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    nonce
+}
+
+/// Run one fail-closed sync session over the two halves of a SyncV1 stream
+/// under the default [`SESSION_TIMEOUT`] budget.
 ///
 /// # Errors
 ///
-/// Any [`SyncError`] aborts the session; the store keeps whatever verified
-/// records preceded the failure.
+/// Any [`SyncError`] aborts the session; see
+/// [`run_sync_session_with_timeout`].
 pub async fn run_sync_session<S, R, F>(
     send: &mut S,
     recv: &mut R,
     store: &OwnerSyncStore,
-    owner: &UserId,
+    owner: &UserKeypair,
+    local_machine: &MachineId,
+    peer_machine: &MachineId,
+    on_accept: F,
+) -> Result<SessionSummary, SyncError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnMut(&VersionedRecord),
+{
+    run_sync_session_with_timeout(
+        SESSION_TIMEOUT,
+        send,
+        recv,
+        store,
+        owner,
+        local_machine,
+        peer_machine,
+        on_accept,
+    )
+    .await
+}
+
+/// [`run_sync_session`] with an explicit total budget (tests use short
+/// ones; production uses [`SESSION_TIMEOUT`]). A peer that stalls at any
+/// protocol stage — after the transport-level protocol prefix — is dropped
+/// when the budget elapses, never held indefinitely (review R2 finding 5).
+///
+/// Both sides run the same symmetric protocol: Hello (with nonce) → mutual
+/// owner-key possession Proof → paged version vectors → paged records both
+/// ways → Done → ONE atomic local commit of the verified batch. The caller
+/// has already cleared the ADR-0022 machine identity gates; this function
+/// enforces the same-owner + enrollment + possession gates (blocker 30) and
+/// verifies EVERY record before anything is committed (review R2 finding 4).
+///
+/// `on_accept` fires for each record committed by this session, after the
+/// clean `Done`, so callers can apply Tier-1 state to live daemon surfaces.
+///
+/// # Errors
+///
+/// Any [`SyncError`] aborts the session with NOTHING from the inbound batch
+/// committed.
+#[allow(clippy::too_many_arguments)]
+pub async fn run_sync_session_with_timeout<S, R, F>(
+    budget: Duration,
+    send: &mut S,
+    recv: &mut R,
+    store: &OwnerSyncStore,
+    owner: &UserKeypair,
     local_machine: &MachineId,
     peer_machine: &MachineId,
     mut on_accept: F,
@@ -870,31 +1316,66 @@ where
     R: AsyncRead + Unpin,
     F: FnMut(&VersionedRecord),
 {
+    tokio::time::timeout(
+        budget,
+        run_sync_session_inner(
+            send,
+            recv,
+            store,
+            owner,
+            local_machine,
+            peer_machine,
+            &mut on_accept,
+        ),
+    )
+    .await
+    .map_err(|_| SyncError::SessionTimeout)?
+}
+
+/// The session body (no timeout wrapper).
+async fn run_sync_session_inner<S, R, F>(
+    send: &mut S,
+    recv: &mut R,
+    store: &OwnerSyncStore,
+    owner: &UserKeypair,
+    local_machine: &MachineId,
+    peer_machine: &MachineId,
+    on_accept: &mut F,
+) -> Result<SessionSummary, SyncError>
+where
+    S: AsyncWrite + Unpin,
+    R: AsyncRead + Unpin,
+    F: FnMut(&VersionedRecord),
+{
+    let owner_id = owner.user_id();
     let mut summary = SessionSummary::default();
 
-    // Same-owner gate: a peer machine that is not enrolled locally never
-    // gets past the first byte (blocker 30).
+    // Same-owner gate: a peer machine that is not enrolled locally (and
+    // current) never gets past the first byte (blocker 30).
     if peer_machine.0 == local_machine.0 {
         return Err(SyncError::SelfSync);
     }
-    if !store.is_enrolled(peer_machine, owner).await {
+    if !store.is_enrolled(peer_machine, &owner_id).await {
         return Err(SyncError::NotEnrolled {
             machine: peer_machine.0,
         });
     }
 
-    // Hello both ways.
+    // Hello both ways (each side contributes a fresh nonce).
+    let local_nonce = fresh_nonce();
     let hello = SyncFrame::Hello {
         protocol_version: SYNC_PROTOCOL_VERSION,
         machine_id: local_machine.0,
-        owner_user_id: owner.0,
+        owner_user_id: owner_id.0,
+        nonce: local_nonce,
     };
     write_frame(send, &hello).await?;
-    match read_frame(recv).await? {
+    let peer_nonce = match read_frame(recv).await? {
         SyncFrame::Hello {
             protocol_version,
             machine_id,
             owner_user_id,
+            nonce,
         } => {
             if protocol_version != SYNC_PROTOCOL_VERSION {
                 return Err(SyncError::ProtocolVersion {
@@ -902,7 +1383,7 @@ where
                     remote: protocol_version,
                 });
             }
-            if owner_user_id != owner.0 {
+            if owner_user_id != owner_id.0 {
                 return Err(SyncError::OwnerMismatch);
             }
             if machine_id != peer_machine.0 {
@@ -911,119 +1392,211 @@ where
                     "hello machine differs from transport peer".into(),
                 ));
             }
+            nonce
         }
         other => {
             return Err(SyncError::MalformedFrame(format!(
                 "expected hello, got {other:?}"
             )));
         }
-    }
+    };
 
-    // Version vectors both ways.
-    let local_vector = store.version_vector().await;
+    // Mutual owner-key possession proof (review R2 finding 1): each side
+    // signs the PEER's nonce bound to both machines and the owner id, and
+    // verifies the peer's proof against its OWN nonce. A machine that
+    // merely echoes the victim's owner id — without holding the owner key —
+    // cannot produce the proof and learns nothing.
+    let proof_msg = proof_message(&peer_nonce, &local_machine.0, &peer_machine.0, &owner_id.0);
+    let proof_sig = sign_with_ml_dsa(owner.secret_key(), &proof_msg)
+        .map_err(|e| SyncError::ChallengeFailed(format!("signing: {e:?}")))?;
     write_frame(
         send,
-        &SyncFrame::VersionVector {
-            kinds: local_vector,
+        &SyncFrame::Proof {
+            signature: proof_sig.as_bytes().to_vec(),
         },
     )
     .await?;
-    let peer_vector = match read_frame(recv).await? {
-        SyncFrame::VersionVector { kinds } => kinds,
-        other => {
-            return Err(SyncError::MalformedFrame(format!(
-                "expected version vector, got {other:?}"
-            )));
-        }
-    };
-
-    // Ship what the peer lacks; receive what we lack. Every inbound record
-    // is owner-verified — one forgery aborts the whole session.
-    let to_ship = store.records_for_peer(&peer_vector).await;
-    summary.shipped = to_ship.len();
-    write_frame(send, &SyncFrame::Records { records: to_ship }).await?;
-    let accepted: Vec<VersionedRecord> = match read_frame(recv).await? {
-        SyncFrame::Records { records } => {
-            let mut accepted = Vec::new();
-            for record in records {
-                match store.merge_record(record.clone(), owner).await {
-                    Ok(MergeOutcome::Accepted) => {
-                        summary.accepted += 1;
-                        accepted.push(store_last_winner(store, &record).await);
-                    }
-                    Ok(MergeOutcome::Superseded) => {
-                        summary.superseded += 1;
-                    }
-                    Err(e) => {
-                        let _ = write_frame(
-                            send,
-                            &SyncFrame::Abort {
-                                reason: e.to_string(),
-                            },
-                        )
-                        .await;
-                        return Err(e);
-                    }
-                }
-            }
-            accepted
-        }
-        other => {
-            return Err(SyncError::MalformedFrame(format!(
-                "expected records, got {other:?}"
-            )));
-        }
-    };
-
-    // Done both ways.
-    write_frame(send, &SyncFrame::Done).await?;
     match read_frame(recv).await? {
-        SyncFrame::Done => {}
-        SyncFrame::Abort { reason } => {
-            return Err(SyncError::MalformedFrame(format!("peer aborted: {reason}")));
+        SyncFrame::Proof { signature } => {
+            let expected_msg =
+                proof_message(&local_nonce, &peer_machine.0, &local_machine.0, &owner_id.0);
+            let sig = MlDsaSignature::from_bytes(&signature)
+                .map_err(|e| SyncError::ChallengeFailed(format!("invalid proof format: {e:?}")))?;
+            verify_with_ml_dsa(owner.public_key(), &expected_msg, &sig)
+                .map_err(|e| SyncError::ChallengeFailed(format!("bad proof: {e:?}")))?;
         }
         other => {
             return Err(SyncError::MalformedFrame(format!(
-                "expected done, got {other:?}"
+                "expected proof, got {other:?}"
             )));
         }
     }
 
-    // Apply accepted records only after the clean Done, so an aborted
-    // session never mutates live daemon state. (The stored winner is
-    // re-read: a later record in the same batch may have superseded it.)
-    for record in accepted {
+    // Paged version vectors both ways (bounded, explicitly terminated).
+    let local_vector = store.version_vector().await;
+    write_paged_vector(send, &local_vector).await?;
+    let peer_vector = read_paged_vector(recv).await?;
+
+    // Compute the outbound set from the FULL peer vector, then ship it in
+    // bounded pages, ending with Done ("finished shipping"). Done is sent
+    // BEFORE reading the peer's records — both sides' reads must be able
+    // to complete independently of their own send state.
+    let to_ship = store.records_for_peer(&peer_vector).await;
+    summary.shipped = to_ship.len();
+    write_paged_records(send, &to_ship).await?;
+    write_frame(send, &SyncFrame::Done).await?;
+
+    // Receive the peer's paged records (terminated by their Done or an
+    // Abort); verify EVERY record before any commit — one forgery aborts
+    // with nothing stored (review R2 finding 4).
+    let inbound = read_paged_records(recv).await?;
+    let mut verified = Vec::with_capacity(inbound.len());
+    for record in inbound {
+        record.verify_owner(&owner_id)?;
+        verified.push(record);
+    }
+    let outcome = store.commit_batch(verified, &owner_id).await?;
+    summary.accepted = outcome.accepted.len();
+    summary.superseded = outcome.superseded;
+    summary.equivocations = outcome.equivocations;
+
+    // Apply committed records after the clean Done so partial sessions never
+    // mutate live daemon state.
+    for record in outcome.accepted {
         on_accept(&record);
     }
     Ok(summary)
 }
 
-/// The stored winner for a freshly merged record's `(kind, key)`.
-async fn store_last_winner(store: &OwnerSyncStore, merged: &VersionedRecord) -> VersionedRecord {
-    store
-        .records_snapshot()
-        .await
-        .into_iter()
-        .find(|r| r.kind == merged.kind && r.key == merged.key)
-        .unwrap_or_else(|| merged.clone())
+/// Write the version table as bounded pages (always at least one page, so
+/// the reader's stage loop always advances).
+async fn write_paged_vector<S: AsyncWrite + Unpin>(
+    send: &mut S,
+    vector: &[KindVersions],
+) -> Result<(), SyncError> {
+    // Each frame carries one kind with at most VV_ENTRIES_PER_FRAME entries.
+    let mut pages: Vec<KindVersions> = Vec::new();
+    for kv in vector {
+        for chunk in kv.entries.chunks(VV_ENTRIES_PER_FRAME) {
+            pages.push(KindVersions {
+                kind: kv.kind,
+                entries: chunk.to_vec(),
+            });
+        }
+    }
+    for page in pages {
+        write_frame(send, &SyncFrame::VersionVector { kinds: vec![page] }).await?;
+    }
+    // Explicit stage terminator — see [`SyncFrame::VectorEnd`].
+    write_frame(send, &SyncFrame::VectorEnd).await?;
+    Ok(())
 }
+/// Read paged version frames until the explicit [`SyncFrame::VectorEnd`]
+/// terminator. Total entries are capped ([`MAX_VECTOR_ENTRIES`]).
+async fn read_paged_vector<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<Vec<KindVersions>, SyncError> {
+    let mut merged: BTreeMap<SyncKind, Vec<(String, RecordClock, [u8; 32])>> = BTreeMap::new();
+    let mut total = 0usize;
+    loop {
+        match read_frame(recv).await? {
+            SyncFrame::VersionVector { kinds } => {
+                for kv in kinds {
+                    total += kv.entries.len();
+                    if total > MAX_VECTOR_ENTRIES {
+                        return Err(SyncError::TooManyRecords(format!(
+                            "version vector exceeds {MAX_VECTOR_ENTRIES} entries"
+                        )));
+                    }
+                    merged.entry(kv.kind).or_default().extend(kv.entries);
+                }
+            }
+            SyncFrame::VectorEnd => {
+                return Ok(SyncKind::ALL
+                    .into_iter()
+                    .map(|kind| KindVersions {
+                        kind,
+                        entries: merged.remove(&kind).unwrap_or_default(),
+                    })
+                    .collect());
+            }
+            other => {
+                return Err(SyncError::MalformedFrame(format!(
+                    "expected version-vector page or end, got {other:?}"
+                )));
+            }
+        }
+    }
+}
+
+/// Read the peer's paged records until `Done`/`Abort`. Capped at
+/// [`MAX_RECORDS_PER_SESSION`].
+async fn read_paged_records<R: AsyncRead + Unpin>(
+    recv: &mut R,
+) -> Result<Vec<VersionedRecord>, SyncError> {
+    let mut records = Vec::new();
+    loop {
+        match read_frame(recv).await? {
+            SyncFrame::Records { records: page } => {
+                records.extend(page);
+                if records.len() > MAX_RECORDS_PER_SESSION {
+                    return Err(SyncError::TooManyRecords(format!(
+                        "inbound batch exceeds {MAX_RECORDS_PER_SESSION} records"
+                    )));
+                }
+            }
+            SyncFrame::Done => break,
+            SyncFrame::Abort { reason } => {
+                return Err(SyncError::Io(format!("peer aborted: {reason}")));
+            }
+            other => {
+                return Err(SyncError::MalformedFrame(format!(
+                    "expected records page or done, got {other:?}"
+                )));
+            }
+        }
+    }
+    Ok(records)
+}
+
+/// Write records as bounded pages (always at least one page).
+async fn write_paged_records<S: AsyncWrite + Unpin>(
+    send: &mut S,
+    records: &[VersionedRecord],
+) -> Result<(), SyncError> {
+    if records.is_empty() {
+        write_frame(
+            send,
+            &SyncFrame::Records {
+                records: Vec::new(),
+            },
+        )
+        .await?;
+        return Ok(());
+    }
+    for page in records.chunks(RECORDS_PER_FRAME) {
+        write_frame(
+            send,
+            &SyncFrame::Records {
+                records: page.to_vec(),
+            },
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 /// Default period between automatic sync passes (also wakes on any local
 /// Tier-1 change via the store's generation channel).
-pub const DEFAULT_SYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(60);
+pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
-/// Current daemon self-profile names, best-effort snapshot.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct SyncProfileNames {
-    pub human_name: Option<String>,
-    pub display_name: Option<String>,
-    pub machine_name: Option<String>,
-}
+/// Concurrent sync sessions this daemon will run at once (inbound +
+/// outbound combined). The acceptor's bounded queue drops (resets) streams
+/// beyond this — an enrolled peer cannot wedge an unbounded task set
+/// (review R2 finding 5).
+pub const MAX_CONCURRENT_SESSIONS: usize = 16;
 
-/// Live daemon view the server installs into [`OwnerSyncService`] after
-/// `AppState` exists. Keeps this module decoupled from server internals:
-/// reads are best-effort (a contended lock reads as "unchanged" and the
-/// next pass retries), applies are fire-and-forget (the implementation
-/// owns locking and persistence).
+/// Live daemon view contract; implemented by the server subtree.
 pub trait SyncDaemonView: Send + Sync + 'static {
     /// Snapshot of the current self-profile names.
     fn profile_names(&self) -> SyncProfileNames;
@@ -1036,6 +1609,14 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
+}
+
+/// Current daemon self-profile names, best-effort snapshot.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SyncProfileNames {
+    pub human_name: Option<String>,
+    pub display_name: Option<String>,
+    pub machine_name: Option<String>,
 }
 
 /// Daemon-resident Tier-1 sync service (the `ForwardService` pattern for
@@ -1052,30 +1633,35 @@ pub struct OwnerSyncService {
     journal_path: Option<PathBuf>,
     view: std::sync::RwLock<Option<Arc<dyn SyncDaemonView>>>,
     tasks: tokio::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>,
+    session_permits: Arc<tokio::sync::Semaphore>,
 }
 
 impl OwnerSyncService {
-    /// Build the service, load its store from `<data_dir>/sync`, and
-    /// register the `SyncV1` acceptor (single-acceptor rule — a conflict is
-    /// a hard startup error). The acceptor is moved into its drain task,
-    /// which deregisters it when the task ends.
+    /// Build the service, load its store from `<data_dir>/sync` (creating
+    /// the directory — failure is a hard startup error, review R2 finding
+    /// 2), and register the `SyncV1` acceptor (single-acceptor rule).
     ///
     /// # Errors
     ///
     /// [`crate::error::NetworkError::StreamAcceptorConflict`] when another
-    /// consumer already owns `SyncV1`.
+    /// consumer already owns `SyncV1`; storage errors when the sync
+    /// directory cannot be created.
     pub async fn new(
         agent: Arc<crate::Agent>,
         data_dir: &Path,
     ) -> crate::error::NetworkResult<Arc<Self>> {
         let acceptor = agent.register_stream_acceptor(crate::streams::StreamProtocol::SyncV1)?;
         let journal_path = agent.cert_journal_path().map(Path::to_path_buf);
+        let store = OwnerSyncStore::load(data_dir)
+            .await
+            .map_err(|e| crate::error::NetworkError::CacheError(format!("sync store: {e}")))?;
         let service = Arc::new(Self {
             agent,
-            store: Arc::new(OwnerSyncStore::load(data_dir).await),
+            store: Arc::new(store),
             journal_path,
             view: std::sync::RwLock::new(None),
             tasks: tokio::sync::Mutex::new(Vec::new()),
+            session_permits: Arc::new(tokio::sync::Semaphore::new(MAX_CONCURRENT_SESSIONS)),
         });
         service.spawn_acceptor_loop(acceptor).await;
         Ok(service)
@@ -1118,7 +1704,7 @@ impl OwnerSyncService {
     }
 
     /// Spawn the inbound acceptor drain loop. Each accepted stream is
-    /// enrollment-gated, then runs one session.
+    /// enrollment-gated, then runs one session under a concurrency permit.
     async fn spawn_acceptor_loop(self: &Arc<Self>, mut acceptor: crate::streams::StreamAcceptor) {
         let service = Arc::clone(self);
         let task = tokio::spawn(async move {
@@ -1133,13 +1719,23 @@ impl OwnerSyncService {
     /// Inbound path: the ADR-0022 machine identity gates have already
     /// cleared in the shared accept loop; enforce the owner device set
     /// (blocker 30) — an unenrolled machine's stream is dropped (reset)
-    /// with zero application bytes read.
+    /// with zero application bytes read. A session permit is REQUIRED
+    /// before any protocol byte: without one the stream is dropped, so a
+    /// flood of streams cannot wedge an unbounded task set.
     async fn handle_inbound(&self, stream: crate::streams::PeerStream) {
-        let Some((owner, local_machine)) = self.owner_and_machine() else {
+        let Some(owner_kp) = self.owner_kp() else {
             return;
         };
+        let Ok(permit) = self.session_permits.clone().try_acquire_owned() else {
+            tracing::warn!(
+                target: "x0x::owner_sync",
+                "SyncV1 stream dropped: session limit reached"
+            );
+            return; // drop => reset, fail closed and bounded
+        };
+        let local_machine = self.agent.machine_id();
         let peer = stream.peer();
-        if !self.store.is_enrolled(&peer, &owner).await {
+        if !self.store.is_enrolled(&peer, &owner_kp.user_id()).await {
             tracing::warn!(
                 target: "x0x::owner_sync",
                 machine = %hex::encode(peer.0),
@@ -1152,12 +1748,13 @@ impl OwnerSyncService {
             &mut send,
             &mut recv,
             &self.store,
-            &owner,
+            owner_kp,
             &local_machine,
             &peer,
             |record| self.apply_record(record),
         )
         .await;
+        drop(permit);
         match result {
             Ok(summary) => {
                 tracing::debug!(
@@ -1165,6 +1762,7 @@ impl OwnerSyncService {
                     machine = %hex::encode(peer.0),
                     accepted = summary.accepted,
                     superseded = summary.superseded,
+                    equivocations = summary.equivocations,
                     shipped = summary.shipped,
                     "Tier-1 sync session complete"
                 );
@@ -1185,10 +1783,10 @@ impl OwnerSyncService {
     /// Dial `machine` and run one session as the initiator. Errors are
     /// strings by design: dial outcomes are logged, never fatal to the pass.
     async fn dial_and_sync(&self, machine: &MachineId) -> Result<SessionSummary, String> {
-        let (owner, local_machine) = self
-            .owner_and_machine()
-            .ok_or_else(|| "no owner key".to_string())?;
-        if !self.store.is_enrolled(machine, &owner).await {
+        let owner_kp = self.owner_kp().ok_or_else(|| "no owner key".to_string())?;
+        let owner_id = owner_kp.user_id();
+        let local_machine = self.agent.machine_id();
+        if !self.store.is_enrolled(machine, &owner_id).await {
             return Err(format!(
                 "machine {} is not enrolled",
                 hex::encode(machine.0)
@@ -1213,11 +1811,17 @@ impl OwnerSyncService {
             .map_err(|e| e.to_string())?;
         let peer = stream.peer();
         let (mut send, mut recv) = stream.into_split();
+        let _permit = self
+            .session_permits
+            .clone()
+            .acquire_owned()
+            .await
+            .map_err(|e| e.to_string())?;
         let result = run_sync_session(
             &mut send,
             &mut recv,
             &self.store,
-            &owner,
+            owner_kp,
             &local_machine,
             &peer,
             |record| self.apply_record(record),
@@ -1256,7 +1860,8 @@ impl OwnerSyncService {
     }
 
     /// Mint local Tier-1 records from live daemon state (no-op when a kind
-    /// is unchanged since its stored winner).
+    /// is unchanged since its stored winner). Persistence failures are
+    /// surfaced per-kind; a failed mint is retried next pass.
     async fn reconcile_local_state(&self) -> Result<(), SyncError> {
         let Some(owner_kp) = self.owner_kp() else {
             return Ok(()); // ownerless installs mint nothing
@@ -1348,7 +1953,7 @@ impl OwnerSyncService {
         }
     }
 
-    /// Apply an accepted record to live daemon state (post-Done only).
+    /// Apply an accepted record to live daemon state (post-commit only).
     ///
     /// Exhaustive over [`SyncValue`] — Tier-3 kinds cannot reach here.
     fn apply_record(&self, record: &VersionedRecord) {
@@ -1474,6 +2079,30 @@ mod tests {
         }
     }
 
+    fn clock(version: u64, ts: u64, writer: u8) -> RecordClock {
+        RecordClock {
+            version,
+            signed_at_ms: ts,
+            writer_machine: machine(writer).0,
+        }
+    }
+
+    fn sign_names(
+        key: &str,
+        display: &str,
+        clock: RecordClock,
+        owner: &UserKeypair,
+    ) -> VersionedRecord {
+        VersionedRecord::sign(
+            SyncKind::MachineNames,
+            key,
+            &names_value(display),
+            clock,
+            owner,
+        )
+        .expect("sign")
+    }
+
     #[tokio::test]
     async fn conflict_rule_orders_version_then_time_then_writer() {
         // WHY: blocker 31 — the exact tie-break chain must hold.
@@ -1515,7 +2144,7 @@ mod tests {
         // WHY: rollback protection — version < stored is never accepted,
         // and equal-version-but-older is superseded, not stored.
         let dir = tempfile::tempdir().expect("tmpdir");
-        let store = OwnerSyncStore::load(dir.path()).await;
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
         let owner = owner_kp(1);
         let owner_id = owner.user_id();
         let key = hex::encode(machine(1).0);
@@ -1530,36 +2159,14 @@ mod tests {
             .await
             .expect("mint v1");
         // Bump to a high version by hand.
-        let high = VersionedRecord::sign(
-            SyncKind::MachineNames,
-            &key,
-            &names_value("v9"),
-            RecordClock {
-                version: 9,
-                signed_at_ms: 1,
-                writer_machine: machine(2).0,
-            },
-            &owner,
-        )
-        .expect("sign v9");
+        let high = sign_names(&key, "v9", clock(9, 1, 2), &owner);
         assert_eq!(
             store.merge_record(high, &owner_id).await.expect("merge v9"),
             MergeOutcome::Accepted
         );
 
         // Rollback: version 3 (and 9-with-older-clock) rejected.
-        let rollback = VersionedRecord::sign(
-            SyncKind::MachineNames,
-            &key,
-            &names_value("old"),
-            RecordClock {
-                version: 3,
-                signed_at_ms: 999,
-                writer_machine: machine(3).0,
-            },
-            &owner,
-        )
-        .expect("sign rollback");
+        let rollback = sign_names(&key, "old", clock(3, 999, 3), &owner);
         assert_eq!(
             store
                 .merge_record(rollback, &owner_id)
@@ -1567,18 +2174,7 @@ mod tests {
                 .expect("merge rollback"),
             MergeOutcome::Superseded
         );
-        let stale_equal = VersionedRecord::sign(
-            SyncKind::MachineNames,
-            &key,
-            &names_value("stale"),
-            RecordClock {
-                version: 9,
-                signed_at_ms: 0,
-                writer_machine: machine(3).0,
-            },
-            &owner,
-        )
-        .expect("sign stale");
+        let stale_equal = sign_names(&key, "stale", clock(9, 0, 3), &owner);
         assert_eq!(
             store
                 .merge_record(stale_equal, &owner_id)
@@ -1602,7 +2198,7 @@ mod tests {
         // WHY: ADR-0041 validation — a forged state-commit from a non-owner
         // key is rejected, and the failure is typed so sessions abort.
         let dir = tempfile::tempdir().expect("tmpdir");
-        let store = OwnerSyncStore::load(dir.path()).await;
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
         let owner = owner_kp(1);
         let attacker = owner_kp(2);
         let forged = VersionedRecord::sign(
@@ -1611,11 +2207,7 @@ mod tests {
             &SyncValue::OwnerProfile {
                 human_name: Some("Mallory".into()),
             },
-            RecordClock {
-                version: 100,
-                signed_at_ms: 200,
-                writer_machine: machine(9).0,
-            },
+            clock(100, 200, 9),
             &attacker,
         )
         .expect("sign forged");
@@ -1639,11 +2231,7 @@ mod tests {
             &SyncValue::OwnerProfile {
                 human_name: Some("A".into()),
             },
-            RecordClock {
-                version: 1,
-                signed_at_ms: 1,
-                writer_machine: machine(1).0,
-            },
+            clock(1, 1, 1),
             &owner,
         )
         .expect("sign");
@@ -1657,16 +2245,19 @@ mod tests {
             "tampered payload must fail signature verification, got {result:?}"
         );
     }
+
     #[tokio::test]
-    async fn enrollment_gate_rejects_unenrolled_and_forged_machines() {
-        // WHY: blocker 30 — only owner-enrolled machines pass the gate.
+    async fn enrollment_gate_rejects_unenrolled_forged_and_expired() {
+        // WHY: blocker 30 + review R2 finding 1 — only owner-enrolled AND
+        // CURRENT machines pass the gate.
         let dir = tempfile::tempdir().expect("tmpdir");
-        let store = OwnerSyncStore::load(dir.path()).await;
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
         let owner = owner_kp(1);
         let owner_id = owner.user_id();
         let enrolled_machine = machine(7);
-        let enrollment = OwnerEnrollment::sign(enrolled_machine, &owner, 1_000).expect("enroll");
-        store.enroll(enrollment).await;
+        let enrollment =
+            OwnerEnrollment::sign(enrolled_machine, &owner, 1_000, None).expect("enroll");
+        store.enroll(enrollment).await.expect("persist enroll");
 
         assert!(store.is_enrolled(&enrolled_machine, &owner_id).await);
         assert!(
@@ -1676,16 +2267,227 @@ mod tests {
 
         // Forged enrollment signed by a different key fails closed.
         let attacker = owner_kp(2);
-        let forged = OwnerEnrollment::sign(machine(9), &attacker, 2_000).expect("sign");
+        let forged = OwnerEnrollment::sign(machine(9), &attacker, 2_000, None).expect("sign");
         assert_eq!(
             forged.verify_owner(&owner_id),
             Err(SyncError::OwnerMismatch)
         );
-        // Directly planted in the file, it still fails verification at the gate.
-        store.enroll(forged).await;
+        store.enroll(forged).await.expect("persist forged");
         assert!(
             !store.is_enrolled(&machine(9), &owner_id).await,
             "foreign-key enrollment never passes the gate"
+        );
+
+        // Expired enrollment fails the currency check even though the
+        // signature is valid (review R2 finding 1).
+        let expired = OwnerEnrollment::sign(
+            machine(4),
+            &owner,
+            1_000,
+            Some(now_unix_ms().saturating_sub(10 * ENROLL_EXPIRY_SKEW_MS)),
+        )
+        .expect("sign");
+        assert!(expired.verify_owner(&owner_id).is_ok(), "signature valid");
+        store.enroll(expired).await.expect("persist");
+        assert!(
+            !store.is_enrolled(&machine(4), &owner_id).await,
+            "expired enrollment must not keep the gate open"
+        );
+    }
+
+    #[tokio::test]
+    async fn unenroll_removes_device_and_persists() {
+        // WHY: review R2 finding 1 — a DELETE path so stale enrollments
+        // don't linger.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let target = machine(6);
+        store
+            .enroll(OwnerEnrollment::sign(target, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+        assert!(store.is_enrolled(&target, &owner_id).await);
+
+        assert!(
+            store.unenroll(&target).await.expect("persist unenroll"),
+            "removal reports true"
+        );
+        assert!(!store.is_enrolled(&target, &owner_id).await);
+        assert!(
+            !store.unenroll(&target).await.expect("idempotent"),
+            "second removal reports false"
+        );
+
+        // Persistence survived: a fresh load over the same dir has no
+        // devices (review R2 finding 2 — durable state must be real).
+        let reloaded = OwnerSyncStore::load(dir.path()).await.expect("reload");
+        assert!(reloaded.enrolled_devices().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn persistence_failures_propagate_never_swallowed() {
+        // WHY: review R2 finding 2 — enroll/mint/commit must FAIL (and roll
+        // back in-memory state) when the disk write fails; success is never
+        // reported on a swallowed error.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+
+        // Break the sync dir: remove it and place a FILE where it was, so
+        // every write under it fails.
+        let sync_dir = dir.path().join(SYNC_DIR);
+        std::fs::remove_dir_all(&sync_dir).expect("remove dir");
+        std::fs::write(&sync_dir, b"not a directory").expect("block path");
+
+        let enrollment = OwnerEnrollment::sign(machine(5), &owner, 1_000, None).expect("sign");
+        assert!(
+            store.enroll(enrollment).await.is_err(),
+            "enroll must fail on persistence failure"
+        );
+        assert!(
+            !store.is_enrolled(&machine(5), &owner_id).await,
+            "in-memory state rolled back / never admitted"
+        );
+
+        let record = sign_names("k", "v", clock(1, 1, 1), &owner);
+        assert!(
+            store.commit_batch(vec![record], &owner_id).await.is_err(),
+            "commit must fail on persistence failure"
+        );
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "commit rolled back — nothing advertised"
+        );
+
+        assert!(
+            store
+                .mint(
+                    SyncKind::OwnerProfile,
+                    "owner",
+                    &SyncValue::OwnerProfile {
+                        human_name: Some("X".into())
+                    },
+                    &owner,
+                    machine(1)
+                )
+                .await
+                .is_err(),
+            "mint must fail on persistence failure"
+        );
+        assert!(store.records_snapshot().await.is_empty());
+
+        // load over a blocked path fails outright (fresh installs must not
+        // silently run with unwritable storage).
+        assert!(OwnerSyncStore::load(dir.path()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn equal_clock_equivocation_converges_by_hash() {
+        // WHY: review R2 finding 3 — two different records with the SAME
+        // clock must converge deterministically on every peer (greater
+        // record hash), never stay split by arrival order.
+        let owner = owner_kp(1);
+        let key = "shared";
+        let a = sign_names(key, "content-a", clock(4, 500, 1), &owner);
+        let b = sign_names(key, "content-b", clock(4, 500, 1), &owner);
+        assert_ne!(a.record_hash(), b.record_hash());
+        let (winner, loser) = if a.record_hash() > b.record_hash() {
+            (&a, &b)
+        } else {
+            (&b, &a)
+        };
+
+        // Two stores, OPPOSITE arrival orders.
+        let dir1 = tempfile::tempdir().expect("tmpdir");
+        let dir2 = tempfile::tempdir().expect("tmpdir");
+        let s1 = OwnerSyncStore::load(dir1.path()).await.expect("store");
+        let s2 = OwnerSyncStore::load(dir2.path()).await.expect("store");
+        let owner_id = owner.user_id();
+        s1.commit_batch(vec![a.clone()], &owner_id)
+            .await
+            .expect("c");
+        s1.commit_batch(vec![b.clone()], &owner_id)
+            .await
+            .expect("c");
+        s2.commit_batch(vec![b.clone()], &owner_id)
+            .await
+            .expect("c");
+        s2.commit_batch(vec![a.clone()], &owner_id)
+            .await
+            .expect("c");
+
+        for store in [&s1, &s2] {
+            let snapshot = store.records_snapshot().await;
+            assert_eq!(snapshot.len(), 1);
+            assert_eq!(snapshot[0].value, winner.value, "hash winner everywhere");
+            assert_eq!(snapshot[0].record_hash(), winner.record_hash());
+        }
+        let _ = loser;
+    }
+
+    #[tokio::test]
+    async fn batch_with_forgery_commits_nothing() {
+        // WHY: review R2 finding 4 — a later forgery in a batch must leave
+        // NOTHING committed, not even the earlier valid records.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let owner_id = owner.user_id();
+        let attacker = owner_kp(2);
+        let valid = sign_names("k1", "good", clock(1, 1, 1), &owner);
+        let forged = VersionedRecord::sign(
+            SyncKind::OwnerProfile,
+            "owner",
+            &SyncValue::OwnerProfile {
+                human_name: Some("Evil".into()),
+            },
+            clock(99, 99, 9),
+            &attacker,
+        )
+        .expect("sign");
+        let err = store
+            .commit_batch(vec![valid, forged], &owner_id)
+            .await
+            .expect_err("batch containing a forgery must fail whole");
+        assert_eq!(err, SyncError::OwnerMismatch);
+        assert!(
+            store.records_snapshot().await.is_empty(),
+            "no partial commit: the earlier valid record is NOT stored"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_cardinality_and_key_caps_fail_closed() {
+        // WHY: review R2 finding 5 — record/key cardinality is bounded with
+        // typed failures, never silent truncation.
+        let owner = owner_kp(1);
+        let long_key = "k".repeat(MAX_KEY_BYTES + 1);
+        let record = VersionedRecord::sign(
+            SyncKind::MachineNames,
+            &long_key,
+            &names_value("x"),
+            clock(1, 1, 1),
+            &owner,
+        )
+        .expect("sign");
+        let err = record.verify().expect_err("over-length key rejected");
+        assert!(matches!(err, SyncError::MalformedFrame(_)));
+
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner_id = owner.user_id();
+        let over: Vec<VersionedRecord> = (0..=MAX_STORED_RECORDS)
+            .map(|i| sign_names(&format!("k{i}"), "v", clock(1, 1, 1), &owner))
+            .collect();
+        assert!(
+            matches!(
+                store.commit_batch(over, &owner_id).await,
+                Err(SyncError::StoreLimit(_))
+            ),
+            "store capacity is enforced with a typed error"
         );
     }
 
@@ -1727,18 +2529,8 @@ mod tests {
                 },
             };
             assert_eq!(value.kind(), kind);
-            let record = VersionedRecord::sign(
-                kind,
-                "k",
-                &value,
-                RecordClock {
-                    version: 1,
-                    signed_at_ms: 1,
-                    writer_machine: machine(1).0,
-                },
-                &owner,
-            )
-            .expect("sign");
+            let record =
+                VersionedRecord::sign(kind, "k", &value, clock(1, 1, 1), &owner).expect("sign");
             record.verify().expect("all four kinds verify");
         }
 
@@ -1748,11 +2540,7 @@ mod tests {
             kind: SyncKind::HomePointer,
             key: "home".into(),
             value: names_value("evil"),
-            clock: RecordClock {
-                version: 1,
-                signed_at_ms: 1,
-                writer_machine: machine(1).0,
-            },
+            clock: clock(1, 1, 1),
             owner_public_key: vec![],
             signature: vec![],
         };
@@ -1801,16 +2589,17 @@ mod tests {
         // WHY: blocker 30 — the stream accept path fails closed before any
         // application byte for unenrolled (or self) peers.
         let dir = tempfile::tempdir().expect("tmpdir");
-        let store = OwnerSyncStore::load(dir.path()).await;
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
         let owner = owner_kp(1);
-        let owner_id = owner.user_id();
         let local = machine(1);
-        let (mut tx, mut rx) = tokio::io::duplex(64);
+        let (tx, mut rx) = tokio::io::duplex(64);
+        let mut tx = tx;
+        let _ = &mut rx;
         let err = run_sync_session(
             &mut tx,
             &mut rx,
             &store,
-            &owner_id,
+            &owner,
             &local,
             &machine(2),
             |_| {},
@@ -1818,9 +2607,140 @@ mod tests {
         .await
         .expect_err("unenrolled peer refused");
         assert!(matches!(err, SyncError::NotEnrolled { .. }));
-        let err = run_sync_session(&mut tx, &mut rx, &store, &owner_id, &local, &local, |_| {})
+        let err = run_sync_session(&mut tx, &mut rx, &store, &owner, &local, &local, |_| {})
             .await
             .expect_err("self-sync refused");
         assert_eq!(err, SyncError::SelfSync);
+    }
+
+    #[tokio::test]
+    async fn session_proof_rejects_peer_without_owner_key() {
+        // WHY: review R2 finding 1 — a stale-enrolled machine that ECHOES
+        // the victim's owner id but does not hold the owner key must fail
+        // the possession proof and receive nothing.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let victim_store = OwnerSyncStore::load(&dir.path().join("v"))
+            .await
+            .expect("store");
+        let owner = owner_kp(1);
+        let attacker_kp = owner_kp(2); // different owner key in hand
+        let attacker_id = attacker_kp.user_id();
+        let victim = machine(1);
+        let attacker = machine(2);
+
+        // The victim enrolled the attacker's machine long ago (stale but
+        // unexpired), so the enrollment gate passes...
+        victim_store
+            .enroll(OwnerEnrollment::sign(attacker, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // ...and run both sides over a duplex pipe: the attacker side
+        // signs its proof with the WRONG key.
+        let (client, server) = tokio::io::duplex(64 * 1024);
+        let (mut v_recv, mut v_send) = tokio::io::split(server);
+        let (mut a_recv, mut a_send) = tokio::io::split(client);
+        let owner_id_bytes = owner.user_id().0;
+        let attacker_signer = Arc::new(attacker_kp);
+
+        // Attacker handshake: honest Hello claiming the victim's owner id,
+        // then a proof signed by the attacker's key.
+        let attacker_hello = tokio::spawn(async move {
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: attacker.0,
+                owner_user_id: owner_id_bytes, // echoed, not held
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut a_send, &hello).await?;
+            let v_hello = match read_frame(&mut a_recv).await? {
+                SyncFrame::Hello { nonce, .. } => nonce,
+                other => return Err(SyncError::MalformedFrame(format!("{other:?}"))),
+            };
+            // Proof over the victim's nonce — but with the ATTACKER key.
+            let msg = proof_message(&v_hello, &attacker.0, &victim.0, &owner_id_bytes);
+            let sig = sign_with_ml_dsa(attacker_signer.secret_key(), &msg)
+                .map_err(|e| SyncError::ChallengeFailed(format!("{e:?}")))?;
+            write_frame(
+                &mut a_send,
+                &SyncFrame::Proof {
+                    signature: sig.as_bytes().to_vec(),
+                },
+            )
+            .await?;
+            // Keep the pipe open briefly so the victim can send its error.
+            let _ = read_frame(&mut a_recv).await;
+            Ok::<(), SyncError>(())
+        });
+
+        let err = run_sync_session(
+            &mut v_send,
+            &mut v_recv,
+            &victim_store,
+            &owner,
+            &victim,
+            &attacker,
+            |_| {},
+        )
+        .await
+        .expect_err("peer without the owner key must fail the proof");
+        assert!(matches!(err, SyncError::ChallengeFailed(_)), "got: {err:?}");
+        let _ = attacker_hello.await;
+        let _ = attacker_id;
+        assert!(
+            victim_store.records_snapshot().await.is_empty(),
+            "victim shipped nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_times_out_when_peer_stalls() {
+        // WHY: review R2 finding 5 — an enrolled peer that stalls after the
+        // handshake holds the session only until the budget elapses.
+        let dir = tempfile::tempdir().expect("tmpdir");
+        let store = OwnerSyncStore::load(dir.path()).await.expect("store");
+        let owner = owner_kp(1);
+        let local = machine(1);
+        let peer = machine(2);
+        store
+            .enroll(OwnerEnrollment::sign(peer, &owner, 1_000, None).expect("sign"))
+            .await
+            .expect("persist");
+
+        // A duplex peer that sends an honest Hello then goes silent.
+        let (client, server) = tokio::io::duplex(4096);
+        let (mut s_recv, mut s_send) = tokio::io::split(server);
+        let (mut c_recv, mut c_send) = tokio::io::split(client);
+        let owner_id_bytes = owner.user_id().0;
+        let peer_hello = tokio::spawn(async move {
+            let hello = SyncFrame::Hello {
+                protocol_version: SYNC_PROTOCOL_VERSION,
+                machine_id: peer.0,
+                owner_user_id: owner_id_bytes,
+                nonce: fresh_nonce(),
+            };
+            write_frame(&mut c_send, &hello).await?;
+            // Read the local Hello, then stall forever (never send Proof).
+            let _ = read_frame(&mut c_recv).await;
+            std::future::pending::<()>().await;
+            #[allow(unreachable_code)]
+            Ok::<(), SyncError>(())
+        });
+        let _ = &mut s_send;
+        let _ = &mut s_recv;
+        let err = run_sync_session_with_timeout(
+            Duration::from_millis(150),
+            &mut s_send,
+            &mut s_recv,
+            &store,
+            &owner,
+            &local,
+            &peer,
+            |_| {},
+        )
+        .await
+        .expect_err("stalled peer must time out");
+        assert_eq!(err, SyncError::SessionTimeout);
+        peer_hello.abort();
     }
 }
