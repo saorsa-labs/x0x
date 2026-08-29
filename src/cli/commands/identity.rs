@@ -293,6 +293,10 @@ pub async fn owner_agents_issue(
         body["label"] = serde_json::json!(label);
     }
     let resp = client.post("/owner/agents/issue", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x sync` / `x0x sync devices` — GET /sync/devices (ADR-0041 Tier-1).
 pub async fn sync_devices(client: &DaemonClient) -> Result<()> {
     client.run_get("/sync/devices").await
@@ -340,6 +344,10 @@ pub async fn owner_riders_issue(
         body["ttl_secs"] = serde_json::json!(ttl);
     }
     let resp = client.post("/owner/riders", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 /// `x0x sync revoke MACHINE_ID` — DELETE /sync/devices/:machine_id.
 pub async fn sync_revoke(client: &DaemonClient, machine_id: &str) -> Result<()> {
     let resp = client

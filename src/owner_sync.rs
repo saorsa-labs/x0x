@@ -2333,6 +2333,13 @@ impl OwnerSyncService {
                 cert_digest,
                 issued_at,
                 not_after: None,
+                // ADR-0039 fields are not part of the Tier-1 sync value:
+                // a synced line records the issuance fact (digest + time);
+                // mode defaults to Acp (the pre-ADR-0039 line shape) and
+                // no certificate bytes travel Tier 1 (Tier-3 boundary).
+                mode: crate::profile::CertMode::Acp,
+                label: None,
+                cert_b64: None,
             };
             if let Err(e) = crate::profile::IssuedCertRecord::append(&path, &record).await {
                 tracing::warn!(

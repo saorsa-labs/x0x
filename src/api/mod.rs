@@ -217,6 +217,9 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         path: "/owner/riders/:id",
         cli_name: "owner riders revoke",
         description: "Revoke a rider token; it fails on the next request",
+        category: "identity",
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/sync/devices",
         cli_name: "sync devices",
