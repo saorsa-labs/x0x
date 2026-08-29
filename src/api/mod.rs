@@ -801,6 +801,20 @@ pub const ENDPOINTS: &[EndpointDef] = &[
     },
     EndpointDef {
         method: Method::Post,
+        path: "/groups/:id/delegate",
+        cli_name: "group delegate",
+        description: "Issue a signed delegation (effective on durable history commit)",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/delegations",
+        cli_name: "group delegations",
+        description: "List effective delegations re-derived from durable history",
+        category: "named-groups",
+    },
+    EndpointDef {
+        method: Method::Post,
         path: "/groups/:id/invite",
         cli_name: "group invite",
         description: "Generate invite link",

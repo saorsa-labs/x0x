@@ -1,4 +1,4 @@
-# GUI named-groups parity report — 37 endpoints total
+# GUI named-groups parity report — 39 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
@@ -7,6 +7,8 @@
   DEFERRED  DELETE /groups/:id/members/:agent_id  // admin flow; GUI currently uses ban rather than direct remove-by-agent
   WIRED     POST /groups/:id/send
   WIRED     GET /groups/:id/messages
+  DEFERRED  POST /groups/:id/delegate  // agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred
+  DEFERRED  GET /groups/:id/delegations  // agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred
   WIRED     POST /groups/:id/invite
   WIRED     POST /groups/join
   WIRED     PUT /groups/:id/display-name
@@ -37,4 +39,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/37 wired; 12 deferred; 0 missing
+Coverage: 25/39 wired; 14 deferred; 0 missing

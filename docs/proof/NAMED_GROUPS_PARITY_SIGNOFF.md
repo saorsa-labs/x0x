@@ -38,7 +38,7 @@ unrecorded gap (zero across all surfaces below).
 |---------|--------------|--------------|---------------|
 | **x0xd REST** | **37 / 37** | `tests/api_coverage.rs` — every route handler (now in `src/server/routes/named_groups.rs`) is in `ENDPOINTS` and has a test entry. | `tests/e2e_named_groups.sh` — 98 REST-driven assertions over a 3-daemon mesh; 3× clean archived. |
 | **x0x CLI** | **37 / 37** | `tests/parity_cli.rs` — spawns `x0x <cli_name> --help` for every endpoint. | `tests/e2e_feature_parity.sh` — 18 assertions per run, 3× clean archived. |
-| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **25 / 37** wired, 12 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
+| **x0x embedded GUI** (`src/gui/x0x-gui.html`) | **25 / 39** wired, 14 deferred (with reasons) | `tests/gui_named_group_parity.rs` — manifest-driven scan; **fails if a new endpoint is added without either a GUI call site or a `DEFERRED` entry**. Per-endpoint coverage report at `tests/proof-reports/parity/gui-named-groups-coverage.txt`. | Manual; headless harness still queued. |
 | **Communitas Rust client** | **36 / 36** named-groups (at the original 2026-04-14 signoff; re-verify in the communitas repo against the 37-endpoint surface) | `parity_manifest.rs` (vendored manifest copy). The IMPLEMENTED list contains 36 entries; the test fails if any named-groups endpoint in the vendored manifest has no client method. 14 tests. | `live_mutation_contract.rs`. |
 | **Communitas Dioxus UI** | consumes the Rust client; UI surfaces `enum SpacePreset`, discover view, admin sheet, requests panel | preset round-trip unit test; 419/419 unit tests | UI driver queued for Phase 7. |
 | **Communitas Swift client** | **36 / 36** named-groups (every Rust method has a Swift counterpart) | `swift_parity.rs` — `parity_map_covers_all_rust_methods` walks `client.rs` for every public method and `swift_client_has_all_rust_methods` greps the Swift source for each one. | `swift test` — 42/42 pass. |
@@ -65,6 +65,8 @@ recorded in `tests/gui_named_group_parity.rs::DEFERRED`:
 | POST | `/groups/:id/secure/decrypt` | secure-plane primitive; consumed implicitly by encrypted chat |
 | POST | `/groups/:id/secure/reseal` | secure-plane primitive; server-side rekey on approve/ban |
 | POST | `/groups/secure/open-envelope` | adversarial test endpoint, not a user-facing action |
+| POST | `/groups/:id/delegate` | ADR-0040 agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred |
+| GET | `/groups/:id/delegations` | ADR-0040 agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred |
 
 **Phase 7 update:** SignedPublic chat now works end-to-end on all
 three surfaces with sub-second latency. Each chat view fetches the
@@ -200,7 +202,7 @@ not yet proven on which surface. Each maps to either the GUI
 | Rust client method exists for every endpoint | ✅ |
 | Swift client method exists for every Rust method | ✅ |
 | Embedded HTML GUI parity is **manifest-driven** (no hand-picked subset) | ✅ — `gui_named_group_parity.rs` enumerates every endpoint |
-| GUI deferrals are **enumerated with reasons** | ✅ — 11 deferred, 0 unrecorded missing |
+| GUI deferrals are **enumerated with reasons** | ✅ — 14 deferred, 0 unrecorded missing |
 | Create modal surfaces all 4 presets | ✅ (x0x GUI + Dioxus + SwiftUI) |
 | Discover view exists with query, nearby, request-access | ✅ (x0x GUI + Dioxus + SwiftUI) |
 | Admin surfaces exist: policy editor, state readout, roster roles/bans, request approve/reject, rename | ✅ |

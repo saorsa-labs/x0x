@@ -444,6 +444,43 @@ pub async fn send(
     Ok(())
 }
 
+/// `x0x group delegate` — POST /groups/:id/delegate (ADR-0040).
+#[allow(clippy::too_many_arguments)]
+pub async fn delegate(
+    client: &DaemonClient,
+    group_id: &str,
+    to_agent: &str,
+    scope: &str,
+    task: Option<&str>,
+    expiry_ms: u64,
+    parent: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let mut req = json!({
+        "to_agent": to_agent,
+        "scope": scope,
+        "expiry_ms": expiry_ms,
+    });
+    if let Some(task) = task {
+        req["task"] = Value::String(task.to_string());
+    }
+    if let Some(parent) = parent {
+        req["parent"] = Value::String(parent.to_string());
+    }
+    let resp = client
+        .post(&format!("/groups/{group_id}/delegate"), &req)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group delegations` — GET /groups/:id/delegations (ADR-0040).
+pub async fn delegations(client: &DaemonClient, group_id: &str) -> Result<()> {
+    client
+        .run_get(&format!("/groups/{group_id}/delegations"))
+        .await
+}
+
 /// `x0x group messages` — GET /groups/:id/messages.
 pub async fn messages(client: &DaemonClient, group_id: &str) -> Result<()> {
     client

@@ -1268,6 +1268,32 @@ enum GroupSub {
         #[arg(long)]
         reply_to: Option<String>,
     },
+    /// Issue a signed delegation to another agent (ADR-0040). Effective on
+    /// durable group-history commit; the DM handoff is a notification.
+    Delegate {
+        /// Group ID.
+        group_id: String,
+        /// Hex AgentId of the delegate.
+        #[arg(long)]
+        to_agent: String,
+        /// Authority scope: task_execute | send_as.
+        #[arg(long)]
+        scope: String,
+        /// Hex TaskId (required for task_execute).
+        #[arg(long)]
+        task: Option<String>,
+        /// Unix-ms expiry (required — authority is bounded).
+        #[arg(long)]
+        expiry_ms: u64,
+        /// Hex parent delegation digest (re-delegation, depth 2).
+        #[arg(long)]
+        parent: Option<String>,
+    },
+    /// List effective delegations in a group (re-derived from history).
+    Delegations {
+        /// Group ID.
+        group_id: String,
+    },
     /// Retrieve cached SignedPublic messages for a group.
     Messages {
         /// Group ID.
@@ -2110,6 +2136,28 @@ async fn run(
                     reply_to.as_deref(),
                 )
                 .await
+            }
+            Some(GroupSub::Delegate {
+                group_id,
+                to_agent,
+                scope,
+                task,
+                expiry_ms,
+                parent,
+            }) => {
+                commands::group::delegate(
+                    &client,
+                    &group_id,
+                    &to_agent,
+                    &scope,
+                    task.as_deref(),
+                    expiry_ms,
+                    parent.as_deref(),
+                )
+                .await
+            }
+            Some(GroupSub::Delegations { group_id }) => {
+                commands::group::delegations(&client, &group_id).await
             }
             Some(GroupSub::Messages { group_id }) => {
                 commands::group::messages(&client, &group_id).await

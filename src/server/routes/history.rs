@@ -407,6 +407,8 @@ mod tests {
             timestamp: 42,
             thread_root: Some(root.clone()),
             thread_parent: Some(root.clone()),
+            mentions: Vec::new(),
+            delegation_digest: None,
             rider_provenance: None,
             signature: "signature-1".to_string(),
         };

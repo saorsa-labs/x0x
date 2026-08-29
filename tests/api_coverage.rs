@@ -320,6 +320,16 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(
         Post,
+        "/groups/:id/delegate",
+        delegation_sendas_positive_and_forges_cross_daemon
+    ),
+    covered!(
+        Get,
+        "/groups/:id/delegations",
+        delegation_survives_restart_via_history
+    ),
+    covered!(
+        Post,
         "/groups/:id/invite",
         d4_stateful_events_converge_via_signed_commits
     ),
@@ -574,6 +584,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "tests/revocation_integration.rs",
         include_str!("revocation_integration.rs"),
+    ),
+    (
+        "tests/delegation_spaces.rs",
+        include_str!("delegation_spaces.rs"),
     ),
 ];
 

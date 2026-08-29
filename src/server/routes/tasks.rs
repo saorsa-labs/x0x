@@ -555,6 +555,10 @@ pub(in crate::server) async fn update_task(
                 "cas": { "scope": "local_replica" },
             })),
         ),
+        Err(x0x::error::IdentityError::PeerIdMismatch) => api_error(
+            StatusCode::FORBIDDEN,
+            "transfer_owner requires the current owner's signature (local agent is not the owner)",
+        ),
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
 }

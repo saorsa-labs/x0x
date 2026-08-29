@@ -1046,9 +1046,6 @@ pub(in crate::server) enum NamedGroupMetadataEvent {
     /// IND-CCA2 security. The adversarial E2E proof in
     /// `tests/e2e_named_groups.sh` section 2c verifies this behaviorally.
     ///
-    /// Fields (all base64):
-    /// - `kem_ciphertext_b64`: ML-KEM-768 encapsulated ciphertext (~1088 bytes).
-    /// - `aead_nonce_b64`: 12-byte ChaCha20-Poly1305 nonce.
     /// - `aead_ciphertext_b64`: 48-byte AEAD-encrypted 32-byte secret.
     SecureShareDelivered {
         group_id: String,
@@ -9254,6 +9251,15 @@ pub(in crate::server) struct SendGroupMessageRequest {
     /// Requires `thread_root` to also be present.
     #[serde(default)]
     thread_parent: Option<String>,
+    /// Structured mentions (ADR-0040): hex AgentIds of mentioned agents.
+    /// Routed daemon-side; replaces GUI string matching.
+    #[serde(default)]
+    mentions: Vec<String>,
+    /// Hex delegation digest authorizing send-as attribution (ADR-0040):
+    /// the local agent signs with ITS OWN key; receivers verify
+    /// actor=local, delegator=from_agent via this delegation.
+    #[serde(default)]
+    delegation_digest: Option<String>,
 }
 
 /// POST /groups/:id/send — publish a message to the group.
@@ -9384,6 +9390,33 @@ pub(in crate::server) async fn send_group_public_message(
             .map(|member| member.agent_id.clone())
             .collect::<Vec<_>>();
 
+        // Send-as authorization (ADR-0040 blocker 25): when the caller
+        // claims a delegation, verify it against THIS daemon's durable
+        // history BEFORE signing — the message must never leave with an
+        // attribution the local agent cannot exercise. The local agent
+        // signs with its own key; only the digest references A. Riders
+        // do not combine send-as with their own provenance envelope.
+        if let Some(digest) = &req.delegation_digest {
+            if !matches!(
+                actor,
+                crate::server::rider_auth::ActorContext::Owner { .. }
+            ) {
+                return forbidden("send_as attribution is an owner-daemon action");
+            }
+            let now = now_millis_u64();
+            if let Err(why) = crate::server::delegations::authorize_send_as(
+                &state,
+                info.stable_group_id(),
+                &state.agent.agent_id(),
+                digest,
+                now,
+            )
+            .await
+            {
+                return api_error(StatusCode::CONFLICT, format!("send_as unauthorized: {why}"));
+            }
+        }
+
         // ADR-0039 rider scope check: even with membership satisfied,
         // the send must be inside the token's explicit grant (Home is
         // not applicable on this SignedPublic-only surface).
@@ -9442,7 +9475,7 @@ pub(in crate::server) async fn send_group_public_message(
             }
         };
 
-        match x0x::groups::GroupPublicMessage::sign(
+        match x0x::groups::GroupPublicMessage::sign_with_attribution(
             info.stable_group_id().to_string(),
             info.state_hash.clone(),
             info.state_revision,
@@ -9453,6 +9486,8 @@ pub(in crate::server) async fn send_group_public_message(
             now_ms,
             req.thread_root,
             req.thread_parent,
+            req.mentions,
+            req.delegation_digest,
             rider_provenance,
         ) {
             Ok(m) => (m, direct_recipients),
@@ -9729,21 +9764,19 @@ pub(in crate::server) async fn get_group_public_messages(
 /// through (`cache_public_message`), so per-group topic, global fallback,
 /// and DM direct-push all record exactly once — the store dedupes on
 /// `msg_id = BLAKE3(signed JSON)`.
-fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicMessage) {
-    let Some(history) = state.agent.history() else {
-        return;
-    };
+fn build_group_public_history_record(
+    state: &AppState,
+    msg: &x0x::groups::GroupPublicMessage,
+) -> Option<x0x::history::HistoryRecord> {
+    let artifact = serde_json::to_vec(msg).ok()?;
     if msg.body.is_empty() {
-        return;
+        return None;
     }
-    let Ok(artifact) = serde_json::to_vec(msg) else {
-        return;
-    };
     let self_hex = hex::encode(state.agent.agent_id().as_bytes());
     let outbound = msg.author_agent_id == self_hex;
     let payload = msg.body.as_bytes().to_vec();
     let now = i64::try_from(x0x::dm::now_unix_ms()).unwrap_or(i64::MAX);
-    history.record(x0x::history::HistoryRecord {
+    Some(x0x::history::HistoryRecord {
         // HistoryRecord.msg_id is the store-internal dedup key governed by
         // HistoryRecord::validate(): it must equal compute_msg_id(artifact,
         // payload), i.e. BLAKE3 of the signed JSON artifact when present.
@@ -9762,13 +9795,21 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
         } else {
             x0x::history::Direction::Inbound
         },
-        content_type: "text/plain".to_string(),
+        content_type: if matches!(msg.kind, x0x::groups::GroupPublicMessageKind::Delegation) {
+            "application/x0x-delegation+json"
+        } else {
+            "text/plain"
+        }
+        .to_string(),
         payload,
         signed_artifact: Some(artifact),
         signature: hex::decode(&msg.signature).ok(),
-        // Mirrors the signing domain used for this message (ADR-0029).
+        // Mirrors the signing domain used for this message (ADR-0029 /
+        // ADR-0040 v3 attribution).
         sig_context: Some(
-            if msg.thread_root.is_some() || msg.thread_parent.is_some() {
+            if !msg.mentions.is_empty() || msg.delegation_digest.is_some() {
+                "x0x.group.public-message.v3"
+            } else if msg.thread_root.is_some() || msg.thread_parent.is_some() {
                 "x0x.group.public-message.v2"
             } else {
                 "x0x.group.public-message.v1"
@@ -9787,7 +9828,85 @@ fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicM
         thread_parent: None,
         ingress_sender_agent: None,
         logical_request_id: None,
-    });
+    })
+}
+
+fn record_group_public_history(state: &AppState, msg: &x0x::groups::GroupPublicMessage) {
+    let Some(history) = state.agent.history() else {
+        return;
+    };
+    let Some(record) = build_group_public_history_record(state, msg) else {
+        return;
+    };
+    history.record(record);
+}
+
+/// Durably commit a group public message's history row and WAIT for the
+/// SQLite transaction (ADR-0040 blocker 28 effectiveness gate).
+///
+/// Unlike the best-effort [`record_group_public_history`], a full or closed
+/// writer queue is an ERROR: callers use this when "committed" is a
+/// load-bearing fact (delegation effectiveness), so an ACK must never get
+/// ahead of durable history.
+pub(in crate::server) async fn record_group_public_history_committed(
+    state: &AppState,
+    msg: &x0x::groups::GroupPublicMessage,
+) -> Result<(), String> {
+    let Some(history) = state.agent.history() else {
+        return Err("history subsystem unavailable".into());
+    };
+    let Some(record) = build_group_public_history_record(state, msg) else {
+        return Err("message has no durable record (empty body)".into());
+    };
+    history
+        .record_committed(record)
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("{e}"))
+}
+
+/// Fan a delegation-carrier message out on the group bus (per-group topic +
+/// global fallback + cache + per-member direct race), mirroring the tail of
+/// `send_group_public_message`. The carrier's history row MUST already be
+/// committed by the caller — publishing never precedes effectiveness.
+pub(in crate::server) async fn publish_delegation_carrier(
+    state: Arc<AppState>,
+    msg: x0x::groups::GroupPublicMessage,
+) {
+    spawn_public_message_listener(Arc::clone(&state), msg.group_id.clone()).await;
+    let topic = x0x::groups::public_topic_for(&msg.group_id);
+    let Ok(bytes) = serde_json::to_vec(&msg) else {
+        tracing::warn!("failed to serialize delegation carrier");
+        return;
+    };
+    if let Err(e) = state.agent.publish_with_fanout(&topic, bytes.clone()).await {
+        tracing::warn!(topic = %LogHexId::topic(&topic), "delegation carrier publish failed: {e}");
+    }
+    if let Err(e) = state
+        .agent
+        .publish(GLOBAL_PUBLIC_MESSAGE_TOPIC, bytes.clone())
+        .await
+    {
+        tracing::warn!(
+            topic = GLOBAL_PUBLIC_MESSAGE_TOPIC,
+            "delegation carrier global fallback failed: {e}"
+        );
+    }
+    cache_public_message(&state, msg.clone()).await;
+    let direct_recipients = {
+        let groups = state.named_groups.read().await;
+        let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+        groups
+            .get(&msg.group_id)
+            .map(|info| {
+                info.active_members()
+                    .filter(|member| !member.agent_id.eq_ignore_ascii_case(&local_hex))
+                    .map(|member| member.agent_id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    spawn_group_public_message_fanout_race(state, topic, bytes, direct_recipients, msg);
 }
 
 /// Signed rider attribution for an MLS-plane send (review r4): the
@@ -10238,7 +10357,55 @@ pub(in crate::server) async fn ingest_public_message(
             state
                 .groups_diagnostics
                 .record_message_received(&stable_id, now_millis_u64());
-            cache_public_message(state, msg).await;
+            // Delegation carriers (ADR-0040 blocker 28): the delegation
+            // becomes effective HERE only when its history row commits —
+            // await the SQLite transaction before caching/indexing.
+            if matches!(msg.kind, x0x::groups::GroupPublicMessageKind::Delegation)
+                && record_group_public_history_committed(state, &msg)
+                    .await
+                    .is_err()
+            {
+                tracing::error!(
+                    group_id = %stable_id,
+                    "delegation carrier failed durable commit at ingest"
+                );
+                state.groups_diagnostics.record_other_drop(&stable_id);
+                return;
+            }
+            // Send-as verification (ADR-0040 blocker 25): a message claiming
+            // a delegation must be authorized by a delegation durably
+            // committed in THIS daemon's history whose delegate is the
+            // message author (the author's own key signed the message; the
+            // delegation supplies the delegator's attribution). Fail-closed
+            // drop — never cache an unauthorized attribution.
+            if let Some(digest) = msg.delegation_digest.clone() {
+                let author = parse_agent_id_hex(&msg.author_agent_id);
+                let authorized = match author {
+                    Ok(actor) => crate::server::delegations::authorize_send_as(
+                        state,
+                        &stable_id,
+                        &actor,
+                        &digest,
+                        now_millis_u64(),
+                    )
+                    .await
+                    .is_ok(),
+                    Err(_) => false,
+                };
+                if !authorized {
+                    state.groups_diagnostics.record_other_drop(&stable_id);
+                    tracing::warn!(
+                        group_id = %group_id_for_log,
+                        digest = %digest,
+                        "E: dropped send-as message: delegation not effective for author"
+                    );
+                    return;
+                }
+            }
+            cache_public_message(state, msg.clone()).await;
+            // Delegate-side registration + mention/delegation routing to
+            // local WS subscribers (ADR-0040 structured mentions).
+            route_delegation_and_mentions(state, &msg, &stable_id).await;
         }
         Err(e) => {
             // Map ingest errors to diagnostics buckets so /diagnostics/groups
@@ -10261,6 +10428,55 @@ pub(in crate::server) async fn ingest_public_message(
                 "E: dropped public message: {e}"
             );
         }
+    }
+}
+
+/// Daemon-side routing of a just-ingested, validated public message
+/// (ADR-0040):
+///
+/// 1. Delegation carriers whose delegate is the LOCAL agent register in the
+///    effectiveness index (the carrier is already durably committed by the
+///    caller) and surface a `delegation` WS event.
+/// 2. Messages whose structured `mentions` field names the LOCAL agent
+///    surface a `mention` WS event — this replaces GUI string matching.
+async fn route_delegation_and_mentions(
+    state: &AppState,
+    msg: &x0x::groups::GroupPublicMessage,
+    stable_id: &str,
+) {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let mut reason: Option<&str> = None;
+
+    if matches!(msg.kind, x0x::groups::GroupPublicMessageKind::Delegation) {
+        if let Ok(sd) = serde_json::from_str::<x0x::delegation::SignedDelegation>(&msg.body) {
+            if x0x::delegation::verify_delegation(&sd).is_ok()
+                && sd.delegation.to_agent.as_bytes() == state.agent.agent_id().as_bytes()
+            {
+                crate::server::delegations::index_committed(state, stable_id, sd).await;
+                reason = Some("delegation");
+            }
+        }
+    }
+
+    if msg
+        .mentions
+        .iter()
+        .any(|m| m.eq_ignore_ascii_case(&local_hex))
+    {
+        reason = Some("mention");
+    }
+
+    if let Some(reason) = reason {
+        let frame = crate::server::ws::MentionFrame {
+            topic: x0x::groups::public_topic_for(stable_id),
+            group_id: stable_id.to_string(),
+            msg_id: msg.msg_id(),
+            author_agent_id: msg.author_agent_id.clone(),
+            reason: reason.to_string(),
+            mentions: msg.mentions.clone(),
+            timestamp: msg.timestamp,
+        };
+        crate::server::ws::emit_mention_event(state, frame).await;
     }
 }
 
@@ -21871,6 +22087,7 @@ pub(in crate::server) mod tests {
             directory_tasks: RwLock::new(HashMap::new()),
             directory_digest_interval_secs: DIRECTORY_DIGEST_INTERVAL_SECS,
             directory_resubscribe_jitter_ms: DIRECTORY_RESUBSCRIBE_JITTER_MS,
+            delegation_index: RwLock::new(HashMap::new()),
             public_messages: RwLock::new(HashMap::new()),
             public_message_tasks: RwLock::new(HashMap::new()),
             agent_kem_keypair: Arc::new(x0x::groups::kem_envelope::AgentKemKeypair::generate()?),
@@ -28065,6 +28282,8 @@ pub(in crate::server) mod tests {
             timestamp: 123,
             thread_root: None,
             thread_parent: None,
+            mentions: Vec::new(),
+            delegation_digest: None,
             rider_provenance: None,
             signature: "cc".repeat(64),
         };

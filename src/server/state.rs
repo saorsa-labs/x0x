@@ -708,6 +708,12 @@ pub(super) struct AppState {
     pub(super) public_messages: RwLock<HashMap<String, Vec<x0x::groups::GroupPublicMessage>>>,
     /// Phase E: background listener tasks on public-chat topics.
     pub(super) public_message_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    /// ADR-0040 delegation registry: per-group index of delegation
+    /// envelopes whose carriers are durably committed in THIS daemon's
+    /// history. Lazily rebuilt from history (crash/restart re-derives from
+    /// the durable store — the single effectiveness rule, blocker 28).
+    pub(super) delegation_index:
+        RwLock<HashMap<String, crate::server::delegations::DelegationIndex>>,
     /// Per-daemon ML-KEM-768 keypair used to open `SecureShareDelivered`
     /// envelopes addressed to this agent. Public half is published in the
     /// `/agent` response and in `JoinRequestCreated` so other daemons can

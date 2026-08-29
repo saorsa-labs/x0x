@@ -113,6 +113,24 @@ enum WsOutbound {
     /// `topic` came from the durable store; everything after is live.
     #[serde(rename = "live")]
     Live { topic: String },
+    /// ADR-0040 daemon-side mention routing: a validated group message (or
+    /// delegation grant) naming the LOCAL agent. Emitted on the group's
+    /// shared topic channel so subscribed clients get a structured signal
+    /// instead of re-deriving mentions by string matching.
+    #[serde(rename = "mention")]
+    Mention {
+        topic: String,
+        group_id: String,
+        msg_id: String,
+        author_agent_id: String,
+        /// `"mention"` (structured mentions field) or `"delegation"` (a
+        /// delegation grant whose delegate is the local agent).
+        reason: String,
+        /// Hex AgentIds from the message's mentions field.
+        #[serde(skip_serializing_if = "Vec::is_empty")]
+        mentions: Vec<String>,
+        timestamp: u64,
+    },
     #[serde(rename = "error")]
     Error { message: String },
 }
@@ -1003,6 +1021,39 @@ pub(super) async fn serve_gui() -> impl IntoResponse {
 
 fn render_gui_html() -> String {
     GUI_HTML.replace("<!-- X0X_TOKEN_INJECTION_POINT -->", "")
+}
+
+/// Broadcast a mention event on the group's shared topic channel (ADR-0040).
+///
+/// No-op when no WS session currently subscribes to the group's topic —
+/// mention ROUTING still happened (the daemon decided the local agent is
+/// named); only the push surface is absent. Frames are best-effort like
+/// other topic frames: a lagging subscriber is dropped by the broadcast
+/// channel, never blocks ingest.
+pub(super) async fn emit_mention_event(state: &AppState, frame: MentionFrame) {
+    let topics = state.ws_topics.read().await;
+    if let Some(shared) = topics.get(&frame.topic) {
+        let _ = shared.channel.send(WsOutbound::Mention {
+            topic: frame.topic,
+            group_id: frame.group_id,
+            msg_id: frame.msg_id,
+            author_agent_id: frame.author_agent_id,
+            reason: frame.reason,
+            mentions: frame.mentions,
+            timestamp: frame.timestamp,
+        });
+    }
+}
+
+/// Arguments of [`emit_mention_event`].
+pub(super) struct MentionFrame {
+    pub(super) topic: String,
+    pub(super) group_id: String,
+    pub(super) msg_id: String,
+    pub(super) author_agent_id: String,
+    pub(super) reason: String,
+    pub(super) mentions: Vec<String>,
+    pub(super) timestamp: u64,
 }
 
 // ---------------------------------------------------------------------------
