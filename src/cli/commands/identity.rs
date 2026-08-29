@@ -268,6 +268,19 @@ fn payload_b64_from_args(file: Option<&str>, payload_b64: Option<&str>) -> Resul
     }
 }
 
+/// `x0x home` — GET /home (ADR-0038 the owner's personal space).
+pub async fn home(client: &DaemonClient) -> Result<()> {
+    client.run_get("/home").await
+}
+
+/// `x0x home rename` — POST /home/rename.
+pub async fn home_rename(client: &DaemonClient, name: &str) -> Result<()> {
+    let body = serde_json::json!({ "name": name });
+    let resp = client.post("/home/rename", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -634,17 +647,4 @@ mod tests {
             .to_string()
             .contains("pass either --file <PATH>"));
     }
-}
-
-/// `x0x home` — GET /home (ADR-0038 the owner's personal space).
-pub async fn home(client: &DaemonClient) -> Result<()> {
-    client.run_get("/home").await
-}
-
-/// `x0x home rename` — POST /home/rename.
-pub async fn home_rename(client: &DaemonClient, name: &str) -> Result<()> {
-    let body = serde_json::json!({ "name": name });
-    let resp = client.post("/home/rename", &body).await?;
-    print_value(client.format(), &resp);
-    Ok(())
 }

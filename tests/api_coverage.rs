@@ -69,6 +69,8 @@ const COVERED: &[CoveredEndpoint] = &[
     ),
     covered!(Get, "/profile", daemon_api_profile_round_trip),
     covered!(Put, "/profile", daemon_api_profile_round_trip),
+    covered!(Get, "/home", home_routes_wired),
+    covered!(Post, "/home/rename", home_rename_round_trips),
     covered!(Get, "/owner/agents", daemon_api_profile_round_trip),
     // ── Network ─────────────────────────────────────────────────────────
     covered!(Get, "/peers", daemon_api_peers),
@@ -490,6 +492,10 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
         include_str!("history_point_lookup_wiring.rs"),
     ),
     ("tests/profile_api.rs", include_str!("profile_api.rs")),
+    (
+        "src/server/routes/home.rs",
+        include_str!("../src/server/routes/home.rs"),
+    ),
     (
         "tests/peer_lifecycle_integration.rs",
         include_str!("peer_lifecycle_integration.rs"),
