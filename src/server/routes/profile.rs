@@ -157,6 +157,11 @@ pub(in crate::server) struct OwnerAgentEntry {
     pub(in crate::server) journal_label: Option<String>,
     /// True when the agent has an ADR-0018 revocation on record.
     pub(in crate::server) revoked: bool,
+    /// ADR-0043 placement enrichment: `"pinned"`/`"roaming"` + epoch from
+    /// the derived placement ledger (`None` when this daemon holds no
+    /// owner-verified placement record for the agent — mint not run / no
+    /// bundle seen; P enforcement fails open for such agents, §9.3).
+    pub(in crate::server) placement: Option<serde_json::Value>,
 }
 
 /// GET /owner/agents — the roster of agents certified by this install's
@@ -204,6 +209,21 @@ pub(in crate::server) async fn owner_agents(
         // authoritative; names and machines come from whatever this daemon
         // has seen live.
         let discovered = state.agent.discovered_agent(agent_id).await.ok().flatten();
+        let placement = state
+            .agent
+            .move_state()
+            .read()
+            .await
+            .placement(&agent_id)
+            .map(|p| {
+                serde_json::json!({
+                    "kind": p.placement.kind(),
+                    "pinned_machine": p.placement
+                        .pinned_machine()
+                        .map(|m| hex::encode(m.as_bytes())),
+                    "placement_epoch": p.placement_epoch,
+                })
+            });
         entries.push(OwnerAgentEntry {
             agent_id: record.agent_id.clone(),
             cert_not_after: record.not_after,
@@ -223,6 +243,7 @@ pub(in crate::server) async fn owner_agents(
             },
             journal_label: record.label.clone(),
             revoked: revoked_ids.contains(&record.agent_id),
+            placement,
         });
     }
     entries.sort_by(|a, b| a.agent_id.cmp(&b.agent_id));

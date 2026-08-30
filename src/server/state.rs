@@ -211,6 +211,15 @@ impl Drop for ServerHandle {
 // Configuration
 // ---------------------------------------------------------------------------
 
+/// `[key_move]` TOML section (ADR-0043).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+pub struct KeyMoveConfig {
+    /// Whether the roaming-move ceremony endpoints are live. Default
+    /// `false`: experimental in v1 (review-r4 scope decision).
+    #[serde(default)]
+    pub ceremony_enabled: bool,
+}
+
 /// Daemon configuration loaded from TOML.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonConfig {
@@ -366,6 +375,16 @@ pub struct DaemonConfig {
     /// (#204 must-fix 1).
     #[serde(default)]
     pub(super) forward: x0x::forward::ForwardConfig,
+
+    /// ADR-0043 agent key-move configuration (TOML: `[key_move]`).
+    /// `ceremony_enabled` defaults to **false** — the roaming-move
+    /// ceremony is experimental in v1; machine ML-KEM enrollment, the
+    /// placement ledger/mint, and B/P enforcement ship always, but the
+    /// commit-then-activate ceremony endpoints stay dark until this flag
+    /// is set (review-r4 scope decision; see
+    /// `docs/design/agent-key-move-implementation.md`).
+    #[serde(default)]
+    pub(super) key_move: KeyMoveConfig,
 
     /// Gossip-plane identifier (issue #206, TOML: `network_id`).
     ///
@@ -617,6 +636,7 @@ impl Default for DaemonConfig {
             update: DaemonUpdateConfig::default(),
             history: default_history_config(),
             gossip: x0x::gossip::GossipConfig::default(),
+            key_move: KeyMoveConfig::default(),
             heartbeat_interval_secs: default_heartbeat_interval(),
             legacy_announce: false,
             identity_ttl_secs: default_identity_ttl(),
@@ -642,6 +662,14 @@ impl Default for DaemonConfig {
 /// Shared state accessible from all route handlers.
 pub(super) struct AppState {
     pub(super) agent: Arc<Agent>,
+    /// ADR-0043 review-r4 scope decision: the roaming-move ceremony is
+    /// **experimental in v1 and OFF by default** (`[key_move]
+    /// ceremony_enabled = false`). With the flag off, the `/agent/move*`
+    /// endpoints answer `501`, no `MoveAuthorization` can ever be chained,
+    /// every agent stays Pinned to its mint machine (the local agent is
+    /// minted Roaming for the ADR-0038 Home invariant — inert without the
+    /// ceremony), and the quiesced/quarantined states are unreachable.
+    pub(super) key_move_ceremony_enabled: bool,
     /// Topics this daemon records durably (ADR-0023 §4 opt-in; from
     /// `[history] record_topics`). Local ingest option only.
     pub(super) history_record_topics: Vec<String>,

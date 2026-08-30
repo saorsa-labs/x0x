@@ -42,6 +42,24 @@ const REVOCATION_MSG_PREFIX: &[u8] = b"x0x-revocation-v1";
 /// Magic marker prefixing the on-disk revocation set file.
 const REVOCATIONS_FILE_MAGIC: &[u8; 4] = b"X0XR";
 
+/// Magic marker prefixing the ADR-0043 ad-hoc binding-record file
+/// (`revocations-v2.bin`).
+const REVOCATIONS_FILE_MAGIC_V2: &[u8; 4] = b"X0R2";
+
+/// An `(agent, machine, move_epoch)` pairing retired by an ADR-0043 move
+/// (or an ad-hoc owner revocation of the same pairing). Revokes the PAIR —
+/// never the whole machine, never co-resident agents.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct AgentMachineBinding {
+    /// The portable agent identity whose binding is retired.
+    pub agent: AgentId,
+    /// The machine the agent may no longer sign from.
+    pub machine: MachineId,
+    /// The move that retired the binding (orders tombstones against
+    /// placement records).
+    pub move_epoch: u64,
+}
+
 /// The identity a revocation record targets.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum RevokedSubject {
@@ -49,6 +67,18 @@ pub enum RevokedSubject {
     Agent(AgentId),
     /// A hardware-pinned machine identity.
     Machine(MachineId),
+    /// An ADR-0043 agent↔machine binding: the agent may keep existing,
+    /// the machine may keep hosting other agents, but THIS pairing is
+    /// permanently dead. Owner-key issued only (self-revocation is
+    /// structurally impossible — the issuer key hashes to one 32-byte id,
+    /// the subject carries two ids plus an epoch).
+    AgentMachineBinding(AgentMachineBinding),
+}
+
+impl From<AgentMachineBinding> for RevokedSubject {
+    fn from(binding: AgentMachineBinding) -> Self {
+        RevokedSubject::AgentMachineBinding(binding)
+    }
 }
 
 impl RevokedSubject {
@@ -57,14 +87,39 @@ impl RevokedSubject {
         match self {
             RevokedSubject::Agent(_) => 0x01,
             RevokedSubject::Machine(_) => 0x02,
+            RevokedSubject::AgentMachineBinding(_) => 0x03,
         }
     }
 
-    /// The raw 32-byte identifier of the subject.
+    /// The raw 32-byte identifier of the subject (Agent/Machine subjects).
+    /// Binding subjects carry TWO ids plus an epoch — see
+    /// [`Self::binding_subject_bytes`].
     fn id_bytes(&self) -> &[u8; 32] {
         match self {
             RevokedSubject::Agent(id) => id.as_bytes(),
             RevokedSubject::Machine(id) => id.as_bytes(),
+            RevokedSubject::AgentMachineBinding(_) => {
+                // Unreachable in canonical construction: canonical_message
+                // dispatches bindings to binding_subject_bytes. The empty slice
+                // keeps callers that only match Agent/Machine total.
+                static EMPTY: [u8; 32] = [0u8; 32];
+                &EMPTY
+            }
+        }
+    }
+
+    /// Fixed-width subject bytes of a binding: `agent ‖ machine ‖
+    /// epoch_le` — no boundary ambiguity (the §7.1 canonical form).
+    fn binding_subject_bytes(&self) -> Option<Vec<u8>> {
+        match self {
+            RevokedSubject::AgentMachineBinding(binding) => {
+                let mut out = Vec::with_capacity(32 + 32 + 8);
+                out.extend_from_slice(binding.agent.as_bytes());
+                out.extend_from_slice(binding.machine.as_bytes());
+                out.extend_from_slice(&binding.move_epoch.to_le_bytes());
+                Some(out)
+            }
+            _ => None,
         }
     }
 }
@@ -90,7 +145,8 @@ impl RevocationRecord {
     /// reason_len || reason`.
     ///
     /// `reason` is length-prefixed so two records that differ only by where a
-    /// field boundary falls cannot collide.
+    /// field boundary falls cannot collide. Binding subjects use the §7.1
+    /// fixed-width form `prefix ‖ 0x03 ‖ agent ‖ machine ‖ epoch_le`.
     fn canonical_message(
         subject: &RevokedSubject,
         issuer_public_key: &[u8],
@@ -102,6 +158,7 @@ impl RevocationRecord {
             REVOCATION_MSG_PREFIX.len()
                 + 1
                 + 32
+                + 72
                 + issuer_public_key.len()
                 + 8
                 + 8
@@ -109,7 +166,13 @@ impl RevocationRecord {
         );
         msg.extend_from_slice(REVOCATION_MSG_PREFIX);
         msg.push(subject.tag());
-        msg.extend_from_slice(subject.id_bytes());
+        if let Some(binding_bytes) = subject.binding_subject_bytes() {
+            // §7.1: `prefix ‖ 0x03 ‖ agent ‖ machine ‖ epoch_le` — fixed
+            // widths, no boundary ambiguity.
+            msg.extend_from_slice(&binding_bytes);
+        } else {
+            msg.extend_from_slice(subject.id_bytes());
+        }
         msg.extend_from_slice(issuer_public_key);
         msg.extend_from_slice(&revoked_at.to_le_bytes());
         msg.extend_from_slice(&(reason_bytes.len() as u64).to_le_bytes());
@@ -181,19 +244,29 @@ impl RevocationRecord {
             .map_err(|e| IdentityError::Revocation(format!("bad signature: {e:?}")))?;
 
         // 2. Self-revocation: the issuer key hashes to the subject id.
+        //    Binding subjects never take this path (no single subject id).
         let issuer_id = derive_peer_id_from_public_key(&issuer_pubkey).0;
-        if &issuer_id == self.subject.id_bytes() {
+        if !matches!(self.subject, RevokedSubject::AgentMachineBinding(_))
+            && &issuer_id == self.subject.id_bytes()
+        {
             return Ok(());
         }
 
-        // 3. Issuer-revocation (Agent subjects only): the issuer key is the
-        //    user key that signed the subject agent's certificate.
-        if let RevokedSubject::Agent(subject_agent) = &self.subject {
+        // 3. Issuer-revocation: the issuer key is the user key that signed
+        //    the subject agent's certificate. For a BINDING subject
+        //    (ADR-0043 §7.2) this is the ONLY legal authority path —
+        //    self-revocation is structurally unreachable (the subject
+        //    carries two ids plus an epoch, not one 32-byte id), so the
+        //    certificate is REQUIRED, never optional.
+        let subject_agent = match &self.subject {
+            RevokedSubject::Agent(agent) => Some(*agent),
+            RevokedSubject::AgentMachineBinding(binding) => Some(binding.agent),
+            RevokedSubject::Machine(_) => None,
+        };
+        if let Some(subject_agent) = subject_agent {
             if let Some(cert) = subject_cert {
-                let cert_binds_subject = cert
-                    .agent_id()
-                    .map(|a| a == *subject_agent)
-                    .unwrap_or(false);
+                let cert_binds_subject =
+                    cert.agent_id().map(|a| a == subject_agent).unwrap_or(false);
                 let cert_is_valid = cert.verify().is_ok();
                 let issuer_is_certifier = cert
                     .user_id()
@@ -210,34 +283,45 @@ impl RevocationRecord {
         ))
     }
 
-    /// Whether this is a self-revocation — the issuer key hashes to the subject
-    /// id.
+    /// Whether this is a self-revocation — the issuer key hashes to the
+    /// subject id.
     ///
     /// A self-revocation re-verifies from the record alone (no certificate
     /// needed); an issuer-revocation requires the subject agent's certificate.
     /// A malformed issuer key yields `false` (it will fail verification anyway).
     #[must_use]
     pub fn is_self_revocation(&self) -> bool {
-        match MlDsaPublicKey::from_bytes(&self.issuer_public_key) {
-            Ok(pk) => &derive_peer_id_from_public_key(&pk).0 == self.subject.id_bytes(),
-            Err(_) => false,
+        match (
+            &self.subject,
+            MlDsaPublicKey::from_bytes(&self.issuer_public_key),
+        ) {
+            // Bindings have no single subject id — never self-revocable.
+            (RevokedSubject::AgentMachineBinding(_), _) => false,
+            (_, Ok(pk)) => &derive_peer_id_from_public_key(&pk).0 == self.subject.id_bytes(),
+            (_, Err(_)) => false,
         }
     }
 
     /// Hex-encoded subject identifier (32 bytes → 64 hex chars).
     ///
-    /// Convenience for REST responses — avoids exposing raw `[u8; 32]` in JSON.
+    /// Convenience for REST responses — avoids exposing raw `[u8; 32]` in
+    /// JSON. A binding subject surfaces its AGENT id (the pairing's primary
+    /// identity; the machine rides in the record's REST view separately).
     #[must_use]
     pub fn subject_hex(&self) -> String {
-        hex::encode(self.subject.id_bytes())
+        match &self.subject {
+            RevokedSubject::AgentMachineBinding(binding) => hex::encode(binding.agent.as_bytes()),
+            _ => hex::encode(self.subject.id_bytes()),
+        }
     }
 
-    /// Human-readable subject kind: `"agent"` or `"machine"`.
+    /// Human-readable subject kind: `"agent"`, `"machine"`, or `"binding"`.
     #[must_use]
     pub fn subject_kind(&self) -> &'static str {
         match &self.subject {
             RevokedSubject::Agent(_) => "agent",
             RevokedSubject::Machine(_) => "machine",
+            RevokedSubject::AgentMachineBinding(_) => "binding",
         }
     }
 
@@ -299,6 +383,15 @@ pub struct RevocationSet {
     revoked_agents: HashSet<AgentId>,
     revoked_machines: HashSet<MachineId>,
     records_by_hash: HashMap<[u8; 32], PersistedRevocation>,
+    /// ADR-0043 tombstone epochs from ad-hoc binding `RevocationRecord`s
+    /// (`x0x.revocation.v2` carrier). Grow-only; never TTL-swept.
+    binding_epochs: HashMap<(AgentId, MachineId), u64>,
+    /// ADR-0043 tombstone epochs unioned from VERIFIED
+    /// `ActivationBundle.retired_bindings` sets (owner-covered by the
+    /// bundle signature — not standalone records). Grow-only, order-
+    /// independent; never TTL-swept. Both maps feed
+    /// [`Self::is_binding_revoked`].
+    bundle_retired_epochs: HashMap<(AgentId, MachineId), u64>,
     /// Monotonic change counter — incremented on every insert or expiry.
     /// Publishers compare this to decide whether the set changed since
     /// their last full broadcast (the on-change piggyback gate), avoiding
@@ -323,6 +416,60 @@ impl RevocationSet {
     #[must_use]
     pub fn is_machine_revoked(&self, id: &MachineId) -> bool {
         self.revoked_machines.contains(id)
+    }
+
+    /// Whether an `(agent, machine)` binding is retired (ADR-0043 check
+    /// **B**): the grow-only union of bundle `retired_bindings` and ad-hoc
+    /// v2 tombstones.
+    #[must_use]
+    pub fn is_binding_revoked(&self, agent: &AgentId, machine: &MachineId) -> bool {
+        let key = (*agent, *machine);
+        self.binding_epochs.contains_key(&key) || self.bundle_retired_epochs.contains_key(&key)
+    }
+
+    /// Highest epoch of any tombstone for the agent across both carriers,
+    /// ordering placement records against tombstones (§9 check **P**).
+    #[must_use]
+    pub fn max_revoked_binding_epoch(&self, agent: &AgentId) -> Option<u64> {
+        let from_records = self
+            .binding_epochs
+            .iter()
+            .filter(|((a, _), _)| a == agent)
+            .map(|(_, epoch)| *epoch)
+            .max();
+        let from_bundles = self
+            .bundle_retired_epochs
+            .iter()
+            .filter(|((a, _), _)| a == agent)
+            .map(|(_, epoch)| *epoch)
+            .max();
+        from_records.max(from_bundles)
+    }
+
+    /// Union a VERIFIED `ActivationBundle`'s cumulative `retired_bindings`
+    /// into the grow-only tombstone set (order-independent; the entries are
+    /// owner-covered by the bundle's signature, not standalone records).
+    /// Returns `true` when anything new was added.
+    ///
+    /// # Security
+    ///
+    /// Callers MUST have passed the bundle through
+    /// [`crate::key_move::verify_bundle_mesh`] first — this method performs
+    /// no cryptography.
+    pub fn union_bundle_retired(&mut self, bindings: &[AgentMachineBinding]) -> bool {
+        let mut changed = false;
+        for binding in bindings {
+            let key = (binding.agent, binding.machine);
+            let entry = self.bundle_retired_epochs.entry(key).or_insert(0);
+            if *entry < binding.move_epoch {
+                *entry = binding.move_epoch;
+                changed = true;
+            }
+        }
+        if changed {
+            self.change_generation = self.change_generation.saturating_add(1);
+        }
+        changed
     }
 
     /// Number of distinct records held.
@@ -400,7 +547,15 @@ impl RevocationSet {
         let expired: Vec<[u8; 32]> = self
             .records_by_hash
             .iter()
-            .filter(|(_, persisted)| persisted.record.revoked_at < cutoff)
+            // ADR-0043 §7.3: binding tombstones are PERMANENT — a retired
+            // binding must never resurrect, so the TTL sweep skips them.
+            .filter(|(_, persisted)| {
+                persisted.record.revoked_at < cutoff
+                    && !matches!(
+                        persisted.record.subject,
+                        RevokedSubject::AgentMachineBinding(_)
+                    )
+            })
             .map(|(hash, _)| *hash)
             .collect();
         if expired.is_empty() {
@@ -414,6 +569,12 @@ impl RevocationSet {
                     }
                     RevokedSubject::Machine(id) => {
                         self.revoked_machines.remove(id);
+                    }
+                    // Bindings never reach the expired list (filter
+                    // above); arm kept total for exhaustiveness.
+                    RevokedSubject::AgentMachineBinding(binding) => {
+                        self.binding_epochs
+                            .remove(&(binding.agent, binding.machine));
                     }
                 }
             }
@@ -434,36 +595,134 @@ impl RevocationSet {
             RevokedSubject::Machine(id) => {
                 self.revoked_machines.insert(*id);
             }
+            RevokedSubject::AgentMachineBinding(binding) => {
+                // Keep the highest epoch per pairing — the grow-only
+                // tombstone set orders placement records (§9 P).
+                let key = (binding.agent, binding.machine);
+                let entry = self.binding_epochs.entry(key).or_insert(0);
+                *entry = (*entry).max(binding.move_epoch);
+            }
         }
         self.records_by_hash.insert(hash, persisted);
         self.change_generation = self.change_generation.saturating_add(1);
         true
     }
 
-    /// All held records (order unspecified), for rebroadcast/anti-entropy.
+    /// All held records for the V1 wire (`Agent`/`Machine` subjects only,
+    /// order unspecified), for rebroadcast/anti-entropy.
+    ///
+    /// ADR-0043 §7.4: the v1 batch is one whole `Vec<RevocationRecord>`
+    /// that legacy peers deserialize in full — an unknown `0x03` variant
+    /// would poison every co-resident record for old peers, so the v1
+    /// publication filters to legacy subjects and stays byte-identical.
     #[must_use]
     pub fn all_records(&self) -> Vec<RevocationRecord> {
         self.records_by_hash
             .values()
+            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
             .map(|p| p.record.clone())
             .collect()
     }
 
-    /// Encode the set for on-disk persistence: `X0XR` magic + bincode of the
-    /// record list (each record carrying the certificate that authorizes it,
-    /// where applicable).
+    /// All held binding-subject records (ad-hoc tombstones) for the
+    /// `x0x.revocation.v2` carrier and the `revocations-v2.bin` store.
+    #[must_use]
+    pub fn binding_records(&self) -> Vec<RevocationRecord> {
+        self.records_by_hash
+            .values()
+            .filter(|p| matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
+            .map(|p| p.record.clone())
+            .collect()
+    }
+
+    /// Encode the V1 set for on-disk persistence: `X0XR` magic + bincode of
+    /// the legacy-subject (`Agent`/`Machine`) record list, each record
+    /// carrying the certificate that authorizes it. Binding tombstones
+    /// persist via [`Self::to_bytes_v2`].
     ///
     /// # Errors
     ///
     /// Returns [`IdentityError::Serialization`] on encode failure.
     pub fn to_bytes(&self) -> Result<Vec<u8>, IdentityError> {
-        let records: Vec<&PersistedRevocation> = self.records_by_hash.values().collect();
+        let records: Vec<&PersistedRevocation> = self
+            .records_by_hash
+            .values()
+            .filter(|p| !matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
+            .collect();
         let body = bincode::serialize(&records)
             .map_err(|e| IdentityError::Serialization(e.to_string()))?;
         let mut out = Vec::with_capacity(REVOCATIONS_FILE_MAGIC.len() + body.len());
         out.extend_from_slice(REVOCATIONS_FILE_MAGIC);
         out.extend_from_slice(&body);
         Ok(out)
+    }
+
+    /// Encode the ADR-0043 ad-hoc binding records for
+    /// `revocations-v2.bin`: `X0R2` magic + bincode of the persisted
+    /// entries (cert included — issuer authority re-verifies on load).
+    /// Bundle-unioned tombstones are re-derived from `move-bundles.bin`
+    /// on load and are NOT duplicated here.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Serialization`] on encode failure.
+    pub fn to_bytes_v2(&self) -> Result<Vec<u8>, IdentityError> {
+        let records: Vec<&PersistedRevocation> = self
+            .records_by_hash
+            .values()
+            .filter(|p| matches!(p.record.subject, RevokedSubject::AgentMachineBinding(_)))
+            .collect();
+        let body = bincode::serialize(&records)
+            .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        let mut out = Vec::with_capacity(REVOCATIONS_FILE_MAGIC_V2.len() + body.len());
+        out.extend_from_slice(REVOCATIONS_FILE_MAGIC_V2);
+        out.extend_from_slice(&body);
+        Ok(out)
+    }
+
+    /// Decode a `revocations-v2.bin` previously written by
+    /// [`to_bytes_v2`](Self::to_bytes_v2), re-verifying every record's
+    /// authority on load. Merge into the main set with
+    /// [`merge_v2`](Self::merge_v2) — the returned set holds only the
+    /// binding records.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IdentityError::Serialization`] if the magic is missing or
+    /// the body is malformed. Empty input yields an empty set.
+    pub fn from_bytes_v2(bytes: &[u8]) -> Result<Self, IdentityError> {
+        if bytes.is_empty() {
+            return Ok(Self::new());
+        }
+        if bytes.len() < REVOCATIONS_FILE_MAGIC_V2.len()
+            || &bytes[..REVOCATIONS_FILE_MAGIC_V2.len()] != REVOCATIONS_FILE_MAGIC_V2
+        {
+            return Err(IdentityError::Serialization(
+                "revocation v2 file missing X0R2 magic".to_string(),
+            ));
+        }
+        let persisted: Vec<PersistedRevocation> =
+            bincode::deserialize(&bytes[REVOCATIONS_FILE_MAGIC_V2.len()..])
+                .map_err(|e| IdentityError::Serialization(e.to_string()))?;
+        let mut set = Self::new();
+        for entry in persisted {
+            // Fail-closed load path: an entry that no longer verifies is
+            // dropped, never trusted.
+            let _ = set.verify_and_insert(entry.record, entry.subject_cert.as_ref());
+        }
+        Ok(set)
+    }
+
+    /// Merge a decoded v2 set into this one (grow-only union).
+    pub fn merge_v2(&mut self, other: Self) {
+        for ((agent, machine), epoch) in other.binding_epochs {
+            let key = (agent, machine);
+            let entry = self.binding_epochs.entry(key).or_insert(0);
+            *entry = (*entry).max(epoch);
+        }
+        for (hash, persisted) in other.records_by_hash {
+            self.records_by_hash.entry(hash).or_insert(persisted);
+        }
     }
 
     /// Decode a set previously written by [`to_bytes`](Self::to_bytes),
@@ -912,5 +1171,102 @@ mod tests {
     #[test]
     fn revocation_set_from_empty_is_empty() {
         assert!(RevocationSet::from_bytes(&[]).unwrap().is_empty());
+    }
+    /// ADR-0043 §7: binding-revocation authority matrix, carrier split,
+    /// and permanence. The WHY: only the owner key may retire a pairing —
+    /// not the moving agent, not either machine, not a third user — and a
+    /// retired binding must never resurrect via TTL or a v1 round-trip.
+    #[test]
+    fn binding_revocation_authority_matrix_and_carriers() {
+        use crate::identity::{AgentKeypair, UserKeypair};
+
+        let owner = UserKeypair::generate().unwrap();
+        let agent_kp = AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&owner, &agent_kp).unwrap();
+        let machine = crate::identity::MachineId([7u8; 32]);
+        let binding = AgentMachineBinding {
+            agent: agent_kp.agent_id(),
+            machine,
+            move_epoch: 3,
+        };
+
+        // Owner-key issued with the cert: accepted.
+        let record = RevocationRecord::sign(
+            RevokedSubject::AgentMachineBinding(binding.clone()),
+            owner.public_key(),
+            owner.secret_key(),
+            1_000,
+            Some("stolen machine".into()),
+        )
+        .unwrap();
+        assert!(record.verify_authority(Some(&cert)).is_ok());
+        // Without the cert: fail-closed (issuer authority unverifiable).
+        assert!(record.verify_authority(None).is_err());
+        assert!(!record.is_self_revocation());
+        assert_eq!(record.subject_kind(), "binding");
+
+        // The moving agent's own key cannot issue it.
+        let agent_issued = RevocationRecord::sign(
+            RevokedSubject::AgentMachineBinding(binding.clone()),
+            agent_kp.public_key(),
+            agent_kp.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(agent_issued.verify_authority(Some(&cert)).is_err());
+
+        // A third user cannot issue it.
+        let stranger = UserKeypair::generate().unwrap();
+        let stranger_issued = RevocationRecord::sign(
+            RevokedSubject::AgentMachineBinding(binding.clone()),
+            stranger.public_key(),
+            stranger.secret_key(),
+            1_000,
+            None,
+        )
+        .unwrap();
+        assert!(stranger_issued.verify_authority(Some(&cert)).is_err());
+
+        // Insert → check B → v1 wire excludes it, v2 round-trips it →
+        // TTL sweep NEVER expires it.
+        let mut set = RevocationSet::new();
+        assert!(set.verify_and_insert(record.clone(), Some(&cert)).unwrap());
+        assert!(set.is_binding_revoked(&binding.agent, &machine));
+        assert_eq!(set.max_revoked_binding_epoch(&binding.agent), Some(3));
+        assert!(
+            set.all_records().is_empty(),
+            "v1 wire must never carry the 0x03 variant (§7.4)"
+        );
+        assert_eq!(set.binding_records().len(), 1);
+
+        let v2 = set.to_bytes_v2().unwrap();
+        let loaded = RevocationSet::from_bytes_v2(&v2).unwrap();
+        assert!(loaded.is_binding_revoked(&binding.agent, &machine));
+        let mut merged = RevocationSet::new();
+        merged.merge_v2(loaded);
+        assert!(merged.is_binding_revoked(&binding.agent, &machine));
+
+        // Permanence: a sweep far past any TTL keeps the tombstone.
+        let expired = set.expire_records_older_than(60, 10_000_000);
+        assert_eq!(expired, 0);
+        assert!(set.is_binding_revoked(&binding.agent, &machine));
+
+        // Bundle-unioned tombstones (no standalone record) feed the same
+        // check and never expire.
+        let mut set2 = RevocationSet::new();
+        assert!(set2.union_bundle_retired(&[
+            binding.clone(),
+            AgentMachineBinding {
+                agent: binding.agent,
+                machine: crate::identity::MachineId([8u8; 32]),
+                move_epoch: 1,
+            }
+        ]));
+        assert!(set2.is_binding_revoked(&binding.agent, &machine));
+        assert_eq!(set2.max_revoked_binding_epoch(&binding.agent), Some(3));
+        assert!(set2.binding_records().is_empty());
+        assert!(set2.expire_records_older_than(0, u64::MAX) == 0);
+        assert!(set2.is_binding_revoked(&binding.agent, &machine));
     }
 }

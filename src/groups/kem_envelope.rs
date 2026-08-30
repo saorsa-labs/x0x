@@ -202,6 +202,76 @@ pub fn open_group_secret(
     Ok(out)
 }
 
+/// Seal an arbitrary-length byte payload to a recipient's ML-KEM-768
+/// public key (ADR-0043 §2.2 — byte-wise sibling of
+/// [`seal_group_secret_to_recipient`]).
+///
+/// The group-secret sealer is fixed to a 32-byte plaintext because a group
+/// shared secret IS 32 bytes; the agent key-move export envelope must carry
+/// a full serialized `AgentKeypair` (ML-DSA-65 secret is 4032 B). The AEAD
+/// underneath already handles arbitrary-length plaintext, so this is the
+/// same construction — KEM encapsulation → ChaCha20-Poly1305 with `aad` —
+/// with the plaintext length constraint lifted. No new cryptography.
+///
+/// Returns `(kem_ciphertext, aead_nonce, aead_ciphertext)`; the ciphertext
+/// is `plaintext.len() + 16` bytes.
+pub fn seal_bytes_to_recipient(
+    recipient_public_bytes: &[u8],
+    aad: &[u8],
+    plaintext: &[u8],
+) -> Result<(Vec<u8>, [u8; 12], Vec<u8>)> {
+    let pk = MlKemPublicKey::from_bytes(KEM_VARIANT, recipient_public_bytes).map_err(|e| {
+        IdentityError::Serialization(format!("recipient ML-KEM public-key decode: {e}"))
+    })?;
+    let kem = MlKem::new(KEM_VARIANT);
+    let (shared, kem_ct) = kem
+        .encapsulate(&pk)
+        .map_err(|e| IdentityError::Serialization(format!("ML-KEM encaps: {e}")))?;
+
+    use rand::RngCore;
+    let mut nonce = [0u8; 12];
+    rand::thread_rng().fill_bytes(&mut nonce);
+    let cipher = ChaCha20Poly1305::new_from_slice(shared.as_bytes())
+        .map_err(|e| IdentityError::Serialization(format!("AEAD init (sealer): {e}")))?;
+    let aead_ct = cipher
+        .encrypt(
+            Nonce::from_slice(&nonce),
+            Payload {
+                msg: plaintext,
+                aad,
+            },
+        )
+        .map_err(|e| IdentityError::Serialization(format!("AEAD encrypt: {e}")))?;
+    Ok((kem_ct.to_bytes(), nonce, aead_ct))
+}
+
+/// Open a [`seal_bytes_to_recipient`] envelope using the recipient's
+/// ML-KEM private key (ADR-0043 §2.2).
+///
+/// AAD substitution (envelope replayed against a different move
+/// authorization) fails the AEAD tag, binding the ciphertext to the exact
+/// `MoveAuthorization` canonical bytes it was sealed under (ADR-0043 §4).
+pub fn open_sealed_bytes(
+    kp: &AgentKemKeypair,
+    aad: &[u8],
+    kem_ciphertext: &[u8],
+    aead_nonce: &[u8; 12],
+    aead_ciphertext: &[u8],
+) -> Result<Vec<u8>> {
+    let shared = kp.decapsulate(kem_ciphertext)?;
+    let cipher = ChaCha20Poly1305::new_from_slice(&shared)
+        .map_err(|e| IdentityError::Serialization(format!("AEAD init (opener): {e}")))?;
+    cipher
+        .decrypt(
+            Nonce::from_slice(aead_nonce),
+            Payload {
+                msg: aead_ciphertext,
+                aad,
+            },
+        )
+        .map_err(|e| IdentityError::Serialization(format!("AEAD decrypt: {e}")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -322,10 +392,52 @@ mod tests {
     async fn agent_kem_keypair_load_or_generate_rejects_corrupted() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kem.key");
+
         tokio::fs::write(&path, b"not-a-valid-keypair")
             .await
             .unwrap();
         let result = AgentKemKeypair::load_or_generate(&path).await;
         assert!(result.is_err(), "corrupted file should fail");
+    }
+    #[test]
+    fn roundtrip_seal_open_bytes() {
+        // ADR-0043 export envelope shape: 4032 B ML-DSA-65 secret + public
+        // half — far past the 32-byte group-secret limit. The byte-wise
+        // sibling must round-trip it exactly.
+        let kp = AgentKemKeypair::generate().expect("generate");
+        let payload: Vec<u8> = (0..4032u32).map(|i| (i % 251) as u8).collect();
+        let aad = b"x0x-agent-move.v1\x00auth-bytes";
+        let (kem_ct, nonce, aead_ct) =
+            seal_bytes_to_recipient(&kp.public_bytes, aad, &payload).expect("seal");
+        let got = open_sealed_bytes(&kp, aad, &kem_ct, &nonce, &aead_ct).expect("open");
+        assert_eq!(got, payload);
+        assert_eq!(aead_ct.len(), payload.len() + 16);
+    }
+
+    #[test]
+    fn bytes_wrong_aad_fails() {
+        // The export envelope's AAD is the MoveAuthorization canonical
+        // bytes; a different authorization (other move, other target)
+        // must fail the AEAD tag — cross-move replay is impossible.
+        let kp = AgentKemKeypair::generate().expect("generate");
+        let (kem_ct, nonce, aead_ct) =
+            seal_bytes_to_recipient(&kp.public_bytes, b"auth-1", b"payload").expect("seal");
+        assert!(
+            open_sealed_bytes(&kp, b"auth-2", &kem_ct, &nonce, &aead_ct).is_err(),
+            "AAD substitution must fail the tag"
+        );
+    }
+
+    #[test]
+    fn bytes_wrong_recipient_fails() {
+        let target = AgentKemKeypair::generate().expect("target");
+        let other = AgentKemKeypair::generate().expect("other");
+        let (kem_ct, nonce, aead_ct) =
+            seal_bytes_to_recipient(&target.public_bytes, b"aad", b"agent-key-bytes")
+                .expect("seal");
+        assert!(
+            open_sealed_bytes(&other, b"aad", &kem_ct, &nonce, &aead_ct).is_err(),
+            "non-recipient machine must not unwrap the export envelope"
+        );
     }
 }

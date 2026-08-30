@@ -22056,6 +22056,10 @@ pub(in crate::server) mod tests {
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
         Ok(Arc::new(AppState {
+            // ADR-0043 r4: the shared test state runs the ceremony ENABLED so
+            // the move-route wiring tests exercise real behavior; the
+            // default-off posture is covered by key_move::tests gate tests.
+            key_move_ceremony_enabled: true,
             agent,
             history_record_topics: Vec::new(),
             history_config: x0x::history::HistoryConfig::default(),

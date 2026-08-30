@@ -726,6 +726,10 @@ pub(crate) struct InboundCtx {
     pub connect_diag: Arc<ConnectDiagnostics>,
     pub fwd_diag: Arc<ForwardDiagnostics>,
     pub revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    /// ADR-0043 derived move state — the mid-flight re-check evaluates
+    /// B/P for EVERY (agent, machine) pairing the lane resolves (both
+    /// machines during the transition window), never per agent.
+    pub move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
     pub discovery_cache:
         Arc<tokio::sync::RwLock<std::collections::HashMap<AgentId, crate::DiscoveredAgent>>>,
     pub contact_store: Arc<tokio::sync::RwLock<crate::contacts::ContactStore>>,
@@ -767,6 +771,35 @@ pub(crate) async fn handle_inbound(mut stream: PeerStream, ctx: &InboundCtx) {
                 "inbound forward: peer revoked after accept — dropping before header read"
             );
             return;
+        }
+    }
+
+    // ADR-0043 §9: B/P for every (agent, machine) pairing the lane
+    // resolves — per pairing, never per agent, so the transition window
+    // (agent discoverable on both machines) resolves correctly: the
+    // source pairing dies, the target passes.
+    {
+        let placements = ctx.move_state.read().await;
+        let revoked = ctx.revocation_set.read().await;
+        for agent in &agents {
+            if crate::key_move::enforce_pairing(
+                &revoked,
+                placements.placement_view(),
+                agent,
+                &machine_id,
+            )
+            .is_some()
+            {
+                ctx.fwd_diag.record_revoked_mid_flight();
+                tracing::info!(
+                    target: "x0x::forward",
+                    agent = %hex::encode(agent.as_bytes()),
+                    machine = %hex::encode(peer.as_bytes()),
+                    outcome = "drop_pairing_mid_flight",
+                    "inbound forward: ADR-0043 B/P pairing gate — dropping before header read"
+                );
+                return;
+            }
         }
     }
 
@@ -1138,6 +1171,8 @@ pub struct ForwardService {
     per_peer: Arc<std::sync::Mutex<HashMap<AgentId, u32>>>,
     /// Shared revocation set for the FIX 4 pre-header re-check.
     revocation_set: Arc<tokio::sync::RwLock<crate::revocation::RevocationSet>>,
+    /// ADR-0043 derived move state — the mid-flight B/P pairing re-check.
+    move_state: Arc<tokio::sync::RwLock<crate::key_move::MoveState>>,
     /// Shared identity discovery cache — for ForwardV2 attestation key
     /// lookups (#204).
     discovery_cache:
@@ -1245,6 +1280,7 @@ impl ForwardService {
         let revocation_set = agent.revocation_set();
         let discovery_cache = agent.identity_discovery_cache();
         let contact_store = agent.contact_store();
+        let move_state = agent.move_state();
         Ok(Self {
             agent,
             policy,
@@ -1257,6 +1293,7 @@ impl ForwardService {
             outbound_permits: Arc::new(tokio::sync::Semaphore::new(MAX_OUTBOUND_STREAMS)),
             per_peer: Arc::new(std::sync::Mutex::new(HashMap::new())),
             revocation_set,
+            move_state,
             discovery_cache,
             contact_store,
             require_attestation,
@@ -1353,8 +1390,9 @@ impl ForwardService {
             let inbound_ctx = InboundCtx {
                 policy: Arc::clone(&this.policy),
                 connect_diag: Arc::clone(&this.connect_diag),
-                fwd_diag: Arc::clone(&this.fwd_diag),
                 revocation_set: Arc::clone(&this.revocation_set),
+                move_state: Arc::clone(&this.move_state),
+                fwd_diag: Arc::clone(&this.fwd_diag),
                 discovery_cache: Arc::clone(&this.discovery_cache),
                 contact_store: Arc::clone(&this.contact_store),
                 own_machine_id: this.agent.machine_id(),
@@ -1563,6 +1601,20 @@ async fn try_outbound_v2(
             return OutboundOutcome::PeerRejectedV2(tcp);
         }
     };
+
+    // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
+    // agent-key signature — a quiesced/quarantined machine produces none.
+    // Fail toward the V1 fallback exactly like a signing error would; the
+    // V1 path carries no agent signature (transport-machine context only,
+    // filtered receiver-side by B/P).
+    if !agent.signing_gate_allows(&agent.agent_id()).await {
+        tracing::info!(
+            target: "x0x::forward",
+            peer = %hex::encode(peer_agent.as_bytes()),
+            "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+        );
+        return OutboundOutcome::PeerRejectedV2(tcp);
+    }
     // Build + sign the V2 header with the local agent keypair. The header
     // carries the opener's public key so the verifier doesn't depend on
     // announce propagation (#204 soak fix).

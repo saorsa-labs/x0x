@@ -878,6 +878,20 @@ pub(in crate::server) async fn agent_sign(
         }
     };
 
+    // ADR-0043 AgentSigningGate (§6): `may_sign = holds_key ∧ custodian ==
+    // this machine`. This daemon's agent with NO move log fails open
+    // (pre-0043 behavior); once a log exists, quiesced (mid-move /
+    // retire-pending source) and quarantined (un-activated target) states
+    // refuse to sign — zero live signers during a transfer is derived, not
+    // tracked.
+    let signing_agent = state.agent.agent_id();
+    if !state.agent.signing_gate_allows(&signing_agent).await {
+        return api_error(
+            StatusCode::CONFLICT,
+            "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate — quiesced or quarantined)",
+        );
+    }
+
     if payload.is_empty() {
         return bad_request("payload must be non-empty");
     }
@@ -1148,11 +1162,17 @@ pub(in crate::server) struct ServiceEntryData {
 /// (revoking own agent-id or own machine-id) always succeeds.  Revoking a
 /// third-party subject requires that a user keypair previously signed an
 /// `AgentCertificate` for that subject (user-authority revocation).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(in crate::server) struct RevokeRequest {
-    /// Which subject to revoke. Exactly one field must be present.
+    /// Which subject to revoke. Exactly one field must be present for
+    /// Agent/Machine subjects; BOTH `agent_id` and `machine_id` (with
+    /// `move_epoch`) select the ADR-0043 binding form — an owner-key
+    /// issued, permanent `(agent, machine)` tombstone on the v2 carrier.
     agent_id: Option<String>,
     machine_id: Option<String>,
+    /// Binding form only: the move epoch ordering the tombstone against
+    /// placement records (§7.1). Required when both ids are present.
+    move_epoch: Option<u64>,
     /// Optional human-readable reason string (stored in the record).
     reason: Option<String>,
 }
@@ -1165,9 +1185,58 @@ pub(in crate::server) struct RevokeRequest {
 /// to revoke the requested subject.
 pub(in crate::server) async fn identity_revoke(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
+    // ADR-0043 both-fields form: owner-key issued binding tombstone.
+    if let (Some(agent_hex), Some(machine_hex)) =
+        (body.agent_id.as_deref(), body.machine_id.as_deref())
+    {
+        if !actor.is_durable_owner() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "binding revocation requires the durable API token (owner-key signing act)",
+            );
+        }
+        let Some(epoch) = body.move_epoch else {
+            return bad_request("binding revocation requires move_epoch");
+        };
+        let agent = hex::decode(agent_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(x0x::identity::AgentId);
+        let machine = hex::decode(machine_hex)
+            .ok()
+            .and_then(|b| b.try_into().ok())
+            .map(x0x::identity::MachineId);
+        let (Some(agent), Some(machine)) = (agent, machine) else {
+            return bad_request("agent_id and machine_id must be 32-byte hex");
+        };
+        return match state
+            .agent
+            .revoke_binding(&agent, &machine, epoch, body.reason.clone())
+            .await
+        {
+            Ok(record) => (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "subject": record.subject_hex(),
+                    "subject_kind": record.subject_kind(),
+                    "issuer": hex::encode(record.issuer_public_key_hash()),
+                    "revoked_at": record.revoked_at,
+                    "reason": record.reason,
+                })),
+            ),
+            Err(e) => api_error(
+                StatusCode::FORBIDDEN,
+                format!("binding revocation rejected (owner key + certificate required): {e}"),
+            ),
+        };
+    }
 
     let subject = match (body.agent_id.as_deref(), body.machine_id.as_deref()) {
         (Some(hex), None) => {

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 165,
+  "endpoint_count": 174,
   "endpoints": [
     {
       "category": "status",
@@ -98,6 +98,69 @@
       "description": "List all revocation records held by this daemon",
       "method": "GET",
       "path": "/identity/revocations"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move authorize",
+      "description": "Owner-authorize an agent move (chain MoveAuthorization; source seals)",
+      "method": "POST",
+      "path": "/agent/move"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move export",
+      "description": "Source machine seals the export envelope + ExportReceipt",
+      "method": "POST",
+      "path": "/agent/move/export"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move import",
+      "description": "Target machine imports a transfer bundle (unwrap + store + receipt)",
+      "method": "POST",
+      "path": "/agent/move/import"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move activate",
+      "description": "Owner commits a move (ActivationBundle on the activation topic)",
+      "method": "POST",
+      "path": "/agent/move/activate"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move abort",
+      "description": "Owner rolls back a pre-activation move (epoch burned)",
+      "method": "POST",
+      "path": "/agent/move/abort"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move retire",
+      "description": "Source machine retires after activation (delete key + receipt)",
+      "method": "POST",
+      "path": "/agent/move/retire"
+    },
+    {
+      "category": "identity",
+      "cli_name": "move list",
+      "description": "Move-log view + derived state (custodian, quiesce, placement)",
+      "method": "GET",
+      "path": "/agent/moves"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner placement",
+      "description": "Derived placement ledger (lazy mint + ≥1-Roaming Home invariant)",
+      "method": "GET",
+      "path": "/owner/placement"
+    },
+    {
+      "category": "identity",
+      "cli_name": "owner agents placement",
+      "description": "One agent's placement record + fold",
+      "method": "GET",
+      "path": "/owner/agents/:id/placement"
     },
     {
       "category": "identity",

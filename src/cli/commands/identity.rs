@@ -363,6 +363,122 @@ pub async fn owner_riders_revoke(client: &DaemonClient, token_id: u64) -> Result
         .run_delete(&format!("/owner/riders/{token_id}"))
         .await
 }
+
+// ── ADR-0043 agent key-move ceremony ─────────────────────────────────────────
+
+/// `x0x owner placement` — GET /owner/placement (mints lazily; shows the
+/// derived ledger + ≥1-Roaming Home invariant status).
+pub async fn owner_placement(client: &DaemonClient) -> Result<()> {
+    client.run_get("/owner/placement").await
+}
+
+/// `x0x owner agents placement AGENT` — GET /owner/agents/:id/placement.
+pub async fn owner_agent_placement(client: &DaemonClient, agent_id: &str) -> Result<()> {
+    client
+        .run_get(&format!("/owner/agents/{agent_id}/placement"))
+        .await
+}
+
+/// `x0x move authorize AGENT TO_MACHINE PLACEMENT` — POST /agent/move.
+pub async fn move_authorize(
+    client: &DaemonClient,
+    agent_id: &str,
+    to_machine: &str,
+    placement: &str,
+) -> Result<()> {
+    let mut body = serde_json::json!({
+        "agent_id": agent_id,
+        "to_machine": to_machine,
+        "placement": placement,
+    });
+    if placement == "pinned" {
+        // Clause 5: a pinned move may only pin to its target.
+        body["pin"] = serde_json::json!(to_machine);
+    }
+    let resp = client.post("/agent/move", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move export BUNDLE_JSON` — POST /agent/move/export (run on the
+/// source machine).
+pub async fn move_export(client: &DaemonClient, bundle_json: &str) -> Result<()> {
+    let bundle = read_bundle_json(bundle_json)?;
+    let resp = client.post("/agent/move/export", &bundle).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move import BUNDLE_JSON` — POST /agent/move/import (run on the
+/// target machine).
+pub async fn move_import(client: &DaemonClient, bundle_json: &str) -> Result<()> {
+    let bundle = read_bundle_json(bundle_json)?;
+    let resp = client.post("/agent/move/import", &bundle).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move activate AGENT EPOCH` — POST /agent/move/activate.
+pub async fn move_activate(client: &DaemonClient, agent_id: &str, move_epoch: u64) -> Result<()> {
+    let body = serde_json::json!({ "agent_id": agent_id, "move_epoch": move_epoch });
+    let resp = client.post("/agent/move/activate", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move abort AGENT EPOCH` — POST /agent/move/abort.
+pub async fn move_abort(
+    client: &DaemonClient,
+    agent_id: &str,
+    move_epoch: u64,
+    reason: Option<&str>,
+) -> Result<()> {
+    let mut body = serde_json::json!({ "agent_id": agent_id, "move_epoch": move_epoch });
+    if let Some(reason) = reason {
+        body["reason"] = serde_json::json!(reason);
+    }
+    let resp = client.post("/agent/move/abort", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move retire AGENT EPOCH` — POST /agent/move/retire.
+pub async fn move_retire(client: &DaemonClient, agent_id: &str, move_epoch: u64) -> Result<()> {
+    let body = serde_json::json!({ "agent_id": agent_id, "move_epoch": move_epoch });
+    let resp = client.post("/agent/move/retire", &body).await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x move list [AGENT]` — GET /agent/moves.
+pub async fn move_list(client: &DaemonClient, agent_id: Option<&str>) -> Result<()> {
+    match agent_id {
+        Some(agent) => {
+            client
+                .run_get(&format!("/agent/moves?agent_id={agent}"))
+                .await
+        }
+        None => client.run_get("/agent/moves").await,
+    }
+}
+
+/// Read a transfer bundle from a literal JSON string, a `@file` path, or
+/// `-` (stdin).
+fn read_bundle_json(spec: &str) -> Result<serde_json::Value> {
+    let text = if spec == "-" {
+        use std::io::Read;
+        let mut buf = String::new();
+        std::io::stdin()
+            .read_to_string(&mut buf)
+            .map_err(|e| anyhow::anyhow!("stdin read failed: {e}"))?;
+        buf
+    } else if let Some(path) = spec.strip_prefix('@') {
+        std::fs::read_to_string(path).map_err(|e| anyhow::anyhow!("read {path}: {e}"))?
+    } else {
+        spec.to_string()
+    };
+    serde_json::from_str(&text).map_err(|e| anyhow::anyhow!("bundle JSON parse: {e}"))
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -658,6 +658,8 @@ mod tests {
             is_coordinator: Some(true),
             reachable_via: vec![MachineId([2u8; 32])],
             relay_candidates: vec![],
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
             agent_ids: vec![],
             user_ids: vec![],
         };
@@ -685,6 +687,8 @@ mod tests {
             is_coordinator: None,
             reachable_via: vec![],
             relay_candidates: vec![],
+            machine_kem_public_key: None,
+            placement_digests: Vec::new(),
             agent_ids: vec![],
             user_ids: vec![],
         };
