@@ -77,13 +77,19 @@ curl http://127.0.0.1:12700/status
 | GET | `/agent` | `x0x agent` | Local agent identity |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
-| GET | `/agent/card` | `x0x agent card` | Generate a shareable, signed identity card |
+| GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
+
+> **Known limitation (#446):** browser **session tokens** (from
+> `POST /auth/session`) currently reach owner-act surfaces — `/agent/sign`,
+> `/exec/*`, `/shutdown`, and `/sync/*` — not just read surfaces. Treat any
+> issued session token as equivalent to the durable API token until #446
+> lands; scope token lifetimes accordingly.
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id`) |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Issue a signed key revocation. Exactly one of `agent_id` / `machine_id` for single-subject forms; BOTH plus `move_epoch` selects the ADR-0043 binding form (a permanent (agent, machine) tombstone on the v2 carrier, epoch-ordered against placement records) |
 | GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
@@ -104,6 +110,11 @@ Notes:
 `GET /agent/card?display_name=Alice&include_groups=true`
 
 ### Agent card signing (ADR-0017)
+
+> **Known limitation (#450, mixed fleet):** AgentCard signatures produced by
+> post-#445 daemons (digest_support inside the signed bincode capability
+> bytes) **fail verification on v0.40.4 peers**. Import across that version
+> seam requires both sides on the same side of #445.
 
 Generated cards are signed with the agent's ML-DSA-65 key. The card carries two
 extra fields:
@@ -243,7 +254,8 @@ authenticates as a distinct principal that may reach exactly:
 
 - `POST /groups/:id/send` — `SignedPublic` groups in its grant list
 - `POST /groups/:id/secure/encrypt` — `MlsEncrypted` groups in its grant
-  list plus Home (always granted)
+  list (Home is NOT implicitly granted — it is delegated like any other
+  group, or not reachable at all; rider_auth review r4)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
@@ -342,9 +354,12 @@ without leaking events to the mesh.
 
 Query params:
 - `/agents/discovered?unfiltered=true`
-- `/agents/discovered/:agent_id?wait=<seconds>`
+- `/agents/discovered/:agent_id?wait=true`
 - `/machines/discovered?unfiltered=true`
-- `/machines/discovered/:machine_id?wait=<seconds>`
+- `/machines/discovered/:machine_id?wait=true`
+
+`wait` is a **boolean**: the daemon waits its fixed discovery window when
+`true` (a numeric value such as `wait=5` is a query-deserialize 400).
 
 ## Contacts, machines, and trust
 
@@ -506,7 +521,12 @@ accepted under this id*. Before v0.38.0 the conflict case was reported as
 
 **Rollout note.** Because the default flipped to durable, clients that
 previously got `200` from a 0.37.x peer will now get
-`409 recipient_ack_semantics_unavailable` until that peer upgrades. This is
+`409 recipient_ack_semantics_unavailable` until that peer upgrades.
+
+> **Known limitation (#448, mixed fleet):** a daemon advertising the new
+> `digest_support=true` DM capability is **undecodable by v0.40.4 peers**;
+> old→new strict DMs keep answering 409 until the OLD side upgrades — the
+> "self-healing" only heals at upgrade time. This is
 deliberate (ADR 0030 §2: never a silent downgrade). Handle the 409 as a
 first-class UX state; where delivery matters more than the receipt, send
 `require_durable_app_ack: false`.
@@ -580,7 +600,7 @@ helper API.
 | GET | `/groups` | `x0x group list` | List named groups |
 | GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
-| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Admin-authored member add (propagates to subscribed peers) |
+| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
@@ -599,7 +619,7 @@ helper API.
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
+| POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
@@ -863,7 +883,14 @@ installs the tree and encrypts on the TreeKEM plane. Covered by
 `tests/e2e_treekem_membership.py` (m1+m2 converge; anchor↔m1, anchor↔m2, m1↔m2
 cross-decrypt; ban epoch-advance; post-ban forward secrecy). Convergence
 *latency* depends on direct-connection/gossip formation — a timing
-consideration, not a capability gap. Public encrypted presets
+consideration, not a capability gap.
+
+> **Known limitations:** OwnerCertified cross-daemon joins can stall when
+> the certificate evidence is only resolvable via a pubsub blob fetch and
+> no backbone peer serves it — the joiner currently gets no typed error
+> (#447). And each owner device auto-provisions its **own** Home instead
+> of joining the owner's existing Home (#449); per-machine Home dedup is
+> pending. Public encrypted presets
 (`public_request_secure`) and grandfathered groups remain on the legacy **GSS**
 plane. See `docs/primers/groups.md`.
 
@@ -875,7 +902,7 @@ plane. See `docs/primers/groups.md`.
 | POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list |
 | GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
 | POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
-| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim/complete ...` | Update task state |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
 
 Update task request body:
 
@@ -991,7 +1018,7 @@ unconditional (still advisory).
 |---|---|---|---|
 | GET | `/stores` | `x0x store list` | List stores |
 | POST | `/stores` | `x0x store create <name> <topic>` | Create a store |
-| POST | `/stores/:id/join` | `x0x store join <topic>` | Join an existing store |
+| POST | `/stores/:id/join` | `x0x store join <topic> --owner <hex>` or `x0x store join <topic> --policy self_keyed` | Join an existing store. An owner-anchored join REQUIRES `expected_owner` (a bare join is a 422 `owner_required`); `--policy self_keyed` is the one owner-free join and must be sent WITHOUT `--owner` (422 `owner_not_allowed` otherwise) |
 | GET | `/stores/:id/keys` | `x0x store keys <store_id>` | List keys |
 | PUT | `/stores/:id/:key` | `x0x store put <store_id> <key> <value>` | Put a base64 value |
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
@@ -1092,11 +1119,15 @@ exactly this (saorsa-labs/x0x-symphony#10).
 
 ## Remote exec
 
+> **Known limitation (#446):** session tokens are currently accepted on the
+> exec endpoints, not only the durable API token. Keep session lifetimes
+> short until owner-act enforcement lands.
+
 Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/exec/run` | `x0x exec <agent_id> -- <argv...>` | Run a command on a peer |
+| POST | `/exec/run` | `x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] [--cwd <dir>] -- <argv...>` | Run a command on a peer (`cwd` is recorded on the wire; the remote ACL currently rejects non-empty values) |
 | POST | `/exec/cancel` | `x0x exec cancel <request_id>` | Cancel an in-flight request |
 | GET | `/exec/sessions` | `x0x exec sessions` | List pending client + active server sessions |
 
@@ -1127,6 +1158,13 @@ Run a command on **another** agent's machine. Disabled by default; every request
 |---|---|---|---|
 | GET | `/upgrade` | `x0x upgrade` (standalone self-updater — does not call this endpoint) | Check for updates |
 | POST | `/upgrade/apply` | `x0x upgrade --apply` (standalone self-updater — does not call this endpoint) | Apply the latest verified release manifest |
+
+> **Known limitation (#451, rollback trap):** a v0.40.4 binary
+> **crash-loops** on a data directory that holds a Home (owner_certified
+> admission state). Downgrading an owned install to v0.40.4 — including via
+> the self-updater's automatic rollback after a failed health probe — can
+> therefore brick the daemon loop. Do not roll owned installs back across
+> the Home seam.
 
 ## WebSocket and GUI
 
@@ -1209,6 +1247,10 @@ x0x direct connect <agent_id>
 x0x direct send <agent_id> hello
 x0x direct send <agent_id> hello --logical-id order-42   # retry-safe identity
 x0x direct send <agent_id> hello --no-durable-ack        # reach a 0.37.x peer
+x0x direct send <agent_id> hello --prefer-raw-quic-if-connected false  # gossip-first (pre-v0.37 behavior)
+x0x direct send <agent_id> hello --prefer-raw-quic-if-connected true --raw-quic-receive-ack-ms 4000 --stop-fallback-on-raw-error
+x0x direct events --backfill 20        # replay 20 stored DM rows, then live (ADR-0023 §7)
+x0x ws direct --backfill 20            # same replay via the WebSocket stream URL
 x0x groups create
 x0x group create team-chat --display-name alice
 x0x tasks create inbox team.tasks

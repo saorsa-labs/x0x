@@ -68,6 +68,10 @@ pub enum CliExpose {
     /// Exposed through the caller-supplied JSON document the CLI posts
     /// verbatim (a per-field flag would be a lie about the interface).
     JsonDoc,
+    /// An `Option<bool>` whose daemon default when omitted is TRUE: the CLI
+    /// must expose it as a value-taking `--flag <true|false>` so `false` is
+    /// reachable (a bare SetTrue flag could only restate the default).
+    BoolValue,
 }
 
 /// One named request field an endpoint accepts, beyond its path parameters.
@@ -142,6 +146,17 @@ impl RequestField {
             location: FieldLocation::Body,
             required: false,
             cli: CliExpose::Ignored,
+        }
+    }
+
+    /// Body `Option<bool>` field defaulting to true when omitted; the CLI
+    /// flag must take an explicit value.
+    pub const fn body_bool_default_true(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required: false,
+            cli: CliExpose::BoolValue,
         }
     }
 
@@ -956,7 +971,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct send",
         description: "Send direct message",
         category: "direct",
-        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body("prefer_raw_quic_if_connected", false), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false)]),
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1546,7 +1561,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/upgrade",
         cli_name: "upgrade",
-        description: "Check for updates",
+        description: "Check for updates (the CLI command is a standalone self-updater; it does NOT call this endpoint)",
         category: "upgrade",
         request: RequestSpec::None,
     },
@@ -1554,7 +1569,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/upgrade/apply",
         cli_name: "upgrade --apply",
-        description: "Apply the latest verified release manifest",
+        description: "Apply the latest verified release manifest (the CLI flag runs the standalone self-updater; it does NOT call this endpoint)",
         category: "upgrade",
         request: RequestSpec::None,
     },

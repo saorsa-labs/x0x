@@ -594,7 +594,9 @@ enum OwnerRidersSub {
         /// Hex agent id of the registered sub-agent.
         #[arg(value_name = "AGENT_ID")]
         agent: String,
-        /// Granted named-group id (repeatable; Home is always granted).
+        /// Granted named-group id (repeatable). Home is NOT implicitly
+        /// granted — include it explicitly to give the rider Home access
+        /// (rider_auth review r4).
         #[arg(long = "group", value_name = "GROUP_ID")]
         groups: Vec<String>,
         /// Operator label.
@@ -1085,9 +1087,12 @@ enum DirectSub {
         require_ack_ms: Option<u64>,
         /// Prefer the raw QUIC lane when a connection already exists
         /// (falls back to the reliable lane on error unless
-        /// --stop-fallback-on-raw-error is set).
-        #[arg(long)]
-        prefer_raw_quic_if_connected: bool,
+        /// --stop-fallback-on-raw-error is set). The daemon defaults this
+        /// to TRUE when the field is omitted, so the flag takes an explicit
+        /// `true|false` — `false` is the only way to restore the
+        /// pre-v0.37.0 gossip-first behavior.
+        #[arg(long, value_name = "BOOL")]
+        prefer_raw_quic_if_connected: Option<bool>,
         /// With --prefer-raw-quic-if-connected: how long (ms) to wait for
         /// the raw-lane receive ACK before treating it as lost.
         #[arg(long)]

@@ -527,6 +527,107 @@ mod tests {
     use crate::cli::{DaemonClient, OutputFormat};
 
     use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    async fn capture_client() -> (
+        crate::cli::DaemonClient,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (url, shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client =
+            crate::cli::DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json)
+                .unwrap();
+        (client, captured, shutdown)
+    }
+
+    /// WHY (review r2, finding 2): the rider delegation capability is
+    /// REQUIRED by the daemon — prove the CLI serializes the nested object.
+    #[tokio::test]
+    async fn rider_issue_serializes_the_delegation_capability() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_riders_issue(
+            &client,
+            &"ab".repeat(32),
+            &["group-1".to_string()],
+            Some("label"),
+            Some(3600),
+            Some("cGF5bG9hZA=="),
+            Some("sig-hex"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["delegation"]["payload_b64"], "cGF5bG9hZA==");
+        assert_eq!(body["delegation"]["signature"], "sig-hex");
+        assert_eq!(body["ttl_secs"], 3600);
+    }
+
+    /// WHY (review r2, finding 2): the DELETE body reason is only visible
+    /// on the wire.
+    #[tokio::test]
+    async fn owner_agents_revoke_sends_reason_in_delete_body() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_agents_revoke(&client, &"cd".repeat(32), Some("superseded"))
+            .await
+            .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, format!("/owner/agents/{}", "cd".repeat(32)));
+        assert_eq!(body["reason"], "superseded");
+    }
+
+    /// WHY (review r2, finding 2): the ADR-0043 binding form must serialize.
+    #[tokio::test]
+    async fn identity_revoke_serializes_move_epoch() {
+        let (client, captured, _shutdown) = capture_client().await;
+        revoke(
+            &client,
+            Some(&"ab".repeat(32)),
+            Some(&"cd".repeat(32)),
+            Some(7),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["move_epoch"], 7);
+        assert_eq!(body["agent_id"], "ab".repeat(32));
+        assert_eq!(body["machine_id"], "cd".repeat(32));
+    }
+
+    /// WHY (review r2, finding 2): cert expiry must serialize.
+    #[tokio::test]
+    async fn owner_agents_issue_serializes_not_after() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_agents_issue(&client, "pubhex", "acp", Some("lbl"), Some(1893456000))
+            .await
+            .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["not_after"], 1893456000);
+    }
+
+    /// WHY (review r2, finding 2): the explicit scheme id must serialize.
+    #[tokio::test]
+    async fn verify_serializes_algorithm() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true, "valid": true})).await;
+        let client =
+            crate::cli::DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json)
+                .unwrap();
+        verify(
+            &client,
+            None,
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            "ctx.v1",
+            Some("x0x.agent-sign.v2.ml-dsa-65"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["algorithm"], "x0x.agent-sign.v2.ml-dsa-65");
+    }
     #[test]
     fn identity_words_encodes_known_hex() {
         let encoder = IdentityEncoder::new();

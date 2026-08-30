@@ -39,6 +39,7 @@ fn render_request(ep: &x0x::api::EndpointDef) -> serde_json::Value {
                         CliExpose::Token(t) => (*t).to_string(),
                         CliExpose::Derived => "derived".to_string(),
                         CliExpose::JsonDoc => "json-doc".to_string(),
+                        CliExpose::BoolValue => "bool-value".to_string(),
                         CliExpose::Ignored => "ignored".to_string(),
                     };
                     serde_json::json!({

@@ -32,7 +32,7 @@ pub async fn send(
     agent_id: &str,
     message: &str,
     require_ack_ms: Option<u64>,
-    prefer_raw_quic_if_connected: bool,
+    prefer_raw_quic_if_connected: Option<bool>,
     raw_quic_receive_ack_ms: Option<u64>,
     stop_fallback_on_raw_error: bool,
     require_gossip: bool,
@@ -49,8 +49,10 @@ pub async fn send(
     if let Some(ms) = require_ack_ms {
         body["require_ack_ms"] = serde_json::json!(ms);
     }
-    if prefer_raw_quic_if_connected {
-        body["prefer_raw_quic_if_connected"] = serde_json::json!(true);
+    if let Some(prefer) = prefer_raw_quic_if_connected {
+        // The daemon defaults this to true when omitted; serialize BOTH
+        // directions so `false` is expressible from the CLI.
+        body["prefer_raw_quic_if_connected"] = serde_json::json!(prefer);
     }
     if let Some(ms) = raw_quic_receive_ack_ms {
         body["raw_quic_receive_ack_ms"] = serde_json::json!(ms);
@@ -145,7 +147,7 @@ mod tests {
             &"aa".repeat(32),
             "hello",
             None,
-            false,
+            None,
             None,
             false,
             false,
@@ -166,7 +168,7 @@ mod tests {
             &"aa".repeat(32),
             "hello",
             Some(500),
-            false,
+            None,
             None,
             false,
             false,
@@ -175,6 +177,90 @@ mod tests {
         )
         .await;
         assert!(result.is_ok(), "send with ack should succeed: {:?}", result);
+    }
+
+    /// WHY (review r2, finding 1): the daemon defaults
+    /// `prefer_raw_quic_if_connected` to TRUE when the field is omitted, so
+    /// the CLI must serialize an explicit false when the user asks for it —
+    /// a positive-only flag can only ever restate the default. Both
+    /// directions are captured on the wire here.
+    #[tokio::test]
+    async fn send_serializes_both_directions_of_prefer_raw_quic() {
+        let (url, _shutdown, captured) =
+            crate::cli::commands::test_support::start_capturing_mock_server(
+                serde_json::json!({"ok": true}),
+            )
+            .await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+
+        send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            Some(true),
+            None,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            Some(false),
+            None,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+        send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            None,
+            None,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let requests: Vec<serde_json::Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(path, _)| path == "/direct/send")
+            .map(|(_, body)| body.clone())
+            .collect();
+        assert_eq!(
+            requests.len(),
+            3,
+            "all three sends should reach /direct/send"
+        );
+        assert_eq!(
+            requests[0]["prefer_raw_quic_if_connected"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            requests[1]["prefer_raw_quic_if_connected"],
+            serde_json::json!(false),
+            "explicit false must be serialized, not dropped to the daemon default"
+        );
+        assert!(
+            requests[2].get("prefer_raw_quic_if_connected").is_none(),
+            "flag omitted: the field must be absent so the daemon default applies"
+        );
     }
 
     /// ADR 0030 §4 puts the CLI in the product tier. The flag names are the
@@ -196,7 +282,7 @@ mod tests {
             &"aa".repeat(32),
             "hello",
             None,
-            false,
+            None,
             None,
             false,
             false,
@@ -210,7 +296,7 @@ mod tests {
             &"aa".repeat(32),
             "hello",
             None,
-            false,
+            None,
             None,
             false,
             false,

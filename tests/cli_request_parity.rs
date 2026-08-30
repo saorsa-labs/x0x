@@ -42,6 +42,17 @@ fn tokenize_cli_name(cli: &str) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Cached `--help` output for an endpoint's CLI command, if it parses.
+fn help_for(method: &str, path: &str) -> Option<String> {
+    let ep = ENDPOINTS
+        .iter()
+        .find(|e| e.method.to_string().to_uppercase() == method && e.path == path)?;
+    tokenize_cli_name(ep.cli_name)
+        .into_iter()
+        .next()
+        .map(|tokens| cached_help(&tokens))
+}
+
 fn cached_help(tokens: &[String]) -> String {
     static HELPS: LazyLock<BTreeMap<Vec<String>, String>> = LazyLock::new(|| {
         let mut m: BTreeMap<Vec<String>, String> = BTreeMap::new();
@@ -82,85 +93,121 @@ fn kebab(name: &str) -> String {
 /// Normalize a bracketed positional value name (`<AGENT_ID>`, `[QUERY]`)
 /// to the field-name spelling (`agent_id`).
 fn normalize_positional(inner: &str) -> String {
-    inner.trim().to_ascii_lowercase().replace('-', "_")
+    inner
+        .trim()
+        .trim_matches(|c| c == '<' || c == '>' || c == '[' || c == ']')
+        .trim()
+        .to_ascii_lowercase()
+        .replace('-', "_")
 }
 
-/// Does `help` contain the flag `--x` as a whole token (not as a substring
-/// of a longer flag like `--identity` matching `--id`)?
-fn help_has_flag(help: &str, flag: &str) -> bool {
-    let bytes = help.as_bytes();
-    let mut from = 0usize;
-    while let Some(pos) = help[from..].find(flag) {
-        let start = from + pos;
-        let end = start + flag.len();
-        let boundary_before = start == 0 || {
-            let b = bytes[start - 1] as char;
-            !(b.is_ascii_alphanumeric() || b == '-' || b == '_')
-        };
-        let boundary_after = end >= bytes.len() || {
-            let b = bytes[end] as char;
-            !(b.is_ascii_alphanumeric() || b == '-' || b == '_')
-        };
-        if boundary_before && boundary_after {
-            return true;
+/// The structural CLI surface parsed from `--help`, immune to
+/// description-text false positives (review r2, finding 2): a flag counts
+/// only when it is the leading token of an option line, a positional only
+/// when it appears in the Arguments section or the Usage line.
+#[derive(Debug, Default)]
+struct HelpSurface {
+    /// Exact flag spellings, e.g. `--payload-b64`, `-h`.
+    flags: BTreeSet<String>,
+    /// Flags that take a value (`--flag <VAL>`), i.e. can express
+    /// non-default values including an explicit `false`.
+    value_flags: BTreeSet<String>,
+    /// Positional value names normalized (`<AGENT_ID>` -> `agent_id`).
+    positionals: BTreeSet<String>,
+}
+
+fn is_value_token(tok: &str) -> bool {
+    (tok.starts_with('<') && tok.ends_with('>') && tok.len() > 2)
+        || (tok.starts_with('[') && tok.ends_with(']') && tok.len() > 2)
+}
+
+fn parse_help_surface(help: &str) -> HelpSurface {
+    let mut out = HelpSurface::default();
+    let mut in_arguments_section = false;
+    for line in help.lines() {
+        let trimmed = line.trim();
+        if trimmed == "Arguments:" {
+            in_arguments_section = true;
+            continue;
         }
-        from = start + 1;
-    }
-    false
-}
-
-/// All `<...>` / `[...]` positional value names in the help text,
-/// normalized for comparison with wire field names.
-fn help_positionals(help: &str) -> BTreeSet<String> {
-    let mut out = BTreeSet::new();
-    let bytes = help.as_bytes();
-    let mut i = 0usize;
-    while i < bytes.len() {
-        let opener = bytes[i] as char;
-        if opener == '<' || opener == '[' {
-            let closer = if opener == '<' { '>' } else { ']' };
-            if let Some(end) = help[i + 1..].find(closer) {
-                let inner = &help[i + 1..i + 1 + end];
-                // Skip option value placeholders inside brackets.
-                if !inner.contains(' ') {
-                    out.insert(normalize_positional(inner));
+        if trimmed == "Options:" || trimmed == "Commands:" {
+            in_arguments_section = false;
+        }
+        if trimmed.starts_with("Usage:") {
+            for tok in trimmed.split_whitespace().skip(1) {
+                if is_value_token(tok) && tok != "[OPTIONS]" && tok != "[COMMAND]" {
+                    out.positionals.insert(normalize_positional(tok));
                 }
-                i = i + 1 + end + 1;
+            }
+            continue;
+        }
+        // Leading-token run of an argument/option line: everything up to
+        // the first token that is not a flag or value placeholder. The
+        // description after it can mention other flags harmlessly.
+        let first = trimmed.split_whitespace().next().unwrap_or("");
+        let is_opt_line = trimmed.starts_with('-');
+        let is_arg_line = in_arguments_section && is_value_token(first);
+        if !(is_opt_line || is_arg_line) {
+            continue;
+        }
+        let mut last_flag: Option<String> = None;
+        for tok in trimmed.split_whitespace() {
+            let bare = tok.trim_end_matches(',');
+            if bare.starts_with('-') && bare.len() > 1 {
+                out.flags.insert(bare.to_string());
+                last_flag = Some(bare.to_string());
+            } else if is_value_token(tok) {
+                if let Some(flag) = &last_flag {
+                    out.value_flags.insert(flag.clone());
+                    if in_arguments_section {
+                        out.positionals.insert(normalize_positional(tok));
+                    }
+                }
+                last_flag = None;
+            } else if tok == "..." {
                 continue;
+            } else {
+                break;
             }
         }
-        i += 1;
     }
     out
 }
 
-/// Assert one `RequestField` is visible in the help text.
-fn field_exposed(help: &str, field: &x0x::api::RequestField) -> Result<(), String> {
-    let positionals = help_positionals(help);
+/// Assert one `RequestField` is visible in the structural CLI surface.
+fn field_exposed(surface: &HelpSurface, field: &x0x::api::RequestField) -> Result<(), String> {
     match &field.cli {
         CliExpose::Derived | CliExpose::Ignored | CliExpose::JsonDoc => Ok(()),
-        CliExpose::Token(token) => {
-            if token.starts_with('-') {
-                if help_has_flag(help, token) {
-                    Ok(())
-                } else {
-                    Err(format!("flag `{token}` not in `--help` output"))
-                }
-            } else if positionals.contains(&normalize_positional(token))
-                || help_has_flag(help, token)
-            {
+        CliExpose::BoolValue => {
+            let flag = format!("--{}", kebab(field.name));
+            if surface.flags.contains(&flag) {
                 Ok(())
             } else {
-                Err(format!("positional/flag `{token}` not in `--help` output"))
+                Err(format!("flag `{flag}` is not an argument of this command"))
+            }
+        }
+        CliExpose::Token(token) => {
+            if token.starts_with('-') {
+                if surface.flags.contains(*token) {
+                    Ok(())
+                } else {
+                    Err(format!("flag `{token}` is not an argument of this command"))
+                }
+            } else if surface.positionals.contains(&normalize_positional(token)) {
+                Ok(())
+            } else {
+                Err(format!(
+                    "positional `{token}` is not an argument of this command"
+                ))
             }
         }
         CliExpose::Default => {
             let flag = format!("--{}", kebab(field.name));
-            if help_has_flag(help, &flag) || positionals.contains(field.name) {
+            if surface.flags.contains(&flag) || surface.positionals.contains(field.name) {
                 Ok(())
             } else {
                 Err(format!(
-                    "neither flag `{flag}` nor a matching positional is in `--help` output"
+                    "neither flag `{flag}` nor a matching positional is an argument of this command"
                 ))
             }
         }
@@ -175,9 +222,9 @@ fn every_request_field_is_exposed_by_the_cli() {
             continue;
         };
         for tokens in tokenize_cli_name(ep.cli_name) {
-            let help = cached_help(&tokens);
+            let surface = parse_help_surface(&cached_help(&tokens));
             for field in *fields {
-                if let Err(msg) = field_exposed(&help, field) {
+                if let Err(msg) = field_exposed(&surface, field) {
                     failures.push(format!(
                         "  {} {} ({} {}): field `{}` — {msg}",
                         ep.method,
@@ -416,7 +463,7 @@ fn first_generic(params: &str, outer: &str) -> Option<String> {
 /// `StructName -> field names` for `struct Name { ... }` definitions
 /// outside `#[cfg(test)]` modules (parsed on the raw source so the
 /// one-field-per-line layout survives).
-fn struct_fields(sources: &[(String, String)]) -> BTreeMap<String, BTreeSet<String>> {
+fn struct_fields(sources: &[(String, String)]) -> BTreeMap<String, BTreeMap<String, String>> {
     let mut out = BTreeMap::new();
     for (_path, src) in sources {
         let cleaned = strip_test_mods(src);
@@ -479,8 +526,8 @@ fn flat_brace_close(body: &str) -> usize {
     body.len()
 }
 
-fn parse_struct_fields(body: &str) -> BTreeSet<String> {
-    let mut fields = BTreeSet::new();
+fn parse_struct_fields(body: &str) -> BTreeMap<String, String> {
+    let mut fields = BTreeMap::new();
     for line in body.lines() {
         let trimmed = line.trim_start();
         if trimmed.starts_with('#')
@@ -505,8 +552,8 @@ fn parse_struct_fields(body: &str) -> BTreeSet<String> {
             && !name.is_empty()
             && !keywords().contains(&name)
         {
-            let _ = tail;
-            fields.insert(name.to_string());
+            let ty = tail.split(',').next().unwrap_or("").trim().to_string();
+            fields.insert(name.to_string(), ty);
         }
     }
     fields
@@ -521,9 +568,22 @@ fn keywords() -> BTreeSet<&'static str> {
 }
 
 /// Endpoints whose registry `Fields` cannot be checked against a resolvable
-/// handler struct (manual `Bytes`/`Value` body parsing). Pinned so a new
-/// one is a conscious edit, not silent drift.
-const PINNED_MANUAL_BODY_ENDPOINTS: usize = 3;
+/// handler struct (manual `Bytes`/`Value` body parsing). Pinned EXACTLY —
+/// endpoints AND their field lists — so a new manual endpoint or a field
+/// change on an existing one is a conscious edit, not silent drift
+/// (review r2, finding 2c).
+const PINNED_MANUAL_BODY_ENDPOINTS: &[(&str, &str, &[&str])] = &[
+    // parse_optional_json over raw Bytes (announce_identity)
+    (
+        "POST",
+        "/announce",
+        &["human_consent", "include_user_identity"],
+    ),
+    // parse_optional_json over raw Bytes (create_group_invite)
+    ("POST", "/groups/:id/invite", &["expiry_secs"]),
+    // raw Bytes -> serde GroupCard passthrough (import_group_card)
+    ("POST", "/groups/cards/import", &[]),
+];
 
 #[test]
 fn registry_request_metadata_matches_handler_structs() {
@@ -548,7 +608,7 @@ fn registry_request_metadata_matches_handler_structs() {
     let structs = struct_fields(&sources);
 
     let mut failures = Vec::new();
-    let mut manual_bodies: Vec<String> = Vec::new();
+    let mut manual_bodies: Vec<(String, String, Vec<String>)> = Vec::new();
     let mut resolved = 0usize;
 
     for ep in ENDPOINTS {
@@ -573,11 +633,14 @@ fn registry_request_metadata_matches_handler_structs() {
                 Extracted::None => {
                     // Manual body parsing (raw `Bytes` + parse_optional_json);
                     // both Fields (documented keys) and Passthrough are honest.
-                    if matches!(
-                        ep.request,
-                        RequestSpec::Fields(_) | RequestSpec::Passthrough
-                    ) {
-                        manual_bodies.push(format!("{} {} ({})", method, ep.path, handler));
+                    if let RequestSpec::Fields(fields) = &ep.request {
+                        manual_bodies.push((
+                            method.clone(),
+                            ep.path.to_string(),
+                            fields.iter().map(|f| f.name.to_string()).collect(),
+                        ));
+                    } else if matches!(ep.request, RequestSpec::Passthrough) {
+                        manual_bodies.push((method.clone(), ep.path.to_string(), Vec::new()));
                     }
                 }
                 Extracted::RawValue => {
@@ -618,14 +681,14 @@ fn registry_request_metadata_matches_handler_structs() {
                             "  {} {}: handler takes `{struct_name}` with fields [{}] but registry request is {:?}",
                             method,
                             ep.path,
-                            fields.iter().cloned().collect::<Vec<_>>().join(", "),
+                            fields.keys().cloned().collect::<Vec<_>>().join(", "),
                             request_kind(ep)
                         ));
                         continue;
                     };
                     let registry_names: BTreeSet<&str> =
                         registry_fields.iter().map(|f| f.name).collect();
-                    let struct_names: BTreeSet<&str> = fields.iter().map(|s| s.as_str()).collect();
+                    let struct_names: BTreeSet<&str> = fields.keys().map(|s| s.as_str()).collect();
                     let missing: Vec<_> = struct_names.difference(&registry_names).collect();
                     let extra: Vec<_> = registry_names.difference(&struct_names).collect();
                     if !missing.is_empty() {
@@ -641,6 +704,34 @@ fn registry_request_metadata_matches_handler_structs() {
                         ));
                     }
                     for f in *registry_fields {
+                        // WHY (review r2, finding 1): an `Option<bool>` whose
+                        // daemon default when omitted is TRUE can only be
+                        // steered to false by an explicit value; a bare
+                        // SetTrue flag could never serialize `false`. Fields
+                        // marked CliExpose::BoolValue must therefore be a
+                        // value-taking flag AND typed Option<bool> on the
+                        // daemon (default-false bools are exempt — omission
+                        // already reaches false).
+                        if matches!(f.cli, CliExpose::BoolValue) {
+                            let flag = format!("--{}", f.name.replace('_', "-"));
+                            let ty = fields.get(f.name).cloned().unwrap_or_default();
+                            let value_flag = help_for(&method, ep.path)
+                                .as_deref()
+                                .map(|h| parse_help_surface(h).value_flags.contains(&flag))
+                                .unwrap_or(true);
+                            if !ty.contains("Option<bool>") {
+                                failures.push(format!(
+                                    "  {} {}: field `{}` is marked BoolValue but the daemon types it `{ty}`",
+                                    method, ep.path, f.name
+                                ));
+                            }
+                            if !value_flag {
+                                failures.push(format!(
+                                    "  {} {}: field `{}` defaults to true when omitted; the CLI flag `{flag}` must take an explicit true|false value or `false` is unreachable",
+                                    method, ep.path, f.name
+                                ));
+                            }
+                        }
                         if f.location != *location {
                             failures.push(format!(
                                 "  {} {}: field `{}` is {} in the registry but the handler extracts it from the {}",
@@ -657,12 +748,30 @@ fn registry_request_metadata_matches_handler_structs() {
         }
     }
 
+    let mut pinned: Vec<(String, String, Vec<String>)> = PINNED_MANUAL_BODY_ENDPOINTS
+        .iter()
+        .map(|(m, p, fs)| {
+            (
+                m.to_string(),
+                p.to_string(),
+                fs.iter().map(|f| f.to_string()).collect(),
+            )
+        })
+        .collect();
+    for (_, _, fs) in &mut pinned {
+        fs.sort();
+    }
+    pinned.sort();
+    let mut actual = manual_bodies.clone();
+    for (_, _, fs) in &mut actual {
+        fs.sort();
+    }
+    actual.sort();
     assert_eq!(
-        manual_bodies.len(),
-        PINNED_MANUAL_BODY_ENDPOINTS,
-        "endpoints with registry Fields but no resolvable handler struct changed; \
-         update PINNED_MANUAL_BODY_ENDPOINTS consciously after verifying each \
-         one parses its body manually. Current: {manual_bodies:#?}"
+        actual, pinned,
+        "endpoints with registry Fields but no resolvable handler struct \
+         (or their field lists) changed; update PINNED_MANUAL_BODY_ENDPOINTS \
+         consciously after verifying each one parses its body manually"
     );
     assert!(
         resolved >= 50,

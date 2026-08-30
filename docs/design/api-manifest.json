@@ -1540,7 +1540,7 @@
             "required": true
           },
           {
-            "cli": "default",
+            "cli": "bool-value",
             "in": "body",
             "name": "prefer_raw_quic_if_connected",
             "required": false
@@ -2850,7 +2850,7 @@
     {
       "category": "upgrade",
       "cli_name": "upgrade",
-      "description": "Check for updates",
+      "description": "Check for updates (the CLI command is a standalone self-updater; it does NOT call this endpoint)",
       "method": "GET",
       "path": "/upgrade",
       "request": {
@@ -2860,7 +2860,7 @@
     {
       "category": "upgrade",
       "cli_name": "upgrade --apply",
-      "description": "Apply the latest verified release manifest",
+      "description": "Apply the latest verified release manifest (the CLI flag runs the standalone self-updater; it does NOT call this endpoint)",
       "method": "POST",
       "path": "/upgrade/apply",
       "request": {

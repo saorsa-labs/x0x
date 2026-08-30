@@ -659,7 +659,57 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    use crate::cli::commands::test_support::start_mock_server;
+    use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    /// WHY (review r2, finding 2): help-text probes cannot prove the
+    /// dispatch serializes the ADR-0040 fields — capture the wire body.
+    #[tokio::test]
+    async fn send_serializes_mentions_and_delegation_digest() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        send(
+            &client,
+            "g1",
+            "hello",
+            None,
+            None,
+            None,
+            &["ab".repeat(32)],
+            Some("deadbeef"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            body["mentions"],
+            serde_json::json!(["ab".repeat(32)]),
+            "structured mentions must serialize as an array"
+        );
+        assert_eq!(body["delegation_digest"], "deadbeef");
+    }
+
+    /// WHY (review r2, finding 2): verb-subset grants must serialize.
+    #[tokio::test]
+    async fn delegate_serializes_verbs() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        delegate(
+            &client,
+            "g1",
+            &"ab".repeat(32),
+            "task_execute",
+            &["claim".to_string()],
+            None,
+            1893456000000,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["verbs"], serde_json::json!(["claim"]));
+    }
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});

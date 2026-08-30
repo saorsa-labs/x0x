@@ -76,7 +76,31 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    use crate::cli::commands::test_support::start_mock_server;
+    use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    /// WHY (review r2, finding 2): help-text probes cannot prove the
+    /// dispatch actually serializes a field — capture the wire body.
+    #[tokio::test]
+    async fn update_serializes_fence_token_and_delegation() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        update(
+            &client,
+            "list-1",
+            "task-9",
+            "claim",
+            Some("10520818218540711462:1"),
+            Some("deadbeef"),
+        )
+        .await
+        .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, "/task-lists/list-1/tasks/task-9");
+        assert_eq!(body["action"], "claim");
+        assert_eq!(body["fence_token"], "10520818218540711462:1");
+        assert_eq!(body["delegation"], "deadbeef");
+    }
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"task_lists": [{"name": "test-list"}]});
