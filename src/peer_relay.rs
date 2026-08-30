@@ -87,7 +87,7 @@
 use crate::dm::DmEnvelope;
 use crate::identity::AgentId;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -149,6 +149,16 @@ pub const DEFAULT_MAX_TOTAL_FORWARDS: u32 = 100;
 /// [`DEFAULT_RELAY_LIMIT_WINDOW`] (~1 MiB/min). Bounds the relay's uplink
 /// spend so an opted-in relay cannot be drained for amplification.
 pub const DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW: u64 = 1024 * 1024;
+
+/// #437 round 6: hard cap on the v2-downgrade-baseline map. Bounds
+/// memory against fresh-key spam — un-gated strangers cannot record at
+/// all (recording happens only after the #193 contact/block gates), and
+/// even gated traffic cannot push the map past this cap.
+pub const MAX_V2_BASELINE_SENDERS: usize = 8_192;
+
+/// #437 round 6: how long a sender's v2 observation remains a valid
+/// downgrade baseline without being refreshed by a newer v2 frame.
+pub const V2_BASELINE_TTL: Duration = Duration::from_secs(3_600);
 
 /// Routing header for a relayed DM — the **only** part a relay node
 /// sees in cleartext. Independently signed by the sender so the relay
@@ -323,11 +333,12 @@ struct RelayedDmV1Wire {
 /// relay cannot decode, gate, or forward. Unknown capability (`None`)
 /// means v1 — the safe default for old peers.
 ///
-/// Receivers enforce the converse: `disposition_for` rejects
-/// digest-less headers from peers whose confirmed advert sets the bit,
-/// closing the downgrade path (a v2-capable sender cannot silently
-/// unbind). Enforcement of digest-bearing frames (mismatch hard-drop)
-/// is unconditional.
+/// Receivers enforce the converse by DOWNGRADE DETECTION (not advert
+/// presence): `disposition_for` rejects a digest-less header only from
+/// a sender it previously observed emitting a fully-valid, gate-passing
+/// v2 frame — so a v2-capable sender cannot silently unbind, while
+/// converging or pre-#437 senders are never dropped. Enforcement of
+/// digest-bearing frames (mismatch hard-drop) is unconditional.
 #[must_use]
 pub fn peer_advertises_inner_digest(caps: Option<&crate::dm::DmCapabilities>) -> bool {
     caps.is_some_and(|c| c.digest_support)
@@ -435,11 +446,12 @@ impl RelayedDm {
     /// - `None` — legacy header (no `inner_digest`, pre-#437 sender):
     ///   accepted per the documented transition (see
     ///   `docs/design/adr-0051-mechanics.md`), keeping exactly today's
-    ///   guarantees. Round 4: absence is rejected when the sender's
-    ///   **confirmed** advert sets `digest_support`
-    ///   (`disposition_for`'s `sender_digest_support_confirmed`) — a
-    ///   v2-capable sender cannot silently unbind — and stays accepted
-    ///   while capability is unknown (pre-#437 senders).
+    ///   guarantees. Absence is rejected only by DOWNGRADE DETECTION:
+    ///   `disposition_for` refuses a digest-less header from a sender
+    ///   it previously observed emitting a fully-valid, gate-passing v2
+    ///   frame — capability-advert presence is deliberately not the
+    ///   trigger (the sender's and relay's capability caches can
+    ///   disagree during convergence).
     /// - `Some(true)` — bound and matching.
     /// - `Some(false)` — the header was signed for a **different**
     ///   inner payload (relay-hop substitution, issue #437) or the
@@ -687,9 +699,9 @@ pub struct RelayStatsSnapshot {
     /// Inbound relayed DMs refused — signed `inner_digest` does not match
     /// the carried inner envelope (#437 substitution hard-drop).
     pub relay_refused_inner_digest_mismatch: u64,
-    /// Inbound relayed DMs refused — digest-less header from a peer
-    /// whose confirmed advert sets `digest_support` (#437 downgrade
-    /// rejection).
+    /// Inbound relayed DMs refused — digest-less header from a sender
+    /// previously observed emitting a valid v2 frame (#437 observed-
+    /// downgrade rejection; not capability-advert presence).
     pub relay_refused_missing_inner_digest: u64,
     /// Inbound relayed DMs refused — stale (likely replay).
     pub relay_refused_stale: u64,
@@ -884,15 +896,17 @@ pub struct PeerRelay {
     stats: RelayStats,
     per_peer: Mutex<HashMap<[u8; 32], PeerRelayState>>,
     limiter: Mutex<RelayLimiter>,
-    /// #437 round 5 (downgrade detection): senders this node has seen
-    /// emit a fully-valid, fresh v2 (digest-bearing) header. A later
-    /// digest-less header from one of these senders is a downgrade and
-    /// is rejected; a sender never observed on v2 (converging, or
-    /// genuinely pre-#437) keeps legacy acceptance. Bounded by distinct
-    /// verified senders observed (32 bytes each); deliberately not
-    /// cleared by `forget_peer` — the baseline is a fact about the
-    /// sender, not about this node's connection to it.
-    v2_observed_senders: Mutex<HashSet<[u8; 32]>>,
+    /// #437 rounds 5-6 (downgrade detection): senders this node has
+    /// seen emit a fully-valid, fresh v2 (digest-bearing) header that
+    /// ALSO passed the #193 contact/block gates, mapped to the last
+    /// observation time. A later digest-less header from one of these
+    /// senders is a downgrade and is rejected; a sender never observed
+    /// on v2 (converging, or genuinely pre-#437) keeps legacy
+    /// acceptance. Resource-bounded: entries expire after
+    /// [`V2_BASELINE_TTL`] and the map is capped at
+    /// [`MAX_V2_BASELINE_SENDERS`] (least-recently-observed evicted), so
+    /// no peer can grow it without limit.
+    v2_observed_senders: Mutex<HashMap<[u8; 32], Instant>>,
 }
 
 impl Default for PeerRelay {
@@ -910,7 +924,7 @@ impl PeerRelay {
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
-            v2_observed_senders: Mutex::new(HashSet::new()),
+            v2_observed_senders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -922,7 +936,7 @@ impl PeerRelay {
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
-            v2_observed_senders: Mutex::new(HashSet::new()),
+            v2_observed_senders: Mutex::new(HashMap::new()),
         }
     }
 
@@ -956,13 +970,50 @@ impl PeerRelay {
         }
     }
 
-    /// Whether this node has previously seen a fully-valid, fresh v2
-    /// (digest-bearing) header from `sender` — the downgrade baseline.
-    /// Poisoned-lock reads are conservative (`false`): a baseline miss
-    /// accepts the frame (legacy behavior), never drops it.
+    /// Record `sender` on the v2 baseline. Called only after the frame
+    /// passed EVERY gate — signature, digest match, freshness, and the
+    /// #193 contact/block gates — so un-gated traffic never grows the
+    /// map. TTL-prunes first; if still at [`MAX_V2_BASELINE_SENDERS`],
+    /// evicts the least-recently-observed entry.
+    fn note_v2_sender(&self, sender: [u8; 32]) {
+        let now = Instant::now();
+        if let Ok(mut seen) = self.v2_observed_senders.lock() {
+            Self::insert_v2_observation(&mut seen, sender, now);
+        }
+    }
+
+    /// Pure insert with an explicit clock — the test seam for TTL expiry
+    /// and cap eviction.
+    fn insert_v2_observation(
+        seen: &mut HashMap<[u8; 32], Instant>,
+        sender: [u8; 32],
+        now: Instant,
+    ) {
+        seen.retain(|_, at| now.saturating_duration_since(*at) < V2_BASELINE_TTL);
+        if seen.len() >= MAX_V2_BASELINE_SENDERS && !seen.contains_key(&sender) {
+            let oldest = seen.iter().min_by_key(|(_, at)| **at).map(|(k, _)| *k);
+            if let Some(oldest) = oldest {
+                seen.remove(&oldest);
+            }
+        }
+        seen.insert(sender, now);
+    }
+
+    /// Whether `sender` has a FRESH v2 observation — the downgrade
+    /// baseline. Expired entries are lazily removed on read. Poisoned
+    /// reads are conservative (`false`): a baseline miss accepts the
+    /// frame (legacy behavior), never drops it.
     fn sender_emitted_v2(&self, sender: &[u8; 32]) -> bool {
+        let now = Instant::now();
         match self.v2_observed_senders.lock() {
-            Ok(seen) => seen.contains(sender),
+            Ok(mut seen) => match seen.get(sender) {
+                Some(at) if now.saturating_duration_since(*at) < V2_BASELINE_TTL => true,
+                Some(_) => {
+                    seen.remove(sender);
+                    false
+                }
+                None => false,
+            },
             Err(_) => false,
         }
     }
@@ -1141,13 +1192,16 @@ impl PeerRelay {
     ///   forward-quota accounting — the header's authenticated sender
     ///   did not sign *this* payload, so no gating or accounting may be
     ///   attributed to it.
-    /// - #437 round 5: digest-less header from a sender previously
-    ///   observed on a fully-valid v2 frame → `Refuse(MissingInnerDigest)`
-    ///   — a real downgrade (was v2, now v1). Capability presence is
-    ///   deliberately NOT the trigger: during advert convergence a
-    ///   sender's relay-candidate lookup can be missing while this
-    ///   node's advert cache knows the sender, and rejecting on that
-    ///   asymmetric state would drop legitimate v1 frames.
+    /// - #437 rounds 5-6 (forward arm, AFTER the contact/blocked
+    ///   gates): digest-less header from a sender previously observed
+    ///   emitting a fully-valid, gate-passing v2 frame →
+    ///   `Refuse(MissingInnerDigest)` — a real downgrade (was v2, now
+    ///   v1). Capability presence is deliberately NOT the trigger: the
+    ///   sender's and this node's capability caches can disagree during
+    ///   advert convergence, and rejecting on that asymmetric state
+    ///   would drop legitimate v1 frames. Only gate-passing v2 frames
+    ///   are recorded on the (capped, TTL-expiring) baseline, so
+    ///   un-gated peers cannot grow it.
     /// - `originated_at` older than `freshness`, or more than
     ///   [`RELAY_CLOCK_SKEW_TOLERANCE_MS`] ahead of `now_unix_ms` →
     ///   `Refuse(Stale)`.
@@ -1218,27 +1272,6 @@ impl PeerRelay {
             return RelayDisposition::Refuse(RelayRefusal::Stale);
         }
 
-        // #437 round 5 — downgrade DETECTION (not capability presence).
-        // A digest-bearing frame that reached this point is fully valid
-        // (signature ✓, digest ✓, fresh ✓): record the sender on the
-        // v2 baseline. A digest-less frame from a baseline sender is a
-        // real downgrade (was v2, now v1) and is rejected. A sender
-        // never observed on v2 — still converging its relay-candidate
-        // capability cache, or genuinely pre-#437 — is accepted: the
-        // asymmetric-cache race (sender's lookup missing while this
-        // node's advert cache knows the sender) must not drop legit
-        // messages. Placement after freshness matters: a replayed,
-        // expired v2 header must not establish the baseline.
-        if relayed.header.inner_digest.is_some() {
-            if let Ok(mut seen) = self.v2_observed_senders.lock() {
-                seen.insert(relayed.header.sender_agent_id);
-            }
-        } else if self.sender_emitted_v2(&relayed.header.sender_agent_id) {
-            self.stats
-                .relay_refused_missing_inner_digest
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest);
-        }
         // Final recipient: receiving a relayed DM addressed to us is not
         // relaying — the contact gate and resource caps target the forward
         // arm where this node spends its own uplink.
@@ -1264,6 +1297,24 @@ impl PeerRelay {
                 .relay_refused_not_a_contact
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::NotAContact);
+        }
+        // #437 rounds 5-6 — downgrade DETECTION (not capability
+        // presence), on the FORWARD arm and only AFTER the #193 gates:
+        // recording requires a frame that passed signature ✓, digest ✓,
+        // freshness ✓, AND the contact/block gates, so un-gated peers
+        // can never populate the (capped, TTL-expiring) baseline. A
+        // digest-less frame from a baseline sender is a real downgrade
+        // (was v2, now v1) and is rejected; a sender never observed on
+        // v2 — converging its relay-candidate cache, or genuinely
+        // pre-#437 — is accepted, so the asymmetric-cache race never
+        // drops legitimate messages.
+        if relayed.header.inner_digest.is_some() {
+            self.note_v2_sender(relayed.header.sender_agent_id);
+        } else if self.sender_emitted_v2(&relayed.header.sender_agent_id) {
+            self.stats
+                .relay_refused_missing_inner_digest
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest);
         }
         RelayDisposition::Forward {
             dst_agent_id: relayed.header.dst_agent_id,
@@ -1869,16 +1920,19 @@ mod tests {
 
     #[test]
     fn digestless_frame_after_observed_v2_is_rejected_as_downgrade() {
-        // Why (#437 round 5, asymmetric-cache race): the reject trigger
-        // must be DOWNGRADE detection — this node previously saw a
-        // fully-valid v2 frame from the sender — NOT capability-advert
-        // presence. During advert convergence the sender's relay-candidate
-        // lookup can be missing (so it emits v1) while this node's advert
-        // cache already knows the sender supports digests; rejecting on
-        // that asymmetric state would drop legitimate messages.
+        // Why (#437 round 5/6, asymmetric-cache race + gate placement):
+        // the reject trigger is DOWNGRADE detection — this node
+        // previously saw a fully-valid, GATE-PASSING v2 frame from the
+        // sender — NOT capability-advert presence. During advert
+        // convergence the sender's relay-candidate lookup can be
+        // missing (so it emits v1) while its caps elsewhere advertise
+        // digest support; rejecting on that asymmetric state would drop
+        // legitimate messages. Runs on the forward arm after the #193
+        // gates; every acceptance leg asserts the POSITIVE disposition.
         let kp = AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
-        let local = aid(78);
+        let dst = aid(79);
+        let we_relay = aid(78);
         let now_ms = 1_700_000_000_000u64;
         let (pub_bytes, sec_bytes) = kp.to_bytes();
         let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
@@ -1886,7 +1940,7 @@ mod tests {
         let legacy = |originated: u64| {
             let signing_bytes = RelayHeader::signing_bytes(
                 RelayHeader::VERSION,
-                &local.0,
+                &dst.0,
                 &sender.0,
                 &pub_bytes,
                 originated,
@@ -1898,7 +1952,7 @@ mod tests {
             RelayedDm {
                 header: RelayHeader {
                     version: RelayHeader::VERSION,
-                    dst_agent_id: local.0,
+                    dst_agent_id: dst.0,
                     sender_agent_id: sender.0,
                     sender_public_key: pub_bytes.clone(),
                     originated_at_unix_ms: originated,
@@ -1909,9 +1963,11 @@ mod tests {
             }
         };
 
-        // Leg 1 — the race: the sender's caps DO advertise digest_support
-        // (so a capability-presence rule would reject), but this node has
-        // never seen a v2 frame from it. The v1 frame must be ACCEPTED.
+        // Leg 1 — the race, POSITIVE outcome: the sender's caps DO
+        // advertise digest_support (a capability-presence rule would
+        // reject), but this node has never seen a v2 frame from it.
+        // The v1 frame must classify Forward — accepted, not merely
+        // "not counted".
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
         let converging = legacy(now_ms);
         assert!(
@@ -1919,21 +1975,24 @@ mod tests {
             "precondition: this build's wired advert sets the bit"
         );
         assert_eq!(
-            relay.disposition_for(&converging, &local, now_ms + 100, false, false),
-            RelayDisposition::DeliverLocally,
-            "sender never observed on v2 → v1 accepted even though its caps advertise digest support"
+            relay.disposition_for(&converging, &we_relay, now_ms + 100, true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            },
+            "sender never observed on v2 → v1 classified Forward (converging sender accepted)"
         );
         assert_eq!(
             relay.stats().snapshot().relay_refused_missing_inner_digest,
             0
         );
 
-        // Leg 2 — the real downgrade: a fully-valid fresh v2 frame
-        // establishes the baseline, and a subsequent v1 frame from the
-        // same sender is rejected.
+        // Leg 2 — the real downgrade: a fully-valid fresh v2 frame that
+        // passes the gates is classified Forward (POSITIVE) and sets
+        // the baseline; a subsequent v1 frame from the same sender is
+        // rejected.
         let v2 = relay
             .build_relayed_dm(
-                &local,
+                &dst,
                 &sender,
                 kp.to_bytes().0,
                 now_ms + 1_000,
@@ -1947,13 +2006,15 @@ mod tests {
             )
             .expect("build v2");
         assert_eq!(
-            relay.disposition_for(&v2, &local, now_ms + 1_100, false, false),
-            RelayDisposition::DeliverLocally,
-            "the v2 frame itself is accepted and sets the baseline"
+            relay.disposition_for(&v2, &we_relay, now_ms + 1_100, true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            },
+            "the gate-passing v2 frame classifies Forward and sets the baseline"
         );
         let downgraded = legacy(now_ms + 2_000);
         assert_eq!(
-            relay.disposition_for(&downgraded, &local, now_ms + 2_100, false, false),
+            relay.disposition_for(&downgraded, &we_relay, now_ms + 2_100, true, false),
             RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest),
             "was v2, now v1 — a real downgrade must be rejected"
         );
@@ -1963,13 +2024,14 @@ mod tests {
             "exactly one downgrade refusal counted"
         );
 
-        // Leg 3 — stale v2 must NOT set the baseline: a replayed, expired
-        // v2 header is refused as Stale before the baseline is recorded,
-        // so a sender's later v1 frames stay accepted.
+        // Leg 3 — stale v2 must NOT set the baseline: a replayed,
+        // expired v2 header is refused as Stale long before the
+        // post-gate recording, so a sender's later v1 frames still
+        // classify Forward.
         let fresh_relay = PeerRelay::with_policy(RelayPolicy::enabled());
         let stale_v2 = relay
             .build_relayed_dm(
-                &local,
+                &dst,
                 &sender,
                 kp.to_bytes().0,
                 now_ms,
@@ -1982,16 +2044,93 @@ mod tests {
                 },
             )
             .expect("build stale v2");
-        // "now" far past freshness: refused Stale, baseline untouched.
         assert_eq!(
-            fresh_relay.disposition_for(&stale_v2, &local, now_ms + 60_000, false, false),
+            fresh_relay.disposition_for(&stale_v2, &we_relay, now_ms + 60_000, true, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         let after = legacy(now_ms + 60_100);
         assert_eq!(
-            fresh_relay.disposition_for(&after, &local, now_ms + 60_200, false, false),
-            RelayDisposition::DeliverLocally,
+            fresh_relay.disposition_for(&after, &we_relay, now_ms + 60_200, true, false),
+            RelayDisposition::Forward {
+                dst_agent_id: dst.0
+            },
             "a stale v2 replay must not poison the sender's baseline"
+        );
+    }
+
+    #[test]
+    fn v2_baseline_is_resource_bounded_and_gate_gated() {
+        // Why (#437 round 6): the downgrade baseline is attacker-facing
+        // state — it must be impossible to grow without limit, and
+        // un-gated peers must never populate it.
+        let relay = PeerRelay::with_policy(RelayPolicy::enabled());
+
+        // Cap: cap+64 distinct senders → map never exceeds the cap.
+        let now = Instant::now();
+        {
+            let mut seen = relay.v2_observed_senders.lock().expect("lock");
+            for i in 0..(MAX_V2_BASELINE_SENDERS + 64) as u64 {
+                let mut id = [0u8; 32];
+                id[24..].copy_from_slice(&i.to_be_bytes());
+                PeerRelay::insert_v2_observation(&mut seen, id, now);
+            }
+            assert!(
+                seen.len() <= MAX_V2_BASELINE_SENDERS,
+                "baseline map must stay bounded at {MAX_V2_BASELINE_SENDERS}, got {}",
+                seen.len()
+            );
+        }
+
+        // TTL: an observation older than V2_BASELINE_TTL is not a
+        // baseline (expired on read and on insert-prune).
+        {
+            let mut seen = relay.v2_observed_senders.lock().expect("lock");
+            seen.clear();
+            let old = now - V2_BASELINE_TTL - Duration::from_secs(1);
+            PeerRelay::insert_v2_observation(&mut seen, [0xAA; 32], old);
+            // A fresh insert prunes the expired entry.
+            PeerRelay::insert_v2_observation(&mut seen, [0xBB; 32], now);
+            assert!(
+                !seen.contains_key(&[0xAA; 32]),
+                "expired entries are pruned"
+            );
+        }
+        assert!(
+            !relay.sender_emitted_v2(&[0xAA; 32]),
+            "expired observations are not baselines"
+        );
+
+        // Gate gating: a v2 frame from a NON-CONTACT sender on a
+        // contact-gated relay is refused before recording — the map
+        // must stay empty.
+        let gated = PeerRelay::with_policy(RelayPolicy::enabled());
+        let kp = AgentKeypair::generate().expect("keypair");
+        let sender = kp.agent_id();
+        let (pub_bytes, sec_bytes) = kp.to_bytes();
+        let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
+        let v2 = gated
+            .build_relayed_dm(
+                &aid(80),
+                &sender,
+                pub_bytes,
+                1_700_000_000_000,
+                dummy_inner(),
+                true,
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build v2");
+        assert_eq!(
+            gated.disposition_for(&v2, &aid(81), 1_700_000_000_100, false, false),
+            RelayDisposition::Refuse(RelayRefusal::NotAContact),
+            "non-contact v2 frame is refused at the contact gate"
+        );
+        assert!(
+            gated.v2_observed_senders.lock().expect("lock").is_empty(),
+            "an un-gated peer must never populate the baseline"
         );
     }
 

@@ -60,24 +60,27 @@ The mixed-fleet behavior is capability-driven end to end:
   frames through the v1 mirror). Default when capability is unknown =
   v1 — a new sender never produces a frame an old relay cannot decode,
   gate, or forward.
-- **Receive path (round 5 — downgrade detection)**: `disposition_for`
-  rejects a digest-less header ONLY when this node has previously seen a
-  fully-valid, fresh v2 (digest-bearing) header from the same sender
-  (`RelayRefusal::MissingInnerDigest`, counted as
+- **Receive path (rounds 5-6 — downgrade detection)**: on the FORWARD
+  arm, AFTER the #193 contact/block gates, `disposition_for` rejects a
+  digest-less header ONLY when this node has previously seen a
+  fully-valid v2 (digest-bearing) header from the same sender that ALSO
+  passed those gates (`RelayRefusal::MissingInnerDigest`, counted as
   `relay_refused_missing_inner_digest`) — a real downgrade (was v2, now
-  v1). The baseline is recorded only after signature ✓, digest ✓, and
-  freshness ✓ all pass, so a replayed expired v2 header cannot poison
-  it. Capability-advert presence is deliberately NOT the trigger: the
-  sender's relay-candidate lookup and the relay's sender lookup are two
-  different caches, and during advert convergence they can disagree
-  (sender emits v1 because its lookup is missing, while the relay's
-  advert cache says the sender supports digests) — rejecting on that
-  asymmetric state dropped legitimate messages. Senders never observed
-  on v2 (converging, or genuinely pre-#437) keep legacy acceptance.
-  Residual, accepted: a v2-capable sender whose relay-candidate cache
-  TTLs out later degrades to v1 and is refused by relays holding its
-  baseline — surfaced as a relay refusal (retry goes direct), not a
-  silent unbound accept.
+  v1). The baseline is a TTL-expiring (1 h), hard-capped (8192 entries,
+  least-recently-observed evicted) sender→last-seen map, recorded only
+  after signature ✓, digest ✓, freshness ✓, and the contact/block gates
+  all pass — so a replayed expired v2 header cannot poison it and
+  un-gated fresh-key spam cannot grow it. Capability-advert presence is
+  deliberately NOT the trigger: the sender's relay-candidate lookup and
+  the relay's sender lookup are two different caches, and during advert
+  convergence they can disagree (sender emits v1 because its lookup is
+  missing, while the relay's advert cache says the sender supports
+  digests) — rejecting on that asymmetric state dropped legitimate
+  messages. Senders never observed on v2 (converging, or genuinely
+  pre-#437) keep legacy acceptance. Residual, accepted: a v2-capable
+  sender whose relay-candidate cache TTLs out later degrades to v1 and
+  is refused by relays holding its baseline — surfaced as a relay
+  refusal (retry goes direct), not a silent unbound accept.
 
 ### Advert wire compatibility (postcard positional, verified empirically)
 
@@ -131,10 +134,14 @@ peers without confirmed support (above).
     v2-sender-to-v1-peer degrades to byte-exact v1; old-relay (v1-struct
     alone) parse; seam decision (None/pending → v1, wired advert → v2).
   - `digestless_frame_after_observed_v2_is_rejected_as_downgrade` —
-    asymmetric-cache convergence leg (v1 accepted though the sender's
-    caps advertise digest support), downgrade leg (v2 then v1 →
-    rejected), stale-v2 control (expired replay must not set the
-    baseline).
+    forward-arm legs with POSITIVE dispositions: convergence v1 →
+    Forward though the sender's caps advertise digest support; valid v2
+    → Forward (baseline set); v2-then-v1 → `MissingInnerDigest`;
+    stale-v2 control (expired replay must not set the baseline).
+  - `v2_baseline_is_resource_bounded_and_gate_gated` — cap+64 distinct
+    senders → map stays ≤ cap; TTL prune + expired-read; a non-contact
+    v2 frame on a gated relay is refused at the contact gate and the
+    map stays empty.
 - `src/dm_capability.rs`:
   - `false_digest_support_encodes_byte_identical_to_v1_caps`,
     `legacy_advert_decodes_and_verifies_on_new_node` (advert wire).
@@ -142,7 +149,8 @@ peers without confirmed support (above).
   - `relay_hop_substituted_inner_is_refused_before_forward_accounting` —
     relay-hop substitution through the real listener.
   - `v2_then_v1_downgrade_is_rejected_but_converging_v1_is_not` —
-    downgrade detection through the real listener: convergence v1
-    accepted, valid v2 accepted (baseline set), subsequent v1 rejected.
+    downgrade detection through the real listener against a REAL Bob:
+    convergence v1 delivered to Bob, valid v2 delivered (baseline set),
+    subsequent v1 rejected with no further delivery.
   - `relay_round_trip_alice_to_bob_via_charlie` — full three-party round
     trip over the v1 emit path (mixed-fleet default).

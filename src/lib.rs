@@ -6127,8 +6127,10 @@ impl Agent {
         // this frame) has a confirmed advert with `digest_support`; else
         // emit the byte-identical v1 frame so an old relay can still
         // parse, gate, and forward. Unknown capability defaults to v1.
-        // Receivers enforce the converse: digest-less frames from
-        // senders whose confirmed advert sets the bit are rejected.
+        // Receivers enforce the converse by DOWNGRADE DETECTION: a
+        // digest-less frame is rejected only from a sender the relay
+        // previously observed emitting a valid v2 frame (see
+        // `peer_relay::PeerRelay::disposition_for`).
         let bind_inner = peer_relay::peer_advertises_inner_digest(
             self.capability_store.lookup(&relay_agent).as_ref(),
         );
