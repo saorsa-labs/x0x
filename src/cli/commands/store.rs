@@ -35,9 +35,22 @@ pub async fn create(
 /// `owner` is the REQUIRED hex-encoded AgentId of the authoritative owner
 /// (the anchor). The joiner accepts the owner's deltas and writes iff it is
 /// the owner. The daemon rejects a join without an anchor (422 owner_required).
-pub async fn join(client: &DaemonClient, topic: &str, owner: &str) -> Result<()> {
+pub async fn join(
+    client: &DaemonClient,
+    topic: &str,
+    owner: Option<&str>,
+    policy: Option<&str>,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({ "expected_owner": owner });
+    // `expected_owner` omitted = owner-free join (self_keyed directory
+    // stores, issue #340); `policy` overrides the inferred join policy.
+    let mut body = serde_json::json!({});
+    if let Some(owner) = owner {
+        body["expected_owner"] = serde_json::json!(owner);
+    }
+    if let Some(policy) = policy {
+        body["policy"] = serde_json::json!(policy);
+    }
     let resp = client.post(&format!("/stores/{topic}/join"), &body).await?;
     print_value(client.format(), &resp);
     Ok(())

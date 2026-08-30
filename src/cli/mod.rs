@@ -217,6 +217,26 @@ impl DaemonClient {
             .context("request failed")?;
         self.handle_response(resp).await
     }
+    /// Send a DELETE request with a JSON body.
+    ///
+    /// A handful of REST endpoints (e.g. `DELETE /owner/agents/:id`) accept
+    /// an optional body alongside the path; axum's `Option<Json<T>>`
+    /// extractor reads it only when a body is present.
+    pub async fn delete_with_body<T: Serialize + ?Sized>(
+        &self,
+        path: &str,
+        body: &T,
+    ) -> Result<serde_json::Value> {
+        let resp = self
+            .client
+            .delete(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
+            .json(body)
+            .send()
+            .await
+            .context("request failed")?;
+        self.handle_response(resp).await
+    }
 
     /// Send a DELETE request.
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {

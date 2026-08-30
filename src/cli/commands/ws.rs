@@ -45,7 +45,7 @@ pub async fn sessions(client: &DaemonClient) -> Result<()> {
 /// in the `Authorization: Bearer <token>` header or `?token=<token>`
 /// query parameter. This command prints the concrete URL a client
 /// should open — there is no stdout HTTP response body to render.
-pub async fn direct(client: &DaemonClient) -> Result<()> {
+pub async fn direct(client: &DaemonClient, backfill: Option<usize>) -> Result<()> {
     client.ensure_running().await?;
     let base = client.base_url();
     let ws_base = base
@@ -56,7 +56,12 @@ pub async fn direct(client: &DaemonClient) -> Result<()> {
                 .map(|rest| format!("wss://{rest}"))
         })
         .unwrap_or_else(|| base.to_string());
-    let url = format!("{ws_base}/ws/direct");
+    // ?backfill=N replays the N most recent stored DM rows before the
+    // `live` marker (ADR-0023 §7).
+    let url = match backfill {
+        Some(n) => format!("{ws_base}/ws/direct?backfill={n}"),
+        None => format!("{ws_base}/ws/direct"),
+    };
     match client.format() {
         crate::cli::OutputFormat::Json => {
             print_value(

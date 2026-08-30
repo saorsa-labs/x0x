@@ -93,8 +93,10 @@ fn group_update_rejects_empty_patch_before_daemon_check() {
     let output = run_cli(&["group", "update", "deadbeef"]).expect("spawn x0x group update");
     assert!(!output.status.success(), "empty group update should fail");
     let stderr = String::from_utf8_lossy(&output.stderr);
+    // The flag is `--new-name` (wire field `name`); the message must name
+    // the real flag, not the wire field.
     assert!(
-        stderr.contains("group update requires at least one of: --name, --description"),
+        stderr.contains("group update requires at least one of: --new-name, --description"),
         "unexpected stderr: {stderr}"
     );
 }

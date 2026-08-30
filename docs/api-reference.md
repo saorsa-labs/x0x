@@ -365,7 +365,7 @@ Query params:
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/contacts/:agent_id/machines` | `x0x machines list <agent_id>` | List machine records |
-| POST | `/contacts/:agent_id/machines` | `x0x machines add <agent_id> <machine_id> [--pin]` | Add a machine record |
+| POST | `/contacts/:agent_id/machines` | `x0x machines add <agent_id> <machine_id> [--label <LABEL>] [--pin]` | Add a machine record |
 | DELETE | `/contacts/:agent_id/machines/:machine_id` | `x0x machines remove <agent_id> <machine_id>` | Remove a machine record |
 | POST | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines pin <agent_id> <machine_id>` | Pin a machine |
 | DELETE | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines unpin <agent_id> <machine_id>` | Unpin a machine |
@@ -394,7 +394,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
-| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
@@ -1125,8 +1125,8 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/upgrade` | `x0x upgrade` | Check for updates |
-| POST | `/upgrade/apply` | `x0x upgrade --apply` | Apply the latest verified release manifest |
+| GET | `/upgrade` | `x0x upgrade` (standalone self-updater — does not call this endpoint) | Check for updates |
+| POST | `/upgrade/apply` | `x0x upgrade --apply` (standalone self-updater — does not call this endpoint) | Apply the latest verified release manifest |
 
 ## WebSocket and GUI
 

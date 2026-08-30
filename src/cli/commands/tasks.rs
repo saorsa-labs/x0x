@@ -52,9 +52,17 @@ pub async fn update(
     list_id: &str,
     task_id: &str,
     action: &str,
+    fence_token: Option<&str>,
+    delegation: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({ "action": action });
+    let mut body = serde_json::json!({ "action": action });
+    if let Some(token) = fence_token {
+        body["fence_token"] = serde_json::json!(token);
+    }
+    if let Some(digest) = delegation {
+        body["delegation"] = serde_json::json!(digest);
+    }
     let resp = client
         .patch(&format!("/task-lists/{list_id}/tasks/{task_id}"), &body)
         .await?;

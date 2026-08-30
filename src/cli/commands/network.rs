@@ -208,10 +208,30 @@ pub async fn peers_events(client: &DaemonClient) -> Result<()> {
     client.ensure_running().await?;
     let resp = client.get_stream("/peers/events").await?;
     let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
+    // Print only the `data:` payload of each SSE frame (one JSON object
+    // per line), matching `x0x events` / `x0x presence events`.
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| anyhow::anyhow!("stream error: {e}"))?;
-        let s = String::from_utf8_lossy(&bytes);
-        print!("{s}");
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    match client.format() {
+                        crate::cli::OutputFormat::Json => println!("{data}"),
+                        crate::cli::OutputFormat::Text => {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                                crate::cli::print_value(crate::cli::OutputFormat::Text, &val);
+                            } else {
+                                println!("{data}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

@@ -26,11 +26,16 @@ pub async fn connect(client: &DaemonClient, agent_id: &str) -> Result<()> {
 /// daemon default (ADR 0030 §4). The CLI is a product surface, so its own
 /// default is durable; sending the field means an older CLI paired with a
 /// newer daemon — or the reverse — never silently swaps receipt semantics.
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     client: &DaemonClient,
     agent_id: &str,
     message: &str,
     require_ack_ms: Option<u64>,
+    prefer_raw_quic_if_connected: bool,
+    raw_quic_receive_ack_ms: Option<u64>,
+    stop_fallback_on_raw_error: bool,
+    require_gossip: bool,
     require_durable_app_ack: bool,
     logical_id: Option<&str>,
 ) -> Result<()> {
@@ -43,6 +48,18 @@ pub async fn send(
     });
     if let Some(ms) = require_ack_ms {
         body["require_ack_ms"] = serde_json::json!(ms);
+    }
+    if prefer_raw_quic_if_connected {
+        body["prefer_raw_quic_if_connected"] = serde_json::json!(true);
+    }
+    if let Some(ms) = raw_quic_receive_ack_ms {
+        body["raw_quic_receive_ack_ms"] = serde_json::json!(ms);
+    }
+    if stop_fallback_on_raw_error {
+        body["stop_fallback_on_raw_error"] = serde_json::json!(true);
+    }
+    if require_gossip {
+        body["require_gossip"] = serde_json::json!(true);
     }
     if let Some(logical_id) = logical_id {
         body["logical_id"] = serde_json::json!(logical_id);
@@ -58,13 +75,19 @@ pub async fn connections(client: &DaemonClient) -> Result<()> {
 }
 
 /// `x0x direct events` — stream GET /direct/events
-pub async fn events(client: &DaemonClient) -> Result<()> {
+pub async fn events(client: &DaemonClient, backfill: Option<usize>) -> Result<()> {
     client.ensure_running().await?;
     eprintln!("Streaming direct messages... (Ctrl+C to stop)");
 
     use futures::StreamExt;
 
-    let resp = client.get_stream("/direct/events").await?;
+    // ?backfill=N replays the N most recent stored DM rows before the
+    // `live` marker (ADR-0023 §7).
+    let path = match backfill {
+        Some(n) => format!("/direct/events?backfill={n}"),
+        None => "/direct/events".to_string(),
+    };
+    let resp = client.get_stream(&path).await?;
     let mut stream = resp.bytes_stream();
     let mut buffer = String::new();
 
@@ -117,7 +140,19 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true, "path": "gossip_inbox"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = send(&client, &"aa".repeat(32), "hello", None, true, None).await;
+        let result = send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            false,
+            None,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "send should succeed: {:?}", result);
     }
 
@@ -126,7 +161,19 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true, "require_ack": {"ok": true, "rtt_ms": 12}});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = send(&client, &"aa".repeat(32), "hello", Some(500), true, None).await;
+        let result = send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            Some(500),
+            false,
+            None,
+            false,
+            false,
+            true,
+            None,
+        )
+        .await;
         assert!(result.is_ok(), "send with ack should succeed: {:?}", result);
     }
 
@@ -149,14 +196,29 @@ mod tests {
             &"aa".repeat(32),
             "hello",
             None,
+            false,
+            None,
+            false,
+            false,
             true,
             Some("order-7"),
         )
         .await
         .unwrap();
-        send(&client, &"aa".repeat(32), "hello", None, false, None)
-            .await
-            .unwrap();
+        send(
+            &client,
+            &"aa".repeat(32),
+            "hello",
+            None,
+            false,
+            None,
+            false,
+            false,
+            false,
+            None,
+        )
+        .await
+        .unwrap();
 
         let requests: Vec<serde_json::Value> = captured
             .lock()
@@ -209,7 +271,7 @@ mod tests {
     async fn events_streams_json_sse_frame() {
         let (url, _shutdown) = start_sse_server("data: {\"message\":\"hello\"}\n\n").await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = events(&client).await;
+        let result = events(&client, None).await;
         assert!(result.is_ok(), "events should succeed: {:?}", result);
     }
 
@@ -217,7 +279,7 @@ mod tests {
     async fn events_streams_text_sse_frame() {
         let (url, _shutdown) = start_sse_server("data: plain text\n\n").await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
-        let result = events(&client).await;
+        let result = events(&client, None).await;
         assert!(result.is_ok(), "events should succeed: {:?}", result);
     }
 
@@ -234,7 +296,7 @@ mod tests {
         let mock_resp = serde_json::json!({"status": "ok"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = events(&client).await;
+        let result = events(&client, None).await;
         assert!(result.is_ok(), "events should succeed: {:?}", result);
     }
 }

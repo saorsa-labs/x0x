@@ -55,12 +55,21 @@ pub async fn list(client: &DaemonClient, agent_id: &str) -> Result<()> {
 }
 
 /// `x0x machines add` — POST /contacts/:agent_id/machines
-pub async fn add(client: &DaemonClient, agent_id: &str, machine_id: &str, pin: bool) -> Result<()> {
+pub async fn add(
+    client: &DaemonClient,
+    agent_id: &str,
+    machine_id: &str,
+    label: Option<&str>,
+    pin: bool,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "machine_id": machine_id,
         "pinned": pin,
     });
+    if let Some(label) = label {
+        body["label"] = serde_json::json!(label);
+    }
     let resp = client
         .post(&format!("/contacts/{agent_id}/machines"), &body)
         .await?;

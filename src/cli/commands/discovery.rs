@@ -18,13 +18,13 @@ pub async fn list(client: &DaemonClient, unfiltered: bool) -> Result<()> {
 }
 
 /// `x0x agents get` — GET /agents/discovered/:agent_id
-pub async fn get(client: &DaemonClient, agent_id: &str, wait: Option<u64>) -> Result<()> {
+pub async fn get(client: &DaemonClient, agent_id: &str, wait: bool) -> Result<()> {
     client.ensure_running().await?;
     let path = format!("/agents/discovered/{agent_id}");
-    let resp = if let Some(secs) = wait {
-        client
-            .get_query(&path, &[("wait", &secs.to_string())])
-            .await?
+    // `wait` is a boolean query param: the daemon waits its fixed
+    // discovery window when true (a numeric value is a 400).
+    let resp = if wait {
+        client.get_query(&path, &[("wait", "true")]).await?
     } else {
         client.get(&path).await?
     };
@@ -84,7 +84,7 @@ mod tests {
         let mock_resp = serde_json::json!({"status": "ok"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = get(&client, "agent-123", None::<u64>).await;
+        let result = get(&client, "agent-123", false).await;
         assert!(result.is_ok(), "get should succeed: {:?}", result);
     }
     #[tokio::test]
