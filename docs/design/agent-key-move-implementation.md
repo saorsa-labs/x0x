@@ -68,3 +68,54 @@ immutable (governance CI); this file carries implementation notes.
   persistence round-trips, binding authority matrix + carrier split +
   TTL permanence, route wiring (owner-gating, lazy mint, typed
   refusals).
+
+## Review round 2 fixes (b2-0037-r2)
+
+All findings from the codex review (3 Critical, 5 High) addressed:
+
+- **C1 (import ceremony):** `move_import` now establishes participant
+  state BEFORE storing the secret — the receipt (and any operator-carried
+  auth/export records) chain first, failures propagate (no key stored on
+  any error path), and the REST response returns the machine-countersigned
+  receipt variant + `receipt_chained` for operator carriage to the owner.
+  The empty-log signing-gate exception is scoped to the daemon's OWN
+  agent: a foreign agent with a key and no log NEVER passes (possession
+  without a custodian fold is quarantine). `move_abort` discards a
+  locally-held imported key of the aborted move (remote targets: the
+  route response instructs the operator to run the abort there).
+- **C2 (daemon-wide signing gate):** the gate now covers the raw-key
+  paths — `send_direct_with_config_inner` (the single gossip/relay/
+  raw-QUIC DM egress funnel; every envelope below signs with the agent
+  key) and the `ForwardV2` attestation (refused → documented V1
+  fallback, which carries no agent signature).
+- **C3 (durability):** `persist_move_state` is fallible and every
+  ceremony step propagates (append is idempotent on retry); activation
+  persists BEFORE publishing. Startup distinguishes ABSENT `moves.bin`
+  (normal pre-0043, fail-open stays) from PRESENT-but-corrupt (latched
+  `move_state_load_failed` → signing gate fail-closed for logless
+  agents). The `move_protocol: 1` advert no longer claims blob-v2.
+- **H4 (retirement):** deletion runs BEFORE the receipt chains and
+  deletion failure returns an error (the operator is never told a
+  source copy is dead while it remains on disk).
+- **H5 (DM enforcement):** outbound DM egress evaluates B+P for the
+  resolved recipient pairing before transmitting; inbound machine gate
+  treats pairing denials as PER-AGENT exclusions (dead pairings drop
+  from the surfaced list; co-resident agents flow; deny only when no
+  live pairing survives). Identity-level gates (#192) still deny the
+  machine.
+- **H6 (session-token oracle):** the binding form of `/identity/revoke`
+  requires the durable owner; `revoke_binding` bounds `move_epoch` by
+  the derived placement epoch (or highest retired epoch) — `u64::MAX`
+  can no longer stale-date every placement.
+- **H7 (invariant ordering + abort scoping):** the ≥1-Roaming check runs
+  BEFORE the bundle appends (a refusal leaves the move abortable at its
+  current head); `move_abort` scopes "already activated" to THE
+  REQUESTED epoch (an older committed bundle never blocks a later
+  move's rollback) and rejects epochs the log has moved past.
+- **H8 (standalone placement authority + equal-epoch forks):**
+  `placements_from_bytes` requires the record's owner key to match a
+  known issuance-journal certificate (unmatched records drop
+  fail-closed); `cache_placement` never overwrites an equal-epoch
+  different-digest record (first-valid wins); `ingest_bundle` never
+  replaces an equal-epoch bundle (owner-fork challenger warns, keeps
+  stored); tombstones still union in every order.

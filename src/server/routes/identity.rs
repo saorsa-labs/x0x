@@ -1162,7 +1162,7 @@ pub(in crate::server) struct ServiceEntryData {
 /// (revoking own agent-id or own machine-id) always succeeds.  Revoking a
 /// third-party subject requires that a user keypair previously signed an
 /// `AgentCertificate` for that subject (user-authority revocation).
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(in crate::server) struct RevokeRequest {
     /// Which subject to revoke. Exactly one field must be present for
     /// Agent/Machine subjects; BOTH `agent_id` and `machine_id` (with
@@ -1185,6 +1185,9 @@ pub(in crate::server) struct RevokeRequest {
 /// to revoke the requested subject.
 pub(in crate::server) async fn identity_revoke(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(body): Json<RevokeRequest>,
 ) -> impl IntoResponse {
     use x0x::revocation::RevokedSubject;
@@ -1192,6 +1195,12 @@ pub(in crate::server) async fn identity_revoke(
     if let (Some(agent_hex), Some(machine_hex)) =
         (body.agent_id.as_deref(), body.machine_id.as_deref())
     {
+        if !actor.is_durable_owner() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "binding revocation requires the durable API token (owner-key signing act)",
+            );
+        }
         let Some(epoch) = body.move_epoch else {
             return bad_request("binding revocation requires move_epoch");
         };

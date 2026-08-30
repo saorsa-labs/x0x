@@ -426,6 +426,11 @@ pub struct Agent {
     /// (`placement-blobs.bin`). Every B/P enforcement gate reads this;
     /// writers append one verified record and readers fold.
     move_state: std::sync::Arc<tokio::sync::RwLock<key_move::MoveState>>,
+    /// Review r2 C3: latched when `moves.bin` exists at startup but fails
+    /// to decode/verify — an empty in-memory log then fail-CLOSES the
+    /// signing gate instead of re-enabling the pre-0043 exception (state
+    /// loss must never resurrect a custodian the durable log moved away).
+    move_state_load_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -1485,9 +1490,10 @@ struct MachineAnnouncementV3Unsigned {
     /// (§8.2). The machine is not the placement authority — it advertises
     /// pointers; every fetched record is owner-verified before caching.
     placement_digests: Vec<(identity::AgentId, [u8; 32])>,
-    /// ADR-0043 protocol capability advert: `1` = machine-announce v3 +
-    /// revocation v2 + activation topics + blob v2. `0` would be absent
-    /// (never published).
+    /// ADR-0043 protocol capability advert (review r2: matches what is
+    /// actually implemented): `1` = machine-announce v3 + revocation v2 +
+    /// activation topic. Blob-v2 fetch-on-miss is NOT advertised (not
+    /// implemented — see docs/design/agent-key-move-implementation.md).
     move_protocol: u8,
 }
 
@@ -1506,7 +1512,9 @@ pub struct MachineAnnouncementV3 {
     pub machine_kem_public_key: Vec<u8>,
     /// Placement-record digests per resident agent.
     pub placement_digests: Vec<(identity::AgentId, [u8; 32])>,
-    /// Move-protocol capability advert (currently `1`).
+    /// Move-protocol capability advert: `1` = machine-announce v3 +
+    /// revocation v2 + activation topic (blob-v2 NOT advertised — not
+    /// implemented).
     pub move_protocol: u8,
     /// Machine ML-DSA-65 signature over the V3 unsigned body.
     pub machine_signature_v3: Vec<u8>,
@@ -5592,6 +5600,38 @@ impl Agent {
         payload: Vec<u8>,
         config: dm::DmSendConfig,
     ) -> Result<dm::DmReceipt, dm::DmError> {
+        // ADR-0043 AgentSigningGate (review r2 C2): this is THE DM egress
+        // funnel — every gossip/relay/raw-QUIC envelope below signs with
+        // the raw agent key, so the gate must refuse HERE, before any
+        // signature exists. A quiesced (mid-move/retire-pending source) or
+        // quarantined (un-activated target) daemon must produce zero agent
+        // signatures, not merely rely on receiver-side filtering.
+        if !self.signing_gate_allows(&self.identity.agent_id()).await {
+            self.direct_messaging.record_outgoing_failed(*to);
+            return Err(dm::DmError::EnvelopeConstruction(
+                "signing refused: this machine is not the agent's custodian (ADR-0043 signing gate)"
+                    .to_string(),
+            ));
+        }
+        // ADR-0043 §9 (review r2 H5): outbound DMs resolve a recipient
+        // machine — evaluate B+P for the pairing before transmitting, so
+        // nothing is delivered to a retired old-source binding.
+        if let Some(machine_id) = {
+            let cache = self.identity_discovery_cache.read().await;
+            cache.get(to).map(|entry| entry.machine_id)
+        } {
+            let denied = {
+                let revoked = self.revocation_set.read().await;
+                let placements = self.move_state.read().await;
+                key_move::enforce_pairing(&revoked, placements.placement_view(), to, &machine_id)
+            };
+            if let Some(denial) = denied {
+                self.direct_messaging.record_outgoing_failed(*to);
+                return Err(dm::DmError::EnvelopeConstruction(format!(
+                    "recipient pairing denied (ADR-0043 B/P): {denial:?}"
+                )));
+            }
+        }
         if *to == self.identity.agent_id() {
             self.direct_messaging.record_outgoing_started(*to, None);
             if payload.len() > direct::MAX_DIRECT_PAYLOAD_SIZE {
@@ -9969,23 +10009,49 @@ impl Agent {
     }
 
     /// The AgentSigningGate decision (§6): `may_sign = holds_key ∧
-    /// custodian == this machine`. Agents with NO move log fail open —
-    /// pre-0043 behavior is unchanged until a mint exists.
+    /// custodian == this machine`.
+    ///
+    /// The empty-log exception is scoped to the daemon's OWN agent
+    /// (pre-0043 behavior unchanged until a mint exists). A FOREIGN agent
+    /// with no log NEVER passes: the only way this machine holds a
+    /// foreign agent key is an import, which implies a move exists
+    /// somewhere — possession without a local custodian fold is
+    /// quarantine, not permission (review r2 C1: an imported key on a
+    /// target that could not chain its receipt must not sign).
     #[must_use]
     pub async fn signing_gate_allows(&self, agent: &identity::AgentId) -> bool {
+        let holds_key = self.holds_agent_key(agent);
         let state = self.move_state.read().await;
         if state.log(agent).is_empty() {
-            return true;
+            return *agent == self.agent_id() && holds_key;
+        }
+        // A corrupt/undecodable moves.bin at startup fail-closes every
+        // empty log (review r2 C3): state loss must not resurrect a
+        // custodian that a durable log had moved away.
+        if self
+            .move_state_load_failed
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            return false;
         }
         let fold = state.fold(agent);
-        fold.may_sign(&self.machine_id(), self.holds_agent_key(agent))
+        fold.may_sign(&self.machine_id(), holds_key)
     }
 
     /// Persist the three ADR-0043 state files + the v2 revocation file.
-    /// Best-effort per file: a failed write logs and continues (the
-    /// in-memory state stays authoritative for this run), mirroring the
-    /// revocation-set persistence posture.
-    async fn persist_move_state(&self) {
+    ///
+    /// Review r2 C3: durability failures are ERRORS, not warnings — a
+    /// record that exists only in memory can be lost to a restart, which
+    /// would resurrect a custodian the log had moved away. Every ceremony
+    /// step calls this and propagates the failure; the in-memory append
+    /// that preceded it is idempotent on retry (identical bytes →
+    /// identical fold), so the operator re-runs the command and the
+    /// persist retries. `Ok(())` means every file encoded AND wrote.
+    ///
+    /// # Errors
+    ///
+    /// Returns the first encode/write failure.
+    async fn persist_move_state(&self) -> error::Result<()> {
         let (logs, bundles, placements, v2) = {
             let state = self.move_state.read().await;
             let v2 = self.revocation_set.read().await.to_bytes_v2();
@@ -9996,42 +10062,23 @@ impl Agent {
                 v2,
             )
         };
-        // Encode failures degrade to a warn (state stays in-memory
-        // authoritative); files whose encode failed are skipped.
-        let encodable = |res: error::Result<Vec<u8>>| res.map_err(|e| e.to_string()).ok();
-        let entries: Vec<(&str, Option<Vec<u8>>)> = [
-            ("moves.bin", encodable(logs)),
-            ("move-bundles.bin", encodable(bundles)),
-            ("placement-blobs.bin", encodable(placements)),
-            ("revocations-v2.bin", encodable(v2)),
-        ]
-        .into_iter()
-        .filter(|(_, bytes)| bytes.is_some())
-        .collect();
-        for (name, bytes) in entries {
-            let Some(path) = self.move_file_path(name) else {
-                continue;
-            };
-            let Some(bytes) = bytes else { continue };
-            if let Err(e) = storage::save_private_bytes_to(&path, bytes).await {
-                tracing::warn!(path = %path.display(), error = %e, "move-state persist failed");
+        for (name, bytes) in [
+            ("moves.bin", logs),
+            ("move-bundles.bin", bundles),
+            ("placement-blobs.bin", placements),
+            ("revocations-v2.bin", v2),
+        ] {
+            let bytes = bytes?;
+            if let Some(path) = self.move_file_path(name) {
+                storage::save_private_bytes_to(&path, bytes).await?;
             }
         }
+        Ok(())
     }
 
     /// Mint epoch-0 `PlacementMint` records for every certificated agent
     /// on this owner's roster that has no move state yet (ADR-0043 §8.2).
-    ///
-    /// Default placement is `Pinned(machine where last seen)`, falling
-    /// back to THIS machine when discovery has never observed the agent.
-    /// The mint must satisfy ADR-0038's ≥1-Roaming Home invariant from
-    /// birth: the install's LOCAL agent is minted `Roaming` (custodian =
-    /// its generating machine), and an all-Pinned mint is refused.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when no owner key is loaded or the mint would
-    /// produce zero roaming agents.
+    /// See the module docs for placement defaults and the ≥1-Roaming rule.
     pub async fn move_mint_placements(&self) -> error::Result<usize> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
@@ -10142,7 +10189,7 @@ impl Agent {
             minted += 1;
         }
         if minted > 0 {
-            self.persist_move_state().await;
+            self.persist_move_state().await?;
         }
         Ok(minted)
     }
@@ -10216,7 +10263,7 @@ impl Agent {
             let mut state = self.move_state.write().await;
             state.append(agent_id, auth_record.clone(), Some(user_kp.public_key()))?;
         }
-        self.persist_move_state().await;
+        self.persist_move_state().await?;
         let mut bundle = key_move::TransferBundle {
             authorization: auth_record,
             export_receipt: None,
@@ -10341,7 +10388,7 @@ impl Agent {
                 Some(user_kp.public_key()),
             )?;
         }
-        self.persist_move_state().await;
+        self.persist_move_state().await?;
         Ok(key_move::TransferBundle {
             authorization: bundle.authorization,
             export_receipt: Some(receipt_record),
@@ -10372,22 +10419,28 @@ impl Agent {
     }
 
     /// Target step: verify the transfer bundle, unwrap the envelope with
-    /// THIS machine's KEM key, store the key material, and countersign
-    /// the `ImportReceipt` (§5). Quarantine is derived (the fold's
-    /// custodian stays ⊥ until activation) — there is no flag to crash
-    /// between.
+    /// THIS machine's KEM key, establish participant state, and only then
+    /// store the key material (§5; review r2 C1: the receipt chains BEFORE
+    /// the secret lands — a crash between the two leaves a receipt with no
+    /// key, which is quarantine-by-possession-false, never a live signer;
+    /// the reverse order left a key on a logless target whose signing gate
+    /// failed open).
     ///
-    /// When this daemon also holds the owner key, the receipt chains into
-    /// the log immediately; otherwise the returned record rides back to
-    /// the owner with the operator (the owner's `/agent/move/activate`
-    /// accepts it as optional evidence).
+    /// Returns the machine-countersigned `ImportReceipt` VARIANT for the
+    /// operator to carry to the owner when this daemon cannot chain it
+    /// itself (no owner key — the owner wraps it in a `ChainedRecord` at
+    /// the next owner contact). `receipt_chained` tells which happened.
     ///
     /// # Errors
     ///
     /// Returns an error when this machine is not the move target, the
-    /// envelope fails to unwrap, or the unwrapped key does not hash to
-    /// the agent id.
-    pub async fn move_import(&self, bundle: key_move::TransferBundle) -> error::Result<()> {
+    /// envelope fails to unwrap, the unwrapped key does not hash to the
+    /// agent id, or (owner-key case) the local log cannot accept the
+    /// records — in every error case NO key material is stored.
+    pub async fn move_import(
+        &self,
+        bundle: key_move::TransferBundle,
+    ) -> error::Result<key_move::ImportOutcome> {
         let auth = match &bundle.authorization.record {
             key_move::MoveRecord::MoveAuthorization(auth) => auth.clone(),
             _ => {
@@ -10407,7 +10460,7 @@ impl Agent {
                 "this machine has no ML-KEM enrollment key".to_string(),
             )
         })?;
-        let envelope = bundle.envelope.ok_or_else(|| {
+        let envelope = bundle.envelope.clone().ok_or_else(|| {
             error::IdentityError::Revocation(
                 "transfer bundle carries no envelope — run the export first".to_string(),
             )
@@ -10442,18 +10495,7 @@ impl Agent {
                 "unwrapped key does not hash to the authorized agent".to_string(),
             ));
         }
-        // Store the key material (the payload form is exactly what export
-        // wrote — length-prefixed public ‖ secret).
-        let path = self
-            .imported_agent_key_path(&auth.agent_id)
-            .ok_or_else(|| {
-                error::IdentityError::Storage(std::io::Error::other(
-                    "no identity directory for imported keys",
-                ))
-            })?;
-        storage::save_private_bytes_to(&path, opened).await?;
-        // Countersign the ImportReceipt; chain it when the owner key is
-        // local (co-resident owner+target), else hand it to the operator.
+        // Countersign the ImportReceipt FIRST.
         let receipt_inner = key_move::MoveRecord::ImportReceipt {
             auth_hash: auth.auth_hash(),
             imported_at: Self::unix_timestamp_secs(),
@@ -10469,7 +10511,7 @@ impl Agent {
             &receipt_inner,
             self.identity.machine_keypair().secret_key(),
         )?;
-        let receipt = match receipt_inner {
+        let receipt_variant = match receipt_inner {
             key_move::MoveRecord::ImportReceipt {
                 auth_hash,
                 imported_at,
@@ -10483,33 +10525,54 @@ impl Agent {
             },
             _ => unreachable!("receipt_inner is an ImportReceipt"),
         };
+        let mut receipt_chained = false;
         if let Some(user_kp) = self.identity.user_keypair() {
-            // Chain the operator-carried records onto the local log when
-            // they are ahead of it (co-resident case: auth + export
-            // already chained; the receipt chains now).
+            // Co-resident owner+target: chain the operator-carried records
+            // onto the local log. FAILURES PROPAGATE — if the local log
+            // cannot accept them (foreign head, corrupt state), the key
+            // must NOT be stored (review r2 C1).
             {
                 let mut state = self.move_state.write().await;
+                if let Some(auth_record) = chainable_auth(&bundle.authorization, &state, &auth) {
+                    state.append(&auth.agent_id, auth_record, Some(user_kp.public_key()))?;
+                }
                 if let Some(export_receipt) = bundle.export_receipt.clone() {
-                    let _ =
-                        state.append(&auth.agent_id, export_receipt, Some(user_kp.public_key()));
+                    state.append(&auth.agent_id, export_receipt, Some(user_kp.public_key()))?;
                 }
                 let head = state.head_hash(&auth.agent_id);
                 let receipt_record = key_move::ChainedRecord::sign(
                     head,
-                    receipt,
+                    receipt_variant.clone(),
                     user_kp.public_key().as_bytes(),
                     user_kp.secret_key(),
                 )?;
                 state.append(&auth.agent_id, receipt_record, Some(user_kp.public_key()))?;
             }
-            self.persist_move_state().await;
+            self.persist_move_state().await?;
+            receipt_chained = true;
         }
+        // Participant state is durable — NOW store the key material. A
+        // failure here leaves a receipt with no key (quarantine holds:
+        // the fold's custodian is ⊥ until activation, and the empty-log
+        // exception never applies to a foreign agent).
+        let path = self
+            .imported_agent_key_path(&auth.agent_id)
+            .ok_or_else(|| {
+                error::IdentityError::Storage(std::io::Error::other(
+                    "no identity directory for imported keys",
+                ))
+            })?;
+        storage::save_private_bytes_to(&path, opened).await?;
         tracing::info!(
             agent = %hex::encode(auth.agent_id.as_bytes()),
             move_epoch = auth.move_epoch,
+            receipt_chained,
             "import complete — key stored, quarantined until activation (derived)"
         );
-        Ok(())
+        Ok(key_move::ImportOutcome {
+            receipt: receipt_variant,
+            receipt_chained,
+        })
     }
 
     /// Owner step 2: verify coherence, chain the `ActivationBundle`
@@ -10595,6 +10658,7 @@ impl Agent {
             Self::unix_timestamp_secs(),
             user_kp.secret_key(),
         )?;
+        let bundle_is_roaming = placement_record.placement == key_move::Placement::Roaming;
         let bundle = key_move::MoveRecord::ActivationBundle {
             authorization: auth,
             retired_bindings: retired,
@@ -10607,6 +10671,25 @@ impl Agent {
             user_kp.public_key().as_bytes(),
             user_kp.secret_key(),
         )?;
+        // Home invariant (§8.2, review r2 H7): check BEFORE appending —
+        // simulate the post-move view (this agent's placement replaced by
+        // the bundle's) over every OTHER known placement; a refusal means
+        // NOTHING was appended and the move stays abortable at this head.
+        {
+            let state = self.move_state.read().await;
+            let roaming_after = state
+                .placement_view()
+                .values()
+                .filter(|p| p.agent_id != *agent_id)
+                .filter(|p| p.placement == key_move::Placement::Roaming)
+                .count()
+                + usize::from(bundle_is_roaming);
+            if roaming_after == 0 {
+                return Err(error::IdentityError::Revocation(format!(
+                    "activation refused: would leave zero Roaming agents — retry with placement=Roaming (move epoch {move_epoch} remains abortable)"
+                )));
+            }
+        }
         {
             let mut state = self.move_state.write().await;
             state.append(agent_id, bundle_record.clone(), Some(user_kp.public_key()))?;
@@ -10615,24 +10698,11 @@ impl Agent {
             let mut revoked = self.revocation_set.write().await;
             state.ingest_bundle(agent_id, &bundle_record, &mut revoked)?;
         }
-        // Home invariant (§8.2): refuse to strand the fleet with zero
-        // roaming agents. Checked AFTER ingest so the check sees the
-        // post-move view — but the append already happened; on refusal
-        // the operator must abort (the bundle is not yet published).
-        let roaming_after = {
-            let state = self.move_state.read().await;
-            state
-                .placement_view()
-                .values()
-                .filter(|p| p.placement == key_move::Placement::Roaming)
-                .count()
-        };
-        if roaming_after == 0 {
-            return Err(error::IdentityError::Revocation(format!(
-                "activation would leave zero Roaming agents — abort this move (epoch {move_epoch}) and retry with placement=Roaming"
-            )));
-        }
-        self.persist_move_state().await;
+        // Review r2 C3: durability BEFORE publication — a bundle on the
+        // mesh that this daemon cannot durably remember would let a
+        // restarted source sign again. Persist failure returns Err (the
+        // in-memory append is idempotent on retry).
+        self.persist_move_state().await?;
         // Eviction semantics: nothing to evict for a bundle (the pairing
         // dies at B/P gates); republish the latest bundle on the
         // activation topic.
@@ -10666,19 +10736,17 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
-        let (head, auth_hash) = {
+        let (head, auth_hash, from_machine) = {
             let state = self.move_state.read().await;
             let log = state.log(agent_id);
-            let auth_hash = log
+            // The requested epoch's authorization.
+            let auth = log
                 .iter()
                 .rev()
                 .find_map(|r| match &r.record {
                     key_move::MoveRecord::MoveAuthorization(a) if a.move_epoch == move_epoch => {
-                        Some(a.auth_hash())
+                        Some(a.clone())
                     }
-                    key_move::MoveRecord::ActivationBundle { .. }
-                    | key_move::MoveRecord::AbortRecord { .. }
-                    | key_move::MoveRecord::PlacementMint { .. } => None,
                     _ => None,
                 })
                 .ok_or_else(|| {
@@ -10686,16 +10754,41 @@ impl Agent {
                         "no active authorization for move epoch {move_epoch}"
                     ))
                 })?;
-            // Terminated moves cannot abort.
-            let terminated = log
-                .iter()
-                .any(|r| matches!(r.record, key_move::MoveRecord::ActivationBundle { .. }));
-            if terminated {
-                return Err(error::IdentityError::Revocation(
-                    "move already activated — abort is a pre-activation terminator".to_string(),
-                ));
+            // Review r2 H7: termination is scoped to THE REQUESTED EPOCH —
+            // a bundle for an OLDER committed move does not make the
+            // current (unterminated) move un-abortable. A bundle for THIS
+            // epoch does.
+            let this_epoch_terminated = log.iter().any(|r| {
+                matches!(
+                    &r.record,
+                    key_move::MoveRecord::ActivationBundle { authorization, .. }
+                        if authorization.move_epoch == move_epoch
+                )
+            });
+            if this_epoch_terminated {
+                return Err(error::IdentityError::Revocation(format!(
+                    "move epoch {move_epoch} is already activated — abort is a pre-activation terminator"
+                )));
             }
-            (state.head_hash(agent_id), auth_hash)
+            // A later epoch's presence means the requested epoch was
+            // terminated before (its head moved on); reviving it would
+            // fork the chain.
+            let later_epoch = log.iter().any(|r| {
+                matches!(
+                    &r.record,
+                    key_move::MoveRecord::MoveAuthorization(a) if a.move_epoch > move_epoch
+                )
+            });
+            if later_epoch {
+                return Err(error::IdentityError::Revocation(format!(
+                    "move epoch {move_epoch} already ended — the log has moved to a later epoch"
+                )));
+            }
+            (
+                state.head_hash(agent_id),
+                auth.auth_hash(),
+                auth.from_machine,
+            )
         };
         let abort = key_move::ChainedRecord::sign(
             head,
@@ -10707,7 +10800,20 @@ impl Agent {
             let mut state = self.move_state.write().await;
             state.append(agent_id, abort.clone(), Some(user_kp.public_key()))?;
         }
-        self.persist_move_state().await;
+        self.persist_move_state().await?;
+        // Review r2 C1: when THIS machine was the move's target and holds
+        // the imported key, the rollback discards it (§5.3 "target
+        // discards key"). A remote target's copy is the operator's to
+        // discard via the same command there — surfaced in the route's
+        // response.
+        let target_key_discarded = self.discard_imported_key_if(agent_id).await;
+        tracing::info!(
+            agent = %hex::encode(agent_id.as_bytes()),
+            move_epoch,
+            from_machine = %hex::encode(from_machine.as_bytes()),
+            target_key_discarded,
+            "move aborted — epoch burned, custodian restored"
+        );
         Ok(abort)
     }
 
@@ -10800,14 +10906,12 @@ impl Agent {
             user_kp.public_key().as_bytes(),
             user_kp.secret_key(),
         )?;
-        {
-            let mut state = self.move_state.write().await;
-            state.append(agent_id, receipt_record.clone(), Some(user_kp.public_key()))?;
-        }
-        // Secure deletion of the source copy: imported keys are deleted;
-        // the daemon's own agent key is the install bootstrap identity
-        // and stays (holds_key remains true — the fold's custodian is
-        // already the target, so may_sign stays false).
+        // Review r2 H4: DELETION BEFORE RECEIPT, and deletion failure
+        // PROPAGATES. If deletion failed but the receipt chained, the
+        // operator would believe the source copy dead while it remains on
+        // disk. The reverse order (receipt then delete-fail) leaves
+        // RetirePending — the fold still quiesces this machine, which is
+        // safe — so delete first, chain only on success.
         if *agent_id != self.agent_id() {
             if let Some(path) = self.imported_agent_key_path(agent_id) {
                 match tokio::fs::remove_file(&path).await {
@@ -10819,17 +10923,43 @@ impl Agent {
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
                     Err(e) => {
-                        tracing::warn!(
-                            path = %path.display(),
-                            error = %e,
-                            "failed to delete retired agent key"
-                        );
+                        return Err(error::IdentityError::Storage(e));
                     }
                 }
             }
         }
-        self.persist_move_state().await;
+        {
+            let mut state = self.move_state.write().await;
+            state.append(agent_id, receipt_record.clone(), Some(user_kp.public_key()))?;
+        }
+        // The daemon's own agent key is the install bootstrap identity
+        // and stays on disk — holds_key remains true but may_sign is
+        // already false (the fold's custodian moved; review r2 C2 gates
+        // every signing path on that fold).
+        self.persist_move_state().await?;
         Ok(receipt_record)
+    }
+
+    /// Best-effort discard of a locally-held imported key for `agent`
+    /// (abort rollback, review r2 C1). Returns whether a key file was
+    /// actually removed.
+    async fn discard_imported_key_if(&self, agent_id: &identity::AgentId) -> bool {
+        if *agent_id == self.agent_id() {
+            return false;
+        }
+        let Some(path) = self.imported_agent_key_path(agent_id) else {
+            return false;
+        };
+        match tokio::fs::remove_file(&path).await {
+            Ok(()) => {
+                tracing::info!(
+                    path = %path.display(),
+                    "imported key discarded (aborted move rollback)"
+                );
+                true
+            }
+            Err(_) => false,
+        }
     }
 
     /// Owner-issued ad-hoc binding revocation (ADR-0043 §7): retire an
@@ -10851,6 +10981,37 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        // Review r2 H6: the epoch is caller-chosen and orders tombstones
+        // against placement records (§9 P) — an unbounded value (u64::MAX)
+        // would stale-date every legitimate placement and silently
+        // disable P for the agent. Bound it by the daemon's derived
+        // knowledge: the agent's current placement epoch (§7.4 "epoch =
+        // the current derived placement epoch"), or the highest retired
+        // binding epoch when no placement record is cached.
+        let placement_epoch_known = {
+            let placements = self.move_state.read().await;
+            placements
+                .placement(agent)
+                .map(|record| record.placement_epoch)
+        };
+        let known_bound = match placement_epoch_known {
+            Some(epoch) => Some(epoch),
+            None => {
+                let revoked = self.revocation_set.read().await;
+                revoked.max_revoked_binding_epoch(agent)
+            }
+        };
+        let Some(bound) = known_bound else {
+            return Err(error::IdentityError::Revocation(format!(
+                "no placement state known for agent {} — binding revocation requires a derived epoch to order against",
+                hex::encode(agent.as_bytes())
+            )));
+        };
+        if move_epoch > bound {
+            return Err(error::IdentityError::Revocation(format!(
+                "move_epoch {move_epoch} exceeds the agent's derived placement epoch {bound} — refusing a tombstone that would stale-date every placement"
+            )));
+        }
         let cert = self.agent_certificate_for(agent).await.ok_or_else(|| {
             error::IdentityError::Revocation(
                 "no certificate known for the agent — binding revocation requires it".to_string(),
@@ -12244,6 +12405,14 @@ impl Agent {
             });
         }
         let now_secs = Self::unix_timestamp_secs();
+        // Review r2 H5: pairing denials are PER-AGENT exclusions, not
+        // machine denials. Identity-level gates (revocation/expiry/trust,
+        // #192) still deny the machine; but a DEAD PAIRING (moved-away
+        // agent whose stale cache entry still names this machine) must
+        // not block the machine's live co-resident agents. Dead-pairing
+        // agents drop from the surfaced list; if NONE survive, the
+        // machine has no live pairing and is denied.
+        let mut surviving: Vec<identity::AgentId> = Vec::with_capacity(agents.len());
         for (agent_id, cert_not_after) in &agents {
             // Runtime cert-expiry gate (issue #191): a cached entry whose
             // cert has expired must be refused on the live path.
@@ -12283,7 +12452,7 @@ impl Agent {
             }
             // ADR-0043 §9: B and P per (agent, machine) pairing — the
             // source pairing of an activated move dies here, permanently,
-            // while co-resident agents pass.
+            // while co-resident agents pass (exclusion, not denial).
             let pairing = {
                 let revoked = revocation_set.read().await;
                 let placements = move_state.read().await;
@@ -12299,20 +12468,29 @@ impl Agent {
                     target: "x0x::streams",
                     agent = %hex::encode(agent_id.as_bytes()),
                     machine = %hex::encode(machine_id.as_bytes()),
-                    agent_count = agents.len(),
-                    outcome = "deny_pairing",
+                    outcome = "exclude_dead_pairing",
                     reason = ?denial,
-                    "inbound traffic denied at ADR-0043 B/P pairing gate"
+                    "inbound agent excluded (ADR-0043 B/P) — co-resident agents unaffected"
                 );
-                return Err(error::NetworkError::PeerNotVerified {
-                    agent_id: agent_id.0,
-                });
+                continue;
             }
+            surviving.push(*agent_id);
+        }
+        if surviving.is_empty() {
+            tracing::info!(
+                target: "x0x::streams",
+                machine = %hex::encode(machine_id.as_bytes()),
+                outcome = "deny_no_live_pairing",
+                "inbound traffic denied — every cached agent on the machine is a dead pairing"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: machine_id.0,
+            });
         }
 
-        // Gate cleared for every agent — drop the expiry metadata and
-        // keep the ordered agent list for the stream/lane handle.
-        let agents: Vec<identity::AgentId> = agents.into_iter().map(|(a, _)| a).collect();
+        // Gate cleared — keep the ordered surviving agent list for the
+        // stream/lane handle.
+        let agents: Vec<identity::AgentId> = surviving;
 
         // Connect-ACL gate (#131 × #132): with an Enabled policy every
         // announced agent on this machine must be pair-listed in the ACL;
@@ -13869,6 +14047,7 @@ impl AgentBuilder {
                 } else {
                     storage::save_agent_certificate(&new_cert).await?;
                 }
+
                 // Record the issuance (append-only; best-effort — a journal
                 // write failure degrades the roster, never startup).
                 if let Some(ref jp) = journal_path {
@@ -14046,19 +14225,49 @@ impl AgentBuilder {
             }
             None => None,
         };
-        let move_state = {
+        let (move_state, move_logs_corrupt) = {
             let dir = identity_dir_or_home.as_deref();
             let mut revoked_for_load = tokio::sync::RwLock::write(&revocation_set).await;
+            // Review r2 C3: distinguish ABSENT moves.bin (normal pre-0043
+            // install — fail-open stays) from a PRESENT-but-corrupt one
+            let moves_path = dir.map(|d| d.join("moves.bin"));
+            let moves_exists = match &moves_path {
+                Some(path) => tokio::fs::try_exists(path).await.unwrap_or(false),
+                None => false,
+            };
             let logs = read_move_file(dir, "moves.bin", |b| {
                 key_move::MoveState::logs_from_bytes(b)
             })
             .await;
+            let logs_corrupt = moves_exists && logs.is_err();
+            if logs_corrupt {
+                tracing::error!(
+                    "moves.bin exists but failed to decode/verify — signing gate fail-closed until the file is restored or removed"
+                );
+            }
             let bundles = read_move_file(dir, "move-bundles.bin", |b| {
                 key_move::MoveState::bundles_from_bytes(b, &mut revoked_for_load)
             })
             .await;
+            // Review r2 H8: standalone placement records must prove their
+            // owner key certified the agent — cross-check against the
+            // issuance-journal certificates; unmatched records drop
+            // (the owner re-mints; peers re-derive from bundles).
+            let mut journal_certs =
+                std::collections::HashMap::<identity::AgentId, identity::AgentCertificate>::new();
+            if let Some(dir) = dir {
+                let journal_path = dir.join("owner-cert-journal.jsonl");
+                for record in profile::IssuedCertRecord::load(&journal_path).await {
+                    let Some(cert) = decode_journal_cert(&record) else {
+                        continue;
+                    };
+                    if let Ok(agent) = cert.agent_id() {
+                        journal_certs.insert(agent, cert);
+                    }
+                }
+            }
             let placements = read_move_file(dir, "placement-blobs.bin", |b| {
-                key_move::MoveState::placements_from_bytes(b)
+                key_move::MoveState::placements_from_bytes(b, &journal_certs)
             })
             .await;
             let mut state = logs.unwrap_or_default();
@@ -14077,9 +14286,11 @@ impl AgentBuilder {
                     }
                 }
             }
-            state
+            (state, logs_corrupt)
         };
         let move_state = std::sync::Arc::new(tokio::sync::RwLock::new(move_state));
+        let move_state_load_failed =
+            std::sync::Arc::new(std::sync::atomic::AtomicBool::new(move_logs_corrupt));
 
         // Initialise contact store now (hoisted before the relay-DM
         // listener spawn so the listener can resolve the #193 contact
@@ -14213,6 +14424,8 @@ impl AgentBuilder {
         let own_pair_user = identity.user_id();
         let own_pair_cert = identity.agent_certificate().cloned();
         Ok(Agent {
+            move_state,
+            move_state_load_failed,
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),
@@ -14224,7 +14437,6 @@ impl AgentBuilder {
             bootstrap_cache,
             gossip_cache_adapter,
             machine_kem,
-            move_state,
             identity_discovery_cache,
             authenticated_machine_bindings: std::sync::Arc::new(tokio::sync::RwLock::new(
                 dm_inbox::AuthenticatedMachineBindingCache::default(),
@@ -14286,9 +14498,21 @@ impl AgentBuilder {
     }
 }
 
+/// Decode a journal record's retained certificate bytes, if readable
+/// (shared by the startup placement cross-check and
+/// [`Agent::agent_certificate_for`]'s fallback).
+fn decode_journal_cert(record: &profile::IssuedCertRecord) -> Option<identity::AgentCertificate> {
+    use base64::Engine as _;
+    let bytes = record
+        .cert_b64
+        .as_deref()
+        .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())?;
+    identity::AgentCertificate::from_storage_bytes(&bytes).ok()
+}
+
 /// Read + decode one ADR-0043 state file. Absence is "no state yet"
-/// (Ok-side default handled by the caller); corruption logs and errors so
-/// the caller can degrade to empty rather than fail the build.
+/// (Ok-side default handled by the caller); corruption errors so the
+/// caller can distinguish missing from corrupt state.
 async fn read_move_file<T, F>(
     dir: Option<&std::path::Path>,
     name: &str,
@@ -14330,6 +14554,32 @@ fn split_export_payload(payload: &[u8]) -> error::Result<(Vec<u8>, Vec<u8>)> {
         payload[8..secret_start].to_vec(),
         payload[secret_start..].to_vec(),
     ))
+}
+
+/// Whether the bundle's `MoveAuthorization` record is a legal chain
+/// extension of the local log (review r2 C1): a target-only daemon starts
+/// with no log for the agent — the authorization chains first, then the
+/// export receipt, then the import receipt. `None` when the log already
+/// contains the authorization — the caller skips straight to the
+/// receipts. A logless agent cannot chain (no mint) and the caller
+/// propagates that failure instead of storing the key.
+fn chainable_auth(
+    authorization: &key_move::ChainedRecord,
+    state: &key_move::MoveState,
+    auth: &key_move::MoveAuthorization,
+) -> Option<key_move::ChainedRecord> {
+    let agent = auth.agent_id;
+    let log = state.log(&agent);
+    if log.is_empty() {
+        return None;
+    }
+    let already_chained = log.iter().any(
+        |record| matches!(&record.record, key_move::MoveRecord::MoveAuthorization(a) if a == auth),
+    );
+    if already_chained {
+        return None;
+    }
+    Some(authorization.clone())
 }
 
 /// Handle for interacting with a collaborative task list.

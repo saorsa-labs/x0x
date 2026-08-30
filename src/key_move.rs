@@ -1150,6 +1150,19 @@ pub struct TransferBundle {
     pub envelope: Option<ExportEnvelope>,
 }
 
+/// What `move_import` produced (review r2 C1: the REST surface must hand
+/// the operator the receipt to carry to the owner when the target could
+/// not chain it itself).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ImportOutcome {
+    /// The machine-countersigned `ImportReceipt` variant (owner wraps it
+    /// in a `ChainedRecord` at the next owner contact).
+    pub receipt: MoveRecord,
+    /// `true` when this daemon held the owner key and chained the receipt
+    /// into its local participant log already.
+    pub receipt_chained: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Enforcement (§9)
 // ---------------------------------------------------------------------------
@@ -1317,16 +1330,31 @@ impl MoveState {
                 _ => None,
             })
             .unwrap_or(0);
-        if acceptance.move_epoch >= bundle_epoch && self.bundles.get(agent) != Some(chained) {
+        // Review r2 H8: an EQUAL-epoch bundle never replaces the stored
+        // one. Two distinct owner-signed bundles at one epoch is an owner
+        // fork; the stored digest wins and the challenger's tombstones
+        // have already unioned (safe in any order). Only a strictly
+        // greater epoch replaces — which is also the only case whose
+        // placement was accepted above.
+        if acceptance.move_epoch > bundle_epoch && self.bundles.get(agent) != Some(chained) {
             self.bundles.insert(*agent, chained.clone());
             changed = true;
+        } else if acceptance.move_epoch == bundle_epoch && self.bundles.get(agent) != Some(chained)
+        {
+            tracing::warn!(
+                agent = %hex::encode(agent.as_bytes()),
+                move_epoch = acceptance.move_epoch,
+                "equal-epoch activation bundle differs from the stored one — owner fork; keeping first-valid"
+            );
         }
         Ok(changed)
     }
 
     /// Cache an owner-verified placement record (mint or fetched via
     /// blob-v2). Mesh-rule epoch monotonicity: strictly older records are
-    /// ignored; equal-digest replays are no-ops.
+    /// ignored; equal-digest replays are no-ops; an equal-epoch record
+    /// with a different digest is a fork and NEVER replaces the cached
+    /// one (first-valid wins, review r2 H8).
     ///
     /// # Errors
     ///
@@ -1339,6 +1367,20 @@ impl MoveState {
         record.verify()?;
         match self.placements.get(&record.agent_id) {
             Some(current) if current.placement_epoch > record.placement_epoch => Ok(false),
+            // Review r2 H8: an equal-epoch record with a DIFFERENT digest
+            // is a fork/forgery — the cached one wins (first-valid), it is
+            // never silently overwritten.
+            Some(current)
+                if current.placement_epoch == record.placement_epoch
+                    && current.digest() != record.digest() =>
+            {
+                tracing::warn!(
+                    agent = %hex::encode(record.agent_id.as_bytes()),
+                    epoch = record.placement_epoch,
+                    "equal-epoch placement record differs from the cached one — keeping first-valid"
+                );
+                Ok(false)
+            }
             Some(current)
                 if current.placement_epoch == record.placement_epoch
                     && current.digest() == record.digest() =>
@@ -1513,12 +1555,21 @@ impl MoveState {
     }
 
     /// Decode `placement-blobs.bin`, re-verifying every record's owner
-    /// signature on load.
+    /// signature AND — review r2 H8 — proving the record's owner key IS
+    /// the issuer of a known certificate for that agent. A standalone
+    /// record only proves its own internal consistency; without the
+    /// issuer cross-check a swapped owner key (self-signed victim
+    /// placement) would survive a tampered-disk load. Records without a
+    /// matching certificate drop fail-closed: the owner re-mints, peers
+    /// re-derive from coherence-verified bundles.
     ///
     /// # Errors
     ///
     /// Returns [`IdentityError::Serialization`] on malformed input.
-    pub fn placements_from_bytes(bytes: &[u8]) -> Result<Self> {
+    pub fn placements_from_bytes(
+        bytes: &[u8],
+        certs: &HashMap<AgentId, AgentCertificate>,
+    ) -> Result<Self> {
         let mut state = Self::new();
         if bytes.is_empty() {
             return Ok(state);
@@ -1535,12 +1586,15 @@ impl MoveState {
                 IdentityError::Serialization(format!("placement-blobs.bin decode: {e}"))
             })?;
         for record in list {
-            if record.verify().is_ok() {
+            let issuer_ok = certs
+                .get(&record.agent_id)
+                .is_some_and(|cert| record.owner_matches_cert(cert));
+            if issuer_ok && record.verify().is_ok() {
                 let _ = state.cache_placement(record);
             } else {
                 tracing::warn!(
                     agent = %hex::encode(record.agent_id.as_bytes()),
-                    "placement-blobs.bin: dropping unverified placement on load"
+                    "placement-blobs.bin: dropping placement without a cert-issuer match on load"
                 );
             }
         }
@@ -1965,8 +2019,34 @@ mod tests {
             ),
         );
         let mut records2 = records.clone();
-        records2.push(auth2);
+        records2.push(auth2.clone());
         assert!(verify_chain(&records2, None).is_ok());
+
+        // Review r2 H7: after ONE committed activation, the CURRENT
+        // (second) move must remain abortable — the chain shape
+        // bundle → auth2 → abort2 is legal; only the CHAIN-level rule
+        // that an AbortRecord follows an unterminated authorization
+        // matters, not "any bundle exists in history".
+        let auth2_hash = match &auth2.record {
+            MoveRecord::MoveAuthorization(a) => a.auth_hash(),
+            _ => unreachable!(),
+        };
+        let abort2 = ChainedRecord::sign(
+            auth2.record_hash(),
+            MoveRecord::AbortRecord {
+                auth_hash: auth2_hash,
+                reason: "post-activation move rolled back".into(),
+            },
+            fx.owner_pk(),
+            fx.owner.secret_key(),
+        )
+        .unwrap();
+        records2.push(abort2);
+        assert!(verify_chain(&records2, None).is_ok());
+        // And the fold after that abort restores the SECOND move's source
+        // (the target machine), leaving epoch-1's committed state intact.
+        let folded = fold_records(&records2);
+        assert_eq!(folded.custodian, Some(fx.target_machine.machine_id()));
 
         // Wrong owner key pinned: the whole chain is rejected.
         let stranger_owner = UserKeypair::generate().unwrap();
@@ -1980,7 +2060,6 @@ mod tests {
         let expected = fx.owner.public_key();
         assert!(verify_chain(&[foreign], Some(expected)).is_err());
     }
-
     #[test]
     fn mesh_rule_epoch_monotonicity_and_order_independent_tombstones() {
         let fx = Fixture::new();
@@ -2006,7 +2085,7 @@ mod tests {
             machine: fx.target_machine.machine_id(),
             move_epoch: 2,
         }];
-        let bundle2 = fx.chain([0u8; 32], &fx.bundle(&auth2_inner, epoch2_only));
+        let bundle2 = fx.chain([0u8; 32], &fx.bundle(&auth2_inner, epoch2_only.clone()));
 
         // A peer fed epoch 2 FIRST: placement at 2, only epoch-2's
         // tombstone known — no head needed, no error.
@@ -2025,6 +2104,20 @@ mod tests {
         assert!(state.ingest_bundle(&agent, &bundle1, &mut revoked).unwrap());
         assert!(revoked.is_binding_revoked(&agent, &fx.source_machine.machine_id()));
         assert_eq!(state.placement(&agent).map(|p| p.placement_epoch), Some(2));
+
+        // Review r2 H8: an EQUAL-epoch bundle with different content is
+        // an owner fork — the stored digest wins, the challenger NEVER
+        // replaces it (tombstones still union safely).
+        let mut forked_auth = auth2_inner.clone();
+        forked_auth.issued_at = 99; // different bytes, same epoch
+        let fork_bundle = fx.chain([0u8; 32], &fx.bundle(&forked_auth, epoch2_only.clone()));
+        assert!(!state
+            .ingest_bundle(&agent, &fork_bundle, &mut revoked)
+            .unwrap());
+        assert_eq!(
+            state.bundle(&agent).map(ChainedRecord::record_hash),
+            Some(bundle2.record_hash())
+        );
     }
 
     #[test]
@@ -2242,7 +2335,10 @@ mod tests {
         let mut loaded = MoveState::logs_from_bytes(&logs_bytes).unwrap();
         let mut revoked2 = RevocationSet::new();
         let bundles_state = MoveState::bundles_from_bytes(&bundles_bytes, &mut revoked2).unwrap();
-        let placements_state = MoveState::placements_from_bytes(&placements_bytes).unwrap();
+        let mut load_certs = HashMap::new();
+        load_certs.insert(fx.agent.agent_id(), fx.cert.clone());
+        let placements_state =
+            MoveState::placements_from_bytes(&placements_bytes, &load_certs).unwrap();
         loaded.merge_loaded(bundles_state);
         loaded.merge_loaded(placements_state);
 
@@ -2254,7 +2350,7 @@ mod tests {
         // Torn/corrupt magic fails closed.
         assert!(MoveState::logs_from_bytes(b"garbage").is_err());
         assert!(MoveState::bundles_from_bytes(b"garbage", &mut RevocationSet::new()).is_err());
-        assert!(MoveState::placements_from_bytes(b"garbage").is_err());
+        assert!(MoveState::placements_from_bytes(b"garbage", &HashMap::new()).is_err());
     }
 
     #[test]

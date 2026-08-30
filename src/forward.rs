@@ -1601,6 +1601,20 @@ async fn try_outbound_v2(
             return OutboundOutcome::PeerRejectedV2(tcp);
         }
     };
+
+    // ADR-0043 AgentSigningGate (review r2 C2): the V2 attestation is an
+    // agent-key signature — a quiesced/quarantined machine produces none.
+    // Fail toward the V1 fallback exactly like a signing error would; the
+    // V1 path carries no agent signature (transport-machine context only,
+    // filtered receiver-side by B/P).
+    if !agent.signing_gate_allows(&agent.agent_id()).await {
+        tracing::info!(
+            target: "x0x::forward",
+            peer = %hex::encode(peer_agent.as_bytes()),
+            "outbound forward v2: signing gate refused (ADR-0043 custodian) — falling back to V1"
+        );
+        return OutboundOutcome::PeerRejectedV2(tcp);
+    }
     // Build + sign the V2 header with the local agent keypair. The header
     // carries the opener's public key so the verifier doesn't depend on
     // announce propagation (#204 soak fix).

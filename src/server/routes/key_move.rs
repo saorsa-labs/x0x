@@ -169,11 +169,17 @@ pub(in crate::server) async fn agent_move_import(
         );
     }
     match state.agent.move_import(bundle).await {
-        Ok(()) => (
+        Ok(outcome) => (
             StatusCode::OK,
             Json(serde_json::json!({
                 "ok": true,
                 "quarantined": true,
+                "receipt_chained": outcome.receipt_chained,
+                // Review r2 C1: when the target could not chain the
+                // receipt itself (no owner key), hand it to the operator —
+                // the owner wraps this variant in a ChainedRecord at the
+                // next owner contact before activating.
+                "receipt": outcome.receipt,
                 "note": "key stored; this machine may sign once the owner activates the move"
             })),
         ),
@@ -224,8 +230,8 @@ pub(in crate::server) async fn agent_move_activate(
     }
 }
 
-// ── POST /agent/move/abort ───────────────────────────────────────────────────
-
+/// POST /agent/move/abort — owner ROLLBACK: chain an `AbortRecord` from
+/// any pre-activation head; the epoch is burned (§5.1).
 /// Request body for `POST /agent/move/abort`.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct MoveAbortRequest {
@@ -235,8 +241,6 @@ pub(in crate::server) struct MoveAbortRequest {
     reason: Option<String>,
 }
 
-/// POST /agent/move/abort — owner ROLLBACK: chain an `AbortRecord` from
-/// any pre-activation head; the epoch is burned (§5.1).
 pub(in crate::server) async fn agent_move_abort(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -264,6 +268,9 @@ pub(in crate::server) async fn agent_move_abort(
             Json(serde_json::json!({
                 "ok": true,
                 "record_hash": hex::encode(record.record_hash()),
+                // Review r2 C1: a remote target's imported copy is the
+                // operator's to discard — run the same abort there.
+                "note": "epoch burned; if the move's target machine holds an imported key, run this abort there too (its local copy is discarded)"
             })),
         ),
         Err(e) => api_error(StatusCode::CONFLICT, format!("abort rejected: {e}")),
@@ -599,6 +606,68 @@ mod tests {
             "mint custodian (this machine) may sign"
         );
 
+        // Review r2 C1: the empty-log exception is scoped to the OWN
+        // agent. A foreign agent with no log NEVER passes the gate —
+        // possession without a local custodian fold is quarantine (an
+        // imported key on a target that could not chain its receipt must
+        // not sign).
+        let foreign = crate::identity::AgentId([0xAB; 32]);
+        assert!(
+            state
+                .agent
+                .signing_gate_allows(&state.agent.agent_id())
+                .await,
+            "own agent, empty-or-minted log: may sign pre-move"
+        );
+        assert!(
+            !state.agent.signing_gate_allows(&foreign).await,
+            "foreign agent with no log: never may sign"
+        );
+
+        // Review r2 H6: the binding form of /identity/revoke is an
+        // owner-key signing oracle — a read-only browser SESSION token
+        // (Owner { durable: false }) must get 403, and an unbounded
+        // epoch must be refused even for the durable owner.
+        {
+            let binding_body: super::super::identity::RevokeRequest =
+                serde_json::from_value(serde_json::json!({
+                    "agent_id": local_agent_hex,
+                    "machine_id": hex::encode([9u8; 32]),
+                    "move_epoch": u64::MAX,
+                }))
+                .expect("binding revoke body");
+            let session = axum::Extension(ActorContext::Owner { durable: false });
+            let (status, _body) = {
+                let response = super::super::identity::identity_revoke(
+                    State(Arc::clone(&state)),
+                    session,
+                    Json(binding_body.clone()),
+                )
+                .await
+                .into_response();
+                (response.status(), ())
+            };
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "session token must not drive the owner-key binding oracle"
+            );
+            // Durable owner + u64::MAX epoch: refused by the epoch bound.
+            let (status, _body) = {
+                let response = super::super::identity::identity_revoke(
+                    State(Arc::clone(&state)),
+                    owner_ext(),
+                    Json(binding_body),
+                )
+                .await
+                .into_response();
+                (response.status(), ())
+            };
+            assert!(
+                status == StatusCode::FORBIDDEN || status == StatusCode::CONFLICT,
+                "unbounded epoch must be refused (got {status})"
+            );
+        }
         // Ceremony refusals are typed, never half-built:
         let stranger = hex::encode([7u8; 32]);
         // 400: malformed placement.
