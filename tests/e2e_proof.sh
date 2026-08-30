@@ -27,7 +27,7 @@ x0x_export_legacy_token_vars
 #   [local]    Local loopback built-in proof (alice + bob)
 #   [cli]      CLI command coverage (e2e_cli.sh)
 #   [local-full] Comprehensive local (e2e_comprehensive.sh)
-#   [lan]      LAN nodes: studio1.local + studio2.local (e2e_lan.sh)
+#   [lan]      LAN nodes: studio1.local + LAN_PEER_HOST (e2e_lan.sh)
 #   [vps]      6 VPS bootstrap nodes (e2e_vps.sh)
 #   [live]     Local node joined to real VPS network (e2e_live_network.sh)
 #   [stress]   Rapid ops + edge cases (e2e_stress.sh)
@@ -932,13 +932,13 @@ $RUN_STRESS     && run_script_suite "stress"     "$(pwd)/tests/e2e_stress.sh"
 # LAN: only if nodes reachable
 if $RUN_LAN; then
     STUDIO1="${STUDIO1_HOST:-studio1.local}"
-    STUDIO2="${STUDIO2_HOST:-studio2.local}"
+    LAN_PEER="${LAN_PEER_HOST:?set LAN_PEER_HOST to the second LAN node (e.g. the MacBook) — studio2 was retired 2026-08-30}"
     S1_TARGET="${STUDIO1_SSH_TARGET:-studio1@$STUDIO1}"
-    S2_TARGET="${STUDIO2_SSH_TARGET:-studio2@$STUDIO2}"
+    S2_TARGET="${LAN_PEER_SSH_TARGET:-${LAN_PEER_USER:-$USER}@$LAN_PEER}"
     if ssh -o ConnectTimeout=5 -o BatchMode=yes -o StrictHostKeyChecking=no \
            "$S1_TARGET" echo ok &>/dev/null 2>&1; then
-        STUDIO1_HOST="$STUDIO1" STUDIO2_HOST="$STUDIO2" \
-        STUDIO1_SSH_TARGET="$S1_TARGET" STUDIO2_SSH_TARGET="$S2_TARGET" \
+        STUDIO1_HOST="$STUDIO1" LAN_PEER_HOST="$LAN_PEER" \
+        STUDIO1_SSH_TARGET="$S1_TARGET" LAN_PEER_SSH_TARGET="$S2_TARGET" \
         run_script_suite "lan" "$(pwd)/tests/e2e_lan.sh"
     else
         echo -e "
