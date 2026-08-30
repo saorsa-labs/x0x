@@ -94,9 +94,12 @@ pub struct DmCapabilities {
     /// (the v2 relay frame shape). Relay senders consult the candidate's
     /// advertised capability and emit the digest-bound v2 frame only to
     /// such peers, falling back to the byte-identical v1 frame otherwise
-    /// (see `peer_relay::peer_advertises_inner_digest`). Receivers may
-    /// reject digest-less headers from peers KNOWN to set this bit —
-    /// closing the downgrade path.
+    /// (see `peer_relay::peer_advertises_inner_digest`). On the receive
+    /// side this bit does NOT itself trigger rejection — receivers
+    /// reject a digest-less header only after observing a gate-passed v2
+    /// baseline from that same sender (observed-downgrade detection;
+    /// TTL-expiring, hard-capped baseline — see
+    /// `peer_relay::PeerRelay::disposition_for`).
     ///
     /// Wire: `false` is the pre-#437 value and is **omitted** from the
     /// serialization when false, so a false bit encodes byte-identically

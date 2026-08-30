@@ -1798,9 +1798,11 @@ mod tests {
         // Why (#437 transition): a pre-#437 sender emits no
         // `inner_digest` (v1 signing domain). Receivers keep today's
         // behavior for such headers — accepted, exactly as before —
-        // until a DmCapabilities-style advert confirms digest support
-        // and absence becomes rejectable (mirrors ADR-0021's
-        // attestation transition).
+        // until the OBSERVED-DOWNGRADE rule fires: a digest-less header
+        // is rejected only from a sender with a prior gate-passed v2
+        // baseline on this relay (TTL-expiring, hard-capped). Advert
+        // presence alone never rejects (mirrors ADR-0021's transition
+        // shape, keyed on observation rather than advertisement).
         let kp = AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
         let (pub_bytes, sec_bytes) = kp.to_bytes();
@@ -2060,69 +2062,96 @@ mod tests {
 
     #[test]
     fn v2_baseline_is_resource_bounded_and_gate_gated() {
-        // Why (#437 round 6): the downgrade baseline is attacker-facing
-        // state — it must be impossible to grow without limit, and
-        // un-gated peers must never populate it.
+        // Why (#437 round 6/7): the downgrade baseline is attacker-facing
+        // state — it must hit its EXACT cap (not merely stay under it),
+        // evict the OLDEST observation when over cap, expire entries on
+        // READ (not only during insert-prune), and never be populated by
+        // un-gated (non-contact OR blocked) senders.
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
-
-        // Cap: cap+64 distinct senders → map never exceeds the cap.
         let now = Instant::now();
+
+        // Cap + oldest-eviction: seed the oldest entry (older timestamp,
+        // still inside the TTL so insert-prune keeps it), fill to the
+        // cap, then overflow by one — the map lands EXACTLY at the cap
+        // and the OLDEST entry is the one evicted.
+        let oldest_id = [0xEE; 32];
+        let mid_id = [0xDD; 32];
+        let last_id = [0xCC; 32];
         {
             let mut seen = relay.v2_observed_senders.lock().expect("lock");
-            for i in 0..(MAX_V2_BASELINE_SENDERS + 64) as u64 {
+            let almost_ttl_old = now - V2_BASELINE_TTL + Duration::from_secs(60);
+            PeerRelay::insert_v2_observation(&mut seen, oldest_id, almost_ttl_old);
+            for i in 0..(MAX_V2_BASELINE_SENDERS - 2) as u64 {
                 let mut id = [0u8; 32];
                 id[24..].copy_from_slice(&i.to_be_bytes());
                 PeerRelay::insert_v2_observation(&mut seen, id, now);
             }
-            assert!(
-                seen.len() <= MAX_V2_BASELINE_SENDERS,
-                "baseline map must stay bounded at {MAX_V2_BASELINE_SENDERS}, got {}",
-                seen.len()
+            PeerRelay::insert_v2_observation(&mut seen, mid_id, now);
+            assert_eq!(
+                seen.len(),
+                MAX_V2_BASELINE_SENDERS,
+                "precondition: map filled to exactly the cap"
             );
+            // Over-cap insert evicts the OLDEST (oldest_id), not mid/last.
+            PeerRelay::insert_v2_observation(&mut seen, last_id, now);
+            assert_eq!(
+                seen.len(),
+                MAX_V2_BASELINE_SENDERS,
+                "map must land EXACTLY at the cap after an over-cap insert"
+            );
+            assert!(
+                !seen.contains_key(&oldest_id),
+                "the OLDEST observation is the one evicted"
+            );
+            assert!(seen.contains_key(&mid_id) && seen.contains_key(&last_id));
         }
 
-        // TTL: an observation older than V2_BASELINE_TTL is not a
-        // baseline (expired on read and on insert-prune).
+        // Expiry on READ: plant an expired entry directly, then prove
+        // the read both reports false AND removes it from the map
+        // (lazy expiry), not just insert-time pruning.
+        let expired_id = [0xAA; 32];
         {
             let mut seen = relay.v2_observed_senders.lock().expect("lock");
-            seen.clear();
-            let old = now - V2_BASELINE_TTL - Duration::from_secs(1);
-            PeerRelay::insert_v2_observation(&mut seen, [0xAA; 32], old);
-            // A fresh insert prunes the expired entry.
-            PeerRelay::insert_v2_observation(&mut seen, [0xBB; 32], now);
-            assert!(
-                !seen.contains_key(&[0xAA; 32]),
-                "expired entries are pruned"
-            );
+            let expired_at = now - V2_BASELINE_TTL - Duration::from_secs(1);
+            seen.insert(expired_id, expired_at);
         }
         assert!(
-            !relay.sender_emitted_v2(&[0xAA; 32]),
-            "expired observations are not baselines"
+            !relay.sender_emitted_v2(&expired_id),
+            "an expired observation must not read as a baseline"
+        );
+        assert!(
+            !relay
+                .v2_observed_senders
+                .lock()
+                .expect("lock")
+                .contains_key(&expired_id),
+            "the expired entry must be REMOVED by the read, not just ignored"
         );
 
-        // Gate gating: a v2 frame from a NON-CONTACT sender on a
-        // contact-gated relay is refused before recording — the map
-        // must stay empty.
+        // Un-gated senders never populate: non-contact (contact gate)...
         let gated = PeerRelay::with_policy(RelayPolicy::enabled());
         let kp = AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
         let (pub_bytes, sec_bytes) = kp.to_bytes();
         let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
-        let v2 = gated
-            .build_relayed_dm(
-                &aid(80),
-                &sender,
-                pub_bytes,
-                1_700_000_000_000,
-                dummy_inner(),
-                true,
-                |bytes| {
-                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
-                        .map(|s| s.as_bytes().to_vec())
-                        .map_err(|e| format!("{e:?}"))
-                },
-            )
-            .expect("build v2");
+        let build_v2 = |engine: &PeerRelay| {
+            engine
+                .build_relayed_dm(
+                    &aid(80),
+                    &sender,
+                    pub_bytes.clone(),
+                    1_700_000_000_000,
+                    dummy_inner(),
+                    true,
+                    |bytes| {
+                        ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                            .map(|s| s.as_bytes().to_vec())
+                            .map_err(|e| format!("{e:?}"))
+                    },
+                )
+                .expect("build v2")
+        };
+        let v2 = build_v2(&gated);
         assert_eq!(
             gated.disposition_for(&v2, &aid(81), 1_700_000_000_100, false, false),
             RelayDisposition::Refuse(RelayRefusal::NotAContact),
@@ -2130,7 +2159,24 @@ mod tests {
         );
         assert!(
             gated.v2_observed_senders.lock().expect("lock").is_empty(),
-            "an un-gated peer must never populate the baseline"
+            "a non-contact (un-gated) sender must never populate the baseline"
+        );
+
+        // ...and BLOCKED senders (blocklist wins before any recording).
+        let blocked_engine = PeerRelay::with_policy(RelayPolicy::enabled());
+        let v2b = build_v2(&blocked_engine);
+        assert_eq!(
+            blocked_engine.disposition_for(&v2b, &aid(82), 1_700_000_000_100, true, true),
+            RelayDisposition::Refuse(RelayRefusal::Blocked),
+            "a blocked sender's v2 frame is refused unconditionally"
+        );
+        assert!(
+            blocked_engine
+                .v2_observed_senders
+                .lock()
+                .expect("lock")
+                .is_empty(),
+            "a blocked (un-gated) sender must never populate the baseline"
         );
     }
 
