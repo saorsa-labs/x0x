@@ -35,6 +35,76 @@ Errors use:
 {"ok":false,"error":"description"}
 ```
 
+## Authentication and token classes
+
+Every endpoint except `GET /health` and `GET /constitution*` requires an
+`Authorization: Bearer <token>` header. Three token classes exist:
+
+| Class | Lifetime | Source | Can act as |
+|---|---|---|---|
+| **Durable API token** | until rotated | `<data_dir>/api-token` | the local owner (full control) |
+| **Session token** | 10 minutes | `POST /auth/session` (exchanged from the durable token) | browser/GUI surfaces |
+| **Rider token** | ≤ 90 days (default 7) | `POST /owner/riders` | a scoped sub-agent principal |
+
+Auth-class labels used throughout this reference:
+
+- **public** — no token (`/health`, `/constitution*` only).
+- **bearer** — any valid token class (the default for ordinary surfaces).
+- **durable-owner** — requires the durable API token; a session token or rider
+  token answers `403`. Applies to the rider-token registry and ledger
+  (`GET /owner/riders`, `/owner/placement`, `/owner/agents/:id/placement` —
+  `GET /owner/agents` is bearer), the `/agent/move*` ceremony, and the
+  ADR-0043 binding form of `/identity/revoke`.
+- **rider-allowed** — the three surfaces a rider token may reach (see the
+  harness-boundary section below).
+
+**Known limitation (#446, v0.41 pre-release):** several owner-act surfaces
+specified durable-only currently *accept* a session token — `/agent/sign`,
+`/exec/run|cancel`, `/shutdown`, `/sync/devices/enroll`, `DELETE /sync/devices/:id`,
+`POST /groups/:id/delegate`, `POST /home/rename`, and `POST /announce`. Until
+#446 lands, treat session tokens as being as sensitive as the durable token
+and use the durable token for owner actions.
+
+`GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept the
+token as a `?token=` query parameter (browser constraint). Query tokens are
+rejected everywhere else.
+
+## Changed in v0.41 (pre-release)
+
+The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added:
+
+- **Owner identity & naming (ADR-0036):** opt-in `user.key`; `GET/PUT /profile`;
+  `GET /owner/agents` roster; V3 announces carry a signed self-name
+  (`display_name`); `GET /agent/card?display_name=` is deprecated in favour of
+  the profile.
+- **Home (ADR-0038):** `GET /home`, `POST /home/rename`; an auto-provisioned
+  `Hidden + OwnerCertified + MlsEncrypted` space per owned install;
+  `GroupAdmission::OwnerCertified` admission is checked at invite-accept and at
+  every state seal.
+- **Sub-agent harness boundary (ADR-0039):** `POST /owner/agents/issue`
+  (ACP/rider modes), `DELETE /owner/agents/:id`, and the rider-token lifecycle
+  (`POST/GET /owner/riders`, `DELETE /owner/riders/:id`).
+- **Delegation & mentions (ADR-0040):** `POST /groups/:id/delegate`,
+  `GET /groups/:id/delegations`; `mentions` and `delegation_digest` fields on
+  `POST /groups/:id/send` and on the signed `GroupPublicMessage` wire object;
+  the WS `mention` event.
+- **Device sync (ADR-0041):** `GET /sync/devices`, `POST /sync/devices/enroll`,
+  `DELETE /sync/devices/:machine_id`; owner-to-owner SyncV1 streams.
+- **Placement & key-move (ADR-0043):** `GET /owner/placement`,
+`GET /owner/agents/:id/placement`, the `/agent/move*` ceremony endpoints
+  (**501 while `[key_move] ceremony_enabled = false`** — the default), and the
+  both-ids binding form of `POST /identity/revoke`.
+- **DM capabilities (issue #437):** `DmCapabilities.digest_support` advertises
+  relay-header digest verification; mixed-fleet behaviour is described with the
+  DM surfaces.
+- **New diagnostics:** `GET /diagnostics/relay`, `GET /diagnostics/history`,
+  `GET /diagnostics/ws`.
+
+Open issues for this release are listed in the README's *Known limitations*
+table (#446–#451). This reference documents **174 endpoints — exactly the set
+`x0x routes` prints** (`/.well-known/agent-card.json` is additionally served
+but is not part of the registry).
+
 ## System
 
 | Method | Endpoint | CLI | Purpose |
@@ -83,7 +153,7 @@ curl http://127.0.0.1:12700/status
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id`) |
+| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form, durable-owner only) |
 | GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
@@ -261,7 +331,211 @@ per-message envelope carries the certificate (~10 KB overhead) so
 verification is self-contained. `/agent/sign` stays owner-only. Rider
 Home encrypts record the sub-agent id as the history row's author.
 
+**Verified rider lifecycle** (run against a live daemon this campaign):
 
+```json
+// POST /owner/riders -> 200 (token secret returned exactly once)
+{"ok":true,"sub_agent_id":"df4eca…","token_id":1,"label":"…",
+ "groups":["home"],"issued_at_unix":1788091312,"expires_at_unix":1788092212,
+ "token":"bfc14e49…"}
+```
+
+- `GET /owner/riders` lists records with **no secrets** — `token_id`,
+  `sub_agent_id`, `cert_digest`, `groups`, `issued_at_unix`,
+  `expires_at_unix`, `revoked_at_unix`. Durable-owner only.
+- With the rider token: `GET /history?scope=group:home` → `200`;
+  `GET /owner/agents` → `403`; `POST /agent/sign` → `403`.
+- `DELETE /owner/riders/:id` → the very next rider request answers `401`
+  (persist-or-fail: a failed disk write returns `500` and the token stays
+  live everywhere).
+- `DELETE /owner/agents/:id` (sub-agent revocation) → ADR-0018
+  issuer-revocation; all rider tokens bound to the agent are revoked in the
+  same stroke. `404` when the agent is not on this owner's journal; `409`
+  when no retained certificate exists.
+- The delegation capability must not outlive
+  `min(cert expiry, token expiry)` — a longer `not_after` answers
+  `400` with the bound named.
+
+
+
+## Owner profile and naming (ADR-0036)
+
+| Method | Endpoint | CLI | Auth | Purpose |
+|---|---|---|---|---|
+| GET | `/profile` | `x0x profile` | bearer | Daemon-persisted self-profile names |
+| PUT | `/profile` | `x0x profile set --display-name … --machine-name … --human-name …` | bearer | Partial update of the self-profile |
+| GET | `/owner/agents` | `x0x owner agents` | bearer | Roster of agents certified by this owner (journal-backed) |
+
+The profile is daemon state (`<data_dir>/profile.json`), not client state:
+names survive GUI resets and are consistent across every client of the
+daemon.
+
+**GET /profile response** (all fields nullable):
+
+```json
+{"ok":true,"human_name":null,"display_name":"Alice","machine_name":"desk"}
+```
+
+**PUT /profile request** — every field optional; only present fields are
+applied (partial update):
+
+| Field | Type | Notes |
+|---|---|---|
+| `human_name` | string? | Owner's human name; feeds the agent card's `owner_name` |
+| `display_name` | string? | This agent's display name; rides the next V3 announce as the signed self-name |
+| `machine_name` | string? | Label for this machine |
+
+Clearing a name is done with an **empty string** (`""`); JSON `null` and
+omitted fields both mean "leave unchanged". A cleared display name keeps
+publishing explicit no-name X0A4 beats so peers erase it.
+
+**GET /owner/agents** answers `409` on an un-owned install. Each roster row:
+`agent_id` (hex), `cert_not_after` (unix seconds, null = no expiry), `label`
+(contact-store label), `self_name` (V3 announce name, when seen), `machine_id`
+(last announced machine, if discovered), `is_local` (bool), `from_journal`
+(bool — persisted issuance journal `owner-cert-journal.jsonl`, survives
+restarts), `mode` (`"acp"` \| `"rider"`), `journal_label`, `revoked` (bool),
+`placement` (nullable enrichment: `"pinned"`/`"roaming"` + epoch — null when
+no owner-verified placement record is held; P enforcement fails open for such
+agents).
+
+## Home (ADR-0038)
+
+| Method | Endpoint | CLI | Auth | Purpose |
+|---|---|---|---|---|
+| GET | `/home` | `x0x home` | bearer | Resolve the owner's Home space |
+| POST | `/home/rename` | `x0x home rename <NAME>` | bearer | Rename the Home (admin-gated, sealed into the state chain) |
+
+The first start of an owned install provisions exactly one Home:
+`Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`,
+named "Home". The daemon's own owner-certified agent is the founding member
+and **primary agent** — the owner speaks *through* an agent; there is no human
+wire signer. Admission is cryptographic: joining requires an agent certificate
+chaining to the owner's user key, re-checked at every state seal. An
+uncertified holder of a valid invite is refused (`403`).
+
+**GET /home response** (`404` with `no Home provisioned (un-owned install)` /
+`no Home provisioned` otherwise):
+
+```json
+{
+  "ok": true,
+  "group_id": "3277a3c3…",
+  "name": "Home",
+  "description": "Owner's personal space (auto-provisioned)",
+  "human_name": "Alice",
+  "primary_agent": {
+    "agent_id": "414529…",
+    "self_name": "Alice",
+    "verified": false
+  },
+  "members": [
+    {"agent_id":"414529…","role":"Admin","placement":"roaming","self_name":"Alice"}
+  ],
+  "warnings": {"no_roaming_agent": false, "primary_agent_unverified": true}
+}
+```
+
+- `placement` per member: `"roaming"` | `"pinned"` (from Home metadata).
+- `primary_agent.verified` is the fail-closed trust check that the primary's
+  certificate chains to the owner (a committed certificate must be present);
+  the GUI shows the owner chip only when true.
+- `warnings.no_roaming_agent` — ADR-0038 invariant: Home should always
+  contain ≥ 1 Roaming agent.
+
+**POST /home/rename** takes `{"name": "…"}`; it is a convenience wrapper over
+`PATCH /groups/:id` (admin-gated, sealed, persisted). Errors: `404` un-owned /
+no Home; `409` admin-gate failures.
+
+**Known limitation (#449):** Home dedup is per-machine — each of the owner's
+devices provisions its own Home (observed live: two daemons sharing one
+`user.key` minted two different `group_id`s). Cross-device reconciliation is
+ADR-0041 follow-up. **Known limitation (#447):** a certified second device
+becomes join-eligible only after its second announce beat (~600 s); a premature
+join is rejected (`MemberJoined: rejecting uncertified joiner`) and the joiner
+must locally delete + rejoin.
+
+## Device sync (ADR-0041, Tier 1)
+
+| Method | Endpoint | CLI | Auth | Purpose |
+|---|---|---|---|---|
+| GET | `/sync/devices` | `x0x sync devices` | bearer | Owner device set + last-sync status |
+| POST | `/sync/devices/enroll` | `x0x sync enroll` | bearer (see #446) | Owner-key-sign a DeviceEnrollment for a machine |
+| DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | bearer (see #446) | Remove a machine from the device set |
+
+All three answer `409` when no owner identity is configured. Sync replicates
+owner state **owner-to-owner only** — Tier 1: profile/names, Home roster,
+sub-agent registry (ADR-0041). Other groups' history, DMs, and exec data
+never replicate, and no third party receives the state. Inbound SyncV1 streams
+are refused at the enrollment gate unless the enrollment signature and
+currency (expiry) verify — corrupt, foreign-key, or stale enrollments never
+open the sync gate; non-enrolled machines are refused at stream accept.
+
+**GET /sync/devices response:**
+
+```json
+{
+  "ok": true,
+  "owner_user_id": "02492c…",
+  "this_machine_id": "e55130…",
+  "devices": [
+    {"machine_id":"e55130…","enrolled_at_ms":1788090728080,
+     "expires_at_ms":null,"last_session_ms":null,"last_session_ok":null,
+     "is_this_machine":true}
+  ]
+}
+```
+
+**POST /sync/devices/enroll** request — `machine_id` optional (64-hex;
+omitted = enroll THIS machine), `ttl_secs` optional (bounds the enrollment's
+lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
+`expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
+`500` — success is never reported on a swallowed write.
+
+**DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
+machine is refused; existing streams are not torn down mid-flight. `404` when
+the machine is not enrolled; `400` for a malformed id.
+
+## Placement and agent key-move (ADR-0043)
+
+| Method | Endpoint | CLI | Auth | Purpose |
+|---|---|---|---|---|
+| POST | `/agent/move` | `x0x move authorize` | durable-owner | Owner-authorize a move (chains `MoveAuthorization`; source seals when run there) |
+| POST | `/agent/move/export` | `x0x move export` | durable-owner | Source machine seals the export envelope + `ExportReceipt` |
+| POST | `/agent/move/import` | `x0x move import` | durable-owner | Target machine imports a transfer bundle (unwrap + store + receipt) |
+| POST | `/agent/move/activate` | `x0x move activate` | durable-owner | Owner commits a move (`ActivationBundle` on the activation topic) |
+| POST | `/agent/move/abort` | `x0x move abort` | durable-owner | Roll back a pre-activation move (epoch burned) |
+| POST | `/agent/move/retire` | `x0x move retire` | durable-owner | Source retires after activation (delete key + receipt) |
+| GET | `/agent/moves` | `x0x move list` | durable-owner | Move-log view + derived state (`?agent_id=` filters) |
+| GET | `/owner/placement` | `x0x owner placement` | durable-owner | Derived placement ledger (lazy mint + ≥1-Roaming Home invariant) |
+| GET | `/owner/agents/:id/placement` | `x0x owner agents placement <AGENT_ID>` | durable-owner | One agent's placement record |
+
+**The roaming-move ceremony is experimental and OFF by default** — every
+`/agent/move*` endpoint answers **501** with an explanatory body until the
+daemon config sets `[key_move] ceremony_enabled = true`. Shipped posture:
+every agent stays **Pinned**; placement *records* and their enforcement gates
+(identity ingest, DM inbox, forward, connect-send) are live.
+
+Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
+placement ledger. **Binding revocation** is the permanent tombstone form of
+`POST /identity/revoke`: send **both** `agent_id` and `machine_id` (32-byte
+hex each) **plus** `move_epoch` (u64, orders the tombstone against placement
+records). Durable-owner only — a session token answers `403`; a missing
+`move_epoch` answers `400`. The one-id forms remain the agent/machine
+self- or user-authority revocations.
+
+`GET /owner/placement` lazily mints epoch-0 records on first read and
+returns `owner_user_id`, `minted_now`, `roaming_count`, `home_invariant_ok`
+(≥ 1 Roaming agent), and `placements[]` (`agent_id`, `kind`
+`"roaming"|"pinned"`, `pinned_machine`, `epoch`, `issued_at`, `digest`).
+`GET /agent/moves` returns per-agent `records[]` (kind + hash) and a
+`derived` fold: `custodian`, `phase` (`idle|mid_move|retire_pending`),
+`retired_bindings`, `placement`, and this-machine flags `holds_key`,
+`may_sign`, `quiesced`, `quarantined`.
+
+Move-ceremony errors: `403` non-durable token; `409` no owner key / no mint /
+a move already in flight / activation-coherence refusal; `400` malformed ids
+or an illegal placement; `501` ceremony disabled.
 
 ## Network
 
@@ -271,7 +545,8 @@ Home encrypts record the sub-agent id as the history row's author.
 | GET | `/presence` | `x0x presence` | Presence view of online agents |
 | GET | `/presence/online` | `x0x presence online` | Online agents (network-view trust filter) |
 | GET | `/presence/foaf` | `x0x presence foaf` | Friends-of-friends discovery walk (`?ttl=<hops>`, default 3; social-view trust filter) |
-| GET | `/presence/status/:id` · `/presence/find/:id` | `x0x presence status/find` | One agent's presence status / lookup |
+| GET | `/presence/status/:id` | `x0x presence status <agent_id>` | One agent's presence status (local cache) |
+| GET | `/presence/find/:id` | `x0x presence find <agent_id>` | Find a specific agent by ID via FOAF random walk |
 | GET | `/presence/events` | `x0x presence events` | Server-Sent Events stream of presence online/offline events |
 | GET | `/network/status` | `x0x network status` | NAT and connectivity diagnostics |
 | GET | `/network/bootstrap-cache` | `x0x network cache` | Bootstrap cache stats |
@@ -511,6 +786,27 @@ deliberate (ADR 0030 §2: never a silent downgrade). Handle the 409 as a
 first-class UX state; where delivery matters more than the receipt, send
 `require_durable_app_ack: false`.
 
+### Recipient capabilities: `DmCapabilities`
+
+Peers advertise their DM capabilities in signed capability adverts and on
+agent cards (`dm_capabilities` member; a card predating the field means
+legacy raw-QUIC-only):
+
+| Field | Type | Meaning |
+|---|---|---|
+| `max_protocol_version` | u16 | Highest receive-path DM protocol the peer understands |
+| `gossip_inbox` | bool | `true` = the peer subscribes to its gossip inbox and published a KEM key |
+| `kem_algorithm` | string | `"ML-KEM-768"` |
+| `max_envelope_bytes` | usize | Maximum accepted envelope size |
+| `kem_public_key` | bytes | ML-KEM-768 public key (empty = unavailable, raw-QUIC fallback) |
+| `digest_support` | bool | **v0.41 / issue #437**: `true` advertises verify/enforce support for the signed `RelayHeader.inner_digest` (`x0x-relay-hdr-v2`). Omitted when `false`, preserving byte-identical pre-#437 adverts |
+
+Mixed-fleet behaviour (#448): a v0.40.x peer cannot verify a `digest_support:
+true` advert after re-serialization and drops it (self-healing once both sides
+upgrade); old→new *strict* durable DMs answer `409
+recipient_ack_semantics_unavailable` until the old side upgrades. Plan
+upgrades as a coordinated roll-forward.
+
 ### `/direct/events` SSE message shape
 
 Direct messages arrive flat — no `data` envelope:
@@ -600,6 +896,8 @@ helper API.
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
 | POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
+| POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit) |
+| GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
 | GET | `/groups/discover/nearby` | `x0x group discover-nearby` | **Phase C.2**: presence-social browse of PublicDirectory groups |
 | GET | `/groups/discover/subscriptions` | `x0x group discover-subscriptions` | **Phase C.2**: list active shard subscriptions |
@@ -689,6 +987,75 @@ Messages on shard topics are `DirectoryMessage::{Card, Digest, Pull}`:
 - `PublicDirectory` — published to tag + name + id shards.
 
 ### Phase E — public-group messaging
+
+**Send request — ADR-0040 fields.** `POST /groups/:id/send` accepts two
+optional attribution fields alongside `body` / `kind` / `thread_root` /
+`thread_parent`:
+
+| Field | Type | Validation | Meaning |
+|---|---|---|---|
+| `mentions` | array of string | each exactly 64 lowercase hex (an AgentId); structural check at ingest — malformed items fail decode and the message is dropped by receivers | Structured mentions. A receiver whose local AgentId is in the list gets a WS `mention` event. Mentions are never inferred from message text. |
+| `delegation_digest` | string? | exactly 64 lowercase hex (BLAKE3 of the authorizing delegation); owner-daemon-only on send | The message author acts under a `send_as` grant: the author signs with its OWN key and cites the grant by digest. Receivers require a locally durably-committed delegation authorizing that author before caching/routing — unauthorized attribution is dropped. |
+
+On the wire, both fields live inside the signed `GroupPublicMessage` (v3
+signature domain when populated; byte-identical to earlier domains when both
+are absent). A `kind: "delegation"` carrier must NOT also carry
+`delegation_digest`. The CLI `x0x group send` does not expose `--mentions`
+yet — use the REST surface.
+
+### Delegation (ADR-0040)
+
+`POST /groups/:id/delegate` issues a signed, bounded, expiring grant **inside
+a space**. The delegator (A) signs the `Delegation` with A's own ML-DSA-65
+key; the delegate (B) never holds A's secret. A later B message cites the
+grant via `delegation_digest`; authority is re-derived from durable group
+history on every use — a forged digest, expired grant, or depth>2 chain is
+rejected before the message is cached or routed. There is deliberately no
+owner-transfer verb on the wire (task-ownership transfer was descoped — see
+the ADR README erratum).
+
+Request body:
+
+| Field | Type | Required | Notes |
+|---|---|---|---|
+| `to_agent` | string | yes | 64-hex AgentId of an active group member |
+| `scope` | string | yes | `"task_execute"` or `"send_as"` |
+| `verbs` | array of string? | no | omitted = all verbs in scope; each of `claim`, `complete`, `send_public_message`; must belong to the scope; non-empty |
+| `expiry_ms` | u64 | yes | unix ms; must be strictly after issuance |
+| `task` | string? | task_execute only | 64-hex TaskId; rejected for `send_as` |
+| `parent` | string? | no | 64-hex parent delegation digest for depth-2 re-delegation; parent must be live, name the caller as delegate, and bound/attenuate the child |
+
+Success `200`:
+
+```json
+{
+  "ok": true,
+  "effective": true,
+  "effectiveness": "durable_group_history",
+  "delegation_digest": "589cac…",
+  "depth": 1,
+  "expiry_ms": 1788093176000,
+  "notification": "durable_ack",
+  "msg_id": "db3c02…"
+}
+```
+
+Effectiveness is exactly "the carrier message is durably committed in this
+group's history" — never "the notification was received". `notification`
+reports the best-effort DM handoff to the delegate (`"durable_ack"` or
+`"unreachable:<error>"`) and is informational only. The notification DM
+payload is the ASCII prefix `x0x-delegation:v1:` followed by the signed
+delegation JSON (arrays-of-bytes fields; no outer wrapper).
+
+`GET /groups/:id/delegations` lists effective delegations re-derived from
+durable history (survives restarts; fail-closed on incomplete history scans).
+Each row: `delegation_digest`, `from_agent`, `to_agent`, `scope`, `verbs`,
+`issued_at_ms`, `expiry_ms`, `depth`, `task_ref`.
+
+Verified behaviour (this campaign): delegate → B sends citing the digest →
+message accepted and attributed (author = B); the same send with a forged
+digest answers `400 send_as unauthorized: referenced delegation is not durably
+committed in this group's history`.
 
 For groups whose `confidentiality == SignedPublic` (the `public_open`
 and `public_announce` presets), messages are signed ML-DSA-65 artefacts
@@ -1090,6 +1457,22 @@ exactly this (saorsa-labs/x0x-symphony#10).
 {"reason":"rejected by user"}
 ```
 
+## Durable history (ADR-0023)
+
+Local, per-daemon history store for `dm:` / `group:` / `topic:` scopes.
+
+| Method | Endpoint | CLI | Purpose |
+|---|---|---|---|
+| GET | `/history` | `x0x history list <SCOPE> [--limit N]` | List durable history for one scope, keyset-paginated |
+| GET | `/history/message/:msg_id` | `x0x history message <MSG_ID>` | Point lookup of one row by exposed `msg_id` (`?scope=` for canonical group ids; 404 when absent, 400 malformed) |
+| GET | `/history/search` | `x0x history search <SCOPE> <QUERY>` | Full-text search over text payloads within a scope |
+| GET | `/history/stats` | `x0x history stats` | Row counts, database size, retention bounds |
+| DELETE | `/history` | `x0x history purge <SCOPE>` | Purge one scope from the local store (local-only) |
+
+Rider tokens may call `GET /history` for scopes they are granted, with the
+limit clamped to 100. Durable DM sends (`require_durable_app_ack: true`)
+commit here before the sender's `200` (ADR-0030).
+
 ## Remote exec
 
 Run a command on **another** agent's machine. Disabled by default; every request is authorized on the **responder** (target) daemon, not the caller. The target runs `argv` only if remote exec is enabled there, the sender is a verified `Accept`-trust contact, and the `(agent_id, machine_id)` pair + exact argv are allow-listed in its exec ACL (`docs/exec.md`). `argv` is never shell-interpreted. A denied request still returns `200` with a non-null `denial_reason` (e.g. `exec_disabled`, `unverified_sender`, `trust_rejected`, `agent_machine_not_in_acl`, `argv_not_allowed`, `cwd_not_allowed`, `shell_metachar_in_argv`) — the refusal is carried in the body, not the HTTP status.
@@ -1163,17 +1546,71 @@ Client → server:
 > should use `POST /direct/send`, not this frame. This surface will be
 > reclassified only if it grows the product fields.
 
-Server → client:
+Server → client (complete outbound frame set):
 
 ```json
 {"type":"connected","session_id":"uuid","agent_id":"hex64..."}
 {"type":"message","topic":"topic-a","payload":"aGVsbG8=","origin":"hex64..."}
-{"type":"direct_message","sender":"hex64...","machine_id":"hex64...","payload":"aGVsbG8=","received_at":1234567890}
+{"type":"direct_message","sender":"hex64...","machine_id":"hex64...","payload":"aGVsbG8=","received_at":1234567890,"verified":true,"trust_decision":"Accept"}
+{"type":"live","topic":"topic-a"}
 {"type":"subscribed","topics":["topic-a","topic-b"]}
 {"type":"unsubscribed","topics":["topic-a"]}
+{"type":"mention","topic":"…","group_id":"…","msg_id":"…","author_agent_id":"hex64...","reason":"mention","mentions":["hex64..."],"timestamp":1788091402064}
 {"type":"pong"}
 {"type":"error","message":"..."}
 ```
+
+### Outbound event reference
+
+| `type` | Fields | Emitted when |
+|---|---|---|
+| `connected` | `session_id`, `agent_id` | Session registered (`/ws` and `/ws/direct`) |
+| `message` | `topic`, `payload` (base64), `origin?` | Gossip arrives on a subscribed topic. Home/delegation group traffic arrives here as opaque base64 — decode `GroupPublicMessage` payloads yourself |
+| `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` replays history rows first) |
+| `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | Backfill ended, live frames begin (ADR-0023) |
+| `subscribed` / `unsubscribed` | `topics[]` | After the corresponding client command |
+| `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
+| `pong` | — | Reply to `ping`; also the 30 s keepalive |
+| `error` | `message` | Malformed command, invalid base64, publish/send failure |
+
+**Delivery semantics.** Topic/control/error frames are best-effort and may be
+dropped for a full per-session queue; DM/keepalive pressure closes the socket
+with close code `1013` instead of emitting another event.
+
+**What is deliberately *not* a WS/SSE event:** Home renames, member changes
+and rekeys (REST/state-commit operations — re-fetch `GET /home` or the group
+state), sync/device enrollment (REST-only), voice call signaling (DM payloads
+prefixed `x0x-voice-sig-v1\n`, ADR-0042), and rider provenance (a signed field
+*inside* group-message payloads). `mention` is the only Home-Suite-specific
+structured push.
+
+### SSE streams
+
+| Stream | `event:` name | `data:` shape |
+|---|---|---|
+| `GET /events` | `message` | outer `{"type":"message","data":{subscription_id, topic, payload, sender?, verified, trust_level?}}` — only for active REST `/subscribe` subscriptions |
+| `GET /events` | `file:offer` / `file:complete` | transfer notifications (`transfer_id`, `filename`, `size`, `sender` / `sha256`, `path`) |
+| `GET /presence/events` | `presence` | `{"event":"online","agent_id","reachable"}` / `{"event":"offline","agent_id"}` |
+| `GET /direct/events` | `direct_message` | flat DM row (`sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?`); `?backfill=N` first replays `history_direct_message` rows then emits `live` `{}`; 15 s keepalive is a `ping` comment |
+| `GET /peers/events` | `peer-lifecycle` | `{"peer_id","event","at_ms"}` — `event` is the Debug text of the transition (`Established`, `Replaced`, `Closing`, `Closed`, `ReaderExited`); treat as open string |
+
+## Voice (ADR-0042)
+
+Voice has **no REST endpoints** — it is not part of the endpoint registry and
+does not appear in `x0x routes`. Calls are built from existing planes:
+
+- **Signaling** rides direct messages: payloads prefixed `x0x-voice-sig-v1\n`
+  followed by the serialized `SignalingMessage`
+  (`CapabilityExchange → ConnectionConfirm → ConnectionReady`). They are
+  classified Ephemeral by the ADR-0023 taxonomy — control traffic, not
+  conversation history — and reach an API client only as ordinary
+  `direct_message` frames (opaque base64).
+- **Media** ride `WebRtcV1` (0x04) byte-streams: u32-BE records over a
+  negotiated unreliable datagram lane with reliable-stream fallback. Calls
+  inherit ordinary identity, trust, and ACL gates; mesh calls are capped at
+  four participants (SFU deferred).
+- **Surface today:** the `x0x::voice` library module. There is no CLI command
+  and no GUI call button yet.
 
 ### GUI
 
@@ -1236,6 +1673,8 @@ All diagnostics endpoints require the normal local daemon bearer token and retur
 | GET | `/diagnostics/exec` | `x0x diagnostics exec` | Remote exec counters, warnings, active sessions, and ACL summary |
 | GET | `/diagnostics/connect` | `x0x diagnostics connect` | Connect-ACL policy summary and stream allow/deny counters |
 | GET | `/diagnostics/ws` | `x0x diagnostics ws` | WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters |
+| GET | `/diagnostics/relay` | `x0x diagnostics relay` | ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence |
+| GET | `/diagnostics/history` | `x0x diagnostics history` | Durable-history writer/reaper counters (ADR-0023) |
 
 ### `GET /diagnostics/groups`
 
