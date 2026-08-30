@@ -3,7 +3,7 @@
 # x0x LAN End-to-End Test Suite v2
 # Tests mDNS discovery, UPnP/NAT status, direct messaging, presence, CRDT
 # kanban boards, swarm formation, CLI on LAN nodes, and GUI across
-# studio1.local and studio2.local Mac Studio nodes.
+# studio1.local and a second LAN node (LAN_PEER_HOST, e.g. the MacBook).
 #
 # PROOF POINTS: Every assertion either echoes actual API data or verifies a
 # round-trip with a unique PROOF_TOKEN — no hallucinated test results.
@@ -15,7 +15,7 @@
 #
 # Prerequisites:
 #   - cargo build --release (builds x0xd + x0x)
-#   - SSH access to studio1.local and studio2.local
+#   - SSH access to studio1.local and the LAN peer (LAN_PEER_HOST / LAN_PEER_SSH_TARGET)
 # =============================================================================
 # Do NOT use set -e globally — assertions capture individual failures.
 set -uo pipefail
@@ -34,12 +34,12 @@ CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
 # ── Node configuration ───────────────────────────────────────────────────
 STUDIO1="${STUDIO1_HOST:-studio1.local}"
-STUDIO2="${STUDIO2_HOST:-studio2.local}"
+LAN_PEER="${LAN_PEER_HOST:?set LAN_PEER_HOST to the second LAN node (e.g. the MacBook) — studio2 was retired 2026-08-30}"
 S1_TARGET="${STUDIO1_SSH_TARGET:-studio1@$STUDIO1}"
-S2_TARGET="${STUDIO2_SSH_TARGET:-studio2@$STUDIO2}"
+S2_TARGET="${LAN_PEER_SSH_TARGET:-${LAN_PEER_USER:-$USER}@$LAN_PEER}"
 S1_API_PORT=19501
 S2_API_PORT=19502
-S3_API_PORT=19503   # Third instance on studio2 for swarm/seedless test
+S3_API_PORT=19503   # Third instance on the LAN peer for swarm/seedless test
 S1_BIND_PORT=19601
 S2_BIND_PORT=19602
 S3_BIND_PORT=19603
@@ -52,7 +52,7 @@ SSH="ssh $SSH_OPTS"
 ssh_target_for_host() {
     case "$1" in
         "$STUDIO1") printf '%s\n' "$S1_TARGET" ;;
-        "$STUDIO2") printf '%s\n' "$S2_TARGET" ;;
+        "$LAN_PEER") printf '%s\n' "$S2_TARGET" ;;
         *) printf '%s\n' "$1" ;;
     esac
 }
@@ -241,7 +241,7 @@ s2_delete() {
          'http://127.0.0.1:$S2_API_PORT$path'" \
         2>/dev/null || echo '{"error":"curl_failed"}'
 }
-# Third instance (on studio2 machine, different port)
+# Third instance (on the LAN peer, different port)
 s3_curl() {
     $SSH "$S2_TARGET" \
         "curl -sf -m 15 -H 'Authorization: Bearer $S3_TK' 'http://127.0.0.1:$S3_API_PORT$1'" \
@@ -271,7 +271,7 @@ s1_raw_headers() {
 S1_TK=""; S2_TK=""; S3_TK=""
 cleanup() {
     echo -e "\n${YELLOW}Cleaning up...${NC}"
-    for host in "$STUDIO1" "$STUDIO2"; do
+    for host in "$STUDIO1" "$LAN_PEER"; do
         local target
         target=$(ssh_target_for_host "$host")
         $SSH "$target" \
@@ -284,7 +284,7 @@ trap cleanup EXIT
 # ════════════════════════════════════════════════════════════════════════════
 echo -e "${BOLD}${CYAN}╔══════════════════════════════════════════════════════════════════╗${NC}"
 echo -e "${BOLD}${CYAN}║  x0x LAN E2E Test Suite v2 — v${VERSION}${NC}"
-echo -e "${BOLD}${CYAN}║  Nodes: ${STUDIO1}, ${STUDIO2}${NC}"
+echo -e "${BOLD}${CYAN}║  Nodes: ${STUDIO1}, ${LAN_PEER}${NC}"
 echo -e "${BOLD}${CYAN}║  PROOF TOKEN: ${PROOF_TOKEN}${NC}"
 echo -e "${BOLD}${CYAN}╚══════════════════════════════════════════════════════════════════╝${NC}"
 echo ""
@@ -308,7 +308,7 @@ echo -e "  ${GREEN}OK${NC}   x0x:  $CLI_BINARY"
 
 # Check SSH access — skip entire suite if nodes unreachable
 NODES_OK=true
-for host in "$STUDIO1" "$STUDIO2"; do
+for host in "$STUDIO1" "$LAN_PEER"; do
     if $SSH "$(ssh_target_for_host "$host")" "echo ok" &>/dev/null; then
         TOTAL=$((TOTAL+1)); PASS=$((PASS+1))
         echo -e "  ${GREEN}PASS${NC} SSH to $host"
@@ -321,7 +321,7 @@ done
 if ! $NODES_OK; then
     echo ""
     echo -e "  ${YELLOW}⚠  LAN nodes not reachable — skipping LAN suite${NC}"
-    echo -e "  ${YELLOW}   Ensure studio1.local and studio2.local are online${NC}"
+    echo -e "  ${YELLOW}   Ensure studio1.local and $LAN_PEER are online${NC}"
     echo -e "  ${YELLOW}   and that SSH key auth is configured.${NC}"
     echo ""
     echo -e "${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
@@ -335,7 +335,7 @@ fi
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[1/18] Deploy x0xd + x0x CLI to LAN nodes${NC}"
 
-for host in "$STUDIO1" "$STUDIO2"; do
+for host in "$STUDIO1" "$LAN_PEER"; do
     $SSH "$(ssh_target_for_host "$host")" \
         "pkill -f 'x0xd.*e2e-lan' 2>/dev/null; rm -rf $DATA_DIR; mkdir -p $DATA_DIR/data1 $DATA_DIR/data2 $DATA_DIR/data3" \
         2>/dev/null || true
@@ -359,7 +359,7 @@ $DATA_DIR/x0xd --config $DATA_DIR/config1.toml --no-hard-coded-bootstrap &> $DAT
 echo \$! > $DATA_DIR/pid1"
 
 $SSH "$S2_TARGET" "cat > $DATA_DIR/config2.toml << 'TOML'
-instance_name = \"e2e-lan-studio2\"
+instance_name = \"e2e-lan-peer\"
 data_dir = \"$DATA_DIR/data2\"
 bind_address = \"0.0.0.0:$S2_BIND_PORT\"
 api_address = \"127.0.0.1:$S2_API_PORT\"
@@ -371,7 +371,7 @@ echo \$! > $DATA_DIR/pid2"
 
 # Wait for health (up to 30s)
 echo "  Waiting for daemons to start..."
-for host_port in "$STUDIO1:$S1_API_PORT" "$STUDIO2:$S2_API_PORT"; do
+for host_port in "$STUDIO1:$S1_API_PORT" "$LAN_PEER:$S2_API_PORT"; do
     host="${host_port%%:*}"; port="${host_port##*:}"
     for i in $(seq 1 30); do
         if $SSH "$(ssh_target_for_host "$host")" "curl -sf http://127.0.0.1:$port/health" &>/dev/null; then
@@ -401,7 +401,7 @@ echo -e "\n${CYAN}[2/18] Health & Identity (PROOF)${NC}"
 R=$(s1_curl /health); check_json "studio1 health" "$R" "ok"
 proof_field "version" "$R" "version"
 
-R=$(s2_curl /health); check_json "studio2 health" "$R" "ok"
+R=$(s2_curl /health); check_json "peer health" "$R" "ok"
 proof_field "version" "$R" "version"
 
 # Agent identity
@@ -411,7 +411,7 @@ S1_MID=$(jq_field "$R" "machine_id")
 proof_field "agent_id" "$R" "agent_id"
 proof_field "machine_id" "$R" "machine_id"
 
-R=$(s2_curl /agent); check_json "studio2 agent identity" "$R" "agent_id"
+R=$(s2_curl /agent); check_json "peer agent identity" "$R" "agent_id"
 S2_AID=$(jq_field "$R" "agent_id")
 S2_MID=$(jq_field "$R" "machine_id")
 proof_field "agent_id" "$R" "agent_id"
@@ -420,17 +420,17 @@ proof_field "machine_id" "$R" "machine_id"
 # Verify distinct identities
 TOTAL=$((TOTAL+1))
 if [ "$S1_AID" != "$S2_AID" ]; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 ≠ studio2 agent IDs [PROOF: ${S1_AID:0:16}... ≠ ${S2_AID:0:16}...]"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 ≠ peer agent IDs [PROOF: ${S1_AID:0:16}... ≠ ${S2_AID:0:16}...]"
 else
     FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} agent IDs are identical — key isolation broken"
 fi
 
 # Agent card
 R=$(s1_curl /agent/card); check_json "studio1 agent card" "$R" "link"
-R=$(s2_curl /agent/card); check_json "studio2 agent card" "$R" "link"
+R=$(s2_curl /agent/card); check_json "peer agent card" "$R" "link"
 
 echo "  studio1: ${S1_AID:0:16}..."
-echo "  studio2: ${S2_AID:0:16}..."
+echo "  peer: ${S2_AID:0:16}..."
 
 # ═════════════════════════════════════════════════════════════════════════
 # 3. NETWORK STATUS & NAT (tests UPnP-mapped external addrs)
@@ -456,13 +456,13 @@ TOTAL=$((TOTAL+1))
 echo -e "  ${GREEN}PASS${NC} studio1 network/external_addrs [PROOF: $EXT_ADDRS]"
 PASS=$((PASS+1))
 
-R=$(s2_curl /network/status); check_json "studio2 network status" "$R" "local_addr"
+R=$(s2_curl /network/status); check_json "peer network status" "$R" "local_addr"
 proof_field "nat_type" "$R" "nat_type"
 proof_field "external_addrs" "$R" "external_addrs"
 
 # Bootstrap cache
 R=$(s1_curl /network/bootstrap-cache); check_json "studio1 bootstrap cache" "$R" "ok"
-R=$(s2_curl /network/bootstrap-cache); check_json "studio2 bootstrap cache" "$R" "ok"
+R=$(s2_curl /network/bootstrap-cache); check_json "peer bootstrap cache" "$R" "ok"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 4. GUI ENDPOINT
@@ -518,16 +518,16 @@ R=$($SSH "$S1_TARGET" \
      $DATA_DIR/x0x --api http://127.0.0.1:$S1_API_PORT --json agents list 2>/dev/null" || echo '{}')
 check_json "studio1 CLI: x0x agents list" "$R" "agents"
 
-# CLI on studio2
+# CLI on peer
 R=$($SSH "$S2_TARGET" \
     "X0X_API_TOKEN=$S2_TK \
      $DATA_DIR/x0x --api http://127.0.0.1:$S2_API_PORT --json health 2>/dev/null" || echo '{}')
-check_json "studio2 CLI: x0x health" "$R" "ok"
+check_json "peer CLI: x0x health" "$R" "ok"
 
 R=$($SSH "$S2_TARGET" \
     "X0X_API_TOKEN=$S2_TK \
      $DATA_DIR/x0x --api http://127.0.0.1:$S2_API_PORT --json agent 2>/dev/null" || echo '{}')
-check_json "studio2 CLI: x0x agent" "$R" "agent_id"
+check_json "peer CLI: x0x agent" "$R" "agent_id"
 
 # x0x status (runtime status with uptime)
 R=$($SSH "$S1_TARGET" \
@@ -549,14 +549,14 @@ for i in $(seq 1 90); do
         R=$(s1_curl /agents/discovered)
         if echo "$R" | grep -q "$S2_AID"; then
             MDNS_FOUND_1TO2=true
-            echo -e "  ${GREEN}PASS${NC} studio1 discovered studio2 via mDNS (${i}s)"
+            echo -e "  ${GREEN}PASS${NC} studio1 discovered peer via mDNS (${i}s)"
         fi
     fi
     if ! $MDNS_FOUND_2TO1; then
         R=$(s2_curl /agents/discovered)
         if echo "$R" | grep -q "$S1_AID"; then
             MDNS_FOUND_2TO1=true
-            echo -e "  ${GREEN}PASS${NC} studio2 discovered studio1 via mDNS (${i}s)"
+            echo -e "  ${GREEN}PASS${NC} peer discovered studio1 via mDNS (${i}s)"
         fi
     fi
     $MDNS_FOUND_1TO2 && $MDNS_FOUND_2TO1 && break
@@ -567,14 +567,14 @@ TOTAL=$((TOTAL+1))
 if $MDNS_FOUND_1TO2; then
     PASS=$((PASS+1))
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 did not discover studio2 within 90s"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 did not discover peer within 90s"
 fi
 
 TOTAL=$((TOTAL+1))
 if $MDNS_FOUND_2TO1; then
     PASS=$((PASS+1))
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 did not discover studio1 within 90s"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer did not discover studio1 within 90s"
 fi
 
 # Verify discovered agent details
@@ -584,12 +584,12 @@ echo -e "  [PROOF: studio1 sees $DISC_COUNT discovered agents]"
 
 # Find specific agent
 R=$(s1_curl "/agents/discovered/$S2_AID")
-check_not_error "studio1 get discovered studio2" "$R"
+check_not_error "studio1 get discovered peer" "$R"
 proof_field "agent_id" "$R" "agent_id"
 
 # Reachability
 R=$(s1_curl "/agents/reachability/$S2_AID")
-check_not_error "studio1 reachability of studio2" "$R"
+check_not_error "studio1 reachability of peer" "$R"
 proof_field "can_receive_direct" "$R" "can_receive_direct"
 proof_field "likely_direct" "$R" "likely_direct"
 
@@ -603,33 +603,33 @@ S1_CARD=$(jq_field "$(s1_curl /agent/card)" "link")
 S2_CARD=$(jq_field "$(s2_curl /agent/card)" "link")
 
 # Import each other's cards
-R=$(s2_post /agent/card/import "{\"card\":\"$S1_CARD\"}"); check_ok "studio2 imports studio1 card" "$R"
-R=$(s1_post /agent/card/import "{\"card\":\"$S2_CARD\"}"); check_ok "studio1 imports studio2 card" "$R"
+R=$(s2_post /agent/card/import "{\"card\":\"$S1_CARD\"}"); check_ok "peer imports studio1 card" "$R"
+R=$(s1_post /agent/card/import "{\"card\":\"$S2_CARD\"}"); check_ok "studio1 imports peer card" "$R"
 
 # Connect
-R=$(s1_post /agents/connect "{\"agent_id\":\"$S2_AID\"}"); check_connect_outcome "studio1 connects to studio2" "$R"
+R=$(s1_post /agents/connect "{\"agent_id\":\"$S2_AID\"}"); check_connect_outcome "studio1 connects to peer" "$R"
 
 # Send unique PROOF message s1 → s2
 DM_PAYLOAD="${PROOF_TOKEN}-direct-s1-to-s2"
 DM_B64=$(b64 "$DM_PAYLOAD")
 R=$(s1_post /direct/send "{\"agent_id\":\"$S2_AID\",\"payload\":\"$DM_B64\"}")
-check_ok "studio1 direct send to studio2" "$R"
+check_ok "studio1 direct send to peer" "$R"
 echo -e "  [PROOF: sent payload='$DM_PAYLOAD' (base64: ${DM_B64:0:20}...)]"
 
 # Verify connections
 R=$(s1_curl /direct/connections); check_json "studio1 connections" "$R" "connections"
 TOTAL=$((TOTAL+1))
 if echo "$R" | grep -q "$S2_AID"; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 connected to studio2 [PROOF: agent_id=$S2_AID]"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 connected to peer [PROOF: agent_id=$S2_AID]"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 direct connections missing studio2: $(echo "$R" | head -c250)"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 direct connections missing peer: $(echo "$R" | head -c250)"
 fi
 
 # Reverse: s2 → s1
 DM_PAYLOAD2="${PROOF_TOKEN}-direct-s2-to-s1"
 DM_B64_2=$(b64 "$DM_PAYLOAD2")
 R=$(s2_post /direct/send "{\"agent_id\":\"$S1_AID\",\"payload\":\"$DM_B64_2\"}")
-check_ok "studio2 direct send to studio1" "$R"
+check_ok "peer direct send to studio1" "$R"
 echo -e "  [PROOF: sent payload='$DM_PAYLOAD2']"
 
 # CLI direct messaging on LAN node
@@ -647,9 +647,9 @@ PUBSUB_TOPIC="${PROOF_TOKEN}-pubsub"
 PUB_PAYLOAD="${PROOF_TOKEN}-pubsub-payload"
 PUB_B64=$(b64 "$PUB_PAYLOAD")
 
-# Subscribe studio2 to topic
+# Subscribe peer to topic
 R=$(s2_post /subscribe "{\"topic\":\"$PUBSUB_TOPIC\"}")
-check_ok "studio2 subscribe to $PUBSUB_TOPIC" "$R"
+check_ok "peer subscribe to $PUBSUB_TOPIC" "$R"
 SUB_ID=$(jq_field "$R" "subscription_id")
 echo -e "  [PROOF: subscription id=$SUB_ID]"
 
@@ -668,7 +668,7 @@ sleep 5
 
 # Unsubscribe
 if [ -n "$SUB_ID" ]; then
-    R=$(s2_delete "/subscribe/$SUB_ID"); check_ok "studio2 unsubscribe" "$R"
+    R=$(s2_delete "/subscribe/$SUB_ID"); check_ok "peer unsubscribe" "$R"
 fi
 
 # CLI pub/sub test
@@ -682,17 +682,17 @@ check_not_error "studio1 CLI: x0x publish" "$R"
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[9/18] Contacts & Trust${NC}"
 
-# Add studio2 as contact on studio1
+# Add peer as contact on studio1
 R=$(s1_post /contacts "{\"agent_id\":\"$S2_AID\",\"trust_level\":\"Known\"}")
-check_ok "studio1 adds studio2 as Known" "$R"
+check_ok "studio1 adds peer as Known" "$R"
 
 # Verify contact in list
 R=$(s1_curl /contacts); check_json "studio1 contacts list" "$R" "contacts"
-check_contains "studio1 contact list has studio2" "$R" "$S2_AID"
+check_contains "studio1 contact list has peer" "$R" "$S2_AID"
 
 # Escalate to Trusted
 R=$(s1_post /contacts/trust "{\"agent_id\":\"$S2_AID\",\"level\":\"trusted\"}")
-check_ok "studio1 trusts studio2" "$R"
+check_ok "studio1 trusts peer" "$R"
 
 # Trust evaluate: Trusted → Accept
 R=$(s1_post /trust/evaluate "{\"agent_id\":\"$S2_AID\",\"machine_id\":\"$S2_MID\"}")
@@ -723,13 +723,13 @@ check_ok "studio1 creates MLS group" "$R"
 MLS_ID=$(jq_field "$R" "group_id")
 echo -e "  [PROOF: MLS group id=$MLS_ID name=$MLS_NAME]"
 
-# Add studio2 to group
+# Add peer to group
 R=$(s1_post "/mls/groups/$MLS_ID/members" "{\"agent_id\":\"$S2_AID\"}")
-check_ok "studio1 adds studio2 to MLS group" "$R"
+check_ok "studio1 adds peer to MLS group" "$R"
 MLS_EPOCH=$(jq_field "$R" "epoch")
 echo -e "  [PROOF: MLS epoch after add=$MLS_EPOCH]"
 
-# Create welcome for studio2
+# Create welcome for peer
 R=$(s1_post "/mls/groups/$MLS_ID/welcome" "{\"agent_id\":\"$S2_AID\"}")
 check_ok "studio1 creates MLS welcome" "$R"
 
@@ -776,9 +776,9 @@ else
     FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} invite link format wrong: '$INVITE_LINK'"
 fi
 
-# studio2 joins via invite — field is "invite" not "invite_link"
-R=$(s2_post /groups/join "{\"invite\":\"$INVITE_LINK\",\"display_name\":\"studio2-space-member\"}")
-check_ok "studio2 joins named group" "$R"
+# peer joins via invite — field is "invite" not "invite_link"
+R=$(s2_post /groups/join "{\"invite\":\"$INVITE_LINK\",\"display_name\":\"peer-space-member\"}")
+check_ok "peer joins named group" "$R"
 
 # Set display name
 R=$(s1_put "/groups/$GRP_ID/display-name" "{\"name\":\"LAN Test Space\"}")
@@ -786,26 +786,26 @@ check_ok "studio1 sets group display name" "$R"
 
 # Group info / members on joiner proves contact added to space
 R=$(s2_curl "/groups/$GRP_ID")
-check_json "studio2 group info" "$R" "members"
-check_contains "studio2 space member list includes self" "$R" "$S2_AID"
-check_contains "studio2 space display name persisted" "$R" "studio2-space-member"
+check_json "peer group info" "$R" "members"
+check_contains "peer space member list includes self" "$R" "$S2_AID"
+check_contains "peer space display name persisted" "$R" "peer-space-member"
 
 # Direct named-space membership API on creator
-R=$(s1_post "/groups/$GRP_ID/members" "{\"agent_id\":\"$S2_AID\",\"display_name\":\"studio2-space-member\"}")
-check_json "studio1 adds studio2 to named-space roster" "$R" "member_count"
+R=$(s1_post "/groups/$GRP_ID/members" "{\"agent_id\":\"$S2_AID\",\"display_name\":\"peer-space-member\"}")
+check_json "studio1 adds peer to named-space roster" "$R" "member_count"
 R=$(s1_curl "/groups/$GRP_ID/members")
 check_json "studio1 named-space members" "$R" "members"
-check_contains "studio1 named-space members include studio2" "$R" "$S2_AID"
-check_contains "studio1 named-space display name includes studio2-space-member" "$R" "studio2-space-member"
+check_contains "studio1 named-space members include peer" "$R" "$S2_AID"
+check_contains "studio1 named-space display name includes peer-space-member" "$R" "peer-space-member"
 R=$(s1_delete "/groups/$GRP_ID/members/$S2_AID")
-check_json "studio1 removes studio2 from named-space roster" "$R" "member_count"
+check_json "studio1 removes peer from named-space roster" "$R" "member_count"
 R=$(s1_curl "/groups/$GRP_ID/members")
 check_json "studio1 named-space members after remove" "$R" "members"
 TOTAL=$((TOTAL+1))
 if echo "$R" | grep -q "$S2_AID"; then
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 named-space roster cleared studio2"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 named-space roster cleared peer"
 else
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 named-space roster cleared studio2"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 named-space roster cleared peer"
 fi
 for _ in $(seq 1 20); do
     R=$(s2_curl "/groups/$GRP_ID")
@@ -816,19 +816,19 @@ for _ in $(seq 1 20); do
 done
 TOTAL=$((TOTAL+1))
 if echo "$R" | grep -q 'group not found\|curl_failed'; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 authoritative removal propagated"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer authoritative removal propagated"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 authoritative removal propagated — $(echo "$R" | head -c200)"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer authoritative removal propagated — $(echo "$R" | head -c200)"
 fi
 
 # List groups on both nodes
 R=$(s1_curl /groups); check_json "studio1 list groups" "$R" "groups"
-R=$(s2_curl /groups); check_json "studio2 list groups" "$R" "groups"
+R=$(s2_curl /groups); check_json "peer list groups" "$R" "groups"
 TOTAL=$((TOTAL+1))
 if echo "$R" | grep -q "$GRP_ID"; then
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 space removed from group list after authoritative remove"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer space removed from group list after authoritative remove"
 else
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 space removed from group list after authoritative remove"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer space removed from group list after authoritative remove"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -846,9 +846,9 @@ check_ok "studio1 creates KV store" "$R"
 KV_STORE_ID=$(jq_field "$R" "id")
 echo -e "  [PROOF: store id=$KV_STORE_ID topic=$KV_TOPIC]"
 
-# Join the same KV store on studio2 BEFORE writes so it sees subsequent CRDT deltas.
+# Join the same KV store on peer BEFORE writes so it sees subsequent CRDT deltas.
 R=$(s2_post "/stores/$KV_STORE_ID/join" '{}')
-check_ok "studio2 joins KV store by topic" "$R"
+check_ok "peer joins KV store by topic" "$R"
 
 # Write a PROOF key
 R=$(s1_put "/stores/$KV_STORE_ID/proof-key" "{\"value\":\"$KV_B64\",\"content_type\":\"text/plain\"}")
@@ -885,12 +885,12 @@ R=$(s1_delete "/stores/$KV_STORE_ID/key-1"); check_ok "studio1 KV delete key-1" 
 echo "  Waiting 15s for KV store CRDT sync..."
 sleep 15
 
-# studio2 should see proof-key written by studio1
+# peer should see proof-key written by studio1
 R=$(s2_curl "/stores/$KV_STORE_ID/proof-key")
-check_json "studio2 sees KV proof-key (CRDT sync)" "$R" "value"
+check_json "peer sees KV proof-key (CRDT sync)" "$R" "value"
 S2_GOT_B64=$(jq_field "$R" "value")
 S2_GOT_VALUE=$(b64d "$S2_GOT_B64")
-check_proof_roundtrip "KV CRDT sync studio1→studio2" "$KV_VALUE" "$S2_GOT_VALUE"
+check_proof_roundtrip "KV CRDT sync studio1→peer" "$KV_VALUE" "$S2_GOT_VALUE"
 
 # CLI KV test
 R=$($SSH "$S1_TARGET" \
@@ -912,9 +912,9 @@ check_ok "studio1 creates kanban (task list)" "$R"
 TL1_ID=$(jq_field "$R" "id")
 echo -e "  [PROOF: task-list id=$TL1_ID topic=$KANBAN_TOPIC]"
 
-# studio2 joins same kanban board (same topic) BEFORE tasks are added so it receives subsequent CRDT updates
+# peer joins same kanban board (same topic) BEFORE tasks are added so it receives subsequent CRDT updates
 R=$(s2_post /task-lists "{\"name\":\"LAN Kanban\",\"topic\":\"$KANBAN_TOPIC\"}")
-check_ok "studio2 joins kanban (same topic)" "$R"
+check_ok "peer joins kanban (same topic)" "$R"
 TL2_ID=$(jq_field "$R" "id")
 
 # Add tasks
@@ -930,20 +930,20 @@ TASK_ID2=$(jq_field "$R" "task_id")
 echo "  Waiting 20s for CRDT kanban sync across LAN..."
 sleep 20
 
-# studio2 should see tasks added by studio1
-R=$(s2_curl "/task-lists/$TL2_ID/tasks"); check_json "studio2 sees kanban tasks (CRDT)" "$R" "tasks"
+# peer should see tasks added by studio1
+R=$(s2_curl "/task-lists/$TL2_ID/tasks"); check_json "peer sees kanban tasks (CRDT)" "$R" "tasks"
 S2_TASK_COUNT=$(jq_list_len "$R" "tasks")
 TOTAL=$((TOTAL+1))
 if [ "$S2_TASK_COUNT" -ge 2 ] 2>/dev/null; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 kanban has $S2_TASK_COUNT tasks [PROOF: CRDT sync worked]"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer kanban has $S2_TASK_COUNT tasks [PROOF: CRDT sync worked]"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 expected ≥2 kanban tasks, got $S2_TASK_COUNT"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer expected ≥2 kanban tasks, got $S2_TASK_COUNT"
 fi
 
-# studio2 claims the first task
+# peer claims the first task
 R=$(s2_patch "/task-lists/$TL2_ID/tasks/$TASK_ID" '{"action":"claim"}')
-check_ok "studio2 claims task (kanban: ToDo→In Progress)" "$R"
-echo -e "  [PROOF: studio2 claimed task $TASK_ID]"
+check_ok "peer claims task (kanban: ToDo→In Progress)" "$R"
+echo -e "  [PROOF: peer claimed task $TASK_ID]"
 
 sleep 10
 
@@ -951,10 +951,10 @@ sleep 10
 R=$(s1_curl "/task-lists/$TL1_ID/tasks")
 check_json "studio1 sees updated task (claimed)" "$R" "tasks"
 
-# studio2 completes the task
+# peer completes the task
 R=$(s2_patch "/task-lists/$TL2_ID/tasks/$TASK_ID" '{"action":"complete"}')
-check_ok "studio2 completes task (kanban: In Progress→Done)" "$R"
-echo -e "  [PROOF: studio2 completed task $TASK_ID]"
+check_ok "peer completes task (kanban: In Progress→Done)" "$R"
+echo -e "  [PROOF: peer completed task $TASK_ID]"
 
 sleep 10
 
@@ -998,23 +998,23 @@ R=$(s1_curl /presence/online); check_json "studio1 presence online" "$R" "agents
 PRESENCE_COUNT=$(jq_list_len "$R" "agents")
 echo -e "  [PROOF: studio1 sees $PRESENCE_COUNT online agents]"
 
-# studio2 should be in presence
+# peer should be in presence
 TOTAL=$((TOTAL+1))
 if echo "$R" | grep -q "$S2_AID"; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 in studio1 presence [PROOF: $S2_AID found]"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer in studio1 presence [PROOF: $S2_AID found]"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 not in studio1 presence"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer not in studio1 presence"
 fi
 
 # Presence FOAF
 R=$(s1_curl /presence/foaf); check_json "studio1 presence FOAF" "$R" "agents"
 
 # Presence find
-R=$(s1_curl "/presence/find/$S2_AID"); check_not_error "studio1 presence find studio2" "$R"
+R=$(s1_curl "/presence/find/$S2_AID"); check_not_error "studio1 presence find peer" "$R"
 proof_field "agent_id" "$R" "agent_id"
 
 # Presence status
-R=$(s1_curl "/presence/status/$S2_AID"); check_not_error "studio1 presence status studio2" "$R"
+R=$(s1_curl "/presence/status/$S2_AID"); check_not_error "studio1 presence status peer" "$R"
 proof_field "status" "$R" "status"
 
 # CLI: presence online
@@ -1027,7 +1027,7 @@ check_json "studio1 CLI: presence online" "$R" "agents"
 R=$($SSH "$S1_TARGET" \
     "X0X_API_TOKEN=$S1_TK \
      $DATA_DIR/x0x --api http://127.0.0.1:$S1_API_PORT --json presence find $S2_AID 2>/dev/null" || echo '{}')
-check_not_error "studio1 CLI: presence find studio2" "$R"
+check_not_error "studio1 CLI: presence find peer" "$R"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 15. AGENT FIND — 100% COVERAGE
@@ -1036,13 +1036,13 @@ echo -e "\n${CYAN}[15/18] Agent Find (all paths)${NC}"
 
 # Announce first so peers know the agents
 R=$(s1_post /announce "{}"); check_ok "studio1 announce" "$R"
-R=$(s2_post /announce "{}"); check_ok "studio2 announce" "$R"
+R=$(s2_post /announce "{}"); check_ok "peer announce" "$R"
 
 sleep 5
 
 # REST: find agent by ID
 R=$(s1_post "/agents/find/$S2_AID" '{}')
-check_not_error "studio1 find studio2 by ID" "$R"
+check_not_error "studio1 find peer by ID" "$R"
 proof_field "found" "$R" "found"
 proof_field "addresses" "$R" "addresses"
 
@@ -1103,14 +1103,14 @@ for _ in $(seq 1 30); do
 done
 TOTAL=$((TOTAL+1))
 if [ -n "$SEEN_TRANSFER" ]; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 sees incoming transfer"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer sees incoming transfer"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 sees incoming transfer"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer sees incoming transfer"
 fi
 
 # Accept and verify completion + bytes on receiver
 R=$(s2_post "/files/accept/$TRANSFER_ID" '{}')
-check_ok "studio2 accepts file transfer" "$R"
+check_ok "peer accepts file transfer" "$R"
 S1_STATUS=""; S2_STATUS=""
 for _ in $(seq 1 40); do
     S1R=$(s1_curl "/files/transfers/$TRANSFER_ID")
@@ -1128,24 +1128,24 @@ else
 fi
 TOTAL=$((TOTAL+1))
 if [ "$S2_STATUS" = "Complete" ]; then
-    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio2 receiver transfer reaches Complete"
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} peer receiver transfer reaches Complete"
 else
-    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2 receiver transfer reaches Complete"
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer receiver transfer reaches Complete"
 fi
 OUT_PATH=$(echo "$S2R" | python3 -c "import sys,json;print(json.load(sys.stdin).get('transfer',{}).get('output_path',''))" 2>/dev/null || echo "")
 RECV_SHA=$($SSH "$S2_TARGET" "shasum -a 256 '$OUT_PATH' | cut -d' ' -f1" 2>/dev/null || echo "")
 RECV_BODY=$($SSH "$S2_TARGET" "cat '$OUT_PATH' 2>/dev/null || true")
-check_eq "studio2 received file sha256 matches" "$RECV_SHA" "$FILE_SHA256"
-check_contains "studio2 received file body contains proof token" "$RECV_BODY" "$PROOF_TOKEN"
+check_eq "peer received file sha256 matches" "$RECV_SHA" "$FILE_SHA256"
+check_contains "peer received file body contains proof token" "$RECV_BODY" "$PROOF_TOKEN"
 
 # ═════════════════════════════════════════════════════════════════════════
 # 17. SEEDLESS BOOTSTRAP VIA mDNS + GOSSIP
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[17/18] Seedless Bootstrap (3rd agent via mDNS)${NC}"
 
-# Start a third instance on studio2, different port, ZERO bootstrap peers
+# Start a third instance on peer, different port, ZERO bootstrap peers
 $SSH "$S2_TARGET" "mkdir -p $DATA_DIR/data3 && cat > $DATA_DIR/config3.toml << 'TOML'
-instance_name = \"e2e-lan-studio2b\"
+instance_name = \"e2e-lan-peerb\"
 data_dir = \"$DATA_DIR/data3\"
 bind_address = \"0.0.0.0:$S3_BIND_PORT\"
 api_address = \"127.0.0.1:$S3_API_PORT\"
@@ -1158,7 +1158,7 @@ echo \$! > $DATA_DIR/pid3"
 # Wait for health
 for i in $(seq 1 30); do
     if $SSH "$S2_TARGET" "curl -sf http://127.0.0.1:$S3_API_PORT/health" &>/dev/null; then
-        echo -e "  ${GREEN}OK${NC}   Third instance (studio2-b) started (${i}s)"
+        echo -e "  ${GREEN}OK${NC}   Third instance (peer-b) started (${i}s)"
         break
     fi
     [ "$i" = "30" ] && { echo -e "  ${RED}SKIP${NC} Third instance failed to start — skip seedless test"; break; }
@@ -1168,20 +1168,20 @@ done
 S3_TK=$($SSH "$S2_TARGET" "cat $DATA_DIR/data3/api-token 2>/dev/null" || echo "")
 
 if [ -n "$S3_TK" ]; then
-    R=$(s3_curl /health); check_json "studio2-b health" "$R" "ok"
+    R=$(s3_curl /health); check_json "peer-b health" "$R" "ok"
 
     # Get identity
     R=$(s3_curl /agent); S3_AID=$(jq_field "$R" "agent_id")
-    echo -e "  [PROOF: studio2-b agent_id=${S3_AID:0:16}...]"
+    echo -e "  [PROOF: peer-b agent_id=${S3_AID:0:16}...]"
 
     # Wait for mDNS to discover existing agents
-    echo "  Waiting 60s for seedless studio2-b to join via mDNS..."
+    echo "  Waiting 60s for seedless peer-b to join via mDNS..."
     S3_FOUND=false
     for i in $(seq 1 60); do
         R=$(s3_curl /agents/discovered)
         if echo "$R" | grep -q "$S1_AID"; then
             S3_FOUND=true
-            echo -e "  ${GREEN}PASS${NC} studio2-b discovered studio1 via mDNS/gossip (${i}s) [PROOF: seedless join works]"
+            echo -e "  ${GREEN}PASS${NC} peer-b discovered studio1 via mDNS/gossip (${i}s) [PROOF: seedless join works]"
             break
         fi
         sleep 1
@@ -1191,10 +1191,10 @@ if [ -n "$S3_TK" ]; then
     if $S3_FOUND; then
         PASS=$((PASS+1))
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio2-b did not discover studio1 within 60s"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} peer-b did not discover studio1 within 60s"
     fi
 else
-    skip_test "seedless bootstrap test" "studio2-b token unavailable"
+    skip_test "seedless bootstrap test" "peer-b token unavailable"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1204,39 +1204,39 @@ echo -e "\n${CYAN}[18/18] Swarm (3-Agent Mesh)${NC}"
 
 if [ -n "$S3_TK" ] && [ -n "$S3_AID" ]; then
     # All 3 agents should see each other
-    echo "  Testing full mesh: studio1 ↔ studio2 ↔ studio2-b"
+    echo "  Testing full mesh: studio1 ↔ peer ↔ peer-b"
 
-    # studio1 should see studio2
+    # studio1 should see peer
     R=$(s1_curl /agents/discovered)
     TOTAL=$((TOTAL+1))
     if echo "$R" | grep -q "$S2_AID"; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: studio1 sees studio2"
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: studio1 sees peer"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: studio1 missing studio2"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: studio1 missing peer"
     fi
 
-    # studio2 should see studio1
+    # peer should see studio1
     R=$(s2_curl /agents/discovered)
     TOTAL=$((TOTAL+1))
     if echo "$R" | grep -q "$S1_AID"; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: studio2 sees studio1"
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: peer sees studio1"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: studio2 missing studio1"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: peer missing studio1"
     fi
 
-    # studio2-b should see studio1 (cross-machine through gossip)
+    # peer-b should see studio1 (cross-machine through gossip)
     R=$(s3_curl /agents/discovered)
     TOTAL=$((TOTAL+1))
     if echo "$R" | grep -q "$S1_AID"; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: studio2-b sees studio1 [PROOF: cross-machine gossip works]"
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} swarm: peer-b sees studio1 [PROOF: cross-machine gossip works]"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: studio2-b missing studio1"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} swarm: peer-b missing studio1"
     fi
 
     # Peer counts — each should have ≥1 connected peer
     R=$(s1_curl /peers); PEERS_1=$(jq_list_len "$R" "peers")
     R=$(s2_curl /peers); PEERS_2=$(jq_list_len "$R" "peers")
-    echo -e "  [PROOF: studio1 peers=$PEERS_1, studio2 peers=$PEERS_2]"
+    echo -e "  [PROOF: studio1 peers=$PEERS_1, peer peers=$PEERS_2]"
 
     TOTAL=$((TOTAL+1))
     if [ "$PEERS_1" -ge 1 ] 2>/dev/null; then
@@ -1258,9 +1258,9 @@ if [ -n "$S3_TK" ] && [ -n "$S3_AID" ]; then
     check_ok "swarm broadcast from studio1" "$R"
     echo -e "  [PROOF: broadcast '$SWARM_MSG' to $SWARM_TOPIC]"
 else
-    skip_test "swarm mesh tests" "studio2-b instance not available"
-    skip_test "swarm peer counts" "studio2-b instance not available"
-    skip_test "swarm pub/sub" "studio2-b instance not available"
+    skip_test "swarm mesh tests" "peer-b instance not available"
+    skip_test "swarm peer counts" "peer-b instance not available"
+    skip_test "swarm pub/sub" "peer-b instance not available"
 fi
 
 # ═════════════════════════════════════════════════════════════════════════
@@ -1281,15 +1281,15 @@ else
     echo "  Collecting logs..."
     echo "--- studio1 log tail ---"
     $SSH "$S1_TARGET" "tail -30 $DATA_DIR/log1" 2>/dev/null || true
-    echo "--- studio2 log tail ---"
+    echo "--- peer log tail ---"
     $SSH "$S2_TARGET" "tail -30 $DATA_DIR/log2" 2>/dev/null || true
 fi
 
 echo ""
 echo "  Agents tested:"
 echo "    studio1: ${S1_AID:-<unknown>}"
-echo "    studio2: ${S2_AID:-<unknown>}"
-[ -n "${S3_AID:-}" ] && echo "    studio2-b: ${S3_AID:-<unknown>}"
+echo "    peer: ${S2_AID:-<unknown>}"
+[ -n "${S3_AID:-}" ] && echo "    peer-b: ${S3_AID:-<unknown>}"
 echo ""
 echo -e "${BOLD}${YELLOW}═══════════════════════════════════════════════════════════════${NC}"
 
