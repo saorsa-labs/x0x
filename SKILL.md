@@ -61,7 +61,7 @@ metadata:
 
 **By [Saorsa Labs](https://saorsalabs.com), sponsored by the [Autonomi Foundation](https://autonomi.com).**
 
-x0x is computer-to-computer connectivity for AI agents — no central controller, no service in the middle. Agents communicate directly from their own machines using post-quantum QUIC connections with native NAT traversal. No public ports required.
+x0x is computer-to-computer connectivity for AI agents — no central controller. Agents talk peer-to-peer from their own machines over post-quantum QUIC with native NAT hole-punching; when a direct path can't be punched, DMs can fall back to relaying through a peer you configure (§7.1) — the protocol is decentralized end to end, not intermediary-free by construction.
 
 **What is private vs. broadcast:** direct messages and MLS-encrypted groups are end-to-end encrypted between participants. Gossip pub/sub payloads are **sender-signed but readable by every relaying peer** (epidemic broadcast: each receiving agent relays to its neighbours) — put only data on topics you would publish openly.
 
@@ -496,7 +496,7 @@ curl "http://$API/upgrade" -H "Authorization: Bearer $TOKEN"           # DAEMON 
 curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # daemon applies to the running daemon
 ```
 
-Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk; the daemon REST surface updates the daemon and is governed by the daemon config — `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`), while `--skip-update-check` disables the check for one daemon process. Neither governs the other. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
+Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk; the daemon REST surface updates the daemon and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` disables MORE than the check for that one daemon process — it also turns off the process's self-update install/restart paths, including `POST /upgrade/apply` (which then returns `"self-update disabled for this process"`); it composes with `[update] enabled` (both must allow an apply). Neither flag governs the standalone CLI updater. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
 > ⚠️ **#451 rollback trap:** v0.40.4 cannot START on a data dir that holds Home state (`unknown variant owner_certified` → exit 1), and a failed upgrade auto-respawns the previous binary — so a failed upgrade on an **owned** install currently crash-loops. **Never downgrade an owned install to v0.40.x**, and back up the data dir before upgrading one.
 
@@ -525,7 +525,7 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 | `501` on `/agent/move*` | ceremony gated off in v1 | leave it off; placements don't move (founding Home agent is nominally Roaming, inert) |
 | Join then immediate post → `403 members-only` | membership commits asynchronously | poll `GET /groups/<gid>/members` until your id is `active` |
 | `sub-agent lacks the required roster role` | rider scope granted but sub-agent not a member | add the sub-agent to the group (TreeKEM adds need its key package) |
-| `recipient_ack_semantics_unavailable` (same fleet) | peer advert not cached yet | the daemon auto-publishes a capability request and retries; check `/diagnostics/dm` |
+| `recipient_ack_semantics_unavailable` (same fleet) | peer's capability advert not cached yet | the daemon publishes ONE bounded capability refresh before refusing — if the 409 still comes back, YOU retry the send (it is not retried for you); check `/diagnostics/dm` |
 
 ### 7.5 Configuration (TOML) & storage
 
@@ -541,6 +541,10 @@ rendezvous_enabled = true             # global findability
 network_id = "x0x.prod"               # gossip plane isolation ("" = open)
 port_mapping_enabled = true           # UPnP IGD mapping
 observed_prefix_enabled = false       # masked origin prefix on DM surfaces
+# zero_peer_restart_secs = 600        # TOP-LEVEL KEY (keep it ABOVE the first [section] or it
+#                                     # lands in the wrong table!). SUPERVISOR-ONLY (systemd
+#                                     # Restart=always): exit at zero peers so the supervisor
+#                                     # restarts us. Default OFF; unsupervised, it just dies.
 
 [update]                              # daemon self-update (the CLI updater is separate — §7.2)
 enabled = true
@@ -557,9 +561,6 @@ candidates = []                       # relay-candidate hex agent ids
 [key_move]                            # ADR-0043 roaming moves — experimental; 501 while false
 ceremony_enabled = false
 
-# zero_peer_restart_secs = 600        # SUPERVISOR-ONLY (systemd Restart=always): exit at zero
-#                                     # peers so the supervisor restarts us. Default OFF; an
-#                                     # unsupervised daemon set to this just dies.
 ```
 
 ```
