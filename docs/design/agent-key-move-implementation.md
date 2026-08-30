@@ -192,3 +192,24 @@ Follow-up tracking: saorsa-labs/x0x#443.
   `move_retire` each return a typed disabled error before any mutation.
   Startup LOADING of existing move state is unaffected (loading ≠
   executing).
+
+## Review round 6 (b2-0037-r6)
+
+- **Ceremony fully unreachable at the library level:** `move_import`
+  gained the disabled-error gate BEFORE anything (no decrypt, no
+  participant-state persist, no key storage), and `move_export`'s gate
+  now precedes the idempotent re-export return. Every executor
+  (`authorize`/`export`/`import`/`activate`/`abort`/`retire`) refuses
+  with a typed error while `ceremony_enabled = false`.
+- **H8 airtight — authority is a VERIFIED type, not a byte slice:**
+  `PlacementAuthority` is constructible only via (1)
+  `cert_issuer(&AgentCertificate)` which VERIFIES the certificate,
+  (2) `bundle_owner(&ChainedRecord)` which re-runs §7.5 coherence
+  verification on the carrying bundle, or (3) `local_owner(&UserKeypair)`
+  — the mint's own trust root, crate-private. The public
+  raw-slice constructor is deleted. `owner_matches_cert` now also
+  requires `cert.verify()`. `merge_loaded` re-proves authority at the
+  merge boundary: an incoming placement merges only when its owner key
+  matches a VERIFIED certificate issuer for the agent or the owner of a
+  coherence-verified bundle in the source state — a self-signed victim
+  record is rejected there (tested).

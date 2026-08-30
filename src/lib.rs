@@ -10268,10 +10268,8 @@ impl Agent {
                 // Review r3/r4 H8: the mint KNOWS the authoritative owner
                 // key — require it on the cache write (a self-signed
                 // record can never enter, even locally).
-                let _ = state.cache_placement(
-                    record,
-                    key_move::PlacementAuthority::verified_owner(owner_pk),
-                );
+                let _ = state
+                    .cache_placement(record, key_move::PlacementAuthority::local_owner(user_kp));
             }
             minted += 1;
         }
@@ -10388,6 +10386,14 @@ impl Agent {
         &self,
         bundle: key_move::TransferBundle,
     ) -> error::Result<key_move::TransferBundle> {
+        // Review r6 (1): the gate precedes EVERY early return — including
+        // the idempotent re-export path, so a disabled ceremony can never
+        // acknowledge export state.
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         let auth = match &bundle.authorization.record {
             key_move::MoveRecord::MoveAuthorization(auth) => auth.clone(),
             _ => {
@@ -10412,11 +10418,6 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
-        if !self.move_ceremony_enabled {
-            return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
-            ));
-        }
         // Target KEM key from the machine discovery cache (V3 announce).
         let target_kem = {
             let machines = self.machine_discovery_cache.read().await;
@@ -10538,6 +10539,14 @@ impl Agent {
         &self,
         bundle: key_move::TransferBundle,
     ) -> error::Result<key_move::ImportOutcome> {
+        // Review r6 (1): the gate runs BEFORE anything — no decrypt, no
+        // participant-state persist, no key storage while the ceremony
+        // is disabled.
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         let auth = match &bundle.authorization.record {
             key_move::MoveRecord::MoveAuthorization(auth) => auth.clone(),
             _ => {
@@ -14393,10 +14402,10 @@ impl AgentBuilder {
             .await;
             let mut state = logs.unwrap_or_default();
             if let Ok(bundles) = bundles {
-                state.merge_loaded(bundles);
+                state.merge_loaded(bundles, &journal_certs);
             }
             if let Ok(placements) = placements {
-                state.merge_loaded(placements);
+                state.merge_loaded(placements, &journal_certs);
             }
             // Ad-hoc binding records (v2 file) merge into the same set.
             if let Some(dir) = dir {

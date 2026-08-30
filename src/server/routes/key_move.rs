@@ -1024,6 +1024,36 @@ mod gate_tests {
                     .contains("ceremony is experimental and disabled"),
                 "typed disabled error expected, got: {err}"
             );
+            // Review r6 (1): move_import is gated BEFORE anything — no
+            // decrypt, no participant-state persist, no key storage.
+            let err = state
+                .agent
+                .move_import(crate::key_move::TransferBundle {
+                    authorization: crate::key_move::ChainedRecord {
+                        prev: [0u8; 32],
+                        record: crate::key_move::MoveRecord::MoveAuthorization(
+                            crate::key_move::MoveAuthorization {
+                                agent_id,
+                                move_epoch: 1,
+                                from_machine: crate::identity::MachineId([1; 32]),
+                                to_machine: state.agent.machine_id(),
+                                placement: crate::key_move::Placement::Roaming,
+                                issued_at: 0,
+                            },
+                        ),
+                        owner_public_key: vec![],
+                        owner_signature: vec![],
+                    },
+                    export_receipt: None,
+                    envelope: None,
+                })
+                .await
+                .expect_err("library move_import must refuse when the ceremony is disabled");
+            assert!(
+                err.to_string()
+                    .contains("ceremony is experimental and disabled"),
+                "move_import typed disabled error expected, got: {err}"
+            );
         }
 
         // The shipped core stays live: the ledger mints and the roster
