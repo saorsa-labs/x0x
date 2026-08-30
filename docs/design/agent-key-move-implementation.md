@@ -213,3 +213,26 @@ Follow-up tracking: saorsa-labs/x0x#443.
   matches a VERIFIED certificate issuer for the agent or the owner of a
   coherence-verified bundle in the source state — a self-signed victim
   record is rejected there (tested).
+
+## Review round 7 (b2-0037-r7) — H8 closed at the type level
+
+- **`PlacementAuthority` is now a struct with a PRIVATE field** — the
+  pub-enum form's public variants (`CertIssuer { issuer_key:
+  attacker_bytes }`) let an external caller bypass `cert_issuer()`'s
+  verify; direct construction is now impossible outside the module.
+  The only construction paths remain the verifying constructors
+  (`cert_issuer` — verifies the cert; `bundle_owner` — re-runs §7.5
+  coherence; `local_owner` — the mint's crate-private trust root).
+- **Authority is agent-bound:** the struct carries the agent it was
+  proven FOR; `cache_placement` rejects a record whose agent differs —
+  an attacker's genuine certificate binds THEIR agent and cannot vouch
+  for a victim's record (the issuer-key-only hole, caught by the new
+  test).
+- **Relabelled bundles rejected:** `ingest_bundle`, `bundles_from_bytes`,
+  and `merge_loaded` all require the bundle's `record.agent_id` to equal
+  the storage key — a VALID FOREIGN bundle stored under a victim id
+  fails (coherence proves genuineness, not slot ownership), at mesh
+  ingest, disk load, and merge.
+- Scope note: this hole was NOT remotely reachable (blob-v2 fetch is the
+  recorded gap and the ceremony is gated off) — defense-in-depth before
+  blob-v2 wires placement fetch. Closed now per review.

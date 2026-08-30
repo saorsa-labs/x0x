@@ -212,26 +212,32 @@ impl PlacementRecord {
 }
 
 /// The PROVEN authority for a placement record entering the cache
-/// (review r5/r6 H8): there is deliberately NO bypass — the type can be
-/// constructed ONLY from
+/// (review r5/r6/r7 H8): there is deliberately NO bypass — the only ways
+/// to obtain one are the verifying constructors:
 ///
-/// 1. a **certificate that verifies** (its issuer certified the agent),
-/// 2. an **`ActivationBundle` that passes coherence verification** (its
-///    owner signer is proven by the whole-record signature + certificate
-///    issuer binding), or
-/// 3. the daemon's OWN owner keypair (the mint's trust root —
-///    crate-private, never constructible from unverified input).
+/// 1. [`PlacementAuthority::cert_issuer`] — VERIFIES the certificate and
+///    yields its issuer key;
+/// 2. [`PlacementAuthority::bundle_owner`] — re-runs §7.5 coherence
+///    verification on the carrying `ActivationBundle` and yields its
+///    proven owner signer;
+/// 3. `local_owner` — the daemon's own owner keypair (the mint's trust
+///    root), crate-private.
 ///
-/// A bare owner-pubkey byte slice is NOT accepted: a self-signed key
-/// passes a raw comparison, which is a caller assertion, not a proof.
+/// The struct's field is PRIVATE (review r7: the earlier pub-enum form
+/// let an external caller construct `CertIssuer { issuer_key:
+/// attacker_bytes }` directly, bypassing `cert_issuer`'s verify — a
+/// self-signed record then passed the cache gate). As a struct with a
+/// private field, direct construction is impossible outside this
+/// module, and the constructors are the only authority path.
 #[derive(Clone, Copy)]
-pub enum PlacementAuthority<'a> {
-    /// The issuer of a certificate whose signature verified.
-    CertIssuer { issuer_key: &'a [u8] },
-    /// The owner signer of a coherence-VERIFIED `ActivationBundle`.
-    BundleOwner { owner_key: &'a [u8] },
-    /// The local daemon's own owner keypair (mint trust root).
-    LocalOwner { owner_key: &'a [u8] },
+pub struct PlacementAuthority<'a> {
+    key: &'a [u8],
+    /// The agent this authority was proven FOR (the certified agent, or
+    /// the bundle's agent). `None` only for the mint's local-owner
+    /// trust root (authoritative for its whole roster). Review r7: this
+    /// closes the issuer-key-only hole — an attacker's genuine
+    /// certificate binds THEIR agent and cannot vouch for a victim's.
+    agent: Option<AgentId>,
 }
 
 impl<'a> PlacementAuthority<'a> {
@@ -244,8 +250,9 @@ impl<'a> PlacementAuthority<'a> {
     /// certificate's signature does not verify.
     pub fn cert_issuer(cert: &'a AgentCertificate) -> std::result::Result<Self, IdentityError> {
         cert.verify()?;
-        Ok(Self::CertIssuer {
-            issuer_key: cert.user_public_key_bytes(),
+        Ok(Self {
+            key: cert.user_public_key_bytes(),
+            agent: Some(cert.agent_id()?),
         })
     }
 
@@ -260,8 +267,17 @@ impl<'a> PlacementAuthority<'a> {
     /// not a coherent `ActivationBundle`.
     pub fn bundle_owner(chained: &'a ChainedRecord) -> std::result::Result<Self, IdentityError> {
         verify_bundle_coherence_chained(chained)?;
-        Ok(Self::BundleOwner {
-            owner_key: &chained.owner_public_key,
+        let agent = match &chained.record {
+            MoveRecord::ActivationBundle { authorization, .. } => authorization.agent_id,
+            _ => {
+                return Err(IdentityError::Revocation(
+                    "authority requires an ActivationBundle".to_string(),
+                ));
+            }
+        };
+        Ok(Self {
+            key: &chained.owner_public_key,
+            agent: Some(agent),
         })
     }
 
@@ -269,17 +285,18 @@ impl<'a> PlacementAuthority<'a> {
     /// signs with. Crate-private so no external caller can wrap an
     /// arbitrary key slice.
     pub(crate) fn local_owner(owner_keypair: &'a crate::identity::UserKeypair) -> Self {
-        Self::LocalOwner {
-            owner_key: owner_keypair.public_key().as_bytes(),
+        Self {
+            key: owner_keypair.public_key().as_bytes(),
+            agent: None,
         }
     }
 
     fn key(&self) -> &'a [u8] {
-        match self {
-            PlacementAuthority::CertIssuer { issuer_key } => issuer_key,
-            PlacementAuthority::BundleOwner { owner_key } => owner_key,
-            PlacementAuthority::LocalOwner { owner_key } => owner_key,
-        }
+        self.key
+    }
+
+    fn agent(&self) -> Option<AgentId> {
+        self.agent
     }
 }
 
@@ -1387,6 +1404,20 @@ impl MoveState {
         chained: &ChainedRecord,
         revoked: &mut RevocationSet,
     ) -> std::result::Result<bool, IdentityError> {
+        // Review r7 H8: the carried bundle must belong to the agent key it
+        // is ingested under — a valid FOREIGN bundle relabelled under a
+        // victim id fails here (coherence proves genuineness, not slot
+        // ownership).
+        let record_agent = match &chained.record {
+            MoveRecord::ActivationBundle { authorization, .. } => Some(authorization.agent_id),
+            _ => None,
+        };
+        if record_agent.as_ref() != Some(agent) {
+            return Err(IdentityError::Revocation(
+                "activation bundle names a different agent than the ingest key (relabelled?)"
+                    .to_string(),
+            ));
+        }
         let acceptance = verify_bundle_mesh(chained, self.placements.get(agent))?;
         let mut changed = revoked.union_bundle_retired(&acceptance.tombstones);
         if let Some(placement) = acceptance.placement {
@@ -1448,6 +1479,16 @@ impl MoveState {
         // the authority type proves the owner key certified the agent
         // (certificate issuer) or was established by an already-verified
         // structure (coherence-checked bundle owner).
+        if let Some(certified) = authority.agent() {
+            // Review r7: the authority was proven for a SPECIFIC agent —
+            // a genuine certificate for a DIFFERENT agent cannot vouch
+            // for this record (the issuer-key-only hole).
+            if certified != record.agent_id {
+                return Err(IdentityError::Revocation(
+                    "placement authority was proven for a different agent".to_string(),
+                ));
+            }
+        }
         if record.owner_public_key.as_slice() != authority.key() {
             return Err(IdentityError::Revocation(
                 "placement record issuer does not match the authoritative owner key".to_string(),
@@ -1599,6 +1640,22 @@ impl MoveState {
                 IdentityError::Serialization(format!("move-bundles.bin decode: {e}"))
             })?;
         for (agent, chained) in list {
+            // Review r7 H8: the bundle's record.agent_id must equal the
+            // map key it is stored under — a VALID FOREIGN bundle
+            // relabelled under a victim agent id must fail here (coherence
+            // alone proves the bundle is genuine, not that it belongs to
+            // THIS agent's slot).
+            let record_agent = match &chained.record {
+                MoveRecord::ActivationBundle { authorization, .. } => Some(authorization.agent_id),
+                _ => None,
+            };
+            if record_agent != Some(agent) {
+                tracing::warn!(
+                    agent = %hex::encode(agent.as_bytes()),
+                    "move-bundles.bin: dropping bundle whose record names a different agent (relabelled?)"
+                );
+                continue;
+            }
             if verify_bundle_coherence_chained(&chained).is_ok() {
                 if let MoveRecord::ActivationBundle {
                     retired_bindings,
@@ -1707,6 +1764,20 @@ impl MoveState {
         // bundle in `other`.
         let mut bundle_owners: HashMap<AgentId, Vec<u8>> = HashMap::new();
         for (agent, chained) in &other.bundles {
+            // Review r7 H8: the bundle's record.agent_id must equal its
+            // map key — a relabelled foreign bundle contributes no
+            // authority and does not merge.
+            let record_agent = match &chained.record {
+                MoveRecord::ActivationBundle { authorization, .. } => Some(authorization.agent_id),
+                _ => None,
+            };
+            if record_agent.as_ref() != Some(agent) {
+                tracing::warn!(
+                    agent = %hex::encode(agent.as_bytes()),
+                    "merge_loaded: dropping bundle whose record names a different agent (relabelled?)"
+                );
+                continue;
+            }
             if verify_bundle_coherence_chained(chained).is_ok() {
                 bundle_owners.insert(*agent, chained.owner_public_key.clone());
             }
@@ -1718,7 +1789,13 @@ impl MoveState {
             }
         }
         for (agent, chained) in other.bundles {
-            self.bundles.entry(agent).or_insert(chained);
+            // Review r7 H8: relabelled bundles never enter the store —
+            // only agents whose bundle passed the key-binding check in
+            // the authority pass above (i.e. present in bundle_owners)
+            // merge.
+            if bundle_owners.contains_key(&agent) {
+                self.bundles.entry(agent).or_insert(chained);
+            }
         }
         for (agent, record) in other.placements {
             let cert_ok = certs
@@ -3106,6 +3183,167 @@ mod r6_tests {
         assert!(
             merged.placement(&victim_agent).is_none(),
             "self-signed victim record must be REJECTED at merge_loaded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r7_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// (a) The authority is UNFORGEABLE at the type level:
+    /// `PlacementAuthority` is a struct with a PRIVATE field — the only
+    /// construction paths outside this module are the verifying
+    /// constructors. The old pub-enum form allowed
+    /// `PlacementAuthority::CertIssuer { issuer_key: attacker_bytes }`,
+    /// which bypassed `cert_issuer`'s verify; that arm no longer exists.
+    /// (Compile-level guarantee: no variant names to construct.)
+    ///
+    /// Behaviorally: a self-signed record paired with a FABRICATED
+    /// authority is impossible to build from unverified input, and the
+    /// only legitimate authority for the attacker's own certificate
+    /// still refuses the victim record (issuer ≠ record signer).
+    #[test]
+    fn fabricated_authority_cannot_vouch_for_self_signed_record() {
+        let victim_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let victim = victim_kp.agent_id();
+        let real_owner = crate::identity::UserKeypair::generate().unwrap();
+        let victim_cert =
+            crate::identity::AgentCertificate::issue(&real_owner, &victim_kp).unwrap();
+
+        // The attacker signs a placement for the victim with their OWN
+        // key and holds a genuine self-consistent certificate for a
+        // DIFFERENT agent of theirs — the only authority they can
+        // legitimately construct.
+        let attacker_owner = crate::identity::UserKeypair::generate().unwrap();
+        let attacker_agent_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let attacker_cert =
+            crate::identity::AgentCertificate::issue(&attacker_owner, &attacker_agent_kp).unwrap();
+        let forged = PlacementRecord::sign(
+            victim,
+            attacker_owner.public_key().as_bytes(),
+            Placement::Pinned(crate::identity::MachineId([0x46; 32])),
+            9,
+            1,
+            attacker_owner.secret_key(),
+        )
+        .unwrap();
+        assert!(
+            forged.verify().is_ok(),
+            "forged record is internally consistent"
+        );
+
+        let mut state = MoveState::new();
+        // The attacker's genuine authority (their own cert's issuer)
+        // still refuses the record: issuer != the record's signer.
+        let err = state.cache_placement(
+            forged,
+            PlacementAuthority::cert_issuer(&attacker_cert).unwrap(),
+        );
+        assert!(err.is_err(), "foreign issuer cannot vouch for the record");
+
+        // And the victim's REAL certificate is not in the attacker's
+        // hands: the honest path (victim cert issuer) also refuses.
+        let err = state.cache_placement(
+            PlacementRecord::sign(
+                victim,
+                attacker_owner.public_key().as_bytes(),
+                Placement::Roaming,
+                9,
+                1,
+                attacker_owner.secret_key(),
+            )
+            .unwrap(),
+            PlacementAuthority::cert_issuer(&victim_cert).unwrap(),
+        );
+        assert!(
+            err.is_err(),
+            "victim's certified issuer refuses the forged signer"
+        );
+    }
+
+    /// (b) A VALID FOREIGN bundle relabelled under a victim agent_id is
+    /// rejected at `ingest_bundle` and at `bundles_from_bytes` — the
+    /// record's `agent_id` must equal the storage key.
+    #[test]
+    fn relabelled_foreign_bundle_rejected() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let source = crate::identity::MachineKeypair::generate().unwrap();
+        let target = crate::identity::MachineKeypair::generate().unwrap();
+        let foreign_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&owner, &foreign_kp).unwrap();
+        let foreign = foreign_kp.agent_id();
+
+        // A fully valid bundle for the FOREIGN agent (coherence-passing).
+        let auth = MoveAuthorization {
+            agent_id: foreign,
+            move_epoch: 1,
+            from_machine: source.machine_id(),
+            to_machine: target.machine_id(),
+            placement: Placement::Roaming,
+            issued_at: 1,
+        };
+        let placement_record = PlacementRecord::sign(
+            foreign,
+            owner.public_key().as_bytes(),
+            Placement::Roaming,
+            1,
+            1,
+            owner.secret_key(),
+        )
+        .unwrap();
+        let bundle = ChainedRecord {
+            prev: [0u8; 32],
+            record: MoveRecord::ActivationBundle {
+                authorization: auth,
+                retired_bindings: vec![AgentMachineBinding {
+                    agent: foreign,
+                    machine: source.machine_id(),
+                    move_epoch: 1,
+                }],
+                placement_record,
+                agent_certificate: cert,
+            },
+            owner_public_key: owner.public_key().as_bytes().to_vec(),
+            owner_signature: Vec::new(),
+        };
+        let bundle = ChainedRecord::sign(
+            [0u8; 32],
+            bundle.record,
+            owner.public_key().as_bytes(),
+            owner.secret_key(),
+        )
+        .unwrap();
+        assert!(
+            verify_bundle_coherence_chained(&bundle).is_ok(),
+            "bundle is genuinely valid"
+        );
+
+        // Relabel: ingest it under the VICTIM's key.
+        let victim = crate::identity::AgentId([0x47; 32]);
+        let mut state = MoveState::new();
+        let mut revoked = RevocationSet::new();
+        let err = state.ingest_bundle(&victim, &bundle, &mut revoked);
+        assert!(err.is_err(), "relabelled bundle must be rejected at ingest");
+        assert!(state.bundle(&victim).is_none());
+        assert!(state.placement(&victim).is_none());
+
+        // Same rule at disk load: `bundles_from_bytes` drops the
+        // relabelled entry (encode a state holding the mis-keyed pair).
+        // Build the persisted list shape directly: (victim, foreign bundle).
+        let bytes = {
+            let mut body = bincode::serialize(&vec![(victim, bundle)]).unwrap();
+            let mut out = BUNDLES_FILE_MAGIC.to_vec();
+            out.append(&mut body);
+            out
+        };
+        let mut revoked2 = RevocationSet::new();
+        let loaded = MoveState::bundles_from_bytes(&bytes, &mut revoked2).unwrap();
+        assert!(
+            loaded.bundle(&victim).is_none(),
+            "relabelled bundle must be dropped on disk load"
         );
     }
 }
