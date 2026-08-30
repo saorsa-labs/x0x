@@ -51,7 +51,9 @@ could carry a *different* valid `DmEnvelope` under an unrelated header.
 The mixed-fleet behavior is capability-driven end to end:
 
 - `DmCapabilities` gains `digest_support: bool` (additive,
-  serde-defaulted, `skip_serializing_if = false`). **This build's wired
+  serde-defaulted, `skip_serializing_if = "is_false"` — the field is
+  omitted from the encoding when false, so a false bit is
+  byte-identical to the pre-#437 struct). **This build's wired
   constructors advertise `true`**; `pending()` stays `false`.
 - **Send path** (`try_relay_fallback`): emit the bound v2 frame **only**
   when the relay candidate's confirmed advert sets `digest_support`
@@ -138,10 +140,15 @@ peers without confirmed support (above).
     Forward though the sender's caps advertise digest support; valid v2
     → Forward (baseline set); v2-then-v1 → `MissingInnerDigest`;
     stale-v2 control (expired replay must not set the baseline).
-  - `v2_baseline_is_resource_bounded_and_gate_gated` — cap+64 distinct
-    senders → map stays ≤ cap; TTL prune + expired-read; a non-contact
-    v2 frame on a gated relay is refused at the contact gate and the
-    map stays empty.
+  - `v2_baseline_is_resource_bounded_and_gate_gated` — the map lands
+    EXACTLY at `MAX_V2_BASELINE_SENDERS` after an over-cap insert; the
+    OLDEST observation is provably the one evicted (strictly older
+    in-TTL entry seeded first); an expired entry planted directly is
+    removed ON READ (map inspected after the read, proving lazy
+    expiry); and un-gated senders never populate the baseline — a
+    non-contact v2 frame is refused at the contact gate, a BLOCKED
+    sender's v2 frame at the blocklist gate, both leaving the map
+    empty.
 - `src/dm_capability.rs`:
   - `false_digest_support_encodes_byte_identical_to_v1_caps`,
     `legacy_advert_decodes_and_verifies_on_new_node` (advert wire).
