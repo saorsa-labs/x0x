@@ -25,6 +25,8 @@ pub struct DaemonClient {
     format: OutputFormat,
     /// API bearer token for authentication.
     api_token: Option<String>,
+    /// `--dump-request` [dev]: print the wire request instead of sending it.
+    dump: bool,
 }
 
 impl DaemonClient {
@@ -77,7 +79,36 @@ impl DaemonClient {
             base_url,
             format,
             api_token,
+            dump: false,
         })
+    }
+
+    /// Enable `--dump-request` mode: every verb prints
+    /// `{"method","path","body"}` (body is the query pairs for GETs) and
+    /// returns a synthetic `{"ok":true}` without contacting any daemon.
+    /// The dispatch-to-wire parity tests drive this so request SHAPES are
+    /// provable for every command, no daemon required.
+    pub fn dump_requests(mut self, dump: bool) -> Self {
+        self.dump = dump;
+        self
+    }
+
+    /// Emit one dumped request and return the synthetic response.
+    fn emit_dump(
+        &self,
+        method: &str,
+        path: &str,
+        body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value> {
+        println!(
+            "{}",
+            serde_json::json!({
+                "method": method,
+                "path": path,
+                "body": body.unwrap_or(serde_json::Value::Null),
+            })
+        );
+        Ok(serde_json::json!({ "ok": true }))
     }
 
     fn discover_api(
@@ -118,6 +149,9 @@ impl DaemonClient {
 
     /// Check if daemon is reachable. Returns an error with a helpful message if not.
     pub async fn ensure_running(&self) -> Result<()> {
+        if self.dump {
+            return Ok(());
+        }
         let resp = self
             .client
             .get(format!("{}/health", self.base_url))
@@ -132,6 +166,9 @@ impl DaemonClient {
 
     /// Send a GET request.
     pub async fn get(&self, path: &str) -> Result<serde_json::Value> {
+        if self.dump {
+            return self.emit_dump("GET", path, None);
+        }
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -144,6 +181,12 @@ impl DaemonClient {
 
     /// Send a GET request with query parameters.
     pub async fn get_query(&self, path: &str, query: &[(&str, &str)]) -> Result<serde_json::Value> {
+        if self.dump {
+            let body = serde_json::Map::from_iter(
+                query.iter().map(|(k, v)| ((*k).to_string(), json_str(v))),
+            );
+            return self.emit_dump("GET", path, Some(serde_json::Value::Object(body)));
+        }
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -161,6 +204,10 @@ impl DaemonClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value> {
+        if self.dump {
+            let value = serde_json::to_value(body).context("dump: serialize body")?;
+            return self.emit_dump("POST", path, Some(value));
+        }
         let resp = self
             .client
             .post(format!("{}{}", self.base_url, path))
@@ -174,6 +221,9 @@ impl DaemonClient {
 
     /// Send a POST request with no body.
     pub async fn post_empty(&self, path: &str) -> Result<serde_json::Value> {
+        if self.dump {
+            return self.emit_dump("POST", path, None);
+        }
         let resp = self
             .client
             .post(format!("{}{}", self.base_url, path))
@@ -190,6 +240,10 @@ impl DaemonClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value> {
+        if self.dump {
+            let value = serde_json::to_value(body).context("dump: serialize body")?;
+            return self.emit_dump("PATCH", path, Some(value));
+        }
         let resp = self
             .client
             .patch(format!("{}{}", self.base_url, path))
@@ -207,6 +261,10 @@ impl DaemonClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value> {
+        if self.dump {
+            let value = serde_json::to_value(body).context("dump: serialize body")?;
+            return self.emit_dump("PUT", path, Some(value));
+        }
         let resp = self
             .client
             .put(format!("{}{}", self.base_url, path))
@@ -227,6 +285,10 @@ impl DaemonClient {
         path: &str,
         body: &T,
     ) -> Result<serde_json::Value> {
+        if self.dump {
+            let value = serde_json::to_value(body).context("dump: serialize body")?;
+            return self.emit_dump("DELETE", path, Some(value));
+        }
         let resp = self
             .client
             .delete(format!("{}{}", self.base_url, path))
@@ -240,6 +302,9 @@ impl DaemonClient {
 
     /// Send a DELETE request.
     pub async fn delete(&self, path: &str) -> Result<serde_json::Value> {
+        if self.dump {
+            return self.emit_dump("DELETE", path, None);
+        }
         let resp = self
             .client
             .delete(format!("{}{}", self.base_url, path))
@@ -252,6 +317,12 @@ impl DaemonClient {
 
     /// Get a streaming response (for SSE).
     pub async fn get_stream(&self, path: &str) -> Result<reqwest::Response> {
+        if self.dump {
+            // Emit the request shape, then stop: there is no daemon to
+            // stream from and no Response to fabricate.
+            let _ = self.emit_dump("GET", path, None)?;
+            anyhow::bail!("--dump-request: streaming stopped after request dump");
+        }
         let resp = self
             .client
             .get(format!("{}{}", self.base_url, path))
@@ -325,6 +396,11 @@ impl DaemonClient {
     pub fn api_token(&self) -> Option<&str> {
         self.api_token.as_deref()
     }
+}
+
+/// `serde_json::Value::String` helper for the dump-mode query map.
+fn json_str(v: &str) -> serde_json::Value {
+    serde_json::Value::String(v.to_string())
 }
 
 /// Build an `anyhow::Error` from a non-success HTTP status and its JSON body.

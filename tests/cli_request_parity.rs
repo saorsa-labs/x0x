@@ -114,6 +114,16 @@ struct HelpSurface {
     value_flags: BTreeSet<String>,
     /// Positional value names normalized (`<AGENT_ID>` -> `agent_id`).
     positionals: BTreeSet<String>,
+    /// The raw Usage line (requiredness evidence: required options appear
+    /// unbracketed there; required positionals as `<X>` not `[X]`).
+    usage_raw: String,
+    /// flag -> its `<VAL>` placeholder spelling (dummy-value heuristics).
+    flag_placeholders: BTreeMap<String, String>,
+    /// flag -> first clap `possible value` when the arg has fixed choices.
+    flag_choices: BTreeMap<String, String>,
+    /// Positional value names in usage order, with bracketing preserved
+    /// (`<NAME>` required, `[NAME]` optional).
+    ordered_positionals: Vec<String>,
 }
 
 fn is_value_token(tok: &str) -> bool {
@@ -134,10 +144,21 @@ fn parse_help_surface(help: &str) -> HelpSurface {
             in_arguments_section = false;
         }
         if trimmed.starts_with("Usage:") {
+            out.usage_raw = trimmed.to_string();
+            let mut prev_was_flag = false;
             for tok in trimmed.split_whitespace().skip(1) {
-                if is_value_token(tok) && tok != "[OPTIONS]" && tok != "[COMMAND]" {
-                    out.positionals.insert(normalize_positional(tok));
+                if tok.starts_with('-') && tok.len() > 1 {
+                    prev_was_flag = true;
+                    continue;
                 }
+                // A value token right after a flag is that flag's VALUE
+                // placeholder (e.g. `--context <CONTEXT>`), not a positional.
+                if is_value_token(tok) && tok != "[OPTIONS]" && tok != "[COMMAND]" && !prev_was_flag
+                {
+                    out.positionals.insert(normalize_positional(tok));
+                    out.ordered_positionals.push(tok.to_string());
+                }
+                prev_was_flag = false;
             }
             continue;
         }
@@ -159,6 +180,9 @@ fn parse_help_surface(help: &str) -> HelpSurface {
             } else if is_value_token(tok) {
                 if let Some(flag) = &last_flag {
                     out.value_flags.insert(flag.clone());
+                    out.flag_placeholders
+                        .entry(flag.clone())
+                        .or_insert_with(|| tok.to_string());
                     if in_arguments_section {
                         out.positionals.insert(normalize_positional(tok));
                     }
@@ -168,6 +192,21 @@ fn parse_help_surface(help: &str) -> HelpSurface {
                 continue;
             } else {
                 break;
+            }
+        }
+        // clap prints fixed choices as `[possible values: a, b]` on the
+        // option's own line; capture the first for dummy-value synthesis.
+        if let Some(leading) = trimmed.split_whitespace().find(|t| t.starts_with("--")) {
+            let leading = leading.trim_end_matches(',');
+            if let Some(idx) = trimmed.find("[possible values: ") {
+                let rest = &trimmed[idx + "[possible values: ".len()..];
+                if let Some(first) = rest.split(',').next() {
+                    let first = first.trim_end_matches(']').trim().trim_end();
+                    if !first.is_empty() {
+                        out.flag_choices
+                            .insert(leading.to_string(), first.to_string());
+                    }
+                }
             }
         }
     }
@@ -212,6 +251,398 @@ fn field_exposed(surface: &HelpSurface, field: &x0x::api::RequestField) -> Resul
             }
         }
     }
+}
+
+/// Is `flag` present in the Usage line OUTSIDE brackets (i.e. required)?
+fn usage_has_required_flag(usage: &str, flag: &str) -> bool {
+    let mut from = 0usize;
+    while let Some(pos) = usage[from..].find(flag) {
+        let start = from + pos;
+        let unbracketed = usage[..start]
+            .chars()
+            .rev()
+            .find(|c| *c == '[' || *c == ']')
+            != Some('[');
+        if unbracketed {
+            return true;
+        }
+        from = start + flag.len();
+    }
+    false
+}
+
+/// Required-on-the-wire fields whose requiredness is enforced by the CLI
+/// BEFORE dispatch rather than by clap, because the argument shape is an
+/// XOR/multi-form command. Each is pinned with its enforcement site so the
+/// exemption cannot rot silently.
+const CLIENT_ENFORCED_REQUIRED: &[(&str, &str, &str, &str)] = &[
+    // `--payload-b64` XOR `--file` (or `-` stdin): exactly one is required
+    // and validated before any daemon contact (payload_b64_from_args).
+    (
+        "POST",
+        "/agent/sign",
+        "payload_b64",
+        "src/cli/commands/identity.rs::payload_b64_from_args",
+    ),
+    (
+        "POST",
+        "/agent/verify",
+        "payload_b64",
+        "src/cli/commands/identity.rs::payload_b64_from_args",
+    ),
+    // `x0x exec` is a multi-form command (run / --cancel / sub-actions);
+    // the run form requires the agent and bails pre-dispatch.
+    (
+        "POST",
+        "/exec/run",
+        "agent_id",
+        "src/cli/commands/exec.rs::run (argv-empty bail)",
+    ),
+];
+
+/// WHY (review r3, item 1): registry `required` must match clap's own
+/// requiredness — a required field exposed as an optional flag (or an
+/// optional positional) silently shifts validation to the daemon.
+#[test]
+fn registry_requiredness_matches_clap() {
+    let mut failures = Vec::new();
+    for ep in ENDPOINTS {
+        let RequestSpec::Fields(fields) = &ep.request else {
+            continue;
+        };
+        for tokens in tokenize_cli_name(ep.cli_name) {
+            let surface = parse_help_surface(&cached_help(&tokens));
+            for field in *fields {
+                if !field.required {
+                    continue;
+                }
+                if CLIENT_ENFORCED_REQUIRED.iter().any(|(m, p, f, _)| {
+                    *m == ep.method.to_string().to_uppercase() && *p == ep.path && *f == field.name
+                }) {
+                    continue;
+                }
+                let flag = match &field.cli {
+                    CliExpose::BoolValue => format!("--{}", kebab(field.name)),
+                    CliExpose::Token(t) if t.starts_with('-') => t.to_string(),
+                    CliExpose::Token(t) => {
+                        let bracketed = format!("[{t}]");
+                        if surface.usage_raw.contains(&bracketed)
+                            && !surface.usage_raw.contains(&format!("<{t}>"))
+                        {
+                            failures.push(format!(
+                                "  {} {}: `{}` is required on the wire but positional `{t}` is optional",
+                                ep.method, ep.path, field.name
+                            ));
+                        }
+                        if !surface.usage_raw.contains(&format!("<{t}>")) {
+                            failures.push(format!(
+                                "  {} {}: required positional `{t}` missing from the usage line",
+                                ep.method, ep.path
+                            ));
+                        }
+                        continue;
+                    }
+                    CliExpose::Default => format!("--{}", kebab(field.name)),
+                    _ => continue,
+                };
+                if CLIENT_ENFORCED_REQUIRED.iter().any(|(m, p, f, _)| {
+                    *m == ep.method.to_string().to_uppercase() && *p == ep.path && *f == field.name
+                }) {
+                    continue;
+                }
+                if surface.flags.contains(&flag) {
+                    if !usage_has_required_flag(&surface.usage_raw, &flag) {
+                        failures.push(format!(
+                            "  {} {}: `{}` is required on the wire but `{flag}` is optional (or absent) in the usage line",
+                            ep.method, ep.path, field.name
+                        ));
+                    }
+                } else if let CliExpose::Default = field.cli {
+                    let bracketed = format!("[{}]", field.name.to_uppercase());
+                    let angled = format!("<{}>", field.name.to_uppercase());
+                    if surface.usage_raw.contains(&bracketed)
+                        && !surface.usage_raw.contains(&angled)
+                    {
+                        failures.push(format!(
+                            "  {} {}: `{}` is required on the wire but its positional is optional",
+                            ep.method, ep.path, field.name
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n\nRegistry requiredness vs clap mismatches ({}):\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+}
+
+/// Dummy CLI value for a flag/positional: BOOL placeholders need a real
+/// boolean, PATH/JSON placeholders point at a valid-JSON temp file (some
+/// commands read AND parse the file client-side), everything else "1"
+/// (parses as every scalar type clap accepts).
+fn dummy_value(placeholder: &str) -> String {
+    let up = placeholder.to_ascii_uppercase();
+    if up.contains("BOOL") {
+        "true".to_string()
+    } else if up.contains("FILE") {
+        "/dev/null".to_string()
+    } else if up.contains("PATH") || up.contains("JSON") || up.contains("ENVELOPE") {
+        static JSON_TMP: LazyLock<String> = LazyLock::new(|| {
+            let p = std::env::temp_dir().join("x0x-parity-dummy.json");
+            let _ = std::fs::write(&p, "{}");
+            p.display().to_string()
+        });
+        JSON_TMP.clone()
+    } else {
+        "1".to_string()
+    }
+}
+
+/// Build argv exercising the command's path-parameter positionals plus
+/// every registry flag field, and run `x0x ... --dump-request`.
+fn dump_request(ep: &EndpointDef, tokens: &[String]) -> Result<serde_json::Value, String> {
+    let surface = parse_help_surface(&cached_help(tokens));
+    let mut argv: Vec<String> = tokens.to_vec();
+
+    // Positionals in usage order (covers path params AND field positionals).
+    for tok in &surface.ordered_positionals {
+        let inner = tok
+            .trim_start_matches('[')
+            .trim_end_matches(']')
+            .trim_start_matches('<')
+            .trim_end_matches('>');
+        argv.push(dummy_value(inner));
+    }
+    // Flags from the registry fields.
+    if let RequestSpec::Fields(fields) = &ep.request {
+        for field in *fields {
+            let flag = match &field.cli {
+                CliExpose::BoolValue => format!("--{}", kebab(field.name)),
+                CliExpose::Token(t) if t.starts_with('-') => t.to_string(),
+                // Default fields are `--kebab` flags when the command has
+                // that flag (positional Defaults are covered by the
+                // usage-order pass above).
+                CliExpose::Default => format!("--{}", kebab(field.name)),
+                _ => continue,
+            };
+            if !surface.flags.contains(&flag) {
+                continue; // presence already enforced by the other tests
+            }
+            argv.push(flag.clone());
+            if surface.value_flags.contains(&flag) {
+                let value = surface.flag_choices.get(&flag).cloned().unwrap_or_else(|| {
+                    surface
+                        .flag_placeholders
+                        .get(&flag)
+                        .map(|p| dummy_value(p))
+                        .unwrap_or_else(|| "1".to_string())
+                });
+                argv.push(value);
+            }
+        }
+    }
+    // Required flags named in the usage line that the registry did not
+    // already cover (e.g. a `requires =` sibling like
+    // --delegation-signature) must also be supplied.
+    let pushed: BTreeSet<String> = argv.iter().cloned().collect();
+    let mut prev_was_flag = false;
+    for tok in surface.usage_raw.split_whitespace().skip(1) {
+        if tok.starts_with("--") && tok.len() > 2 {
+            prev_was_flag = true;
+            let flag = tok.trim_end_matches(',');
+            if !pushed.contains(flag) && surface.flags.contains(flag) {
+                argv.push(flag.to_string());
+                if surface.value_flags.contains(flag) {
+                    let value = surface.flag_choices.get(flag).cloned().unwrap_or_else(|| {
+                        surface
+                            .flag_placeholders
+                            .get(flag)
+                            .map(|p| dummy_value(p))
+                            .unwrap_or_else(|| "1".to_string())
+                    });
+                    argv.push(value);
+                }
+            }
+            continue;
+        }
+        if prev_was_flag && is_value_token(tok) {
+            continue; // flag value placeholder, handled above
+        }
+        prev_was_flag = false;
+    }
+    argv.push("--dump-request".to_string());
+    // Trailing var-args (`[ARGV]...` in the usage line) need one element
+    // or the command bails pre-dispatch — AFTER the global flag, which
+    // would otherwise be swallowed as remote argv.
+    if surface.usage_raw.contains("ARGV]") {
+        argv.push("--".to_string());
+        argv.push("1".to_string());
+    }
+
+    // clap conflicts (e.g. --no-durable-ack vs --logical-id): run one
+    // variant per side of each conflict so BOTH fields get their wire
+    // presence proven across the collected dumps.
+    let mut variants: Vec<Vec<String>> = vec![argv];
+    let mut dumps: Vec<serde_json::Value> = Vec::new();
+    let mut last_err = String::new();
+    while let Some(candidate) = variants.pop() {
+        match run_dump(&candidate) {
+            Ok(dumped) => dumps.push(dumped),
+            Err(msg) => {
+                last_err = msg.clone();
+                if let Some((first, second)) = conflicting_flag(&msg) {
+                    for drop_flag in [first, second] {
+                        let Some(pos) = candidate.iter().position(|a| *a == drop_flag) else {
+                            continue;
+                        };
+                        let mut variant = candidate.clone();
+                        let has_value = pos + 1 < variant.len()
+                            && !variant[pos + 1].starts_with('-')
+                            && surface.value_flags.contains(&drop_flag);
+                        variant.drain(pos..=pos + usize::from(has_value));
+                        variants.push(variant);
+                    }
+                }
+            }
+        }
+    }
+    if dumps.is_empty() {
+        return Err(last_err);
+    }
+    Ok(serde_json::Value::Array(dumps))
+}
+
+/// Parse `the argument 'A' cannot be used with 'B'` from a clap error.
+fn conflicting_flag(err: &str) -> Option<(String, String)> {
+    let first_idx = err.find("the argument '")? + "the argument '".len();
+    let first_end = first_idx + err[first_idx..].find('\'')?;
+    let first = err[first_idx..first_end]
+        .split_whitespace()
+        .next()?
+        .to_string();
+    let second_idx = err.find("cannot be used with '")? + "cannot be used with '".len();
+    let second_end = second_idx + err[second_idx..].find('\'')?;
+    let second = err[second_idx..second_end]
+        .split_whitespace()
+        .next()?
+        .to_string();
+    Some((first, second))
+}
+
+fn run_dump(argv: &[String]) -> Result<serde_json::Value, String> {
+    let out = Command::new(bin_path())
+        .args(argv)
+        .output()
+        .map_err(|e| format!("spawn failed: {e}"))?;
+    // Streaming commands (subscribe/events) dump their request and then
+    // exit non-zero when no daemon answers — the dump line is the proof.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let dumped = stdout
+        .lines()
+        .find(|l| l.starts_with('{') && l.contains("\"method\""))
+        .and_then(|l| serde_json::from_str(l).ok());
+    if let Some(dumped) = dumped {
+        return Ok(dumped);
+    }
+    Err(format!(
+        "`x0x {}` produced no request dump (status {:?}): {}",
+        argv.join(" "),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stderr).trim()
+    ))
+}
+
+/// Endpoints whose CLI command deliberately issues no HTTP request (URL
+/// printers for external clients) — dispatch-to-wire does not apply.
+const DISPATCH_EXEMPT: &[(&str, &str, &str)] = &[
+    // `x0x ws direct` prints the WebSocket URL (with ?backfill=) for an
+    // external client to dial; the CLI never opens the socket.
+    (
+        "GET",
+        "/ws/direct",
+        "ws/commands/ws.rs::direct (URL printer)",
+    ),
+];
+
+/// WHY (review r3, item 1): presence checks cannot prove the DISPATCH
+/// serializes a field. `--dump-request` emits the exact wire request the
+/// builder would send; this test asserts every registry field of every
+/// field-bearing endpoint actually lands in the emitted body/query, and
+/// that the emitted method matches the registry.
+#[test]
+fn dispatched_requests_carry_every_registry_field() {
+    let mut failures = Vec::new();
+    for ep in ENDPOINTS {
+        let RequestSpec::Fields(fields) = &ep.request else {
+            continue;
+        };
+        if DISPATCH_EXEMPT
+            .iter()
+            .any(|(m, p, _)| *m == ep.method.to_string().to_uppercase() && *p == ep.path)
+        {
+            continue;
+        }
+        for tokens in tokenize_cli_name(ep.cli_name) {
+            let dumped = match dump_request(ep, &tokens) {
+                Ok(d) => d,
+                Err(msg) => {
+                    failures.push(format!("  {} {}: {msg}", ep.method, ep.path));
+                    continue;
+                }
+            };
+            let variants = dumped.as_array().cloned().unwrap_or_else(|| vec![dumped]);
+            for field in *fields {
+                if matches!(
+                    field.cli,
+                    CliExpose::Derived | CliExpose::Ignored | CliExpose::JsonDoc
+                ) {
+                    continue;
+                }
+                // Present if ANY conflict-variant dump carries the field
+                // (mutually exclusive flags prove presence across variants).
+                let present = variants.iter().any(|d| {
+                    d["body"]
+                        .as_object()
+                        .map(|o| o.contains_key(field.name))
+                        .unwrap_or(false)
+                        || d["path"]
+                            .as_str()
+                            .map(|p| p.contains(&format!("{}=", field.name)))
+                            .unwrap_or(false)
+                });
+                if !present {
+                    failures.push(format!(
+                        "  {} {}: field `{}` never reaches the wire request built by `x0x {}`",
+                        ep.method,
+                        ep.path,
+                        field.name,
+                        tokens.join(" ")
+                    ));
+                }
+            }
+            for d in &variants {
+                let method = d["method"].as_str().unwrap_or_default();
+                if method != ep.method.to_string().to_uppercase() {
+                    failures.push(format!(
+                        "  {} {}: dump emitted method {method}",
+                        ep.method, ep.path
+                    ));
+                }
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n\nDispatch-to-wire violations ({}):\n{}\n\n\
+         Fix the body/query builder in src/cli/commands/ — the argument \
+         exists but is not serialized.",
+        failures.len(),
+        failures.join("\n")
+    );
 }
 
 #[test]
@@ -704,6 +1135,57 @@ fn registry_request_metadata_matches_handler_structs() {
                         ));
                     }
                     for f in *registry_fields {
+                        // WHY (review r3, item 1): the daemon's field TYPE
+                        // must be compatible with the CLI's argument shape:
+                        // booleans may be bare flags; everything else must
+                        // take a value (flag or positional). Catches e.g. a
+                        // daemon u64 exposed as a valueless switch.
+                        if let Some(ty) = fields.get(f.name) {
+                            let inner = ty.replace("Option<", "").trim_end_matches('>').to_string();
+                            let is_bool =
+                                inner.trim() == "bool" || inner.trim().starts_with("bool");
+                            let shape_ok = help_for(&method, ep.path)
+                                .as_deref()
+                                .map(|h| {
+                                    let surface = parse_help_surface(h);
+                                    let flag = match &f.cli {
+                                        CliExpose::Default | CliExpose::BoolValue => {
+                                            format!("--{}", kebab(f.name))
+                                        }
+                                        CliExpose::Token(t) if t.starts_with('-') => t.to_string(),
+                                        CliExpose::Token(t) => {
+                                            // Positional binding: its value
+                                            // name may differ from the wire
+                                            // field name (e.g. EPOCH for
+                                            // move_epoch).
+                                            return surface
+                                                .positionals
+                                                .contains(&normalize_positional(t));
+                                        }
+                                        _ => return true,
+                                    };
+                                    let positional_names = [f.name.to_string(), kebab(f.name)];
+                                    if surface
+                                        .positionals
+                                        .intersection(&positional_names.iter().cloned().collect())
+                                        .next()
+                                        .is_some()
+                                    {
+                                        true
+                                    } else if is_bool {
+                                        surface.flags.contains(&flag)
+                                    } else {
+                                        surface.value_flags.contains(&flag)
+                                    }
+                                })
+                                .unwrap_or(true);
+                            if !shape_ok {
+                                failures.push(format!(
+                                    "  {} {}: daemon types `{}` as `{ty}` but the CLI exposes it without a value",
+                                    method, ep.path, f.name
+                                ));
+                            }
+                        }
                         // WHY (review r2, finding 1): an `Option<bool>` whose
                         // daemon default when omitted is TRUE can only be
                         // steered to false by an explicit value; a bare

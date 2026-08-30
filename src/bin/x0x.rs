@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// [dev] Print the wire request (method, path, body/query) instead of
+    /// sending it — the dispatch-to-wire parity tests drive this.
+    #[arg(long, global = true, hide = true)]
+    dump_request: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -610,11 +615,21 @@ enum OwnerRidersSub {
         /// ADR-0039 review r3 option B). REQUIRED together with
         /// --delegation-signature: without the sub-agent-signed capability
         /// the daemon refuses to mint the token.
-        #[arg(long, value_name = "BASE64", requires = "delegation_signature")]
+        #[arg(
+            long,
+            value_name = "BASE64",
+            required = true,
+            requires = "delegation_signature"
+        )]
         delegation_payload_b64: Option<String>,
         /// Hex ML-DSA-65 signature over the delegation payload, made with
         /// the sub-agent's certified key.
-        #[arg(long, value_name = "HEX", requires = "delegation_payload_b64")]
+        #[arg(
+            long,
+            value_name = "HEX",
+            required = true,
+            requires = "delegation_payload_b64"
+        )]
         delegation_signature: Option<String>,
     },
     /// Revoke a rider token by id; it fails on the next request.
@@ -1688,6 +1703,7 @@ async fn main() -> ExitCode {
         cli.instance.as_deref(),
         cli.api.as_deref(),
         format,
+        cli.dump_request,
     )
     .await;
 
@@ -1711,6 +1727,7 @@ async fn run(
     name: Option<&str>,
     api: Option<&str>,
     format: OutputFormat,
+    dump_request: bool,
 ) -> anyhow::Result<()> {
     // Commands that don't need a running daemon.
     match &command {
@@ -1782,7 +1799,7 @@ async fn run(
         _ => {}
     }
 
-    let client = DaemonClient::new(name, api, format)?;
+    let client = DaemonClient::new(name, api, format)?.dump_requests(dump_request);
 
     // Commands that need a running daemon.
     match command {

@@ -82,15 +82,15 @@ curl http://127.0.0.1:12700/status
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
+| GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Issue a signed key revocation. Exactly one of `agent_id` / `machine_id` for single-subject forms; BOTH plus `move_epoch` selects the ADR-0043 binding form (a permanent (agent, machine) tombstone on the v2 carrier, epoch-ordered against placement records) |
+| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 > **Known limitation (#446):** browser **session tokens** (from
 > `POST /auth/session`) currently reach owner-act surfaces — `/agent/sign`,
 > `/exec/*`, `/shutdown`, and `/sync/*` — not just read surfaces. Treat any
 > issued session token as equivalent to the durable API token until #446
 > lands; scope token lifetimes accordingly.
-| GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Issue a signed key revocation. Exactly one of `agent_id` / `machine_id` for single-subject forms; BOTH plus `move_epoch` selects the ADR-0043 binding form (a permanent (agent, machine) tombstone on the v2 carrier, epoch-ordered against placement records) |
-| GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
 
@@ -409,7 +409,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
-| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
