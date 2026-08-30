@@ -14,7 +14,7 @@ There is **not** a single universal `data` wrapper.
 Examples:
 
 ```json
-{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"uptime_secs":300}
+{"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300}
 ```
 
 `status` is `"healthy"`, or `"degraded"` when the daemon has had zero peers
@@ -49,14 +49,18 @@ Every endpoint except `GET /health` and `GET /constitution*` requires an
 Auth-class labels used throughout this reference:
 
 - **public** — no token (`/health`, `/constitution*` only).
-- **bearer** — any valid token class (the default for ordinary surfaces).
-- **durable-owner** — requires the durable API token; a session token or rider
-  token answers `403`. Applies to the rider-token registry and ledger
-  (`GET /owner/riders`, `/owner/placement`, `/owner/agents/:id/placement` —
-  `GET /owner/agents` is bearer), the `/agent/move*` ceremony, and the
-  ADR-0043 binding form of `/identity/revoke`.
+- **bearer** — the durable API token or a session token in the
+  `Authorization` header (the default for ordinary surfaces).
+- **durable-owner** — requires the durable API token; a session token or
+  rider token answers `403`. Applies to the whole owner registry and ledger:
+  `POST /owner/agents/issue`, `DELETE /owner/agents/:id`, `POST /owner/riders`,
+  `GET /owner/riders`, `DELETE /owner/riders/:id`, `/owner/placement`,
+  `/owner/agents/:id/placement`, the `/agent/move*` ceremony, and the
+  ADR-0043 binding form of `/identity/revoke`. (`GET /owner/agents` is
+  bearer — a read-only roster view.)
 - **rider-allowed** — the three surfaces a rider token may reach (see the
-  harness-boundary section below).
+  harness-boundary section below). Rider tokens authenticate in the
+  `Authorization` header only.
 
 **Known limitation (#446, v0.41 pre-release):** several owner-act surfaces
 specified durable-only currently *accept* a session token — `/agent/sign`,
@@ -65,9 +69,11 @@ specified durable-only currently *accept* a session token — `/agent/sign`,
 #446 lands, treat session tokens as being as sensitive as the durable token
 and use the durable token for owner actions.
 
-`GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept the
-token as a `?token=` query parameter (browser constraint). Query tokens are
-rejected everywhere else.
+`GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
+**session token** as a `?token=` query parameter (browser constraint). The
+durable API token and rider tokens are **never** valid in a query string
+(#127/WS1.6 — no long-lived secret in URLs), and query tokens are rejected
+everywhere else.
 
 ## Changed in v0.41 (pre-release)
 
@@ -102,8 +108,8 @@ The Home Suite campaign (ADRs 0036–0043, plus the 0044–0058 backfills) added
 
 Open issues for this release are listed in the README's *Known limitations*
 table (#446–#451). This reference documents **174 endpoints — exactly the set
-`x0x routes` prints** (`/.well-known/agent-card.json` is additionally served
-but is not part of the registry).
+`x0x routes` prints** (two further served paths sit outside the registry:
+`/.well-known/agent-card.json` and the `/gui/` alias).
 
 ## System
 
@@ -120,13 +126,14 @@ but is not part of the registry).
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<x.y.z>","peers":4,"send_ready_peers":4,"uptime_secs":300}
 ```
 
 ### Example: status
 
 ```bash
-curl http://127.0.0.1:12700/status
+TOKEN=$(cat "$HOME/Library/Application Support/x0x/api-token")   # Linux: ~/.local/share/x0x
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 # {
 #   "ok": true,
 #   "status": "connected",
@@ -136,6 +143,7 @@ curl http://127.0.0.1:12700/status
 #   "external_addrs": ["203.0.113.5:5483"],
 #   "agent_id": "8a3f...",
 #   "peers": 4,
+#   "send_ready_peers": 4,
 #   "warnings": []
 # }
 ```
@@ -153,7 +161,7 @@ curl http://127.0.0.1:12700/status
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form, durable-owner only) |
+| POST | `/identity/revoke` | `x0x identity revoke` (single-id forms only) | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form). The binding form is **REST-only**: the CLI has no `move_epoch` flag and never serializes it |
 | GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
@@ -182,10 +190,15 @@ extra fields:
 - `signature` — hex ML-DSA-65 signature over the canonical card bytes.
 
 Verification binds the embedded public key to the card's `agent_id`
-(`agent_id == SHA-256(agent_public_key)`) and then checks the signature, so a
-relay cannot substitute a foreign key. `POST /agent/card/import` rejects a signed
+(`agent_id` is the domain-separated hash of `agent_public_key`) and then
+checks the signature, so a relay cannot substitute a foreign key. `POST /agent/card/import` rejects a signed
 card whose signature fails; legacy unsigned cards (`signature` absent) still
 import for backward compatibility.
+
+**Mixed-fleet caveat (#450, pre-v0.41):** cards embed live DM capabilities in
+their signed bytes; a v0.40.x peer drops the `digest_support` field during
+re-serialization and therefore **fails to verify AgentCards from new daemons**.
+Upgrade peers together — see the README's Known limitations table.
 
 ### Agent card import trust floor
 
@@ -282,7 +295,7 @@ Notes:
 | GET | `/owner/agents` | `x0x owner agents` | Roster of owner-certified agents (journal-backed) |
 | POST | `/owner/agents/issue` | `x0x owner agents issue <PUB_HEX>` | Owner-sign an `AgentCertificate` over a harness-submitted agent **public** key |
 | DELETE | `/owner/agents/:id` | `x0x owner agents revoke <AGENT_ID>` | ADR-0018 owner issuer-revocation of a registered sub-agent |
-| POST | `/owner/riders` | `x0x owner riders issue <AGENT_ID>` | Mint a scoped rider token for a registered rider-mode sub-agent |
+| POST | `/owner/riders` | — (REST/library only; see below) | Mint a scoped rider token for a registered rider-mode sub-agent |
 | GET | `/owner/riders` | `x0x owner riders` | List rider-token records (no secrets) |
 | DELETE | `/owner/riders/:id` | `x0x owner riders revoke <TOKEN_ID>` | Revoke a rider token (fails on next request) |
 
@@ -303,7 +316,13 @@ authority evidence), and the response returns the certificate
 string, "ttl_secs"?: ≤ 90 days, default 7, "delegation": {
 "payload_b64", "signature" } }`) are stored hashed at rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
-The `delegation` capability is REQUIRED and is produced harness-side:
+The `delegation` capability is REQUIRED — a request without it answers
+`400 delegation is required…` — so **the CLI `x0x owner riders issue`
+cannot mint tokens** (it never sends the capability). Certify the
+sub-agent (`POST /owner/agents/issue` with `"mode": "rider"` — the CLI
+equivalent is `x0x owner agents issue <PUB_HEX> --mode rider`), then mint
+via REST with a harness-side capability:
+
 the harness signs `rider_delegation_bytes(sub_agent_id,
 daemon_agent_id, groups, not_after)` with the sub-agent's OWN key
 (helper: `x0x::groups::sign_rider_delegation`); the daemon verifies it
@@ -312,8 +331,10 @@ token, and re-verifies it before every send. A rider token
 authenticates as a distinct principal that may reach exactly:
 
 - `POST /groups/:id/send` — `SignedPublic` groups in its grant list
-- `POST /groups/:id/secure/encrypt` — `MlsEncrypted` groups in its grant
-  list plus Home (always granted)
+- `POST /groups/:id/secure/encrypt` — `MlsEncrypted` groups (incl. Home)
+  **in its grant list** — there is no implicit Home grant; Home's group id
+  must be listed explicitly like any other group (`rider_allows_group`
+  checks the explicit list only)
 - `GET /history` — `group:` scopes it is granted, limit clamped to 100
 
 Every other route — including `/agent/sign`, `/exec/*`, `/identity/*`,
@@ -492,6 +513,20 @@ lifetime; omitted = until deleted). Response: `machine_id`, `enrolled_at_ms`,
 `expires_at_ms` (null = no expiry), `device_count`. A persistence failure is a
 `500` — success is never reported on a swallowed write.
 
+**Enrollment is per-machine and must be bilateral.** A daemon dials sync only
+to machines in *its own* enrolled set (minus itself), and the receiving side
+accepts a stream only from a machine *it* has enrolled. Two machines sync
+when each holds the other's enrollment — run `enroll` on **both** machines,
+each naming the other's machine id (plus itself), or no session is ever
+established.
+
+**What Tier 1 actually applies today:** profile/names converge; the Home
+pointer is synced and **stored for future adoption — it is not applied**
+(each device keeps its own Home, #449); sub-agent issuance journal lines are
+synced as the issuance fact only (digest + time) — `mode` defaults to `acp`,
+`label` is dropped, and **no certificate bytes travel Tier 1** (Tier-3
+boundary), so a synced roster row is not itself mint-capable for riders.
+
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
 machine is refused; existing streams are not torn down mid-flight. `404` when
 the machine is not enrolled; `400` for a malformed id.
@@ -513,7 +548,10 @@ the machine is not enrolled; `400` for a malformed id.
 **The roaming-move ceremony is experimental and OFF by default** — every
 `/agent/move*` endpoint answers **501** with an explanatory body until the
 daemon config sets `[key_move] ceremony_enabled = true`. Shipped posture:
-every agent stays **Pinned**; placement *records* and their enforcement gates
+no move can occur; every roster agent stays **Pinned** at its mint machine —
+except the local agent itself, which the lazy mint deliberately records as
+**Roaming** (epoch 0, inert without the ceremony) to satisfy the ADR-0038
+≥-1-Roaming Home invariant. Placement *records* and their enforcement gates
 (identity ingest, DM inbox, forward, connect-send) are live.
 
 Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
@@ -655,6 +693,7 @@ Query params:
 
 ```bash
 curl -X POST http://127.0.0.1:12700/contacts/<agent_id>/machines \
+  -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"machine_id":"<hex>","pinned":true}'
 ```
@@ -1000,8 +1039,10 @@ optional attribution fields alongside `body` / `kind` / `thread_root` /
 On the wire, both fields live inside the signed `GroupPublicMessage` (v3
 signature domain when populated; byte-identical to earlier domains when both
 are absent). A `kind: "delegation"` carrier must NOT also carry
-`delegation_digest`. The CLI `x0x group send` does not expose `--mentions`
-yet — use the REST surface.
+`delegation_digest`. **Both fields are REST-only today**: `x0x group send`
+exposes no `--mentions` and no `--delegation-digest` flag — use the REST
+surface for attributed sends (grant *issuance* via `x0x group delegate`
+works from the CLI).
 
 ### Delegation (ADR-0040)
 
@@ -1258,6 +1299,15 @@ or
 
 ### Task versions, advisory claims, and local-replica fencing
 
+### Task mutation request fields (ADR-0040 `delegation`)
+
+Task mutations accept optional authority evidence alongside `action`:
+
+| Field | Type | Meaning |
+|---|---|---|
+| `fence_token` | string? | Local-replica fencing precondition; echo a prior token verbatim or the mutation is `409`-rejected |
+| `delegation` | string? | Hex delegation digest — authorization evidence for a `task_execute` claim/complete performed under a delegation. Validated against the group's durably-committed delegation set before the mutation runs; invalid ⇒ `403` and nothing changes. **REST-only**: the tasks CLI cannot supply it |
+
 Every task-list response carries the list's `version` — a local counter bumped
 on each local or merged mutation. Mutation responses (create list, add task,
 claim, complete) return the new version plus `"committed":"local"`:
@@ -1508,8 +1558,18 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| GET | `/upgrade` | `x0x upgrade` | Check for updates |
-| POST | `/upgrade/apply` | `x0x upgrade --apply` | Apply the latest verified release manifest |
+| GET | `/upgrade` | — (CLI does not call this) | Daemon-side check for updates (release manifests over the `x0x/release` gossip topic; GitHub first-discovery fallback) |
+| POST | `/upgrade/apply` | — (CLI does not call this) | Daemon applies the latest verified release manifest with transactional restart |
+
+**The CLI is a separate, standalone updater.** `x0x upgrade [--check]` (and
+`--apply`, which dispatches to the same standalone path — the flag does not
+target the daemon) checks GitHub directly and needs **no running daemon**.
+Drive the daemon-side endpoints above over REST or the GUI. See
+[docs/upgrade-system.md](upgrade-system.md).
+
+**#451 caveat:** never downgrade an owned install to v0.40.x — the old
+binary cannot read the `owner_certified` policy variant and crash-loops; the
+upgrade helper auto-respawns the previous binary on a failed health check.
 
 ## WebSocket and GUI
 
@@ -1597,7 +1657,8 @@ structured push.
 ## Voice (ADR-0042)
 
 Voice has **no REST endpoints** — it is not part of the endpoint registry and
-does not appear in `x0x routes`. Calls are built from existing planes:
+does not appear in `x0x routes`. What ships today is **point-to-point
+(two-party) calls**, feature-gated behind the `voice` cargo feature:
 
 - **Signaling** rides direct messages: payloads prefixed `x0x-voice-sig-v1\n`
   followed by the serialized `SignalingMessage`
@@ -1605,12 +1666,16 @@ does not appear in `x0x routes`. Calls are built from existing planes:
   classified Ephemeral by the ADR-0023 taxonomy — control traffic, not
   conversation history — and reach an API client only as ordinary
   `direct_message` frames (opaque base64).
-- **Media** ride `WebRtcV1` (0x04) byte-streams: u32-BE records over a
-  negotiated unreliable datagram lane with reliable-stream fallback. Calls
-  inherit ordinary identity, trust, and ACL gates; mesh calls are capped at
-  four participants (SFU deferred).
-- **Surface today:** the `x0x::voice` library module. There is no CLI command
-  and no GUI call button yet.
+- **Media** ride `WebRtcV1` (0x04) byte-streams (u32-BE records), audio only.
+  The unreliable-datagram lane is **opt-in** via a mutual capability advert
+  exchanged over the signaling DMs; until (and unless) the peer advertises
+  back, audio keeps the reliable stream. Calls inherit ordinary identity,
+  trust, and ACL gates.
+- **Multi-party mesh** (ADR-0042 design-bounds it at four participants), SFU,
+  and browser access are recorded **ADR follow-ups**, not shipped.
+- **Surface today:** the `x0x::voice` library module (adapters:
+  `X0xSignaling`, `X0xLinkTransport`). There is no CLI command and no GUI
+  call button yet.
 
 ### GUI
 

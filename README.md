@@ -78,12 +78,16 @@ x0x home rename "Alice's Home"     # POST /home/rename {"name":"Alice's Home"}
 **5. Give an AI harness a sub-agent.** Two modes (ADR-0039). The harness generates the keypair and sends you the *public* key; your owner key certifies it:
 
 ```bash
-x0x owner agents issue <PUB_HEX>   # POST /owner/agents/issue — ACP mode: harness owns the key
-x0x owner riders issue <AGENT_ID>  # POST /owner/riders — rider mode: scoped token, see below
-x0x owner agents                   # GET /owner/agents — your roster (journal-backed)
+x0x owner agents issue <PUB_HEX> --mode rider   # POST /owner/agents/issue — certify the key
+                                                 # (--mode acp is the default; see below)
+x0x owner agents                                 # GET /owner/agents — your roster (journal-backed)
+x0x owner riders                                 # GET /owner/riders — token records (no secrets)
 ```
 
-A **rider token** reaches exactly three surfaces — `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt` (Home always granted), and `GET /history` (granted scopes, limit ≤ 100). Everything else — `/agent/sign`, `/exec`, `/owner/*`, `/sync/*`, `/shutdown` — answers `403`. Every rider send is signed by your daemon with the sub-agent's authorization embedded *inside the signed bytes*, so receivers can verify attribution cryptographically. Revoking a rider (or its sub-agent) takes effect on the very next request.
+- **ACP mode** (default): the harness owns the certified key and connects as a full peer. The CLI covers this end-to-end.
+- **Rider mode:** a scoped API token instead of a key. Certify the key with `--mode rider` **via REST or CLI**, then the *harness* signs a delegation capability with the sub-agent's own key and you mint the token with `POST /owner/riders` including that `delegation` field. This mint is **REST/library-only today**: `x0x owner riders issue <AGENT_ID>` cannot send the required capability and answers `400` — use the REST endpoint (or the `x0x` crate's `sign_rider_delegation` helper harness-side). See [docs/api-reference.md](./docs/api-reference.md) for the full flow.
+
+A **rider token** reaches exactly three surfaces — `POST /groups/:id/send`, `POST /groups/:id/secure/encrypt`, and `GET /history` (limit ≤ 100) — and only for **groups explicitly named in its grant list**: there is no implicit Home grant; grant Home's group id like any other group. Everything else — `/agent/sign`, `/exec`, `/owner/*`, `/sync/*`, `/shutdown` — answers `403`. Every rider send is signed by your daemon with the sub-agent's authorization embedded *inside the signed bytes*, so receivers can verify attribution cryptographically. Revoking a rider (or its sub-agent) takes effect on the very next request.
 
 **6. The agent acts on your behalf** — DMs, spaces, delegation, mentions, tasks:
 
@@ -96,25 +100,32 @@ x0x group delegate <GROUP_ID> --to-agent <B> --scope send_as --expiry-ms <MS>
 x0x tasks add <LIST_ID> "ship the release"     # POST /task-lists/:id/tasks
 ```
 
-Mentions are structured (`mentions: [<64-hex agent ids>]` on the send API; no CLI flag yet): receivers route a WS `mention` event when they are named — no string-matching in clients.
+Attribution fields are **REST-only for now** — the CLI cannot supply them:
+`mentions: [<64-hex agent ids>]` and `delegation_digest` on `POST /groups/:id/send`, and the `delegation` field on task claim/complete (authority evidence for acting under a `task_execute` grant). Receivers route a WS `mention` event when they are named — no string-matching in clients. `x0x group delegate` (issuing grants) works from the CLI.
 
-**7. Add a second device.** Put the same user key on the new machine (`x0x user-id create <path> --from-seed <HEX>` re-derives it deterministically, or copy `user.key`), then enroll it into the owner device set:
+**7. Add a second device.** Put the same user key on the new machine (`x0x user-id create <path> --from-seed <HEX>` re-derives it deterministically, or copy `user.key`). Sync then needs **bilateral enrollment** — each daemon dials only machines in *its own* device set, and accepts a stream only from a machine *it* has enrolled — so enroll on **both** machines:
 
 ```bash
-x0x sync enroll                    # POST /sync/devices/enroll (omit body = this machine)
+# on machine A: enroll A itself, then B's machine id
+x0x sync enroll                    # POST /sync/devices/enroll (omit id = this machine)
+x0x sync enroll <B_MACHINE_ID>     # POST /sync/devices/enroll {"machine_id": "..."}
+# on machine B: enroll B itself, then A's machine id — then:
 x0x sync devices                   # GET /sync/devices — device set + last-sync status
 ```
 
-Sync is owner-to-owner only (Tier 1: profile, names, Home roster, sub-agent registry); DMs and other groups' history never replicate. **Caveat today:** each device still provisions its own Home (#449) and a certified join needs the joiner to announce twice (#447) — see [Known limitations](#known-limitations-v041-pre-release).
+Sync is owner-to-owner only (Tier 1: profile, names, Home roster pointer, sub-agent issuance facts); DMs and other groups' history never replicate. As implemented today: the synced Home pointer is **stored for future adoption, not applied** (each device keeps its own Home, #449), and synced sub-agent journal lines record the issuance fact (digest + time) without mode, label, or certificate bytes. Joining one Home from a second device additionally needs the joiner to have announced twice (#447) — see [Known limitations](#known-limitations-v041-pre-release).
 
-**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md): calls signal over DMs (`x0x-voice-sig-v1`), media ride negotiated datagram lanes with reliable-stream fallback, capped at four participants. This is a library surface today (`x0x::voice`) — there is **no CLI or GUI call button yet**; a GUI surface is post-v1.0 work.
+**8. Voice.** Ratified in [ADR-0042](docs/adr/0042-voice-media-over-tailnet-streams.md). What is implemented today is **point-to-point (two-party) calls**: signaling over DMs (`x0x-voice-sig-v1`), audio over `WebRtcV1` streams with an opt-in unreliable-datagram lane (audio only, mutually negotiated) and reliable-stream fallback. It is a library surface behind the `voice` cargo feature (`x0x::voice`) — there is **no CLI or GUI call button yet**, and multi-party mesh (design-bounded at four participants), SFU, and browser access are recorded ADR follow-ups.
 
-**9. Stay current.** Self-update distributes ML-DSA-65-signed manifests over the mesh with transactional restart (GitHub is the first-discovery fallback):
+**9. Stay current.** Two updaters, deliberately separate:
 
 ```bash
-x0x upgrade --check                # GET /upgrade
-x0x upgrade --apply                # POST /upgrade/apply
+x0x upgrade --check    # standalone updater: checks GitHub for a signed release (no daemon needed)
+                      # --apply runs the same standalone path — the flag is accepted but the
+                      # daemon REST endpoints are NOT what the CLI calls
 ```
+
+The daemon's own `GET /upgrade` / `POST /upgrade/apply` distribute ML-DSA-65-signed manifests over the `x0x/release` gossip topic with transactional restart (GitHub is the first-discovery fallback) — drive those over REST or the GUI. See [docs/upgrade-system.md](./docs/upgrade-system.md), and never downgrade an owned install to v0.40.x (#451).
 
 ---
 
@@ -123,7 +134,7 @@ x0x upgrade --apply                # POST /upgrade/apply
 - **Cryptographic Home admission.** Joining a Home requires an agent certificate that chains to *your* owner key — checked when the invite is accepted and again at every state seal. An intruder holding a stolen invite is refused (`403`); a removed agent is gone after the rekey. There is no "admin lets them in" path.
 - **The rider boundary is deny-by-default.** A rider token is not a login: it names exact groups, expires, is stored hashed, and fails closed everywhere except its three granted surfaces. Revocation is effective on the next request, across restarts.
 - **Delegation is attributable, not transferable.** When B acts for A, *B signs with B's own key* and cites A's grant by digest. Receivers re-derive authority from durably-committed history — a forged digest or expired grant is rejected before the message is cached or routed. There is deliberately no owner-transfer verb on the wire.
-- **Placement & key custody.** Every agent is `Pinned` to a machine or `Roaming` in an owner-signed ledger; binding revocation is a permanent tombstone. (The roaming *move ceremony* is experimental and off by default — all agents stay Pinned today; endpoints answer `501`.)
+- **Placement & key custody.** Every agent is `Pinned` to a machine or `Roaming` in an owner-signed ledger; binding revocation is a permanent tombstone. The roaming *move ceremony* is experimental and off by default — no move can occur and `/agent/move*` answers `501`; every roster agent stays Pinned except the local Home agent, which is minted `Roaming` (inert, no ceremony) to satisfy the ≥-1-Roaming Home invariant.
 - **Post-quantum transport, everywhere.** ML-KEM-768 session keys, ML-DSA-65 signatures, MLS (RFC 9420) group encryption. Unsigned or malformed traffic is dropped, never rebroadcast.
 - **What fails closed:** uncertified Home joins, sync streams from non-enrolled machines, forged delegations or relay-payload substitution, malformed mentions, tampered identity cards.
 - **Token classes on the local API:** the durable `api-token` (owner-grade), short-lived 10-minute browser **session tokens**, and rider tokens. See the limitation on session tokens below.
@@ -149,7 +160,7 @@ The Home Suite (ADRs 0036–0043) is on `main` ahead of a v0.41 release. Honest 
 | [#449](https://github.com/saorsa-labs/x0x/issues/449) | Each of your devices auto-provisions its **own** Home; no reconciliation yet. | Treat Home as per-device until fixed; don't market multi-device Home as one space. |
 | [#448](https://github.com/saorsa-labs/x0x/issues/448) / [#450](https://github.com/saorsa-labs/x0x/issues/450) | Mixed old/new fleets: v0.40.x peers can't verify new capability adverts or AgentCards; old→new *strict* DMs answer `409` until the old side upgrades. | Upgrade peers together — avoid long mixed-fleet windows; `--no-durable-ack` reaches old peers when you must. |
 | [#451](https://github.com/saorsa-labs/x0x/issues/451) | An owned install's data dir is not readable by v0.40.x — the old binary crash-loops on the `owner_certified` policy variant, and the upgrader auto-respawns it. | **Never downgrade an owned install to v0.40.x.** |
-| — | Roaming-move ceremony is experimental and disabled (`[key_move] ceremony_enabled = false`); `/agent/move*` answer `501`. | None needed: Pinned-everywhere is the shipped posture; do not enable the ceremony in production. |
+| — | Roaming-move ceremony is experimental and disabled (`[key_move] ceremony_enabled = false`); `/agent/move*` answer `501`. | None needed: no moves can occur in the shipped posture (the local Home agent is minted Roaming, inert without the ceremony); do not enable the ceremony in production. |
 | — | Delegation task-*ownership* transfer (ADR-0040 §"transfer") was descoped pending a non-grindable design. | Use `send_as`/`task_execute` scopes, which are shipped and verified. |
 
 **Versioning / mixed-fleet policy:** wire formats are versioned and old peers fail closed (never mis-admit or mis-verify), but v0.40.x cannot participate in Home Suite features. Plan upgrades as a coordinated roll-forward; keep fleet-wide windows short. ADR-0040's ownership transfer and ADR-0043's ceremony are the two recorded descopes; the ADR index ([docs/adr/README.md](./docs/adr/README.md)) carries the errata.
@@ -284,7 +295,7 @@ x0x start --name bob          # they connect with zero bootstrap configuration
 
 ```toml
 [dependencies]
-x0x = "0.19"
+x0x = "0.40"
 ```
 
 ```rust
