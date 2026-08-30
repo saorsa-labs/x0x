@@ -227,6 +227,7 @@ async fn sender_uses_relay_when_direct_path_fails() {
         kem_algorithm: "ML-KEM-768".to_string(),
         max_envelope_bytes: MAX_ENVELOPE_BYTES,
         kem_public_key: bob_kem.public_bytes.clone(),
+        digest_support: false,
     };
     alice.insert_capability_for_testing(bob_agent_id, bob_machine_id, bob_cap);
 
@@ -316,6 +317,7 @@ async fn enabled_policy_without_candidates_surfaces_direct_err() {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
+            digest_support: false,
         },
     );
     drive_past_relay_threshold(&alice, &bob_agent_id);
@@ -633,6 +635,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
+            digest_support: false,
         },
     );
     drive_past_relay_threshold(&alice, &bob.agent_id());
@@ -779,6 +782,7 @@ fn signed_relayed(origin: &AgentKeypair, dst: AgentId, inner: DmEnvelope) -> Rel
         &origin.agent_id().0,
         &pub_bytes,
         originated,
+        None,
     );
     let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
         origin.secret_key(),
@@ -794,6 +798,10 @@ fn signed_relayed(origin: &AgentKeypair, dst: AgentId, inner: DmEnvelope) -> Rel
             sender_agent_id: origin.agent_id().0,
             sender_public_key: pub_bytes,
             originated_at_unix_ms: originated,
+            // Legacy (digest-less) header: these tests exercise the
+            // pre-#437 sender shape, which remains accepted per the
+            // documented transition.
+            inner_digest: None,
             signature,
         },
         inner,
@@ -1031,4 +1039,396 @@ async fn forged_inner_relayed_dm_is_never_a_verified_delivery() {
         attacker.agent_id(),
         "the wire sender is the attacker's self-asserted agent id"
     );
+}
+
+/// #437 — the RELAY-HOP attack, end to end through the real listener.
+///
+/// Threat model: Bob's end-to-end integrity never depended on the relay
+/// header (the inner `DmEnvelope` carries its own ML-DSA-65 signature —
+/// a substituted envelope is attributable to *its* real author, never a
+/// forgery of the original sender). What #437 closes is the relay hop:
+/// Charlie-the-relay's contact gate (#193) and forward rate/bandwidth
+/// accounting act on the HEADER's authenticated sender. Here Alice
+/// (the header sender, a passing contact on a contact-gated relay —
+/// equivalently any sender on this open-relay config) signs a bound
+/// header for inner A addressed to Bob; an on-path holder swaps in an
+/// unrelated well-formed inner B and hands the frame to Charlie for
+/// forwarding. Pre-fix, Charlie would classify Forward — spending its
+/// uplink and quota on bytes authored by someone else, attributed to
+/// Alice. Post-fix the digest gate refuses BEFORE the contact gate or
+/// any quota admission.
+///
+/// Assertions target Charlie's relay-hop decision: the mismatch refusal
+/// counter advances, `relay_forwarded` and `relay_received` stay flat
+/// (no accounting attributed to Alice), and nothing is re-injected
+/// locally (dst is Bob, not Charlie). Bob-side header↔inner
+/// verification is out of scope by construction — the forward arm
+/// delivers only the inner envelope; the header never travels past the
+/// relay hop.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn relay_hop_substituted_inner_is_refused_before_forward_accounting() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping substituted_inner: bind permission unavailable");
+            return;
+        }
+    };
+    charlie.join_network().await.expect("charlie join_network");
+
+    // Bob is the final recipient; Charlie is the intermediate relay the
+    // frame is handed to for forwarding (dst != Charlie → forward arm).
+    let bob = AgentId([0x55; 32]);
+
+    // Alice signs a bound header for inner A, addressed to Bob.
+    let alice = AgentKeypair::generate().expect("alice keypair");
+    let inner_a = opaque_inner(alice.agent_id().0, [0x22; 32], vec![0u8; 8]);
+    let digest = RelayedDm::inner_digest_of(&inner_a).expect("canonical encode inner A");
+    let (pub_bytes, _sec_bytes) = alice.to_bytes();
+    let originated = now_unix_ms();
+    let signing_bytes = RelayHeader::signing_bytes(
+        RelayHeader::VERSION,
+        &bob.0,
+        &alice.agent_id().0,
+        &pub_bytes,
+        originated,
+        Some(&digest),
+    );
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        alice.secret_key(),
+        &signing_bytes,
+    )
+    .expect("ml-dsa sign bound relay header");
+
+    // ...but the frame carries unrelated inner B — a well-formed envelope
+    // from a different origin, the exact relay-hop substitution. Pre-fix
+    // this classifies Forward (spending Charlie's uplink/quota on
+    // Mallory's bytes, attributed to Alice).
+    let inner_b = opaque_inner([0x99; 32], [0x88; 32], vec![0xCD; 32]);
+    let relayed = RelayedDm {
+        header: RelayHeader {
+            version: RelayHeader::VERSION,
+            dst_agent_id: bob.0,
+            sender_agent_id: alice.agent_id().0,
+            sender_public_key: pub_bytes,
+            originated_at_unix_ms: originated,
+            inner_digest: Some(digest),
+            signature: signature.as_bytes().to_vec(),
+        },
+        inner: inner_b,
+    };
+
+    let pre_refusals = charlie
+        .peer_relay()
+        .stats()
+        .snapshot()
+        .relay_refused_inner_digest_mismatch;
+    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
+    let pre_received = charlie.peer_relay().stats().snapshot().relay_received;
+    let mut charlie_sub = charlie.subscribe_direct();
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), relayed)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+
+    // The digest gate must refuse the substituted frame...
+    let start = tokio::time::Instant::now();
+    loop {
+        if charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_inner_digest_mismatch
+            == pre_refusals + 1
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "relay_refused_inner_digest_mismatch never advanced — the substituted inner was NOT dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    // ...with no forward accounting attributed to the header's sender
+    // (the relay-hop decision this test exists to measure)...
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded,
+        pre_forwarded,
+        "no forward may be spent on a substituted envelope — quota stays unattributed to Alice"
+    );
+    // ...no receive accounting (the frame is addressed to Bob)...
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_received,
+        pre_received,
+        "a frame addressed to Bob must not count as received by Charlie"
+    );
+    // ...and nothing may reach Charlie's direct subscribers.
+    match tokio::time::timeout(Duration::from_millis(300), charlie_sub.recv()).await {
+        Err(_) => {}
+        Ok(msg) => panic!("substituted inner must NOT be delivered, got {msg:?}"),
+    }
+}
+
+/// #437 rounds 5+6, downgrade detection end-to-end with a REAL Bob so
+/// every acceptance is asserted as a positive outcome (Bob actually
+/// receives the inner envelope), not just "a counter stayed zero".
+///
+/// 1. Convergence leg: Mallory's advert sets `digest_support` (a
+///    capability-presence rule would reject her v1), but Charlie has
+///    never seen a v2 frame from her → her v1 frame is ACCEPTED:
+///    classified Forward and DELIVERED to Bob.
+/// 2. Baseline leg: a fully-valid fresh v2 frame is ACCEPTED — Bob
+///    receives it — and (post-gate) sets Charlie's downgrade baseline.
+/// 3. Downgrade leg: Mallory's next v1 frame is rejected
+///    (`MissingInnerDigest`); Bob receives nothing further.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn v2_then_v1_downgrade_is_rejected_but_converging_v1_is_not() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping downgrade_detect: bind permission unavailable");
+            return;
+        }
+    };
+    let bob = match build_agent(
+        &dir,
+        "bob",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build bob")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping downgrade_detect: bob bind permission unavailable");
+            return;
+        }
+    };
+    bob.join_network().await.expect("bob join_network");
+    charlie.join_network().await.expect("charlie join_network");
+
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let bob_addr = normalize_loopback(
+        bob.network()
+            .expect("bob network")
+            .bound_addr()
+            .await
+            .expect("bob bound"),
+    );
+    let charlie_addr = normalize_loopback(
+        charlie
+            .network()
+            .expect("charlie network")
+            .bound_addr()
+            .await
+            .expect("charlie bound"),
+    );
+    // Charlie needs Bob (forward-arm destination); Bob needs Charlie
+    // (the wire-layer sender his binding check sees).
+    charlie
+        .insert_discovered_agent_for_testing(discovered_for(&bob, bob_addr, now_secs))
+        .await;
+    bob.insert_discovered_agent_for_testing(discovered_for(&charlie, charlie_addr, now_secs))
+        .await;
+    let charlie_network = charlie.network().expect("charlie network");
+    let charlie_to_bob = charlie_network
+        .connect_addr(bob_addr)
+        .await
+        .expect("charlie connects to bob");
+    assert_eq!(charlie_to_bob.0, bob.machine_id().0);
+    wait_until_connected(
+        &charlie,
+        ant_quic::PeerId(bob.machine_id().0),
+        Duration::from_secs(5),
+    )
+    .await;
+
+    // Mallory: a virtual sender whose advert DOES set digest_support —
+    // a capability-presence rule would reject her v1 frames. This is
+    // the asymmetric-cache state the test pins.
+    let mallory = AgentKeypair::generate().expect("mallory keypair");
+    let machine = MachineKeypair::generate().expect("mallory machine keypair");
+    charlie.insert_capability_for_testing(
+        mallory.agent_id(),
+        machine.machine_id(),
+        DmCapabilities::v1_gossip_ready(vec![0x11; 16]),
+    );
+    let mut bob_sub = bob.subscribe_direct();
+
+    let v1_frame = |nonce: u8| {
+        signed_relayed(
+            &mallory,
+            bob.agent_id(),
+            opaque_inner(mallory.agent_id().0, [nonce; 32], vec![0u8; 8]),
+        )
+    };
+
+    // Leg 1 — convergence: v1 from a never-seen-on-v2 sender. POSITIVE:
+    // Bob receives the inner envelope; the refusal counter stays flat.
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), v1_frame(0x22))
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+    let delivered = tokio::time::timeout(Duration::from_secs(3), bob_sub.recv())
+        .await
+        .expect("convergence leg: the accepted v1 frame must reach Bob")
+        .expect("bob subscription open");
+    assert_eq!(
+        delivered.sender,
+        charlie.agent_id(),
+        "wire-layer sender is the forwarder (Charlie), per the relay pattern"
+    );
+    let inner_v1 = x0x::dm::DmEnvelope::from_wire_bytes(&delivered.payload)
+        .expect("delivered payload is a wire-encoded DmEnvelope");
+    assert_eq!(
+        inner_v1.sender_agent_id,
+        mallory.agent_id().0,
+        "embedded sender_agent_id identifies Mallory as the true origin"
+    );
+    assert_eq!(inner_v1.sender_machine_id, [0x22; 32], "leg-1 frame");
+    assert_eq!(
+        charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest,
+        0,
+        "convergence leg: no downgrade refusal for a never-seen-on-v2 sender"
+    );
+
+    // Leg 2 — the valid fresh v2 frame: POSITIVE acceptance — Bob
+    // receives it — and it sets the post-gate baseline.
+    let (pub_bytes, _sec) = mallory.to_bytes();
+    let inner = opaque_inner(mallory.agent_id().0, [0x31; 32], vec![0u8; 8]);
+    let digest = RelayedDm::inner_digest_of(&inner).expect("canonical encode");
+    let originated = now_unix_ms();
+    let signing_bytes = RelayHeader::signing_bytes(
+        RelayHeader::VERSION,
+        &bob.agent_id().0,
+        &mallory.agent_id().0,
+        &pub_bytes,
+        originated,
+        Some(&digest),
+    );
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        mallory.secret_key(),
+        &signing_bytes,
+    )
+    .expect("sign v2 header");
+    let v2_frame = RelayedDm {
+        header: RelayHeader {
+            version: RelayHeader::VERSION,
+            dst_agent_id: bob.agent_id().0,
+            sender_agent_id: mallory.agent_id().0,
+            sender_public_key: pub_bytes,
+            originated_at_unix_ms: originated,
+            inner_digest: Some(digest),
+            signature: signature.as_bytes().to_vec(),
+        },
+        inner,
+    };
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), v2_frame)
+            .await,
+        "seam must accept the v2 frame"
+    );
+    let delivered_v2 = tokio::time::timeout(Duration::from_secs(3), bob_sub.recv())
+        .await
+        .expect("baseline leg: the accepted v2 frame must reach Bob")
+        .expect("bob subscription open");
+    assert_eq!(delivered_v2.sender, charlie.agent_id());
+    let inner_v2 = x0x::dm::DmEnvelope::from_wire_bytes(&delivered_v2.payload)
+        .expect("delivered payload is a wire-encoded DmEnvelope");
+    assert_eq!(inner_v2.sender_agent_id, mallory.agent_id().0);
+    assert_eq!(inner_v2.sender_machine_id, [0x31; 32], "leg-2 v2 frame");
+    assert_eq!(
+        charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest,
+        0,
+        "the valid v2 frame itself is accepted"
+    );
+
+    // Leg 3 — the downgrade: v1 from the now-baselined sender. Rejected
+    // before any forward; Bob receives nothing further.
+    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), v1_frame(0x23))
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+    let start = tokio::time::Instant::now();
+    loop {
+        if charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest
+            == 1
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "relay_refused_missing_inner_digest never advanced — the downgrade was NOT rejected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded,
+        pre_forwarded,
+        "no forward may be spent on a downgraded frame"
+    );
+    match tokio::time::timeout(Duration::from_millis(300), bob_sub.recv()).await {
+        Err(_) => {}
+        Ok(msg) => panic!("downgraded frame must NOT be delivered, got {msg:?}"),
+    }
 }

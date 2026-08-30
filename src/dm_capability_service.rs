@@ -158,7 +158,7 @@ pub(crate) fn ingest_verified_capability_advert(
     if pubsub_sender == self_agent_id {
         return false;
     }
-    let advert: CapabilityAdvert = match postcard::from_bytes(&message.payload) {
+    let advert = match CapabilityAdvert::from_postcard(&message.payload) {
         Ok(advert) => advert,
         Err(_) => return false,
     };

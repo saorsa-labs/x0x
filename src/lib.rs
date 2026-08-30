@@ -6122,16 +6122,38 @@ impl Agent {
         let (sender_pub_bytes, sender_sec_bytes) = self.identity.agent_keypair().to_bytes();
         let sender_secret = ant_quic::MlDsaSecretKey::from_bytes(&sender_sec_bytes)
             .map_err(|e| dm::DmError::RelayBuildFailed(format!("agent secret key: {e:?}")))?;
+        // #437 rounds 3+4 (mixed-fleet interop): emit the bound v2 frame
+        // shape only when the RELAY CANDIDATE (the peer that must decode
+        // this frame) has a confirmed advert with `digest_support`; else
+        // emit the byte-identical v1 frame so an old relay can still
+        // parse, gate, and forward. Unknown capability defaults to v1.
+        // Receivers enforce the converse by DOWNGRADE DETECTION: a
+        // digest-less frame is rejected only from a sender the relay
+        // previously observed emitting a valid v2 frame (see
+        // `peer_relay::PeerRelay::disposition_for`).
+        let bind_inner = peer_relay::peer_advertises_inner_digest(
+            self.capability_store.lookup(&relay_agent).as_ref(),
+        );
         let relayed = self
             .peer_relay
-            .build_relayed_dm(to, &sender, sender_pub_bytes, now, envelope, |bytes| {
-                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&sender_secret, bytes)
-                    .map(|s| s.as_bytes().to_vec())
-                    .map_err(|e| format!("{e:?}"))
-            })
+            .build_relayed_dm(
+                to,
+                &sender,
+                sender_pub_bytes,
+                now,
+                envelope,
+                bind_inner,
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&sender_secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
             .map_err(dm::DmError::RelayBuildFailed)?;
 
-        let wire = postcard::to_allocvec(&relayed).map_err(|e| {
+        // `to_postcard` emits byte-exact v1 for digest-less frames, so
+        // the wire shape always matches what the chosen header signed.
+        let wire = relayed.to_postcard().map_err(|e| {
             dm::DmError::EnvelopeConstruction(format!("relayed envelope postcard: {e}"))
         })?;
         let network = self
@@ -16243,6 +16265,21 @@ pub const NAME: &str = "x0x";
 /// check a revoked agent that cannot direct-connect (e.g. NAT-blocked)
 /// could still reach the recipient via a relay, bypassing revocation.
 /// A revoked origin is dropped and counted as `relay_dropped_revoked`.
+///
+/// # Inner-payload binding (#437)
+///
+/// `disposition_for` enforces `header.inner_digest == blake3(inner)`
+/// for headers that carry a digest **before** any sender gating or
+/// accounting is acted on: a relay (or on-path holder of a valid
+/// header) cannot substitute a different valid `DmEnvelope` under an
+/// unrelated header, because the refusal precedes the contact gate,
+/// `relay_received`/forward accounting, and quota admission. Legacy
+/// digest-less headers (pre-#437 senders) keep today's behavior per the
+/// documented transition. Round 5: digest-less headers from a sender
+/// previously observed on a fully-valid v2 frame are rejected as a
+/// downgrade (`MissingInnerDigest`) — decided by `disposition_for`'s
+/// local v2 baseline, not by advert-cache presence, so asymmetric cache
+/// states during convergence never drop legitimate v1 frames.
 fn spawn_relay_dm_listener(
     network: std::sync::Arc<network::NetworkNode>,
     peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
@@ -20657,6 +20694,7 @@ mod tests {
                 // Empty pubkey + signature: header.verify() must fail.
                 sender_public_key: Vec::new(),
                 originated_at_unix_ms: dm::now_unix_ms(),
+                inner_digest: None,
                 signature: Vec::new(),
             },
             inner: dm::DmEnvelope {

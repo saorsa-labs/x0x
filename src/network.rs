@@ -1230,7 +1230,8 @@ pub fn validate_plane_id(id: &str) -> Result<(), String> {
 /// 3. `crate::peer_relay::RelayedDm` - the parsed envelope. The
 ///    *original* sender's identity lives inside
 ///    `relayed.header.sender_agent_id`, trust-anchored by the header's
-///    ML-DSA-65 signature, not by the wire prefix.
+///    ML-DSA-65 signature (which, since #437, also binds the carried
+///    inner payload via `inner_digest`), not by the wire prefix.
 pub type RelayedDmEvent = (AntPeerId, [u8; 32], crate::peer_relay::RelayedDm);
 
 const CHANNEL_PRESSURE_INFO_INTERVAL: Duration = Duration::from_secs(30);
@@ -4079,8 +4080,9 @@ impl NetworkNode {
                             // capped by `MAX_DIRECT_PAYLOAD_SIZE`; the +32 +
                             // 8 KiB allowance covers the relay prefix plus the
                             // RelayHeader (ML-DSA-65 pubkey 1952 + signature
-                            // 3293 + dst/sender agent ids + timestamps fits
-                            // comfortably under 8 KiB).
+                            // 3293 + dst/sender agent ids + timestamps +
+                            // #437 inner_digest 32 fits comfortably under
+                            // 8 KiB).
                             if data.len() > crate::direct::MAX_DIRECT_PAYLOAD_SIZE + 32 + 8 * 1024 {
                                 warn!(
                                     "[1/6 network] dropping oversized RelayedDm: {} bytes from peer {:?} (max: {})",
@@ -4093,9 +4095,10 @@ impl NetworkNode {
                             let mut relay_sender_agent_id = [0u8; 32];
                             relay_sender_agent_id.copy_from_slice(&data[1..33]);
                             let body = &data[33..];
-                            let relayed = match postcard::from_bytes::<crate::peer_relay::RelayedDm>(
-                                body,
-                            ) {
+                            // #437: two-stage decode — v2 (digest-bound)
+                            // first, then the byte-exact v1 legacy shape,
+                            // so pre-#437 senders' frames still parse.
+                            let relayed = match crate::peer_relay::RelayedDm::from_postcard(body) {
                                 Ok(r) => r,
                                 Err(e) => {
                                     warn!(

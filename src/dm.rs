@@ -83,13 +83,39 @@ pub struct DmCapabilities {
 
     /// Maximum envelope size (in bytes) this agent will accept.
     pub max_envelope_bytes: usize,
-
     /// ML-KEM-768 public key bytes. Senders encapsulate the per-message
     /// content key to this key. Empty means "not yet available" — senders
     /// MUST fall back to the raw-QUIC path (or return
     /// `DmError::RecipientKeyUnavailable` when `require_gossip` is set).
     #[serde(default)]
     pub kem_public_key: Vec<u8>,
+
+    /// #437: this daemon verifies and enforces `RelayHeader.inner_digest`
+    /// (the v2 relay frame shape). Relay senders consult the candidate's
+    /// advertised capability and emit the digest-bound v2 frame only to
+    /// such peers, falling back to the byte-identical v1 frame otherwise
+    /// (see `peer_relay::peer_advertises_inner_digest`). On the receive
+    /// side this bit does NOT itself trigger rejection — receivers
+    /// reject a digest-less header only after observing a gate-passed v2
+    /// baseline from that same sender (observed-downgrade detection;
+    /// TTL-expiring, hard-capped baseline — see
+    /// `peer_relay::PeerRelay::disposition_for`).
+    ///
+    /// Wire: `false` is the pre-#437 value and is **omitted** from the
+    /// serialization when false, so a false bit encodes byte-identically
+    /// to the old struct; a true bit appends one byte. Old peers cannot
+    /// verify a true-valued advert (advert verification re-serializes
+    /// the decoded struct) and drop it — a documented, self-healing
+    /// transition cost; new peers decode both shapes (two-stage, see
+    /// `dm_capability::CapabilityAdvert::from_postcard`).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub digest_support: bool,
+}
+
+/// Serde helper: omit `digest_support` when false so the encoding stays
+/// byte-identical to the pre-#437 `DmCapabilities`.
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 impl DmCapabilities {
@@ -114,6 +140,9 @@ impl DmCapabilities {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: Vec::new(),
+            // Placeholder material is never published and never
+            // represents a wired v2 relay peer.
+            digest_support: false,
         }
     }
 
@@ -127,6 +156,8 @@ impl DmCapabilities {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key,
+            // #437: this build verifies and enforces inner_digest.
+            digest_support: true,
         }
     }
 
@@ -143,6 +174,8 @@ impl DmCapabilities {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key,
+            // #437: this build verifies and enforces inner_digest.
+            digest_support: true,
         }
     }
 
