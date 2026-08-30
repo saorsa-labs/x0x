@@ -485,8 +485,10 @@ must locally delete + rejoin.
 | DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | bearer (see #446) | Remove a machine from the device set |
 
 All three answer `409` when no owner identity is configured. Sync replicates
-owner state **owner-to-owner only** — Tier 1: profile/names, Home roster,
-sub-agent registry (ADR-0041). Other groups' history, DMs, and exec data
+owner state **owner-to-owner only** — Tier 1: profile/names, the Home
+roster pointer (stored for future adoption), and sub-agent issuance facts
+(ADR-0041; see "What Tier 1 actually applies today" below). Other groups'
+history, DMs, and exec data
 never replicate, and no third party receives the state. Inbound SyncV1 streams
 are refused at the enrollment gate unless the enrollment signature and
 currency (expiry) verify — corrupt, foreign-key, or stale enrollments never
@@ -1297,8 +1299,6 @@ or
 {"action":"complete"}
 ```
 
-### Task versions, advisory claims, and local-replica fencing
-
 ### Task mutation request fields (ADR-0040 `delegation`)
 
 Task mutations accept optional authority evidence alongside `action`:
@@ -1307,6 +1307,8 @@ Task mutations accept optional authority evidence alongside `action`:
 |---|---|---|
 | `fence_token` | string? | Local-replica fencing precondition; echo a prior token verbatim or the mutation is `409`-rejected |
 | `delegation` | string? | Hex delegation digest — authorization evidence for a `task_execute` claim/complete performed under a delegation. Validated against the group's durably-committed delegation set before the mutation runs; invalid ⇒ `403` and nothing changes. **REST-only**: the tasks CLI cannot supply it |
+
+### Task versions, advisory claims, and local-replica fencing
 
 Every task-list response carries the list's `version` — a local counter bumped
 on each local or merged mutation. Mutation responses (create list, add task,

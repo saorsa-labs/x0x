@@ -38,7 +38,7 @@ x0x is built around a **human owner** and their agents, not around a server:
 - **Home** (ADR-0038): a private, encrypted space that only *your* owner-certified agents can join — admission is a cryptographic check, not an admin's judgement call.
 - **Sub-agents** (ADR-0039): give an AI harness an **ACP key** (it owns the keypair, your owner key certifies it) or a **rider token** (deny-by-default scoped token; your daemon signs and attributes every send).
 - **Delegation** (ADR-0040): agent A can grant agent B bounded, expiring authority *inside a space* — B acts signed with B's own key, citing A's grant.
-- **Sync** (ADR-0041): your second machine replicates owner state (names, Home roster, sub-agent registry) owner-to-owner; nobody else ever sees it.
+- **Sync** (ADR-0041): your second machine replicates owner state owner-to-owner — names converge fully; the Home roster arrives as a pointer for future adoption and sub-agent records as issuance facts. Nobody else ever sees it.
 
 ---
 
@@ -106,10 +106,15 @@ Attribution fields are **REST-only for now** — the CLI cannot supply them:
 **7. Add a second device.** Put the same user key on the new machine (`x0x user-id create <path> --from-seed <HEX>` re-derives it deterministically, or copy `user.key`). Sync then needs **bilateral enrollment** — each daemon dials only machines in *its own* device set, and accepts a stream only from a machine *it* has enrolled — so enroll on **both** machines:
 
 ```bash
-# on machine A: enroll A itself, then B's machine id
+# on machine A — enroll A itself, then B's machine id:
 x0x sync enroll                    # POST /sync/devices/enroll (omit id = this machine)
 x0x sync enroll <B_MACHINE_ID>     # POST /sync/devices/enroll {"machine_id": "..."}
-# on machine B: enroll B itself, then A's machine id — then:
+
+# on machine B — enroll B itself, then A's machine id:
+x0x sync enroll
+x0x sync enroll <A_MACHINE_ID>
+
+# then, on either machine:
 x0x sync devices                   # GET /sync/devices — device set + last-sync status
 ```
 
