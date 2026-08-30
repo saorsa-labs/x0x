@@ -57,6 +57,22 @@ fn owner_missing() -> (StatusCode, Json<serde_json::Value>) {
     )
 }
 
+/// Review-r4 scope gate: the roaming-move ceremony is experimental in v1
+/// and OFF by default (`[key_move] ceremony_enabled`). When off, every
+/// ceremony endpoint answers `501` — no `MoveAuthorization` can be
+/// chained, so no agent ever enters MidMove/quiesced/quarantined and the
+/// ceremony-durability/universal-signing holes are unreachable. The
+/// shipped core (enrollment, mint/ledger, B/P enforcement) is always on.
+fn ceremony_disabled(state: &AppState) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    if state.key_move_ceremony_enabled {
+        return None;
+    }
+    Some(api_error(
+        StatusCode::NOT_IMPLEMENTED,
+        "roaming-move ceremony is experimental in v1 and disabled on this daemon ([key_move] ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable",
+    ))
+}
+
 // ── POST /agent/move — authorize (+ export when local) ───────────────────────
 
 /// Request body for `POST /agent/move`.
@@ -85,6 +101,9 @@ pub(in crate::server) async fn agent_move_authorize(
     >,
     Json(body): Json<MoveAuthorizeRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -134,6 +153,9 @@ pub(in crate::server) async fn agent_move_export(
     >,
     Json(bundle): Json<TransferBundle>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -162,6 +184,9 @@ pub(in crate::server) async fn agent_move_import(
     >,
     Json(bundle): Json<TransferBundle>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -207,6 +232,9 @@ pub(in crate::server) async fn agent_move_activate(
     >,
     Json(body): Json<MoveEpochRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -248,6 +276,9 @@ pub(in crate::server) async fn agent_move_abort(
     >,
     Json(body): Json<MoveAbortRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -290,6 +321,9 @@ pub(in crate::server) async fn agent_move_retire(
     >,
     Json(body): Json<MoveEpochRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     if !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
@@ -328,6 +362,9 @@ pub(in crate::server) async fn agent_moves(
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<std::collections::HashMap<String, String>>,
 ) -> impl IntoResponse {
+    if let Some(resp) = ceremony_disabled(&state) {
+        return resp;
+    }
     let agent = match params
         .get("agent_id")
         .map(|hex_id| parse_hex_id(hex_id, "agent_id").map(AgentId))
@@ -788,4 +825,203 @@ mod tests {
     }
 
     fn response_status(_body: &serde_json::Value) {}
+}
+
+#[cfg(test)]
+mod gate_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use crate::key_move::ChainedRecord;
+    use crate::server::rider_auth::ActorContext;
+    use std::sync::Arc;
+
+    async fn owned_state(data_dir: &std::path::Path) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::generate()?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_identity_dir(data_dir)
+                .build()
+                .await?,
+        );
+        crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(data_dir, agent)
+            .await
+    }
+
+    /// WHY (review r4 scope decision): with `[key_move] ceremony_enabled`
+    /// unset (the DEFAULT), every `/agent/move*` endpoint must answer 501
+    /// — no authorization can be chained, so no agent can ever enter
+    /// MidMove/quiesced/quarantined and the ceremony-durability and
+    /// universal-signing holes are unreachable in the shipped posture —
+    /// while the SHIPPED CORE (placement ledger, lazy mint, B/P
+    /// enforcement inputs) stays live: /owner/placement mints and every
+    /// roster agent stays Pinned to its mint machine (the local agent is
+    /// minted Roaming per the ADR-0038 Home invariant — inert without the
+    /// ceremony).
+    #[tokio::test]
+    async fn ceremony_endpoints_501_when_disabled_agents_stay_pinned() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut state = owned_state(dir.path()).await?;
+        // The shared test helper enables the ceremony; flip to the SHIPPED
+        // default (off) — the only reference is this one, so get_mut works.
+        Arc::get_mut(&mut state)
+            .expect("sole state ref")
+            .key_move_ceremony_enabled = false;
+
+        let owner = axum::Extension(ActorContext::Owner { durable: true });
+        let agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+        let stranger = hex::encode([7u8; 32]);
+
+        // Every ceremony endpoint: 501, before any auth or body parsing
+        // side effects can matter.
+        let cases: Vec<(StatusCode, String)> = vec![
+            (
+                agent_move_authorize(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(MoveAuthorizeRequest {
+                        agent_id: agent_hex.clone(),
+                        to_machine: stranger.clone(),
+                        placement: "roaming".to_string(),
+                        pin: None,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "authorize".into(),
+            ),
+            (
+                agent_move_export(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(TransferBundle {
+                        authorization: ChainedRecord {
+                            prev: [0u8; 32],
+                            record: crate::key_move::MoveRecord::PlacementMint {
+                                agent_id: crate::identity::AgentId([1; 32]),
+                                placement: crate::key_move::Placement::Roaming,
+                                custodian_machine: MachineId([2; 32]),
+                                issued_at: 0,
+                            },
+                            owner_public_key: vec![],
+                            owner_signature: vec![],
+                        },
+                        export_receipt: None,
+                        envelope: None,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "export".into(),
+            ),
+            (
+                agent_move_import(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(TransferBundle {
+                        authorization: ChainedRecord {
+                            prev: [0u8; 32],
+                            record: crate::key_move::MoveRecord::PlacementMint {
+                                agent_id: crate::identity::AgentId([1; 32]),
+                                placement: crate::key_move::Placement::Roaming,
+                                custodian_machine: MachineId([2; 32]),
+                                issued_at: 0,
+                            },
+                            owner_public_key: vec![],
+                            owner_signature: vec![],
+                        },
+                        export_receipt: None,
+                        envelope: None,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "import".into(),
+            ),
+            (
+                agent_move_activate(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(MoveEpochRequest {
+                        agent_id: agent_hex.clone(),
+                        move_epoch: 1,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "activate".into(),
+            ),
+            (
+                agent_move_abort(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(MoveAbortRequest {
+                        agent_id: agent_hex.clone(),
+                        move_epoch: 1,
+                        reason: None,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "abort".into(),
+            ),
+            (
+                agent_move_retire(
+                    State(Arc::clone(&state)),
+                    owner.clone(),
+                    Json(MoveEpochRequest {
+                        agent_id: agent_hex.clone(),
+                        move_epoch: 1,
+                    }),
+                )
+                .await
+                .into_response()
+                .status(),
+                "retire".into(),
+            ),
+            (
+                agent_moves(
+                    State(Arc::clone(&state)),
+                    axum::extract::Query(std::collections::HashMap::new()),
+                )
+                .await
+                .into_response()
+                .status(),
+                "moves".into(),
+            ),
+        ];
+        for (status, name) in cases {
+            assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{name} must be 501");
+        }
+
+        // The shipped core stays live: the ledger mints and the roster
+        // placement view is queryable (agents stay Pinned-in-practice; the
+        // local agent's Home-invariant Roaming mint is inert without the
+        // ceremony).
+        let response = owner_placement(State(Arc::clone(&state)), owner)
+            .await
+            .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(
+            body["home_invariant_ok"], true,
+            "mint still guarantees >=1 Roaming"
+        );
+        assert!(
+            body["placements"].as_array().is_some_and(|p| !p.is_empty()),
+            "ledger view live: {body:?}"
+        );
+        Ok(())
+    }
 }

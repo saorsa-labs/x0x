@@ -5480,6 +5480,21 @@ impl Agent {
         (peer.stats.avg_rtt_ms > 0).then_some(peer.stats.avg_rtt_ms)
     }
 
+    /// ADR-0043 §9 outbound B/P (review r4 H5): evaluate the pairing for
+    /// a RESOLVED recipient machine — whichever source resolved it
+    /// (discovery cache, capability-advert binding, or the DM connection
+    /// registry). Present evidence fails closed; absent evidence fails
+    /// open (§9.3).
+    async fn recipient_pairing_denied(
+        &self,
+        to: &identity::AgentId,
+        machine: &identity::MachineId,
+    ) -> Option<key_move::PairingDenial> {
+        let revoked = self.revocation_set.read().await;
+        let placements = self.move_state.read().await;
+        key_move::enforce_pairing(&revoked, placements.placement_view(), to, machine)
+    }
+
     /// X0X-0041: build a prefer-newest-connection hint for the gossip-DM
     /// retry loop. Returns `None` when the recipient's machine_id is unknown
     /// (e.g. uninitialised discovery cache); in that case the gossip path
@@ -5613,19 +5628,17 @@ impl Agent {
                     .to_string(),
             ));
         }
-        // ADR-0043 §9 (review r2 H5): outbound DMs resolve a recipient
+        // ADR-0043 §9 (review r2/r4 H5): outbound DMs resolve a recipient
         // machine — evaluate B+P for the pairing before transmitting, so
-        // nothing is delivered to a retired old-source binding.
+        // nothing is delivered to a retired old-source binding. This first
+        // pass covers the DISCOVERY-CACHED machine; the capability-advert
+        // binding and the DM-registry/raw-QUIC resolutions re-check below
+        // (they can resolve a machine the discovery cache never saw).
         if let Some(machine_id) = {
             let cache = self.identity_discovery_cache.read().await;
             cache.get(to).map(|entry| entry.machine_id)
         } {
-            let denied = {
-                let revoked = self.revocation_set.read().await;
-                let placements = self.move_state.read().await;
-                key_move::enforce_pairing(&revoked, placements.placement_view(), to, &machine_id)
-            };
-            if let Some(denial) = denied {
+            if let Some(denial) = self.recipient_pairing_denied(to, &machine_id).await {
                 self.direct_messaging.record_outgoing_failed(*to);
                 return Err(dm::DmError::EnvelopeConstruction(format!(
                     "recipient pairing denied (ADR-0043 B/P): {denial:?}"
@@ -5730,6 +5743,20 @@ impl Agent {
             source = cap_source,
             capability_store_entries = self.capability_store.len(),
         );
+
+        // ADR-0043 §9 (review r4 H5): the capability-advert BINDING can
+        // pin a machine the discovery cache never saw — when the gossip
+        // path will use it, evaluate B+P for that pairing too.
+        if gossip_ok {
+            if let Some(cap_machine) = cap_machine {
+                if let Some(denial) = self.recipient_pairing_denied(to, &cap_machine).await {
+                    self.direct_messaging.record_outgoing_failed(*to);
+                    return Err(dm::DmError::EnvelopeConstruction(format!(
+                        "recipient pairing denied (ADR-0043 B/P, capability binding): {denial:?}"
+                    )));
+                }
+            }
+        }
 
         if config.require_durable_app_ack
             && !capability_binding_supports_durable_ack(
@@ -6343,6 +6370,24 @@ impl Agent {
                 (id, "post_connect")
             }
         };
+
+        // ADR-0043 §9 (review r4 H5): the DM-connection REGISTRY can
+        // resolve a machine the discovery cache never saw (raw-QUIC
+        // fallback) — evaluate B+P for whatever machine was resolved so a
+        // DM cannot reach a retired old-source binding through it.
+        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+            tracing::info!(
+                target: "x0x::direct",
+                stage = "send",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                outcome = "drop_pairing",
+                reason = ?denial,
+                "raw-QUIC send refused: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
+        }
 
         // Check if connected. ant-quic's live connection table is the source
         // of truth; the x0x lifecycle table is a derived fast-fail cache and
@@ -10184,7 +10229,10 @@ impl Agent {
                     now,
                     user_kp.secret_key(),
                 )?;
-                let _ = state.cache_placement(record);
+                // Review r3/r4 H8: the mint KNOWS the authoritative owner
+                // key — require it on the cache write (a self-signed
+                // record can never enter, even locally).
+                let _ = state.cache_placement(record, Some(owner_pk));
             }
             minted += 1;
         }

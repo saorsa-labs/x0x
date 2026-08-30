@@ -119,3 +119,51 @@ All findings from the codex review (3 Critical, 5 High) addressed:
   different-digest record (first-valid wins); `ingest_bundle` never
   replaces an equal-epoch bundle (owner-fork challenger warns, keeps
   stored); tombstones still union in every order.
+
+## Review round 4 — scope decision (b2-0037-r4)
+
+**The roaming-move ceremony is experimental in v1 and OFF by default**
+(`[key_move] ceremony_enabled = false`). With the flag off:
+
+- every `/agent/move*` endpoint answers `501` — no `MoveAuthorization`
+  can ever be chained, so **no agent ever enters MidMove, quiesced, or
+  quarantined**; the ceremony-durability and universal-signing-gate
+  holes from rounds 2–3 are UNREACHABLE in the shipped posture;
+- every agent stays Pinned to its mint machine. (The local agent is
+  minted `Roaming` for the ADR-0038 ≥1-Roaming Home invariant — without
+  the ceremony that designation is inert: a roamer's per-machine
+  authorization is exactly the derived tombstone set, and B is the only
+  check that ever fires.)
+
+**Shipped and always-on:** machine ML-KEM enrollment (V3 announce),
+owner-signed `PlacementRecord`s + the Pinned/Roaming placement field +
+lazy mint, the binding-revocation subject with the v1/v2 carrier split
+(durable-owner-gated, epoch-bounded — round-2 H6), and the B/P
+ENFORCEMENT gates at every receive path plus the outbound DM egress.
+
+**Round-4 fixes shipped regardless of the gate:**
+
+- **H5** — outbound B/P now evaluates EVERY recipient-machine
+  resolution: the discovery cache (first pass at the DM egress funnel
+  head), the capability-advert binding (`cap_machine`, before the gossip
+  path uses it), and the raw-QUIC/DM-registry resolution (after
+  machine resolution, before the dial). A DM cannot reach a retired
+  old-source binding through any of them.
+- **H8** — `cache_placement` requires the caller-supplied authoritative
+  owner key to match (`expected_owner`): the mint passes its own key,
+  bundle ingest passes the coherence-verified bundle owner, disk load
+  passes the certificate issuer. A self-signed victim placement cannot
+  enter the view through ANY path — the API is hardened before blob-v2
+  could wire it remotely.
+
+**Follow-up (tracked as a GitHub issue):** the full commit-then-activate
+flow + universal signing-gate coverage land behind the flag in a
+follow-up — keyless-target participant-log chaining + owner
+receipt-ingestion endpoint, abort delivery to the target with key
+cleanup, a universal signing gate across DM-ACK envelopes and task-list
+claim signing, transactional single-file move-state durability with a
+missing-log poison latch (never-moved vs log-lost), idempotent
+activation retry after a persist failure, retire own-key deletion, and
+the blob-v2 placement fetch-on-miss transport.
+
+Follow-up tracking: saorsa-labs/x0x#443.

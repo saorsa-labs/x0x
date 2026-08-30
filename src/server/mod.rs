@@ -814,6 +814,7 @@ pub async fn serve_with_options(
 
     let state = Arc::new(AppState {
         agent: Arc::clone(&agent),
+        key_move_ceremony_enabled: config.key_move.ceremony_enabled,
         history_record_topics: config.history.record_topics.clone(),
         history_config: config.history.clone(),
         subscriptions: RwLock::new(HashMap::new()),
