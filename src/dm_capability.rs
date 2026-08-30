@@ -118,6 +118,66 @@ impl CapabilityAdvert {
     }
 }
 
+/// Legacy (pre-#437) wire shape of [`dm::DmCapabilities`] — the exact
+/// five-field sequence old peers advertise (no `digest_support`).
+/// Postcard is positional and the caps sit **inside** the advert before
+/// `signature`, so a naive single-struct decode would misparse the
+/// digest bit from the signature's length bytes; this mirror preserves
+/// the old byte layout for the two-stage decode below.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DmCapabilitiesV1Wire {
+    max_protocol_version: u16,
+    gossip_inbox: bool,
+    kem_algorithm: String,
+    max_envelope_bytes: usize,
+    #[serde(default)]
+    kem_public_key: Vec<u8>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct CapabilityAdvertV1Wire {
+    protocol_version: u16,
+    agent_id: [u8; 32],
+    machine_id: [u8; 32],
+    created_at_unix_ms: u64,
+    capabilities: DmCapabilitiesV1Wire,
+    signature: Vec<u8>,
+}
+
+impl CapabilityAdvert {
+    /// Two-stage postcard decode for the #437 `digest_support`
+    /// transition: the v2 shape (caps may carry `digest_support`) first,
+    /// then the byte-exact v1 legacy shape, lifted with
+    /// `digest_support: false`. Signature verification works for both:
+    /// `verify_advert_signature` re-serializes the decoded struct, and a
+    /// false `digest_support` is omitted from serialization
+    /// (`skip_serializing_if`), so a v1-decoded advert re-encodes
+    /// byte-identically to what its signer signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the v2 decode error when the bytes parse as neither shape.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes::<Self>(bytes).or_else(|_| {
+            postcard::from_bytes::<CapabilityAdvertV1Wire>(bytes).map(|v1| Self {
+                protocol_version: v1.protocol_version,
+                agent_id: v1.agent_id,
+                machine_id: v1.machine_id,
+                created_at_unix_ms: v1.created_at_unix_ms,
+                capabilities: crate::dm::DmCapabilities {
+                    max_protocol_version: v1.capabilities.max_protocol_version,
+                    gossip_inbox: v1.capabilities.gossip_inbox,
+                    kem_algorithm: v1.capabilities.kem_algorithm,
+                    max_envelope_bytes: v1.capabilities.max_envelope_bytes,
+                    kem_public_key: v1.capabilities.kem_public_key,
+                    digest_support: false,
+                },
+                signature: v1.signature,
+            })
+        })
+    }
+}
+
 /// In-memory cache of `AgentId → latest CapabilityAdvert`, with TTL
 /// eviction.
 ///
@@ -638,5 +698,89 @@ mod tests {
         let b = advert.signed_bytes().expect("signed bytes 2");
         assert_eq!(a, b);
         assert!(a.starts_with(ADVERT_SIGN_DOMAIN));
+    }
+
+    #[test]
+    fn false_digest_support_encodes_byte_identical_to_v1_caps() {
+        // Why (#437 round 4): `digest_support: false` must serialize to
+        // the EXACT pre-#437 caps bytes (skip-when-false), so old peers
+        // that never learn about the bit keep verifying our adverts and
+        // cards unchanged.
+        let mut caps = DmCapabilities::v1_gossip_ready(vec![5u8; 16]);
+        caps.digest_support = false;
+        let v1_caps = DmCapabilitiesV1Wire {
+            max_protocol_version: caps.max_protocol_version,
+            gossip_inbox: caps.gossip_inbox,
+            kem_algorithm: caps.kem_algorithm.clone(),
+            max_envelope_bytes: caps.max_envelope_bytes,
+            kem_public_key: caps.kem_public_key.clone(),
+        };
+        assert_eq!(
+            postcard::to_allocvec(&caps).expect("v2-false encode"),
+            postcard::to_allocvec(&v1_caps).expect("v1 encode"),
+            "a false digest_support bit must be wire-invisible"
+        );
+
+        // True appends exactly one byte.
+        caps.digest_support = true;
+        let enc_true = postcard::to_allocvec(&caps).expect("v2-true encode");
+        let enc_false = {
+            caps.digest_support = false;
+            postcard::to_allocvec(&caps).expect("v2-false encode")
+        };
+        assert_eq!(enc_true.len(), enc_false.len() + 1);
+        assert!(enc_true.starts_with(&enc_false));
+    }
+
+    #[test]
+    fn legacy_advert_decodes_and_verifies_on_new_node() {
+        // Why (#437 round 4): new nodes must keep reading OLD peers'
+        // adverts — the caps struct sits before `signature` in the
+        // positional encoding, so a naive v2-only decode misparses. The
+        // two-stage decode recovers the v1 shape, and because a
+        // v1-decoded advert has digest_support=false (omitted on
+        // re-serialize), signature verification still passes against
+        // the signer's original bytes.
+        use crate::gossip::SigningContext;
+        use crate::identity::AgentKeypair;
+
+        let kp = AgentKeypair::generate().expect("keypair");
+        let signing = SigningContext::from_keypair(&kp);
+        let v1_caps = DmCapabilitiesV1Wire {
+            max_protocol_version: 1,
+            gossip_inbox: true,
+            kem_algorithm: "ML-KEM-768".to_string(),
+            max_envelope_bytes: crate::dm::MAX_ENVELOPE_BYTES,
+            kem_public_key: vec![7u8; 16],
+        };
+        let mut v1 = CapabilityAdvertV1Wire {
+            protocol_version: 1,
+            agent_id: *signing.agent_id.as_bytes(),
+            machine_id: [9u8; 32],
+            created_at_unix_ms: 1_700_000_000_000,
+            capabilities: v1_caps,
+            signature: Vec::new(),
+        };
+        // Sign over the v1 signed-bytes shape (what an old node computed).
+        let mut sign_buf = Vec::new();
+        sign_buf.extend_from_slice(ADVERT_SIGN_DOMAIN);
+        sign_buf.extend_from_slice(&v1.protocol_version.to_be_bytes());
+        sign_buf.extend_from_slice(&v1.agent_id);
+        sign_buf.extend_from_slice(&v1.machine_id);
+        sign_buf.extend_from_slice(&v1.created_at_unix_ms.to_be_bytes());
+        sign_buf.extend_from_slice(&postcard::to_stdvec(&v1.capabilities).expect("caps"));
+        v1.signature = signing.sign(&sign_buf).expect("sign v1 advert");
+
+        let wire = postcard::to_allocvec(&v1).expect("v1 advert encode");
+        // The v2 struct alone must fail (positional)...
+        assert!(postcard::from_bytes::<CapabilityAdvert>(&wire).is_err());
+        // ...the two-stage decode recovers it, unbound...
+        let decoded = CapabilityAdvert::from_postcard(&wire).expect("two-stage decode");
+        assert!(!decoded.capabilities.digest_support);
+        // ...and it still verifies (re-serialization omits the false bit).
+        assert!(crate::dm_capability_service::verify_advert_signature(
+            &decoded,
+            &signing.public_key_bytes
+        ));
     }
 }

@@ -6122,16 +6122,36 @@ impl Agent {
         let (sender_pub_bytes, sender_sec_bytes) = self.identity.agent_keypair().to_bytes();
         let sender_secret = ant_quic::MlDsaSecretKey::from_bytes(&sender_sec_bytes)
             .map_err(|e| dm::DmError::RelayBuildFailed(format!("agent secret key: {e:?}")))?;
+        // #437 rounds 3+4 (mixed-fleet interop): emit the bound v2 frame
+        // shape only when the RELAY CANDIDATE (the peer that must decode
+        // this frame) has a confirmed advert with `digest_support`; else
+        // emit the byte-identical v1 frame so an old relay can still
+        // parse, gate, and forward. Unknown capability defaults to v1.
+        // Receivers enforce the converse: digest-less frames from
+        // senders whose confirmed advert sets the bit are rejected.
+        let bind_inner = peer_relay::peer_advertises_inner_digest(
+            self.capability_store.lookup(&relay_agent).as_ref(),
+        );
         let relayed = self
             .peer_relay
-            .build_relayed_dm(to, &sender, sender_pub_bytes, now, envelope, |bytes| {
-                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&sender_secret, bytes)
-                    .map(|s| s.as_bytes().to_vec())
-                    .map_err(|e| format!("{e:?}"))
-            })
+            .build_relayed_dm(
+                to,
+                &sender,
+                sender_pub_bytes,
+                now,
+                envelope,
+                bind_inner,
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&sender_secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
             .map_err(dm::DmError::RelayBuildFailed)?;
 
-        let wire = postcard::to_allocvec(&relayed).map_err(|e| {
+        // `to_postcard` emits byte-exact v1 for digest-less frames, so
+        // the wire shape always matches what the chosen header signed.
+        let wire = relayed.to_postcard().map_err(|e| {
             dm::DmError::EnvelopeConstruction(format!("relayed envelope postcard: {e}"))
         })?;
         let network = self
@@ -14275,6 +14295,9 @@ impl AgentBuilder {
         let relay_candidates =
             std::sync::Arc::new(tokio::sync::RwLock::new(parsed_relay_candidates));
 
+        // Hoisted so the relay-DM listener and the Agent share one store
+        // (#437 round 4: the listener resolves sender digest support).
+        let capability_store = std::sync::Arc::new(dm_capability::CapabilityStore::new());
         // Issue #120: extract the opt-in observed-prefix gate before
         // `self.network_config` is moved into `NetworkNode::new` (same
         // pattern as `peer_relay_config` above). With no network config the
@@ -14448,6 +14471,7 @@ impl AgentBuilder {
                 std::sync::Arc::clone(&identity_discovery_cache),
                 std::sync::Arc::clone(&revocation_set),
                 std::sync::Arc::clone(&contact_store),
+                std::sync::Arc::clone(&capability_store),
                 identity.agent_id(),
             );
         }
@@ -14594,7 +14618,7 @@ impl AgentBuilder {
             observed_prefix_enabled,
             presence,
             user_identity_consented: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            capability_store: std::sync::Arc::new(dm_capability::CapabilityStore::new()),
+            capability_store: std::sync::Arc::clone(&capability_store),
             capability_refreshes: std::sync::Arc::new(CapabilityRefreshRegistry::default()),
             dm_capabilities_tx: std::sync::Arc::new({
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
@@ -16253,7 +16277,11 @@ pub const NAME: &str = "x0x";
 /// unrelated header, because the refusal precedes the contact gate,
 /// `relay_received`/forward accounting, and quota admission. Legacy
 /// digest-less headers (pre-#437 senders) keep today's behavior per the
-/// documented transition.
+/// documented transition. Round 4: digest-less headers from a sender
+/// whose **confirmed** capability advert sets `digest_support` are
+/// rejected (`MissingInnerDigest`) — the listener resolves that from
+/// the `CapabilityStore`, closing the downgrade path while unknown
+/// capability stays legacy-accepted.
 fn spawn_relay_dm_listener(
     network: std::sync::Arc<network::NetworkNode>,
     peer_relay: std::sync::Arc<peer_relay::PeerRelay>,
@@ -16262,6 +16290,7 @@ fn spawn_relay_dm_listener(
     >,
     revocation_set: std::sync::Arc<tokio::sync::RwLock<revocation::RevocationSet>>,
     contact_store: std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>>,
+    capability_store: std::sync::Arc<dm_capability::CapabilityStore>,
     local_agent_id: identity::AgentId,
 ) {
     tokio::spawn(async move {
@@ -16311,12 +16340,19 @@ fn spawn_relay_dm_listener(
                     None => (false, false),
                 }
             };
+            // #437 round 4: the sender's CONFIRMED advert decides whether a
+            // digest-less header is a rejectable downgrade. Snapshot per
+            // frame, same TOCTOU semantics as the contact resolution above.
+            let sender_digest_support_confirmed = peer_relay::peer_advertises_inner_digest(
+                capability_store.lookup(&sender_agent_id).as_ref(),
+            );
             let disposition = peer_relay.disposition_for(
                 &relayed,
                 &local_agent_id,
                 now_ms,
                 is_sender_contact,
                 is_sender_blocked,
+                sender_digest_support_confirmed,
             );
 
             // Revocation gate (PR #177 review, fix 1): the inner envelope's

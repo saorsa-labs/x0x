@@ -227,6 +227,7 @@ async fn sender_uses_relay_when_direct_path_fails() {
         kem_algorithm: "ML-KEM-768".to_string(),
         max_envelope_bytes: MAX_ENVELOPE_BYTES,
         kem_public_key: bob_kem.public_bytes.clone(),
+        digest_support: false,
     };
     alice.insert_capability_for_testing(bob_agent_id, bob_machine_id, bob_cap);
 
@@ -316,6 +317,7 @@ async fn enabled_policy_without_candidates_surfaces_direct_err() {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
+            digest_support: false,
         },
     );
     drive_past_relay_threshold(&alice, &bob_agent_id);
@@ -633,6 +635,7 @@ async fn relay_round_trip_alice_to_bob_via_charlie() {
             kem_algorithm: "ML-KEM-768".to_string(),
             max_envelope_bytes: MAX_ENVELOPE_BYTES,
             kem_public_key: bob_kem.public_bytes.clone(),
+            digest_support: false,
         },
     );
     drive_past_relay_threshold(&alice, &bob.agent_id());
@@ -831,7 +834,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
         !disabled.policy().enabled,
         "PeerRelay::new must be disabled by default"
     );
-    let disp = disabled.disposition_for(&relayed, &dst, now, false, false);
+    let disp = disabled.disposition_for(&relayed, &dst, now, false, false, false);
     assert_eq!(
         disp,
         RelayDisposition::Refuse(RelayRefusal::PolicyDisabled),
@@ -847,7 +850,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
     // Contrast: an ENABLED engine runs verify() and rejects the bad signature,
     // confirming the reorder is the only behavioural change.
     let enabled = PeerRelay::with_policy(RelayPolicy::enabled());
-    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false);
+    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false, false);
     assert_eq!(
         disp2,
         RelayDisposition::Refuse(RelayRefusal::BadSignature),
@@ -1181,4 +1184,93 @@ async fn relay_hop_substituted_inner_is_refused_before_forward_accounting() {
         Err(_) => {}
         Ok(msg) => panic!("substituted inner must NOT be delivered, got {msg:?}"),
     }
+}
+
+/// #437 round 4, downgrade closure end-to-end: Charlie-the-relay has a
+/// CONFIRMED capability advert for Mallory with `digest_support = true`
+/// (this build's wired advert). Mallory then hands Charlie a
+/// digest-less (v1) relayed frame — either a downgrade attempt or a
+/// pre-#437 replay from a sender that has since upgraded. The listener's
+/// `disposition_for` must reject it (`MissingInnerDigest`) before any
+/// gating or forward accounting; the counter advances.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn digestless_frame_from_known_v2_sender_is_rejected_via_listener() {
+    let dir = tempfile::tempdir().expect("tmpdir");
+    let charlie = match build_agent(
+        &dir,
+        "charlie",
+        PeerRelayConfig {
+            enabled: true,
+            require_contact_to_relay: false,
+            fail_threshold: 3,
+            fail_window_ms: 60_000,
+            candidates: Vec::new(),
+            ..Default::default()
+        },
+    )
+    .await
+    .expect("build charlie")
+    {
+        Some(agent) => agent,
+        None => {
+            eprintln!("skipping digestless_known_v2: bind permission unavailable");
+            return;
+        }
+    };
+    charlie.join_network().await.expect("charlie join_network");
+
+    // Mallory's CONFIRMED advert sets digest_support (this build's
+    // wired constructors do), so Charlie knows a digest-less frame from
+    // her is a downgrade, never a legitimate legacy send.
+    let mallory = AgentKeypair::generate().expect("mallory keypair");
+    let machine = MachineKeypair::generate().expect("mallory machine keypair");
+    charlie.insert_capability_for_testing(
+        mallory.agent_id(),
+        machine.machine_id(),
+        DmCapabilities::v1_gossip_ready(vec![0x11; 16]),
+    );
+
+    // A digest-less (v1) frame addressed to Bob via Charlie.
+    let bob = AgentId([0x55; 32]);
+    let relayed = signed_relayed(
+        &mallory,
+        bob,
+        opaque_inner(mallory.agent_id().0, [0x22; 32], vec![0u8; 8]),
+    );
+
+    let pre = charlie
+        .peer_relay()
+        .stats()
+        .snapshot()
+        .relay_refused_missing_inner_digest;
+    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), relayed)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
+
+    let start = tokio::time::Instant::now();
+    loop {
+        if charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest
+            == pre + 1
+        {
+            break;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(3),
+            "relay_refused_missing_inner_digest never advanced — the downgrade was NOT rejected"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded,
+        pre_forwarded,
+        "no forward may be spent on a downgraded frame"
+    );
 }

@@ -8,7 +8,7 @@ snapshot; changes to shipped behavior are recorded here.
 
 ADR-0051's Decision bullet 2 and Negative section record the pre-fix
 weakness: `RelayHeader::signing_bytes()` signed **no digest of
-`RelayedDm.inner`**, so a relay (or any on-path holder of a valid header)
+`RelayedDm.inner`, so a relay (or any on-path holder of a valid header)
 could carry a *different* valid `DmEnvelope` under an unrelated header.
 
 ### Threat model (scope of the fix)
@@ -17,8 +17,7 @@ could carry a *different* valid `DmEnvelope` under an unrelated header.
   `DmEnvelope` carries its own ML-DSA-65 origin signature and
   recipient-bound encryption: a substituted envelope, if delivered at all,
   is delivered as a message validly authored by *its* real author — never
-  as a forgery of the original sender. #437 does not change (and did not
-  need to change) this end-to-end property.
+  as a forgery of the original sender.
 - **What was broken is the relay hop.** An intermediate node's #193
   contact gate and forward rate/bandwidth accounting act on the
   **header's** authenticated sender. Without a header↔inner binding, a
@@ -35,87 +34,100 @@ could carry a *different* valid `DmEnvelope` under an unrelated header.
   digest is `blake3(postcard(DmEnvelope))` — the canonical wire bytes a
   relay forwards verbatim and the recipient re-injects onto the direct-DM
   channel, so the binding covers the exact payload that travels.
-- **Signing**: a header **with** a digest signs under a new domain
-  (`x0x-relay-hdr-v2`): same field layout as v1 plus the trailing digest.
-  A header **without** one keeps the legacy v1 layout byte-for-byte, so
-  pre-#437 signatures still verify. The digest (and its presence) is
-  inside the signed bytes, so stripping it changes the signing bytes —
-  downgrade is cryptographically impossible.
-- **Send path**: `PeerRelay::build_relayed_dm` always computes and signs
-  the digest (serialization failure fails the build). New senders always
-  bind and always emit v2 wire bytes.
-- **Receive path**: `PeerRelay::disposition_for` enforces
-  `header.inner_digest == blake3(inner)` immediately after header
-  signature verification and **before** freshness counting, the
-  `DeliverLocally` receive accounting (`relay_received`), the #193
-  contact/blocked sender gates, and forward-quota admission. A mismatch
-  hard-drops with `RelayRefusal::InnerDigestMismatch`, counted as
-  `relay_refused_inner_digest_mismatch`. One choke point covers both the
-  final-recipient and intermediate-relay arms.
+- **Signing**: a digest-bearing header signs under the `x0x-relay-hdr-v2`
+  domain (v1 fields + trailing digest); a digest-less header keeps the v1
+  layout and domain byte-for-byte. The digest (and its presence) is
+  inside the signed bytes, so stripping it breaks the signature —
+  downgrade by stripping is cryptographically impossible.
+- **Receive path**: `PeerRelay::disposition_for` enforces the binding
+  immediately after header signature verification, **before** freshness
+  counting, `relay_received` accounting, the #193 contact/blocked gates,
+  and forward-quota admission. Mismatch hard-drops
+  (`RelayRefusal::InnerDigestMismatch`, counted as
+  `relay_refused_inner_digest_mismatch`).
 
-## Wire compatibility (v1 ↔ v2 decode)
+## Capability signal (`DmCapabilities::digest_support`) — round 4
 
-Postcard encodes structs **positionally**: inserting `inner_digest` into
-`RelayHeader` changes the byte layout, so a naive single-struct decode
-would reject every v1 frame from a pre-#437 sender (the `Option` tag
-would be parsed from the signature's length bytes — an ML-DSA-65
-signature is ~3309 bytes, whose varint length prefix decodes as an
-invalid variant index). Therefore:
+The mixed-fleet behavior is capability-driven end to end:
 
-- `RelayedDm::from_postcard` performs a **two-stage decode**: the v2
-  (digest-bearing) shape first; on failure, the byte-exact v1 legacy
-  shape (`RelayedDmV1Wire` mirror), lifted with `inner_digest: None`.
-  The network demux uses this decoder.
-- Ambiguity is fail-closed: a frame that misparses across shapes
-  necessarily splits the byte stream at the wrong field boundary, which
-  invalidates the ML-DSA-65 signature — `verify()` drops it.
-- **Known limitation (positional formats)**: an *old* node cannot parse
-  *new* v2 frames — they fail decode and are dropped as malformed. New
-  senders' relayed DMs need a #437-aware relay during the transition
-  window. Sending v1-look-alike bytes from new nodes was rejected
-  because it would require emitting digest-less (unbound) headers,
-  re-opening #437 for every new sender.
+- `DmCapabilities` gains `digest_support: bool` (additive,
+  serde-defaulted, `skip_serializing_if = false`). **This build's wired
+  constructors advertise `true`**; `pending()` stays `false`.
+- **Send path** (`try_relay_fallback`): emit the bound v2 frame **only**
+  when the relay candidate's confirmed advert sets `digest_support`
+  (`peer_relay::peer_advertises_inner_digest`); otherwise emit the
+  byte-identical v1 frame (`RelayedDm::to_postcard` routes digest-less
+  frames through the v1 mirror). Default when capability is unknown =
+  v1 — a new sender never produces a frame an old relay cannot decode,
+  gate, or forward.
+- **Receive path**: `disposition_for` rejects digest-less headers from a
+  sender whose **confirmed** advert sets `digest_support`
+  (`RelayRefusal::MissingInnerDigest`, counted as
+  `relay_refused_missing_inner_digest`) — a v2-capable sender cannot
+  silently unbind. Unknown/unconfirmed capability keeps the documented
+  legacy acceptance (pre-#437 senders). The listener resolves the
+  sender's advert from the `CapabilityStore` per frame.
 
-## Transition (honest scope; mirrors ADR-0021's shape)
+### Advert wire compatibility (postcard positional, verified empirically)
 
-- **Present-but-mismatched** digest → hard-drop, always. A mismatch is
-  active relay-hop substitution under a valid header.
-- **Absent** digest (legacy pre-#437 sender) → accepted with exactly the
-  pre-fix relay-hop guarantees. **This is fail-open and stays fail-open
-  until the follow-up lands** — it is NOT an implemented end-state:
-  tracked as issue
-  [#442](https://github.com/saorsa-labs/x0x/issues/442) (add a
-  digest-support flag to `DmCapabilities`; once a peer's confirmed
-  advert shows support, `disposition_for` rejects digest-less headers
-  from that peer and the residual closes).
-- Rationale for not hard-requiring immediately: there is no capability
-  negotiation on the relay path today; hard-requiring would silently
-  sever every pre-#437 sender, exactly the trade-off ADR-0021 documented
-  for attestations.
+- `digest_support: false` encodes **byte-identically** to the pre-#437
+  caps (skip-when-false), so this build's `pending()` state and any
+  false-valued advert remain verifiable by old peers.
+- New nodes decode old adverts via a two-stage decode
+  (`CapabilityAdvert::from_postcard`): v2 shape first, then the v1
+  mirror lifted with `digest_support: false`. Because a false bit is
+  omitted on re-serialization, signature verification of a v1-decoded
+  advert passes against the signer's original bytes.
+- **Known transition cost**: an old peer cannot verify a `digest_support
+  = true` advert (advert verification re-serializes the decoded struct;
+  the appended byte changes the signed bytes) and drops it — old peers
+  fall back to raw-QUIC DM path selection for this node until they
+  upgrade. Adverts republish every 10 min; the cost is transient and
+  self-healing on fleet upgrade. Issue #442 remains open only for any
+  richer policy on top.
+
+## Relay-frame wire compatibility (v1 ↔ v2 decode)
+
+Postcard encodes structs **positionally**: `RelayedDm::from_postcard`
+two-stage decodes (v2 first, byte-exact v1 mirror fallback,
+`inner_digest: None`); the network demux uses it. Cross-shape misparse
+is fail-closed (wrong field boundary invalidates the ML-DSA signature).
+New→old relay frames never occur: the send path degrades to v1 for
+peers without confirmed support (above).
+
+## Transition summary
+
+| Frame | Sender capability known? | Receiver action |
+|---|---|---|
+| digest present + matches | — | accept (bound) |
+| digest present + mismatches | — | hard-drop `InnerDigestMismatch` |
+| digest absent | sender confirmed `digest_support` | reject `MissingInnerDigest` (downgrade) |
+| digest absent | unknown / pre-#437 sender | accept (legacy guarantees) |
 
 ## Tests
 
 - `src/peer_relay.rs`:
-  - `build_relayed_dm_binds_inner_digest` — new senders always bind; v2
-    header verifies; fresh build self-binds.
+  - `build_relayed_dm_binds_inner_digest` — bound build self-binds, v2
+    verifies (v2-to-v2 send shape).
   - `substituted_inner_is_refused_before_gating_or_accounting` — both
-    arms, counters, no accounting attributed.
+    arms, no accounting attributed (enforcement).
   - `legacy_digestless_header_still_accepted_per_transition`.
   - `bound_header_rejects_digest_strip_downgrade`.
-  - `legacy_v1_wire_decodes_via_two_stage_and_verifies` — pins the wire
-    break the two-stage decode fixes (v1 bytes must NOT parse as v2) and
-    verifies a genuinely signed v1 header after decode.
-  - `v2_wire_round_trips_through_two_stage_decode`.
-  - `frozen_v1_wire_vector_still_decodes` — frozen byte-level v1 frame
-    (explicit varints transcribed from a canonical encoding) decodes
-    with `inner_digest: None`; pins the v1 mirror against layout drift.
+  - `legacy_v1_wire_decodes_via_two_stage_and_verifies`,
+    `v2_wire_round_trips_through_two_stage_decode`,
+    `frozen_v1_wire_vector_still_decodes` (wire compat).
+  - `unbound_relayed_dm_emits_v1_wire_an_old_relay_parses` —
+    v2-sender-to-v1-peer degrades to byte-exact v1; old-relay (v1-struct
+    alone) parse; seam decision (None/pending → v1, wired advert → v2).
+  - `digestless_header_from_known_v2_sender_is_rejected` — downgrade
+    closure + unconfirmed-capability control leg.
+- `src/dm_capability.rs`:
+  - `false_digest_support_encodes_byte_identical_to_v1_caps`,
+    `legacy_advert_decodes_and_verifies_on_new_node` (advert wire).
 - `tests/peer_relay_integration.rs`:
   - `relay_hop_substituted_inner_is_refused_before_forward_accounting` —
-    the relay-hop attack through the real `spawn_relay_dm_listener`:
-    Alice's bound header for inner A addressed to Bob, inner swapped to
-    B, handed to Charlie-the-relay; the mismatch refusal advances,
-    `relay_forwarded`/`relay_received` stay flat, nothing is re-injected.
-  - `relay_round_trip_alice_to_bob_via_charlie` — full three-party QUIC
-    round trip over the always-bound build path.
-  - `signed_relayed` helper remains the legacy (digest-less) sender
-    shape; its consumers keep passing — v1 acceptance is pinned.
+    relay-hop substitution through the real listener.
+  - `digestless_frame_from_known_v2_sender_is_rejected_via_listener` —
+    downgrade closure through the real listener + capability store.
+  - `relay_round_trip_alice_to_bob_via_charlie` — full three-party round
+    trip over the v1 emit path (mixed-fleet default).
