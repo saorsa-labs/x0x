@@ -834,7 +834,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
         !disabled.policy().enabled,
         "PeerRelay::new must be disabled by default"
     );
-    let disp = disabled.disposition_for(&relayed, &dst, now, false, false, false);
+    let disp = disabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp,
         RelayDisposition::Refuse(RelayRefusal::PolicyDisabled),
@@ -850,7 +850,7 @@ fn disabled_relay_refuses_before_verifying_signature() {
     // Contrast: an ENABLED engine runs verify() and rejects the bad signature,
     // confirming the reorder is the only behavioural change.
     let enabled = PeerRelay::with_policy(RelayPolicy::enabled());
-    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false, false);
+    let disp2 = enabled.disposition_for(&relayed, &dst, now, false, false);
     assert_eq!(
         disp2,
         RelayDisposition::Refuse(RelayRefusal::BadSignature),
@@ -1186,15 +1186,19 @@ async fn relay_hop_substituted_inner_is_refused_before_forward_accounting() {
     }
 }
 
-/// #437 round 4, downgrade closure end-to-end: Charlie-the-relay has a
-/// CONFIRMED capability advert for Mallory with `digest_support = true`
-/// (this build's wired advert). Mallory then hands Charlie a
-/// digest-less (v1) relayed frame — either a downgrade attempt or a
-/// pre-#437 replay from a sender that has since upgraded. The listener's
-/// `disposition_for` must reject it (`MissingInnerDigest`) before any
-/// gating or forward accounting; the counter advances.
+/// #437 round 5, downgrade detection end-to-end through the real
+/// listener. The reject trigger is NOT capability-advert presence (that
+/// dropped legit v1 during the asymmetric-cache convergence race) — it
+/// is a PRIOR fully-valid v2 frame from the same sender:
+///
+/// 1. Convergence leg: Mallory's advert sets `digest_support`, but
+///    Charlie has never seen a v2 frame from her → her v1 frame is
+///    ACCEPTED (forwarded), not dropped.
+/// 2. Downgrade leg: Mallory then sends a fully-valid v2 frame
+///    (baseline set), followed by a v1 frame → the v1 frame is rejected
+///    (`MissingInnerDigest`) and no forward is spent on it.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn digestless_frame_from_known_v2_sender_is_rejected_via_listener() {
+async fn v2_then_v1_downgrade_is_rejected_but_converging_v1_is_not() {
     let dir = tempfile::tempdir().expect("tmpdir");
     let charlie = match build_agent(
         &dir,
@@ -1213,44 +1217,109 @@ async fn digestless_frame_from_known_v2_sender_is_rejected_via_listener() {
     {
         Some(agent) => agent,
         None => {
-            eprintln!("skipping digestless_known_v2: bind permission unavailable");
+            eprintln!("skipping downgrade_detect: bind permission unavailable");
             return;
         }
     };
     charlie.join_network().await.expect("charlie join_network");
 
-    // Mallory's CONFIRMED advert sets digest_support (this build's
-    // wired constructors do), so Charlie knows a digest-less frame from
-    // her is a downgrade, never a legitimate legacy send.
     let mallory = AgentKeypair::generate().expect("mallory keypair");
     let machine = MachineKeypair::generate().expect("mallory machine keypair");
+    // Mallory's advert DOES set digest_support — a capability-presence
+    // rule would reject her v1 frames; the race this test pins.
     charlie.insert_capability_for_testing(
         mallory.agent_id(),
         machine.machine_id(),
         DmCapabilities::v1_gossip_ready(vec![0x11; 16]),
     );
-
-    // A digest-less (v1) frame addressed to Bob via Charlie.
     let bob = AgentId([0x55; 32]);
-    let relayed = signed_relayed(
+
+    // Leg 1 — convergence: v1 from a never-seen-on-v2 sender. Must be
+    // accepted: dst is Bob, so Charlie classifies Forward (no downgrade
+    // refusal), and the forward may fail transport (Bob unreachable) —
+    // irrelevant; the refusal counter must stay flat.
+    let v1_frame = signed_relayed(
         &mallory,
         bob,
         opaque_inner(mallory.agent_id().0, [0x22; 32], vec![0u8; 8]),
     );
-
-    let pre = charlie
-        .peer_relay()
-        .stats()
-        .snapshot()
-        .relay_refused_missing_inner_digest;
-    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
     assert!(
         charlie
-            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), relayed)
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), v1_frame)
             .await,
         "seam must accept the synthetic relayed DM"
     );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest,
+        0,
+        "convergence leg: v1 from a sender never observed on v2 must NOT be dropped"
+    );
 
+    // Leg 2a — a fully-valid fresh v2 frame from Mallory (bound build).
+    let (pub_bytes, _sec) = mallory.to_bytes();
+    let inner = opaque_inner(mallory.agent_id().0, [0x22; 32], vec![0u8; 8]);
+    let digest = RelayedDm::inner_digest_of(&inner).expect("canonical encode");
+    let originated = now_unix_ms();
+    let signing_bytes = RelayHeader::signing_bytes(
+        RelayHeader::VERSION,
+        &bob.0,
+        &mallory.agent_id().0,
+        &pub_bytes,
+        originated,
+        Some(&digest),
+    );
+    let signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        mallory.secret_key(),
+        &signing_bytes,
+    )
+    .expect("sign v2 header");
+    let v2_frame = RelayedDm {
+        header: RelayHeader {
+            version: RelayHeader::VERSION,
+            dst_agent_id: bob.0,
+            sender_agent_id: mallory.agent_id().0,
+            sender_public_key: pub_bytes,
+            originated_at_unix_ms: originated,
+            inner_digest: Some(digest),
+            signature: signature.as_bytes().to_vec(),
+        },
+        inner,
+    };
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), v2_frame)
+            .await,
+        "seam must accept the v2 frame"
+    );
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(
+        charlie
+            .peer_relay()
+            .stats()
+            .snapshot()
+            .relay_refused_missing_inner_digest,
+        0,
+        "the valid v2 frame itself must not be refused"
+    );
+
+    // Leg 2b — the downgrade: v1 from the now-baselined sender.
+    let downgraded = signed_relayed(
+        &mallory,
+        bob,
+        opaque_inner(mallory.agent_id().0, [0x23; 32], vec![0u8; 8]),
+    );
+    let pre_forwarded = charlie.peer_relay().stats().snapshot().relay_forwarded;
+    assert!(
+        charlie
+            .push_relayed_dm_for_testing(ant_quic::PeerId([0x33; 32]), downgraded)
+            .await,
+        "seam must accept the synthetic relayed DM"
+    );
     let start = tokio::time::Instant::now();
     loop {
         if charlie
@@ -1258,7 +1327,7 @@ async fn digestless_frame_from_known_v2_sender_is_rejected_via_listener() {
             .stats()
             .snapshot()
             .relay_refused_missing_inner_digest
-            == pre + 1
+            == 1
         {
             break;
         }
@@ -1268,9 +1337,8 @@ async fn digestless_frame_from_known_v2_sender_is_rejected_via_listener() {
         );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
-    assert_eq!(
-        charlie.peer_relay().stats().snapshot().relay_forwarded,
-        pre_forwarded,
+    assert!(
+        charlie.peer_relay().stats().snapshot().relay_forwarded == pre_forwarded,
         "no forward may be spent on a downgraded frame"
     );
 }

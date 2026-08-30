@@ -87,7 +87,7 @@
 use crate::dm::DmEnvelope;
 use crate::identity::AgentId;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -482,13 +482,12 @@ pub enum RelayRefusal {
     /// (Final-recipient integrity is unaffected — the inner envelope's
     /// own signature attributes it to its real author.)
     InnerDigestMismatch,
-    /// #437 round 4: the header carries no `inner_digest` but the
-    /// sender's confirmed capability advert says it supports digests
-    /// (`DmCapabilities::digest_support`). A v2-capable sender never
-    /// legitimately emits a digest-less frame to an enforcing peer, so
-    /// this is a downgrade (or a pre-#437 replay from that sender) and
-    /// is rejected — closing the unbinding path. Unknown/unconfirmed
-    /// capability keeps the documented legacy acceptance.
+    /// #437 round 5: a digest-less (v1) header from a sender this node
+    /// has previously observed emitting a fully-valid, fresh v2
+    /// (digest-bearing) header — a real downgrade (was v2, now v1),
+    /// closing the unbinding path. Senders never observed on v2 (still
+    /// converging, or genuinely pre-#437) keep the documented legacy
+    /// acceptance.
     MissingInnerDigest,
     /// `originated_at_unix_ms` is older than the freshness budget — a
     /// likely replay of a captured relay envelope.
@@ -885,6 +884,15 @@ pub struct PeerRelay {
     stats: RelayStats,
     per_peer: Mutex<HashMap<[u8; 32], PeerRelayState>>,
     limiter: Mutex<RelayLimiter>,
+    /// #437 round 5 (downgrade detection): senders this node has seen
+    /// emit a fully-valid, fresh v2 (digest-bearing) header. A later
+    /// digest-less header from one of these senders is a downgrade and
+    /// is rejected; a sender never observed on v2 (converging, or
+    /// genuinely pre-#437) keeps legacy acceptance. Bounded by distinct
+    /// verified senders observed (32 bytes each); deliberately not
+    /// cleared by `forget_peer` — the baseline is a fact about the
+    /// sender, not about this node's connection to it.
+    v2_observed_senders: Mutex<HashSet<[u8; 32]>>,
 }
 
 impl Default for PeerRelay {
@@ -902,6 +910,7 @@ impl PeerRelay {
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
+            v2_observed_senders: Mutex::new(HashSet::new()),
         }
     }
 
@@ -913,6 +922,7 @@ impl PeerRelay {
             stats: RelayStats::default(),
             per_peer: Mutex::new(HashMap::new()),
             limiter: Mutex::new(RelayLimiter::default()),
+            v2_observed_senders: Mutex::new(HashSet::new()),
         }
     }
 
@@ -943,6 +953,17 @@ impl PeerRelay {
         match self.per_peer.lock() {
             Ok(g) => g,
             Err(poisoned) => poisoned.into_inner(),
+        }
+    }
+
+    /// Whether this node has previously seen a fully-valid, fresh v2
+    /// (digest-bearing) header from `sender` — the downgrade baseline.
+    /// Poisoned-lock reads are conservative (`false`): a baseline miss
+    /// accepts the frame (legacy behavior), never drops it.
+    fn sender_emitted_v2(&self, sender: &[u8; 32]) -> bool {
+        match self.v2_observed_senders.lock() {
+            Ok(seen) => seen.contains(sender),
+            Err(_) => false,
         }
     }
 
@@ -1104,11 +1125,7 @@ impl PeerRelay {
     /// whether the header's authenticated `sender_agent_id` is an
     /// *explicitly-trusted* contact (Known/Trusted — NOT a merely-
     /// discovered `Unknown` entry); `is_sender_blocked` is whether it is
-    /// an explicitly-blocked contact; `sender_digest_support_confirmed`
-    /// is whether the sender's **confirmed** capability advert sets
-    /// [`crate::dm::DmCapabilities::digest_support`] (see
-    /// [`peer_advertises_inner_digest`] — the listener resolves it from
-    /// the `CapabilityStore`). Classification refusal telemetry is
+    /// an explicitly-blocked contact. Classification refusal telemetry is
     /// updated here; forwarding quota and success telemetry are updated by
     /// [`reserve_forward`](Self::reserve_forward) and its reservation guard.
     ///
@@ -1124,11 +1141,13 @@ impl PeerRelay {
     ///   forward-quota accounting — the header's authenticated sender
     ///   did not sign *this* payload, so no gating or accounting may be
     ///   attributed to it.
-    /// - #437 round 4: digest-less header from a sender whose confirmed
-    ///   advert sets `digest_support` → `Refuse(MissingInnerDigest)` —
-    ///   a v2-capable sender never legitimately emits an unbound frame
-    ///   to an enforcing peer. Unknown/unconfirmed capability keeps the
-    ///   documented legacy acceptance (pre-#437 senders).
+    /// - #437 round 5: digest-less header from a sender previously
+    ///   observed on a fully-valid v2 frame → `Refuse(MissingInnerDigest)`
+    ///   — a real downgrade (was v2, now v1). Capability presence is
+    ///   deliberately NOT the trigger: during advert convergence a
+    ///   sender's relay-candidate lookup can be missing while this
+    ///   node's advert cache knows the sender, and rejecting on that
+    ///   asymmetric state would drop legitimate v1 frames.
     /// - `originated_at` older than `freshness`, or more than
     ///   [`RELAY_CLOCK_SKEW_TOLERANCE_MS`] ahead of `now_unix_ms` →
     ///   `Refuse(Stale)`.
@@ -1156,7 +1175,6 @@ impl PeerRelay {
         now_unix_ms: u64,
         is_sender_contact: bool,
         is_sender_blocked: bool,
-        sender_digest_support_confirmed: bool,
     ) -> RelayDisposition {
         // DoS guard: reject on the disabled-policy path before doing any
         // ML-DSA-65 signature work, so a disabled relay cannot be made to
@@ -1186,15 +1204,6 @@ impl PeerRelay {
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::InnerDigestMismatch);
         }
-        // #437 round 4: a v2-capable sender (confirmed advert) must bind.
-        // Unknown capability keeps legacy acceptance — a pre-#437 sender
-        // has no bit to set.
-        if relayed.header.inner_digest.is_none() && sender_digest_support_confirmed {
-            self.stats
-                .relay_refused_missing_inner_digest
-                .fetch_add(1, Ordering::Relaxed);
-            return RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest);
-        }
         let freshness_ms = self.policy.freshness.as_millis() as u64;
         let originated = relayed.header.originated_at_unix_ms;
         // Refuse far-future timestamps: without this bound `saturating_sub`
@@ -1207,6 +1216,28 @@ impl PeerRelay {
                 .relay_refused_stale
                 .fetch_add(1, Ordering::Relaxed);
             return RelayDisposition::Refuse(RelayRefusal::Stale);
+        }
+
+        // #437 round 5 — downgrade DETECTION (not capability presence).
+        // A digest-bearing frame that reached this point is fully valid
+        // (signature ✓, digest ✓, fresh ✓): record the sender on the
+        // v2 baseline. A digest-less frame from a baseline sender is a
+        // real downgrade (was v2, now v1) and is rejected. A sender
+        // never observed on v2 — still converging its relay-candidate
+        // capability cache, or genuinely pre-#437 — is accepted: the
+        // asymmetric-cache race (sender's lookup missing while this
+        // node's advert cache knows the sender) must not drop legit
+        // messages. Placement after freshness matters: a replayed,
+        // expired v2 header must not establish the baseline.
+        if relayed.header.inner_digest.is_some() {
+            if let Ok(mut seen) = self.v2_observed_senders.lock() {
+                seen.insert(relayed.header.sender_agent_id);
+            }
+        } else if self.sender_emitted_v2(&relayed.header.sender_agent_id) {
+            self.stats
+                .relay_refused_missing_inner_digest
+                .fetch_add(1, Ordering::Relaxed);
+            return RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest);
         }
         // Final recipient: receiving a relayed DM addressed to us is not
         // relaying — the contact gate and resource caps target the forward
@@ -1671,7 +1702,7 @@ mod tests {
         // Sender IS a contact and NOT blocked — the digest gate must
         // refuse before either sender gate is consulted.
         assert_eq!(
-            relay.disposition_for(&substituted, &local, now_ms + 100, true, false, false),
+            relay.disposition_for(&substituted, &local, now_ms + 100, true, false),
             RelayDisposition::Refuse(RelayRefusal::InnerDigestMismatch),
             "a header carrying a different inner envelope must hard-drop"
         );
@@ -1701,14 +1732,7 @@ mod tests {
             .expect("build");
         substituted_local.inner = dummy_inner_b();
         assert_eq!(
-            relay.disposition_for(
-                &substituted_local,
-                &local,
-                now_ms + 100,
-                false,
-                false,
-                false
-            ),
+            relay.disposition_for(&substituted_local, &local, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::InnerDigestMismatch)
         );
         assert_eq!(
@@ -1760,7 +1784,7 @@ mod tests {
         assert_eq!(legacy.inner_digest_matches(), None, "legacy = unbound");
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
         assert_eq!(
-            relay.disposition_for(&legacy, &local, now_ms + 100, false, false, false),
+            relay.disposition_for(&legacy, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally,
             "legacy digest-less headers keep today's acceptance"
         );
@@ -1838,19 +1862,20 @@ mod tests {
         assert_eq!(new_view.header.inner_digest, None);
         assert!(new_view.header.verify());
         assert_eq!(
-            relay.disposition_for(&new_view, &dst, 1_700_000_000_100, false, false, false),
+            relay.disposition_for(&new_view, &dst, 1_700_000_000_100, false, false),
             RelayDisposition::DeliverLocally
         );
     }
 
     #[test]
-    fn digestless_header_from_known_v2_sender_is_rejected() {
-        // Why (#437 round 4, downgrade closure): a sender whose
-        // confirmed advert sets digest_support never legitimately emits
-        // a digest-less frame to an enforcing peer — so the receiver
-        // rejects it, closing the "quietly unbind" downgrade. Unknown
-        // or unconfirmed capability keeps the documented legacy
-        // acceptance (control leg).
+    fn digestless_frame_after_observed_v2_is_rejected_as_downgrade() {
+        // Why (#437 round 5, asymmetric-cache race): the reject trigger
+        // must be DOWNGRADE detection — this node previously saw a
+        // fully-valid v2 frame from the sender — NOT capability-advert
+        // presence. During advert convergence the sender's relay-candidate
+        // lookup can be missing (so it emits v1) while this node's advert
+        // cache already knows the sender supports digests; rejecting on
+        // that asymmetric state would drop legitimate messages.
         let kp = AgentKeypair::generate().expect("keypair");
         let sender = kp.agent_id();
         let local = aid(78);
@@ -1858,52 +1883,115 @@ mod tests {
         let (pub_bytes, sec_bytes) = kp.to_bytes();
         let secret = ant_quic::MlDsaSecretKey::from_bytes(&sec_bytes).expect("secret");
 
-        let signing_bytes = RelayHeader::signing_bytes(
-            RelayHeader::VERSION,
-            &local.0,
-            &sender.0,
-            &pub_bytes,
-            now_ms,
-            None,
-        );
-        let signature =
-            ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, &signing_bytes)
-                .expect("legacy sign");
-        let legacy = RelayedDm {
-            header: RelayHeader {
-                version: RelayHeader::VERSION,
-                dst_agent_id: local.0,
-                sender_agent_id: sender.0,
-                sender_public_key: pub_bytes,
-                originated_at_unix_ms: now_ms,
-                inner_digest: None,
-                signature: signature.as_bytes().to_vec(),
-            },
-            inner: dummy_inner(),
+        let legacy = |originated: u64| {
+            let signing_bytes = RelayHeader::signing_bytes(
+                RelayHeader::VERSION,
+                &local.0,
+                &sender.0,
+                &pub_bytes,
+                originated,
+                None,
+            );
+            let signature =
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, &signing_bytes)
+                    .expect("legacy sign");
+            RelayedDm {
+                header: RelayHeader {
+                    version: RelayHeader::VERSION,
+                    dst_agent_id: local.0,
+                    sender_agent_id: sender.0,
+                    sender_public_key: pub_bytes.clone(),
+                    originated_at_unix_ms: originated,
+                    inner_digest: None,
+                    signature: signature.as_bytes().to_vec(),
+                },
+                inner: dummy_inner(),
+            }
         };
 
+        // Leg 1 — the race: the sender's caps DO advertise digest_support
+        // (so a capability-presence rule would reject), but this node has
+        // never seen a v2 frame from it. The v1 frame must be ACCEPTED.
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
-        // Confirmed v2-capable sender → digest-less is a downgrade.
+        let converging = legacy(now_ms);
+        assert!(
+            crate::dm::DmCapabilities::v1_gossip_ready(vec![0u8; 8]).digest_support,
+            "precondition: this build's wired advert sets the bit"
+        );
         assert_eq!(
-            relay.disposition_for(&legacy, &local, now_ms + 100, false, false, true),
-            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest),
-            "a known-digest sender must not be allowed to quietly unbind"
+            relay.disposition_for(&converging, &local, now_ms + 100, false, false),
+            RelayDisposition::DeliverLocally,
+            "sender never observed on v2 → v1 accepted even though its caps advertise digest support"
         );
         assert_eq!(
             relay.stats().snapshot().relay_refused_missing_inner_digest,
-            1
+            0
         );
 
-        // Control: unconfirmed capability keeps legacy acceptance.
-        let fresh = PeerRelay::with_policy(RelayPolicy::enabled());
+        // Leg 2 — the real downgrade: a fully-valid fresh v2 frame
+        // establishes the baseline, and a subsequent v1 frame from the
+        // same sender is rejected.
+        let v2 = relay
+            .build_relayed_dm(
+                &local,
+                &sender,
+                kp.to_bytes().0,
+                now_ms + 1_000,
+                dummy_inner(),
+                true,
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build v2");
         assert_eq!(
-            fresh.disposition_for(&legacy, &local, now_ms + 100, false, false, false),
+            relay.disposition_for(&v2, &local, now_ms + 1_100, false, false),
             RelayDisposition::DeliverLocally,
-            "unknown capability keeps the documented legacy acceptance"
+            "the v2 frame itself is accepted and sets the baseline"
+        );
+        let downgraded = legacy(now_ms + 2_000);
+        assert_eq!(
+            relay.disposition_for(&downgraded, &local, now_ms + 2_100, false, false),
+            RelayDisposition::Refuse(RelayRefusal::MissingInnerDigest),
+            "was v2, now v1 — a real downgrade must be rejected"
         );
         assert_eq!(
-            fresh.stats().snapshot().relay_refused_missing_inner_digest,
-            0
+            relay.stats().snapshot().relay_refused_missing_inner_digest,
+            1,
+            "exactly one downgrade refusal counted"
+        );
+
+        // Leg 3 — stale v2 must NOT set the baseline: a replayed, expired
+        // v2 header is refused as Stale before the baseline is recorded,
+        // so a sender's later v1 frames stay accepted.
+        let fresh_relay = PeerRelay::with_policy(RelayPolicy::enabled());
+        let stale_v2 = relay
+            .build_relayed_dm(
+                &local,
+                &sender,
+                kp.to_bytes().0,
+                now_ms,
+                dummy_inner(),
+                true,
+                |bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(&secret, bytes)
+                        .map(|s| s.as_bytes().to_vec())
+                        .map_err(|e| format!("{e:?}"))
+                },
+            )
+            .expect("build stale v2");
+        // "now" far past freshness: refused Stale, baseline untouched.
+        assert_eq!(
+            fresh_relay.disposition_for(&stale_v2, &local, now_ms + 60_000, false, false),
+            RelayDisposition::Refuse(RelayRefusal::Stale)
+        );
+        let after = legacy(now_ms + 60_100);
+        assert_eq!(
+            fresh_relay.disposition_for(&after, &local, now_ms + 60_200, false, false),
+            RelayDisposition::DeliverLocally,
+            "a stale v2 replay must not poison the sender's baseline"
         );
     }
 
@@ -2109,7 +2197,7 @@ mod tests {
             "stripping the digest must break the signature (v2 was signed)"
         );
         assert_eq!(
-            relay.disposition_for(&stripped, &local, now_ms + 100, true, false, false),
+            relay.disposition_for(&stripped, &local, now_ms + 100, true, false),
             RelayDisposition::Refuse(RelayRefusal::BadSignature),
             "a downgraded (stripped) bound header dies on signature, not legacy acceptance"
         );
@@ -2144,7 +2232,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms + 100, false, false, false),
+            relay.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally
         );
         assert_eq!(relay.stats().snapshot().relay_received, 1);
@@ -2183,14 +2271,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(
-                &relayed,
-                &we_are_the_relay,
-                now_ms + 100,
-                true,
-                false,
-                false
-            ),
+            relay.disposition_for(&relayed, &we_are_the_relay, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -2234,7 +2315,7 @@ mod tests {
         // "now" is 31 s past origination — beyond the 30 s freshness.
         let now_ms = originated_ms + 31_000;
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms, false, false, false),
+            relay.disposition_for(&relayed, &local, now_ms, false, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -2273,7 +2354,7 @@ mod tests {
             .expect("build");
 
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms, false, false, false),
+            relay.disposition_for(&relayed, &local, now_ms, false, false),
             RelayDisposition::Refuse(RelayRefusal::Stale)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_stale, 1);
@@ -2295,7 +2376,7 @@ mod tests {
             )
             .expect("build");
         assert_eq!(
-            relay.disposition_for(&fresh, &local, now_ms, false, false, false),
+            relay.disposition_for(&fresh, &local, now_ms, false, false),
             RelayDisposition::DeliverLocally
         );
     }
@@ -2333,7 +2414,7 @@ mod tests {
 
         let disabled = PeerRelay::new();
         assert_eq!(
-            disabled.disposition_for(&relayed, &local, now_ms + 100, false, false, false),
+            disabled.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::PolicyDisabled)
         );
         assert_eq!(disabled.stats().snapshot().relay_refused_policy_disabled, 1);
@@ -2388,7 +2469,7 @@ mod tests {
 
         let relay = PeerRelay::with_policy(RelayPolicy::enabled()); // require_contact defaults true
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false, false, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::NotAContact)
         );
         assert_eq!(relay.stats().snapshot().relay_refused_not_a_contact, 1);
@@ -2410,7 +2491,7 @@ mod tests {
         let relay = PeerRelay::with_policy(RelayPolicy::enabled());
         // Classification only — no quota charge, no telemetry bump.
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true, false, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -2451,7 +2532,7 @@ mod tests {
         policy.require_contact_to_relay = false;
         let relay = PeerRelay::with_policy(policy);
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false, false, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
@@ -2486,7 +2567,7 @@ mod tests {
             )
             .expect("build");
         assert_eq!(
-            relay.disposition_for(&relayed, &local, now_ms + 100, false, false, false),
+            relay.disposition_for(&relayed, &local, now_ms + 100, false, false),
             RelayDisposition::DeliverLocally
         );
     }
@@ -2604,13 +2685,13 @@ mod tests {
         // Blocked + not-a-contact → still Blocked (gate is unconditional +
         // checked before the contact gate).
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false, true, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, true),
             RelayDisposition::Refuse(RelayRefusal::Blocked)
         );
         // Even if the sender were (impossibly) both "a contact" and blocked,
         // the Blocked gate runs first.
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true, true, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, true),
             RelayDisposition::Refuse(RelayRefusal::Blocked)
         );
         let snap = relay.stats().snapshot();
@@ -2641,7 +2722,7 @@ mod tests {
         policy.require_contact_to_relay = false;
         let relay = PeerRelay::with_policy(policy);
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false, true, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, true),
             RelayDisposition::Refuse(RelayRefusal::Blocked)
         );
         let snap = relay.stats().snapshot();
@@ -2669,12 +2750,12 @@ mod tests {
         let relay = PeerRelay::with_policy(RelayPolicy::enabled()); // require_contact default true
                                                                     // is_sender_contact=false models an Unknown (or absent) sender.
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, false, false, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, false, false),
             RelayDisposition::Refuse(RelayRefusal::NotAContact)
         );
         // A Known/Trusted contact (is_sender_contact=true) does pass.
         assert_eq!(
-            relay.disposition_for(&relayed, &we, now_ms + 100, true, false, false),
+            relay.disposition_for(&relayed, &we, now_ms + 100, true, false),
             RelayDisposition::Forward {
                 dst_agent_id: dst.0
             }
