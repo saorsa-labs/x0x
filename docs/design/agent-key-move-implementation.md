@@ -167,3 +167,28 @@ activation retry after a persist failure, retire own-key deletion, and
 the blob-v2 placement fetch-on-miss transport.
 
 Follow-up tracking: saorsa-labs/x0x#443.
+
+## Review round 5 (b2-0037-r5)
+
+- **Rebased onto `origin/main` (`1a09fd8`)** — the branch no longer
+  carries the pre-#433 loopback-substitution probe; `restart.rs` keeps
+  main's exact-address bind probe verbatim (no diff vs main).
+- **H5 closed:** the raw-QUIC path re-runs B/P against the FINAL
+  recipient machine immediately before transmission — after EVERY
+  reassignment site (initial registry/cache resolution, send-readiness
+  repair, discovery redial). A retired or pinned-elsewhere machine
+  introduced by any repair/redial is refused at the transmit seam.
+- **H8 closed — authority is MANDATORY at the cache boundary:**
+  `cache_placement` now takes a [`PlacementAuthority`] constructible only
+  from a verified certificate issuer or an already-verified structure's
+  owner (a coherence-checked bundle); the `None` bypass no longer exists
+  at the type level. `combined_from_bytes` takes the certificate map and
+  drops standalone records without a cert-issuer match fail-closed;
+  `placements_from_bytes` likewise.
+- **Ceremony globally unreachable:** the gate is mirrored on the agent
+  (`AgentBuilder::with_move_ceremony`, default `false`, wired from
+  `[key_move] ceremony_enabled` in `serve`) — `move_authorize` /
+  `move_export` / `move_import` / `move_activate` / `move_abort` /
+  `move_retire` each return a typed disabled error before any mutation.
+  Startup LOADING of existing move state is unaffected (loading ≠
+  executing).

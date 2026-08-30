@@ -208,6 +208,42 @@ impl PlacementRecord {
     }
 }
 
+/// The PROVEN authority for a placement record entering the cache
+/// (review r5 H8): there is deliberately NO bypass — every entry path
+/// must construct this from either a verified certificate issuer or an
+/// owner key whose authority over the agent was already established by
+/// a verified structure (a coherence-checked `ActivationBundle`).
+///
+/// A bare byte slice is not accepted: signature validity alone proves
+/// internal consistency, not that the signer owns the agent.
+#[derive(Clone, Copy)]
+pub struct PlacementAuthority<'a> {
+    owner_key: &'a [u8],
+}
+
+impl<'a> PlacementAuthority<'a> {
+    /// Authority from a VERIFIED `AgentCertificate`: its issuer key
+    /// certified the agent.
+    #[must_use]
+    pub fn cert_issuer(cert: &'a AgentCertificate) -> Self {
+        Self {
+            owner_key: cert.user_public_key_bytes(),
+        }
+    }
+
+    /// Authority already proven by a verified structure — the coherence
+    /// check of an `ActivationBundle` established that this owner key
+    /// signed the bundle that carries the placement.
+    #[must_use]
+    pub fn verified_owner(owner_key: &'a [u8]) -> Self {
+        Self { owner_key }
+    }
+
+    fn key(&self) -> &'a [u8] {
+        self.owner_key
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Move records (§3.1)
 // ---------------------------------------------------------------------------
@@ -1318,7 +1354,10 @@ impl MoveState {
             // Review r3 H8: the bundle's coherence check proved the issuer
             // == owner signer; carry that authority into the cache write
             // (one epoch/authority rule for every placement entry path).
-            if self.cache_placement(placement, Some(&chained.owner_public_key))? {
+            if self.cache_placement(
+                placement,
+                PlacementAuthority::verified_owner(&chained.owner_public_key),
+            )? {
                 changed = true;
             }
         }
@@ -1365,22 +1404,18 @@ impl MoveState {
     pub fn cache_placement(
         &mut self,
         record: PlacementRecord,
-        expected_owner: Option<&[u8]>,
+        authority: PlacementAuthority<'_>,
     ) -> std::result::Result<bool, IdentityError> {
         record.verify()?;
-        // Review r3 H8: signature validity alone proves internal
-        // consistency — the record's owner key could be an attacker's.
-        // When the caller knows the authoritative issuer (the mint's own
-        // owner key, a coherence-verified bundle's owner, or a
-        // certificate issuer), REQUIRE the match; `None` is reserved for
-        // callers that have already established authority by other means.
-        if let Some(expected) = expected_owner {
-            if record.owner_public_key.as_slice() != expected {
-                return Err(IdentityError::Revocation(
-                    "placement record issuer does not match the authoritative owner key"
-                        .to_string(),
-                ));
-            }
+        // Review r5 H8: authority is MANDATORY — there is no `None`
+        // bypass. Signature validity alone proves internal consistency;
+        // the authority type proves the owner key certified the agent
+        // (certificate issuer) or was established by an already-verified
+        // structure (coherence-checked bundle owner).
+        if record.owner_public_key.as_slice() != authority.key() {
+            return Err(IdentityError::Revocation(
+                "placement record issuer does not match the authoritative owner key".to_string(),
+            ));
         }
         match self.placements.get(&record.agent_id) {
             Some(current) if current.placement_epoch > record.placement_epoch => Ok(false),
@@ -1603,19 +1638,14 @@ impl MoveState {
                 IdentityError::Serialization(format!("placement-blobs.bin decode: {e}"))
             })?;
         for record in list {
-            let issuer_key = certs
+            let authority = certs
                 .get(&record.agent_id)
-                .filter(|_| {
-                    // Authority: the record's owner key must BE the cert
-                    // issuer (owner_matches_cert), then we pass the issuer
-                    // bytes as the expected owner to the cache write.
-                    certs
-                        .get(&record.agent_id)
-                        .is_some_and(|cert| record.owner_matches_cert(cert))
-                })
-                .map(crate::identity::AgentCertificate::user_public_key_bytes);
-            if issuer_key.is_some() && record.verify().is_ok() {
-                let _ = state.cache_placement(record, issuer_key);
+                .filter(|cert| record.owner_matches_cert(cert))
+                .map(PlacementAuthority::cert_issuer);
+            if let Some(authority) = authority {
+                if record.verify().is_ok() {
+                    let _ = state.cache_placement(record, authority);
+                }
             } else {
                 tracing::warn!(
                     agent = %hex::encode(record.agent_id.as_bytes()),
@@ -1688,7 +1718,11 @@ impl MoveState {
     ///
     /// Returns [`IdentityError::Serialization`] on malformed input — the
     /// caller treats a PRESENT-but-corrupt file as poisoned state.
-    pub fn combined_from_bytes(bytes: &[u8], revoked: &mut RevocationSet) -> Result<(Self, u64)> {
+    pub fn combined_from_bytes(
+        bytes: &[u8],
+        revoked: &mut RevocationSet,
+        certs: &HashMap<AgentId, AgentCertificate>,
+    ) -> Result<(Self, u64)> {
         if bytes.len() < MOVE_STATE_FILE_MAGIC.len()
             || &bytes[..MOVE_STATE_FILE_MAGIC.len()] != MOVE_STATE_FILE_MAGIC
         {
@@ -1719,8 +1753,10 @@ impl MoveState {
                 } = &chained.record
                 {
                     let _ = revoked.union_bundle_retired(retired_bindings);
-                    let _ = state
-                        .cache_placement(placement_record.clone(), Some(&chained.owner_public_key));
+                    let _ = state.cache_placement(
+                        placement_record.clone(),
+                        PlacementAuthority::verified_owner(&chained.owner_public_key),
+                    );
                 }
                 state.bundles.insert(agent, chained);
             } else {
@@ -1731,11 +1767,24 @@ impl MoveState {
             }
         }
         for record in persisted.placements {
-            // Standalone records carry no in-file issuer proof; the
-            // caller (builder) re-checks them against the cert journal —
-            // keep them raw here and let the builder filter via
-            // [`Self::retain_placements_issued_by`].
-            let _ = state.cache_placement(record, None);
+            // Review r5 H8: standalone records carry no in-file issuer
+            // proof — they enter ONLY through a certificate-issuer
+            // authority; without one they drop fail-closed (the owner
+            // re-mints; bundle-derived records re-enter above with the
+            // bundle's verified owner).
+            let authority = certs
+                .get(&record.agent_id)
+                .filter(|cert| record.owner_matches_cert(cert))
+                .map(PlacementAuthority::cert_issuer);
+            match authority {
+                Some(authority) if record.verify().is_ok() => {
+                    let _ = state.cache_placement(record, authority);
+                }
+                _ => tracing::warn!(
+                    agent = %hex::encode(record.agent_id.as_bytes()),
+                    "move-state.bin: dropping standalone placement without a cert-issuer match"
+                ),
+            }
         }
         Ok((state, persisted.generation))
     }
@@ -2681,12 +2730,18 @@ mod r4_tests {
         let mut state = MoveState::new();
         // Correct authority: accepted.
         assert!(state
-            .cache_placement(good, Some(owner.public_key().as_bytes()))
+            .cache_placement(
+                good,
+                PlacementAuthority::verified_owner(owner.public_key().as_bytes())
+            )
             .unwrap());
         // Foreign key (higher epoch, would otherwise win): REFUSED, and
         // the pinned-elsewhere placement never enters the view.
         assert!(state
-            .cache_placement(forged, Some(owner.public_key().as_bytes()))
+            .cache_placement(
+                forged,
+                PlacementAuthority::verified_owner(owner.public_key().as_bytes())
+            )
             .is_err());
         assert_eq!(
             state.placement(&agent).map(|p| p.placement),
@@ -2763,7 +2818,10 @@ mod r4_egress_tests {
             let move_state = agent.move_state();
             let mut state = move_state.write().await;
             state
-                .cache_placement(pinned, Some(owner.public_key().as_bytes()))
+                .cache_placement(
+                    pinned,
+                    PlacementAuthority::verified_owner(owner.public_key().as_bytes()),
+                )
                 .unwrap();
         }
 
@@ -2777,6 +2835,157 @@ mod r4_egress_tests {
         assert!(
             err.to_string().contains("pairing denied"),
             "refusal must name the B/P gate, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r5_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// WHY (review r5 H8): the `None` authority bypass is GONE at the
+    /// type level — `cache_placement` accepts only a
+    /// [`PlacementAuthority`], constructible solely from a verified
+    /// certificate issuer or an already-verified structure's owner key.
+    /// Loading must drop standalone records that cannot prove a
+    /// certificate issuer: the combined store round-trips bundle-derived
+    /// placements (bundle authority) and drops cert-less standalones.
+    #[test]
+    fn combined_load_requires_authority_for_standalone_placements() {
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let agent_kp = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&owner, &agent_kp).unwrap();
+        let agent = agent_kp.agent_id();
+        let stranger = crate::identity::AgentId([0x33; 32]);
+
+        let mut state = MoveState::new();
+        // A cert-backed standalone placement (the mint's own shape).
+        let minted = PlacementRecord::sign(
+            agent,
+            owner.public_key().as_bytes(),
+            Placement::Roaming,
+            0,
+            1,
+            owner.secret_key(),
+        )
+        .unwrap();
+        state
+            .cache_placement(minted, PlacementAuthority::cert_issuer(&cert))
+            .unwrap();
+        // A standalone placement for an agent with NO known certificate —
+        // internally consistent, but unprovable authority.
+        let orphan_owner = crate::identity::UserKeypair::generate().unwrap();
+        let orphan = PlacementRecord::sign(
+            stranger,
+            orphan_owner.public_key().as_bytes(),
+            Placement::Roaming,
+            0,
+            1,
+            orphan_owner.secret_key(),
+        )
+        .unwrap();
+        state
+            .cache_placement(
+                orphan,
+                PlacementAuthority::verified_owner(orphan_owner.public_key().as_bytes()),
+            )
+            .unwrap();
+
+        let bytes = state.combined_to_bytes(7).unwrap();
+        // Load with only the FIRST agent's certificate: the orphan drops
+        // fail-closed; the cert-backed record survives.
+        let mut certs = HashMap::new();
+        certs.insert(agent, cert);
+        let mut revoked = RevocationSet::new();
+        let (loaded, generation) =
+            MoveState::combined_from_bytes(&bytes, &mut revoked, &certs).unwrap();
+        assert_eq!(generation, 7);
+        assert!(
+            loaded.placement(&agent).is_some(),
+            "cert-backed mint record survives"
+        );
+        assert!(
+            loaded.placement(&stranger).is_none(),
+            "standalone record without a certificate drops on load — no authority bypass"
+        );
+    }
+}
+
+#[cfg(test)]
+mod r5_registry_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+
+    /// WHY (review r5 H5): a recipient resolved through the DM-connection
+    /// REGISTRY (no discovery-cache entry, so the funnel-head check never
+    /// fired) must still be refused when its pairing is dead — and the
+    /// post-resolution check is the SAME seam that covers machine
+    /// REASSIGNMENT during repair/redial (the check runs against the
+    /// FINAL machine immediately before transmission, after every
+    /// reassignment site).
+    #[tokio::test]
+    async fn registry_resolved_recipient_refused_by_post_resolution_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = crate::network::NetworkConfig::default();
+        let sender = crate::Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_identity_dir(dir.path())
+            .with_network_config(config)
+            .build()
+            .await
+            .unwrap();
+        let peer = crate::identity::AgentKeypair::generate().unwrap();
+
+        // NO discovery-cache entry for the peer (so the funnel-head B/P
+        // pass is skipped), but the raw-QUIC path resolves a machine for
+        // it through the DM registry — simulate the post-resolution state
+        // directly: the recipient is pinned elsewhere, so ANY resolved
+        // machine must refuse.
+        let owner = crate::identity::UserKeypair::generate().unwrap();
+        let pinned = PlacementRecord::sign(
+            peer.agent_id(),
+            owner.public_key().as_bytes(),
+            Placement::Pinned(crate::identity::MachineId([0x0C; 32])),
+            2,
+            1,
+            owner.secret_key(),
+        )
+        .unwrap();
+        {
+            let move_state = sender.move_state();
+            let mut state = move_state.write().await;
+            state
+                .cache_placement(
+                    pinned,
+                    PlacementAuthority::verified_owner(owner.public_key().as_bytes()),
+                )
+                .unwrap();
+        }
+
+        // Seed the DM-connection REGISTRY with a machine for the peer
+        // (exactly what a prior direct connection leaves behind) — the
+        // raw-QUIC path resolves it with NO discovery-cache entry, so the
+        // funnel-head check never fired; the post-resolution check must
+        // refuse.
+        let stale_machine = crate::identity::MachineId([0x0D; 32]);
+        sender
+            .direct_messaging()
+            .mark_connected(peer.agent_id(), stale_machine)
+            .await;
+        let err = sender
+            .send_direct(&peer.agent_id(), b"registry-resolved probe".to_vec())
+            .await
+            .expect_err("DM to a pinned-elsewhere pairing must be refused");
+        // The raw-QUIC path surfaces PeerNotVerified through the DM
+        // error mapping ("... not verified") — the B/P refusal.
+        assert!(
+            err.to_string().contains("not verified"),
+            "refusal must be the B/P PeerNotVerified (post-resolution seam), got: {err}"
         );
     }
 }

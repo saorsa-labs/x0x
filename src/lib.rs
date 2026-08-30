@@ -431,6 +431,12 @@ pub struct Agent {
     /// signing gate instead of re-enabling the pre-0043 exception (state
     /// loss must never resurrect a custodian the durable log moved away).
     move_state_load_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// ADR-0043 review-r5: ceremony gate mirrored on the agent so the
+    /// LIBRARY API (`move_authorize`/`move_export`/`move_import`/
+    /// `move_activate`/`move_abort`/`move_retire`) is unreachable when
+    /// the experimental roaming-move ceremony is disabled — not just the
+    /// REST surface. Loading existing move state is unaffected.
+    move_ceremony_enabled: bool,
 }
 
 /// Closed-flag task registry for deterministic Agent teardown.
@@ -2645,6 +2651,14 @@ fn build_machine_announcement_for_identity(
 pub struct AgentBuilder {
     machine_key_path: Option<std::path::PathBuf>,
     agent_keypair: Option<identity::AgentKeypair>,
+    /// ADR-0043 review-r4/r5 scope gate: whether the roaming-move
+    /// ceremony is live on this agent. Default `false` (experimental in
+    /// v1) — `move_authorize`/`move_export`/`move_import`/
+    /// `move_activate`/`move_abort`/`move_retire` then return a typed
+    /// disabled error, making the ceremony unreachable via the LIBRARY
+    /// API, not just REST. Startup loading of existing move state is
+    /// unaffected (loading ≠ executing).
+    move_ceremony_enabled: bool,
     agent_key_path: Option<std::path::PathBuf>,
     /// Custom path for `agent.cert`. When set, the cert is loaded/saved from
     /// this path instead of `~/.x0x/agent.cert`. Required for multi-daemon
@@ -3595,6 +3609,7 @@ impl Agent {
             heartbeat_interval_secs: None,
             legacy_announce: None,
             identity_ttl_secs: None,
+            move_ceremony_enabled: false,
             presence_beacon_interval_secs: None,
             presence_event_poll_interval_secs: None,
             presence_offline_timeout_secs: None,
@@ -6448,6 +6463,27 @@ impl Agent {
                     resolution = "discovery_redial";
                 }
             }
+        }
+
+        // ADR-0043 §9 (review r5 H5): ANY machine reassignment above
+        // (registry/repair/redial) can land on a pairing the pre-send
+        // check never saw — re-run B/P against the FINAL machine
+        // immediately before transmission, so a retired or
+        // pinned-elsewhere binding reached through the repair path is
+        // refused here regardless of how it was resolved.
+        if let Some(denial) = self.recipient_pairing_denied(agent_id, &machine_id).await {
+            tracing::info!(
+                target: "x0x::direct",
+                agent_prefix = %crate::logging::LogHexId::agent(&agent_prefix),
+                machine_prefix = %crate::logging::LogHexId::new("machine", &machine_prefix),
+                resolution,
+                outcome = "drop_pairing_post_resolution",
+                reason = ?denial,
+                "raw-QUIC send refused after machine resolution: recipient pairing denied (ADR-0043 B/P)"
+            );
+            return Err(error::NetworkError::PeerNotVerified {
+                agent_id: agent_id.0,
+            });
         }
 
         // X0X-0051 / X0X-0053: the X0X-0041 prefer-newest-grace block was
@@ -10232,7 +10268,10 @@ impl Agent {
                 // Review r3/r4 H8: the mint KNOWS the authoritative owner
                 // key — require it on the cache write (a self-signed
                 // record can never enter, even locally).
-                let _ = state.cache_placement(record, Some(owner_pk));
+                let _ = state.cache_placement(
+                    record,
+                    key_move::PlacementAuthority::verified_owner(owner_pk),
+                );
             }
             minted += 1;
         }
@@ -10265,6 +10304,11 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         if let key_move::Placement::Pinned(pin) = placement {
             if &pin != to_machine {
                 return Err(error::IdentityError::CertificateVerification(
@@ -10368,6 +10412,11 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         // Target KEM key from the machine discovery cache (V3 announce).
         let target_kem = {
             let machines = self.machine_discovery_cache.read().await;
@@ -10641,6 +10690,11 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         let (head, auth, retired, cert) = {
             let state = self.move_state.read().await;
             let log = state.log(agent_id);
@@ -10784,6 +10838,11 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         let (head, auth_hash, from_machine) = {
             let state = self.move_state.read().await;
             let log = state.log(agent_id);
@@ -10886,6 +10945,11 @@ impl Agent {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
         })?;
+        if !self.move_ceremony_enabled {
+            return Err(error::IdentityError::Revocation(
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+            ));
+        }
         let (head, auth_hash, from_machine) = {
             let state = self.move_state.read().await;
             let log = state.log(agent_id);
@@ -13890,6 +13954,15 @@ impl AgentBuilder {
         self
     }
 
+    /// Enable the (experimental, v1-off-by-default) roaming-move
+    /// ceremony on the built agent — see
+    /// [`Agent::move_authorize`] for the gate semantics.
+    #[must_use]
+    pub fn with_move_ceremony(mut self, enabled: bool) -> Self {
+        self.move_ceremony_enabled = enabled;
+        self
+    }
+
     /// Override the presence beacon broadcast interval in seconds.
     #[must_use]
     pub fn with_presence_beacon_interval(mut self, secs: u64) -> Self {
@@ -14474,6 +14547,7 @@ impl AgentBuilder {
         Ok(Agent {
             move_state,
             move_state_load_failed,
+            move_ceremony_enabled: self.move_ceremony_enabled,
             history_service: tokio::sync::Mutex::new(history_service),
             history_handle,
             self_name: std::sync::Arc::new(std::sync::RwLock::new(None)),

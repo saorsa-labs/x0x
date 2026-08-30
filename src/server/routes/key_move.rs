@@ -557,6 +557,7 @@ mod tests {
                 .with_user_key(user)
                 .with_contact_store_path(data_dir.join("contacts.json"))
                 .with_identity_dir(data_dir)
+                .with_move_ceremony(true)
                 .build()
                 .await?,
         );
@@ -1002,6 +1003,27 @@ mod gate_tests {
         ];
         for (status, name) in cases {
             assert_eq!(status, StatusCode::NOT_IMPLEMENTED, "{name} must be 501");
+        }
+
+        // Review r5 (4): the ceremony is unreachable via the LIBRARY API
+        // too, not just REST — the default-built agent (flag off) returns
+        // a typed disabled error from every executor.
+        {
+            let agent_id = state.agent.agent_id();
+            let err = state
+                .agent
+                .move_authorize(
+                    &agent_id,
+                    &crate::identity::MachineId([9u8; 32]),
+                    crate::key_move::Placement::Roaming,
+                )
+                .await
+                .expect_err("library move_authorize must refuse when the ceremony is disabled");
+            assert!(
+                err.to_string()
+                    .contains("ceremony is experimental and disabled"),
+                "typed disabled error expected, got: {err}"
+            );
         }
 
         // The shipped core stays live: the ledger mints and the roster

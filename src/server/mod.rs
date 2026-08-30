@@ -525,7 +525,8 @@ pub async fn serve_with_options(
         .with_history(history_config)
         .with_heartbeat_interval(config.heartbeat_interval_secs)
         .with_legacy_announce(config.legacy_announce)
-        .with_identity_ttl(config.identity_ttl_secs);
+        .with_identity_ttl(config.identity_ttl_secs)
+        .with_move_ceremony(config.key_move.ceremony_enabled);
 
     if let Some(secs) = config.presence_beacon_interval_secs {
         builder = builder.with_presence_beacon_interval(secs);
