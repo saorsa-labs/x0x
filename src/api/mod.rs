@@ -31,6 +31,173 @@ impl std::fmt::Display for Method {
         }
     }
 }
+/// Where a request field lives on the wire.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FieldLocation {
+    /// JSON request body.
+    Body,
+    /// URL query string.
+    Query,
+}
+
+impl FieldLocation {
+    /// Wire label used in the generated manifest.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FieldLocation::Body => "body",
+            FieldLocation::Query => "query",
+        }
+    }
+}
+
+/// How the `x0x` CLI surfaces one request field.
+#[derive(Debug, Clone)]
+pub enum CliExpose {
+    /// A `--kebab-case(name)` flag or a `<NAME>` positional — the default
+    /// CLI naming conventions.
+    Default,
+    /// The exact token as it appears in `x0x <cmd> --help` output
+    /// (e.g. `"--trust"`, `"PUBLIC_KEY_HEX"`).
+    Token(&'static str),
+    /// The CLI synthesizes the value from other arguments (e.g. it
+    /// base64-encodes `--file` into `payload_b64`); no help token exists.
+    Derived,
+    /// Accepted by the request struct but ignored (or rejected) by the
+    /// handler — deliberately not surfaced to users.
+    Ignored,
+    /// Exposed through the caller-supplied JSON document the CLI posts
+    /// verbatim (a per-field flag would be a lie about the interface).
+    JsonDoc,
+    /// An `Option<bool>` whose daemon default when omitted is TRUE: the CLI
+    /// must expose it as a value-taking `--flag <true|false>` so `false` is
+    /// reachable (a bare SetTrue flag could only restate the default).
+    BoolValue,
+}
+
+/// One named request field an endpoint accepts, beyond its path parameters.
+#[derive(Debug, Clone)]
+pub struct RequestField {
+    /// Wire field name (the serde name).
+    pub name: &'static str,
+    /// Body or query-string location.
+    pub location: FieldLocation,
+    /// Whether the handler requires the field (no serde default).
+    pub required: bool,
+    /// How the CLI exposes the field.
+    pub cli: CliExpose,
+}
+
+impl RequestField {
+    /// Body field using the default CLI naming convention.
+    pub const fn body(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required,
+            cli: CliExpose::Default,
+        }
+    }
+
+    /// Query field using the default CLI naming convention.
+    pub const fn query(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Query,
+            required,
+            cli: CliExpose::Default,
+        }
+    }
+
+    /// Body field bound to a specific `--help` token.
+    pub const fn body_as(name: &'static str, required: bool, token: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required,
+            cli: CliExpose::Token(token),
+        }
+    }
+
+    /// Query field bound to a specific `--help` token.
+    pub const fn query_as(name: &'static str, required: bool, token: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Query,
+            required,
+            cli: CliExpose::Token(token),
+        }
+    }
+
+    /// Body field the CLI synthesizes from other arguments.
+    pub const fn body_derived(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required,
+            cli: CliExpose::Derived,
+        }
+    }
+
+    /// Body field the request struct carries but the handler ignores or
+    /// rejects (e.g. a tombstoned pre-migration knob).
+    pub const fn body_ignored(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required: false,
+            cli: CliExpose::Ignored,
+        }
+    }
+
+    /// Body `Option<bool>` field defaulting to true when omitted; the CLI
+    /// flag must take an explicit value.
+    pub const fn body_bool_default_true(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required: false,
+            cli: CliExpose::BoolValue,
+        }
+    }
+
+    /// Body field supplied through the verbatim JSON document argument.
+    pub const fn body_json_doc(name: &'static str, required: bool) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required,
+            cli: CliExpose::JsonDoc,
+        }
+    }
+
+    /// Query field the request struct carries but the handler ignores.
+    pub const fn query_ignored(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Query,
+            required: false,
+            cli: CliExpose::Ignored,
+        }
+    }
+}
+
+/// Request-shape metadata for one endpoint.
+///
+/// `tests/cli_request_parity.rs` enforces this contract against both the
+/// CLI argument parser and the daemon's request structs: a field hidden
+/// from the CLI is a hidden capability, and a registry entry that drifts
+/// from the request struct is a lying manifest.
+#[derive(Debug, Clone)]
+pub enum RequestSpec {
+    /// No request data beyond path parameters.
+    None,
+    /// Named body/query fields.
+    Fields(&'static [RequestField]),
+    /// The CLI posts a caller-supplied JSON document verbatim (from a
+    /// literal, `@file`, or stdin), so every struct field is exposed by
+    /// construction.
+    Passthrough,
+}
 
 /// A single API endpoint definition.
 #[derive(Debug, Clone)]
@@ -45,8 +212,9 @@ pub struct EndpointDef {
     pub description: &'static str,
     /// Grouping category.
     pub category: &'static str,
+    /// Request-shape contract (body/query fields) for CLI parity.
+    pub request: RequestSpec,
 }
-
 /// Complete registry of all x0x API endpoints.
 pub const ENDPOINTS: &[EndpointDef] = &[
     // ── Status ──────────────────────────────────────────────────────────
@@ -56,6 +224,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "health",
         description: "Health check",
         category: "status",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -63,6 +232,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "status",
         description: "Runtime status with uptime",
         category: "status",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -70,6 +240,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "stop",
         description: "Gracefully stop the daemon",
         category: "status",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -77,6 +248,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "auth session",
         description: "Exchange the durable API token for a short-lived browser session token",
         category: "status",
+        request: RequestSpec::None,
     },
     // ── Identity ────────────────────────────────────────────────────────
     EndpointDef {
@@ -85,6 +257,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent",
         description: "Agent identity info",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -92,6 +265,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "announce",
         description: "Announce identity to network",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("include_user_identity", false, "--include-user"), RequestField::body_as("human_consent", false, "--consent")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -99,6 +273,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent user-id",
         description: "Current agent user ID",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -106,6 +281,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent card",
         description: "Generate shareable identity card",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::query_as("display_name", false, "DISPLAY_NAME"), RequestField::query("include_groups", false), RequestField::query("include_local_addresses", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -113,6 +289,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent introduction",
         description: "Introduction card with trust-scoped disclosure",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::query("peer", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -120,6 +297,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent import",
         description: "Import agent card to contacts",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("card", true, "CARD"), RequestField::body_as("trust_level", false, "--trust")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -127,6 +305,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent sign",
         description: "Detached ML-DSA-65 signature over a caller-supplied payload",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body("context", true), RequestField::body_as("payload_b64", true, "--payload-b64")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -134,6 +313,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agent verify",
         description: "Verify a detached ML-DSA-65 signature against a caller-supplied public key",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("payload_b64", true, "--payload-b64"), RequestField::body("signature_b64", true), RequestField::body("public_key_b64", true), RequestField::body("context", true), RequestField::body("algorithm", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -141,6 +321,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "identity revoke",
         description: "Issue a signed revocation for an agent-id or machine-id keypair",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body("agent_id", false), RequestField::body("machine_id", false), RequestField::body("move_epoch", false), RequestField::body("reason", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -148,6 +329,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "identity revocations",
         description: "List all revocation records held by this daemon",
         category: "identity",
+        request: RequestSpec::None,
     },
     // ── ADR-0043 agent key-move ceremony + placement ledger ────────────
     EndpointDef {
@@ -156,6 +338,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move authorize",
         description: "Owner-authorize an agent move (chain MoveAuthorization; source seals)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("to_machine", true, "TO_MACHINE"), RequestField::body_as("placement", true, "PLACEMENT"), RequestField::body_derived("pin", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -163,6 +346,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move export",
         description: "Source machine seals the export envelope + ExportReceipt",
         category: "identity",
+        request: RequestSpec::Passthrough,
     },
     EndpointDef {
         method: Method::Post,
@@ -170,6 +354,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move import",
         description: "Target machine imports a transfer bundle (unwrap + store + receipt)",
         category: "identity",
+        request: RequestSpec::Passthrough,
     },
     EndpointDef {
         method: Method::Post,
@@ -177,6 +362,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move activate",
         description: "Owner commits a move (ActivationBundle on the activation topic)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("move_epoch", true, "EPOCH")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -184,6 +370,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move abort",
         description: "Owner rolls back a pre-activation move (epoch burned)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("move_epoch", true, "EPOCH"), RequestField::body_as("reason", false, "--reason")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -191,6 +378,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move retire",
         description: "Source machine retires after activation (delete key + receipt)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("move_epoch", true, "EPOCH")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -198,6 +386,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "move list",
         description: "Move-log view + derived state (custodian, quiesce, placement)",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -205,6 +394,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner placement",
         description: "Derived placement ledger (lazy mint + ≥1-Roaming Home invariant)",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -212,6 +402,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner agents placement",
         description: "One agent's placement record + fold",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -219,6 +410,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "profile",
         description: "Daemon self-profile names (human/display/machine)",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Put,
@@ -226,6 +418,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "profile set",
         description: "Update stored self-profile names (partial update)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body("human_name", false), RequestField::body("display_name", false), RequestField::body("machine_name", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -233,6 +426,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "home",
         description: "ADR-0038 Home space: group id, primary agent, members, warnings",
         category: "groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -240,6 +434,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "home rename",
         description: "Rename the Home space (admin-gated, sealed)",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -247,6 +442,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner agents",
         description: "Roster of agents certified by this install's owner (journal-backed; survives restarts)",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -254,6 +450,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner agents issue",
         description: "Owner-sign an AgentCertificate over a harness-submitted agent public key (ADR-0039)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_public_key", true, "PUBLIC_KEY_HEX"), RequestField::body("mode", false), RequestField::body("label", false), RequestField::body("not_after", false)]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -261,13 +458,15 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner agents revoke",
         description: "ADR-0018 owner issuer-revocation of a registered sub-agent",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body("reason", false)]),
     },
     EndpointDef {
         method: Method::Post,
         path: "/owner/riders",
         cli_name: "owner riders issue",
-        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; REST-only mint — the required harness-signed delegation cannot be supplied from the CLI)",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("sub_agent_id", true, "AGENT_ID"), RequestField::body_as("groups", false, "--group"), RequestField::body("label", false), RequestField::body("ttl_secs", false), RequestField::body_as("delegation", true, "--delegation-payload-b64")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -275,6 +474,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner riders",
         description: "List rider-token records (no secrets; hashed identifiers only)",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -282,6 +482,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "owner riders revoke",
         description: "Revoke a rider token; it fails on the next request",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -289,6 +490,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "sync devices",
         description: "ADR-0041 Tier-1: enrolled owner devices + last-sync status",
         category: "identity",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -296,6 +498,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "sync enroll",
         description: "Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)",
         category: "identity",
+        request: RequestSpec::Fields(&[RequestField::body_as("machine_id", false, "MACHINE_ID"), RequestField::body("ttl_secs", false)]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -303,6 +506,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "sync revoke",
         description: "Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)",
         category: "identity",
+        request: RequestSpec::None,
     },
     // ── Network ─────────────────────────────────────────────────────────
     EndpointDef {
@@ -311,13 +515,15 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "peers",
         description: "Connected gossip peers",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
         path: "/presence",
         cli_name: "presence",
-        description: "Online agents (alias for /presence/online)",
+        description: "Online agents (gossip presence view; /presence/online is the discovery-cache view)",
         category: "presence",
+        request: RequestSpec::None,
     },
     // ── Presence ────────────────────────────────────────────────────────
     EndpointDef {
@@ -326,6 +532,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "presence online",
         description: "List all currently online agents (network view, non-blocked)",
         category: "presence",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -333,6 +540,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "presence foaf",
         description: "FOAF random-walk discovery of nearby agents (social view)",
         category: "presence",
+        request: RequestSpec::Fields(&[RequestField::query("ttl", false), RequestField::query("timeout_ms", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -340,6 +548,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "presence find",
         description: "Find a specific agent by ID via FOAF random walk",
         category: "presence",
+        request: RequestSpec::Fields(&[RequestField::query("ttl", false), RequestField::query("timeout_ms", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -347,6 +556,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "presence status",
         description: "Get local cache presence status for an agent",
         category: "presence",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -354,6 +564,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "presence events",
         description: "Server-Sent Events stream of presence online/offline events",
         category: "presence",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -361,6 +572,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "network status",
         description: "Network connectivity details",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -368,6 +580,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "network cache",
         description: "Bootstrap peer cache stats",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -375,6 +588,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics connectivity",
         description: "Connectivity snapshot (NodeStatus + transport_environment VPN/MTU assessment)",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -382,6 +596,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics ack",
         description: "ACK-v2 per-stage latency buckets and outcome counters",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -389,6 +604,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics gossip",
         description: "PubSub drop-detection counters (publish/deliver deltas)",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -396,6 +612,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics transport",
         description: "Transport connection accounting (zombie-connection hunt, #368)",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -403,6 +620,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics relay",
         description: "ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -410,6 +628,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics dm",
         description: "Direct-message send/receive counters and per-peer health",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -417,6 +636,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics groups",
         description: "Per-group ingest counters, listener state, and drop buckets",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -424,6 +644,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics history",
         description: "Durable-history writer/reaper counters (ADR-0023)",
         category: "network",
+        request: RequestSpec::None,
     },
     // ── History (ADR-0023 durable local history) ────────────────────────
     EndpointDef {
@@ -432,6 +653,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "history list",
         description: "List durable history for one scope (dm:/group:/topic:), keyset-paginated",
         category: "history",
+        request: RequestSpec::Fields(&[RequestField::query_as("scope", true, "SCOPE"), RequestField::query("since_ms", false), RequestField::query("until_ms", false), RequestField::query("limit", false), RequestField::query("before_id", false), RequestField::query_ignored("q")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -439,6 +661,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "history message",
         description: "Point lookup of one durable history row by exposed msg_id (canonical group ids need ?scope=)",
         category: "history",
+        request: RequestSpec::Fields(&[RequestField::query("scope", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -446,6 +669,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "history search",
         description: "Full-text search over text history payloads within a scope",
         category: "history",
+        request: RequestSpec::Fields(&[RequestField::query_as("scope", true, "SCOPE"), RequestField::query_as("q", true, "QUERY"), RequestField::query("since_ms", false), RequestField::query("until_ms", false), RequestField::query("limit", false), RequestField::query("before_id", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -453,6 +677,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "history stats",
         description: "History row counts, database size, and retention bounds",
         category: "history",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -460,6 +685,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "history purge",
         description: "Purge one scope from the local history store (local-only)",
         category: "history",
+        request: RequestSpec::Fields(&[RequestField::query_as("scope", true, "SCOPE")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -467,6 +693,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics exec",
         description: "Remote exec counters, warnings, active sessions, and ACL summary",
         category: "exec",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -474,6 +701,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics connect",
         description: "Connect-ACL policy summary and stream allow/deny counters",
         category: "connect",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -481,6 +709,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "diagnostics ws",
         description: "WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -488,6 +717,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "peer probe",
         description: "Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)",
         category: "network",
+        request: RequestSpec::Fields(&[RequestField::query("timeout_ms", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -495,6 +725,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "peer health",
         description: "Connection health snapshot for a peer (ant-quic 0.27.1 #170)",
         category: "network",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -502,6 +733,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "peer events",
         description: "SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)",
         category: "network",
+        request: RequestSpec::None,
     },
     // ── Messaging ───────────────────────────────────────────────────────
     EndpointDef {
@@ -510,6 +742,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "publish",
         description: "Publish message to topic",
         category: "messaging",
+        request: RequestSpec::Fields(&[RequestField::body_as("topic", true, "TOPIC"), RequestField::body_as("payload", true, "PAYLOAD")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -517,6 +750,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "subscribe",
         description: "Subscribe to topic",
         category: "messaging",
+        request: RequestSpec::Fields(&[RequestField::body_as("topic", true, "TOPIC")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -524,6 +758,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "unsubscribe",
         description: "Unsubscribe by ID",
         category: "messaging",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -531,6 +766,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "events",
         description: "SSE event stream",
         category: "messaging",
+        request: RequestSpec::None,
     },
     // ── Discovery ───────────────────────────────────────────────────────
     EndpointDef {
@@ -539,6 +775,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents list",
         description: "List discovered agents",
         category: "discovery",
+        request: RequestSpec::Fields(&[RequestField::query("unfiltered", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -546,6 +783,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents get",
         description: "Get discovered agent details",
         category: "discovery",
+        request: RequestSpec::Fields(&[RequestField::query("wait", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -553,6 +791,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents machine",
         description: "Resolve agent to current machine endpoint",
         category: "discovery",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -560,6 +799,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines discovered",
         description: "List discovered machine endpoints",
         category: "machines",
+        request: RequestSpec::Fields(&[RequestField::query("unfiltered", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -567,6 +807,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines get",
         description: "Get discovered machine endpoint details",
         category: "machines",
+        request: RequestSpec::Fields(&[RequestField::query("wait", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -574,6 +815,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents find",
         description: "Find agent on network",
         category: "discovery",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -581,6 +823,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents reachability",
         description: "Agent reachability info",
         category: "discovery",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -588,6 +831,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "agents by-user",
         description: "Agents by user ID",
         category: "discovery",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -595,6 +839,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines by-user",
         description: "Machine endpoints by user ID",
         category: "machines",
+        request: RequestSpec::None,
     },
     // ── Contacts ────────────────────────────────────────────────────────
     EndpointDef {
@@ -603,6 +848,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts list",
         description: "List contacts",
         category: "contacts",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -610,6 +856,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts add",
         description: "Add contact",
         category: "contacts",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("trust_level", false, "--trust"), RequestField::body_as("label", false, "--label")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -617,6 +864,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "trust set",
         description: "Quick trust/block",
         category: "contacts",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("level", true, "LEVEL")]),
     },
     EndpointDef {
         method: Method::Patch,
@@ -624,6 +872,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts update",
         description: "Update contact trust",
         category: "contacts",
+        request: RequestSpec::Fields(&[RequestField::body_as("trust_level", false, "--trust"), RequestField::body_as("identity_type", false, "--identity-type")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -631,6 +880,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts remove",
         description: "Remove contact",
         category: "contacts",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -638,6 +888,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts revoke",
         description: "Revoke contact",
         category: "contacts",
+        request: RequestSpec::Fields(&[RequestField::body_as("reason", true, "--reason")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -645,6 +896,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "contacts revocations",
         description: "List revocations",
         category: "contacts",
+        request: RequestSpec::None,
     },
     // ── Machines ────────────────────────────────────────────────────────
     EndpointDef {
@@ -653,6 +905,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines list",
         description: "List machines for contact",
         category: "machines",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -660,6 +913,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines add",
         description: "Add machine record",
         category: "machines",
+        request: RequestSpec::Fields(&[RequestField::body_as("machine_id", true, "MACHINE_ID"), RequestField::body("label", false), RequestField::body_as("pinned", false, "--pin")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -667,6 +921,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines remove",
         description: "Remove machine record",
         category: "machines",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -674,6 +929,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines pin",
         description: "Pin machine",
         category: "machines",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -681,6 +937,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines unpin",
         description: "Unpin machine",
         category: "machines",
+        request: RequestSpec::None,
     },
     // ── Trust ───────────────────────────────────────────────────────────
     EndpointDef {
@@ -689,6 +946,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "trust evaluate",
         description: "Evaluate trust for agent+machine",
         category: "trust",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("machine_id", true, "MACHINE_ID")]),
     },
     // ── Direct messaging ────────────────────────────────────────────────
     EndpointDef {
@@ -697,6 +955,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct connect",
         description: "Connect to agent",
         category: "direct",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -704,6 +963,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "machines connect",
         description: "Connect to machine",
         category: "direct",
+        request: RequestSpec::Fields(&[RequestField::body_as("machine_id", true, "MACHINE_ID")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -711,6 +971,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct send",
         description: "Send direct message",
         category: "direct",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_as("payload", true, "MESSAGE"), RequestField::body_bool_default_true("prefer_raw_quic_if_connected"), RequestField::body("raw_quic_receive_ack_ms", false), RequestField::body("stop_fallback_on_raw_error", false), RequestField::body("require_gossip", false), RequestField::body_ignored("require_gossip_ack"), RequestField::body_as("require_ack_ms", false, "--require-ack-ms"), RequestField::body_as("require_durable_app_ack", false, "--no-durable-ack"), RequestField::body("logical_id", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -718,6 +979,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct connections",
         description: "List direct connections",
         category: "direct",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -725,6 +987,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "direct events",
         description: "Stream direct messages",
         category: "direct",
+        request: RequestSpec::Fields(&[RequestField::query("backfill", false)]),
     },
     // ── Exec ───────────────────────────────────────────────────────────
     EndpointDef {
@@ -733,6 +996,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "exec",
         description: "Run a strictly allowlisted non-interactive command on a remote daemon",
         category: "exec",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body_derived("argv", true), RequestField::body_as("stdin_b64", false, "--stdin-file"), RequestField::body_as("timeout_ms", false, "--timeout"), RequestField::body("cwd", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -740,6 +1004,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "exec cancel",
         description: "Cancel an in-flight remote exec request",
         category: "exec",
+        request: RequestSpec::Fields(&[RequestField::body_as("request_id", true, "REQUEST_ID"), RequestField::body("agent_id", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -747,6 +1012,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "exec sessions",
         description: "List local pending and remote active exec sessions",
         category: "exec",
+        request: RequestSpec::None,
     },
     // ── MLS groups ──────────────────────────────────────────────────────
     EndpointDef {
@@ -755,6 +1021,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups create",
         description: "Create encrypted group",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("group_id", false, "--id")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -762,6 +1029,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups list",
         description: "List groups",
         category: "groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -769,6 +1037,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups get",
         description: "Get group details",
         category: "groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -776,6 +1045,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups add-member",
         description: "Add member to group",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -783,6 +1053,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups remove-member",
         description: "Remove member",
         category: "groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -790,6 +1061,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups encrypt",
         description: "Encrypt for group",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("payload", true, "PAYLOAD")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -797,6 +1069,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups decrypt",
         description: "Decrypt from group",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("ciphertext", true, "CIPHERTEXT"), RequestField::body("epoch", true)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -804,6 +1077,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "groups welcome",
         description: "Create welcome for member",
         category: "groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID")]),
     },
     // ── Named groups (high-level) ─────────────────────────────────────
     EndpointDef {
@@ -812,6 +1086,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group create",
         description: "Create named group",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME"), RequestField::body("description", false), RequestField::body("display_name", false), RequestField::body("preset", false), RequestField::body_as("policy", false, "--policy")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -819,6 +1094,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group list",
         description: "List groups",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -826,6 +1102,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group info",
         description: "Get group info",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -833,6 +1110,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group members",
         description: "List named-group members",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -840,6 +1118,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group add-member",
         description: "Add named-group member",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("agent_id", true, "AGENT_ID"), RequestField::body("display_name", false), RequestField::body_as("treekem_key_package_b64", false, "--key-package")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -847,6 +1126,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group remove-member",
         description: "Remove named-group member",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     // ── Phase E: public-group messaging ──────────────────────────────────
     EndpointDef {
@@ -855,6 +1135,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group send",
         description: "Publish a signed message to a SignedPublic group",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("body", true, "BODY"), RequestField::body("kind", false), RequestField::body("thread_root", false), RequestField::body_as("thread_parent", false, "--reply-to"), RequestField::body_as("mentions", false, "--mentions"), RequestField::body_as("delegation_digest", false, "--delegation-digest")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -862,6 +1143,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group messages",
         description: "Retrieve cached public messages (non-members on Public read)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::query("thread_root", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -869,6 +1151,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group delegate",
         description: "Issue a signed delegation (effective on durable history commit)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("to_agent", true, "--to-agent"), RequestField::body_as("scope", true, "--scope"), RequestField::body_as("verbs", false, "--verb"), RequestField::body_as("expiry_ms", true, "--expiry-ms"), RequestField::body("task", false), RequestField::body("parent", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -876,6 +1159,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group delegations",
         description: "List effective delegations re-derived from durable history",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -883,6 +1167,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group invite",
         description: "Generate invite link",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("expiry_secs", false, "--expiry")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -890,6 +1175,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group join",
         description: "Join group via invite",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("invite", true, "INVITE"), RequestField::body("display_name", false)]),
     },
     EndpointDef {
         method: Method::Put,
@@ -897,6 +1183,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group set-name",
         description: "Set display name in group",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -904,6 +1191,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group leave",
         description: "Leave a group (sole-member leave deletes the group)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     // ── Phase D.3: state-commit chain ────────────────────────────────────
     EndpointDef {
@@ -912,6 +1200,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group state",
         description: "Inspect the signed state-commit chain for a group",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -919,6 +1208,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group state-commits",
         description: "Read retained state-commit history (members only, paged)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::query("from_revision", false), RequestField::query("limit", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -926,6 +1216,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group state-seal",
         description: "Advance the state-commit chain and republish signed card",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -933,6 +1224,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group delete",
         description: "Delete a group with a terminal withdrawal commit",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     // ── Named groups: policy, roles, join requests, discovery ───────────
     EndpointDef {
@@ -941,6 +1233,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group update",
         description: "Update group name/description (admin+)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", false, "--new-name"), RequestField::body("description", false)]),
     },
     EndpointDef {
         method: Method::Patch,
@@ -948,6 +1241,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group policy",
         description: "Update group policy (admin+)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("preset", false), RequestField::body("discoverability", false), RequestField::body("admission", false), RequestField::body("confidentiality", false), RequestField::body("read_access", false), RequestField::body("write_access", false)]),
     },
     EndpointDef {
         method: Method::Patch,
@@ -955,6 +1249,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group set-role",
         description: "Change a member's role (admin+)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("role", true, "ROLE")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -962,6 +1257,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group ban",
         description: "Ban a member (admin+)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -969,6 +1265,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group unban",
         description: "Unban a member (admin+)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -976,6 +1273,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group requests",
         description: "List join requests (admin+)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -983,6 +1281,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group request-access",
         description: "Submit a join request",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body("message", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -990,6 +1289,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group approve-request",
         description: "Approve a join request (admin+)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -997,6 +1297,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group reject-request",
         description: "Reject a join request (admin+)",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -1004,6 +1305,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group cancel-request",
         description: "Cancel own pending join request",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1011,6 +1313,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group discover",
         description: "List locally known discoverable groups",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     // ── Phase C.2: shard-based distributed discovery ─────────────────────
     EndpointDef {
@@ -1019,6 +1322,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group discover-nearby",
         description: "Presence-social browse of PublicDirectory groups",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1026,6 +1330,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group discover-subscriptions",
         description: "List active shard subscriptions",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1033,6 +1338,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group discover-subscribe",
         description: "Subscribe to a tag/name/id directory shard",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("kind", true, "KIND"), RequestField::body("key", false), RequestField::body("shard", false)]),
     },
     EndpointDef {
         method: Method::Delete,
@@ -1040,6 +1346,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group discover-unsubscribe",
         description: "Unsubscribe from a directory shard",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1047,6 +1354,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group card",
         description: "Fetch a single group card",
         category: "named-groups",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1054,6 +1362,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group card-import",
         description: "Import a group card into local cache",
         category: "named-groups",
+        request: RequestSpec::Passthrough,
     },
     // ── Phase D.2: cross-daemon group shared-secret encryption ──────────
     EndpointDef {
@@ -1062,6 +1371,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group secure-encrypt",
         description: "Encrypt content with the group's shared secret (member-only)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("payload_b64", true, "PAYLOAD")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -1070,6 +1380,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description:
             "Decrypt content with the group's shared secret (member-only, epoch must match)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("ciphertext_b64", true, "CIPHERTEXT_B64"), RequestField::body_as("nonce_b64", false, "NONCE_B64"), RequestField::body_as("secret_epoch", false, "SECRET_EPOCH")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -1078,6 +1389,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description:
             "Re-seal the current group shared secret to a named recipient (produces a real SecureShareDelivered-format envelope)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_as("recipient", true, "RECIPIENT")]),
     },
     EndpointDef {
         method: Method::Post,
@@ -1086,6 +1398,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         description:
             "Attempt to open a SecureShareDelivered envelope with this daemon's KEM key (adversarial test)",
         category: "named-groups",
+        request: RequestSpec::Fields(&[RequestField::body_json_doc("group_id", true), RequestField::body_json_doc("recipient", true), RequestField::body_json_doc("secret_epoch", true), RequestField::body_json_doc("kem_ciphertext_b64", true), RequestField::body_json_doc("aead_nonce_b64", true), RequestField::body_json_doc("aead_ciphertext_b64", true)]),
     },
     // ── Task lists ──────────────────────────────────────────────────────
     EndpointDef {
@@ -1094,6 +1407,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks list",
         description: "List task lists",
         category: "tasks",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1101,6 +1415,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks create",
         description: "Create task list",
         category: "tasks",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME"), RequestField::body_as("topic", true, "TOPIC")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1108,6 +1423,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks show",
         description: "Show tasks in list",
         category: "tasks",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1115,6 +1431,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks add",
         description: "Add task to list",
         category: "tasks",
+        request: RequestSpec::Fields(&[RequestField::body_as("title", true, "TITLE"), RequestField::body("description", false)]),
     },
     EndpointDef {
         method: Method::Patch,
@@ -1122,6 +1439,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "tasks claim / tasks complete",
         description: "Claim or complete a task (action: claim|complete)",
         category: "tasks",
+        request: RequestSpec::Fields(&[RequestField::body_derived("action", true), RequestField::body("fence_token", false), RequestField::body("delegation", false)]),
     },
     // ── Key-value stores ────────────────────────────────────────────────
     EndpointDef {
@@ -1130,6 +1448,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store list",
         description: "List key-value stores",
         category: "stores",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1137,6 +1456,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store create",
         description: "Create key-value store",
         category: "stores",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME"), RequestField::body_as("topic", true, "TOPIC"), RequestField::body("policy", false)]),
     },
     EndpointDef {
         method: Method::Post,
@@ -1144,6 +1464,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store join",
         description: "Join existing store",
         category: "stores",
+        request: RequestSpec::Fields(&[RequestField::body_as("expected_owner", false, "--owner"), RequestField::body("policy", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1151,6 +1472,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store keys",
         description: "List keys in store",
         category: "stores",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Put,
@@ -1158,6 +1480,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store put",
         description: "Put value in store",
         category: "stores",
+        request: RequestSpec::Fields(&[RequestField::body_as("value", true, "VALUE"), RequestField::body_as("content_type", false, "--content-type")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1165,6 +1488,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store get",
         description: "Get value from store",
         category: "stores",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -1172,6 +1496,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "store rm",
         description: "Remove key from store",
         category: "stores",
+        request: RequestSpec::None,
     },
     // ── Files ──────────────────────────────────────────────────────────
     EndpointDef {
@@ -1180,6 +1505,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "send-file",
         description: "Send file to agent",
         category: "files",
+        request: RequestSpec::Passthrough,
     },
     EndpointDef {
         method: Method::Get,
@@ -1187,6 +1513,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "transfers",
         description: "List file transfers",
         category: "files",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1194,6 +1521,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "transfer-status",
         description: "Transfer status",
         category: "files",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1201,6 +1529,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "accept-file",
         description: "Accept incoming transfer",
         category: "files",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1208,6 +1537,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "reject-file",
         description: "Reject incoming transfer",
         category: "files",
+        request: RequestSpec::Fields(&[RequestField::body_as("reason", false, "--reason")]),
     },
     // ── Constitution ──────────────────────────────────────────────────
     EndpointDef {
@@ -1216,6 +1546,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "constitution",
         description: "Display the x0x Constitution (Markdown)",
         category: "status",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1223,6 +1554,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "constitution --json",
         description: "Constitution with version metadata (JSON)",
         category: "status",
+        request: RequestSpec::None,
     },
     // ── Upgrade ─────────────────────────────────────────────────────────
     EndpointDef {
@@ -1231,6 +1563,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "upgrade",
         description: "Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)",
         category: "upgrade",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Post,
@@ -1238,6 +1571,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "upgrade --apply",
         description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)",
         category: "upgrade",
+        request: RequestSpec::None,
     },
     // ── WebSocket ───────────────────────────────────────────────────────
     EndpointDef {
@@ -1246,6 +1580,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "ws",
         description: "General-purpose WebSocket session",
         category: "websocket",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1253,6 +1588,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "ws direct",
         description: "WebSocket session for direct messaging",
         category: "websocket",
+        request: RequestSpec::Fields(&[RequestField::query("backfill", false)]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1260,6 +1596,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "ws sessions",
         description: "List WebSocket sessions",
         category: "websocket",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1267,6 +1604,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "gui",
         description: "Open the embedded GUI",
         category: "websocket",
+        request: RequestSpec::None,
     },
     // ── Tailnet forwarding (#132 T6) ────────────────────────────────────
     EndpointDef {
@@ -1275,6 +1613,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward add",
         description: "Add a local port forward to a peer's loopback service",
         category: "connect",
+        request: RequestSpec::Fields(&[RequestField::body_as("local_addr", true, "--local"), RequestField::body_as("peer_agent", true, "--peer"), RequestField::body_as("target_host", true, "--target"), RequestField::body_as("target_port", true, "--target-port")]),
     },
     EndpointDef {
         method: Method::Get,
@@ -1282,6 +1621,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward list",
         description: "List registered port forwards",
         category: "connect",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Delete,
@@ -1289,6 +1629,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "forward rm",
         description: "Remove a port forward by its local bind address",
         category: "connect",
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Get,
@@ -1296,6 +1637,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "streams",
         description: "Active forward-stream count + connect-ACL counters",
         category: "connect",
+        request: RequestSpec::None,
     },
 ];
 

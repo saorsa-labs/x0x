@@ -155,13 +155,13 @@ curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:12700/status
 | GET | `/agent` | `x0x agent` | Local agent identity |
 | POST | `/announce` | `x0x announce` | Re-announce identity to the network |
 | GET | `/agent/user-id` | `x0x agent user-id` | Current user ID if configured |
-| GET | `/agent/card` | `x0x agent card` | Generate a shareable, signed identity card |
+| GET | `/agent/card` | `x0x agent card [DISPLAY_NAME] [--include-groups] [--include-local-addresses]` | Generate a shareable, signed identity card (`--include-local-addresses` adds loopback/RFC1918 addresses for local testnet cards; off by default so shared cards don't leak unroutable addresses) |
 | GET | `/.well-known/agent-card.json` | — | A2A-compatible discovery card (ADR-0017) |
 | POST | `/agent/card/import` | `x0x agent import` | Import a card into contacts (verifies signature; never changes existing trust: floor at existing level, Blocked is sticky) |
 | POST | `/agent/sign` | `x0x agent sign` | Detached ML-DSA-65 signature over caller-supplied bytes |
 | POST | `/agent/verify` | `x0x agent verify` | Verify a detached ML-DSA-65 signature against a caller-supplied public key |
 | GET | `/introduction` | `x0x agent introduction` | Trust-gated introduction card (`?peer=<64-hex>` scopes it to that peer's trust) |
-| POST | `/identity/revoke` | `x0x identity revoke` (single-id forms only) | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form). The binding form is **REST-only**: the CLI has no `move_epoch` flag and never serializes it |
+| POST | `/identity/revoke` | `x0x identity revoke [--agent-id <hex>] [--machine-id <hex>] [--move-epoch <n>] [--reason <text>]` | Issue a signed key revocation (self-revocation always allowed; revoking a third party requires a user-signed AgentCertificate; exactly one of `agent_id` / `machine_id` — or **both plus `move_epoch`** for the ADR-0043 binding form, which the CLI reaches via `--move-epoch`) |
 | GET | `/identity/revocations` | `x0x identity revocations` | List signed identity revocations known to this daemon |
 
 ### Announce request body
@@ -657,9 +657,12 @@ without leaking events to the mesh.
 
 Query params:
 - `/agents/discovered?unfiltered=true`
-- `/agents/discovered/:agent_id?wait=<seconds>`
+- `/agents/discovered/:agent_id?wait=true`
 - `/machines/discovered?unfiltered=true`
-- `/machines/discovered/:machine_id?wait=<seconds>`
+- `/machines/discovered/:machine_id?wait=true`
+
+`wait` is a **boolean**: the daemon waits its fixed discovery window when
+`true` (a numeric value such as `wait=5` is a query-deserialize 400).
 
 ## Contacts, machines, and trust
 
@@ -680,7 +683,7 @@ Query params:
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
 | GET | `/contacts/:agent_id/machines` | `x0x machines list <agent_id>` | List machine records |
-| POST | `/contacts/:agent_id/machines` | `x0x machines add <agent_id> <machine_id> [--pin]` | Add a machine record |
+| POST | `/contacts/:agent_id/machines` | `x0x machines add <agent_id> <machine_id> [--label <LABEL>] [--pin]` | Add a machine record |
 | DELETE | `/contacts/:agent_id/machines/:machine_id` | `x0x machines remove <agent_id> <machine_id>` | Remove a machine record |
 | POST | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines pin <agent_id> <machine_id>` | Pin a machine |
 | DELETE | `/contacts/:agent_id/machines/:machine_id/pin` | `x0x machines unpin <agent_id> <machine_id>` | Unpin a machine |
@@ -710,7 +713,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 |---|---|---|---|
 | POST | `/agents/connect` | `x0x direct connect <agent_id>` | Establish a direct connection |
 | POST | `/machines/connect` | `x0x machines connect <machine_id>` | Establish a machine-id transport connection |
-| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
+| POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
 | GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
@@ -917,7 +920,7 @@ helper API.
 | GET | `/groups` | `x0x group list` | List named groups |
 | GET | `/groups/:id` | `x0x group info <group_id>` | Get group info |
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
-| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id>` | Admin-authored member add (propagates to subscribed peers) |
+| POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
 | POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
 | POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
@@ -936,7 +939,7 @@ helper API.
 | GET | `/groups/:id/state/commits` | `x0x group state-commits <group_id>` | **issue #111**: read retained state-commit history (members only, paged) |
 | POST | `/groups/:id/state/seal` | `x0x group state-seal <group_id>` | **Phase D.3**: advance the chain + republish signed card |
 | POST | `/groups/:id/state/withdraw` | `x0x group delete <group_id>` | **Phase D.3**: any admin permanently deletes the group with a signed terminal withdrawal |
-| POST | `/groups/:id/send` | `x0x group send` | **Phase E**: publish a signed message to a SignedPublic group |
+| POST | `/groups/:id/send` | `x0x group send <group_id> <body> [--kind chat\|announcement] [--thread-root <id>] [--reply-to <id>] [--mentions <hex>...] [--delegation-digest <hex>]` | **Phase E**: publish a signed message to a SignedPublic group. `--mentions` (repeatable) routes structured ADR-0040 mentions daemon-side; `--delegation-digest` authorizes send-as attribution |
 | POST | `/groups/:id/delegate` | `x0x group delegate <group_id> --to-agent … --scope … --expiry-ms …` | Issue a signed delegation (ADR-0040; effective on durable history commit) |
 | GET | `/groups/:id/delegations` | `x0x group delegations <group_id>` | List effective delegations re-derived from durable history |
 | GET | `/groups/:id/messages` | `x0x group messages` | **Phase E**: retrieve cached public messages (non-members on Public read) |
@@ -1041,10 +1044,9 @@ optional attribution fields alongside `body` / `kind` / `thread_root` /
 On the wire, both fields live inside the signed `GroupPublicMessage` (v3
 signature domain when populated; byte-identical to earlier domains when both
 are absent). A `kind: "delegation"` carrier must NOT also carry
-`delegation_digest`. **Both fields are REST-only today**: `x0x group send`
-exposes no `--mentions` and no `--delegation-digest` flag — use the REST
-surface for attributed sends (grant *issuance* via `x0x group delegate`
-works from the CLI).
+`delegation_digest`. Both fields are CLI-reachable: `x0x group send`
+takes `--mentions <hex>` (repeatable) and `--delegation-digest <hex>`;
+grant *issuance* works via `x0x group delegate`.
 
 ### Delegation (ADR-0040)
 
@@ -1285,7 +1287,7 @@ plane. See `docs/primers/groups.md`.
 | POST | `/task-lists` | `x0x tasks create <name> <topic>` | Create a task list |
 | GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
 | POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
-| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim/complete ...` | Update task state |
+| PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
 
 Update task request body:
 
@@ -1306,7 +1308,7 @@ Task mutations accept optional authority evidence alongside `action`:
 | Field | Type | Meaning |
 |---|---|---|
 | `fence_token` | string? | Local-replica fencing precondition; echo a prior token verbatim or the mutation is `409`-rejected |
-| `delegation` | string? | Hex delegation digest — authorization evidence for a `task_execute` claim/complete performed under a delegation. Validated against the group's durably-committed delegation set before the mutation runs; invalid ⇒ `403` and nothing changes. **REST-only**: the tasks CLI cannot supply it |
+| `delegation` | string? | Hex delegation digest — authorization evidence for a `task_execute` claim/complete performed under a delegation. Validated against the group's durably-committed delegation set before the mutation runs; invalid ⇒ `403` and nothing changes. CLI: `--delegation <hex>` on `x0x tasks claim/complete` |
 
 ### Task versions, advisory claims, and local-replica fencing
 
@@ -1410,7 +1412,7 @@ unconditional (still advisory).
 |---|---|---|---|
 | GET | `/stores` | `x0x store list` | List stores |
 | POST | `/stores` | `x0x store create <name> <topic>` | Create a store |
-| POST | `/stores/:id/join` | `x0x store join <topic>` | Join an existing store |
+| POST | `/stores/:id/join` | `x0x store join <topic> --owner <hex>` or `x0x store join <topic> --policy self_keyed` | Join an existing store. An owner-anchored join REQUIRES `expected_owner` (a bare join is a 422 `owner_required`); `--policy self_keyed` is the one owner-free join and must be sent WITHOUT `--owner` (422 `owner_not_allowed` otherwise) |
 | GET | `/stores/:id/keys` | `x0x store keys <store_id>` | List keys |
 | PUT | `/stores/:id/:key` | `x0x store put <store_id> <key> <value>` | Put a base64 value |
 | GET | `/stores/:id/:key` | `x0x store get <store_id> <key>` | Get a value |
@@ -1531,7 +1533,7 @@ Run a command on **another** agent's machine. Disabled by default; every request
 
 | Method | Endpoint | CLI | Purpose |
 |---|---|---|---|
-| POST | `/exec/run` | `x0x exec <agent_id> -- <argv...>` | Run a command on a peer |
+| POST | `/exec/run` | `x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] [--cwd <dir>] -- <argv...>` | Run a command on a peer (`cwd` is recorded on the wire; the remote ACL currently rejects non-empty values) |
 | POST | `/exec/cancel` | `x0x exec cancel <request_id>` | Cancel an in-flight request |
 | GET | `/exec/sessions` | `x0x exec sessions` | List pending client + active server sessions |
 
@@ -1641,7 +1643,7 @@ with close code `1013` instead of emitting another event.
 
 **What is deliberately *not* a WS/SSE event:** Home renames, member changes
 and rekeys (REST/state-commit operations — re-fetch `GET /home` or the group
-state), sync/device enrollment (REST-only), voice call signaling (DM payloads
+state), sync/device enrollment (REST surface — `x0x sync enroll` from the CLI), voice call signaling (DM payloads
 prefixed `x0x-voice-sig-v1\n`, ADR-0042), and rider provenance (a signed field
 *inside* group-message payloads). `mention` is the only Home-Suite-specific
 structured push.
@@ -1713,6 +1715,10 @@ x0x direct connect <agent_id>
 x0x direct send <agent_id> hello
 x0x direct send <agent_id> hello --logical-id order-42   # retry-safe identity
 x0x direct send <agent_id> hello --no-durable-ack        # reach a 0.37.x peer
+x0x direct send <agent_id> hello --prefer-raw-quic-if-connected false  # gossip-first (pre-v0.37 behavior)
+x0x direct send <agent_id> hello --prefer-raw-quic-if-connected true --raw-quic-receive-ack-ms 4000 --stop-fallback-on-raw-error
+x0x direct events --backfill 20        # replay 20 stored DM rows, then live (ADR-0023 §7)
+x0x ws direct --backfill 20            # same replay via the WebSocket stream URL
 x0x groups create
 x0x group create team-chat --display-name alice
 x0x tasks create inbox team.tasks

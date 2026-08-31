@@ -49,18 +49,38 @@ pub async fn status(client: &DaemonClient, id: &str) -> Result<()> {
 
 /// `x0x presence events` — GET /presence/events (SSE stream).
 ///
-/// Streams presence online/offline events as they happen. Each line on
-/// stdout is a raw SSE event from the daemon. The command runs until
-/// the daemon closes the stream or the user presses Ctrl+C.
+/// Streams presence online/offline events as they happen. Only the
+/// `data:` payload of each SSE frame is printed (one JSON object per
+/// line), matching the consumption style of `x0x events` and
+/// `x0x direct events`. The command runs until the daemon closes the
+/// stream or the user presses Ctrl+C.
 pub async fn events(client: &DaemonClient) -> Result<()> {
     use futures::StreamExt as _;
     client.ensure_running().await?;
     let resp = client.get_stream("/presence/events").await?;
     let mut stream = resp.bytes_stream();
+    let mut buffer = String::new();
     while let Some(chunk) = stream.next().await {
         let bytes = chunk.map_err(|e| anyhow::anyhow!("stream error: {e}"))?;
-        let s = String::from_utf8_lossy(&bytes);
-        print!("{s}");
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        while let Some(pos) = buffer.find("\n\n") {
+            let frame = buffer[..pos].to_string();
+            buffer = buffer[pos + 2..].to_string();
+            for line in frame.lines() {
+                if let Some(data) = line.strip_prefix("data: ") {
+                    match client.format() {
+                        crate::cli::OutputFormat::Json => println!("{data}"),
+                        crate::cli::OutputFormat::Text => {
+                            if let Ok(val) = serde_json::from_str::<serde_json::Value>(data) {
+                                crate::cli::print_value(crate::cli::OutputFormat::Text, &val);
+                            } else {
+                                println!("{data}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

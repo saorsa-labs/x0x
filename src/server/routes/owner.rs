@@ -329,7 +329,9 @@ pub(in crate::server) async fn owner_agents_revoke(
 pub(in crate::server) struct IssueRiderRequest {
     /// Hex AgentId of a registered `mode=rider` sub-agent.
     sub_agent_id: String,
-    /// Explicitly granted named-group ids (Home is always granted).
+    /// Explicitly granted named-group ids. Home is NOT implicitly granted
+    /// (rider_auth review r4): it is delegated like any other group, or
+    /// not reachable at all.
     #[serde(default)]
     groups: Vec<String>,
     #[serde(default)]

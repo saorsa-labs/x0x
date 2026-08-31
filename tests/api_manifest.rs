@@ -21,10 +21,39 @@ use x0x::api::ENDPOINTS;
 
 /// Relative path (from crate root) of the committed manifest.
 const MANIFEST_PATH: &str = "docs/design/api-manifest.json";
-
 /// Pretty-printed JSON projection of `ENDPOINTS`. Stable field order
-/// (`method`, `path`, `cli_name`, `category`, `description`) so diffs are
-/// review-friendly and consumers can rely on the shape.
+/// (`method`, `path`, `cli_name`, `category`, `description`, `request`) so
+/// diffs are review-friendly and consumers can rely on the shape.
+fn render_request(ep: &x0x::api::EndpointDef) -> serde_json::Value {
+    use x0x::api::{CliExpose, RequestSpec};
+    match &ep.request {
+        RequestSpec::None => serde_json::json!({ "kind": "none" }),
+        RequestSpec::Passthrough => serde_json::json!({ "kind": "passthrough" }),
+        RequestSpec::Fields(fields) => serde_json::json!({
+            "kind": "fields",
+            "fields": fields
+                .iter()
+                .map(|f| {
+                    let cli = match &f.cli {
+                        CliExpose::Default => "default".to_string(),
+                        CliExpose::Token(t) => (*t).to_string(),
+                        CliExpose::Derived => "derived".to_string(),
+                        CliExpose::JsonDoc => "json-doc".to_string(),
+                        CliExpose::BoolValue => "bool-value".to_string(),
+                        CliExpose::Ignored => "ignored".to_string(),
+                    };
+                    serde_json::json!({
+                        "name": f.name,
+                        "in": f.location.as_str(),
+                        "required": f.required,
+                        "cli": cli,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn render_manifest() -> String {
     let entries: Vec<serde_json::Value> = ENDPOINTS
         .iter()
@@ -35,6 +64,7 @@ fn render_manifest() -> String {
                 "cli_name": ep.cli_name,
                 "category": ep.category,
                 "description": ep.description,
+                "request": render_request(ep),
             })
         })
         .collect();

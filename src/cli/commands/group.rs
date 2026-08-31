@@ -87,7 +87,7 @@ pub async fn update(
 ) -> Result<()> {
     ensure!(
         name.is_some() || description.is_some(),
-        "group update requires at least one of: --name, --description"
+        "group update requires at least one of: --new-name, --description"
     );
     client.ensure_running().await?;
     let mut body = json!({});
@@ -113,11 +113,15 @@ pub async fn add_member(
     group_id: &str,
     agent_id: &str,
     display_name: Option<&str>,
+    treekem_key_package_b64: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "agent_id": agent_id });
     if let Some(dn) = display_name {
         body["display_name"] = Value::String(dn.to_string());
+    }
+    if let Some(kp) = treekem_key_package_b64 {
+        body["treekem_key_package_b64"] = Value::String(kp.to_string());
     }
     let resp = client
         .post(&format!("/groups/{group_id}/members"), &body)
@@ -418,6 +422,7 @@ pub async fn card_import(client: &DaemonClient, path: &str) -> Result<()> {
 // ── Public messaging (Phase E) ──────────────────────────────────────────
 
 /// `x0x group send` — POST /groups/:id/send.
+#[allow(clippy::too_many_arguments)]
 pub async fn send(
     client: &DaemonClient,
     group_id: &str,
@@ -425,6 +430,8 @@ pub async fn send(
     kind: Option<&str>,
     thread_root: Option<&str>,
     reply_to: Option<&str>,
+    mentions: &[String],
+    delegation_digest: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut req = json!({ "body": body_text });
@@ -436,6 +443,12 @@ pub async fn send(
     }
     if let Some(parent) = reply_to {
         req["thread_parent"] = Value::String(parent.to_string());
+    }
+    if !mentions.is_empty() {
+        req["mentions"] = json!(mentions);
+    }
+    if let Some(digest) = delegation_digest {
+        req["delegation_digest"] = Value::String(digest.to_string());
     }
     let resp = client
         .post(&format!("/groups/{group_id}/send"), &req)
@@ -451,6 +464,7 @@ pub async fn delegate(
     group_id: &str,
     to_agent: &str,
     scope: &str,
+    verbs: &[String],
     task: Option<&str>,
     expiry_ms: u64,
     parent: Option<&str>,
@@ -461,6 +475,9 @@ pub async fn delegate(
         "scope": scope,
         "expiry_ms": expiry_ms,
     });
+    if !verbs.is_empty() {
+        req["verbs"] = json!(verbs);
+    }
     if let Some(task) = task {
         req["task"] = Value::String(task.to_string());
     }
@@ -482,10 +499,26 @@ pub async fn delegations(client: &DaemonClient, group_id: &str) -> Result<()> {
 }
 
 /// `x0x group messages` — GET /groups/:id/messages.
-pub async fn messages(client: &DaemonClient, group_id: &str) -> Result<()> {
-    client
-        .run_get(&format!("/groups/{group_id}/messages"))
-        .await
+pub async fn messages(
+    client: &DaemonClient,
+    group_id: &str,
+    thread_root: Option<&str>,
+) -> Result<()> {
+    match thread_root {
+        Some(root) => {
+            client
+                .run_get_query(
+                    &format!("/groups/{group_id}/messages"),
+                    &[("thread_root", root)],
+                )
+                .await
+        }
+        None => {
+            client
+                .run_get(&format!("/groups/{group_id}/messages"))
+                .await
+        }
+    }
 }
 
 // ── State-commit chain (Phase D.3) ──────────────────────────────────────
@@ -563,15 +596,20 @@ pub async fn secure_decrypt(
     client: &DaemonClient,
     group_id: &str,
     ciphertext_b64: &str,
-    nonce_b64: &str,
-    secret_epoch: u64,
+    nonce_b64: Option<&str>,
+    secret_epoch: Option<u64>,
 ) -> Result<()> {
     client.ensure_running().await?;
-    let body = json!({
-        "ciphertext_b64": ciphertext_b64,
-        "nonce_b64": nonce_b64,
-        "secret_epoch": secret_epoch,
-    });
+    // The daemon defaults nonce_b64 to "" and secret_epoch to 0 (current
+    // epoch); shared-secret ciphertexts carry their own nonce, so both are
+    // optional here exactly as they are on the wire.
+    let mut body = json!({ "ciphertext_b64": ciphertext_b64 });
+    if let Some(nonce) = nonce_b64 {
+        body["nonce_b64"] = Value::String(nonce.to_string());
+    }
+    if let Some(epoch) = secret_epoch {
+        body["secret_epoch"] = json!(epoch);
+    }
     let resp = client
         .post(&format!("/groups/{group_id}/secure/decrypt"), &body)
         .await?;
@@ -621,7 +659,57 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    use crate::cli::commands::test_support::start_mock_server;
+    use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    /// WHY (review r2, finding 2): help-text probes cannot prove the
+    /// dispatch serializes the ADR-0040 fields — capture the wire body.
+    #[tokio::test]
+    async fn send_serializes_mentions_and_delegation_digest() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        send(
+            &client,
+            "g1",
+            "hello",
+            None,
+            None,
+            None,
+            &["ab".repeat(32)],
+            Some("deadbeef"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(
+            body["mentions"],
+            serde_json::json!(["ab".repeat(32)]),
+            "structured mentions must serialize as an array"
+        );
+        assert_eq!(body["delegation_digest"], "deadbeef");
+    }
+
+    /// WHY (review r2, finding 2): verb-subset grants must serialize.
+    #[tokio::test]
+    async fn delegate_serializes_verbs() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        delegate(
+            &client,
+            "g1",
+            &"ab".repeat(32),
+            "task_execute",
+            &["claim".to_string()],
+            None,
+            1893456000000,
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["verbs"], serde_json::json!(["claim"]));
+    }
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"status": "ok"});
@@ -727,7 +815,7 @@ mod tests {
         let mock_resp = serde_json::json!([{"id": "msg-1", "text": "hello"}]);
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = messages(&client, "group-123").await;
+        let result = messages(&client, "group-123", None).await;
         assert!(result.is_ok(), "messages should succeed: {:?}", result);
     }
 
@@ -834,7 +922,7 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = add_member(&client, "group-123", "agent-456", None).await;
+        let result = add_member(&client, "group-123", "agent-456", None, None).await;
         assert!(result.is_ok(), "add_member should succeed: {:?}", result);
     }
 

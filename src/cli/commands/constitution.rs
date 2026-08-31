@@ -1,34 +1,75 @@
 //! Constitution display command.
 
+use crate::cli::DaemonClient;
 use crate::constitution::{CONSTITUTION_MD, CONSTITUTION_STATUS, CONSTITUTION_VERSION};
 use anyhow::Result;
 use std::io::Write;
 use std::process::{Command, Stdio};
 
 /// Display the x0x Constitution.
-pub fn display(raw: bool, json: bool) -> Result<()> {
+///
+/// The daemon is the source of truth (`GET /constitution`,
+/// `GET /constitution/json`): when it is reachable, its copy is shown so a
+/// CLI/daemon version skew never serves stale text. When no daemon is
+/// running, the CLI binary's embedded copy is the fallback.
+pub async fn display(client: Option<&DaemonClient>, raw: bool, json: bool) -> Result<()> {
+    let served = match client {
+        Some(client) => daemon_constitution(client).await,
+        None => None,
+    };
+    let (md, version, status) = match served {
+        Some((md, version, status)) => (md, version, status),
+        None => (
+            CONSTITUTION_MD.to_string(),
+            CONSTITUTION_VERSION.to_string(),
+            CONSTITUTION_STATUS.to_string(),
+        ),
+    };
+
     if json {
         let out = serde_json::json!({
-            "version": CONSTITUTION_VERSION,
-            "status": CONSTITUTION_STATUS,
-            "content": CONSTITUTION_MD,
+            "version": version,
+            "status": status,
+            "content": md,
         });
         println!("{}", serde_json::to_string_pretty(&out)?);
         return Ok(());
     }
 
     if raw {
-        println!("{CONSTITUTION_MD}");
+        println!("{md}");
         return Ok(());
     }
 
     // Prettify the markdown for terminal display
-    let rendered = render_for_terminal(CONSTITUTION_MD);
+    let rendered = render_for_terminal(&md);
 
     // Page the output
     page_output(&rendered)?;
 
     Ok(())
+}
+
+/// Fetch the daemon-served constitution, returning `(md, version, status)`
+/// when the daemon answered.
+///
+/// Always uses `/constitution/json`: plain `/constitution` serves raw
+/// markdown, which the JSON-oriented `DaemonClient` cannot parse.
+async fn daemon_constitution(client: &DaemonClient) -> Option<(String, String, String)> {
+    client.ensure_running().await.ok()?;
+    let resp = client.get("/constitution/json").await.ok()?;
+    let md = resp.get("content").and_then(|v| v.as_str())?.to_string();
+    let version = resp
+        .get("version")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let status = resp
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    Some((md, version, status))
 }
 
 fn render_for_terminal(md: &str) -> String {
@@ -118,15 +159,15 @@ This is a test.",
         assert!(rendered.is_empty() || !rendered.is_empty());
     }
 
-    #[test]
-    fn display_json_output() {
-        let result = display(false, true);
+    #[tokio::test]
+    async fn display_json_output_offline() {
+        let result = display(None, false, true).await;
         assert!(result.is_ok(), "JSON display should succeed");
     }
 
-    #[test]
-    fn display_raw_output() {
-        let result = display(true, false);
+    #[tokio::test]
+    async fn display_raw_output_offline() {
+        let result = display(None, true, false).await;
         assert!(result.is_ok(), "raw display should succeed");
     }
 }

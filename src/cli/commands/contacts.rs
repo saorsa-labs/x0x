@@ -12,14 +12,15 @@ pub async fn list(client: &DaemonClient) -> Result<()> {
 pub async fn add(
     client: &DaemonClient,
     agent_id: &str,
-    trust: &str,
+    trust: Option<&str>,
     label: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
-    let mut body = serde_json::json!({
-        "agent_id": agent_id,
-        "trust_level": trust,
-    });
+    // trust_level omitted = the daemon default ("known").
+    let mut body = serde_json::json!({ "agent_id": agent_id });
+    if let Some(trust) = trust {
+        body["trust_level"] = serde_json::json!(trust);
+    }
     if let Some(l) = label {
         body["label"] = serde_json::Value::String(l.to_string());
     }
@@ -150,7 +151,7 @@ mod tests {
         let mock_resp = serde_json::json!({"ok": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = add(&client, "agent-123", "trusted", Some("my-friend")).await;
+        let result = add(&client, "agent-123", Some("trusted"), Some("my-friend")).await;
         assert!(result.is_ok(), "add should succeed: {:?}", result);
     }
 

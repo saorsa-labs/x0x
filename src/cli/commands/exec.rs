@@ -13,6 +13,8 @@ struct ExecRunBody<'a> {
     stdin_b64: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     timeout_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -29,6 +31,7 @@ pub async fn run(
     argv: &[String],
     timeout_secs: Option<u32>,
     stdin_file: Option<&Path>,
+    cwd: Option<&str>,
 ) -> Result<()> {
     if argv.is_empty() {
         anyhow::bail!(
@@ -48,6 +51,7 @@ pub async fn run(
         argv,
         stdin_b64,
         timeout_ms: timeout_secs.map(|s| s.saturating_mul(1000)),
+        cwd,
     };
     let resp = client.post("/exec/run", &body).await?;
     if matches!(client.format(), OutputFormat::Json) {
@@ -118,7 +122,7 @@ mod tests {
         let mock_resp = serde_json::json!({"status": "unused"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = run(&client, &"aa".repeat(32), &[], None, None).await;
+        let result = run(&client, &"aa".repeat(32), &[], None, None, None).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("usage: x0x exec"));
     }
@@ -129,7 +133,7 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let argv = vec!["echo".to_string(), "ok".to_string()];
-        let result = run(&client, &"aa".repeat(32), &argv, Some(2), None).await;
+        let result = run(&client, &"aa".repeat(32), &argv, Some(2), None, None).await;
         assert!(result.is_ok(), "run should succeed: {:?}", result);
     }
 
@@ -142,7 +146,15 @@ mod tests {
         let stdin_path = dir.path().join("stdin.txt");
         std::fs::write(&stdin_path, b"stdin bytes").unwrap();
         let argv = vec!["cat".to_string()];
-        let result = run(&client, &"aa".repeat(32), &argv, None, Some(&stdin_path)).await;
+        let result = run(
+            &client,
+            &"aa".repeat(32),
+            &argv,
+            None,
+            Some(&stdin_path),
+            None,
+        )
+        .await;
         assert!(
             result.is_ok(),
             "run with stdin file should succeed: {:?}",
@@ -157,7 +169,7 @@ mod tests {
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
         let missing = tempfile::tempdir().unwrap().path().join("missing.txt");
         let argv = vec!["cat".to_string()];
-        let result = run(&client, &"aa".repeat(32), &argv, None, Some(&missing)).await;
+        let result = run(&client, &"aa".repeat(32), &argv, None, Some(&missing), None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -179,7 +191,7 @@ mod tests {
             let client =
                 DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
             let argv = vec!["echo".to_string(), "ok".to_string()];
-            let result = run(&client, &"aa".repeat(32), &argv, None, None).await;
+            let result = run(&client, &"aa".repeat(32), &argv, None, None, None).await;
             assert!(result.is_err());
             assert!(result.unwrap_err().to_string().contains(expected));
         }
@@ -191,7 +203,7 @@ mod tests {
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Text).unwrap();
         let argv = vec!["echo".to_string(), "ok".to_string()];
-        let result = run(&client, &"aa".repeat(32), &argv, None, None).await;
+        let result = run(&client, &"aa".repeat(32), &argv, None, None, None).await;
         assert!(result.is_err());
         assert!(result
             .unwrap_err()

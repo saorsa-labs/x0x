@@ -35,9 +35,22 @@ pub async fn create(
 /// `owner` is the REQUIRED hex-encoded AgentId of the authoritative owner
 /// (the anchor). The joiner accepts the owner's deltas and writes iff it is
 /// the owner. The daemon rejects a join without an anchor (422 owner_required).
-pub async fn join(client: &DaemonClient, topic: &str, owner: &str) -> Result<()> {
+pub async fn join(
+    client: &DaemonClient,
+    topic: &str,
+    owner: Option<&str>,
+    policy: Option<&str>,
+) -> Result<()> {
     client.ensure_running().await?;
-    let body = serde_json::json!({ "expected_owner": owner });
+    // `expected_owner` omitted = owner-free join (self_keyed directory
+    // stores, issue #340); `policy` overrides the inferred join policy.
+    let mut body = serde_json::json!({});
+    if let Some(owner) = owner {
+        body["expected_owner"] = serde_json::json!(owner);
+    }
+    if let Some(policy) = policy {
+        body["policy"] = serde_json::json!(policy);
+    }
     let resp = client.post(&format!("/stores/{topic}/join"), &body).await?;
     print_value(client.format(), &resp);
     Ok(())
@@ -88,7 +101,39 @@ mod tests {
     use super::*;
     use crate::cli::DaemonClient;
 
-    use crate::cli::commands::test_support::start_mock_server;
+    use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    /// WHY (review r2, finding 2): prove the join body omits `expected_owner`
+    /// for owner-free joins and carries the policy override.
+    #[tokio::test]
+    async fn join_omits_owner_when_absent_and_carries_policy() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
+        join(&client, "topic-x", None, Some("self_keyed"))
+            .await
+            .unwrap();
+        join(&client, "topic-y", Some(&"aa".repeat(32)), None)
+            .await
+            .unwrap();
+        let reqs = captured.lock().unwrap().clone();
+        let (p1, b1) = reqs
+            .iter()
+            .find(|(p, _)| p == "/stores/topic-x/join")
+            .unwrap();
+        assert_eq!(p1, "/stores/topic-x/join");
+        assert_eq!(b1["policy"], "self_keyed");
+        assert!(
+            b1.get("expected_owner").is_none(),
+            "owner-free join must omit expected_owner"
+        );
+        let (_, b2) = reqs
+            .iter()
+            .find(|(p, _)| p == "/stores/topic-y/join")
+            .unwrap();
+        assert_eq!(b2["expected_owner"], "aa".repeat(32));
+        assert!(b2.get("policy").is_none());
+    }
     #[tokio::test]
     async fn list_returns_mock_response() {
         let mock_resp = serde_json::json!({"stores": [{"name": "test-store"}]});

@@ -101,6 +101,7 @@ pub async fn card(
     client: &DaemonClient,
     display_name: Option<&str>,
     include_groups: bool,
+    include_local_addresses: bool,
 ) -> Result<()> {
     client.ensure_running().await?;
     // Build the query with reqwest's encoder so a `display_name` containing
@@ -111,6 +112,9 @@ pub async fn card(
     }
     if include_groups {
         query.push(("include_groups", "true"));
+    }
+    if include_local_addresses {
+        query.push(("include_local_addresses", "true"));
     }
     let resp = client.get_query("/agent/card", &query).await?;
 
@@ -126,8 +130,15 @@ pub async fn card(
 }
 
 /// `x0x agent introduction` — GET /introduction
-pub async fn introduction(client: &DaemonClient) -> Result<()> {
-    client.run_get("/introduction").await
+pub async fn introduction(client: &DaemonClient, peer: Option<&str>) -> Result<()> {
+    match peer {
+        Some(peer_id) => {
+            client
+                .run_get_query("/introduction", &[("peer", peer_id)])
+                .await
+        }
+        None => client.run_get("/introduction").await,
+    }
 }
 
 /// `x0x agent import` — POST /agent/card/import
@@ -190,6 +201,7 @@ pub async fn verify(
     signature_b64: &str,
     public_key_b64: &str,
     context: &str,
+    algorithm: Option<&str>,
 ) -> Result<()> {
     // Usage errors (missing/ambiguous payload args) must win over daemon
     // reachability, so validate local inputs before probing the daemon.
@@ -197,12 +209,15 @@ pub async fn verify(
 
     client.ensure_running().await?;
 
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "context": context,
         "payload_b64": payload_b64,
         "signature_b64": signature_b64,
         "public_key_b64": public_key_b64,
     });
+    if let Some(algorithm) = algorithm {
+        body["algorithm"] = serde_json::json!(algorithm);
+    }
     let resp = client.post("/agent/verify", &body).await?;
     print_value(client.format(), &resp);
     if resp.get("valid").and_then(|v| v.as_bool()) != Some(true) {
@@ -221,6 +236,7 @@ pub async fn revoke(
     client: &DaemonClient,
     agent_id: Option<&str>,
     machine_id: Option<&str>,
+    move_epoch: Option<u64>,
     reason: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
@@ -230,6 +246,9 @@ pub async fn revoke(
     }
     if let Some(id) = machine_id {
         body["machine_id"] = serde_json::Value::String(id.to_string());
+    }
+    if let Some(epoch) = move_epoch {
+        body["move_epoch"] = serde_json::json!(epoch);
     }
     if let Some(r) = reason {
         body["reason"] = serde_json::Value::String(r.to_string());
@@ -287,10 +306,14 @@ pub async fn owner_agents_issue(
     public_key_hex: &str,
     mode: &str,
     label: Option<&str>,
+    not_after: Option<u64>,
 ) -> Result<()> {
     let mut body = serde_json::json!({ "agent_public_key": public_key_hex, "mode": mode });
     if let Some(label) = label {
         body["label"] = serde_json::json!(label);
+    }
+    if let Some(not_after) = not_after {
+        body["not_after"] = serde_json::json!(not_after);
     }
     let resp = client.post("/owner/agents/issue", &body).await?;
     print_value(client.format(), &resp);
@@ -317,10 +340,18 @@ pub async fn sync_enroll(
 }
 
 /// `x0x owner agents revoke` — DELETE /owner/agents/:id (ADR-0039).
-pub async fn owner_agents_revoke(client: &DaemonClient, agent_id: &str) -> Result<()> {
-    client
-        .run_delete(&format!("/owner/agents/{agent_id}"))
-        .await
+pub async fn owner_agents_revoke(
+    client: &DaemonClient,
+    agent_id: &str,
+    reason: Option<&str>,
+) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({ "reason": reason });
+    let resp = client
+        .delete_with_body(&format!("/owner/agents/{agent_id}"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
 }
 
 /// `x0x owner riders` — GET /owner/riders (ADR-0039).
@@ -335,6 +366,8 @@ pub async fn owner_riders_issue(
     groups: &[String],
     label: Option<&str>,
     ttl_secs: Option<u64>,
+    delegation_payload_b64: Option<&str>,
+    delegation_signature: Option<&str>,
 ) -> Result<()> {
     let mut body = serde_json::json!({ "sub_agent_id": sub_agent_id, "groups": groups });
     if let Some(label) = label {
@@ -342,6 +375,15 @@ pub async fn owner_riders_issue(
     }
     if let Some(ttl) = ttl_secs {
         body["ttl_secs"] = serde_json::json!(ttl);
+    }
+    // The daemon REQUIRES the sub-agent-signed delegation capability
+    // (ADR-0039 review r3 option B): payload_b64 carries the canonical
+    // rider-delegation bytes, signature is the sub-agent key's hex sig.
+    if let (Some(payload_b64), Some(signature)) = (delegation_payload_b64, delegation_signature) {
+        body["delegation"] = serde_json::json!({
+            "payload_b64": payload_b64,
+            "signature": signature,
+        });
     }
     let resp = client.post("/owner/riders", &body).await?;
     print_value(client.format(), &resp);
@@ -485,6 +527,107 @@ mod tests {
     use crate::cli::{DaemonClient, OutputFormat};
 
     use crate::cli::commands::test_support::{start_capturing_mock_server, start_mock_server};
+
+    async fn capture_client() -> (
+        crate::cli::DaemonClient,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, serde_json::Value)>>>,
+        tokio::sync::oneshot::Sender<()>,
+    ) {
+        let (url, shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true})).await;
+        let client =
+            crate::cli::DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json)
+                .unwrap();
+        (client, captured, shutdown)
+    }
+
+    /// WHY (review r2, finding 2): the rider delegation capability is
+    /// REQUIRED by the daemon — prove the CLI serializes the nested object.
+    #[tokio::test]
+    async fn rider_issue_serializes_the_delegation_capability() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_riders_issue(
+            &client,
+            &"ab".repeat(32),
+            &["group-1".to_string()],
+            Some("label"),
+            Some(3600),
+            Some("cGF5bG9hZA=="),
+            Some("sig-hex"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["delegation"]["payload_b64"], "cGF5bG9hZA==");
+        assert_eq!(body["delegation"]["signature"], "sig-hex");
+        assert_eq!(body["ttl_secs"], 3600);
+    }
+
+    /// WHY (review r2, finding 2): the DELETE body reason is only visible
+    /// on the wire.
+    #[tokio::test]
+    async fn owner_agents_revoke_sends_reason_in_delete_body() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_agents_revoke(&client, &"cd".repeat(32), Some("superseded"))
+            .await
+            .unwrap();
+        let (path, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(path, format!("/owner/agents/{}", "cd".repeat(32)));
+        assert_eq!(body["reason"], "superseded");
+    }
+
+    /// WHY (review r2, finding 2): the ADR-0043 binding form must serialize.
+    #[tokio::test]
+    async fn identity_revoke_serializes_move_epoch() {
+        let (client, captured, _shutdown) = capture_client().await;
+        revoke(
+            &client,
+            Some(&"ab".repeat(32)),
+            Some(&"cd".repeat(32)),
+            Some(7),
+            None,
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["move_epoch"], 7);
+        assert_eq!(body["agent_id"], "ab".repeat(32));
+        assert_eq!(body["machine_id"], "cd".repeat(32));
+    }
+
+    /// WHY (review r2, finding 2): cert expiry must serialize.
+    #[tokio::test]
+    async fn owner_agents_issue_serializes_not_after() {
+        let (client, captured, _shutdown) = capture_client().await;
+        owner_agents_issue(&client, "pubhex", "acp", Some("lbl"), Some(1893456000))
+            .await
+            .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["not_after"], 1893456000);
+    }
+
+    /// WHY (review r2, finding 2): the explicit scheme id must serialize.
+    #[tokio::test]
+    async fn verify_serializes_algorithm() {
+        let (url, _shutdown, captured) =
+            start_capturing_mock_server(serde_json::json!({"ok": true, "valid": true})).await;
+        let client =
+            crate::cli::DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json)
+                .unwrap();
+        verify(
+            &client,
+            None,
+            Some("aGVsbG8="),
+            "c2ln",
+            "cGs=",
+            "ctx.v1",
+            Some("x0x.agent-sign.v2.ml-dsa-65"),
+        )
+        .await
+        .unwrap();
+        let (_, body) = captured.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(body["algorithm"], "x0x.agent-sign.v2.ml-dsa-65");
+    }
     #[test]
     fn identity_words_encodes_known_hex() {
         let encoder = IdentityEncoder::new();
@@ -599,7 +742,7 @@ mod tests {
         let mock_resp = serde_json::json!({"link": "x0x-card:abc", "ok": true});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = card(&client, Some("Alice"), true).await;
+        let result = card(&client, Some("Alice"), true, false).await;
         assert!(result.is_ok(), "card should succeed: {:?}", result);
     }
 
@@ -608,7 +751,7 @@ mod tests {
         let mock_resp = serde_json::json!({"introduction": "hello"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = introduction(&client).await;
+        let result = introduction(&client, None).await;
         assert!(result.is_ok(), "introduction should succeed: {:?}", result);
     }
 
@@ -697,7 +840,7 @@ mod tests {
 
         let url = format!("http://{addr}");
         let client = DaemonClient::new(None, Some(&url), OutputFormat::Json).unwrap();
-        let result = card(&client, Some("Alice & Bob"), false).await;
+        let result = card(&client, Some("Alice & Bob"), false, false).await;
         assert!(result.is_ok(), "card should succeed: {result:?}");
 
         let uri = captured.lock().await.clone().expect("request captured");
@@ -733,6 +876,7 @@ mod tests {
             "c2ln",
             "cGs=",
             "x0x.test.v1",
+            None,
         )
         .await;
         assert!(result.is_ok(), "verify should succeed: {:?}", result);
@@ -763,6 +907,7 @@ mod tests {
             "c2ln",
             "cGs=",
             "x0x.test.v1",
+            None,
         )
         .await;
         assert!(result.is_ok(), "verify should succeed: {:?}", result);
@@ -795,6 +940,7 @@ mod tests {
             "c2ln",
             "cGs=",
             "x0x.test.v1",
+            None,
         )
         .await;
         assert!(result.is_err(), "valid:false must map to a non-zero exit");
@@ -817,12 +963,13 @@ mod tests {
             "c2ln",
             "cGs=",
             "x0x.test.v1",
+            None,
         )
         .await;
         assert!(both.is_err());
         assert!(both.unwrap_err().to_string().contains("pass either --file"));
 
-        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1").await;
+        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1", None).await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()
@@ -837,7 +984,7 @@ mod tests {
         // the usage error.
         let client =
             DaemonClient::new(None, Some("http://127.0.0.1:9"), OutputFormat::Json).unwrap();
-        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1").await;
+        let neither = verify(&client, None, None, "c2ln", "cGs=", "x0x.test.v1", None).await;
         assert!(neither.is_err());
         assert!(neither
             .unwrap_err()

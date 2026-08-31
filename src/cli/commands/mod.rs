@@ -35,7 +35,8 @@ use serde::Serialize;
 /// JSON shape of one endpoint in `routes --json`.
 ///
 /// Field order/names are the public contract consumed by `just routes-json`
-/// and other tooling: `method`, `path`, `cli_name`, `description`, `category`.
+/// and other tooling: `method`, `path`, `cli_name`, `description`,
+/// `category`, `request`.
 #[derive(Serialize)]
 struct RouteEntry<'a> {
     method: String,
@@ -43,14 +44,46 @@ struct RouteEntry<'a> {
     cli_name: &'a str,
     description: &'a str,
     category: &'a str,
+    request: serde_json::Value,
+}
+
+/// Compact one-line summary of an endpoint's request shape for the
+/// human-readable `x0x routes` table (e.g. `body: to_agent, scope`).
+fn request_summary(ep: &api::EndpointDef) -> String {
+    use api::{CliExpose, FieldLocation, RequestSpec};
+    match &ep.request {
+        RequestSpec::None => String::new(),
+        RequestSpec::Passthrough => "passthrough".to_string(),
+        RequestSpec::Fields(fields) => {
+            let mut body: Vec<&str> = Vec::new();
+            let mut query: Vec<&str> = Vec::new();
+            for f in *fields {
+                if matches!(f.cli, CliExpose::Ignored) {
+                    continue;
+                }
+                match f.location {
+                    FieldLocation::Body => body.push(f.name),
+                    FieldLocation::Query => query.push(f.name),
+                }
+            }
+            let mut parts: Vec<String> = Vec::new();
+            if !body.is_empty() {
+                parts.push(format!("body: {}", body.join(",")));
+            }
+            if !query.is_empty() {
+                parts.push(format!("query: {}", query.join(",")));
+            }
+            parts.join("; ")
+        }
+    }
 }
 
 /// Print the full API route table.
 ///
 /// When `json` is true, emits a JSON array — one object per endpoint with
-/// `method`, `path`, `cli_name`, `description`, `category` fields. Used by
-/// `just routes-json` and other downstream tooling to treat the registry as
-/// the source of truth.
+/// `method`, `path`, `cli_name`, `description`, `category`, `request`
+/// fields. Used by `just routes-json` and other downstream tooling to treat
+/// the registry as the source of truth.
 pub fn routes(json: bool) -> anyhow::Result<()> {
     if json {
         let entries: Vec<RouteEntry<'_>> = api::ENDPOINTS
@@ -61,6 +94,7 @@ pub fn routes(json: bool) -> anyhow::Result<()> {
                 cli_name: ep.cli_name,
                 description: ep.description,
                 category: ep.category,
+                request: request_json(ep),
             })
             .collect();
         println!("{}", serde_json::to_string_pretty(&entries)?);
@@ -72,23 +106,62 @@ pub fn routes(json: bool) -> anyhow::Result<()> {
     let cmd_width = 24;
 
     println!(
-        "{:<method_width$}  {:<path_width$}  {:<cmd_width$}  DESCRIPTION",
-        "METHOD", "PATH", "CLI COMMAND"
+        "{:<method_width$}  {:<path_width$}  {:<cmd_width$}  {:<REQUEST_WIDTH$}  DESCRIPTION",
+        "METHOD",
+        "PATH",
+        "CLI COMMAND",
+        "REQUEST",
+        REQUEST_WIDTH = 28,
     );
-    println!("{}", "-".repeat(method_width + path_width + cmd_width + 30));
+    println!("{}", "-".repeat(method_width + path_width + cmd_width + 42));
 
     for cat in api::categories() {
         let endpoints = api::by_category(cat);
         for ep in endpoints {
             println!(
-                "{:<method_width$}  {:<path_width$}  {:<cmd_width$}  {}",
-                ep.method, ep.path, ep.cli_name, ep.description
+                "{:<method_width$}  {:<path_width$}  {:<cmd_width$}  {:<28}  {}",
+                ep.method,
+                ep.path,
+                ep.cli_name,
+                request_summary(ep),
+                ep.description
             );
         }
     }
 
     println!("\n{} endpoints total", api::ENDPOINTS.len());
     Ok(())
+}
+
+/// JSON projection of an endpoint's request shape for `routes --json`.
+fn request_json(ep: &api::EndpointDef) -> serde_json::Value {
+    use api::{CliExpose, RequestSpec};
+    match &ep.request {
+        RequestSpec::None => serde_json::json!({ "kind": "none" }),
+        RequestSpec::Passthrough => serde_json::json!({ "kind": "passthrough" }),
+        RequestSpec::Fields(fields) => serde_json::json!({
+            "kind": "fields",
+            "fields": fields
+                .iter()
+                .map(|f| {
+                    let cli = match &f.cli {
+                        CliExpose::Default => "default".to_string(),
+                        CliExpose::Token(t) => (*t).to_string(),
+                        CliExpose::Derived => "derived".to_string(),
+                        CliExpose::JsonDoc => "json-doc".to_string(),
+                        CliExpose::BoolValue => "bool-value".to_string(),
+                        CliExpose::Ignored => "ignored".to_string(),
+                    };
+                    serde_json::json!({
+                        "name": f.name,
+                        "in": f.location.as_str(),
+                        "required": f.required,
+                        "cli": cli,
+                    })
+                })
+                .collect::<Vec<_>>(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -110,6 +183,7 @@ mod tests {
                 cli_name: ep.cli_name,
                 description: ep.description,
                 category: ep.category,
+                request: request_json(ep),
             })
             .collect();
         let json = serde_json::to_string_pretty(&entries).unwrap();
@@ -139,6 +213,7 @@ mod tests {
             cli_name: "x",
             description: "say \"hi\"\nand\ttab",
             category: "test",
+            request: serde_json::json!({ "kind": "none" }),
         }];
         let json = serde_json::to_string(&entries).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();

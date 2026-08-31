@@ -49,6 +49,11 @@ struct Cli {
     #[arg(long, global = true)]
     json: bool,
 
+    /// [dev] Print the wire request (method, path, body/query) instead of
+    /// sending it — the dispatch-to-wire parity tests drive this.
+    #[arg(long, global = true, hide = true)]
+    dump_request: bool,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -225,6 +230,11 @@ enum Commands {
         /// Send stdin from this file.
         #[arg(long)]
         stdin_file: Option<PathBuf>,
+        /// Working directory for the remote command (recorded in the
+        /// request; the remote ACL currently rejects non-empty values, so
+        /// this exists to exercise the field honestly).
+        #[arg(long)]
+        cwd: Option<String>,
         /// Cancel an in-flight request id.
         #[arg(long)]
         cancel: Option<String>,
@@ -363,14 +373,27 @@ enum AgentSub {
     UserId,
     /// Generate a shareable identity card.
     Card {
-        /// Your display name (e.g. "David").
+        /// Display name for the card. DEPRECATED (ADR-0036): the
+        /// daemon-persisted profile (`x0x profile set --display-name`)
+        /// takes precedence; this fallback applies only when no profile
+        /// was ever stored.
         display_name: Option<String>,
         /// Include group invite links in the card.
         #[arg(long)]
         include_groups: bool,
+        /// Include loopback/private interface addresses (local testnet
+        /// cards; default off so shared cards don't leak unroutable
+        /// RFC1918/loopback addresses).
+        #[arg(long)]
+        include_local_addresses: bool,
     },
     /// Show this agent's introduction card.
-    Introduction,
+    Introduction {
+        /// Connecting peer's hex agent id — serves the trust-gated card
+        /// filtered for that peer instead of the public view.
+        #[arg(long, value_name = "AGENT_ID")]
+        peer: Option<String>,
+    },
     /// Import an agent card (add to contacts).
     Import {
         /// Card link (x0x://agent/...) or raw base64.
@@ -416,6 +439,11 @@ enum AgentSub {
         /// Required domain-separation context the signature was produced with.
         #[arg(long)]
         context: String,
+        /// Explicit signing-scheme id; the daemon currently accepts only
+        /// `x0x.agent-sign.v2.ml-dsa-65` (its default). Pass this to make a
+        /// future scheme migration explicit rather than silent.
+        #[arg(long)]
+        algorithm: Option<String>,
     },
 }
 
@@ -423,8 +451,8 @@ enum AgentSub {
 #[derive(Subcommand)]
 enum ProfileSub {
     /// Update stored profile names — every flag optional (partial update).
-    /// Setting a value requires a non-empty string; omit a flag to keep the
-    /// stored name.
+    /// Omit a flag to keep the stored name; pass an EMPTY string (`--human-name ""`)
+    /// to explicitly clear it (the daemon treats `""` as the clear sentinel).
     Set {
         /// Owner's human name (e.g. "David Irvine").
         #[arg(long, value_name = "NAME")]
@@ -541,12 +569,18 @@ enum OwnerAgentsSub {
         /// Operator label for the roster.
         #[arg(long, value_name = "LABEL")]
         label: Option<String>,
+        /// Certificate expiry (unix seconds); omit for the daemon default.
+        #[arg(long, value_name = "UNIX_SECS")]
+        not_after: Option<u64>,
     },
     /// Revoke a registered sub-agent (ADR-0018 owner issuer-revocation).
     Revoke {
         /// Hex agent id from the roster.
         #[arg(value_name = "AGENT_ID")]
         agent_id: String,
+        /// Optional reason stored in the revocation record.
+        #[arg(long, value_name = "REASON")]
+        reason: Option<String>,
     },
     /// Show one agent's placement record + fold (ADR-0043).
     Placement {
@@ -580,6 +614,27 @@ enum OwnerRidersSub {
         /// Token lifetime seconds (default 7 days, max 90 days).
         #[arg(long, value_name = "SECS")]
         ttl_secs: Option<u64>,
+        /// Base64 canonical rider-delegation payload
+        /// (`rider_delegation_bytes(sub, daemon, scopes, not_after)`,
+        /// ADR-0039 review r3 option B). REQUIRED together with
+        /// --delegation-signature: without the sub-agent-signed capability
+        /// the daemon refuses to mint the token.
+        #[arg(
+            long,
+            value_name = "BASE64",
+            required = true,
+            requires = "delegation_signature"
+        )]
+        delegation_payload_b64: Option<String>,
+        /// Hex ML-DSA-65 signature over the delegation payload, made with
+        /// the sub-agent's certified key.
+        #[arg(
+            long,
+            value_name = "HEX",
+            required = true,
+            requires = "delegation_payload_b64"
+        )]
+        delegation_signature: Option<String>,
     },
     /// Revoke a rider token by id; it fails on the next request.
     Revoke {
@@ -766,12 +821,17 @@ enum IdentitySub {
     /// third-party identity requires that the user keypair previously signed
     /// an AgentCertificate for the subject.
     Revoke {
-        /// Agent ID to revoke (hex, 64 chars). Exactly one of --agent-id or --machine-id.
+        /// Agent ID to revoke (hex, 64 chars).
         #[arg(long)]
         agent_id: Option<String>,
-        /// Machine ID to revoke (hex, 64 chars). Exactly one of --agent-id or --machine-id.
+        /// Machine ID to revoke (hex, 64 chars).
         #[arg(long)]
         machine_id: Option<String>,
+        /// ADR-0043 binding form: pass BOTH --agent-id and --machine-id
+        /// plus this epoch to issue a permanent (agent, machine) tombstone
+        /// on the v2 carrier. Required when both ids are present.
+        #[arg(long)]
+        move_epoch: Option<u64>,
         /// Optional human-readable reason stored in the revocation record.
         #[arg(long)]
         reason: Option<String>,
@@ -869,9 +929,10 @@ enum AgentsSub {
     Get {
         /// Agent ID (hex).
         agent_id: String,
-        /// Wait for agent to appear (seconds).
+        /// Wait (up to the daemon's fixed discovery window) for the agent
+        /// to appear in the local cache before answering.
         #[arg(long)]
-        wait: Option<u64>,
+        wait: bool,
     },
     /// Find an agent on the network (3-stage lookup).
     Find {
@@ -903,9 +964,9 @@ enum ContactsSub {
     Add {
         /// Agent ID (hex).
         agent_id: String,
-        /// Trust level: blocked, unknown, known, trusted.
+        /// Trust level: blocked, unknown, known (default), trusted.
         #[arg(long)]
-        trust: String,
+        trust: Option<String>,
         /// Optional display label.
         #[arg(long)]
         label: Option<String>,
@@ -978,6 +1039,9 @@ enum MachinesSub {
         agent_id: String,
         /// Machine ID (hex).
         machine_id: String,
+        /// Optional label for the machine record.
+        #[arg(long)]
+        label: Option<String>,
         /// Pin this machine.
         #[arg(long)]
         pin: bool,
@@ -1040,6 +1104,26 @@ enum DirectSub {
         /// (ant-quic 0.27.1 `probe_peer`). Response includes RTT or reason.
         #[arg(long)]
         require_ack_ms: Option<u64>,
+        /// Prefer the raw QUIC lane when a connection already exists
+        /// (falls back to the reliable lane on error unless
+        /// --stop-fallback-on-raw-error is set). The daemon defaults this
+        /// to TRUE when the field is omitted, so the flag takes an explicit
+        /// `true|false` — `false` is the only way to restore the
+        /// pre-v0.37.0 gossip-first behavior.
+        #[arg(long, value_name = "BOOL")]
+        prefer_raw_quic_if_connected: Option<bool>,
+        /// With --prefer-raw-quic-if-connected: how long (ms) to wait for
+        /// the raw-lane receive ACK before treating it as lost.
+        #[arg(long)]
+        raw_quic_receive_ack_ms: Option<u64>,
+        /// With --prefer-raw-quic-if-connected: fail instead of falling
+        /// back to the reliable lane when the raw lane errors.
+        #[arg(long)]
+        stop_fallback_on_raw_error: bool,
+        /// Require gossip delivery instead of a direct connection
+        /// (diagnostic toggle for the transport-selection matrix).
+        #[arg(long)]
+        require_gossip: bool,
         /// Opt out of ADR 0030 durable delivery: succeed as soon as the
         /// recipient accepts the envelope, instead of requiring proof it was
         /// durably committed. Use to reach a peer that has not upgraded —
@@ -1061,7 +1145,12 @@ enum DirectSub {
     /// List established direct connections.
     Connections,
     /// Stream incoming direct messages.
-    Events,
+    Events {
+        /// Replay the N most recent stored DM rows before the `live`
+        /// marker (ADR-0023 §7 backfill).
+        #[arg(long)]
+        backfill: Option<usize>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1161,6 +1250,11 @@ enum GroupSub {
         /// Optional display name to store locally for that member.
         #[arg(long)]
         display_name: Option<String>,
+        /// Base64 TreeKEM key package for direct-add to encrypted groups
+        /// (required when the group policy needs a key package; omit for
+        /// invite-flow adds).
+        #[arg(long, value_name = "BASE64")]
+        key_package: Option<String>,
     },
     /// Remove a member from a named group.
     RemoveMember {
@@ -1347,6 +1441,15 @@ enum GroupSub {
         /// Requires --thread-root to also be set.
         #[arg(long)]
         reply_to: Option<String>,
+        /// Structured mentions (ADR-0040): hex AgentIds of mentioned
+        /// agents, routed daemon-side (repeatable).
+        #[arg(long = "mentions", value_name = "AGENT_ID")]
+        mentions: Vec<String>,
+        /// Hex delegation digest authorizing send-as attribution
+        /// (ADR-0040): the local agent signs with its own key; receivers
+        /// verify actor=local, delegator=from_agent.
+        #[arg(long, value_name = "HEX")]
+        delegation_digest: Option<String>,
     },
     /// Issue a signed delegation to another agent (ADR-0040). Effective on
     /// durable group-history commit; the DM handoff is a notification.
@@ -1359,6 +1462,11 @@ enum GroupSub {
         /// Authority scope: task_execute | send_as.
         #[arg(long)]
         scope: String,
+        /// Granted verbs, a subset of the scope's verbs (repeatable;
+        /// default: all of them — claim+complete for task_execute,
+        /// send_public_message for send_as).
+        #[arg(long = "verb", value_name = "VERB")]
+        verbs: Vec<String>,
         /// Hex TaskId (required for task_execute).
         #[arg(long)]
         task: Option<String>,
@@ -1378,6 +1486,10 @@ enum GroupSub {
     Messages {
         /// Group ID.
         group_id: String,
+        /// Only messages in the thread rooted at this msg_id
+        /// (64 lowercase hex, ADR-0029).
+        #[arg(long)]
+        thread_root: Option<String>,
     },
     /// Inspect the state-commit chain for a group.
     State {
@@ -1419,10 +1531,12 @@ enum GroupSub {
         group_id: String,
         /// Base64 ciphertext.
         ciphertext_b64: String,
-        /// Base64 nonce (12 bytes).
-        nonce_b64: String,
-        /// Secret epoch the ciphertext was produced under.
-        secret_epoch: u64,
+        /// Base64 nonce (12 bytes). Optional: shared-secret ciphertexts
+        /// carry their own nonce; omit for TreeKEM envelopes.
+        nonce_b64: Option<String>,
+        /// Secret epoch the ciphertext was produced under. Optional
+        /// (defaults to the current epoch when omitted).
+        secret_epoch: Option<u64>,
     },
     /// Re-seal the current shared secret to a recipient (admin+).
     SecureReseal {
@@ -1457,15 +1571,21 @@ enum StoreSub {
     },
     /// Join an existing store by topic.
     ///
-    /// `--owner` (hex AgentId of the authoritative owner) is REQUIRED: a join
-    /// without an owner anchor is a dead replica. The owner anchor lets the
-    /// joiner accept the owner's deltas and write iff it is the owner.
+    /// `--owner` (hex AgentId of the authoritative owner) anchors an
+    /// owner-anchored join; OMIT it for `--policy self_keyed` owner-free
+    /// directory stores (issue #340), where writers are bound to their
+    /// AgentId key prefix instead of an owner.
     Join {
         /// Gossip topic.
         topic: String,
-        /// Hex-encoded AgentId of the authoritative owner (the required anchor).
+        /// Hex-encoded AgentId of the authoritative owner anchor. Required
+        /// for owner-anchored joins; must be omitted for self_keyed stores.
+        #[arg(long, value_name = "AGENT_ID")]
+        owner: Option<String>,
+        /// Join policy override: `self_keyed` for owner-free directory
+        /// stores (the daemon infers the default otherwise).
         #[arg(long)]
-        owner: String,
+        policy: Option<String>,
     },
     /// List keys in a store.
     Keys {
@@ -1532,6 +1652,15 @@ enum TasksSub {
         list_id: String,
         /// Task ID.
         task_id: String,
+        /// Local-replica fencing precondition: echo the `fence_token`
+        /// from a prior GET/mutation verbatim; a mismatch is rejected
+        /// with 409 and nothing changes.
+        #[arg(long)]
+        fence_token: Option<String>,
+        /// Hex delegation digest (ADR-0040) authorizing this claim under
+        /// a `task_execute` delegation; invalid digests are rejected 403.
+        #[arg(long)]
+        delegation: Option<String>,
     },
     /// Mark a task as complete.
     Complete {
@@ -1539,6 +1668,12 @@ enum TasksSub {
         list_id: String,
         /// Task ID.
         task_id: String,
+        /// Local-replica fencing precondition (see `tasks claim`).
+        #[arg(long)]
+        fence_token: Option<String>,
+        /// Hex delegation digest (ADR-0040; see `tasks claim`).
+        #[arg(long)]
+        delegation: Option<String>,
     },
 }
 
@@ -1547,7 +1682,12 @@ enum WsSub {
     /// List active WebSocket sessions.
     Sessions,
     /// Print the WebSocket URL for the direct-messaging stream.
-    Direct,
+    Direct {
+        /// Replay the N most recent stored DM rows before the `live`
+        /// marker (ADR-0023 §7 backfill).
+        #[arg(long)]
+        backfill: Option<usize>,
+    },
 }
 
 // ── Main ────────────────────────────────────────────────────────────────
@@ -1567,6 +1707,7 @@ async fn main() -> ExitCode {
         cli.instance.as_deref(),
         cli.api.as_deref(),
         format,
+        cli.dump_request,
     )
     .await;
 
@@ -1590,6 +1731,7 @@ async fn run(
     name: Option<&str>,
     api: Option<&str>,
     format: OutputFormat,
+    dump_request: bool,
 ) -> anyhow::Result<()> {
     // Commands that don't need a running daemon.
     match &command {
@@ -1598,7 +1740,10 @@ async fn run(
         Commands::Uninstall => return uninstall().await,
         Commands::Purge => return purge().await,
         Commands::Constitution { raw, json } => {
-            return commands::constitution::display(*raw, *json);
+            // Daemon-served text when reachable (source of truth); the
+            // embedded copy remains the offline fallback.
+            let client = DaemonClient::new(name, api, format).ok();
+            return commands::constitution::display(client.as_ref(), *raw, *json).await;
         }
         Commands::Upgrade {
             check,
@@ -1658,7 +1803,7 @@ async fn run(
         _ => {}
     }
 
-    let client = DaemonClient::new(name, api, format)?;
+    let client = DaemonClient::new(name, api, format)?.dump_requests(dump_request);
 
     // Commands that need a running daemon.
     match command {
@@ -1735,6 +1880,7 @@ async fn run(
                         public_key,
                         mode,
                         label,
+                        not_after,
                     }),
             }) => {
                 commands::identity::owner_agents_issue(
@@ -1742,12 +1888,15 @@ async fn run(
                     &public_key,
                     mode.as_deref().unwrap_or("acp"),
                     label.as_deref(),
+                    not_after,
                 )
                 .await
             }
             Some(OwnerSub::Agents {
-                sub: Some(OwnerAgentsSub::Revoke { agent_id }),
-            }) => commands::identity::owner_agents_revoke(&client, &agent_id).await,
+                sub: Some(OwnerAgentsSub::Revoke { agent_id, reason }),
+            }) => {
+                commands::identity::owner_agents_revoke(&client, &agent_id, reason.as_deref()).await
+            }
             Some(OwnerSub::Agents {
                 sub: Some(OwnerAgentsSub::Placement { agent_id }),
             }) => commands::identity::owner_agent_placement(&client, &agent_id).await,
@@ -1761,6 +1910,8 @@ async fn run(
                         groups,
                         label,
                         ttl_secs,
+                        delegation_payload_b64,
+                        delegation_signature,
                     }),
             }) => {
                 commands::identity::owner_riders_issue(
@@ -1769,6 +1920,8 @@ async fn run(
                     &groups,
                     label.as_deref(),
                     ttl_secs,
+                    delegation_payload_b64.as_deref(),
+                    delegation_signature.as_deref(),
                 )
                 .await
             }
@@ -1826,8 +1979,19 @@ async fn run(
             Some(AgentSub::Card {
                 display_name,
                 include_groups,
-            }) => commands::identity::card(&client, display_name.as_deref(), include_groups).await,
-            Some(AgentSub::Introduction) => commands::identity::introduction(&client).await,
+                include_local_addresses,
+            }) => {
+                commands::identity::card(
+                    &client,
+                    display_name.as_deref(),
+                    include_groups,
+                    include_local_addresses,
+                )
+                .await
+            }
+            Some(AgentSub::Introduction { peer }) => {
+                commands::identity::introduction(&client, peer.as_deref()).await
+            }
             Some(AgentSub::Import { card, trust }) => {
                 commands::identity::import_card(&client, &card, Some(trust.as_str())).await
             }
@@ -1845,6 +2009,7 @@ async fn run(
                 signature_b64,
                 public_key_b64,
                 context,
+                algorithm,
             }) => {
                 commands::identity::verify(
                     &client,
@@ -1853,6 +2018,7 @@ async fn run(
                     &signature_b64,
                     &public_key_b64,
                     &context,
+                    algorithm.as_deref(),
                 )
                 .await
             }
@@ -1965,7 +2131,10 @@ async fn run(
                 agent_id,
                 trust,
                 label,
-            }) => commands::contacts::add(&client, &agent_id, &trust, label.as_deref()).await,
+            }) => {
+                commands::contacts::add(&client, &agent_id, trust.as_deref(), label.as_deref())
+                    .await
+            }
             Some(ContactsSub::Update {
                 agent_id,
                 trust,
@@ -2004,8 +2173,12 @@ async fn run(
             MachinesSub::Add {
                 agent_id,
                 machine_id,
+                label,
                 pin,
-            } => commands::machines::add(&client, &agent_id, &machine_id, pin).await,
+            } => {
+                commands::machines::add(&client, &agent_id, &machine_id, label.as_deref(), pin)
+                    .await
+            }
             MachinesSub::Remove {
                 agent_id,
                 machine_id,
@@ -2038,6 +2211,7 @@ async fn run(
             agent_id,
             timeout,
             stdin_file,
+            cwd,
             cancel,
             argv,
             sub,
@@ -2054,8 +2228,15 @@ async fn run(
                     let Some(agent_id) = agent_id else {
                         anyhow::bail!("usage: x0x exec <agent_id> [--timeout <secs>] [--stdin-file <path>] -- <argv...>");
                     };
-                    commands::exec::run(&client, &agent_id, &argv, timeout, stdin_file.as_deref())
-                        .await
+                    commands::exec::run(
+                        &client,
+                        &agent_id,
+                        &argv,
+                        timeout,
+                        stdin_file.as_deref(),
+                        cwd.as_deref(),
+                    )
+                    .await
                 }
             }
         },
@@ -2065,6 +2246,10 @@ async fn run(
                 agent_id,
                 message,
                 require_ack_ms,
+                prefer_raw_quic_if_connected,
+                raw_quic_receive_ack_ms,
+                stop_fallback_on_raw_error,
+                require_gossip,
                 no_durable_ack,
                 logical_id,
             } => {
@@ -2073,13 +2258,17 @@ async fn run(
                     &agent_id,
                     &message,
                     require_ack_ms,
+                    prefer_raw_quic_if_connected,
+                    raw_quic_receive_ack_ms,
+                    stop_fallback_on_raw_error,
+                    require_gossip,
                     !no_durable_ack,
                     logical_id.as_deref(),
                 )
                 .await
             }
             DirectSub::Connections => commands::direct::connections(&client).await,
-            DirectSub::Events => commands::direct::events(&client).await,
+            DirectSub::Events { backfill } => commands::direct::events(&client, backfill).await,
         },
         Commands::Groups { sub } => match sub {
             None => commands::groups::list(&client).await,
@@ -2134,9 +2323,16 @@ async fn run(
                 group_id,
                 agent_id,
                 display_name,
+                key_package,
             }) => {
-                commands::group::add_member(&client, &group_id, &agent_id, display_name.as_deref())
-                    .await
+                commands::group::add_member(
+                    &client,
+                    &group_id,
+                    &agent_id,
+                    display_name.as_deref(),
+                    key_package.as_deref(),
+                )
+                .await
             }
             Some(GroupSub::RemoveMember { group_id, agent_id }) => {
                 commands::group::remove_member(&client, &group_id, &agent_id).await
@@ -2238,6 +2434,8 @@ async fn run(
                 kind,
                 thread_root,
                 reply_to,
+                mentions,
+                delegation_digest,
             }) => {
                 if reply_to.is_some() && thread_root.is_none() {
                     anyhow::bail!("--reply-to requires --thread-root to also be set");
@@ -2249,6 +2447,8 @@ async fn run(
                     kind.as_deref(),
                     thread_root.as_deref(),
                     reply_to.as_deref(),
+                    &mentions,
+                    delegation_digest.as_deref(),
                 )
                 .await
             }
@@ -2256,6 +2456,7 @@ async fn run(
                 group_id,
                 to_agent,
                 scope,
+                verbs,
                 task,
                 expiry_ms,
                 parent,
@@ -2265,6 +2466,7 @@ async fn run(
                     &group_id,
                     &to_agent,
                     &scope,
+                    &verbs,
                     task.as_deref(),
                     expiry_ms,
                     parent.as_deref(),
@@ -2274,9 +2476,10 @@ async fn run(
             Some(GroupSub::Delegations { group_id }) => {
                 commands::group::delegations(&client, &group_id).await
             }
-            Some(GroupSub::Messages { group_id }) => {
-                commands::group::messages(&client, &group_id).await
-            }
+            Some(GroupSub::Messages {
+                group_id,
+                thread_root,
+            }) => commands::group::messages(&client, &group_id, thread_root.as_deref()).await,
             Some(GroupSub::State { group_id }) => commands::group::state(&client, &group_id).await,
             Some(GroupSub::StateCommits {
                 group_id,
@@ -2308,7 +2511,7 @@ async fn run(
                     &client,
                     &group_id,
                     &ciphertext_b64,
-                    &nonce_b64,
+                    nonce_b64.as_deref(),
                     secret_epoch,
                 )
                 .await
@@ -2329,9 +2532,11 @@ async fn run(
                 topic,
                 policy,
             }) => commands::store::create(&client, &name, &topic, policy.as_deref()).await,
-            Some(StoreSub::Join { topic, owner }) => {
-                commands::store::join(&client, &topic, &owner).await
-            }
+            Some(StoreSub::Join {
+                topic,
+                owner,
+                policy,
+            }) => commands::store::join(&client, &topic, owner.as_deref(), policy.as_deref()).await,
             Some(StoreSub::Keys { store_id }) => commands::store::keys(&client, &store_id).await,
             Some(StoreSub::Put {
                 store_id,
@@ -2361,11 +2566,37 @@ async fn run(
                 title,
                 description,
             }) => commands::tasks::add(&client, &list_id, &title, description.as_deref()).await,
-            Some(TasksSub::Claim { list_id, task_id }) => {
-                commands::tasks::update(&client, &list_id, &task_id, "claim").await
+            Some(TasksSub::Claim {
+                list_id,
+                task_id,
+                fence_token,
+                delegation,
+            }) => {
+                commands::tasks::update(
+                    &client,
+                    &list_id,
+                    &task_id,
+                    "claim",
+                    fence_token.as_deref(),
+                    delegation.as_deref(),
+                )
+                .await
             }
-            Some(TasksSub::Complete { list_id, task_id }) => {
-                commands::tasks::update(&client, &list_id, &task_id, "complete").await
+            Some(TasksSub::Complete {
+                list_id,
+                task_id,
+                fence_token,
+                delegation,
+            }) => {
+                commands::tasks::update(
+                    &client,
+                    &list_id,
+                    &task_id,
+                    "complete",
+                    fence_token.as_deref(),
+                    delegation.as_deref(),
+                )
+                .await
             }
         },
         Commands::Upgrade { .. } => {
@@ -2374,7 +2605,7 @@ async fn run(
         Commands::Ws { sub } => match sub {
             None => commands::ws::general(&client).await,
             Some(WsSub::Sessions) => commands::ws::sessions(&client).await,
-            Some(WsSub::Direct) => commands::ws::direct(&client).await,
+            Some(WsSub::Direct { backfill }) => commands::ws::direct(&client, backfill).await,
         },
         Commands::Stop => commands::daemon::stop(&client).await,
         Commands::Doctor => commands::daemon::doctor(&client).await,
@@ -2403,12 +2634,14 @@ async fn run(
             IdentitySub::Revoke {
                 agent_id,
                 machine_id,
+                move_epoch,
                 reason,
             } => {
                 commands::identity::revoke(
                     &client,
                     agent_id.as_deref(),
                     machine_id.as_deref(),
+                    move_epoch,
                     reason.as_deref(),
                 )
                 .await
@@ -2554,7 +2787,7 @@ x0x (v{VERSION})
 +-- Data
 |   +-- store list         List key-value stores
 |   +-- store create       Create a KV store
-|   +-- store join         Join existing store by topic (--owner to anchor)
+|   +-- store join         Join existing store by topic (--owner or --policy self_keyed)
 |   +-- store keys         List keys
 |   +-- store put          Write a value
 |   +-- store get          Read a value
