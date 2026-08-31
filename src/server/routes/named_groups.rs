@@ -2535,6 +2535,91 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
+/// #458: the joiner-stub adoption for an authority `MemberAdded` commit
+/// whose `prev_state_hash` cannot chain from the invite base state.
+/// Returns `Some(adopted)` when the fast-forward validated (structure,
+/// revision monotonicity, actor authority, and the reconstructed roster
+/// root equal to the commit's SIGNED roster root) — `None` to reject.
+/// Separate fn + `Box::pin` at the call site: the giant apply fn's async
+/// frame must not absorb these locals (a deterministic 2 MiB-stack
+/// overflow appeared when they were inline).
+#[allow(clippy::too_many_arguments)]
+async fn try_adopt_member_added_across_gap(
+    state: &Arc<AppState>,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::GroupStateCommit,
+    info: &x0x::groups::GroupInfo,
+    actor: &str,
+    actor_authorized: bool,
+    agent_id: &str,
+    display_name: Option<String>,
+    treekem_key_package_hash: Option<String>,
+    owner_certified_certificate: Option<x0x::identity::AgentCertificate>,
+    revision: u64,
+    e: x0x::groups::state_commit::ApplyError,
+) -> Option<x0x::groups::GroupInfo> {
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let adoptable = matches!(
+        e,
+        x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. }
+    ) && info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+        && actor_authorized
+        && agent_id == local_agent_hex
+        && !info.has_active_member(&local_agent_hex)
+        && commit.verify_structure().is_ok()
+        && commit.revision > current.state_revision;
+    if !adoptable {
+        return None;
+    }
+    let mut adopted = current.clone();
+    adopted.roster_revision = revision.max(adopted.roster_revision);
+    adopted.add_member(
+        agent_id.to_string(),
+        x0x::groups::GroupRole::Member,
+        Some(actor.to_string()),
+        display_name,
+    );
+    if let Some(package_hash) = treekem_key_package_hash {
+        adopted.set_member_treekem_key_package_hash(agent_id, package_hash);
+    }
+    if let Some(cert) = owner_certified_certificate {
+        adopted.set_member_certificate(agent_id, cert);
+    }
+    // Fast-forward checks: the roster the joiner reconstructs MUST equal
+    // the roster the authority's signature committed to (`roster_root`),
+    // and the last-admin invariant must hold. The full state-hash
+    // comparison is deliberately NOT required here — the commit's hash
+    // covers the intermediate commits' metadata (e.g. a rename the joiner
+    // never saw), which the stub cannot reconstruct. The chain fields are
+    // adopted from the SIGNED commit instead, so the next commit chains
+    // normally.
+    match adopted.finalize_adopted_commit_roster_checked(commit) {
+        Ok(()) => {
+            state
+                .groups_diagnostics
+                .record_member_added_adopted(&info.stable_group_id());
+            tracing::info!(
+                group_id = %LogHexId::group(info.stable_group_id()),
+                member = %agent_id,
+                commit_revision = commit.revision,
+                "MemberAdded: joiner stub adopted authority commit across prev_state_hash gap (#458)"
+            );
+            Some(adopted)
+        }
+        Err(adopt_err) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(info.stable_group_id()),
+                member = %agent_id,
+                "MemberAdded: adoption failed the roster-root/last-admin check (#458): {adopt_err}"
+            );
+            state
+                .groups_diagnostics
+                .record_member_added_rejected_state_chain_gap(&info.stable_group_id());
+            None
+        }
+    }
+}
+
 fn apply_stateful_event_to_group<F>(
     current: &x0x::groups::GroupInfo,
     commit: &x0x::groups::GroupStateCommit,
@@ -6626,85 +6711,44 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     // joiner `already_joined` locally but absent from every
                     // roster (403 on every post). On a NON-TreeKEM plane
                     // (no catch-up queue exists there) a joiner whose OWN
-                    // add this is may ADOPT the authority-signed commit:
-                    let local_agent_hex_adopt = hex::encode(state.agent.agent_id().as_bytes());
-                    let adoptable = matches!(
-                        e,
-                        x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. }
-                    ) && info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
-                        && actor_authorized
-                        && agent_id == local_agent_hex_adopt
-                        && !info.has_active_member(&local_agent_hex_adopt)
-                        && commit.verify_structure().is_ok()
-                        && commit.revision > current.state_revision;
-                    if !adoptable {
-                        tracing::debug!(
-                            target: "treekem.trace",
-                            stage = "apply_metadata_event_reject",
-                            reason = "member_added_state_commit_apply_failed",
-                            group_id = %resolved_group_key,
-                            member = %agent_id,
-                            sender = %sender_hex,
-                            revision,
-                            commit_revision = commit.revision,
-                            local_state_revision = current.state_revision,
-                            local_roster_revision = current.roster_revision,
-                            local_state_hash = %current.state_hash,
-                            commit_prev_state_hash = ?commit.prev_state_hash,
-                            error = %e,
-                        );
-                        state
-                            .groups_diagnostics
-                            .record_member_added_rejected_state_chain_gap(&resolved_group_key);
-                        return ApplyMetadataResult::REJECTED;
-                    }
-                    let mut adopted = current.clone();
-                    adopted.roster_revision = revision.max(adopted.roster_revision);
-                    adopted.add_member(
-                        agent_id.clone(),
-                        x0x::groups::GroupRole::Member,
-                        Some(actor.clone()),
+                    // add this is may ADOPT the authority-signed commit.
+                    // The adoption body is BOXED: this apply fn's async
+                    // frame is already enormous (it grew past a 2 MiB test
+                    // stack once the adoption locals landed inline), and
+                    // `Box::pin` moves the helper's future to the heap.
+                    let adopt_state = Arc::clone(state);
+                    let adopted = Box::pin(try_adopt_member_added_across_gap(
+                        &adopt_state,
+                        &current,
+                        &commit,
+                        &info,
+                        &actor,
+                        actor_authorized,
+                        &agent_id,
                         display_name.clone(),
-                    );
-                    if let Some(package_hash) = treekem_key_package_hash.clone() {
-                        adopted.set_member_treekem_key_package_hash(&agent_id, package_hash);
-                    }
-                    if let Some(cert) = owner_certified_certificate.clone() {
-                        adopted.set_member_certificate(&agent_id, cert);
-                    }
-                    if let Some(name) = display_name.clone() {
-                        adopted.set_display_name(&agent_id, name);
-                    }
-                    // Fast-forward checks: the roster the joiner
-                    // reconstructs MUST equal the roster the authority's
-                    // signature committed to (`roster_root`), and the
-                    // last-admin invariant must hold. The full state-hash
-                    // comparison is deliberately NOT required here — the
-                    // commit's hash covers the intermediate commits'
-                    // metadata (e.g. a rename the joiner never saw), which
-                    // the stub cannot reconstruct. The chain fields are
-                    // adopted from the SIGNED commit instead, so the next
-                    // commit chains normally.
-                    let roster_ok = adopted.finalize_adopted_commit_roster_checked(&commit);
-                    match roster_ok {
-                        Ok(()) => {
-                            state
-                                .groups_diagnostics
-                                .record_member_added_adopted(&resolved_group_key);
-                            tracing::info!(
+                        treekem_key_package_hash.clone(),
+                        owner_certified_certificate.clone(),
+                        revision,
+                        e.clone(),
+                    ))
+                    .await;
+                    match adopted {
+                        Some(next) => next,
+                        None => {
+                            tracing::debug!(
+                                target: "treekem.trace",
+                                stage = "apply_metadata_event_reject",
+                                reason = "member_added_state_commit_apply_failed",
                                 group_id = %resolved_group_key,
                                 member = %agent_id,
+                                sender = %sender_hex,
+                                revision,
                                 commit_revision = commit.revision,
                                 local_state_revision = current.state_revision,
-                                "MemberAdded: joiner stub adopted authority commit across prev_state_hash gap (#458)"
-                            );
-                            adopted
-                        }
-                        Err(adopt_err) => {
-                            tracing::warn!(
-                                group_id = %resolved_group_key,
-                                member = %agent_id,
-                                "MemberAdded: adoption failed the roster-root/last-admin check (#458): {adopt_err}"
+                                local_roster_revision = current.roster_revision,
+                                local_state_hash = %current.state_hash,
+                                commit_prev_state_hash = ?commit.prev_state_hash,
+                                error = %e,
                             );
                             state
                                 .groups_diagnostics
@@ -30178,8 +30222,32 @@ pub(in crate::server) mod tests {
     /// cooperating. The package is authenticated by B's embedded ML-DSA-65
     /// signature (re-verified on install), independent of the delivering peer,
     /// so a forged or replayed response cannot install a wrong key.
-    #[tokio::test]
-    async fn member_keyed_catchup_then_recovery_advances_removal_without_inviter() -> Result<()> {
+    // WHY the explicit runtime: this test walks the suite's deepest
+    // apply→seal→evidence chain, and on main it already overflowed below
+    // ~1.6 MiB of stack — the F2 certified-membership work (#447/#458)
+    // legitimately grows each async frame in that chain by a few hundred
+    // bytes, which pushed the test past the 2 MiB default test-thread
+    #[test]
+    fn member_keyed_catchup_then_recovery_advances_removal_without_inviter() {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime")
+                    .block_on(
+                        member_keyed_catchup_then_recovery_advances_removal_without_inviter_inner(),
+                    )
+                    .expect("test body failed");
+            })
+            .expect("spawn test thread")
+            .join()
+            .expect("join test thread");
+    }
+
+    async fn member_keyed_catchup_then_recovery_advances_removal_without_inviter_inner(
+    ) -> Result<()> {
         // O = owner/inviter, B = target, W = independent witness, and A = a
         // later-promoted admin. W validates and retains B's event before O
         // performs the inviter-only authoritative add.

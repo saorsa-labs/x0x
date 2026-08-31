@@ -544,7 +544,7 @@ async fn issue457_treekem_unavailable_rejection_is_counted() -> Result<()> {
     };
     state.treekem_groups.write().await.remove(&group_id);
 
-    let result = apply_named_group_metadata_event(&state, event, joiner_id, true, None).await;
+    let result = apply_named_group_metadata_event(state, event, joiner_id, true, None).await;
     assert!(!result.accepted, "missing TreeKEM group must reject");
     let row = diagnostics_row(state.as_ref(), &fixture.stable_group_id).await;
     assert_eq!(
