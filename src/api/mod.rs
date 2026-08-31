@@ -266,7 +266,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/owner/riders",
         cli_name: "owner riders issue",
-        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039)",
+        description: "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; REST-only mint — the required harness-signed delegation cannot be supplied from the CLI)",
         category: "identity",
     },
     EndpointDef {
@@ -1229,14 +1229,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Get,
         path: "/upgrade",
         cli_name: "upgrade",
-        description: "Check for updates",
+        description: "Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)",
         category: "upgrade",
     },
     EndpointDef {
         method: Method::Post,
         path: "/upgrade/apply",
         cli_name: "upgrade --apply",
-        description: "Apply the latest verified release manifest",
+        description: "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)",
         category: "upgrade",
     },
     // ── WebSocket ───────────────────────────────────────────────────────

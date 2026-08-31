@@ -265,10 +265,10 @@ enum Commands {
         /// Just check for updates, don't apply.
         #[arg(long)]
         check: bool,
-        /// Apply the latest verified release manifest. Mirrors
-        /// `POST /upgrade/apply`. Default behaviour when no flags are
-        /// passed; this flag exists so the REST/CLI parity tests can
-        /// drive `x0x upgrade --apply` explicitly.
+        /// Accepted for REST/CLI parity naming only: this standalone
+        /// updater installs by default (no flags) straight from GitHub
+        /// and does NOT call the daemon's `POST /upgrade/apply`. The
+        /// flag is otherwise ignored.
         #[arg(long)]
         apply: bool,
         /// Skip version comparison, download and install latest.
@@ -560,11 +560,18 @@ enum OwnerAgentsSub {
 #[derive(Subcommand)]
 enum OwnerRidersSub {
     /// Mint a scoped rider token for a registered rider-mode sub-agent.
+    ///
+    /// Note: minting requires the harness-signed delegation capability,
+    /// which this command cannot supply — use POST /owner/riders (REST)
+    /// or the x0x crate's sign_rider_delegation helper. This command
+    /// will answer 400 on a registered sub-agent.
     Issue {
         /// Hex agent id of the registered sub-agent.
         #[arg(value_name = "AGENT_ID")]
         agent: String,
-        /// Granted named-group id (repeatable; Home is always granted).
+        /// Granted named-group id (repeatable). Every group — Home
+        /// included — must be granted explicitly; there is no implicit
+        /// Home grant.
         #[arg(long = "group", value_name = "GROUP_ID")]
         groups: Vec<String>,
         /// Operator label.

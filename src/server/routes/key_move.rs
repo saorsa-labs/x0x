@@ -69,7 +69,7 @@ fn ceremony_disabled(state: &AppState) -> Option<(StatusCode, Json<serde_json::V
     }
     Some(api_error(
         StatusCode::NOT_IMPLEMENTED,
-        "roaming-move ceremony is experimental in v1 and disabled on this daemon ([key_move] ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable",
+        "roaming-move ceremony is experimental in v1 and disabled on this daemon ([key_move] ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable",
     ))
 }
 
