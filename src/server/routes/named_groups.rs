@@ -14229,8 +14229,18 @@ fn last_admin_precheck(
 }
 
 /// PATCH /groups/:id — update name/description (admin+).
+///
+/// Issue #446 (review round 2): when the target group is the
+/// owner-certified HOME (Home metadata + exact Home policy), the
+/// mutation requires the DURABLE owner — the same authority as
+/// `POST /home/rename`, so the convenience alias cannot be bypassed by
+/// PATCHing the Home `group_id` directly. Ordinary groups keep the
+/// session-allowed admin path.
 pub(in crate::server) async fn update_named_group(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> impl IntoResponse {
@@ -14250,6 +14260,22 @@ pub(in crate::server) async fn update_named_group(
     }
     if let Some(resp) = reject_withdrawn_group(info) {
         return resp;
+    }
+    // Issue #446: Home-targeted PATCH = owner act (durable required).
+    // `find_home` re-locks the groups table, so match the same predicate
+    // inline: Home metadata + EXACTLY the Home policy for this owner.
+    if info.home.is_some()
+        && state
+            .agent
+            .identity()
+            .user_keypair()
+            .is_some_and(|kp| info.policy == super::home::home_policy(&kp.user_id()))
+        && !actor.is_durable_owner()
+    {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "mutating the Home requires the durable API token (not a session token)",
+        );
     }
     let name_update = req.name.clone();
     let desc_update = req.description.clone();
@@ -30478,6 +30504,9 @@ pub(in crate::server) mod tests {
         // Non-hex agent_id.
         let response = direct_send(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(direct_send_test_request(
                 "not-hex".to_string(),
                 BASE64.encode(b"hello"),
@@ -30496,6 +30525,9 @@ pub(in crate::server) mod tests {
         // Well-formed agent_id, invalid base64 payload.
         let response = direct_send(
             State(state),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(direct_send_test_request(
                 "ab".repeat(32),
                 "!!!not-base64!!!".to_string(),
@@ -30530,6 +30562,9 @@ pub(in crate::server) mod tests {
         );
         let response = direct_send(
             State(state),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(direct_send_test_request(
                 hex::encode(recipient.as_bytes()),
                 BASE64.encode(b"hello"),
@@ -30563,6 +30598,9 @@ pub(in crate::server) mod tests {
         );
         let response = direct_send(
             State(state),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(direct_send_test_request(
                 hex::encode(recipient.as_bytes()),
                 BASE64.encode(b"hello"),

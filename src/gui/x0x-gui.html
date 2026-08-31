@@ -698,12 +698,14 @@ const wsSubs=new Set();
 
 async function api(path,opt){return apiWith(SESSION_TOKEN,path,opt)}
 
-// Issue #446: owner-act surfaces (/agent/sign, /exec/*, /sync/devices*,
-// /announce with user identity) require the DURABLE API token — a
-// session bearer gets a typed 403 naming it. ownerApi() prefers a
-// remembered owner token, and on the durable-required 403 prompts once,
-// keeps it in sessionStorage ONLY (never localStorage, never a URL),
-// and retries.
+// Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
+// /sync/devices*, /announce with user identity, /home/rename,
+// /upgrade/apply, PATCH on the Home group, and /direct/send with
+// reserved exec payloads) require the DURABLE API token — a session
+// bearer gets a typed 403 naming it. ownerApi() prefers a remembered
+// owner token, and on the durable-required 403 prompts once, keeps it
+// in sessionStorage ONLY (never localStorage, never a URL), and
+// retries.
 function readOwnerToken(){try{return sessionStorage.getItem('x0x_owner_token')||''}catch(e){return ''}}
 let OWNER_TOKEN=readOwnerToken();
 function durableRequired(r){return !!(r&&r._http_status===403&&String(r.error||'').indexOf('durable')!==-1)}
@@ -1794,7 +1796,7 @@ function renameHomeSpace(){
   const cur=hd?(hd.name||'Home'):'Home';
   const name=prompt('Rename Home:',cur);
   if(!name||name===cur)return;
-  api('/home/rename',{method:'POST',body:JSON.stringify({name})}).then(r=>{
+  ownerApi('/home/rename',{method:'POST',body:JSON.stringify({name})}).then(r=>{
     if(r&&r.ok){mountHomeSpace();renderSidebar();}
   });
 }
@@ -1867,7 +1869,7 @@ async function pollDash(){
 async function applyUpgrade(){
   const btn=document.getElementById('upg-apply-btn');
   if(btn){btn.disabled=true;btn.textContent='Applying…'}
-  const r=await api('/upgrade/apply',{method:'POST'});
+  const r=await ownerApi('/upgrade/apply',{method:'POST'});
   if(!r){toast('Apply failed: no response','error');if(btn){btn.disabled=false;btn.textContent='Apply update'}return}
   if(r.ok&&r.applied){
     toast('Upgrade applied: v'+(r.version||'?')+'. Daemon will restart.','success');
@@ -5044,7 +5046,7 @@ async function nagRenameGroup(gid){
   if(name)body.name=name;
   if(desc)body.description=desc;
   nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Working…');
-  const r=await api('/groups/'+gid,{method:'PATCH',body:JSON.stringify(body)});
+  const r=await ownerApi('/groups/'+gid,{method:'PATCH',body:JSON.stringify(body)});
   if(r&&r.ok){
     nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Saved.','ok');
     nagRenderAdmin(gid);

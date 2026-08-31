@@ -151,6 +151,21 @@ pub(super) async fn auth_middleware(
     .is_ok();
 
     if owner_ok {
+        // Issue #446 (review round 2): owner-act surfaces require the
+        // DURABLE token at the route layer — BEFORE extractors, so a
+        // session bearer gets the typed 403 whatever the body looks
+        // like. Handler-side gates remain as defense-in-depth.
+        if requires_durable_owner(&method, &path) && !durable {
+            return (
+                StatusCode::FORBIDDEN,
+                Json(serde_json::json!({
+                    "error": format!(
+                        "{path} requires the durable API token (not a session token)"
+                    )
+                })),
+            )
+                .into_response();
+        }
         let mut req = req;
         req.extensions_mut()
             .insert(super::rider_auth::ActorContext::Owner { durable });
@@ -267,6 +282,60 @@ fn accepts_query_token(path: &str) -> bool {
             | "/peers/events"
             | "/presence/events"
     )
+}
+
+/// Issue #446 (review round 2): the COMPLETE route table of owner-act
+/// surfaces that require the DURABLE API token at the ROUTE layer —
+/// enforced by [`auth_middleware`] BEFORE any extractor or handler
+/// runs, so a session bearer gets the typed `403` regardless of body
+/// validity (a malformed JSON body cannot leak an extraction error in
+/// front of the authorization decision). Handler-side
+/// `is_durable_owner()` gates remain as defense-in-depth and for
+/// direct-handler wiring.
+///
+/// `POST /announce` is deliberately absent: its gate is body-conditional
+/// (`include_user_identity`) and stays in the handler. `POST
+/// /direct/send` and WS `SendDirect` carry arbitrary DM payloads; their
+/// exec-prefix egress check is likewise payload-conditional and lives
+/// in the handlers.
+pub(super) fn requires_durable_owner(method: &Method, path: &str) -> bool {
+    match *method {
+        Method::POST => {
+            matches!(
+                path,
+                "/agent/sign"
+                    | "/exec/run"
+                    | "/exec/cancel"
+                    | "/shutdown"
+                    | "/sync/devices/enroll"
+                    | "/home/rename"
+                    | "/upgrade/apply"
+            ) || is_two_segment_action(path, "delegate")
+        }
+        Method::DELETE => is_sync_device_path(path),
+        _ => false,
+    }
+}
+
+/// `true` for exactly `/groups/<nonempty-id>/delegate`.
+fn is_two_segment_action(path: &str, action: &str) -> bool {
+    match path.strip_prefix("/groups/") {
+        Some(rest) => {
+            let mut segs = rest.split('/');
+            segs.next().is_some_and(|id| !id.is_empty())
+                && segs.next() == Some(action)
+                && segs.next().is_none()
+        }
+        None => false,
+    }
+}
+
+/// `true` for exactly `/sync/devices/<nonempty-machine-id>`.
+fn is_sync_device_path(path: &str) -> bool {
+    match path.strip_prefix("/sync/devices/") {
+        Some(id) => !id.is_empty() && !id.contains('/'),
+        None => false,
+    }
 }
 
 // ── CORS-origin predicates ───────────────────────────────────────────────
@@ -547,14 +616,6 @@ mod tests {
         // #127 / WS1.6: a short-lived session token in the Bearer header is
         // accepted on protected endpoints too (browser clients use it after
         // exchange, so REST calls work without the durable secret).
-        //
-        // Issue #446 FLIP: `/agent/sign` is deliberately NO LONGER in this
-        // list. `authorize` only decides bearer VALIDITY; the owner-act
-        // surfaces (`/agent/sign`, `/exec/*`, `/shutdown`, `/sync/devices*`,
-        // `/groups/:id/delegate`, `/announce` with user identity) fence
-        // session bearers at the HANDLER with a 403 (`is_durable_owner`).
-        // That matrix is pinned end-to-end (middleware + handler) in
-        // `routes::identity::owner_act_tests::owner_act_matrix_*`.
         let sessions = SessionStore::new(SESSION_TOKEN_TTL);
         let now = Instant::now();
         let session = sessions.issue(now);
@@ -564,6 +625,118 @@ mod tests {
                 "{path} with a session bearer must pass (Ok)"
             );
         }
+    }
+
+    #[test]
+    fn auth_matrix_owner_act_routes_invert_the_session_assertion() {
+        // Issue #446 (review round 2): the ORIGINAL assertion — "a session
+        // bearer must pass /agent/sign (Ok)" — INVERTED. `authorize` alone
+        // still returns Ok (it decides bearer validity only); the middleware
+        // composes it with `requires_durable_owner` and refuses the session
+        // bearer with a typed 403 BEFORE any extractor runs. This is the
+        // same composition `auth_middleware` performs.
+        let sessions = SessionStore::new(SESSION_TOKEN_TTL);
+        let now = Instant::now();
+        let session = sessions.issue(now);
+        for (method, path) in [
+            (Method::POST, "/agent/sign"),
+            (Method::POST, "/exec/run"),
+            (Method::POST, "/exec/cancel"),
+            (Method::POST, "/shutdown"),
+            (Method::POST, "/sync/devices/enroll"),
+            (
+                Method::DELETE,
+                "/sync/devices/00112233445566778899aabbccddeeff",
+            ),
+            (Method::POST, "/groups/some-group/delegate"),
+            (Method::POST, "/home/rename"),
+            (Method::POST, "/upgrade/apply"),
+        ] {
+            // The route is classified durable-owner…
+            assert!(
+                requires_durable_owner(&method, path),
+                "{method} {path} must be classified durable-owner"
+            );
+            // …the session bearer is a VALID bearer (authorize Ok)…
+            assert!(
+                authorize(
+                    path,
+                    &method,
+                    Some(&session),
+                    None,
+                    TEST_API_TOKEN,
+                    &sessions,
+                    now
+                )
+                .is_ok(),
+                "{method} {path}: session bearer is a valid bearer"
+            );
+            // …and the middleware composition therefore answers 403.
+            assert_eq!(
+                middleware_owner_decision(
+                    Some(&session),
+                    &method,
+                    path,
+                    TEST_API_TOKEN,
+                    &sessions,
+                    now
+                ),
+                Err(StatusCode::FORBIDDEN),
+                "{method} {path} with a session bearer must be 403"
+            );
+            // The durable token passes the same composition.
+            assert_eq!(
+                middleware_owner_decision(
+                    Some(TEST_API_TOKEN),
+                    &method,
+                    path,
+                    TEST_API_TOKEN,
+                    &sessions,
+                    now
+                ),
+                Ok(()),
+                "{method} {path} with the durable bearer must pass"
+            );
+        }
+        // Lookalikes must NOT be classified (deny-by-default table):
+        for (method, path) in [
+            (Method::GET, "/agent/sign"),
+            (Method::POST, "/agent/sign/extra"),
+            (Method::POST, "/groups/some-group/delegate/x"),
+            (Method::POST, "/groups/delegate"),
+            (Method::DELETE, "/sync/devices/with/extra"),
+            (Method::GET, "/exec/sessions"),
+            (Method::GET, "/sync/devices"),
+        ] {
+            assert!(
+                !requires_durable_owner(&method, path),
+                "{method} {path} must NOT be classified durable-owner"
+            );
+        }
+    }
+
+    /// The owner-side of `auth_middleware`'s decision, factored pure so the
+    /// auth-matrix tests exercise the same composition as production:
+    /// bearer validity (`authorize`) ∧ durability of the presented token ∧
+    /// route classification.
+    fn middleware_owner_decision(
+        header_token: Option<&str>,
+        method: &Method,
+        path: &str,
+        api_token: &str,
+        sessions: &SessionStore,
+        now: Instant,
+    ) -> Result<(), StatusCode> {
+        let bearer_valid =
+            authorize(path, method, header_token, None, api_token, sessions, now).is_ok();
+        let durable = header_token.is_some_and(|token| ct_eq(token, api_token));
+        if bearer_valid && requires_durable_owner(method, path) && !durable {
+            return Err(StatusCode::FORBIDDEN);
+        }
+        if bearer_valid {
+            return Ok(());
+        }
+        Err(StatusCode::UNAUTHORIZED)
     }
 
     // -- Auth-exempt public paths: served without any token.

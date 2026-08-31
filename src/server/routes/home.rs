@@ -668,16 +668,27 @@ pub(in crate::server) struct RenameHomeRequest {
 /// POST /home/rename — convenience wrapper over the existing
 /// PATCH /groups/:id (admin-gated, sealed, persisted).
 ///
-/// Issue #446 decision: this surface deliberately stays SESSION-allowed.
-/// It is a pure wrapper over `update_named_group` (PATCH /groups/:id),
-/// which remains session-allowed; gating only the alias would be
-/// theater while the identical authority stays reachable via PATCH.
-/// No credential or capability is minted — a rename is sealed group
-/// metadata. Riders remain 403 (ADR-0039 deny-by-default middleware).
+/// Issue #446 (review round 2): requires the DURABLE owner — and the
+/// underlying PATCH requires it too when the target is the Home (see
+/// `update_named_group`), so the alias cannot be bypassed via PATCH.
+/// Enforced at the route layer (`requires_durable_owner`) and here.
 pub(in crate::server) async fn rename_home(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<RenameHomeRequest>,
 ) -> Response {
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "renaming the Home requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return (
             StatusCode::NOT_FOUND,
@@ -702,9 +713,14 @@ pub(in crate::server) async fn rename_home(
         name: Some(req.name),
         description: None,
     };
-    update_named_group(State(state), Path(group_id), Json(update))
-        .await
-        .into_response()
+    update_named_group(
+        State(state),
+        axum::extract::Extension(actor),
+        Path(group_id),
+        Json(update),
+    )
+    .await
+    .into_response()
 }
 
 #[cfg(test)]
@@ -1079,6 +1095,9 @@ pub(in crate::server::routes) mod tests {
         provision_home(&state).await;
         let response = rename_home(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(RenameHomeRequest {
                 name: "Irvine HQ".to_string(),
             }),
@@ -1092,13 +1111,12 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// WHY (issue #446): `/home/rename` deliberately stays SESSION-allowed —
-    /// it is a wrapper over `PATCH /groups/:id` (session-allowed) and mints
-    /// no credential. Pin the decision end-to-end through the real auth
-    /// middleware: a session bearer renames Home (200), a rider is 403
-    /// (deny-by-default), the durable token keeps working.
+    /// WHY (issue #446, review round 2): `/home/rename` requires the
+    /// DURABLE owner — session bearers and riders get 403, the durable
+    /// token renames. Pinned end-to-end through the real auth middleware
+    /// (route classification + handler gate).
     #[tokio::test]
-    async fn home_rename_stays_session_allowed() -> anyhow::Result<()> {
+    async fn home_rename_requires_durable_owner() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let state = owned_state(dir.path(), [0x44; 32]).await?;
         provision_home(&state).await;
@@ -1128,9 +1146,13 @@ pub(in crate::server::routes) mod tests {
         let session = state.sessions.issue(std::time::Instant::now());
         let response = call(session, "Session Rename").await?;
         let (status, body) = response_json(response.into_response()).await?;
-        assert_eq!(status, StatusCode::OK, "session bearer must rename: {body}");
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session bearer must be refused: {body}"
+        );
 
-        // A rider token is still denied (ADR-0039 deny-by-default).
+        // A rider token is denied (ADR-0039 deny-by-default).
         let mut store = state.rider_tokens.lock().await;
         let (rider, _record) = store
             .issue(
@@ -1159,6 +1181,101 @@ pub(in crate::server::routes) mod tests {
         let owner = owner_of(&state);
         let (_, info) = find_home(&state, &owner).await.expect("home");
         assert_eq!(info.name, "Durable Rename");
+        Ok(())
+    }
+
+    /// WHY (issue #446, review round 2): the underlying PATCH must fence
+    /// the SAME authority for the HOME group (else the /home/rename gate
+    /// is bypassable by PATCHing the Home `group_id` revealed by
+    /// session-readable GET /home), while ordinary groups keep the
+    /// session-allowed admin path.
+    #[tokio::test]
+    async fn patch_on_home_requires_durable_owner_plain_groups_stay_session_allowed(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x45; 32]).await?;
+        provision_home(&state).await;
+
+        // A plain (non-Home) group created through the real handler.
+        let created = super::super::named_groups::create_named_group(
+            State(Arc::clone(&state)),
+            axum::Json(super::super::named_groups::CreateGroupRequest {
+                name: "Plain Space".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: None,
+                policy: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(created).await?;
+        assert_eq!(status, StatusCode::CREATED, "plain group created: {body}");
+        let plain_id = body["group_id"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default();
+        assert!(
+            !plain_id.is_empty(),
+            "create response carries the id: {body}"
+        );
+
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let patch = |bearer: String, id: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::patch(format!("/groups/{id}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "name": "Renamed" }).to_string(),
+                        ))
+                        .expect("body builds"),
+                )
+                .await
+            }
+        };
+
+        // Session bearer: Home PATCH → 403 …
+        let session = state.sessions.issue(std::time::Instant::now());
+        let response = patch(session.clone(), home_id.clone()).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session PATCH on the Home must be refused: {body}"
+        );
+        // … but a PLAIN group PATCH stays session-allowed (boundary pin).
+        let response = patch(session.clone(), plain_id).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "session PATCH on a plain group must keep working: {body}"
+        );
+
+        // Durable bearer: Home PATCH succeeds through the same path.
+        let response = patch("test-token".to_string(), home_id).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "durable PATCH on the Home must rename: {body}"
+        );
         Ok(())
     }
 

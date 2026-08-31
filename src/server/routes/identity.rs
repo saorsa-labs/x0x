@@ -1384,9 +1384,12 @@ mod owner_act_tests {
     fn matrix_router(state: Arc<AppState>) -> axum::Router {
         use crate::server::auth::auth_middleware;
         use crate::server::delegations::delegate_group_authority;
+        use crate::server::routes::direct::direct_send;
         use crate::server::routes::exec::{exec_cancel, exec_run};
+        use crate::server::routes::home::rename_home;
         use crate::server::routes::status::shutdown_handler;
         use crate::server::routes::sync::{enroll_device, unenroll_device};
+        use crate::server::routes::upgrade::apply_upgrade;
         axum::Router::new()
             .route("/agent/sign", post(agent_sign))
             .route("/announce", post(announce_identity))
@@ -1396,6 +1399,9 @@ mod owner_act_tests {
             .route("/sync/devices/enroll", post(enroll_device))
             .route("/sync/devices/:machine_id", delete(unenroll_device))
             .route("/groups/:id/delegate", post(delegate_group_authority))
+            .route("/home/rename", post(rename_home))
+            .route("/upgrade/apply", post(apply_upgrade))
+            .route("/direct/send", post(direct_send))
             .layer(axum::middleware::from_fn_with_state(
                 Arc::clone(&state),
                 auth_middleware,
@@ -1743,6 +1749,185 @@ mod owner_act_tests {
             StatusCode::BAD_REQUEST,
             "plain announce stays session-allowed (400 = gossip runtime absent, NOT 403)"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_home_rename() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        crate::server::routes::home::provision_home(&state).await;
+        let app = matrix_router(Arc::clone(&state));
+        let body = serde_json::json!({ "name": "Round 2 Home" });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/home/rename",
+            &session_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/home/rename",
+            &rider_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "POST", "/home/rename", DURABLE, body).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer renames: {json}");
+        assert_eq!(json["ok"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_upgrade_apply() -> anyhow::Result<()> {
+        // Verdict item 3: /upgrade/apply swaps the binary and drives the
+        // SAME shutdown channels as /shutdown — it must not be reachable
+        // with a session token. Gated at the ROUTE layer (auth.rs
+        // classification) so the upgrade handler itself is untouched
+        // (sibling session HS-F4 owns the rollback work).
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let empty = serde_json::json!({});
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/upgrade/apply",
+            &session_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/upgrade/apply",
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        // Durable clears the route gate; the fixture has self-update
+        // disabled, so the handler reports its own (non-403) outcome —
+        // the point is that the lifecycle gate was passed only with
+        // the durable token.
+        let (status, json) = call(&app, "POST", "/upgrade/apply", DURABLE, empty).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "durable clears the route gate: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_direct_send_exec_prefix() -> anyhow::Result<()> {
+        // Verdict item 1: reserved exec frames ride DMs behind
+        // `x0x-exec-v1\0`; the receiver routes them into the exec
+        // service. Crafting that prefix through the generic /direct/send
+        // egress must require the durable owner, while ordinary DM
+        // payloads stay session-allowed.
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let exec_payload = {
+            let mut bytes = x0x::exec::EXEC_DM_PREFIX.to_vec();
+            bytes.extend_from_slice(b"bincode-frame-bytes");
+            serde_json::json!({
+                "agent_id": "ab".repeat(32),
+                "payload": BASE64.encode(bytes),
+            })
+        };
+        let plain_payload = serde_json::json!({
+            "agent_id": "ab".repeat(32),
+            "payload": BASE64.encode(b"an ordinary dm"),
+        });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/direct/send",
+            &session_token(&state).await,
+            exec_payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session bearer must not craft exec frames: {json}"
+        );
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("durable"));
+
+        // The same session bearer may still send an ordinary DM (the
+        // fixture agent has no route to the peer, so the handler
+        // reports a send failure — anything but 403).
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/direct/send",
+            &session_token(&state).await,
+            plain_payload.clone(),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "ordinary DM payloads stay session-allowed: {json}"
+        );
+
+        // Durable may carry the reserved prefix (its /exec/* authority
+        // subsumes the transport); with no route the send fails past
+        // the gate.
+        let (status, json) = call(&app, "POST", "/direct/send", DURABLE, exec_payload).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "durable clears the exec-prefix egress gate: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_session_403_precedes_body_extraction() -> anyhow::Result<()> {
+        // Verdict item 4: the typed 403 must be universal for the routed
+        // surfaces — the route-layer gate fires BEFORE axum's Json
+        // extractor, so even a MALFORMED body cannot surface an
+        // extraction error in front of the authorization decision.
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        for path in [
+            "/agent/sign",
+            "/exec/run",
+            "/exec/cancel",
+            "/home/rename",
+            "/upgrade/apply",
+            "/groups/x/delegate",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(
+                    "authorization",
+                    format!("Bearer {}", session_token(&state).await),
+                )
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("this is {{{ not json"))
+                .expect("request builds");
+            let resp = app.clone().oneshot(req).await.expect("router answers");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{path} with a session bearer and a malformed body must be 403 pre-extractor"
+            );
+        }
         Ok(())
     }
 
