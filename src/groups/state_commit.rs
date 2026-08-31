@@ -616,6 +616,11 @@ pub enum ApplyError {
     #[error("state hash mismatch: expected {expected}, got {got}")]
     StateHashMismatch { expected: String, got: String },
 
+    /// #458: an adopted commit's signed roster root does not equal the
+    /// locally reconstructed roster root (joiner fast-forward failed).
+    #[error("roster root mismatch: expected {expected}, got {got}")]
+    RosterRootMismatch { expected: String, got: String },
+
     /// The event's `group_id` does not match the target group.
     #[error("group_id mismatch: got {got}, expected {expected}")]
     GroupIdMismatch { expected: String, got: String },

@@ -1264,6 +1264,40 @@ impl GroupInfo {
         self.finalize_applied_commit_with_terminal_mode(commit, false)
     }
 
+    /// #458: finalize a commit a joiner stub ADOPTED across a
+    /// `prev_state_hash` gap. The stub cannot reconstruct the intermediate
+    /// commits' metadata (e.g. a rename it never received), so the full
+    /// state-hash equality of [`GroupInfo::finalize_applied_commit`] is
+    /// unreachable by construction. Instead this verifies the part the
+    /// joiner CAN and MUST verify — the reconstructed roster's root equals
+    /// the commit's SIGNED `roster_root` (the joiner's seat is exactly
+    /// what the authority committed) and the last-admin invariant holds —
+    /// then adopts the signed chain fields (`state_revision`,
+    /// `prev_state_hash`, `state_hash`, `security_binding`) so the next
+    /// authority commit chains normally.
+    pub fn finalize_adopted_commit_roster_checked(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        if self.withdrawn && !commit.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        if roster_root != commit.roster_root {
+            return Err(state_commit::ApplyError::RosterRootMismatch {
+                expected: commit.roster_root.clone(),
+                got: roster_root,
+            });
+        }
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        self.state_revision = commit.revision;
+        self.prev_state_hash = commit.prev_state_hash.clone();
+        self.state_hash = commit.state_hash.clone();
+        self.security_binding = commit.security_binding.clone();
+        self.retain_commit(commit);
+        Ok(())
+    }
+
     /// Finalize an explicitly terminal, already-authorized withdrawal commit.
     ///
     /// This is the terminal counterpart to [`GroupInfo::finalize_applied_commit`]:

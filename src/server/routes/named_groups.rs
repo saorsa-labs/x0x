@@ -2722,10 +2722,170 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    persist_named_groups_mutation(state, |groups| {
+    let outcome = persist_named_groups_mutation(state, |groups| {
         store_named_group_info_locked(groups, group_id, info)
     })
-    .await
+    .await;
+    // #457: a durable named-group state change on a TreeKEM group must keep
+    // the snapshot envelope binding in step, or the next restart drops the
+    // secure plane for that group.
+    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+        rebind_treekem_snapshot_after_named_seal(state, group_id).await;
+    }
+    outcome
+}
+
+/// #457: keep the TreeKEM snapshot envelope bound to the named-group state
+/// after a METADATA-ONLY seal (rename, policy/role change, reseal). Those
+/// seals advance `state_revision`/`state_hash` without touching the TreeKEM
+/// crypto state, so the on-disk envelope goes stale and the next restart
+/// dropped the group from the live map ("snapshot/named-group binding
+/// mismatch") — silently rejecting every certified join afterwards.
+///
+/// Two arms:
+/// 1. LIVE group in the map — re-encode the current snapshot under the new
+///    binding (same crypto bytes, fresh envelope fields).
+/// 2. NOT in the map (already mismatched, e.g. restarted into the wedge) —
+///    repair from the on-disk snapshot: only when the envelope's
+///    `security_binding` still EQUALS the named binding (the TreeKEM epoch
+///    never diverged; only named-side metadata advanced) is the crypto
+///    snapshot still current, so re-bind it, persist, and restore the group
+///    into the live map.
+///
+/// Best-effort by design: a contended TreeKEM mutex (try_lock) or a
+/// genuinely diverged binding (epoch advanced without a new snapshot) is
+/// skipped loudly — never a crash, never a wrong binding.
+async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &str) {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).cloned()
+    };
+    let Some(info) = info else { return };
+    if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
+        return;
+    }
+    // Arm 1: live group — refresh the envelope binding in place.
+    let live = {
+        let map = state.treekem_groups.read().await;
+        map.get(group_id).cloned()
+    };
+    if let Some(group) = live {
+        let Ok(guard) = group.try_lock() else {
+            tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind skipped: group mutex contended (#457)"
+            );
+            return;
+        };
+        match encode_treekem_snapshot_envelope(&info, &guard) {
+            Ok(bytes) => {
+                if let Err(e) =
+                    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, bytes).await
+                {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(group_id),
+                        "TreeKEM snapshot rebind persist failed (#457): {e}"
+                    );
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_id),
+                    "TreeKEM snapshot rebind encode failed (#457): {e}"
+                );
+            }
+        }
+        return;
+    }
+    // Arm 2: repair from disk — only a metadata-only divergence qualifies.
+    let path = treekem_snapshot_path(&state.treekem_dir, group_id);
+    let bytes = match tokio::fs::read(&path).await {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind read failed (#457): {e}"
+            );
+            return;
+        }
+    };
+    let envelope = match decode_treekem_snapshot_envelope(&bytes) {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind skipped: legacy unbound snapshot (#457)"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind skipped: undecodable snapshot (#457): {e}"
+            );
+            return;
+        }
+    };
+    if envelope.security_binding != info.security_binding
+        || envelope.state_revision > info.state_revision
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            snapshot_revision = envelope.state_revision,
+            named_revision = info.state_revision,
+            "TreeKEM snapshot rebind refused: epoch/binding diverged — secure content needs a fresh share (#457)"
+        );
+        return;
+    }
+    let rebound = TreeKemSnapshotEnvelope {
+        version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+        state_revision: info.state_revision,
+        state_hash: info.state_hash.clone(),
+        security_binding: info.security_binding.clone(),
+        snapshot: envelope.snapshot,
+    };
+    let mut rebound_bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+    match postcard::to_stdvec(&rebound) {
+        Ok(encoded) => rebound_bytes.extend(encoded),
+        Err(e) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind encode failed (#457): {e}"
+            );
+            return;
+        }
+    }
+    if let Err(e) =
+        persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, rebound_bytes).await
+    {
+        tracing::warn!(
+            group_id = %LogHexId::group(group_id),
+            "TreeKEM snapshot rebind persist failed (#457): {e}"
+        );
+        return;
+    }
+    match restore_local_treekem_group_from_snapshot(state, &info, &rebound.snapshot) {
+        Ok(group) => {
+            tracing::info!(
+                group_id = %LogHexId::group(group_id),
+                snapshot_revision = envelope.state_revision,
+                named_revision = info.state_revision,
+                "repaired TreeKEM snapshot/named-group binding mismatch; secure content restored (#457)"
+            );
+            state
+                .treekem_groups
+                .write()
+                .await
+                .insert(group_id.to_string(), Arc::new(Mutex::new(group)));
+        }
+        Err(e) => {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "TreeKEM snapshot rebind restore failed (#457): {e}"
+            );
+        }
+    }
 }
 
 fn restore_local_treekem_group_from_snapshot(
@@ -6458,22 +6618,100 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 Ok(next) => next,
                 Err(e) => {
-                    tracing::debug!(
-                        target: "treekem.trace",
-                        stage = "apply_metadata_event_reject",
-                        reason = "member_added_state_commit_apply_failed",
-                        group_id = %resolved_group_key,
-                        member = %agent_id,
-                        sender = %sender_hex,
-                        revision,
-                        commit_revision = commit.revision,
-                        local_state_revision = current.state_revision,
-                        local_roster_revision = current.roster_revision,
-                        local_state_hash = %current.state_hash,
-                        commit_prev_state_hash = ?commit.prev_state_hash,
-                        error = %e,
+                    // #458: the joiner's local view is a stub seeded from
+                    // the invite's base state. When the authority sealed
+                    // OTHER commits between the invite mint and our add
+                    // (a rename, another member), `prev_state_hash` cannot
+                    // chain from our stub and the apply fails — leaving the
+                    // joiner `already_joined` locally but absent from every
+                    // roster (403 on every post). On a NON-TreeKEM plane
+                    // (no catch-up queue exists there) a joiner whose OWN
+                    // add this is may ADOPT the authority-signed commit:
+                    let local_agent_hex_adopt = hex::encode(state.agent.agent_id().as_bytes());
+                    let adoptable = matches!(
+                        e,
+                        x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. }
+                    ) && info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem
+                        && actor_authorized
+                        && agent_id == local_agent_hex_adopt
+                        && !info.has_active_member(&local_agent_hex_adopt)
+                        && commit.verify_structure().is_ok()
+                        && commit.revision > current.state_revision;
+                    if !adoptable {
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "apply_metadata_event_reject",
+                            reason = "member_added_state_commit_apply_failed",
+                            group_id = %resolved_group_key,
+                            member = %agent_id,
+                            sender = %sender_hex,
+                            revision,
+                            commit_revision = commit.revision,
+                            local_state_revision = current.state_revision,
+                            local_roster_revision = current.roster_revision,
+                            local_state_hash = %current.state_hash,
+                            commit_prev_state_hash = ?commit.prev_state_hash,
+                            error = %e,
+                        );
+                        state
+                            .groups_diagnostics
+                            .record_member_added_rejected_state_chain_gap(&resolved_group_key);
+                        return ApplyMetadataResult::REJECTED;
+                    }
+                    let mut adopted = current.clone();
+                    adopted.roster_revision = revision.max(adopted.roster_revision);
+                    adopted.add_member(
+                        agent_id.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(actor.clone()),
+                        display_name.clone(),
                     );
-                    return ApplyMetadataResult::REJECTED;
+                    if let Some(package_hash) = treekem_key_package_hash.clone() {
+                        adopted.set_member_treekem_key_package_hash(&agent_id, package_hash);
+                    }
+                    if let Some(cert) = owner_certified_certificate.clone() {
+                        adopted.set_member_certificate(&agent_id, cert);
+                    }
+                    if let Some(name) = display_name.clone() {
+                        adopted.set_display_name(&agent_id, name);
+                    }
+                    // Fast-forward checks: the roster the joiner
+                    // reconstructs MUST equal the roster the authority's
+                    // signature committed to (`roster_root`), and the
+                    // last-admin invariant must hold. The full state-hash
+                    // comparison is deliberately NOT required here — the
+                    // commit's hash covers the intermediate commits'
+                    // metadata (e.g. a rename the joiner never saw), which
+                    // the stub cannot reconstruct. The chain fields are
+                    // adopted from the SIGNED commit instead, so the next
+                    // commit chains normally.
+                    let roster_ok = adopted.finalize_adopted_commit_roster_checked(&commit);
+                    match roster_ok {
+                        Ok(()) => {
+                            state
+                                .groups_diagnostics
+                                .record_member_added_adopted(&resolved_group_key);
+                            tracing::info!(
+                                group_id = %resolved_group_key,
+                                member = %agent_id,
+                                commit_revision = commit.revision,
+                                local_state_revision = current.state_revision,
+                                "MemberAdded: joiner stub adopted authority commit across prev_state_hash gap (#458)"
+                            );
+                            adopted
+                        }
+                        Err(adopt_err) => {
+                            tracing::warn!(
+                                group_id = %resolved_group_key,
+                                member = %agent_id,
+                                "MemberAdded: adoption failed the roster-root/last-admin check (#458): {adopt_err}"
+                            );
+                            state
+                                .groups_diagnostics
+                                .record_member_added_rejected_state_chain_gap(&resolved_group_key);
+                            return ApplyMetadataResult::REJECTED;
+                        }
+                    }
                 }
             };
             let mut recovery_cache_entries = Vec::new();
@@ -7998,6 +8236,25 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 match owner_certified_admission_check(state, &info, &member_agent_id).await {
                     Ok(cert) => cert,
                     Err(failure) => {
+                        state
+                            .groups_diagnostics
+                            .record_member_joined_rejected_owner_cert_pending(&resolved_group_key);
+                        // #447: NoCertificate is EVIDENCE-IN-FLIGHT, not a
+                        // fact about the joiner — the async announce-blob
+                        // fetch may complete (or the 600 s heartbeat land)
+                        // after the joiner's retry volley has already given
+                        // up. Retain the fully member-signed event so a later
+                        // evidence resolution can re-apply it; every other
+                        // failure is definitive and earns no retention.
+                        if failure == x0x::groups::owner_cert::OwnerCertFailure::NoCertificate {
+                            retain_pending_owner_cert_join(
+                                state,
+                                &resolved_group_key,
+                                &member_agent_id,
+                                &event_for_log,
+                            )
+                            .await;
+                        }
                         tracing::info!(
                             group_id = %resolved_group_key,
                             member = %member_agent_id,
@@ -8096,6 +8353,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     map.get(&resolved_group_key).cloned()
                 };
                 let Some(group) = group else {
+                    // #457: this is the silent-rejection wedge — a restart
+                    // after a metadata-only seal (e.g. Home rename) leaves
+                    // the snapshot/named-group binding mismatched, the
+                    // TreeKEM group is dropped from the live map, and every
+                    // certified MemberJoined died HERE with no log line and
+                    // no counter while the joiner polled forever.
+                    state
+                        .groups_diagnostics
+                        .record_member_joined_rejected_treekem_unavailable(&resolved_group_key);
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "MemberJoined: TreeKEM group unavailable (missing snapshot or snapshot/named-group binding mismatch — run POST /groups/:id/state/seal to repair)"
+                    );
                     return ApplyMetadataResult::REJECTED;
                 };
                 let mut guard = group.lock().await;
@@ -8787,17 +9058,32 @@ pub(in crate::server) async fn get_named_group(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    let groups = state.named_groups.read().await;
-    let Some(info) = groups.get(&id) else {
-        return not_found("group not found");
+    let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // #447/#458: typed LOCAL membership state so a joiner in limbo (local
+    // stub persisted, authority never committed its MemberAdded) can see
+    // "pending_authority_commit" instead of a bare 200 that reads as full
+    // membership.
+    let (info, membership_state) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        let info = info.clone();
+        let state_label =
+            local_join_membership_state(state.as_ref(), &info, &local_agent_hex).await;
+        (info, state_label)
     };
-    let members = named_group_member_values(info);
+    // #447: an operator reading the group is a natural moment to sweep
+    // retained owner-cert-pending joins whose evidence may have landed.
+    retry_pending_owner_cert_joins(&state, Some(&id)).await;
+    let members = named_group_member_values(&info);
 
     (
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
             "group_id": info.mls_group_id,
+            "membership_state": membership_state,
             "name": info.name,
             "description": info.description,
             "creator": hex::encode(info.creator.as_bytes()),
@@ -8820,11 +9106,35 @@ pub(in crate::server) async fn get_named_group(
                     (agent.clone(), serde_json::json!(if *placement == x0x::groups::MemberPlacement::Roaming { "roaming" } else { "pinned" }))
                 }).collect::<serde_json::Map<String, serde_json::Value>>(),
             })),
-            "warnings": super::home::home_roaming_warning_for(info)
+            "warnings": super::home::home_roaming_warning_for(&info)
                 .map(|warning| vec![warning])
                 .unwrap_or_default(),
         })),
     )
+}
+
+/// #447/#458: the LOCAL agent's membership state in `info`, for
+/// `GET /groups/:id` and the duplicate-join response. `active` means the
+/// authority's own roster lists us; `pending_authority_commit` means we hold
+/// a join stub and an expected-inviter pin but our own roster seat never
+/// landed — the limbo state that used to read as `already_joined: true`.
+async fn local_join_membership_state(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    local_agent_hex: &str,
+) -> &'static str {
+    if info.has_active_member(local_agent_hex) {
+        return "active";
+    }
+    let stable = info.stable_group_id().to_string();
+    if expected_join_result_inviter(state, &join_result_key(&stable, local_agent_hex)).is_some() {
+        return "pending_authority_commit";
+    }
+    match info.members_v2.get(local_agent_hex) {
+        Some(member) if member.is_active() => "active",
+        Some(member) if member.state == x0x::groups::GroupMemberState::Pending => "pending",
+        _ => "not_member",
+    }
 }
 
 /// GET /groups/:id/members — list local named-group members.
@@ -10912,21 +11222,60 @@ pub(in crate::server) async fn join_group_via_invite(
             // Issue #188: a duplicate/replayed join (retried cmd-DM,
             // redelivered invite) for a group this node already joined — or
             // is mid-join on, since the local stub lands in `named_groups`
-            // before TreeKEM convergence completes — is an idempotent
-            // success, not an error. No state is mutated and no MemberJoined
-            // is re-published; the membership lock above serializes the
+            // before convergence completes — is an idempotent success, not
+            // an error. The membership lock above serializes the
             // first-join/replay race.
-            let info = groups.get(&group_id_hex).or_else(|| {
-                groups
-                    .values()
-                    .find(|info| info.mls_group_id == group_id_hex)
-            });
+            //
+            // #447/#458: "mid-join" is now TYPED — if our own roster seat
+            // never landed (the authority never committed our MemberAdded —
+            // rejected for unresolved certificate evidence, or the commit
+            // was lost under churn), the response says
+            // `join_state: "pending_authority_commit"` and the signed
+            // MemberJoined volley is re-fired + re-polled instead of
+            // short-circuiting as a bare idempotent success. The one-time
+            // invite secret was never consumed by a rejection, so replaying
+            // it is safe.
+            let info = groups
+                .get(&group_id_hex)
+                .or_else(|| {
+                    groups
+                        .values()
+                        .find(|info| info.mls_group_id == group_id_hex)
+                })
+                .cloned();
             if let Some(info) = info {
+                let joiner_hex = hex::encode(agent_id.as_bytes());
+                let membership_state =
+                    local_join_membership_state(state.as_ref(), &info, &joiner_hex).await;
+                let still_pending = membership_state == "pending_authority_commit";
+                if still_pending {
+                    let refire_state = Arc::clone(&state);
+                    let refire_group_id = group_id_hex.clone();
+                    let refire_stable = invite_stable_group_id.to_string();
+                    let refire_inviter = invite.inviter.clone();
+                    let refire_secret = invite.invite_secret.clone();
+                    let refire_treekem =
+                        invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
+                    drop(groups);
+                    drop(membership_guard);
+                    tokio::spawn(async move {
+                        refire_pending_join_volley(
+                            &refire_state,
+                            &refire_group_id,
+                            refire_stable,
+                            &refire_inviter,
+                            refire_secret,
+                            refire_treekem,
+                        )
+                        .await;
+                    });
+                }
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "ok": true,
                         "already_joined": true,
+                        "join_state": membership_state,
                         "group_id": group_id_hex,
                         "group_name": info.name,
                         "chat_topic": info.general_chat_topic(),
@@ -13882,6 +14231,17 @@ pub(in crate::server) async fn owner_cert_evidence_for(
     // One keyed pass. An entry whose cert is absent but whose digest is
     // known records a PENDING warranted fetch — the grace-aware ladder
     // reads that as evidence-in-flight rather than "never certified".
+    //
+    // #447: an entry whose cert is absent but whose digest is known ALSO
+    // consults the announce-blob cache directly. The async fetch triggered
+    // by the first announce completes within seconds and populates the blob
+    // cache, but nothing re-attaches the pair to the discovery entry until
+    // the agent's NEXT announce (600 s heartbeat) — before this, every
+    // admission check answered `no agent certificate resolved` even though
+    // a verified cert was already cached. The re-check below mirrors the
+    // ingest-time binding rule: the cached pair was verified against the
+    // agent that triggered the fetch, and the digest is attacker-choosable,
+    // so the certificate must bind THIS entry's agent id before it counts.
     {
         let cache = state.agent.identity_discovery_cache();
         let cache = cache.read().await;
@@ -13901,8 +14261,26 @@ pub(in crate::server) async fn owner_cert_evidence_for(
                     }
                 }
                 None => {
-                    if let Some(digest) = entry.cert_digest {
-                        evidence.observe_pending_digest(entry_hex, digest);
+                    let Some(digest) = entry.cert_digest else {
+                        continue;
+                    };
+                    evidence.observe_pending_digest(entry_hex.clone(), digest);
+                    // #447: fetched-but-unattached evidence — the blob cache
+                    // holds the verified pair keyed by the same digest the
+                    // entry's announce committed to.
+                    if let Some(blob) = state.agent.announce_blob_cache.get(&digest).await {
+                        if let Some(cert) = blob.agent_certificate.as_ref() {
+                            if cert.agent_id().is_ok_and(|id| id == entry.agent_id)
+                                && cert.user_id().ok() == blob.user_id
+                            {
+                                evidence.insert_cert(entry_hex.clone(), cert.clone());
+                            } else {
+                                tracing::debug!(
+                                    agent = %entry_hex,
+                                    "announce blob cache holds a cert bound to a different agent; ignoring (digest copy attempt)"
+                                );
+                            }
+                        }
                     }
                 }
             }
@@ -13990,6 +14368,125 @@ async fn owner_certified_admission_check(
     let evidence = owner_cert_evidence_for(state, &[member_hex]).await;
     x0x::groups::owner_cert::verify_owner_certified_member(&owner, member_hex, &evidence)
         .map(|()| evidence.cert_for(member_hex).cloned())
+}
+
+/// #447: a `MemberJoined` rejected ONLY because the joiner's OwnerCertified
+/// certificate evidence had not resolved yet. Retained on the authority so
+/// the admission can be re-run once evidence appears (announce-blob fetch
+/// completion, heartbeat landing, or any later evidence build).
+#[derive(Clone)]
+pub(in crate::server) struct PendingOwnerCertJoin {
+    /// Stable group id the event's own `group_id` field carries.
+    pub(in crate::server) group_id: String,
+    /// The `group_id` the event itself carries (may be the mls id).
+    pub(in crate::server) event_group_key: String,
+    /// The joiner's hex agent id (also the retention key suffix).
+    pub(in crate::server) member_agent_id: String,
+    /// The fully member-signed `MemberJoined` event, re-appliable as-is.
+    pub(in crate::server) event: NamedGroupMetadataEvent,
+    /// When the event was retained (for TTL pruning).
+    pub(in crate::server) retained_at: Instant,
+}
+
+/// Retention cap: a Sybil joiner must not be able to grow the pending map
+/// without bound. Same order as the TreeKEM pending-event cap.
+const OWNER_CERT_PENDING_JOINS_CAP: usize = TREEKEM_PENDING_EVENTS_PER_GROUP_CAP;
+/// Retention TTL: covers the 600 s identity heartbeat plus slack, matching
+/// the join-result staging window the joiner's own poll already uses.
+const OWNER_CERT_PENDING_JOIN_TTL: Duration = PENDING_JOIN_RESULT_TTL;
+
+/// #447: retain a `MemberJoined` that failed admission ONLY for missing
+/// certificate evidence. Idempotent per (group, member): a retry volley
+/// replaces the retained copy with the newest fully-signed event.
+async fn retain_pending_owner_cert_join(
+    state: &AppState,
+    group_key: &str,
+    member_agent_id: &str,
+    event: &NamedGroupMetadataEvent,
+) {
+    let stable_group_id = {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_key)
+            .map(|info| info.stable_group_id().to_string())
+            .unwrap_or_else(|| group_key.to_string())
+    };
+    let key = join_result_key(&stable_group_id, member_agent_id);
+    let mut pending = state.owner_cert_pending_joins.write().await;
+    // TTL-prune first so the cap operates on live entries only.
+    pending.retain(|_, entry| entry.retained_at.elapsed() < OWNER_CERT_PENDING_JOIN_TTL);
+    if pending.len() >= OWNER_CERT_PENDING_JOINS_CAP && !pending.contains_key(&key) {
+        tracing::warn!(
+            member = %member_agent_id,
+            "owner-cert pending-join retention full; dropping newest retention"
+        );
+        return;
+    }
+    let event_group_key = match event {
+        NamedGroupMetadataEvent::MemberJoined { group_id, .. } => group_id.clone(),
+        _ => group_key.to_string(),
+    };
+    pending.insert(
+        key,
+        PendingOwnerCertJoin {
+            group_id: stable_group_id,
+            event_group_key,
+            member_agent_id: member_agent_id.to_string(),
+            event: event.clone(),
+            retained_at: Instant::now(),
+        },
+    );
+}
+
+/// #447: re-run admission for retained `MemberJoined` events whose joiner
+/// evidence may since have resolved. Called from Arc-holding trigger points
+/// (a join-result fetch from the joiner, an operator GET on the group) —
+/// never from inside the evidence builder, whose `&AppState` cannot spawn
+/// and whose caller may hold the membership lock this retry must take.
+pub(in crate::server) async fn retry_pending_owner_cert_joins(
+    state: &Arc<AppState>,
+    group_filter: Option<&str>,
+) {
+    let candidates: Vec<PendingOwnerCertJoin> = {
+        let pending = state.owner_cert_pending_joins.read().await;
+        pending
+            .values()
+            .filter(|entry| {
+                group_filter.is_none_or(|group| {
+                    entry.group_id.eq_ignore_ascii_case(group)
+                        || entry.event_group_key.eq_ignore_ascii_case(group)
+                })
+            })
+            .cloned()
+            .collect()
+    };
+    for entry in candidates {
+        let sender = parse_agent_id_hex(&entry.member_agent_id).ok();
+        let Some(sender) = sender else {
+            state
+                .owner_cert_pending_joins
+                .write()
+                .await
+                .remove(&join_result_key(&entry.group_id, &entry.member_agent_id));
+            continue;
+        };
+        tracing::debug!(
+            group_id = %entry.group_id,
+            member = %entry.member_agent_id,
+            "retrying retained MemberJoined after certificate-evidence change (#447)"
+        );
+        let applied =
+            apply_named_group_metadata_event(state, entry.event.clone(), sender, true, None)
+                .await
+                .accepted;
+        if applied {
+            state
+                .owner_cert_pending_joins
+                .write()
+                .await
+                .remove(&join_result_key(&entry.group_id, &entry.member_agent_id));
+        }
+    }
 }
 
 /// Require the caller to be an active Admin or higher.
@@ -17925,13 +18422,65 @@ pub(in crate::server) async fn restore_treekem_groups(
         let snapshot = match decode_treekem_snapshot_envelope(&snapshot_bytes) {
             Ok(Some(envelope)) => {
                 if !treekem_snapshot_envelope_matches_info(&envelope, info) {
-                    tracing::warn!(
-                        group_id = %group_id_hex,
-                        snapshot_revision = envelope.state_revision,
-                        named_revision = info.state_revision,
-                        "TreeKEM snapshot/named-group binding mismatch; secure content unavailable until repaired"
-                    );
-                    continue;
+                    // #457: a METADATA-ONLY divergence (the named side
+                    // advanced through rename/policy/role/reseal commits
+                    // while the TreeKEM crypto state — and its
+                    // security_binding — never moved) still has a current
+                    // crypto snapshot; re-bind it instead of dropping the
+                    // secure plane. A diverged binding (epoch advanced
+                    // without a matching snapshot) is a REAL mismatch and
+                    // keeps the fail-closed skip.
+                    if envelope.security_binding == info.security_binding
+                        && envelope.state_revision <= info.state_revision
+                    {
+                        let rebound = TreeKemSnapshotEnvelope {
+                            version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
+                            state_revision: info.state_revision,
+                            state_hash: info.state_hash.clone(),
+                            security_binding: info.security_binding.clone(),
+                            snapshot: envelope.snapshot.clone(),
+                        };
+                        let mut rebound_bytes = TREEKEM_DAEMON_SNAPSHOT_MAGIC.to_vec();
+                        match postcard::to_stdvec(&rebound) {
+                            Ok(encoded) => {
+                                rebound_bytes.extend(encoded);
+                                if let Err(e) = persist_treekem_snapshot_bytes(
+                                    treekem_dir,
+                                    group_id_hex,
+                                    rebound_bytes,
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        group_id = %group_id_hex,
+                                        "binding repair persist failed (#457): {e}"
+                                    );
+                                    continue;
+                                }
+                                tracing::warn!(
+                                    group_id = %group_id_hex,
+                                    snapshot_revision = envelope.state_revision,
+                                    named_revision = info.state_revision,
+                                    "re-bound stale TreeKEM snapshot binding after metadata-only seal (#457)"
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    group_id = %group_id_hex,
+                                    "binding repair encode failed (#457): {e}"
+                                );
+                                continue;
+                            }
+                        }
+                    } else {
+                        tracing::warn!(
+                            group_id = %group_id_hex,
+                            snapshot_revision = envelope.state_revision,
+                            named_revision = info.state_revision,
+                            "TreeKEM snapshot/named-group binding mismatch; secure content unavailable until repaired"
+                        );
+                        continue;
+                    }
                 }
                 envelope.snapshot
             }
@@ -20529,6 +21078,151 @@ async fn stage_join_result(
     );
 }
 
+/// #447/#458: re-fire a `MemberJoined` volley for a join whose local stub
+/// exists but whose authority commit never landed. Rebuilds the signed event
+/// from the still-unconsumed invite (a rejection never consumes the one-time
+/// secret), publishes both volley channels, and restarts the join-result
+/// poll. Called from the duplicate-join path in a spawned task — never under
+/// the membership lock (the poll's confirmation reads take it).
+async fn refire_pending_join_volley(
+    state: &Arc<AppState>,
+    group_id_hex: &str,
+    stable_group_id: String,
+    inviter_hex: &str,
+    invite_secret: String,
+    invite_is_treekem: bool,
+) {
+    let inviter = match parse_agent_id_hex(inviter_hex) {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(group_id = %group_id_hex, "pending-join refire: invalid inviter: {e}");
+            return;
+        }
+    };
+    let agent_id = state.agent.agent_id();
+    let joiner_hex = hex::encode(agent_id.as_bytes());
+    let (metadata_topic, mls_group_id) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id_hex).or_else(|| {
+            groups
+                .values()
+                .find(|info| info.stable_group_id() == stable_group_id)
+        }) else {
+            return;
+        };
+        (info.metadata_topic.clone(), info.mls_group_id.clone())
+    };
+    let treekem_key_package_b64 = if invite_is_treekem {
+        match hex::decode(&mls_group_id) {
+            Ok(group_id_bytes) => {
+                let seed = agent_treekem_seed(state.agent.as_ref(), &group_id_bytes);
+                match x0x::mls::TreeKemMlsGroup::prepare_member(agent_id, &seed) {
+                    Ok(prepared) => Some(BASE64.encode(prepared.key_package_bytes())),
+                    Err(e) => {
+                        tracing::warn!(
+                            group_id = %group_id_hex,
+                            "pending-join refire: KeyPackage prepare failed: {e}"
+                        );
+                        None
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!(group_id = %group_id_hex, "pending-join refire: bad group hex: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    let signing_kp = state.agent.identity().agent_keypair();
+    let member_pubkey_b64 = BASE64.encode(signing_kp.public_key().as_bytes());
+    let now_ms = now_millis_u64();
+    let canonical = canonical_member_joined_bytes(
+        &mls_group_id,
+        Some(&stable_group_id),
+        &joiner_hex,
+        &member_pubkey_b64,
+        x0x::groups::GroupRole::Member,
+        None,
+        inviter_hex,
+        &invite_secret,
+        now_ms,
+        treekem_key_package_b64.as_deref(),
+    );
+    let event = match ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        signing_kp.secret_key(),
+        &canonical,
+    ) {
+        Ok(sig) => NamedGroupMetadataEvent::MemberJoined {
+            group_id: mls_group_id,
+            stable_group_id: Some(stable_group_id.clone()),
+            member_agent_id: joiner_hex.clone(),
+            member_public_key_b64: member_pubkey_b64,
+            role: x0x::groups::GroupRole::Member,
+            display_name: None,
+            inviter_agent_id: inviter_hex.to_string(),
+            invite_secret,
+            ts_ms: now_ms,
+            treekem_key_package_b64,
+            recovery_authority_agent_id: None,
+            recovery_authority_public_key_b64: None,
+            recovery_authority_signature_b64: None,
+            recovery_authority_commit: None,
+            signature_b64: BASE64.encode(sig.as_bytes()),
+        },
+        Err(e) => {
+            tracing::warn!(group_id = %group_id_hex, "pending-join refire: sign failed: {e:?}");
+            return;
+        }
+    };
+    let payload = match serde_json::to_vec(&event) {
+        Ok(payload) => payload,
+        Err(e) => {
+            tracing::warn!(group_id = %group_id_hex, "pending-join refire: serialize failed: {e}");
+            return;
+        }
+    };
+    record_expected_join_result_inviter(
+        state.as_ref(),
+        join_result_key(&stable_group_id, &joiner_hex),
+        inviter_hex.to_string(),
+    );
+    let resend = MemberJoinedResend {
+        metadata_topic,
+        event,
+        payload,
+    };
+    tracing::info!(
+        group_id = %group_id_hex,
+        member = %joiner_hex,
+        "re-firing MemberJoined volley for unconfirmed join (#447/#458)"
+    );
+    publish_named_group_metadata_event(state, &resend.metadata_topic, &resend.event).await;
+    let direct_state = Arc::clone(state);
+    let direct_recipient = inviter;
+    let direct_payload = resend.payload.clone();
+    tokio::spawn(async move {
+        let _ = direct_state
+            .agent
+            .send_direct_with_config(
+                &direct_recipient,
+                direct_payload,
+                named_group_direct_delivery_config(),
+            )
+            .await;
+    });
+    tokio::spawn(poll_join_result_until_membership_confirmed(
+        Arc::clone(state),
+        group_id_hex.to_string(),
+        stable_group_id,
+        inviter,
+        joiner_hex,
+        invite_is_treekem,
+        Some(resend),
+    ));
+}
+
 pub(in crate::server) async fn handle_join_result_message(
     state: &Arc<AppState>,
     sender: &AgentId,
@@ -20551,6 +21245,12 @@ pub(in crate::server) async fn handle_join_result_message(
                 tracing::warn!(group_id = %LogHexId::group(&group_id), sender = %LogHexId::agent(&sender_hex), member = %LogHexId::agent(&member_agent_id), "ignoring unauthorized join-result fetch");
                 return;
             }
+            // #447: the joiner is still polling — its certificate evidence
+            // may have resolved since the last volley rejection (async blob
+            // fetch completed, heartbeat landed). Re-run any retained
+            // admission for this group BEFORE answering, so "nothing
+            // staged" can turn into a staged result on the next poll.
+            retry_pending_owner_cert_joins(state, Some(&group_id)).await;
             let key = join_result_key(&group_id, &member_agent_id);
             let (event, pending_count) = {
                 let mut results = state.pending_join_results.write().await;
@@ -21410,6 +22110,7 @@ pub(in crate::server) mod tests {
     mod adr0028_sidecar_recovery_controls;
     mod adr0038_owner_certified;
     mod cache_hardening_followup;
+    mod hs_f2_membership_cluster;
     mod pr291_restart_marker_matrix;
     fn fake_group_state_commit(
         group_id: &str,
@@ -22106,6 +22807,7 @@ pub(in crate::server) mod tests {
             mls_groups_path: data_dir.join("mls_groups.bin"),
             pending_join_results: RwLock::new(HashMap::new()),
             expected_join_result_inviters: StdMutex::new(HashMap::new()),
+            owner_cert_pending_joins: RwLock::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),

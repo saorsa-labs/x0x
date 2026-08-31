@@ -777,6 +777,12 @@ pub(super) struct AppState {
     /// arrived before local TreeKEM readiness or ahead of our state frontier.
     pub(super) treekem_pending_events:
         RwLock<HashMap<String, VecDeque<PendingTreeKemMetadataEvent>>>,
+    /// #447: `MemberJoined` events rejected ONLY for missing OwnerCertified
+    /// certificate evidence (retryable), retained so the authority can
+    /// re-apply them once the joiner's announce blob resolves. Keyed by
+    /// `join_result_key(stable_group_id, member)`. Bounded + TTL-pruned.
+    pub(super) owner_cert_pending_joins:
+        RwLock<HashMap<String, crate::server::routes::named_groups::PendingOwnerCertJoin>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after
