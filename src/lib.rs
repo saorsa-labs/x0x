@@ -23369,4 +23369,47 @@ mod peer_connected_handler_integration_tests {
             "young network"
         );
     }
+
+    /// HS-A review fixture gap (seam check 2026-08-30, concern 2): the
+    /// V3 machine announcement rides its own topic, but nothing pinned
+    /// its bincode shape — a future field INSERTED into
+    /// `MachineAnnouncementUnsigned` or `MachineAnnouncementV3Unsigned`
+    /// would silently break every pre-existing V3 decoder. Pin the exact
+    /// bytes of a fully-populated record and decode them back.
+    #[test]
+    fn machine_announcement_v3_unsigned_bytes_match_frozen_vector() {
+        let unsigned = MachineAnnouncementV3Unsigned {
+            base: MachineAnnouncementUnsigned {
+                machine_id: identity::MachineId([0x11; 32]),
+                machine_public_key: vec![0x22; 4],
+                addresses: vec!["203.0.113.9:5483".parse().expect("addr")],
+                announced_at: 1_700_000_123,
+                nat_type: Some("Symmetric".to_string()),
+                can_receive_direct: Some(true),
+                is_relay: Some(false),
+                is_coordinator: None,
+                reachable_via: vec![identity::MachineId([0x33; 32])],
+                relay_candidates: Vec::new(),
+            },
+            machine_kem_public_key: vec![0x44; 8],
+            placement_digests: vec![(identity::AgentId([0x55; 32]), [0x66; 32])],
+            move_protocol: 1,
+        };
+        let bytes = bincode::serialize(&unsigned).expect("serialize v3");
+        // Frozen at #448/#450 review (2026-08-31): the exact bincode of a
+        // fully-populated V3 unsigned body. Any field inserted, reordered,
+        // or retyped inside `MachineAnnouncementUnsigned` or
+        // `MachineAnnouncementV3Unsigned` changes these bytes.
+        const FROZEN_V3_HEX: &str = "1111111111111111111111111111111111111111111111111111111111111111040000000000000022222222010000000000000000000000cb0071096b157bf153650000000001090000000000000053796d6d657472696301010100000100000000000000333333333333333333333333333333333333333333333333333333333333333300000000000000000800000000000000444444444444444401000000000000005555555555555555555555555555555555555555555555555555555555555555666666666666666666666666666666666666666666666666666666666666666601";
+        let frozen = hex::decode(FROZEN_V3_HEX).expect("frozen hex");
+        assert_eq!(
+            bytes, frozen,
+            "V3 unsigned bincode must stay byte-identical (append-only fields)"
+        );
+        let back: MachineAnnouncementV3Unsigned =
+            bincode::deserialize(&frozen).expect("frozen bytes decode back");
+        assert_eq!(back.placement_digests, unsigned.placement_digests);
+        assert_eq!(back.machine_kem_public_key, unsigned.machine_kem_public_key);
+        assert_eq!(back.move_protocol, unsigned.move_protocol);
+    }
 }

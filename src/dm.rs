@@ -103,13 +103,44 @@ pub struct DmCapabilities {
     ///
     /// Wire: `false` is the pre-#437 value and is **omitted** from the
     /// serialization when false, so a false bit encodes byte-identically
-    /// to the old struct; a true bit appends one byte. Old peers cannot
-    /// verify a true-valued advert (advert verification re-serializes
-    /// the decoded struct) and drop it — a documented, self-healing
-    /// transition cost; new peers decode both shapes (two-stage, see
-    /// `dm_capability::CapabilityAdvert::from_postcard`).
+    /// to the old struct. A true bit never enters any bytes an old peer
+    /// re-serializes: #448/#450 freeze every signed caps encoding to the
+    /// [`DmCapabilitiesV1Wire`] projection (card signable bytes and the
+    /// published advert), and the true bit reaches new peers only via the
+    /// signed digest extension on
+    /// [`DM_CAPABILITY_DIGEST_TOPIC`](crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC).
+    /// New peers still decode a pre-fix true-valued advert on the steady
+    /// topic (two-stage, see
+    /// `dm_capability::CapabilityAdvert::from_postcard`); card-imported
+    /// caps have the bit clamped untrusted at
+    /// `CapabilityStore::insert_from_card` because the frozen card bytes
+    /// cannot cover it.
     #[serde(default, skip_serializing_if = "is_false")]
     pub digest_support: bool,
+}
+
+/// Frozen pre-#437 wire shape of [`DmCapabilities`] — the exact five-field
+/// sequence every peer since 0.18 decodes (no `digest_support`).
+///
+/// Shared frozen base of the #448/#450 mixed-fleet fix: this projection is
+/// the ONLY caps encoding that enters bytes a peer re-serializes during
+/// signature verification —
+/// [`AgentCard::signable_bytes`](crate::groups::card::AgentCard::signable_bytes)
+/// bincode-encodes it (#450: an old JSON reader drops `digest_support` and
+/// rebuilds exactly these bytes), and the published capability advert is
+/// built from it (#448: postcard is positional and the caps sit before
+/// `signature`, so a true bit would make the whole advert undecodable by
+/// v0.40.4 peers). The true `digest_support` bit travels only via the
+/// separately-signed extension on
+/// [`DM_CAPABILITY_DIGEST_TOPIC`](crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct DmCapabilitiesV1Wire {
+    pub(crate) max_protocol_version: u16,
+    pub(crate) gossip_inbox: bool,
+    pub(crate) kem_algorithm: String,
+    pub(crate) max_envelope_bytes: usize,
+    #[serde(default)]
+    pub(crate) kem_public_key: Vec<u8>,
 }
 
 /// Serde helper: omit `digest_support` when false so the encoding stays
@@ -185,6 +216,22 @@ impl DmCapabilities {
         self.kem_public_key = kem_public_key;
         self.gossip_inbox = true;
         self
+    }
+
+    /// Project onto the frozen pre-#437 wire shape: every field except
+    /// `digest_support`, in the original field order. The shared frozen
+    /// base of the #448/#450 mixed-fleet fix — see
+    /// [`DmCapabilitiesV1Wire`] for why no post-v1 field may ever enter
+    /// a signed caps encoding.
+    #[must_use]
+    pub(crate) fn to_v1_wire(&self) -> DmCapabilitiesV1Wire {
+        DmCapabilitiesV1Wire {
+            max_protocol_version: self.max_protocol_version,
+            gossip_inbox: self.gossip_inbox,
+            kem_algorithm: self.kem_algorithm.clone(),
+            max_envelope_bytes: self.max_envelope_bytes,
+            kem_public_key: self.kem_public_key.clone(),
+        }
     }
 }
 

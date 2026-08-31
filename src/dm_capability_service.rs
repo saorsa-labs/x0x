@@ -176,9 +176,47 @@ pub(crate) fn ingest_verified_capability_advert(
     )
 }
 
+/// Verify and ingest one digest extension using the same authenticated
+/// sender boundary as [`ingest_verified_capability_advert`]: the pubsub
+/// envelope must be verified, carry the sender and their public key, name
+/// themselves as the extension's agent, and sign the extension with the
+/// matching ML-DSA-65 key.
+pub(crate) fn ingest_verified_digest_extension(
+    store: &CapabilityStore,
+    self_agent_id: AgentId,
+    message: &PubSubMessage,
+) -> bool {
+    let (pubsub_sender, sender_pubkey) =
+        match (message.sender, message.sender_public_key.as_deref()) {
+            (Some(sender), Some(public_key)) if message.verified => (sender, public_key),
+            _ => return false,
+        };
+    if pubsub_sender == self_agent_id {
+        return false;
+    }
+    let Ok(extension) =
+        crate::dm_capability::DigestSupportExtension::from_postcard(&message.payload)
+    else {
+        return false;
+    };
+    if extension.protocol_version != crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION
+        || extension.agent_id != *pubsub_sender.as_bytes()
+        || !verify_digest_extension_signature(&extension, sender_pubkey)
+    {
+        return false;
+    }
+    store.apply_digest_extension(
+        AgentId(extension.agent_id),
+        MachineId(extension.machine_id),
+        extension.digest_support,
+        extension.created_at_unix_ms,
+    )
+}
+
 pub struct CapabilityAdvertService {
     publisher: JoinHandle<()>,
     subscriber: JoinHandle<()>,
+    digest_subscriber: JoinHandle<()>,
     targeted_response_subscriber: JoinHandle<()>,
     targeted_request_responder: JoinHandle<()>,
 }
@@ -196,6 +234,11 @@ impl CapabilityAdvertService {
         periodic: bool,
     ) -> NetworkResult<Self> {
         let mut subscription = pubsub.subscribe(DM_CAPABILITY_TOPIC.to_string()).await;
+        // #448: new peers additionally consume the signed digest
+        // extension; v0.40.4 peers never subscribe to this topic.
+        let mut digest_subscription = pubsub
+            .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
+            .await;
         let mut targeted_response_subscription = pubsub
             .subscribe(DM_CAPABILITY_TARGETED_RESPONSE_TOPIC.to_string())
             .await;
@@ -239,6 +282,23 @@ impl CapabilityAdvertService {
                 }
             }
             tracing::debug!("capability advert subscriber exited");
+        });
+
+        let digest_store_sub = Arc::clone(&store);
+        let digest_subscriber = tokio::spawn(async move {
+            while let Some(message) = digest_subscription.recv().await {
+                if ingest_verified_digest_extension(&digest_store_sub, self_agent_for_sub, &message)
+                {
+                    tracing::debug!(
+                        target: "dm.trace",
+                        stage = "capability_digest_extension_ingested",
+                        sender = message
+                            .sender
+                            .map(|agent_id| hex::encode(agent_id.as_bytes())),
+                    );
+                }
+            }
+            tracing::debug!("capability digest extension subscriber exited");
         });
 
         let targeted_response_subscriber = tokio::spawn(async move {
@@ -340,14 +400,37 @@ impl CapabilityAdvertService {
                     &publisher_signing,
                     self_agent_id,
                     self_machine_id,
-                    caps_snapshot,
+                    caps_snapshot.clone(),
                 ) {
                     Ok(bytes) => {
+                        // #448: publish the digest extension alongside
+                        // every advert cycle, on its own topic. A publish
+                        // failure is logged, not fatal — the base advert
+                        // alone already keeps old and pre-#448 peers
+                        // fully served for v1 semantics; new peers simply
+                        // fall back to v1 relay frames until the next
+                        // extension window.
+                        if let Ok(Some(ext)) = build_signed_digest_extension(
+                            &publisher_signing,
+                            self_agent_id,
+                            self_machine_id,
+                            &caps_snapshot,
+                        ) {
+                            if let Err(e) = publisher_pubsub
+                                .publish(
+                                    crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string(),
+                                    Bytes::from(ext),
+                                )
+                                .await
+                            {
+                                tracing::warn!("digest extension publish failed: {e}");
+                            }
+                        }
                         let bytes = Bytes::from(bytes);
                         // Answer the strict requester on the Critical topic
                         // first: its convergence window is seconds long and
-                        // must not be spent waiting behind Bulk cooling on the
-                        // steady advert topic.
+                        // must not be spent waiting behind Bulk cooling on
+                        // the steady advert topic.
                         if targeted_response_pending {
                             match publisher_pubsub
                                 .publish(
@@ -441,6 +524,7 @@ impl CapabilityAdvertService {
         });
 
         Ok(Self {
+            digest_subscriber,
             publisher,
             subscriber,
             targeted_response_subscriber,
@@ -472,6 +556,7 @@ impl CapabilityAdvertService {
     pub fn abort(&self) {
         self.publisher.abort();
         self.subscriber.abort();
+        self.digest_subscriber.abort();
         self.targeted_response_subscriber.abort();
         self.targeted_request_responder.abort();
     }
@@ -492,12 +577,30 @@ pub fn advert_is_publishable(caps: &DmCapabilities) -> bool {
     caps.gossip_inbox && !caps.kem_public_key.is_empty()
 }
 
+/// Build the steady-topic advert in its FROZEN v1 wire shape (#448).
+///
+/// `capabilities` is projected onto [`dm::DmCapabilitiesV1Wire`] before
+/// signing and encoding, so the published bytes — and the signed bytes a
+/// v0.40.4 verifier recomputes — carry exactly the five pre-#437 caps
+/// fields. A true `digest_support` bit must instead travel via
+/// [`build_signed_digest_extension`] on
+/// [`DM_CAPABILITY_DIGEST_TOPIC`](crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC).
+/// Mixed-window note: a pre-#448 build's v2-shaped advert (true bit
+/// inline) is still DECODED and verified by new peers via
+/// [`CapabilityAdvert::from_postcard`]; this function merely never
+/// produces that shape.
 pub fn build_signed_advert(
     signing: &SigningContext,
     self_agent_id: AgentId,
     self_machine_id: MachineId,
     capabilities: DmCapabilities,
 ) -> NetworkResult<Vec<u8>> {
+    // #448: freeze to the v1 wire shape. `digest_support: false` is
+    // omitted from both the postcard body (skip_serializing_if) and the
+    // recomputed signed bytes, making the advert byte-identical to what
+    // an old peer's own encoder produces.
+    let mut capabilities = capabilities;
+    capabilities.digest_support = false;
     let mut advert = CapabilityAdvert {
         protocol_version: ADVERT_PROTOCOL_VERSION,
         agent_id: *self_agent_id.as_bytes(),
@@ -512,6 +615,65 @@ pub fn build_signed_advert(
     advert.signature = signing.sign(&signed_bytes)?;
     postcard::to_stdvec(&advert)
         .map_err(|e| NetworkError::SerializationError(format!("advert encode: {e}")))
+}
+
+/// Build the signed `digest_support` extension record for the same
+/// live capability snapshot (#448). Returns `None` when the bit is
+/// false — the frozen v1 advert already encodes false, so an extension
+/// would be pure noise.
+pub fn build_signed_digest_extension(
+    signing: &SigningContext,
+    self_agent_id: AgentId,
+    self_machine_id: MachineId,
+    capabilities: &DmCapabilities,
+) -> NetworkResult<Option<Vec<u8>>> {
+    if !capabilities.digest_support {
+        return Ok(None);
+    }
+    let mut extension = crate::dm_capability::DigestSupportExtension {
+        protocol_version: crate::dm_capability::DIGEST_EXTENSION_PROTOCOL_VERSION,
+        agent_id: *self_agent_id.as_bytes(),
+        machine_id: *self_machine_id.as_bytes(),
+        created_at_unix_ms: now_unix_ms(),
+        digest_support: true,
+        signature: Vec::new(),
+    };
+    let signed_bytes = extension
+        .signed_bytes()
+        .map_err(|e| NetworkError::SerializationError(format!("digest ext sign-bytes: {e}")))?;
+    extension.signature = signing.sign(&signed_bytes)?;
+    postcard::to_stdvec(&extension)
+        .map_err(|e| NetworkError::SerializationError(format!("digest ext encode: {e}")))
+        .map(Some)
+}
+
+/// Verify an extension record against the sender's ML-DSA-65 public key,
+/// mirroring [`verify_advert_signature`]'s derived-id binding.
+pub fn verify_digest_extension_signature(
+    extension: &crate::dm_capability::DigestSupportExtension,
+    public_key_bytes: &[u8],
+) -> bool {
+    let Ok(signed_bytes) = extension.signed_bytes() else {
+        return false;
+    };
+    let Ok(public_key) = ant_quic::MlDsaPublicKey::from_bytes(public_key_bytes) else {
+        return false;
+    };
+    let derived = crate::identity::AgentId::from_public_key(&public_key);
+    if derived.0 != extension.agent_id {
+        return false;
+    }
+    let Ok(signature) =
+        ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&extension.signature)
+    else {
+        return false;
+    };
+    ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+        &public_key,
+        &signed_bytes,
+        &signature,
+    )
+    .is_ok()
 }
 
 pub fn verify_advert_signature(advert: &CapabilityAdvert, public_key_bytes: &[u8]) -> bool {
@@ -568,7 +730,7 @@ mod tests {
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
         )
         .expect("build signed advert");
-        postcard::from_bytes(&encoded).expect("decode advert")
+        CapabilityAdvert::from_postcard(&encoded).expect("decode advert")
     }
 
     #[test]
@@ -584,7 +746,7 @@ mod tests {
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
         )
         .expect("build");
-        let advert: CapabilityAdvert = postcard::from_bytes(&encoded).expect("decode");
+        let advert: CapabilityAdvert = CapabilityAdvert::from_postcard(&encoded).expect("decode");
         assert!(verify_advert_signature(&advert, &signing.public_key_bytes));
     }
 
@@ -610,7 +772,8 @@ mod tests {
             DmCapabilities::v1_gossip_ready(vec![0u8; 1184]),
         )
         .expect("build");
-        let mut advert: CapabilityAdvert = postcard::from_bytes(&encoded).expect("decode");
+        let mut advert: CapabilityAdvert =
+            CapabilityAdvert::from_postcard(&encoded).expect("decode");
         advert.signature[0] ^= 0x01;
         assert!(!verify_advert_signature(&advert, &signing.public_key_bytes));
     }
@@ -752,7 +915,8 @@ mod tests {
             .expect("timed out waiting for published advert")
             .expect("subscriber stream closed");
 
-        let advert: CapabilityAdvert = postcard::from_bytes(&msg.payload).expect("decode advert");
+        let advert: CapabilityAdvert =
+            CapabilityAdvert::from_postcard(&msg.payload).expect("decode advert");
         assert_eq!(advert.protocol_version, ADVERT_PROTOCOL_VERSION);
         assert_eq!(advert.agent_id, *agent_id.as_bytes());
         assert_eq!(advert.machine_id, *machine_id.as_bytes());
@@ -935,7 +1099,7 @@ mod tests {
             .expect("targeted response within the strict convergence window")
             .expect("subscription live");
         let advert: CapabilityAdvert =
-            postcard::from_bytes(&response.payload).expect("decode signed response");
+            CapabilityAdvert::from_postcard(&response.payload).expect("decode signed response");
 
         assert_eq!(advert.agent_id, *self_agent.as_bytes());
         assert_eq!(advert.machine_id, *self_machine.as_bytes());
@@ -1032,5 +1196,165 @@ mod tests {
         })
         .await;
         assert!(finished.is_ok(), "abort() did not terminate both tasks");
+    }
+
+    // ------------------------------------------------------------------
+    // #448: digest extension end-to-end on loopback pubsub
+    // ------------------------------------------------------------------
+
+    /// The publisher must emit a signed digest extension alongside every
+    /// advert cycle whenever the live caps carry the bit.
+    #[tokio::test]
+    async fn service_publishes_signed_digest_extension_on_loopback() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&kp));
+        let agent_id = kp.agent_id();
+        let machine_id = MachineId([0x61; 32]);
+
+        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let mut ext_sub = pubsub
+            .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
+            .await;
+
+        let store = Arc::new(CapabilityStore::new());
+        let (_caps_tx, caps_rx) =
+            tokio::sync::watch::channel(DmCapabilities::v2_durable_gossip_ready(vec![0x62; 1184]));
+
+        let service = CapabilityAdvertService::spawn_default(
+            Arc::clone(&pubsub),
+            Arc::clone(&signing),
+            agent_id,
+            machine_id,
+            caps_rx,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("spawn_default");
+
+        let msg = tokio::time::timeout(Duration::from_secs(3), ext_sub.recv())
+            .await
+            .expect("timed out waiting for published digest extension")
+            .expect("subscriber stream closed");
+
+        let ext = crate::dm_capability::DigestSupportExtension::from_postcard(&msg.payload)
+            .expect("decode extension");
+        assert_eq!(ext.agent_id, *agent_id.as_bytes());
+        assert_eq!(ext.machine_id, *machine_id.as_bytes());
+        assert!(ext.digest_support);
+        assert!(
+            verify_digest_extension_signature(&ext, &signing.public_key_bytes),
+            "published extension must verify against the signer's public key"
+        );
+
+        service.abort();
+    }
+
+    /// A digest=false publisher must NOT emit extensions (the frozen
+    /// advert already encodes false; an extension would be noise).
+    #[tokio::test]
+    async fn service_emits_no_digest_extension_when_bit_is_false() {
+        let kp = AgentKeypair::generate().expect("keygen");
+        let signing = Arc::new(SigningContext::from_keypair(&kp));
+        let mut caps = DmCapabilities::v2_durable_gossip_ready(vec![0x63; 1184]);
+        caps.digest_support = false;
+
+        let pubsub = Arc::new(PubSubManager::new(make_node().await, None).expect("pubsub"));
+        let mut ext_sub = pubsub
+            .subscribe(crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string())
+            .await;
+
+        let store = Arc::new(CapabilityStore::new());
+        let (_caps_tx, caps_rx) = tokio::sync::watch::channel(caps);
+
+        let service = CapabilityAdvertService::spawn_default(
+            Arc::clone(&pubsub),
+            signing,
+            kp.agent_id(),
+            MachineId([0x64; 32]),
+            caps_rx,
+            store,
+        )
+        .await
+        .expect("spawn_default");
+
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), ext_sub.recv())
+                .await
+                .is_err(),
+            "a false bit must not produce extension traffic"
+        );
+
+        service.abort();
+    }
+
+    /// Full #448 mixed-fleet convergence on one loopback mesh: the peer's
+    /// v1-shaped base advert lands (old-verifiable, no digest knowledge)
+    /// and its signed extension merges the bit into the cached binding.
+    #[tokio::test]
+    async fn peer_advert_plus_extension_converge_in_the_store() {
+        let kp_p = AgentKeypair::generate().expect("keygen");
+        let signing_p = Arc::new(SigningContext::from_keypair(&kp_p));
+        let agent_p = kp_p.agent_id();
+        let peer_machine = MachineId([0x71; 32]);
+
+        let pubsub = Arc::new(
+            PubSubManager::new(make_node().await, Some(Arc::clone(&signing_p))).expect("pubsub"),
+        );
+        let store = Arc::new(CapabilityStore::new());
+        let self_agent = AgentId([99u8; 32]);
+        let (_caps_tx, caps_rx) = tokio::sync::watch::channel(DmCapabilities::pending());
+
+        let service = CapabilityAdvertService::spawn_default(
+            Arc::clone(&pubsub),
+            Arc::clone(&signing_p),
+            self_agent,
+            MachineId([7u8; 32]),
+            caps_rx,
+            Arc::clone(&store),
+        )
+        .await
+        .expect("spawn_default");
+
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let peer_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x72; 1184]);
+        let advert = build_signed_advert(&signing_p, agent_p, peer_machine, peer_caps.clone())
+            .expect("build peer advert");
+        pubsub
+            .publish(DM_CAPABILITY_TOPIC.to_string(), Bytes::from(advert))
+            .await
+            .expect("publish advert");
+        let extension =
+            build_signed_digest_extension(&signing_p, agent_p, peer_machine, &peer_caps)
+                .expect("build peer extension")
+                .expect("digest bit is true");
+        pubsub
+            .publish(
+                crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC.to_string(),
+                Bytes::from(extension),
+            )
+            .await
+            .expect("publish extension");
+
+        let converged = tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if store
+                    .lookup(&agent_p)
+                    .is_some_and(|caps| caps.digest_support)
+                {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await;
+        assert!(
+            converged.is_ok(),
+            "base advert + extension must converge to a full-knowledge binding"
+        );
+        let caps = store.lookup(&agent_p).expect("binding");
+        assert!(caps.supports_durable_app_ack());
+
+        service.abort();
     }
 }
