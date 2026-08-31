@@ -127,16 +127,19 @@ pub struct IdentityAnnouncementV3 {
     pub payload_version: u64,
     /// ML-DSA-65 machine signature over the bincode of the unsigned struct.
     pub machine_signature: Vec<u8>,
-    /// Agent self-name (ADR-0036). Carried ONLY by the V3.1 (`X0A4`)
-    /// envelope — the V3 (`X0A3`) serializer drops it so the legacy beat
-    /// stays byte-identical to pre-0036 and old decoders keep working. The
-    /// X0A4 body always serializes the field (bincode is positional; a
+    /// Agent self-name (ADR-0036). Serialization depends on the envelope:
+    /// the legacy V3 (`X0A3`) serializer DROPS it so the beat stays
+    /// byte-identical to pre-0036 and old decoders keep working (for them
+    /// the name is effectively unsigned and never cached), while the V3.1
+    /// (`X0A4`) envelope carries it INSIDE the machine-signed V3.1
+    /// unsigned body (the private `IdentityAnnouncementV31Unsigned`
+    /// shape) — [`Self::sign_v3_1`] signs it
+    /// (ADR-0036 review P0-3: an unsigned name would let any peer
+    /// republish another agent's core under an attacker-chosen name).
+    /// The X0A4 body always serializes the field (bincode is positional; a
     /// conditionally-absent trailing field would be undecodable), `None`
-    /// meaning "explicitly unnamed". Deliberately OUTSIDE the machine-signed
-    /// `IdentityAnnouncementV3Unsigned` (same pattern as V2's
-    /// `agent_public_key`): signing it would change the canonical signed
-    /// bytes and break signature verification of beats signed before the
-    /// field existed. It also never enters `cert_digest` — that digest
+    /// meaning "explicitly unnamed"; which form was signed is recorded in
+    /// [`Self::v31_signed`]. It never enters `cert_digest` — that digest
     /// commits to `bincode((user_id, agent_certificate))` only, so the
     /// digest gate and the blob fetch/verify path are untouched.
     #[serde(default)]
