@@ -10084,12 +10084,12 @@ impl Agent {
     }
 
     /// Resolve a file name under this install's ADR-0043 state directory
-    /// (identity dir with the `~/.x0x` fallback, same rule as
-    /// revocations).
+    /// (identity dir with the default-dir fallback, same rule as
+    /// revocations; the fallback honors `X0X_HOME` — issue #456).
     fn move_file_path(&self, name: &str) -> Option<std::path::PathBuf> {
         self.identity_dir
             .clone()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+            .or_else(storage::x0x_home_dir)
             .map(|dir| dir.join(name))
     }
 
@@ -14228,9 +14228,9 @@ impl AgentBuilder {
         // previous runs and nothing is written to disk.
         let bootstrap_cache_config = if self.network_config.is_some() {
             let cache_dir = self.peer_cache_dir.unwrap_or_else(|| {
-                dirs::home_dir()
+                // Issue #456: honor X0X_HOME for the default cache dir.
+                storage::x0x_home_dir()
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
-                    .join(".x0x")
                     .join("peers")
             });
             Some(
@@ -14355,11 +14355,9 @@ impl AgentBuilder {
         // key (beside the machine key) and load the derived move state
         // from its three files (each re-verified on load; corrupt or
         // absent files degrade to empty state). Both resolve through the
-        // identity dir with the same `~/.x0x` fallback as revocations.
-        let identity_dir_or_home = self
-            .identity_dir
-            .clone()
-            .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")));
+        // identity dir with the same default-dir fallback as revocations
+        // (the fallback honors `X0X_HOME` — issue #456).
+        let identity_dir_or_home = self.identity_dir.clone().or_else(storage::x0x_home_dir);
         let machine_kem = match &identity_dir_or_home {
             Some(dir) => {
                 let path = dir.join("machine-kem.key");
@@ -14448,9 +14446,9 @@ impl AgentBuilder {
         // listener spawn so the listener can resolve the #193 contact
         // gate against the same shared store the Agent mutates).
         let contacts_path = self.contact_store_path.unwrap_or_else(|| {
-            dirs::home_dir()
+            // Issue #456: honor X0X_HOME for the default store path.
+            storage::x0x_home_dir()
                 .unwrap_or_else(|| std::path::PathBuf::from("."))
-                .join(".x0x")
                 .join("contacts.json")
         });
         let contact_store = std::sync::Arc::new(tokio::sync::RwLock::new(
@@ -14555,10 +14553,11 @@ impl AgentBuilder {
                 let data_dir = self
                     .identity_dir
                     .clone()
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+                    .or_else(storage::x0x_home_dir)
                     .ok_or_else(|| {
                         error::IdentityError::HistoryInit(
-                            "no identity_dir and no home directory for history.db".into(),
+                            "no identity_dir and no default identity directory for history.db"
+                                .into(),
                         )
                     })?;
                 let service = history::HistoryService::start(cfg, &data_dir)
@@ -14629,7 +14628,7 @@ impl AgentBuilder {
             announce_blob_cache: std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(
                 self.identity_dir
                     .clone()
-                    .or_else(|| dirs::home_dir().map(|h| h.join(".x0x")))
+                    .or_else(storage::x0x_home_dir)
                     .map(|dir| dir.join("announce-blob-cache.bin")),
             )),
             own_cert_pair: announce_blob::shared_cert_pair(own_pair_user, own_pair_cert),

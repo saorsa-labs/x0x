@@ -12186,16 +12186,24 @@ async fn repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
     stable_group_id: Option<&str>,
     reason: &str,
 ) -> anyhow::Result<bool> {
-    let repair_json = {
+    let (repair_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
         if !has_withdrawn_same_stable_group_record(&groups, group_id, stable_group_id) {
             return Ok(false);
         }
-        serde_json::to_string_pretty(&*groups)
+        encode_named_groups_store(&groups)
             .map_err(|e| anyhow::anyhow!("withdrawn named groups repair encode: {e}"))?
     };
 
     remove_treekem_persistence_for_group_id(state, group_id, reason).await;
+    // Issue #451: sidecar first, legacy-safe view second (same ordering
+    // contract as save_named_groups_checked_unlocked). The withdrawn flag
+    // rides BOTH views — the placeholder keeps it so an old binary's
+    // journal-recovery guard also discards persistence for the group.
+    let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
+    if sidecar_outcome == AtomicWriteOutcome::NotReplaced && home_suite_json != "{}" {
+        anyhow::bail!("withdrawn Home-Suite sidecar repair did not replace the sidecar");
+    }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &repair_json)
         .await
         .map_err(|e| anyhow::anyhow!("withdrawn named groups repair write: {e}"))?;
@@ -17677,11 +17685,18 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     {
         anyhow::bail!("refusing to persist key material for withdrawn group");
     }
-    let named_groups_json = {
+    // Issue #451: the embedded journal body (and the direct write below)
+    // must be the LEGACY-SAFE view. A pre-ADR-0038 binary that recovers a
+    // leftover journal parses `named_groups_json` with old shapes and
+    // REWRITES named_groups.json with it — an `owner_certified` entry in
+    // the embedded body crash-looped v0.40.4 (issue #451's second vector).
+    // The real Home-Suite state rides in the sidecar, written BEFORE the
+    // journal so journal replay can never regress it.
+    let (named_groups_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
         let mut next_groups = groups.clone();
         next_groups.insert(group_id_hex.to_string(), info.clone());
-        serde_json::to_string_pretty(&next_groups)
+        encode_named_groups_store(&next_groups)
             .map_err(|e| anyhow::anyhow!("named groups encode: {e}"))?
     };
 
@@ -17694,6 +17709,11 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     .await;
 
     let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
+    // Sidecar first (see write_home_suite_sidecar ordering contract).
+    let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
+    if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
+        anyhow::bail!("Home-Suite sidecar replacement did not occur");
+    }
     let journal = TreeKemNamedPersistJournal {
         version: TREEKEM_NAMED_JOURNAL_VERSION,
         group_id_hex: group_id_hex.to_string(),
@@ -18160,6 +18180,87 @@ pub(in crate::server) async fn load_named_groups(
             )
         }),
     }
+}
+
+/// Load the Home-Suite sidecar (issue #451). Absent file ⇒ empty map (no
+/// Home-Suite groups exist). A PRESENT-but-corrupt sidecar is a hard error:
+/// unlike `named_groups.json` placeholders, this file is the AUTHORITATIVE
+/// record for owner-certified groups — silently continuing on the
+/// placeholder view would downgrade Home security to invite-only. Recovery
+/// (documented in `docs/upgrade-system.md`): restore the file from backup,
+/// or delete it to lose Home-Suite state and re-provision.
+pub(in crate::server) async fn load_home_suite_groups(
+    sidecar_path: &FsPath,
+) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
+    match tokio::fs::read_to_string(sidecar_path).await {
+        Ok(json) => {
+            let groups = serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json)
+                .with_context(|| {
+                    format!(
+                        "failed to parse Home-Suite sidecar {} — the authoritative \
+                         owner-certified group state is unreadable. Restore it from backup \
+                         or remove the file to re-provision (see docs/upgrade-system.md, \
+                         Downgrade safety)",
+                        sidecar_path.display()
+                    )
+                })?;
+            tracing::info!(
+                "Loaded {} Home-Suite groups from {}",
+                groups.len(),
+                sidecar_path.display()
+            );
+            Ok(groups)
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(e) => Err(e).with_context(|| {
+            format!(
+                "failed to read Home-Suite sidecar {}",
+                sidecar_path.display()
+            )
+        }),
+    }
+}
+
+/// Apply the same restore fixups to sidecar entries that
+/// [`load_named_groups`] applies to the legacy view, then let each sidecar
+/// entry REPLACE the placeholder installed under the same id. The sidecar
+/// is authoritative: mutations an old (downgraded) binary made to the
+/// placeholder are intentionally discarded.
+#[must_use]
+pub(in crate::server) fn merge_home_suite_groups(
+    named: HashMap<String, x0x::groups::GroupInfo>,
+    sidecar: HashMap<String, x0x::groups::GroupInfo>,
+) -> HashMap<String, x0x::groups::GroupInfo> {
+    let mut merged = named;
+    for (id, mut info) in sidecar {
+        info.migrate_from_v1();
+        // ADR-0038 review finding 6 (same gate as load_named_groups).
+        if info.policy.admission.owner_certified_user_id().is_some() {
+            info.owner_cert_reverify_required = true;
+        }
+        if let Some(placeholder) = merged.get(&id) {
+            tracing::debug!(
+                group_id = %id,
+                "restored Home-Suite group from sidecar over placeholder \
+                 (legacy state_revision {})",
+                placeholder.state_revision
+            );
+        }
+        merged.insert(id, info);
+    }
+    merged
+}
+
+/// Startup load for the durable group store: `named_groups.json` (the
+/// legacy-safe view every binary can parse) merged with the Home-Suite
+/// sidecar (the authoritative owner-certified state; issue #451).
+pub(in crate::server) async fn load_named_groups_merged(
+    named_groups_path: &FsPath,
+    sidecar_path: &FsPath,
+) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
+    let named = load_named_groups(named_groups_path).await?;
+    let sidecar = load_home_suite_groups(sidecar_path).await?;
+    Ok(merge_home_suite_groups(named, sidecar))
 }
 
 /// ADR 0028: versioned sidecar for the causal approval queue. The version
@@ -20203,6 +20304,133 @@ pub(in crate::server) async fn save_named_groups(state: &AppState) -> bool {
     }
 }
 
+/// Sidecar file (in the instance data dir, beside `named_groups.json`)
+/// holding the REAL durable state of Home-Suite groups — every entry whose
+/// `GroupAdmission` is `OwnerCertified` (the auto-provisioned Home and any
+/// manually created owner-certified group).
+///
+/// Issue #451: pre-ADR-0038 decoders fail closed on the `owner_certified`
+/// admission VARIANT (an unknown enum variant is a hard parse error, unlike
+/// an unknown struct field, which serde ignores). A new daemon that persists
+/// such an entry into `named_groups.json` bricks any older binary that later
+/// reads the same data dir — including the upgrade helper's rollback binary
+/// after a failed health check, which crash-looped v0.40.4 in the field
+/// (`unknown variant owner_certified` → exit 1 → supervisor restart → …).
+/// `named_groups.json` therefore carries only legacy-safe PLACEHOLDER
+/// entries for these groups; the real state lives here, where old binaries
+/// never look. Old binaries mutate at most the placeholder; re-upgrading
+/// restores the authoritative sidecar state.
+pub(in crate::server) const HOME_SUITE_GROUPS_FILE: &str = "home-suite-groups.json";
+
+/// Whether this entry must be persisted in the Home-Suite sidecar (its
+/// serialization is not decodable by pre-ADR-0038 binaries).
+#[must_use]
+fn is_home_suite_group_entry(info: &x0x::groups::GroupInfo) -> bool {
+    matches!(
+        info.policy.admission,
+        x0x::groups::GroupAdmission::OwnerCertified(_)
+    )
+}
+
+/// Legacy-safe placeholder written into `named_groups.json` for a
+/// Home-Suite sidecar entry (issue #451).
+///
+/// Design constraints, all verified against the v0.40.4 decoder:
+/// - Every serialized value must be parsable by pre-ADR-0038 shapes. The
+///   only hard hazard is the `owner_certified` admission variant, so the
+///   placeholder carries the default (invite-only) policy.
+/// - The placeholder must be INERT for an old binary: no TreeKEM plane (a
+///   `TreeKem`-tagged entry makes v0.40.4 restore the sidecar group's
+///   `.snap` and run it under admission rules it cannot enforce), no
+///   shared secret, no roster (an empty roster makes v0.40.4's last-admin
+///   invariant refuse mutations), no join state, no invite state.
+/// - The identity and state-commit chain head are PRESERVED (stable group
+///   id, genesis, `state_revision`/`state_hash`/`prev_state_hash`, topics)
+///   so an old binary keeps the id reserved, recognises the chain head, and
+///   rejects forged lower-revision commits for the group.
+/// - The real entry (roster with embedded certificates, Home metadata,
+///   owner-certified policy) is durable in the sidecar and replaces the
+///   placeholder at load time.
+#[must_use]
+fn legacy_safe_placeholder(info: &x0x::groups::GroupInfo) -> x0x::groups::GroupInfo {
+    // Clone preserves the identity + chain head; every line below
+    // neutralises exactly one old-decoder hazard or old-binary capability.
+    let mut placeholder = info.clone();
+    // THE hazard (#451): `owner_certified` is an unknown admission VARIANT
+    // for a pre-ADR-0038 decoder — a hard parse error, unlike an unknown
+    // struct field. The five-axis default uses only pre-ADR-0038 variants.
+    placeholder.policy = x0x::groups::GroupPolicy::default();
+    // Inertness for an old binary (see function doc).
+    placeholder.security_binding = None;
+    placeholder.secure_plane = x0x::mls::SecureGroupPlane::Gss;
+    placeholder.shared_secret = None;
+    placeholder.members_v2 = std::collections::BTreeMap::new();
+    placeholder.join_requests = std::collections::BTreeMap::new();
+    placeholder.issued_invite_secrets = std::collections::HashSet::new();
+    placeholder.issued_invites = std::collections::HashMap::new();
+    placeholder.commit_log = Vec::new();
+    placeholder.home = None;
+    placeholder
+}
+
+/// Split the live roster into (legacy-safe `named_groups.json` view,
+/// Home-Suite sidecar view). Entries whose serialization an old binary can
+/// decode stay in the legacy view verbatim; Home-Suite entries move to the
+/// sidecar view and leave a placeholder behind.
+#[must_use]
+fn split_named_groups_for_store(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> (
+    HashMap<String, x0x::groups::GroupInfo>,
+    HashMap<String, x0x::groups::GroupInfo>,
+) {
+    let mut legacy = HashMap::with_capacity(groups.len());
+    let mut home_suite = HashMap::new();
+    for (id, info) in groups {
+        if is_home_suite_group_entry(info) {
+            home_suite.insert(id.clone(), info.clone());
+            legacy.insert(id.clone(), legacy_safe_placeholder(info));
+        } else {
+            legacy.insert(id.clone(), info.clone());
+        }
+    }
+    (legacy, home_suite)
+}
+
+/// Encode both durable views of the roster (issue #451): the legacy-safe
+/// `named_groups.json` body and the Home-Suite sidecar body.
+fn encode_named_groups_store(
+    groups: &HashMap<String, x0x::groups::GroupInfo>,
+) -> std::io::Result<(String, String)> {
+    let (legacy, home_suite) = split_named_groups_for_store(groups);
+    let legacy_json = serde_json::to_string(&legacy)
+        .map_err(|e| std::io::Error::other(format!("failed to serialize named groups: {e}")))?;
+    let home_suite_json = serde_json::to_string(&home_suite).map_err(|e| {
+        std::io::Error::other(format!("failed to serialize Home-Suite groups: {e}"))
+    })?;
+    Ok((legacy_json, home_suite_json))
+}
+
+/// Persist the Home-Suite sidecar. MUST be written BEFORE the matching
+/// `named_groups.json` replacement in every save path: the sidecar is the
+/// authoritative record for Home-Suite groups, so a crash between the two
+/// writes leaves (new sidecar, old placeholder) — never a named-groups view
+/// whose Home entry has no authoritative backing.
+async fn write_home_suite_sidecar(
+    state: &AppState,
+    home_suite_json: &str,
+) -> std::io::Result<AtomicWriteOutcome> {
+    write_named_groups_json_atomic(&state.home_suite_groups_path, home_suite_json)
+        .await
+        .map_err(|e| {
+            tracing::error!(
+                path = %state.home_suite_groups_path.display(),
+                "failed to save Home-Suite sidecar: {e}"
+            );
+            e
+        })
+}
+
 /// ADR 0028: checked version of save_named_groups that returns an error on
 /// write failure so the causal replay path can refuse to drop a queue entry
 /// when group-state persistence failed (audit 5).
@@ -20224,9 +20452,14 @@ pub(in crate::server) async fn save_named_groups_checked(
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    let json = {
+    // Issue #451: encode both durable views up front. The sidecar (the
+    // authoritative Home-Suite record) is written FIRST; the legacy-safe
+    // named_groups.json replacement follows only on sidecar success, so a
+    // crash between the writes can never leave a named-groups view whose
+    // Home-Suite entry has no authoritative backing.
+    let (legacy_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
-        serde_json::to_string(&*groups)
+        encode_named_groups_store(&groups)?
     };
     #[cfg(test)]
     {
@@ -20239,18 +20472,25 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             release.notified().await;
         }
     }
-    let outcome = match json {
-        Ok(json) => write_named_groups_json_atomic(&state.named_groups_path, &json)
-            .await
-            .map_err(|e| {
-                tracing::error!("Failed to save named groups: {e}");
-                e
-            }),
-        Err(e) => {
-            tracing::error!("Failed to serialize named groups: {e}");
-            Ok(AtomicWriteOutcome::NotReplaced)
+    // A non-empty sidecar body must reach disk before the roster view
+    // changes; an empty body only needs writing when a sidecar already
+    // exists (a Home-Suite group was removed and the stale sidecar must
+    // not resurrect it on the next load).
+    let sidecar_exists = tokio::fs::try_exists(&state.home_suite_groups_path)
+        .await
+        .unwrap_or(false);
+    if !home_suite_json.is_empty() && (sidecar_exists || home_suite_json != "{}") {
+        let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
+        if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
+            return Ok(AtomicWriteOutcome::NotReplaced);
         }
-    };
+    }
+    let outcome = write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
+        .await
+        .map_err(|e| {
+            tracing::error!("Failed to save named groups: {e}");
+            e
+        });
     match &outcome {
         Ok(AtomicWriteOutcome::Durable) => state
             .named_groups_requires_durability_confirmation
@@ -22025,7 +22265,9 @@ pub(in crate::server) mod tests {
         let treekem_dir = data_dir.join("treekem");
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
-        let named_groups = load_named_groups(&named_groups_path).await?;
+        let home_suite_groups_path = data_dir.join(HOME_SUITE_GROUPS_FILE);
+        let named_groups =
+            load_named_groups_merged(&named_groups_path, &home_suite_groups_path).await?;
         let treekem_member_key_packages = load_treekem_member_key_packages(
             &treekem_dir.join("member-key-packages.json"),
             &named_groups,
@@ -22073,6 +22315,7 @@ pub(in crate::server) mod tests {
             crdt_handle_locks: RwLock::new(HashMap::new()),
             named_groups: RwLock::new(named_groups),
             named_groups_path,
+            home_suite_groups_path,
             named_groups_persistence_lock: Mutex::new(()),
             named_groups_requires_durability_confirmation: AtomicBool::new(false),
             causal_approval_queue_persistence_lock: Mutex::new(()),
@@ -31274,4 +31517,415 @@ mod adr0028 {
     // MiniMax will implement controls 1–5 here calling these private
     // functions directly per Watson event 838a1e92 and Kimi event
     // 63d135aa.
+}
+
+/// Issue #451 acceptance harness: the pre-ADR-0038 (v0.40.4) durable-store
+/// decoder, frozen exactly as a downgrade target knows it (field-for-field
+/// from the `v0.40.4` tag). Old serde IGNORES unknown struct fields (so
+/// `GroupMember::certificate` and `GroupInfo::home` are invisible to it)
+/// but REJECTS unknown enum VARIANTS — `owner_certified` is the one variant
+/// a Home-Suite daemon writes that an old binary cannot parse, and it made
+/// v0.40.4 exit 1 on every start of a data dir holding a Home (crash loop).
+///
+/// The four non-admission policy axes, `GroupMember`'s old field set,
+/// `SecureGroupPlane`, the state-commit types, `JoinRequest` and
+/// `IssuedInviteRecord` are byte-identical between v0.40.4 and current
+/// (verified by diff against the tag), so the frozen structs reuse the
+/// crate types for those; the DIFFERING pieces — the admission axis and
+/// the absence of `GroupInfo::home` — are replicated here.
+#[cfg(test)]
+pub(in crate::server) mod old_decoder_451 {
+    use crate as x0x;
+    use serde::{Deserialize, Serialize};
+    use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+
+    /// `GroupAdmission` exactly as v0.40.4 defines it — three variants.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+    #[serde(rename_all = "snake_case")]
+    pub(in crate::server) enum OldAdmission {
+        InviteOnly,
+        RequestAccess,
+        OpenJoin,
+    }
+
+    /// `GroupPolicy` as v0.40.4 defines it (old admission axis).
+    #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+    pub(in crate::server) struct OldPolicy {
+        pub(in crate::server) discoverability: x0x::groups::GroupDiscoverability,
+        pub(in crate::server) admission: OldAdmission,
+        pub(in crate::server) confidentiality: x0x::groups::GroupConfidentiality,
+        pub(in crate::server) read_access: x0x::groups::GroupReadAccess,
+        pub(in crate::server) write_access: x0x::groups::GroupWriteAccess,
+    }
+
+    impl Default for OldPolicy {
+        fn default() -> Self {
+            Self {
+                discoverability: x0x::groups::GroupDiscoverability::Hidden,
+                admission: OldAdmission::InviteOnly,
+                confidentiality: x0x::groups::GroupConfidentiality::MlsEncrypted,
+                read_access: x0x::groups::GroupReadAccess::MembersOnly,
+                write_access: x0x::groups::GroupWriteAccess::MembersOnly,
+            }
+        }
+    }
+    /// `GroupInfo` exactly as v0.40.4 defines it — no `home` field, old
+    /// admission axis. A `home` key in the JSON is an unknown field and is
+    /// ignored, exactly as on a real old binary.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub(in crate::server) struct OldGroupInfo {
+        #[serde(default, skip_serializing)]
+        pub(in crate::server) members: BTreeSet<String>,
+        #[serde(default, skip_serializing)]
+        pub(in crate::server) display_names: HashMap<String, String>,
+        #[serde(default, skip_serializing)]
+        pub(in crate::server) membership_revision: u64,
+        pub(in crate::server) name: String,
+        pub(in crate::server) description: String,
+        pub(in crate::server) creator: x0x::identity::AgentId,
+        pub(in crate::server) created_at: u64,
+        #[serde(default)]
+        pub(in crate::server) updated_at: u64,
+        pub(in crate::server) mls_group_id: String,
+        pub(in crate::server) metadata_topic: String,
+        pub(in crate::server) chat_topic_prefix: String,
+        #[serde(default)]
+        pub(in crate::server) policy: OldPolicy,
+        #[serde(default)]
+        pub(in crate::server) policy_revision: u64,
+        #[serde(default)]
+        pub(in crate::server) roster_revision: u64,
+        #[serde(default)]
+        pub(in crate::server) members_v2: BTreeMap<String, x0x::groups::GroupMember>,
+        #[serde(default)]
+        pub(in crate::server) join_requests: BTreeMap<String, x0x::groups::JoinRequest>,
+        #[serde(default)]
+        pub(in crate::server) discovery_card_topic: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pub(in crate::server) shared_secret: Option<Vec<u8>>,
+        #[serde(default)]
+        pub(in crate::server) secret_epoch: u64,
+        #[serde(default)]
+        pub(in crate::server) secure_plane: x0x::mls::SecureGroupPlane,
+        #[serde(default)]
+        pub(in crate::server) genesis: Option<x0x::groups::state_commit::GroupGenesis>,
+        #[serde(default)]
+        pub(in crate::server) state_revision: u64,
+        #[serde(default)]
+        pub(in crate::server) state_hash: String,
+        #[serde(default)]
+        pub(in crate::server) prev_state_hash: Option<String>,
+        #[serde(default)]
+        pub(in crate::server) security_binding: Option<String>,
+        #[serde(default)]
+        pub(in crate::server) tags: Vec<String>,
+        #[serde(default)]
+        pub(in crate::server) avatar_url: Option<String>,
+        #[serde(default)]
+        pub(in crate::server) banner_url: Option<String>,
+        #[serde(default)]
+        pub(in crate::server) withdrawn: bool,
+        #[serde(default)]
+        pub(in crate::server) commit_log: Vec<x0x::groups::state_commit::RetainedCommit>,
+        #[serde(default)]
+        pub(in crate::server) issued_invite_secrets: HashSet<String>,
+        #[serde(default)]
+        pub(in crate::server) issued_invites: HashMap<String, x0x::groups::IssuedInviteRecord>,
+    }
+
+    /// Parse a durable roster exactly as a v0.40.4 binary would at startup
+    /// (`load_named_groups`). `Err` here IS the #451 crash: unknown variant
+    /// `owner_certified` → context error → daemon exit 1.
+    pub(in crate::server) fn parse_roster(
+        json: &str,
+    ) -> Result<HashMap<String, OldGroupInfo>, serde_json::Error> {
+        serde_json::from_str::<HashMap<String, OldGroupInfo>>(json)
+    }
+
+    /// `TreeKemNamedPersistJournal` as v0.40.4 defines it — the struct is
+    /// unchanged since, so postcard bytes decode identically on an old
+    /// binary (which then REPLAYS the embedded roster json through
+    /// `parse_roster`: the #451 crash's second vector).
+    #[derive(Debug, Deserialize)]
+    pub(in crate::server) struct OldPersistJournal {
+        pub(in crate::server) version: u8,
+        pub(in crate::server) group_id_hex: String,
+        pub(in crate::server) named_groups_json: String,
+        pub(in crate::server) snapshot_envelope: Vec<u8>,
+    }
+
+    pub(in crate::server) fn parse_journal(
+        bytes: &[u8],
+    ) -> Result<OldPersistJournal, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+
+    /// Event tags `NamedGroupMetadataEvent` carried in v0.40.4. Used to
+    /// prove `member-key-packages.json` never carries a tag an old binary
+    /// would reject while parsing the whole file at startup (a parse error
+    /// there is survivable — v0.40.4 quarantines the cache — but a clean
+    /// parse keeps the downgrade window lossless).
+    pub(in crate::server) const KNOWN_EVENT_TAGS: &[&str] = &[
+        "member_added",
+        "member_removed",
+        "member_banned",
+        "member_unbanned",
+        "member_joined",
+        "join_request_created",
+        "join_request_withdrawn",
+        "join_request_decided",
+        "group_policy_updated",
+        "group_deleted",
+        "group_renamed",
+        "display_name_changed",
+        "secure_share_delivered",
+        "member_role_changed",
+        "treekem_catchup_request",
+        "treekem_catchup_response",
+        "group_withdrawn",
+        "alias_mls_id_superseded",
+    ];
+}
+
+/// Issue #451 store-layer regression tests: the durable roster a Home-Suite
+/// daemon writes must stay decodable by the frozen v0.40.4 shapes, through
+/// every path that writes or replays it.
+#[cfg(test)]
+mod hs451_downgrade_safety {
+    use super::old_decoder_451;
+    use super::*;
+    use std::collections::HashMap;
+
+    fn home_suite_entry() -> x0x::groups::GroupInfo {
+        let owner = x0x::identity::UserKeypair::from_seed(&[0x38; 32])
+            .expect("owner seed")
+            .user_id();
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            "Owner's personal space".to_string(),
+            x0x::identity::AgentId([2; 32]),
+            "ab".repeat(16),
+            crate::server::routes::home::home_policy(&owner),
+        );
+        info.state_revision = 5;
+        info.state_hash = "hash-451".to_string();
+        info.prev_state_hash = Some("hash-450".to_string());
+        info.policy_revision = 2;
+        info.roster_revision = 3;
+        info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+        info.security_binding = Some("treekem:epoch=1".to_string());
+        info.home = Some(x0x::groups::HomeMetadata {
+            primary_agent: "02".repeat(32),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1_700_000_000_000,
+        });
+        info.members_v2.insert(
+            "02".repeat(32),
+            x0x::groups::GroupMember::new_admin("02".repeat(32), None, 1),
+        );
+        info
+    }
+
+    fn legacy_entry() -> x0x::groups::GroupInfo {
+        x0x::groups::GroupInfo::new(
+            "plain".to_string(),
+            String::new(),
+            x0x::identity::AgentId([3; 32]),
+            "cd".repeat(16),
+        )
+    }
+
+    /// THE #451 acceptance: after a Home-Suite daemon persists a Home
+    /// entry, the frozen v0.40.4 decoder parses `named_groups.json` without
+    /// error, and the roster it sees carries a placeholder — not the
+    /// `owner_certified` variant that crash-looped v0.40.4.
+    #[tokio::test]
+    async fn store_split_keeps_named_groups_json_old_parsable() {
+        let mut groups = HashMap::new();
+        let home = home_suite_entry();
+        let home_id = "aa".repeat(16);
+        groups.insert(home_id.to_string(), home.clone());
+        groups.insert("ee".repeat(16), legacy_entry());
+
+        let (legacy_json, sidecar_json) =
+            encode_named_groups_store(&groups).expect("store encode must succeed");
+
+        // Old decoder parses the legacy view — the exact operation that
+        // exited 1 on v0.40.4.
+        let old = old_decoder_451::parse_roster(&legacy_json)
+            .expect("frozen v0.40.4 decoder must parse named_groups.json");
+        assert_eq!(old.len(), 2, "placeholder keeps the id reserved");
+        let placeholder = &old[&home_id];
+        assert_eq!(
+            placeholder.policy.admission,
+            old_decoder_451::OldAdmission::InviteOnly
+        );
+        assert!(
+            placeholder.members_v2.is_empty(),
+            "placeholder roster must be empty (inert for an old binary)"
+        );
+        assert_eq!(
+            placeholder.secure_plane,
+            x0x::mls::SecureGroupPlane::Gss,
+            "placeholder must not make an old binary restore the Home .snap"
+        );
+        assert!(placeholder.shared_secret.is_none());
+        assert!(placeholder.security_binding.is_none());
+        // Chain head preserved: an old binary recognises the revision and
+        // rejects forged lower-revision commits.
+        assert_eq!(placeholder.state_revision, home.state_revision);
+        assert_eq!(placeholder.state_hash, home.state_hash);
+        assert_eq!(placeholder.prev_state_hash, home.prev_state_hash);
+        assert_eq!(placeholder.policy_revision, home.policy_revision);
+        assert_eq!(placeholder.roster_revision, home.roster_revision);
+        assert!(!legacy_json.contains("owner_certified"));
+
+        // v1 compat fields are write-only (skip_serializing) — an old
+        // decoder deserialises their absence as the defaults.
+        assert!(placeholder.members.is_empty());
+        assert!(placeholder.display_names.is_empty());
+        assert_eq!(placeholder.membership_revision, 0);
+
+        // Sidecar carries the REAL state (old binaries never read it).
+        let sidecar: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&sidecar_json).expect("sidecar json");
+        let real = &sidecar[&home_id];
+        assert!(matches!(
+            real.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        assert!(real.home.is_some());
+        assert_eq!(real.members_v2.len(), 1);
+        assert_eq!(real.secure_plane, x0x::mls::SecureGroupPlane::TreeKem);
+        assert!(sidecar_json.contains("owner_certified"));
+
+        // The plain group is untouched in the legacy view.
+        let plain_id = "ee".repeat(16);
+        assert_eq!(old[&plain_id].name, "plain");
+    }
+
+    /// #451's SECOND crash vector: v0.40.4's journal recovery parses the
+    /// roster json EMBEDDED in a leftover `.journal` and rewrites
+    /// named_groups.json with it. A journal written by this daemon must
+    /// therefore embed the legacy-safe view, and must still decode with the
+    /// old (unchanged) journal shape.
+    #[tokio::test]
+    async fn journal_embeds_old_parsable_roster() {
+        let mut groups = HashMap::new();
+        groups.insert("aa".repeat(16), home_suite_entry());
+        let (legacy_json, _) =
+            encode_named_groups_store(&groups).expect("store encode must succeed");
+
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: "aa".repeat(16),
+            named_groups_json: legacy_json,
+            snapshot_envelope: vec![1, 2, 3],
+        };
+        let bytes = postcard::to_stdvec(&journal).expect("journal encode");
+        let old_journal = old_decoder_451::parse_journal(&bytes)
+            .expect("frozen v0.40.4 journal decode must succeed");
+        assert_eq!(old_journal.version, TREEKEM_NAMED_JOURNAL_VERSION);
+        assert_eq!(old_journal.group_id_hex, "aa".repeat(16));
+        assert!(!old_journal.snapshot_envelope.is_empty());
+        // ...and parses + replays the embedded roster without the #451
+        // `unknown variant owner_certified` error.
+        old_decoder_451::parse_roster(&old_journal.named_groups_json)
+            .expect("old decoder must parse the embedded roster json");
+    }
+
+    /// Merge semantics: the sidecar is authoritative. A downgrade window in
+    /// which an old binary rewrote the placeholder cannot displace the real
+    /// Home state, and restored owner-certified entries get the re-verify
+    /// gate (ADR-0038 review finding 6).
+    #[tokio::test]
+    async fn merge_restores_sidecar_authority_over_placeholder() {
+        let home = home_suite_entry();
+        let home_id = "aa".repeat(16);
+        let placeholder = legacy_safe_placeholder(&home);
+        let mut named = HashMap::new();
+        named.insert(home_id.clone(), placeholder);
+        let mut sidecar = HashMap::new();
+        sidecar.insert(home_id.clone(), home);
+
+        let merged = merge_home_suite_groups(named, sidecar);
+        let real = &merged[&home_id];
+        assert!(matches!(
+            real.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        assert!(real.home.is_some());
+        assert_eq!(real.members_v2.len(), 1);
+        assert!(
+            real.owner_cert_reverify_required,
+            "restored OwnerCertified state is untrusted until re-verified"
+        );
+    }
+
+    /// A present-but-corrupt sidecar is a hard startup error — never a
+    /// silent downgrade of Home security to the invite-only placeholder.
+    #[tokio::test]
+    async fn corrupt_sidecar_fails_closed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        tokio::fs::write(&path, b"{not json").await.expect("write");
+        assert!(load_home_suite_groups(&path).await.is_err());
+    }
+
+    /// End-to-end store round-trip through the checked save path: the
+    /// on-disk pair is exactly (old-parsable named_groups.json,
+    /// authoritative sidecar), and a v0.40.4-style full rewrite of
+    /// named_groups.json from the old view cannot lose the Home state.
+    #[tokio::test]
+    async fn save_writes_old_parsable_pair_and_survives_old_rewrite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(dir.path().join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().expect("agent key"))
+                .with_agent_cert_path(dir.path().join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(dir.path().join("contacts.json"))
+                .build()
+                .await
+                .expect("agent"),
+        );
+        let state = tests::secure_endpoint_test_state_at(dir.path(), agent)
+            .await
+            .expect("state");
+        let home_id = "aa".repeat(16);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(home_id.clone(), home_suite_entry());
+        let outcome = save_named_groups_checked(&state).await.expect("save");
+        assert_eq!(outcome, AtomicWriteOutcome::Durable);
+
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let legacy = tokio::fs::read_to_string(&named_path).await.expect("read");
+        old_decoder_451::parse_roster(&legacy)
+            .expect("old decoder must parse the persisted named_groups.json");
+        assert!(sidecar_path.exists(), "sidecar must be written");
+
+        // Downgrade window: the old binary rewrites named_groups.json from
+        // ITS view (old shapes, no sidecar knowledge).
+        let old_view = old_decoder_451::parse_roster(&legacy).expect("old view");
+        let rewritten = serde_json::to_string(&old_view).expect("old rewrite");
+        tokio::fs::write(&named_path, rewritten)
+            .await
+            .expect("rewrite");
+
+        // Re-upgrade: merged load restores the authoritative sidecar state.
+        let merged = load_named_groups_merged(&named_path, &sidecar_path)
+            .await
+            .expect("merged load after old-binary rewrite");
+        let real = &merged[&home_id];
+        assert!(matches!(
+            real.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        assert!(real.home.is_some());
+    }
 }

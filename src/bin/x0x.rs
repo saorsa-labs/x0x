@@ -672,7 +672,10 @@ enum UserIdSub {
     /// Overwrites an existing key only for the same identity or with
     /// --rotate-owner (ADR-0036); a different identity refuses.
     Create {
-        /// Output path. Existing file at this path is overwritten.
+        /// Output path. Existing file at this path is overwritten. When
+        /// omitted, the key goes to the default identity dir — or, with the
+        /// global `--name <instance>` selector, into that named instance's
+        /// identity directory (`.x0x-<instance>`, issue #456).
         path: Option<PathBuf>,
         /// Derive the keypair deterministically from a 32-byte hex seed
         /// (64 hex chars) via FIPS 204 seeded KeyGen. Same seed, same keypair.
@@ -1769,9 +1772,20 @@ async fn run(
                 from_seed,
                 rotate_owner,
             } => {
+                // Issue #456: honor the global `--name <instance>`
+                // selector — write the key into that named instance's
+                // identity dir (`.x0x-<name>`), the same directory a
+                // daemon started with `--name` uses. An explicit PATH
+                // still wins.
+                let output = match (path, name) {
+                    (Some(p), _) => Some(p.clone()),
+                    (None, Some(instance)) => {
+                        Some(commands::user_id::instance_user_key_path(instance)?)
+                    }
+                    (None, None) => None,
+                };
                 let resolved =
-                    commands::user_id::create(path.clone(), from_seed.as_deref(), *rotate_owner)
-                        .await?;
+                    commands::user_id::create(output, from_seed.as_deref(), *rotate_owner).await?;
                 match format {
                     OutputFormat::Json => x0x::cli::print_value(
                         format,
@@ -1784,7 +1798,16 @@ async fn run(
                 return Ok(());
             }
             UserIdSub::Inspect { path } => {
-                let report = commands::user_id::inspect(path.clone()).await?;
+                // Issue #456: honor the global `--name <instance>` selector
+                // symmetrically with create.
+                let input = match (path, name) {
+                    (Some(p), _) => Some(p.clone()),
+                    (None, Some(instance)) => {
+                        Some(commands::user_id::instance_user_key_path(instance)?)
+                    }
+                    (None, None) => None,
+                };
+                let report = commands::user_id::inspect(input).await?;
                 match format {
                     OutputFormat::Json => {
                         x0x::cli::print_value(format, &serde_json::to_value(&report)?)
@@ -2873,7 +2896,7 @@ async fn uninstall() -> anyhow::Result<()> {
         eprintln!();
         eprintln!("Data preserved at: {}", data_dir.display());
     }
-    if let Some(home) = dirs::home_dir().map(|h| h.join(".x0x")) {
+    if let Some(home) = x0x::storage::x0x_home_dir() {
         if home.exists() {
             eprintln!("Keys preserved at: {}", home.display());
         }
@@ -2934,7 +2957,11 @@ async fn purge() -> anyhow::Result<()> {
     eprintln!();
 
     let data_dir = dirs::data_dir();
-    let home_dir = dirs::home_dir();
+    // Issue #456: with X0X_HOME set, keys and instance dirs live beside the
+    // override's parent — purge must target where state actually lives.
+    let home_dir = x0x::storage::x0x_home_dir()
+        .and_then(|dir| dir.parent().map(std::path::Path::to_path_buf))
+        .or_else(dirs::home_dir);
     let paths_to_remove =
         commands::purge::collect_purge_paths(data_dir.as_deref(), home_dir.as_deref());
     for purge_path in &paths_to_remove {

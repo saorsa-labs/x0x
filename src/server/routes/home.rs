@@ -1176,8 +1176,11 @@ mod round2_tests {
             super::super::named_groups::save_named_groups(&state).await,
             "legacy roster persisted to disk"
         );
-        let reloaded =
-            super::super::named_groups::load_named_groups(&state.named_groups_path).await?;
+        let reloaded = super::super::named_groups::load_named_groups_merged(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+        )
+        .await?;
         assert!(
             reloaded
                 .get(&id)
@@ -1288,5 +1291,116 @@ mod round2_tests {
             "no warning on a fresh Home"
         );
         Ok(())
+    }
+
+    /// Issue #451 end-to-end acceptance: after this daemon provisions a
+    /// Home, every durable store a v0.40.4 binary reads at startup parses
+    /// with the frozen old shapes — no `owner_certified` anywhere it looks —
+    /// and a downgrade-window REWRITE of `named_groups.json` by the old
+    /// binary cannot destroy the Home: the re-upgraded daemon restores the
+    /// authoritative sidecar state.
+    #[tokio::test]
+    async fn provisioned_home_store_is_downgrade_safe() {
+        use super::super::named_groups::old_decoder_451;
+        use std::collections::HashMap;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path().to_path_buf();
+        let state = owned_state(&data, [0x45; 32]).await.expect("owned state");
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (group_id, info) = find_home(&state, &owner).await.expect("Home provisioned");
+
+        // 1) named_groups.json: old decoder parses; the Home id is present
+        //    as an inert placeholder; no new variant anywhere in the bytes.
+        let named_path = data.join("named_groups.json");
+        let legacy = tokio::fs::read_to_string(&named_path)
+            .await
+            .expect("read roster");
+        assert!(
+            !legacy.contains("owner_certified"),
+            "the #451 crash variant must never reach named_groups.json"
+        );
+        let old = old_decoder_451::parse_roster(&legacy)
+            .expect("frozen v0.40.4 decoder must parse the provisioned store");
+        let placeholder = &old[&group_id];
+        assert_eq!(
+            placeholder.policy.admission,
+            old_decoder_451::OldAdmission::InviteOnly
+        );
+        assert!(placeholder.members_v2.is_empty());
+        assert_eq!(
+            placeholder.secure_plane,
+            crate::mls::SecureGroupPlane::Gss,
+            "an old binary must not restore the Home TreeKEM snapshot"
+        );
+        assert_eq!(placeholder.state_revision, info.state_revision);
+        assert_eq!(placeholder.state_hash, info.state_hash);
+
+        // 2) The sidecar carries the real Home state.
+        let sidecar_path = data.join(super::super::named_groups::HOME_SUITE_GROUPS_FILE);
+        let sidecar_json = tokio::fs::read_to_string(&sidecar_path)
+            .await
+            .expect("Home-Suite sidecar written");
+        let sidecar: HashMap<String, crate::groups::GroupInfo> =
+            serde_json::from_str(&sidecar_json).expect("sidecar json");
+        let real = &sidecar[&group_id];
+        assert!(matches!(
+            real.policy.admission,
+            crate::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        assert!(real.home.is_some());
+        assert_eq!(real.members_v2.len(), info.members_v2.len());
+
+        // 3) The marker (old binaries never read it) and the snapshot
+        //    (old binaries skip it: the placeholder is not TreeKem-tagged).
+        assert!(data.join(HOME_MARKER_FILE).exists());
+        assert!(
+            data.join("treekem")
+                .join(format!("{group_id}.snap"))
+                .exists(),
+            "Home snapshot persists for the re-upgraded binary"
+        );
+
+        // 4) member-key-packages.json parses whole-file for an old binary
+        //    and carries only event tags v0.40.4 knows.
+        let key_packages = data.join("treekem").join("member-key-packages.json");
+        if let Ok(cache_json) = tokio::fs::read_to_string(&key_packages).await {
+            let cache: serde_json::Value = serde_json::from_str(&cache_json).expect("cache json");
+            if let Some(entries) = cache.as_object() {
+                for entry in entries.values() {
+                    let tag = entry["event"].as_str().expect("event tag");
+                    assert!(
+                        old_decoder_451::KNOWN_EVENT_TAGS.contains(&tag),
+                        "unknown-to-v0.40.4 event tag {tag} in the key-package cache"
+                    );
+                }
+            }
+        }
+
+        // 5) Downgrade window: the old binary rewrites named_groups.json
+        //    from ITS (placeholder) view — its map has no Home entry, so
+        //    the rewrite drops even the placeholder.
+        let rewritten = serde_json::to_string(&old).expect("old-binary rewrite");
+        tokio::fs::write(&named_path, rewritten)
+            .await
+            .expect("old-binary rewrite write");
+
+        // 6) Re-upgrade: same data dir, same owner seed → the merged load
+        //    restores the authoritative sidecar Home; provisioning adopts
+        //    it instead of duplicating.
+        let state2 = owned_state(&data, [0x45; 32]).await.expect("restart state");
+        provision_home(&state2).await;
+        let owner2 = owner_of(&state2);
+        let (id2, info2) = find_home(&state2, &owner2)
+            .await
+            .expect("Home survives the downgrade window");
+        assert_eq!(id2, group_id, "no duplicate Home after re-upgrade");
+        assert!(matches!(
+            info2.policy.admission,
+            crate::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        assert!(info2.home.is_some());
+        assert_eq!(info2.members_v2.len(), info.members_v2.len());
     }
 }

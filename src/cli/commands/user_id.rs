@@ -6,10 +6,21 @@ use std::path::PathBuf;
 use crate::identity::UserKeypair;
 use crate::storage::{load_user_keypair_from, save_user_keypair_to};
 
-/// Default user identity key path (`~/.x0x/user.key`).
+/// Default user identity key path (`<x0x home>/user.key`; the x0x home is
+/// `$X0X_HOME` when set, else `~/.x0x` — issue #456).
 pub fn default_user_key_path() -> Result<PathBuf> {
-    let home = dirs::home_dir().context("could not determine home directory")?;
-    Ok(home.join(".x0x").join("user.key"))
+    let home =
+        crate::storage::x0x_home_dir().context("could not determine default identity directory")?;
+    Ok(home.join("user.key"))
+}
+
+/// User identity key path of a NAMED daemon instance (issue #456): the
+/// `--name` target for `x0x user-id create` mirrors the daemon's instance
+/// identity-dir rule (`.x0x-<name>` beside the default x0x home).
+pub fn instance_user_key_path(name: &str) -> Result<PathBuf> {
+    let dir = crate::storage::x0x_instance_dir(name)
+        .with_context(|| format!("could not resolve identity directory for instance '{name}'"))?;
+    Ok(dir.join("user.key"))
 }
 
 /// Inter-process lock around the `user.key` + `owner.json` two-file update
@@ -506,7 +517,6 @@ mod tests {
             err.to_string().contains("unreadable"),
             "error names the reason: {err}"
         );
-
         // Explicit rotation recovers.
         create(Some(path.clone()), Some(SEED_A), true)
             .await
@@ -514,5 +524,17 @@ mod tests {
     }
 
     const SEED_A: &str = "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20";
+
+    /// Issue #456: `--name` targets the named instance's identity dir
+    /// (`.x0x-<name>/user.key`), mirroring the daemon's `--name` rule.
+    #[test]
+    fn instance_user_key_path_targets_instance_dir() {
+        let path = instance_user_key_path("alice").expect("path resolves");
+        let rendered = path.to_string_lossy();
+        assert!(
+            rendered.ends_with(".x0x-alice/user.key"),
+            "unexpected instance user key path: {rendered}"
+        );
+    }
     const SEED_B: &str = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 }

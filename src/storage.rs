@@ -325,19 +325,94 @@ pub async fn write_private_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
     write_private_file(path, bytes).await
 }
 
+/// Pure resolution core for [`x0x_home_dir`] (issue #456): the default x0x
+/// identity directory is `$X0X_HOME` when set, else `<home>/.x0x`.
+///
+/// Split out so tests can exercise precedence without racing the process
+/// environment (unit tests run multi-threaded; `std::env::set_var` is
+/// process-global).
+#[must_use]
+pub fn resolve_x0x_home(
+    env_override: Option<&str>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let overridden = env_override
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    overridden.or_else(|| home.map(|h| h.join(X0X_DIR)))
+}
+
+/// The process-wide default x0x identity directory (issue #456).
+///
+/// Every `~/.x0x` fallback in the codebase resolves through here:
+/// - precedence: `$X0X_HOME` (if set and non-empty) > `$HOME/.x0x`;
+/// - the test harness sets `X0X_HOME` (`.config/nextest.toml` `[env]`), so
+///   the workspace suite never writes Home-Suite state (owner-cert journal,
+///   `agent.cert`, move/placement files, history, contacts) into a
+///   developer's real `~/.x0x`;
+/// - under `cfg(test)` with NO override this PANICS by design: a test
+///   touching the real home fallback is exactly the #456 pollution bug, so
+///   it fails loudly instead of silently dirtying the maintainer's node.
+///   Tests that need a default-dir path must run under the harness env or
+///   configure explicit paths (`identity_dir`, `with_agent_cert_path`, …).
+///
+/// # Panics
+/// In test builds when neither `X0X_HOME` nor `$HOME`-based isolation is
+/// active — see above.
+pub fn x0x_home_dir() -> Option<std::path::PathBuf> {
+    let env_override = std::env::var("X0X_HOME").ok();
+    if env_override.as_deref().is_some_and(|s| !s.is_empty()) {
+        return env_override.map(std::path::PathBuf::from);
+    }
+    #[cfg(test)]
+    {
+        panic!(
+            "#456 test-home guard: a test reached the real ~/.x0x fallback. \
+             Set X0X_HOME (the nextest harness does), or give the builder \
+             explicit paths (identity_dir / key / cert / store paths)."
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir();
+        resolve_x0x_home(None, home)
+    }
+}
+
+/// The identity directory of a NAMED daemon instance (issue #456): a
+/// sibling of the default x0x home named `.x0x-<name>`. With `X0X_HOME`
+/// set, instances live beside the override's parent — the same "instances
+/// sit next to the default dir" rule as `~/.x0x-<name>` on a real home.
+#[must_use]
+pub fn resolve_x0x_instance_dir(
+    home: Option<std::path::PathBuf>,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    let home = home?;
+    let parent = home.parent().map(std::path::Path::to_path_buf)?;
+    Some(parent.join(format!(".x0x-{name}")))
+}
+
+/// See [`resolve_x0x_instance_dir`]; resolves the default home first.
+#[must_use]
+pub fn x0x_instance_dir(name: &str) -> Option<std::path::PathBuf> {
+    resolve_x0x_instance_dir(x0x_home_dir(), name)
+}
+
 /// Get the x0x configuration directory path.
+///
+/// Honours `X0X_HOME` (issue #456) via [`x0x_home_dir`].
 ///
 /// # Returns
 ///
-/// The path to the .x0x directory in the user's home directory
+/// The path to the .x0x directory (default identity directory)
 pub(crate) async fn x0x_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    x0x_home_dir().ok_or_else(|| {
         IdentityError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "home directory not found",
+            "no home directory and no X0X_HOME override",
         ))
-    })?;
-    Ok(home.join(X0X_DIR))
+    })
 }
 
 /// Save a MachineKeypair to the default storage location.
@@ -652,10 +727,9 @@ pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<Agen
 fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     match identity_dir {
         Some(dir) => Some(dir.join(REVOCATION_FILE)),
-        None => {
-            let home = dirs::home_dir()?;
-            Some(home.join(X0X_DIR).join(REVOCATION_FILE))
-        }
+        // Issue #456: honor X0X_HOME (tests relocate this; never the real
+        // home under the test harness).
+        None => x0x_home_dir().map(|dir| dir.join(REVOCATION_FILE)),
     }
 }
 
@@ -1156,6 +1230,65 @@ mod tests {
             plain.public_key().as_bytes(),
             kp.public_key().as_bytes(),
             "the plain loader must recover key material from a v2 file"
+        );
+    }
+
+    // ── Default-dir resolution (issue #456) ──
+
+    #[test]
+    fn resolve_x0x_home_prefers_override_over_real_home() {
+        let real_home = std::path::PathBuf::from("/home/developer");
+        // Override wins.
+        assert_eq!(
+            super::resolve_x0x_home(Some("/tmp/xt"), Some(real_home.clone())),
+            Some(std::path::PathBuf::from("/tmp/xt"))
+        );
+        // An EMPTY override is ignored (unset semantics), never a
+        // resolve-to-empty-dir footgun.
+        assert_eq!(
+            super::resolve_x0x_home(Some(""), Some(real_home.clone())),
+            Some(real_home.join(".x0x"))
+        );
+        // Default: <home>/.x0x.
+        assert_eq!(
+            super::resolve_x0x_home(None, Some(real_home)),
+            Some(std::path::PathBuf::from("/home/developer/.x0x"))
+        );
+        // Nothing resolvable at all.
+        assert_eq!(super::resolve_x0x_home(None, None), None);
+    }
+
+    #[test]
+    fn instance_dir_is_sibling_of_default_home() {
+        let home = std::path::PathBuf::from("/home/developer/.x0x");
+        assert_eq!(
+            super::resolve_x0x_instance_dir(Some(home.clone()), "alice"),
+            Some(std::path::PathBuf::from("/home/developer/.x0x-alice"))
+        );
+        // An override home relocates instances beside the override.
+        let override_home = std::path::PathBuf::from("/tmp/xt");
+        assert_eq!(
+            super::resolve_x0x_instance_dir(Some(override_home), "alice"),
+            Some(std::path::PathBuf::from("/tmp/.x0x-alice"))
+        );
+        assert_eq!(super::resolve_x0x_instance_dir(None, "alice"), None);
+    }
+
+    /// #456 tripwire proof: outside the harness env (`X0X_HOME` unset, as
+    /// with a bare `cargo test`), the resolver REFUSES to hand back the
+    /// real `~/.x0x` in test builds — it panics, so a polluting test fails
+    /// loudly instead of dirtying the maintainer's node. Self-skipping
+    /// under the nextest harness (which sets X0X_HOME).
+    #[test]
+    fn x0x_home_dir_test_guard_panics_without_override() {
+        if std::env::var_os("X0X_HOME").is_some_and(|v| !v.is_empty()) {
+            // Harness env active: the guard cannot fire; nothing to prove.
+            return;
+        }
+        let result = std::panic::catch_unwind(super::x0x_home_dir);
+        assert!(
+            result.is_err(),
+            "#456 guard must panic when a test would touch the real ~/.x0x"
         );
     }
 }
