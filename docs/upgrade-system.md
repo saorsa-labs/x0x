@@ -110,8 +110,22 @@ sees a shape it cannot parse:
   owner-certified state (roster with embedded certificates, Home metadata,
   TreeKEM binding). Written before the matching `named_groups.json`
   replacement in every save path, so a crash between writes never leaves a
-  roster view whose Home entry lacks authoritative backing. Old binaries do
-  not know the file exists.
+  Home-Suite entry without authoritative backing. Old binaries do not know
+  the file exists.
+- **`treekem/<group>.hsjournal`** — crash-recovery journal for the sidecar,
+  written BEFORE the sidecar changes inside the atomic TreeKEM persist
+  transaction (review r2). A crash between the sidecar write and the
+  snapshot/roster writes is healed at startup by replaying it (and the
+  legacy journal) — without it, the merged roster could be authoritative
+  with a stale/absent TreeKEM snapshot and nothing could repair it. The
+  extension is invisible to v0.40.x, whose recovery scan only reads
+  `*.journal`; the postcard shape of the legacy journal itself is unchanged
+  because old binaries decode the FULL struct before checking its version.
+- **Migration**: a store written by a pre-#451 Home-Suite binary (real
+  owner-certified entries directly in `named_groups.json`) is migrated to
+  the split layout automatically on the first post-#451 start — no
+  unrelated mutation needed — so the downgrade safety below applies to
+  existing data dirs from that start onward.
 
 What each binary does on the same data dir:
 

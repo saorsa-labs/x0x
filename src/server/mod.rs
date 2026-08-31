@@ -60,16 +60,17 @@ use routes::{
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
     list_tasks, load_causal_approval_queue, load_named_groups_merged,
     load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, mls_decrypt, mls_encrypt, named_group_metadata_event_group_id,
-    named_group_metadata_event_kind, network_status, now_millis_u64, owner_agents,
-    owner_agents_issue, owner_agents_revoke, owner_riders_issue, owner_riders_list,
-    owner_riders_revoke, peer_health_handler, peers, pin_machine, presence, presence_find,
-    presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
-    publish_group_card_to_discovery, put_kv_value, quick_trust, recover_treekem_named_journals,
-    reject_join_request, reject_unverified_direct_public_message, relay_diagnostics,
-    remove_mls_member, remove_named_group_member, replay_pending_causal_approvals,
-    restore_treekem_groups, revoke_contact, run_fallback_github_poll, run_gossip_update_listener,
-    run_startup_update_check, save_named_groups_checked, save_named_groups_checked_unlocked,
+    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
+    now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
+    owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
+    reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
+    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
     send_group_public_message, set_group_display_name, shutdown_handler,
@@ -607,6 +608,12 @@ pub async fn serve_with_options(
     recover_treekem_named_journals(&named_groups_path, &treekem_dir)
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
+    // Review r2 (#451): replay leftover Home-Suite sidecar journals before
+    // the merged load, so a crash inside the atomic TreeKEM persist
+    // transaction heals before the roster is read.
+    recover_home_suite_sidecar_journals(&home_suite_groups_path, &treekem_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to recover Home-Suite sidecar journal: {e}"))?;
     let named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
         .await
         .map_err(|e| anyhow::anyhow!("failed to load named groups: {e}"))?;
@@ -916,6 +923,14 @@ pub async fn serve_with_options(
         forward_service,
         owner_sync,
     });
+
+    // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
+    // still holds owner-certified entries in named_groups.json — v0.40.x
+    // would crash-loop on it. Migrate to the split layout immediately so
+    // the data dir is downgrade-safe from this start onward.
+    migrate_unsplit_home_suite_store_if_needed(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to migrate unsplit Home-Suite store: {e}"))?;
 
     let port_file = config.data_dir.join("api.port");
 

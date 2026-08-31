@@ -2957,13 +2957,14 @@ async fn purge() -> anyhow::Result<()> {
     eprintln!();
 
     let data_dir = dirs::data_dir();
-    // Issue #456: with X0X_HOME set, keys and instance dirs live beside the
-    // override's parent — purge must target where state actually lives.
-    let home_dir = x0x::storage::x0x_home_dir()
-        .and_then(|dir| dir.parent().map(std::path::Path::to_path_buf))
-        .or_else(dirs::home_dir);
+    // Issue #456 (review r2): purge must target the RESOLVED default
+    // identity directory itself — with X0X_HOME=/tmp/site/x0x that is
+    // /tmp/site/x0x, not /tmp/site/.x0x. Passing the override's parent
+    // made purge miss the override and read the wrong confirmation key.
+    let x0x_home =
+        x0x::storage::x0x_home_dir().or_else(|| dirs::home_dir().map(|home| home.join(".x0x")));
     let paths_to_remove =
-        commands::purge::collect_purge_paths(data_dir.as_deref(), home_dir.as_deref());
+        commands::purge::collect_purge_paths(data_dir.as_deref(), x0x_home.as_deref());
     for purge_path in &paths_to_remove {
         match purge_path.kind {
             commands::purge::PurgePathKind::Data => eprintln!(
@@ -3025,7 +3026,7 @@ async fn purge() -> anyhow::Result<()> {
     input.clear();
     eprintln!();
     eprintln!("\x1b[33mStep 3/3: Verify your agent ID.\x1b[0m");
-    let agent_id_hint = match commands::purge::agent_id_confirmation_hint(home_dir.as_deref()) {
+    let agent_id_hint = match commands::purge::agent_id_confirmation_hint(x0x_home.as_deref()) {
         Ok(hint) => hint,
         Err(error) => {
             eprintln!("Cannot verify your agent ID: {error:#}");

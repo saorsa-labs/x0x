@@ -17685,13 +17685,15 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     {
         anyhow::bail!("refusing to persist key material for withdrawn group");
     }
-    // Issue #451: the embedded journal body (and the direct write below)
-    // must be the LEGACY-SAFE view. A pre-ADR-0038 binary that recovers a
-    // leftover journal parses `named_groups_json` with old shapes and
-    // REWRITES named_groups.json with it — an `owner_certified` entry in
-    // the embedded body crash-looped v0.40.4 (issue #451's second vector).
-    // The real Home-Suite state rides in the sidecar, written BEFORE the
-    // journal so journal replay can never regress it.
+    // Issue #451 + review r2: the durable trio (sidecar / snapshot /
+    // named_groups.json) must only change AFTER their repair payloads are
+    // durable. The legacy TreeKEM journal (postcard shape UNCHANGED so old
+    // binaries decode + replay it) carries the roster view and snapshot
+    // envelope; a separate `.hsjournal` (extension invisible to old
+    // binaries, whose recovery scan only reads `*.journal`) carries the
+    // sidecar body. Writing the sidecar before the journals — as round 1
+    // did — opened a crash window where the Home roster was authoritative
+    // with a stale/absent snapshot and nothing on disk could repair it.
     let (named_groups_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
         let mut next_groups = groups.clone();
@@ -17709,11 +17711,8 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     .await;
 
     let snapshot_envelope = encode_treekem_snapshot_envelope(&info, group)?;
-    // Sidecar first (see write_home_suite_sidecar ordering contract).
-    let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
-    if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
-        anyhow::bail!("Home-Suite sidecar replacement did not occur");
-    }
+    // 1) Repair payloads first: the legacy journal (old binaries replay it
+    //    into snapshot + named_groups.json), then the sidecar journal.
     let journal = TreeKemNamedPersistJournal {
         version: TREEKEM_NAMED_JOURNAL_VERSION,
         group_id_hex: group_id_hex.to_string(),
@@ -17726,6 +17725,12 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     x0x::storage::write_private_bytes(&journal_path, journal_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
+    write_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex, &home_suite_json).await?;
+    // 2) Live files, each now repairable from the journals above.
+    let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
+    if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
+        anyhow::bail!("Home-Suite sidecar replacement did not occur");
+    }
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id_hex, snapshot_envelope).await?;
     if repair_withdrawn_named_groups_json_and_wipe_key_material_locked(
         state,
@@ -17772,6 +17777,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
         }
     }
+    remove_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex).await;
     Ok(())
 }
 
@@ -17897,6 +17903,111 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             .await
             .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
         tracing::warn!(group_id = %journal.group_id_hex, "replayed TreeKEM/named-group persistence journal after prior crash");
+    }
+    Ok(())
+}
+
+/// Review r2 (#451): crash-recovery journal for the Home-Suite sidecar,
+/// written BEFORE the sidecar changes inside the atomic TreeKEM persist
+/// transaction so a crash between the sidecar write and the snapshot /
+/// roster writes is repairable at startup (without it, the merged roster
+/// could be authoritative with a stale/absent TreeKEM snapshot and nothing
+/// on disk could restore consistency).
+///
+/// Deliberately a SEPARATE file from [`TreeKemNamedPersistJournal`]: the
+/// postcard shape of that struct must stay byte-identical for pre-#451
+/// binaries (they decode the FULL journal before checking its version, so
+/// an added field would crash exactly the downgrades #451 fixes). This
+/// file uses the `.hsjournal` extension, which an old binary's recovery
+/// scan ignores (it only reads `*.journal`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct HomeSuiteSidecarJournal {
+    version: u8,
+    home_suite_json: String,
+}
+
+const TREEKEM_HOME_SUITE_JOURNAL_VERSION: u8 = 1;
+
+fn treekem_home_suite_journal_path(treekem_dir: &FsPath, group_id_hex: &str) -> PathBuf {
+    treekem_dir.join(format!("{group_id_hex}.hsjournal"))
+}
+
+async fn write_home_suite_sidecar_journal(
+    treekem_dir: &FsPath,
+    group_id_hex: &str,
+    home_suite_json: &str,
+) -> anyhow::Result<()> {
+    let journal = HomeSuiteSidecarJournal {
+        version: TREEKEM_HOME_SUITE_JOURNAL_VERSION,
+        home_suite_json: home_suite_json.to_string(),
+    };
+    let bytes = postcard::to_stdvec(&journal)
+        .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal encode: {e}"))?;
+    let path = treekem_home_suite_journal_path(treekem_dir, group_id_hex);
+    x0x::storage::write_private_bytes(&path, bytes)
+        .await
+        .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))
+}
+
+async fn remove_home_suite_sidecar_journal(treekem_dir: &FsPath, group_id_hex: &str) {
+    let path = treekem_home_suite_journal_path(treekem_dir, group_id_hex);
+    if let Err(e) = tokio::fs::remove_file(&path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::warn!(path = %path.display(), "Home-Suite sidecar journal cleanup: {e}");
+        }
+    }
+}
+
+/// Startup replay for leftover `.hsjournal` files (review r2, #451):
+/// rewrite the sidecar from the journaled body, then remove the journal.
+/// At most one exists at a time (the atomic persist holds the persistence
+/// lock and removes it on every exit path after a successful commit).
+pub(in crate::server) async fn recover_home_suite_sidecar_journals(
+    sidecar_path: &FsPath,
+    treekem_dir: &FsPath,
+) -> anyhow::Result<()> {
+    let mut entries = match tokio::fs::read_dir(treekem_dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => {
+            return Err(anyhow::anyhow!(
+                "read TreeKEM dir for sidecar journals: {e}"
+            ))
+        }
+    };
+    while let Some(entry) = entries
+        .next_entry()
+        .await
+        .map_err(|e| anyhow::anyhow!("read TreeKEM dir entry for sidecar journals: {e}"))?
+    {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("hsjournal") {
+            continue;
+        }
+        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+            anyhow::anyhow!("read Home-Suite sidecar journal {}: {e}", path.display())
+        })?;
+        let journal: HomeSuiteSidecarJournal = postcard::from_bytes(&bytes).map_err(|e| {
+            anyhow::anyhow!("decode Home-Suite sidecar journal {}: {e}", path.display())
+        })?;
+        if journal.version != TREEKEM_HOME_SUITE_JOURNAL_VERSION {
+            tracing::warn!(
+                path = %path.display(),
+                version = journal.version,
+                "ignoring unsupported Home-Suite sidecar journal version"
+            );
+            continue;
+        }
+        let outcome = write_named_groups_json_atomic(sidecar_path, &journal.home_suite_json)
+            .await
+            .map_err(|e| anyhow::anyhow!("replay Home-Suite sidecar journal: {e}"))?;
+        if outcome != AtomicWriteOutcome::Durable {
+            anyhow::bail!("replayed Home-Suite sidecar journal was not directory-durable");
+        }
+        tokio::fs::remove_file(&path).await.map_err(|e| {
+            anyhow::anyhow!("remove replayed sidecar journal {}: {e}", path.display())
+        })?;
+        tracing::warn!("replayed Home-Suite sidecar persistence journal after prior crash");
     }
     Ok(())
 }
@@ -18261,6 +18372,44 @@ pub(in crate::server) async fn load_named_groups_merged(
     let named = load_named_groups(named_groups_path).await?;
     let sidecar = load_home_suite_groups(sidecar_path).await?;
     Ok(merge_home_suite_groups(named, sidecar))
+}
+
+/// Review r2 (#451, item 3): a store written by a pre-#451 Home-Suite
+/// binary holds the REAL owner-certified entries directly in
+/// `named_groups.json` (no sidecar). Loading it is fine for the new
+/// binary, but until something rewrites the store, a v0.40.x binary
+/// still crash-loops on that directory. This detects the unsplit shape
+/// and immediately persists the split pair. Idempotent: a split store's
+/// legacy view contains only placeholders, so the check costs one file
+/// read per start and rewrites nothing.
+pub(in crate::server) async fn migrate_unsplit_home_suite_store_if_needed(
+    state: &AppState,
+) -> std::io::Result<()> {
+    let legacy = match tokio::fs::read_to_string(&state.named_groups_path).await {
+        Ok(json) => json,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    let unsplit: HashMap<String, x0x::groups::GroupInfo> = match serde_json::from_str(&legacy) {
+        Ok(groups) => groups,
+        Err(e) => {
+            // load_named_groups has already rejected a corrupt file by the
+            // time this runs; a race here is not worth failing startup over.
+            tracing::warn!("could not re-parse named groups for migration check: {e}");
+            return Ok(());
+        }
+    };
+    if !unsplit.values().any(is_home_suite_group_entry) {
+        return Ok(());
+    }
+    tracing::info!("migrating pre-#451 named-groups store to the Home-Suite sidecar layout");
+    let outcome = save_named_groups_checked(state).await?;
+    if outcome == AtomicWriteOutcome::NotReplaced {
+        return Err(std::io::Error::other(
+            "unsplit Home-Suite store migration did not replace the roster",
+        ));
+    }
+    Ok(())
 }
 
 /// ADR 0028: versioned sidecar for the causal approval queue. The version
@@ -22266,6 +22415,9 @@ pub(in crate::server) mod tests {
         tokio::fs::create_dir_all(&treekem_dir).await?;
         let named_groups_path = data_dir.join("named_groups.json");
         let home_suite_groups_path = data_dir.join(HOME_SUITE_GROUPS_FILE);
+        // Review r2 (#451): mirror daemon startup — sidecar-journal
+        // recovery before the merged load.
+        recover_home_suite_sidecar_journals(&home_suite_groups_path, &treekem_dir).await?;
         let named_groups =
             load_named_groups_merged(&named_groups_path, &home_suite_groups_path).await?;
         let treekem_member_key_packages = load_treekem_member_key_packages(
@@ -22297,7 +22449,7 @@ pub(in crate::server) mod tests {
         let exec_service =
             x0x::exec::ExecService::spawn(Arc::clone(&agent), exec_policy, exec_dm_rx);
 
-        Ok(Arc::new(AppState {
+        let state = Arc::new(AppState {
             // ADR-0043 r4: the shared test state runs the ceremony ENABLED so
             // the move-route wiring tests exercise real behavior; the
             // default-off posture is covered by key_move::tests gate tests.
@@ -22403,7 +22555,12 @@ pub(in crate::server) mod tests {
             )),
             forward_service: None,
             owner_sync,
-        }))
+        });
+
+        // Review r2 (#451): mirror daemon startup — migrate a pre-#451
+        // unsplit store to the sidecar layout before returning.
+        migrate_unsplit_home_suite_store_if_needed(&state).await?;
+        Ok(state)
     }
 
     async fn response_json(response: Response) -> Result<(StatusCode, serde_json::Value)> {
@@ -31927,5 +32084,196 @@ mod hs451_downgrade_safety {
             x0x::groups::GroupAdmission::OwnerCertified(_)
         ));
         assert!(real.home.is_some());
+    }
+
+    /// Review r2, item 1: a crash after the sidecar write but before the
+    /// snapshot/roster writes must be REPAIRABLE from the journals the
+    /// transaction wrote first. Simulates the crash point directly on disk
+    /// (sidecar new, snapshot stale, both journals left behind) and proves
+    /// startup recovery restores a fully consistent, old-parsable trio.
+    #[tokio::test]
+    async fn crash_between_sidecar_and_snapshot_is_journal_repaired() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let home_id = "aa".repeat(16);
+
+        // Pre-transaction durable state: OLD placeholder view + no sidecar.
+        let mut old_groups = HashMap::new();
+        old_groups.insert(
+            home_id.clone(),
+            legacy_safe_placeholder(&home_suite_entry()),
+        );
+        let old_json = serde_json::to_string(&old_groups).expect("old view json");
+        write_named_groups_json_atomic(&named_path, &old_json)
+            .await
+            .expect("old view write");
+
+        // The transaction's encoded payloads (as persist_treekem_... would
+        // produce): legacy view, sidecar body, snapshot envelope.
+        let mut next_groups = HashMap::new();
+        next_groups.insert(home_id.clone(), home_suite_entry());
+        let (legacy_json, sidecar_json) = encode_named_groups_store(&next_groups).expect("encode");
+        let envelope = vec![7u8; 16];
+
+        // Crash point: BOTH journals written, sidecar WRITTEN (new),
+        // snapshot NOT yet (stale file absent), roster NOT yet (old view).
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: home_id.clone(),
+            named_groups_json: legacy_json.clone(),
+            snapshot_envelope: envelope.clone(),
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_journal_path(&treekem, &home_id),
+            postcard::to_stdvec(&journal).expect("journal encode"),
+        )
+        .await
+        .expect("journal write");
+        write_home_suite_sidecar_journal(&treekem, &home_id, &sidecar_json)
+            .await
+            .expect("hsjournal write");
+        write_named_groups_json_atomic(&sidecar_path, &sidecar_json)
+            .await
+            .expect("sidecar write (crash point)");
+
+        // Startup recovery, exactly as serve() orders it.
+        recover_treekem_named_journals(&named_path, &treekem)
+            .await
+            .expect("treekem journal recovery");
+        recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+            .await
+            .expect("sidecar journal recovery");
+
+        // The trio is consistent and every journal is consumed.
+        let legacy = tokio::fs::read_to_string(&named_path).await.expect("read");
+        assert_eq!(
+            legacy, legacy_json,
+            "roster replayed from the legacy journal"
+        );
+        old_decoder_451::parse_roster(&legacy).expect("old decoder still parses");
+        let sidecar_after = tokio::fs::read_to_string(&sidecar_path)
+            .await
+            .expect("sidecar read");
+        assert_eq!(sidecar_after, sidecar_json);
+        let snap = tokio::fs::read(treekem.join(format!("{home_id}.snap")))
+            .await
+            .expect("snapshot replayed");
+        assert_eq!(snap, envelope);
+        assert!(!treekem.join(format!("{home_id}.journal")).exists());
+        assert!(!treekem.join(format!("{home_id}.hsjournal")).exists());
+    }
+
+    /// Review r2, item 1 (negative control): an unsupported .hsjournal
+    /// version is skipped with the sidecar untouched — never a startup
+    /// failure, never a blind overwrite.
+    #[tokio::test]
+    async fn unsupported_hsjournal_version_is_skipped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        write_named_groups_json_atomic(&sidecar_path, "{}")
+            .await
+            .expect("sidecar init");
+        let journal = HomeSuiteSidecarJournal {
+            version: TREEKEM_HOME_SUITE_JOURNAL_VERSION + 1,
+            home_suite_json: "{\"evil\":true}".to_string(),
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_home_suite_journal_path(&treekem, "aa"),
+            postcard::to_stdvec(&journal).expect("encode"),
+        )
+        .await
+        .expect("write");
+
+        recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+            .await
+            .expect("recovery tolerates unknown versions");
+
+        let sidecar = tokio::fs::read_to_string(&sidecar_path)
+            .await
+            .expect("sidecar untouched");
+        assert_eq!(sidecar, "{}");
+    }
+
+    /// Review r2, item 3: a pre-#451 UNSPLIT store (real owner-certified
+    /// entry directly in named_groups.json) must be migrated to the split
+    /// layout on the first post-#451 start, so a v0.40.x binary can no
+    /// longer crash-loop on it.
+    #[tokio::test]
+    async fn unsplit_pre451_store_migrates_on_load() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let data = dir.path();
+        // A pre-#451 binary wrote the REAL Home entry into
+        // named_groups.json and knew no sidecar.
+        let mut unsplit = HashMap::new();
+        unsplit.insert("aa".repeat(16), home_suite_entry());
+        let unsplit_json = serde_json::to_string(&unsplit).expect("unsplit json");
+        tokio::fs::write(data.join("named_groups.json"), &unsplit_json)
+            .await
+            .expect("write unsplit store");
+
+        let agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().expect("agent key"))
+                .with_agent_cert_path(data.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data.join("contacts.json"))
+                .build()
+                .await
+                .expect("agent"),
+        );
+        let state = tests::secure_endpoint_test_state_at(data, agent)
+            .await
+            .expect("state (startup mirrors: migration runs)");
+
+        // The store is now split and old-parsable.
+        let legacy = tokio::fs::read_to_string(data.join("named_groups.json"))
+            .await
+            .expect("read");
+        assert!(
+            !legacy.contains("owner_certified"),
+            "migration must remove the old-decoder crash variant"
+        );
+        old_decoder_451::parse_roster(&legacy).expect("old decoder parses");
+        let sidecar = tokio::fs::read_to_string(data.join(HOME_SUITE_GROUPS_FILE))
+            .await
+            .expect("sidecar written");
+        assert!(sidecar.contains("owner_certified"));
+
+        // The in-memory roster is the REAL Home (merge), and a second
+        // start is idempotent (no further rewrite).
+        let merged = state.named_groups.read().await;
+        let real = merged.get(&"aa".repeat(16)).expect("home");
+        assert!(matches!(
+            real.policy.admission,
+            x0x::groups::GroupAdmission::OwnerCertified(_)
+        ));
+        drop(merged);
+        let before = tokio::fs::read_to_string(data.join("named_groups.json"))
+            .await
+            .expect("reread");
+        let second_agent = Arc::new(
+            Agent::builder()
+                .with_machine_key(data.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().expect("agent key"))
+                .with_agent_cert_path(data.join("agent.cert"))
+                .with_peer_cache_disabled()
+                .with_contact_store_path(data.join("contacts.json"))
+                .build()
+                .await
+                .expect("agent2"),
+        );
+        let _second = tests::secure_endpoint_test_state_at(data, second_agent)
+            .await
+            .expect("second state");
+        let after = tokio::fs::read_to_string(data.join("named_groups.json"))
+            .await
+            .expect("reread2");
+        assert_eq!(before, after, "an already-split store is not rewritten");
     }
 }
