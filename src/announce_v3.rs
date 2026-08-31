@@ -29,8 +29,9 @@
 //!   `cert_digest` and outside the legacy `X0A3` machine signature; on
 //!   `X0A4` it rides INSIDE the V3.1 machine signature (`sign_v3_1`
 //!   signing the private `IdentityAnnouncementV31Unsigned` body), so
-//!   verification and the blob fetch path are untouched by either
-//!   envelope.
+//!   only the `cert_digest` gate and the certificate-blob fetch/verify
+//!   path are untouched by either envelope (beat verification itself
+//!   selects the canonical signed bytes for whichever envelope it holds).
 
 use crate::{error, identity};
 
