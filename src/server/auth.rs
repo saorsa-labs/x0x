@@ -377,7 +377,7 @@ impl SessionStore {
     /// Issue a fresh session token, store its digest, and return the raw token
     /// to hand to the client. `now` is injected so expiry can be unit-tested
     /// without sleeping.
-    fn issue(&self, now: Instant) -> String {
+    pub(super) fn issue(&self, now: Instant) -> String {
         use rand::RngCore;
         let mut bytes = [0u8; 32];
         rand::thread_rng().fill_bytes(&mut bytes);
@@ -547,10 +547,18 @@ mod tests {
         // #127 / WS1.6: a short-lived session token in the Bearer header is
         // accepted on protected endpoints too (browser clients use it after
         // exchange, so REST calls work without the durable secret).
+        //
+        // Issue #446 FLIP: `/agent/sign` is deliberately NO LONGER in this
+        // list. `authorize` only decides bearer VALIDITY; the owner-act
+        // surfaces (`/agent/sign`, `/exec/*`, `/shutdown`, `/sync/devices*`,
+        // `/groups/:id/delegate`, `/announce` with user identity) fence
+        // session bearers at the HANDLER with a 403 (`is_durable_owner`).
+        // That matrix is pinned end-to-end (middleware + handler) in
+        // `routes::identity::owner_act_tests::owner_act_matrix_*`.
         let sessions = SessionStore::new(SESSION_TOKEN_TTL);
         let now = Instant::now();
         let session = sessions.issue(now);
-        for path in ["/status", "/agent", "/agent/sign", "/agent/verify"] {
+        for path in ["/status", "/agent", "/agent/verify"] {
             assert!(
                 authorize_protected(path, Some(&session), None, &sessions).is_ok(),
                 "{path} with a session bearer must pass (Ok)"

@@ -52,8 +52,24 @@ pub(in crate::server) struct ExecCancelRequest {
 /// POST /exec/run — run a strictly allowlisted command on a remote daemon.
 pub(in crate::server) async fn exec_run(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<ExecRunRequest>,
 ) -> axum::response::Response {
+    // Issue #446: initiating remote command execution is an owner act —
+    // remote ACLs bound the blast radius, but the initiating authority
+    // is local. Session bearers are read-only principals (ADR-0039).
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "remote exec requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -127,8 +143,23 @@ pub(in crate::server) async fn exec_run(
 /// POST /exec/cancel — cancel an in-flight exec request originated by this daemon.
 pub(in crate::server) async fn exec_cancel(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<ExecCancelRequest>,
 ) -> axum::response::Response {
+    // Issue #446: same durable-owner fence as /exec/run — cancelling is
+    // authority over an in-flight owner-initiated act.
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "remote exec requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
     let request_id = match x0x::exec::ExecRequestId::from_hex(&req.request_id) {
         Ok(id) => id,
         Err(e) => {

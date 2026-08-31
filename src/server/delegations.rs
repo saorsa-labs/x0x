@@ -539,9 +539,22 @@ pub(in crate::server) struct DelegateRequest {
 /// what makes the delegation effective.
 pub(in crate::server) async fn delegate_group_authority(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     Json(req): Json<DelegateRequest>,
 ) -> impl IntoResponse {
+    // Issue #446: delegation mints an owner-key-SIGNED capability whose
+    // lifetime is caller-chosen (expiry_ms) — a 10-minute session
+    // bearer must not mint authority that outlives it (the owner.rs
+    // "90-day credentials" bar, verbatim). Checked before any parsing
+    // so the 403 never depends on body validity.
+    if !actor.is_durable_owner() {
+        return forbidden(
+            "issuing a delegation requires the durable API token (not a session token)",
+        );
+    }
     let local = state.agent.agent_id();
     let local_hex = hex::encode(local.as_bytes());
     let now_ms = crate::server::routes::now_millis_u64();

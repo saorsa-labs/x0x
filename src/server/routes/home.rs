@@ -667,6 +667,13 @@ pub(in crate::server) struct RenameHomeRequest {
 
 /// POST /home/rename — convenience wrapper over the existing
 /// PATCH /groups/:id (admin-gated, sealed, persisted).
+///
+/// Issue #446 decision: this surface deliberately stays SESSION-allowed.
+/// It is a pure wrapper over `update_named_group` (PATCH /groups/:id),
+/// which remains session-allowed; gating only the alias would be
+/// theater while the identical authority stays reachable via PATCH.
+/// No credential or capability is minted — a rename is sealed group
+/// metadata. Riders remain 403 (ADR-0039 deny-by-default middleware).
 pub(in crate::server) async fn rename_home(
     State(state): State<Arc<AppState>>,
     Json(req): Json<RenameHomeRequest>,
@@ -701,7 +708,7 @@ pub(in crate::server) async fn rename_home(
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::server::routes) mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
@@ -709,7 +716,7 @@ mod tests {
 
     /// Owned test state: user key (deterministic seed so the owner id is
     /// stable across the "restart" arm) + builder-issued agent certificate.
-    pub(in crate::server::routes::home) async fn owned_state(
+    pub(in crate::server::routes) async fn owned_state(
         data_dir: &std::path::Path,
         owner_seed: [u8; 32],
     ) -> anyhow::Result<Arc<AppState>> {
@@ -1082,6 +1089,76 @@ mod tests {
         let owner = owner_of(&state);
         let (_, info) = find_home(&state, &owner).await.expect("home");
         assert_eq!(info.name, "Irvine HQ");
+        Ok(())
+    }
+
+    /// WHY (issue #446): `/home/rename` deliberately stays SESSION-allowed —
+    /// it is a wrapper over `PATCH /groups/:id` (session-allowed) and mints
+    /// no credential. Pin the decision end-to-end through the real auth
+    /// middleware: a session bearer renames Home (200), a rider is 403
+    /// (deny-by-default), the durable token keeps working.
+    #[tokio::test]
+    async fn home_rename_stays_session_allowed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x44; 32]).await?;
+        provision_home(&state).await;
+        let app = axum::Router::new()
+            .route("/home/rename", axum::routing::post(rename_home))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let call = |bearer: String, name: &'static str| {
+            let app = app.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::post("/home/rename")
+                            .header("authorization", format!("Bearer {bearer}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::json!({ "name": name }).to_string()))
+                            .expect("body builds"),
+                    )
+                    .await
+            }
+        };
+
+        let session = state.sessions.issue(std::time::Instant::now());
+        let response = call(session, "Session Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "session bearer must rename: {body}");
+
+        // A rider token is still denied (ADR-0039 deny-by-default).
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "ab".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let response = call(rider, "Rider Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rider must be denied: {body}"
+        );
+
+        let response = call("test-token".to_string(), "Durable Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "durable bearer must rename: {body}");
+        let owner = owner_of(&state);
+        let (_, info) = find_home(&state, &owner).await.expect("home");
+        assert_eq!(info.name, "Durable Rename");
         Ok(())
     }
 

@@ -56,11 +56,13 @@ pub(super) enum ActorContext {
     /// The durable API token (`durable: true`) or a browser session
     /// token (`durable: false`) — the human owner's control plane.
     /// Also the context for exempt paths (`/health`, CORS preflights)
-    /// with `durable: false`. Owner-ADMIN acts — certifying sub-agents
-    /// and minting/revoking rider tokens — require `durable: true`
-    /// (review fix: a 10-minute session bearer must not mint 90-day
-    /// credentials or owner-signed certificates); read-only surfaces
-    /// accept either.
+    /// with `durable: false`. Owner-ADMIN acts — certifying sub-agents,
+    /// minting/revoking rider tokens, agent signing, remote exec,
+    /// shutdown, sync-device enrollment, and delegation issuance
+    /// (issue #446) — require `durable: true` (review fix: a
+    /// 10-minute session bearer must not mint 90-day credentials,
+    /// permanent signatures, or owner-signed certificates);
+    /// read-only surfaces accept either.
     Owner { durable: bool },
     /// A scoped rider token: acts as the registered `sub_agent_id`
     /// through this daemon. `groups` is the explicit named-group grant
