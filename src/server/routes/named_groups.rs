@@ -2597,7 +2597,7 @@ async fn try_adopt_member_added_across_gap(
         Ok(()) => {
             state
                 .groups_diagnostics
-                .record_member_added_adopted(&info.stable_group_id());
+                .record_member_added_adopted(info.stable_group_id());
             tracing::info!(
                 group_id = %LogHexId::group(info.stable_group_id()),
                 member = %agent_id,
@@ -2614,7 +2614,7 @@ async fn try_adopt_member_added_across_gap(
             );
             state
                 .groups_diagnostics
-                .record_member_added_rejected_state_chain_gap(&info.stable_group_id());
+                .record_member_added_rejected_state_chain_gap(info.stable_group_id());
             None
         }
     }
