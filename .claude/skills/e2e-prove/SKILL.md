@@ -12,7 +12,7 @@ Run x0x E2E tests, evaluate results, fix issues, and generate proof reports.
 ```bash
 /e2e-prove              # Interactive — asks which suite to run
 /e2e-prove vps          # VPS all-pairs matrix (6 bootstrap nodes)
-/e2e-prove lan          # LAN suite (studio1 + studio2 Mac Studios)
+/e2e-prove lan          # LAN suite (studio1 + LAN_PEER_HOST, e.g. the MacBook)
 /e2e-prove local        # Local loopback (alice + bob)
 /e2e-prove all          # Run all suites sequentially
 /e2e-prove status       # Show latest proof reports
@@ -273,7 +273,7 @@ Use `-v` for verbose (shows which suites cover each route), `--test-endpoints` t
 | Suite | Script | Scope |
 |-------|--------|-------|
 | VPS | tests/e2e_vps.sh | 6 bootstrap nodes, all-pairs matrix |
-| LAN | tests/e2e_lan.sh | studio1 + studio2 Mac Studios |
+| LAN | tests/e2e_lan.sh | studio1 + LAN_PEER_HOST (second LAN node) |
 | Local | tests/e2e_full_audit.sh | Self-contained local loopback proof: 83 endpoints + CLI + GUI + SSE + WS + file transfer + shutdown + swarm |
 | Local (alt) | tests/e2e_comprehensive.sh | Local loopback (older) |
 | Coverage | tests/api-coverage.sh | Auto-detect untested routes |

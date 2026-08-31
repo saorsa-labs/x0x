@@ -1304,7 +1304,7 @@ ant-quic now provides zero-config LAN discovery for x0x. x0x no longer registers
 | Machine | Tailscale IP | User | Role |
 |---------|-------------|------|------|
 | studio1 | 100.118.167.101 | studio1 | mDNS peer A |
-| studio2 | 100.78.147.60 | studio2 | mDNS peer B |
+| macbook | 192.168.1.89 | davidirvine | mDNS peer B (studio2 retired 2026-08-30) |
 
 Deploy x0xd: `scp target/release/x0xd studio1@100.118.167.101:/tmp/x0xd`
 
@@ -1337,15 +1337,15 @@ Deploy x0xd: `scp target/release/x0xd studio1@100.118.167.101:/tmp/x0xd`
 
 ### 19.4 Cross-Machine Discovery (5×)
 
-Requires mDNS multicast between studio1 and studio2 (may need UniFi "Multicast Enhancement" disabled).
+Requires mDNS multicast between studio1 and the macbook (may need UniFi "Multicast Enhancement" disabled).
 
 | # | Interface | Action | Expected |
 |---|-----------|--------|----------|
-| 1 | Logs | Start on studio1, then studio2 | studio2 discovers studio1 via ant-quic LAN discovery |
-| 2 | Logs | studio1 discovers studio2 via background browse | Bidirectional discovery |
-| 3 | Logs | studio2 connects to studio1 via LAN address | Direct connection succeeds without manual bootstrap |
-| 4 | curl | `GET /peers` on studio2 | studio1's peer ID present |
-| 5 | curl | `GET /agents/discovered` on studio1 | studio2's agent_id in discovered list (after identity announce) |
+| 1 | Logs | Start on studio1, then the macbook | the macbook discovers studio1 via ant-quic LAN discovery |
+| 2 | Logs | studio1 discovers the macbook via background browse | Bidirectional discovery |
+| 3 | Logs | the macbook connects to studio1 via LAN address | Direct connection succeeds without manual bootstrap |
+| 4 | curl | `GET /peers` on the macbook | studio1's peer ID present |
+| 5 | curl | `GET /agents/discovered` on studio1 | the macbook's agent_id in discovered list (after identity announce) |
 
 ### 19.5 Transport Discovery Lifecycle (5×)
 | # | Test | Expected |

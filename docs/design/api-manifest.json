@@ -568,7 +568,7 @@
     {
       "category": "identity",
       "cli_name": "owner riders issue",
-      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039)",
+      "description": "Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)",
       "method": "POST",
       "path": "/owner/riders",
       "request": {
@@ -2850,7 +2850,7 @@
     {
       "category": "upgrade",
       "cli_name": "upgrade",
-      "description": "Check for updates (the CLI command is a standalone self-updater; it does NOT call this endpoint)",
+      "description": "Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)",
       "method": "GET",
       "path": "/upgrade",
       "request": {
@@ -2860,7 +2860,7 @@
     {
       "category": "upgrade",
       "cli_name": "upgrade --apply",
-      "description": "Apply the latest verified release manifest (the CLI flag runs the standalone self-updater; it does NOT call this endpoint)",
+      "description": "Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)",
       "method": "POST",
       "path": "/upgrade/apply",
       "request": {

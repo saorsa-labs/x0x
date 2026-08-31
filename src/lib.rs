@@ -10326,7 +10326,7 @@ impl Agent {
         })?;
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         if let key_move::Placement::Pinned(pin) = placement {
@@ -10413,7 +10413,7 @@ impl Agent {
         // acknowledge export state.
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         let auth = match &bundle.authorization.record {
@@ -10566,7 +10566,7 @@ impl Agent {
         // is disabled.
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         let auth = match &bundle.authorization.record {
@@ -10723,7 +10723,7 @@ impl Agent {
         })?;
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         let (head, auth, retired, cert) = {
@@ -10871,7 +10871,7 @@ impl Agent {
         })?;
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         let (head, auth_hash, from_machine) = {
@@ -10978,7 +10978,7 @@ impl Agent {
         })?;
         if !self.move_ceremony_enabled {
             return Err(error::IdentityError::Revocation(
-                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); all agents stay Pinned and quiesced/quarantined states are unreachable".to_string(),
+                "roaming-move ceremony is experimental and disabled on this agent (ceremony_enabled = false); roster agents stay Pinned (the local Home agent's Roaming mint is inert without the ceremony) and quiesced/quarantined states are unreachable".to_string(),
             ));
         }
         let (head, auth_hash, from_machine) = {
