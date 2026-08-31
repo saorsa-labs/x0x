@@ -1264,17 +1264,28 @@ impl GroupInfo {
         self.finalize_applied_commit_with_terminal_mode(commit, false)
     }
 
-    /// #458: finalize a commit a joiner stub ADOPTED across a
-    /// `prev_state_hash` gap. The stub cannot reconstruct the intermediate
-    /// commits' metadata (e.g. a rename it never received), so the full
-    /// state-hash equality of [`GroupInfo::finalize_applied_commit`] is
-    /// unreachable by construction. Instead this verifies the part the
-    /// joiner CAN and MUST verify — the reconstructed roster's root equals
-    /// the commit's SIGNED `roster_root` (the joiner's seat is exactly
-    /// what the authority committed) and the last-admin invariant holds —
-    /// then adopts the signed chain fields (`state_revision`,
-    /// `prev_state_hash`, `state_hash`, `security_binding`) so the next
-    /// authority commit chains normally.
+    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
+    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
+    /// chain fields onto content they do not cover.
+    ///
+    /// Verified before anything mutates:
+    /// - the reconstructed roster's root equals the commit's SIGNED
+    ///   `roster_root` — the joiner's seat, role, state and committed
+    ///   certificate are exactly what the authority signed;
+    /// - the last-admin invariant holds on that roster.
+    ///
+    /// Then the joiner FORKS its local chain at its own frontier, keeping
+    /// internal consistency: `state_revision` advances to the commit's
+    /// revision and `security_binding` follows the commit (an epoch
+    /// input), but `prev_state_hash` chains from the LOCAL hash and
+    /// `state_hash` is RECOMPUTED from local content — never copied.
+    /// Copying the commit's hash would bind the joiner's stored hash to
+    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
+    /// hash ≠ content; the next normal apply/seal would then recompute
+    /// and reject, wedging the very joiner this path exists to free.
+    /// A forked joiner converges on later authority commits through this
+    /// same roster-root-verified path until a full resync (restart,
+    /// catch-up) rebuilds the chain link.
     pub fn finalize_adopted_commit_roster_checked(
         &mut self,
         commit: &state_commit::GroupStateCommit,
@@ -1290,10 +1301,11 @@ impl GroupInfo {
             });
         }
         state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
-        self.state_revision = commit.revision;
-        self.prev_state_hash = commit.prev_state_hash.clone();
-        self.state_hash = commit.state_hash.clone();
+        let prev = self.state_hash.clone();
         self.security_binding = commit.security_binding.clone();
+        self.state_revision = commit.revision;
+        self.prev_state_hash = Some(prev);
+        self.recompute_state_hash();
         self.retain_commit(commit);
         Ok(())
     }

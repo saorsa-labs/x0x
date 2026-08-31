@@ -2535,11 +2535,27 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
-/// #458: the joiner-stub adoption for an authority `MemberAdded` commit
-/// whose `prev_state_hash` cannot chain from the invite base state.
-/// Returns `Some(adopted)` when the fast-forward validated (structure,
-/// revision monotonicity, actor authority, and the reconstructed roster
-/// root equal to the commit's SIGNED roster root) — `None` to reject.
+/// #458 (review r2): the joiner-stub adoption for an authority
+/// `MemberAdded` commit whose `prev_state_hash` cannot chain from the
+/// invite base state. Returns `Some(adopted)` when the fast-forward
+/// validated — `None` to reject.
+///
+/// SIGNER AUTHORITY anchors (all must hold):
+/// 1. `commit.verify_structure()` — the signature verifies and
+///    `committed_by` is the AgentId DERIVED from the signing key;
+/// 2. `commit.committed_by == actor` — the admin the event names is the
+///    key that signed it (no third-party signing under an admin's name);
+/// 3. `actor == sender` + admin-per-stub (the caller's
+///    `actor_authorized`, over the invite's authority-signed base roster);
+/// 4. for OwnerCertified groups, the ingress gate has ALREADY verified
+///    the event's committed certificate chains to the admission owner —
+///    the strongest anchor, independent of the local roster.
+///
+/// The adopted state is INTERNALLY CONSISTENT (see
+/// `finalize_adopted_commit_roster_checked`): roster-root equality against
+/// the signed commit + a locally recomputed hash — the commit's own hash
+/// is never copied over content it does not cover.
+///
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
 /// frame must not absorb these locals (a deterministic 2 MiB-stack
 /// overflow appeared when they were inline).
@@ -2567,6 +2583,7 @@ async fn try_adopt_member_added_across_gap(
         && agent_id == local_agent_hex
         && !info.has_active_member(&local_agent_hex)
         && commit.verify_structure().is_ok()
+        && commit.committed_by.eq_ignore_ascii_case(actor)
         && commit.revision > current.state_revision;
     if !adoptable {
         return None;
@@ -2588,11 +2605,10 @@ async fn try_adopt_member_added_across_gap(
     // Fast-forward checks: the roster the joiner reconstructs MUST equal
     // the roster the authority's signature committed to (`roster_root`),
     // and the last-admin invariant must hold. The full state-hash
-    // comparison is deliberately NOT required here — the commit's hash
-    // covers the intermediate commits' metadata (e.g. a rename the joiner
-    // never saw), which the stub cannot reconstruct. The chain fields are
-    // adopted from the SIGNED commit instead, so the next commit chains
-    // normally.
+    // comparison is deliberately not required (the commit's hash covers
+    // intermediate metadata the stub cannot reconstruct) — instead the
+    // local chain forks SELF-CONSISTENTLY: revision/binding follow the
+    // signed commit, the hash is recomputed from local content.
     match adopted.finalize_adopted_commit_roster_checked(commit) {
         Ok(()) => {
             state
@@ -2807,15 +2823,72 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    let outcome = persist_named_groups_mutation(state, |groups| {
-        store_named_group_info_locked(groups, group_id, info)
-    })
-    .await;
-    // #457: a durable named-group state change on a TreeKEM group must keep
-    // the snapshot envelope binding in step, or the next restart drops the
-    // secure plane for that group.
+    // #457 (review r2): the named write and the TreeKEM snapshot rebind
+    // are ONE transaction under the persistence lock — the rebind runs
+    // while the lock is still held, and its FAILURE fails the operation
+    // (after a best-effort rollback of the visible map). No caller can
+    // observe success with a torn named/snapshot pair, and the crash
+    // window (named durable, crash before the snapshot write) is exactly
+    // the window the STARTUP repair heals.
+    let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+    if state
+        .named_groups_requires_durability_confirmation
+        .load(Ordering::Acquire)
+    {
+        match save_named_groups_checked_unlocked(state).await {
+            Ok(AtomicWriteOutcome::Durable) => state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release),
+            outcome => return outcome,
+        }
+    }
+    let snapshot = {
+        let mut groups = state.named_groups.write().await;
+        let snapshot = groups.clone();
+        if !store_named_group_info_locked(&mut groups, group_id, info) {
+            return Ok(AtomicWriteOutcome::NotReplaced);
+        }
+        snapshot
+    };
+    let outcome = save_named_groups_checked_unlocked(state).await;
+    if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
+        *state.named_groups.write().await = snapshot;
+        return outcome;
+    }
+    match &outcome {
+        Ok(AtomicWriteOutcome::Durable) => state
+            .named_groups_requires_durability_confirmation
+            .store(false, Ordering::Release),
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
+            .named_groups_requires_durability_confirmation
+            .store(true, Ordering::Release),
+        Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
+    }
     if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-        rebind_treekem_snapshot_after_named_seal(state, group_id).await;
+        match rebind_treekem_snapshot_after_named_seal(state, group_id).await {
+            RebindOutcome::Failed(e) => {
+                // Roll the visible map back to the pre-write snapshot and
+                // try to make that rollback durable; the operation FAILS
+                // either way — success is never reported over a torn
+                // named/snapshot pair.
+                *state.named_groups.write().await = snapshot;
+                if let Err(restore_err) = save_named_groups_checked_unlocked(state).await {
+                    tracing::error!(
+                        group_id = %LogHexId::group(group_id),
+                        error = %restore_err,
+                        "#457: rollback save ALSO failed — named/snapshot state may be torn until the next restart repair"
+                    );
+                }
+                return Err(std::io::Error::other(format!(
+                    "TreeKEM snapshot rebind failed, named-group write rolled back: {e}"
+                )));
+            }
+            RebindOutcome::DeferredContention => tracing::debug!(
+                group_id = %LogHexId::group(group_id),
+                "#457: snapshot rebind deferred — a concurrent membership apply holds the TreeKEM group and will write named+snapshot atomically under this same lock"
+            ),
+            RebindOutcome::Rebound | RebindOutcome::NotApplicable => {}
+        }
     }
     outcome
 }
@@ -2837,17 +2910,36 @@ pub(in crate::server) async fn persist_named_group_info(
 ///    snapshot still current, so re-bind it, persist, and restore the group
 ///    into the live map.
 ///
-/// Best-effort by design: a contended TreeKEM mutex (try_lock) or a
-/// genuinely diverged binding (epoch advanced without a new snapshot) is
-/// skipped loudly — never a crash, never a wrong binding.
-async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &str) {
+/// Outcome of a rebind attempt (#457 review r2). `Failed` fails the whole
+/// named persist (caller rolls back); `DeferredContention` is SUCCESS — a
+/// concurrent membership apply holds the TreeKEM group mutex and its atomic
+/// journal write (taken under the SAME persistence lock, after this call
+/// returns) writes named+snapshot together, superseding this rebind.
+#[derive(Debug)]
+enum RebindOutcome {
+    /// Group is not on the TreeKEM plane (or withdrawn/unknown) — nothing to do.
+    NotApplicable,
+    /// Envelope re-bound (or repaired) and persisted.
+    Rebound,
+    /// TreeKEM group mutex contended — the concurrent atomic writer covers it.
+    DeferredContention,
+    /// Encode/write failure — the caller must fail the operation.
+    Failed(anyhow::Error),
+}
+
+async fn rebind_treekem_snapshot_after_named_seal(
+    state: &AppState,
+    group_id: &str,
+) -> RebindOutcome {
     let info = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).cloned()
     };
-    let Some(info) = info else { return };
+    let Some(info) = info else {
+        return RebindOutcome::NotApplicable;
+    };
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
-        return;
+        return RebindOutcome::NotApplicable;
     }
     // Arm 1: live group — refresh the envelope binding in place.
     let live = {
@@ -2858,41 +2950,33 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
         let Ok(guard) = group.try_lock() else {
             tracing::debug!(
                 group_id = %LogHexId::group(group_id),
-                "TreeKEM snapshot rebind skipped: group mutex contended (#457)"
+                "TreeKEM snapshot rebind deferred: group mutex contended (#457)"
             );
-            return;
+            return RebindOutcome::DeferredContention;
         };
-        match encode_treekem_snapshot_envelope(&info, &guard) {
+        return match encode_treekem_snapshot_envelope(&info, &guard) {
             Ok(bytes) => {
-                if let Err(e) =
-                    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, bytes).await
-                {
-                    tracing::warn!(
-                        group_id = %LogHexId::group(group_id),
-                        "TreeKEM snapshot rebind persist failed (#457): {e}"
-                    );
+                match persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, bytes).await {
+                    Ok(()) => RebindOutcome::Rebound,
+                    Err(e) => RebindOutcome::Failed(e),
                 }
             }
-            Err(e) => {
-                tracing::warn!(
-                    group_id = %LogHexId::group(group_id),
-                    "TreeKEM snapshot rebind encode failed (#457): {e}"
-                );
-            }
-        }
-        return;
+            Err(e) => RebindOutcome::Failed(e),
+        };
     }
     // Arm 2: repair from disk — only a metadata-only divergence qualifies.
     let path = treekem_snapshot_path(&state.treekem_dir, group_id);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return RebindOutcome::NotApplicable;
+        }
         Err(e) => {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
                 "TreeKEM snapshot rebind read failed (#457): {e}"
             );
-            return;
+            return RebindOutcome::Failed(anyhow::anyhow!("snapshot read: {e}"));
         }
     };
     let envelope = match decode_treekem_snapshot_envelope(&bytes) {
@@ -2902,14 +2986,14 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
                 group_id = %LogHexId::group(group_id),
                 "TreeKEM snapshot rebind skipped: legacy unbound snapshot (#457)"
             );
-            return;
+            return RebindOutcome::NotApplicable;
         }
         Err(e) => {
             tracing::warn!(
                 group_id = %LogHexId::group(group_id),
                 "TreeKEM snapshot rebind skipped: undecodable snapshot (#457): {e}"
             );
-            return;
+            return RebindOutcome::Failed(e);
         }
     };
     if envelope.security_binding != info.security_binding
@@ -2921,7 +3005,7 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
             named_revision = info.state_revision,
             "TreeKEM snapshot rebind refused: epoch/binding diverged — secure content needs a fresh share (#457)"
         );
-        return;
+        return RebindOutcome::NotApplicable;
     }
     let rebound = TreeKemSnapshotEnvelope {
         version: TREEKEM_DAEMON_SNAPSHOT_VERSION,
@@ -2938,7 +3022,7 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
                 group_id = %LogHexId::group(group_id),
                 "TreeKEM snapshot rebind encode failed (#457): {e}"
             );
-            return;
+            return RebindOutcome::Failed(anyhow::anyhow!("envelope encode: {e}"));
         }
     }
     if let Err(e) =
@@ -2948,7 +3032,7 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
             group_id = %LogHexId::group(group_id),
             "TreeKEM snapshot rebind persist failed (#457): {e}"
         );
-        return;
+        return RebindOutcome::Failed(e);
     }
     match restore_local_treekem_group_from_snapshot(state, &info, &rebound.snapshot) {
         Ok(group) => {
@@ -2971,6 +3055,7 @@ async fn rebind_treekem_snapshot_after_named_seal(state: &AppState, group_id: &s
             );
         }
     }
+    RebindOutcome::Rebound
 }
 
 fn restore_local_treekem_group_from_snapshot(
@@ -11314,11 +11399,17 @@ pub(in crate::server) async fn join_group_via_invite(
                         .await;
                     });
                 }
+                let confirmed = membership_state == "active";
                 return (
                     StatusCode::OK,
                     Json(serde_json::json!({
                         "ok": true,
-                        "already_joined": true,
+                        // #458 (review r2): `already_joined` claims a
+                        // CONFIRMED membership. A stub without the member's
+                        // own MemberAdded in the chain is NOT joined — the
+                        // typed `join_state` says so and the volley refire
+                        // above is already repairing it.
+                        "already_joined": confirmed,
                         "join_state": membership_state,
                         "group_id": group_id_hex,
                         "group_name": info.name,
@@ -11400,18 +11491,36 @@ pub(in crate::server) async fn join_group_via_invite(
 
             let chat_topic = info.general_chat_topic();
 
-            if !matches!(
-                persist_named_groups_mutation(&state, |groups| {
-                    groups.insert(group_id_hex.clone(), info.clone());
-                    true
-                })
-                .await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
-                return api_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "named-group state is not directory-durable",
-                );
+            // #458 (review r2): the joiner must NOT durably record an
+            // unconfirmed join. The stub is inserted in MEMORY so the
+            // listeners/poll/volley machinery works, but named_groups.json
+            // only becomes durable when the member's own `MemberAdded` is
+            // observed in the chain (the apply path persists at that
+            // point). Exception: when the invite's committed base state
+            // already seats the local joiner (single-daemon self-rejoin
+            // via an invite minted before leaving), the signed base IS the
+            // confirmation — keep the durable write for that shape.
+            let base_seats_joiner = info.has_active_member(&joiner_hex);
+            if base_seats_joiner {
+                if !matches!(
+                    persist_named_groups_mutation(&state, |groups| {
+                        groups.insert(group_id_hex.clone(), info.clone());
+                        true
+                    })
+                    .await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    );
+                }
+            } else {
+                state
+                    .named_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), info.clone());
             }
             drop(membership_guard);
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
@@ -11620,6 +11729,11 @@ pub(in crate::server) async fn join_group_via_invite(
                     "group_id": group_id_hex,
                     "group_name": invite.group_name,
                     "chat_topic": chat_topic,
+                    // #458 (review r2): the join is CONFIRMED only when the
+                    // invite's committed base already seated us (self-rejoin
+                    // shape); a fresh join stays pending until our own
+                    // MemberAdded lands in the chain.
+                    "join_state": if base_seats_joiner { "active" } else { "pending_authority_commit" },
                 })),
             )
         }

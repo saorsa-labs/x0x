@@ -694,12 +694,31 @@ async fn issue458_joiner_adopts_member_added_across_rename_gap() -> Result<()> {
         result.accepted,
         "#458: joiner stub must adopt the authority MemberAdded across the prev-hash gap"
     );
+    let commit_hash = {
+        match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(c), ..
+            } => c.state_hash.clone(),
+            _ => String::new(),
+        }
+    };
     {
         let groups = joiner_state.named_groups.read().await;
         let jinfo = groups.get(&stage.group_id).expect("joiner group");
         assert!(
             jinfo.has_active_member(&stage.joiner_hex),
             "#458: adopted commit must seat the joiner"
+        );
+        // r2: the adoption FORKS self-consistently — the stored hash is
+        // recomputed from local content (never the commit's blind copy),
+        // so the next normal seal/apply cannot reject on hash≠content.
+        assert_ne!(
+            jinfo.state_hash, commit_hash,
+            "#458 r2: the commit's hash must never be copied over content it does not cover"
+        );
+        assert!(
+            jinfo.state_hash_is_current(),
+            "#458 r2: adopted state must be internally consistent (hash == recomputed content)"
         );
     }
     let row = diagnostics_row(joiner_state.as_ref(), &stage.group_id).await;
@@ -914,5 +933,764 @@ async fn integration_rename_restart_certified_join_single_announce() -> Result<(
             "joiner seated after the single-announce join"
         );
     }
+    Ok(())
+}
+
+// ── Review round 2 ────────────────────────────────────────────────────────
+
+/// #458 r2 item 1 (route level): the join stub is NOT durable before the
+/// member's own `MemberAdded` is observed; the initial AND duplicate join
+/// responses carry the typed pending state; durability lands exactly when
+/// the confirmation applies.
+#[tokio::test]
+async fn issue458r2_join_stub_not_durable_and_typed_until_member_added() -> Result<()> {
+    // Authority side: OwnerCertified group at revision 0 with an invite,
+    // and the certified joiner admitted (no rename → the MemberAdded
+    // chains cleanly from the invite base).
+    let stage = issue458_stage(0x51, false).await?;
+
+    // Build the invite LINK the way the authority's invite endpoint does:
+    // base state = the authority's revision-0 frontier.
+    let inviter_id = stage.authority.agent.agent_id();
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        stage.group_id.clone(),
+        "issue458r2-secret".to_string(),
+        &inviter_id,
+        3600,
+    );
+    {
+        // Rebuild the invite base from the PRE-JOIN authority info (the
+        // stub the joiner seeds from): founder-only roster.
+        let mut base_info = stage.base_info.clone();
+        base_info.recompute_state_hash();
+        invite.group_name = base_info.name.clone();
+        invite.group_description = Some(base_info.description.clone());
+        invite.group_created_at = Some(base_info.created_at);
+        invite.policy = Some(base_info.policy.clone());
+        invite.stable_group_id = Some(base_info.stable_group_id().to_string());
+        invite.base_state_revision = Some(base_info.state_revision);
+        invite.base_members_v2 = Some(base_info.members_v2.clone());
+        invite.base_state_hash = Some(base_info.state_hash.clone());
+        invite.base_prev_state_hash = base_info.prev_state_hash.clone();
+    }
+    let invite_link = invite.encode_link()?;
+
+    // JOINER side: owned install under the SAME owner (self-issued agent
+    // cert — the certified second device), no group state yet.
+    let jdir = tempfile::tempdir()?;
+    let owner_seed = [0xF2u8; 32];
+    let (joiner_pk, joiner_sk) = stage.joiner_key_bytes.clone();
+    let joiner_kp = crate::identity::AgentKeypair::from_bytes(&joiner_pk, &joiner_sk)?;
+    let agent_key_bytes = x0x::storage::serialize_agent_keypair(&joiner_kp)?;
+    std::fs::write(jdir.path().join("agent.key"), agent_key_bytes)?;
+    let joiner_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(jdir.path().join("machine2.key"))
+            .with_agent_key_path(jdir.path().join("agent.key"))
+            .with_agent_cert_path(jdir.path().join("agent.cert"))
+            .with_user_key(UserKeypair::from_seed(&owner_seed)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(jdir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    assert_eq!(
+        hex::encode(joiner_agent.agent_id().as_bytes()),
+        stage.joiner_hex,
+        "joiner agent identity must be the staged joiner (persisted key)"
+    );
+    let joiner_state = secure_endpoint_test_state_at(jdir.path(), joiner_agent).await?;
+    let named_groups_json = jdir.path().join("named_groups.json");
+
+    // 1. Initial join via the REAL route: typed pending, nothing durable.
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: invite_link.clone(),
+            display_name: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "initial join accepted, body: {body}"
+    );
+    assert_eq!(
+        body["join_state"], "pending_authority_commit",
+        "r2: initial join must be typed pending, body: {body}"
+    );
+    assert!(
+        joiner_state
+            .named_groups
+            .read()
+            .await
+            .contains_key(&stage.group_id),
+        "in-memory stub exists for the poll/listener machinery"
+    );
+    let on_disk = tokio::fs::read_to_string(&named_groups_json)
+        .await
+        .unwrap_or_default();
+    assert!(
+        !on_disk.contains(&stage.group_id),
+        "r2: an unconfirmed join must NOT be durable (named_groups.json)"
+    );
+
+    // 2. Duplicate join (retry while unconfirmed): typed pending, NOT
+    // already_joined.
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: invite_link,
+            display_name: None,
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "duplicate join ok, body: {body}");
+    assert_eq!(
+        body["already_joined"], false,
+        "r2: an unconfirmed join must not claim already_joined, body: {body}"
+    );
+    assert_eq!(
+        body["join_state"], "pending_authority_commit",
+        "r2: duplicate join carries the typed pending state, body: {body}"
+    );
+
+    // 3. The authority's MemberAdded applies (the confirmation) — NOW the
+    // group must be durable.
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        stage.member_added.clone(),
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    if !result.accepted {
+        let stub = joiner_state
+            .named_groups
+            .read()
+            .await
+            .get(&stage.group_id)
+            .cloned()
+            .unwrap();
+        let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(c), ..
+        } = &stage.member_added
+        else {
+            panic!("no commit")
+        };
+        let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+        let probe_persist =
+            persist_named_group_info(joiner_state.as_ref(), &stage.group_id, stub.clone()).await;
+        let cert_probe = match &stage.member_added {
+            NamedGroupMetadataEvent::MemberAdded {
+                certificate_b64: Some(b),
+                ..
+            } => {
+                use base64::Engine as _;
+                let bytes = BASE64.decode(b).unwrap_or_default();
+                bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes)
+                    .map(|cert| {
+                        let owner = stub.policy.admission.owner_certified_user_id().cloned();
+                        (
+                            hex::encode(
+                                cert.user_id()
+                                    .map(|u| u.as_bytes().to_vec())
+                                    .unwrap_or_default(),
+                            ),
+                            owner.map(|o| hex::encode(o.as_bytes())),
+                            cert.agent_id().map(|a| hex::encode(a.as_bytes())),
+                        )
+                    })
+                    .map_err(|e| format!("decode: {e}"))
+            }
+            _ => Err("no cert".to_string()),
+        };
+        panic!(
+            "confirmation apply rejected: {result:?} | persist={probe_persist:?} | cert={cert_probe:?} | role={:?} verify={:?} stub_binding={:?} commit_binding={:?} stub_hash={} commit_prev={:?} commit_rev={} stub_rev={}",
+            stub.caller_role(&authority_hex),
+            c.verify_structure(),
+            stub.security_binding,
+            c.security_binding,
+            stub.state_hash,
+            c.prev_state_hash,
+            c.revision,
+            stub.state_revision,
+        );
+    }
+    let on_disk = tokio::fs::read_to_string(&named_groups_json)
+        .await
+        .unwrap_or_default();
+    assert!(
+        on_disk.contains(&stage.group_id),
+        "r2: the confirmed join IS durable once the member's own MemberAdded applied"
+    );
+    Ok(())
+}
+
+/// #458 r2 item 2 (security): adoption refuses a commit whose signer is not
+/// the admin the event names — `committed_by` must equal the actor.
+#[tokio::test]
+async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> {
+    let stage = issue458_stage(0x52, true).await?;
+    let (joiner_state, _jdir) = joiner_state_for(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stage.base_info.clone());
+
+    // Rebuild the authority's commit fields but SIGNED BY A THIRD KEY: the
+    // event still names the authority as `actor` (admin per the stub), the
+    // signature is internally valid, but `committed_by` ≠ actor.
+    let forged = {
+        let NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(real),
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_key_package_hash,
+            certificate_b64,
+            ..
+        } = stage.member_added.clone()
+        else {
+            panic!("stage carries a MemberAdded with a commit");
+        };
+        let signer = AgentKeypair::generate()?;
+        let signer_hex = hex::encode(signer.agent_id().as_bytes());
+        let _ = &signer_hex;
+        let forged_commit = x0x::groups::GroupStateCommit::sign(
+            real.group_id.clone(),
+            real.revision,
+            real.prev_state_hash.clone(),
+            real.roster_root.clone(),
+            real.policy_hash.clone(),
+            real.public_meta_hash.clone(),
+            real.security_binding.clone(),
+            real.withdrawn,
+            real.committed_at,
+            &signer,
+        )?;
+        NamedGroupMetadataEvent::MemberAdded {
+            group_id: stage.group_id.clone(),
+            revision,
+            actor,
+            agent_id,
+            display_name,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64,
+            commit: Some(forged_commit),
+        }
+    };
+
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        forged,
+        stage.authority.agent.agent_id(),
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        !result.accepted,
+        "#458 r2: a commit signed by a non-actor key must never be adopted"
+    );
+    let row = diagnostics_row(joiner_state.as_ref(), &stage.group_id).await;
+    assert_eq!(
+        row.counters.member_added_events_adopted, 0,
+        "no adoption for a third-party-signed commit"
+    );
+    Ok(())
+}
+
+/// #457 r2 item 4: a FAILED snapshot rebind fails the whole named persist
+/// (with a rollback of the visible map) — success is never reported over a
+/// torn named/snapshot pair.
+#[tokio::test]
+async fn issue457r2_rebind_failure_fails_the_persist() -> Result<()> {
+    let fixture = member_joined_treekem_fixture(0x53, 0x53).await?;
+    let state = &fixture.state;
+    let group_id = fixture.group_id.clone();
+
+    // Sabotage the snapshot path: a DIRECTORY where the .snap file must be
+    // written makes every snapshot write fail.
+    let snap_path = treekem_snapshot_path(&state.treekem_dir, &group_id);
+    tokio::fs::create_dir_all(&snap_path).await?;
+
+    let (pre_name, pre_hash) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        (info.name.clone(), info.state_hash.clone())
+    };
+    let outcome = update_named_group(
+        State(Arc::clone(state)),
+        Path(group_id.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("Must Not Stick".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(
+        outcome.status(),
+        StatusCode::SERVICE_UNAVAILABLE,
+        "#457 r2: rebind failure must fail the mutation, not report success"
+    );
+    let (post_name, post_hash) = {
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group");
+        (info.name.clone(), info.state_hash.clone())
+    };
+    assert_eq!(
+        (post_name.as_str(), post_hash.as_str()),
+        (pre_name.as_str(), pre_hash.as_str()),
+        "#457 r2: the visible map must be rolled back on rebind failure"
+    );
+    Ok(())
+}
+
+/// #457/#447/#458 review r2 item 5 — the REAL end-to-end walkthrough on the
+/// certified-TreeKEM OwnerCertified Home path: two REAL agents on loopback
+/// networking, the owner provisions a TreeKEM OwnerCertified Home, RENAMES
+/// it, RESTARTS (AppState rebuilt from the same dir, production
+/// `restore_treekem_groups`), and the certified second device announces
+/// exactly ONCE with identity — the real V3 publish, the real owner ingest,
+/// the real `ensure_blob` fetch over pubsub, the real watcher patch — then
+/// `POST /groups/:id/invite` + `POST /groups/join` run as ROUTES, the
+/// MemberJoined volley rides the metadata topic, and the joiner converges
+/// (TreeKEM Welcome installed, roster seat, durable state) with NO second
+/// manual announce.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn integration_treekem_home_rename_restart_single_announce_end_to_end() -> Result<()> {
+    let owner_dir = tempfile::tempdir()?;
+    let joiner_dir = tempfile::tempdir()?;
+    let owner_seed = [0x0E; 32];
+
+    let loopback_addr: std::net::SocketAddr = "127.0.0.1:0".parse()?;
+    let loopback_cfg = move || x0x::network::NetworkConfig {
+        bind_addr: Some(loopback_addr),
+        bootstrap_nodes: Vec::new(),
+        port_mapping_enabled: false,
+        ..x0x::network::NetworkConfig::default()
+    };
+
+    let build_owner_agent = || async {
+        Agent::builder()
+            .with_machine_key(owner_dir.path().join("machine.key"))
+            .with_agent_key_path(owner_dir.path().join("agent.key"))
+            .with_agent_cert_path(owner_dir.path().join("agent.cert"))
+            .with_user_key(UserKeypair::from_seed(&owner_seed)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(owner_dir.path().join("contacts.json"))
+            .with_network_config(loopback_cfg())
+            .build()
+            .await
+    };
+    let joiner_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(joiner_dir.path().join("machine.key"))
+            .with_agent_key_path(joiner_dir.path().join("agent.key"))
+            .with_agent_cert_path(joiner_dir.path().join("agent.cert"))
+            // The certified second device: same owner user key — the builder
+            // load-or-self-issues an agent certificate chained to the owner.
+            .with_user_key(UserKeypair::from_seed(&owner_seed)?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(joiner_dir.path().join("contacts.json"))
+            .with_network_config(loopback_cfg())
+            .build()
+            .await?,
+    );
+
+    // Bring up both networks (identity listeners + blob responders + the
+    // 3 s anonymous auto re-announce) and connect them.
+    let owner_agent = Arc::new(build_owner_agent().await?);
+    owner_agent.join_network().await?;
+    joiner_agent.join_network().await?;
+    let owner_net = owner_agent.network().expect("owner network").clone();
+    let joiner_net = joiner_agent.network().expect("joiner network").clone();
+    let joiner_addr = {
+        let a = joiner_net.bound_addr().await.expect("joiner bound");
+        if a.ip().is_unspecified() {
+            std::net::SocketAddr::new(
+                std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+                a.port(),
+            )
+        } else {
+            a
+        }
+    };
+    owner_net.connect_addr(joiner_addr).await?;
+    let joiner_peer = ant_quic::PeerId(joiner_agent.machine_id().0);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < deadline {
+        if owner_net.is_connected(&joiner_peer).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    if !owner_net.is_connected(&joiner_peer).await {
+        eprintln!("SKIP: loopback connect unavailable in this environment");
+        return Ok(());
+    }
+    // Let the 3 s anonymous auto re-announce fire and the gossip mesh settle
+    // BEFORE the joiner's single identity announce.
+    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+
+    // Owner state + TreeKEM OwnerCertified Home.
+    let owner_state =
+        secure_endpoint_test_state_at(owner_dir.path(), Arc::clone(&owner_agent)).await?;
+    let group_id = "0E".repeat(32);
+    let owner_kp = UserKeypair::from_seed(&owner_seed)?;
+    let mut home_info = x0x::groups::GroupInfo::with_policy(
+        "Home".to_string(),
+        String::new(),
+        owner_agent.agent_id(),
+        group_id.clone(),
+        owner_certified_policy(&owner_kp),
+    );
+    home_info.secure_plane = x0x::mls::SecureGroupPlane::TreeKem;
+    home_info.shared_secret = None;
+    let group_id_bytes = hex::decode(&group_id)?;
+    let creator_seed = agent_treekem_seed(owner_agent.as_ref(), &group_id_bytes);
+    let treekem_group =
+        x0x::mls::TreeKemMlsGroup::create(group_id_bytes, owner_agent.agent_id(), &creator_seed)?;
+    home_info.secret_epoch = treekem_group.epoch();
+    home_info.security_binding = Some(format!("treekem:epoch={}", treekem_group.epoch()));
+    home_info.recompute_state_hash();
+    let treekem_group = Arc::new(Mutex::new(treekem_group));
+    owner_state
+        .treekem_groups
+        .write()
+        .await
+        .insert(group_id.clone(), Arc::clone(&treekem_group));
+    owner_state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), home_info.clone());
+    let persist = persist_named_group_info(&owner_state, &group_id, home_info).await;
+    assert!(
+        matches!(persist, Ok(AtomicWriteOutcome::Durable)),
+        "Home provision must be durable (with snapshot rebind): {persist:?}"
+    );
+    ensure_named_group_listeners(Arc::clone(&owner_state), &group_id).await;
+
+    // RENAME the Home (the #457 trigger), durably.
+    let response = update_named_group(
+        State(Arc::clone(&owner_state)),
+        Path(group_id.clone()),
+        Json(UpdateGroupRequest {
+            name: Some("David's Home".to_string()),
+            description: None,
+        }),
+    )
+    .await
+    .into_response();
+    assert_eq!(response.status(), StatusCode::OK, "rename must succeed");
+
+    // RESTART the owner daemon: same dirs, agent key persisted, AppState
+    // rebuilt, production snapshot restore, listeners re-armed.
+    drop(owner_state);
+    let owner_agent = Arc::new(build_owner_agent().await?);
+    owner_agent.join_network().await?;
+    // Reconnect the restarted daemon to the joiner and let the mesh settle —
+    // the restart is a NEW network endpoint (exactly the live shape).
+    let owner_net = owner_agent
+        .network()
+        .expect("restarted owner network")
+        .clone();
+    owner_net.connect_addr(joiner_addr).await?;
+    let reconnect_deadline = std::time::Instant::now() + std::time::Duration::from_secs(20);
+    while std::time::Instant::now() < reconnect_deadline {
+        if owner_net.is_connected(&joiner_peer).await {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(
+        owner_net.is_connected(&joiner_peer).await,
+        "restarted owner must reconnect to the joiner"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // The restarted daemon's STARTUP announce (anonymous — real daemons
+    // announce at boot) starts its identity listener so it can INGEST.
+    owner_agent.announce_identity(false, false).await?;
+    let owner_state =
+        secure_endpoint_test_state_at(owner_dir.path(), Arc::clone(&owner_agent)).await?;
+    {
+        let named_groups = owner_state.named_groups.read().await.clone();
+        let restored = restore_treekem_groups(
+            &named_groups,
+            owner_state.agent.as_ref(),
+            &owner_state.treekem_dir,
+        )
+        .await;
+        assert!(
+            restored.contains_key(&group_id),
+            "#457: the renamed Home's TreeKEM group must survive the restart"
+        );
+    }
+    ensure_named_group_listeners(Arc::clone(&owner_state), &group_id).await;
+
+    // The certified second device announces exactly ONCE, with identity.
+    joiner_agent.announce_identity(true, true).await?;
+    let joiner_id = joiner_agent.agent_id();
+    let joiner_hex = hex::encode(joiner_id.as_bytes());
+    let evidence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
+    loop {
+        let resolved = {
+            let cache = owner_state.agent.identity_discovery_cache();
+            let cache = cache.read().await;
+            cache
+                .get(&joiner_id)
+                .and_then(|e| e.agent_certificate.clone())
+        };
+        if resolved.is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= evidence_deadline {
+            let cache = owner_state.agent.identity_discovery_cache();
+            let cache = cache.read().await;
+            let entry = cache.get(&joiner_id);
+            let peers = owner_net.connected_peers().await.len();
+            eprintln!(
+                "DIAG entry_present={} digest={:?} cert={:?} blob_stats={:?} peers={}",
+                entry.is_some(),
+                entry.and_then(|e| e.cert_digest.map(|d| hex::encode(&d[..4]))),
+                entry.and_then(|e| e.agent_certificate.as_ref().map(|c| c.agent_id().is_ok())),
+                owner_state.agent.announce_blob_cache.snapshot(),
+                peers
+            );
+            panic!("#447: the single identity announce must resolve (blob fetch + watcher)");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+
+    // Invite via the real route.
+    let response = create_group_invite(
+        State(Arc::clone(&owner_state)),
+        Path(group_id.clone()),
+        HeaderMap::new(),
+        axum::body::Bytes::new(),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "invite minted: {body}");
+    let invite_link = body["invite_link"]
+        .as_str()
+        .expect("invite_link in response")
+        .to_string();
+
+    // Joiner joins via the real route (in-memory stub + real volley).
+    let joiner_state =
+        secure_endpoint_test_state_at(joiner_dir.path(), Arc::clone(&joiner_agent)).await?;
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner_state)),
+        Json(JoinGroupRequest {
+            invite: invite_link,
+            display_name: Some("second-device".to_string()),
+        }),
+    )
+    .await
+    .into_response();
+    let (status, body) = response_json(response).await?;
+    assert_eq!(status, StatusCode::OK, "join accepted: {body}");
+    assert_eq!(
+        body["join_state"], "pending_authority_commit",
+        "r2: the initial join response is typed pending: {body}"
+    );
+
+    // Converge, leg 1: the authority applies the volley's MemberJoined and
+    // STAGES the authoritative MemberAdded (join result) — driven purely by
+    // the real pubsub volley from the join route.
+    let converge_deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let owner_has = owner_state
+            .named_groups
+            .read()
+            .await
+            .get(&group_id)
+            .is_some_and(|i| i.has_active_member(&joiner_hex));
+        if owner_has {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < converge_deadline,
+            "authority never applied the certified MemberJoined"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+
+    // Converge, leg 2: the joiner receives the staged MemberAdded. In a
+    // real daemon this arrives over the join-result DM (the poll's
+    // FetchRequest → `handle_join_result_message`, wired at the DM router)
+    // or the metadata topic; in-process the DM router is daemon wiring, so
+    // the production RECEIVE handler is driven directly with the owner's
+    // staged event — every check inside it (inviter pin, apply, Welcome
+    // install) is the shipped code.
+    let staged = loop {
+        let results = owner_state.pending_join_results.read().await;
+        if let Some(pending) = results.get(&join_result_key(&group_id, &joiner_hex)) {
+            break pending.event.clone();
+        }
+        drop(results);
+        assert!(
+            std::time::Instant::now() < converge_deadline,
+            "authority never staged the MemberAdded join result"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    };
+    // The staged MemberAdded references its Welcome blob by
+    // `welcome_ref` — in a real daemon the blob arrives over the
+    // welcome-chunk DM protocol (proven cross-node by the VPS groups
+    // harness on every run). In-process the DM router is daemon wiring, so
+    // the production RECEIVE handlers (`handle_join_result_message` +
+    // `handle_welcome_blob_message` Offer/Chunk) are driven directly with
+    // the OWNER's staged blob — the joiner-side install (crypto recheck,
+    // atomic persist, live-map insert) is the shipped code.
+    let welcome_ref = match &staged {
+        NamedGroupMetadataEvent::MemberAdded {
+            welcome_ref: Some(r),
+            ..
+        } => r.clone(),
+        _ => panic!("staged MemberAdded must reference its Welcome blob"),
+    };
+    let owner_blob = {
+        let welcomes = owner_state.pending_welcomes.read().await;
+        welcomes
+            .get(&welcome_ref.welcome_id)
+            .map(|p| p.bytes.clone())
+            .expect("owner staged the Welcome blob")
+    };
+    assert_eq!(
+        x0x::server::routes::named_groups::welcome_id_for_bytes(&owner_blob),
+        welcome_ref.welcome_id,
+        "staged blob matches its blake3 id"
+    );
+
+    // The joiner's fetch registers a receive slot the moment the apply
+    // starts — spawn the receive handler, wait for the slot, deliver.
+    let joiner_handle = {
+        let joiner_state = Arc::clone(&joiner_state);
+        let owner_id = owner_agent.agent_id();
+        let staged = staged.clone();
+        tokio::spawn(async move {
+            handle_join_result_message(
+                &joiner_state,
+                &owner_id,
+                x0x::server::routes::named_groups::JoinResultMessage::Result {
+                    event: Box::new(staged),
+                },
+            )
+            .await;
+        })
+    };
+    let slot_deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+    loop {
+        let slot = joiner_state
+            .pending_welcome_receives
+            .read()
+            .await
+            .contains_key(&welcome_ref.welcome_id);
+        if slot {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < slot_deadline,
+            "joiner never started the Welcome fetch"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let chunk_size = x0x::files::DEFAULT_CHUNK_SIZE;
+    let total_chunks = x0x::files::total_chunks_for_size(welcome_ref.byte_len, chunk_size);
+    handle_welcome_blob_message(
+        &joiner_state,
+        &owner_agent.agent_id(),
+        x0x::server::routes::named_groups::WelcomeBlobMessage::Offer {
+            group_id: group_id.clone(),
+            welcome_id: welcome_ref.welcome_id.clone(),
+            byte_len: welcome_ref.byte_len,
+            chunk_size,
+            total_chunks,
+            blake3_hex: welcome_ref.welcome_id.clone(),
+        },
+    )
+    .await;
+    for sequence in 0..total_chunks {
+        let start = (sequence as usize) * chunk_size;
+        let end = (((sequence as usize) + 1) * chunk_size).min(owner_blob.len());
+        let data = BASE64.encode(&owner_blob[start..end]);
+        handle_welcome_blob_message(
+            &joiner_state,
+            &owner_agent.agent_id(),
+            x0x::server::routes::named_groups::WelcomeBlobMessage::Chunk {
+                welcome_id: welcome_ref.welcome_id.clone(),
+                sequence,
+                data,
+            },
+        )
+        .await;
+    }
+    handle_welcome_blob_message(
+        &joiner_state,
+        &owner_agent.agent_id(),
+        x0x::server::routes::named_groups::WelcomeBlobMessage::Complete {
+            welcome_id: welcome_ref.welcome_id.clone(),
+        },
+    )
+    .await;
+    let joiner_deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let joiner_installed = joiner_state
+            .treekem_groups
+            .read()
+            .await
+            .contains_key(&group_id);
+        if joiner_installed {
+            break;
+        }
+        if std::time::Instant::now() >= joiner_deadline {
+            let groups = joiner_state.named_groups.read().await;
+            let info = groups.get(&group_id);
+            let row = diagnostics_row(joiner_state.as_ref(), &group_id).await;
+            panic!(
+                "joiner never installed the TreeKEM group: seat={:?} epoch={:?} counters={:?}",
+                info.and_then(|i| i.members_v2.get(&joiner_hex).map(|m| m.state)),
+                info.map(|i| i.secret_epoch),
+                row.counters
+            );
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+    joiner_handle.abort();
+
+    // The confirmed join is durable on the joiner (r2 item 1) and the
+    // owner applied exactly one MemberJoined.
+    let joiner_disk = tokio::fs::read_to_string(joiner_dir.path().join("named_groups.json"))
+        .await
+        .unwrap_or_default();
+    assert!(
+        joiner_disk.contains(&group_id),
+        "r2: the confirmed join is durable on the joiner"
+    );
+    let owner_row = diagnostics_row(owner_state.as_ref(), &group_id).await;
+    assert!(
+        owner_row.counters.member_joined_events_applied >= 1,
+        "authority applied the certified MemberJoined on the single-announce evidence"
+    );
     Ok(())
 }

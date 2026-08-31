@@ -2247,11 +2247,25 @@ async fn patch_discovery_entry_when_blob_lands(
         }
         let mut cache = cache.write().await;
         if let Some(entry) = cache.get_mut(agent_id) {
+            // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
+            // must still commit to the digest this fetch resolved. Between
+            // the fetch being triggered and landing, a newer announce can
+            // have moved the entry to digest D2 — the normal upsert would
+            // DROP the old cert there (see `upsert_discovered_agent`'s
+            // digest-change branch); this async path must not re-attach
+            // the superseded D1 evidence on top of it.
+            if entry.cert_digest != Some(*digest) {
+                tracing::debug!(
+                    agent = %hex::encode(&agent_id.0[..8]),
+                    current_digest = ?entry.cert_digest.map(hex::encode),
+                    "announce blob landed for a superseded digest; not patching (#447 r2)"
+                );
+                return;
+            }
             if entry.agent_certificate.is_none() {
                 entry.user_id = blob.user_id;
                 entry.cert_not_after = cert.not_after();
                 entry.agent_certificate = Some(cert.clone());
-                entry.cert_digest = Some(*digest);
                 tracing::debug!(
                     agent = %hex::encode(&agent_id.0[..8]),
                     "patched discovery entry from completed announce-blob fetch (#447)"
@@ -22582,6 +22596,68 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
     assert!(
         not_patched.agent_certificate.is_none(),
         "#447: a copied digest must not import another agent's cert"
+    );
+}
+
+/// #447 r2: a DELAYED fetch for superseded digest D1 must not attach its
+/// evidence after a newer announce moved the entry to D2 — the normal
+/// upsert clears the cert on a digest change, and the async watcher must
+/// not resurrect it. Only evidence matching the CURRENT announce digest
+/// may attach.
+#[tokio::test]
+async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x48; 32]).expect("owner kp");
+    let agent = identity::AgentKeypair::generate().expect("agent kp");
+    let old_cert = identity::AgentCertificate::issue_for_public_key(
+        &user_kp,
+        agent.public_key().as_bytes(),
+        None,
+    )
+    .expect("old cert");
+    let d1 = announce_v3::cert_digest(&old_cert.user_id().ok(), &Some(old_cert.clone()));
+
+    let cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut entry = discovered_agent_fixture(0x48, 100, &[], None);
+    entry.agent_id = agent.agent_id();
+    entry.cert_digest = Some(d1);
+    upsert_discovered_agent(&cache, entry).await;
+
+    // The D1 fetch completes and lands in the blob cache…
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest: d1,
+            user_id: old_cert.user_id().ok(),
+            agent_certificate: Some(old_cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+
+    // …but a NEWER announce already moved the entry to D2 (re-key/re-issue).
+    let d2 = [0xD2u8; 32];
+    let mut newer = discovered_agent_fixture(0x48, 200, &[], None);
+    newer.agent_id = agent.agent_id();
+    newer.cert_digest = Some(d2);
+    upsert_discovered_agent(&cache, newer).await;
+
+    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &d1, &agent.agent_id()).await;
+    let entry = cache
+        .read()
+        .await
+        .get(&agent.agent_id())
+        .cloned()
+        .expect("entry");
+    assert!(
+        entry.agent_certificate.is_none(),
+        "#447 r2: a superseded digest's evidence must not attach"
+    );
+    assert_eq!(
+        entry.cert_digest,
+        Some(d2),
+        "#447 r2: the entry keeps its CURRENT announce digest"
     );
 }
 
