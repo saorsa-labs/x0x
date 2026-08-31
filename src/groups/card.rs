@@ -683,17 +683,44 @@ mod tests {
         kem_public_key: Vec<u8>,
     }
 
-    /// Exact replica of the pre-#450 verifier path: the same length-
-    /// prefixed grammar, with `bincode(Option<V0404DmCapabilities>)` as
-    /// the caps encoding (what a v0.40.4 binary recomputes).
-    fn v0404_signable_bytes(card: &AgentCard) -> Vec<u8> {
-        let caps = card.dm_capabilities.as_ref().map(|c| V0404DmCapabilities {
-            max_protocol_version: c.max_protocol_version,
-            gossip_inbox: c.gossip_inbox,
-            kem_algorithm: c.kem_algorithm.clone(),
-            max_envelope_bytes: c.max_envelope_bytes,
-            kem_public_key: c.kem_public_key.clone(),
-        });
+    /// Frozen replica of the v0.40.4 `AgentCard` DECODER: the exact
+    /// pre-#437 field set, with `dm_capabilities:
+    /// Option<V0404DmCapabilities>`. Deserializing THIS build's card JSON
+    /// through this type reproduces bit-for-bit what an old peer's serde
+    /// sees — the `digest_support` field is dropped inside the caps
+    /// because the inner replica struct has nowhere to put it (the outer
+    /// fields all still match).
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    struct V0404AgentCard {
+        display_name: String,
+        agent_id: String,
+        machine_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_id: Option<String>,
+        #[serde(default)]
+        addresses: Vec<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        groups: Vec<CardGroup>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        stores: Vec<CardStore>,
+        created_at: u64,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        dm_capabilities: Option<V0404DmCapabilities>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        agent_public_key: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        owner_name: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        signature_scheme: Option<String>,
+    }
+
+    /// Exact replica of the pre-#450 verifier path over the OLD card
+    /// type: the same length-prefixed grammar, with
+    /// `bincode(Option<V0404DmCapabilities>)` as the caps encoding —
+    /// exactly what a v0.40.4 binary recomputes from what it decoded.
+    fn v0404_signable_bytes(card: &V0404AgentCard) -> Vec<u8> {
         let mut buf = Vec::with_capacity(512);
         buf.extend_from_slice(AGENT_CARD_SIGNATURE_DOMAIN);
         push_len_prefixed(&mut buf, card.display_name.as_bytes());
@@ -715,7 +742,7 @@ mod tests {
             push_len_prefixed(&mut buf, s.topic.as_bytes());
         }
         buf.extend_from_slice(&card.created_at.to_le_bytes());
-        let dm_bytes = bincode::serialize(&caps).unwrap_or_default();
+        let dm_bytes = bincode::serialize(&card.dm_capabilities).unwrap_or_default();
         push_len_prefixed(&mut buf, &dm_bytes);
         push_len_prefixed(
             &mut buf,
@@ -724,11 +751,19 @@ mod tests {
         buf
     }
 
-    /// #450 direction 1: a card signed by THIS build with
-    /// `digest_support: true` must verify under the frozen v0.40.4
-    /// decoder replica. Before the freeze, the true bit entered
-    /// `bincode(dm_capabilities)`, the old reader's recompute dropped it,
-    /// and every card from a new binary failed verification on old peers.
+    /// #450 direction 1: an OWNERLESS (v1-domain) card signed by THIS
+    /// build with `digest_support: true` must verify under the frozen
+    /// v0.40.4 decoder — the card JSON is deserialized through the
+    /// replica card TYPE, so the old peer's field-dropping parse is
+    /// exercised for real, not simulated. Before the freeze, the true bit
+    /// entered `bincode(dm_capabilities)`, the old reader's recompute
+    /// dropped it, and every card from a new binary failed verification
+    /// on old peers.
+    ///
+    /// Scope note (review r2): cards carrying an `owner_name` sign under
+    /// the v2 domain, which v0.40.4 rejects outright by design (ADR-0036
+    /// accepted limitation) — this fixture pins the ownerless v1 path,
+    /// the only shape old and new builds share.
     #[test]
     fn true_digest_card_verifies_under_frozen_v0404_decoder() {
         let kp = AgentKeypair::generate().expect("kp");
@@ -742,20 +777,19 @@ mod tests {
             .dm_capabilities
             .as_ref()
             .is_some_and(|c| c.digest_support));
+        assert!(card.owner_name.is_none(), "fixture pins the v1 domain");
         card.sign(&kp).expect("sign");
 
-        // Old-peer transport: JSON. The old decoder's struct has no
-        // `digest_support`, so the round trip through its shape DROPS the
-        // field — reproduce exactly that by decoding into JSON and
-        // re-materializing the card without the bit.
+        // Old-peer transport: JSON, decoded through the FROZEN v0.40.4
+        // card type. The replica's caps struct has no `digest_support`,
+        // so serde silently drops the field — the exact old-peer parse.
         let json = serde_json::to_string(&card).expect("card json");
-        let mut as_old: AgentCard = serde_json::from_str(&json).expect("old decode");
-        if let Some(caps) = as_old.dm_capabilities.as_mut() {
-            caps.digest_support = false;
-        }
+        let as_old: V0404AgentCard = serde_json::from_str(&json).expect("frozen v0.40.4 decode");
+        assert_eq!(as_old.signature_scheme, None);
 
-        // The frozen v0.40.4 recompute must equal the NEW signer's bytes
-        // byte-for-byte, so the embedded signature verifies.
+        // The frozen v0.40.4 recompute from the OLD type must equal the
+        // NEW signer's bytes byte-for-byte, so the embedded signature
+        // verifies under the old peer's own verifier.
         assert_eq!(
             v0404_signable_bytes(&as_old),
             card.signable_bytes(),
@@ -775,8 +809,10 @@ mod tests {
         );
     }
 
-    /// #450 direction 2: a card signed by a v0.40.4 agent (whose caps have
-    /// no digest bit at all) must keep verifying on THIS build.
+    /// #450 direction 2: a card signed by a v0.40.4 agent (whose caps
+    /// have no digest bit at all) must keep verifying on THIS build. The
+    /// old signer's view is likewise built through the frozen replica
+    /// type, so both directions exercise the same frozen decode.
     #[test]
     fn old_signed_card_verifies_on_new_decoder() {
         let kp = AgentKeypair::generate().expect("kp");
@@ -789,14 +825,16 @@ mod tests {
             kem_public_key: vec![3u8; 1184],
             digest_support: false,
         });
-        // Sign the way the old binary did: signable bytes over the OLD
-        // caps encoding.
+        // Sign the way the old binary did: parse the card JSON through
+        // its own (replica) type, then sign over the replica's encoding.
         card.agent_public_key = Some(hex::encode(kp.public_key().as_bytes()));
-        let bytes = v0404_signable_bytes(&card);
+        let json = serde_json::to_string(&card).expect("card json");
+        let as_old: V0404AgentCard = serde_json::from_str(&json).expect("frozen decode");
+        let bytes = v0404_signable_bytes(&as_old);
         let sig = sign_with_ml_dsa(kp.secret_key(), &bytes).expect("old-style sign");
         card.signature = Some(hex::encode(sig.as_bytes()));
 
-        let json = serde_json::to_string(&card).expect("card json");
+        let json = serde_json::to_string(&card).expect("signed card json");
         let restored: AgentCard = serde_json::from_str(&json).expect("new decode");
         restored
             .verify_signature()

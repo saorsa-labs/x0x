@@ -502,8 +502,19 @@ impl CapabilityStore {
         // clamping it here means a mid-flight flip can never steer relay
         // lane selection. Signed sources (the runtime advert and the
         // digest extension) are the only trust path for the bit.
+        // #448 r2: the clamp must not ERASE signed knowledge either — a
+        // later card import replaces the binding wholesale, so re-merge
+        // a still-fresh extension from the SAME machine exactly like
+        // `insert` does (review round 2: without this, one card import
+        // knocked the bit off until the next extension publish, which
+        // on-demand mode never emits).
         let mut capabilities = capabilities;
         capabilities.digest_support = false;
+        if let Some(ext) = fresh_digest_ext(&inner.digest_exts, agent_id.as_bytes(), now) {
+            if ext.machine_id == *machine_id.as_bytes() {
+                capabilities.digest_support = ext.digest_support;
+            }
+        }
         if let Some(existing) = inner.adverts.get(agent_id.as_bytes()) {
             if created_at_unix_ms < existing.created_at_unix_ms {
                 return false;
@@ -1149,5 +1160,54 @@ mod tests {
         // The signed extension remains the trust path for the bit.
         assert!(store.apply_digest_extension(agent, machine, true, now_unix_ms() + 1));
         assert!(store.lookup(&agent).expect("binding").digest_support);
+    }
+
+    /// Review r2 (#448): a later card import replaces the binding
+    /// wholesale with a FRESH local timestamp, so the unconditional clamp
+    /// used to erase a still-fresh, signed digest extension — in
+    /// on-demand mode nothing republishes the extension, so the bit stayed
+    /// lost indefinitely. The import must re-merge a fresh same-machine
+    /// extension exactly like a base-advert insert does.
+    #[test]
+    fn card_import_preserves_a_fresh_signed_digest_extension() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0x54; 32]);
+        let machine = MachineId([0x55; 32]);
+        let now = now_unix_ms();
+
+        // Signed knowledge lands first (extension before the card, and
+        // also materialized into an existing base binding).
+        assert!(store.apply_digest_extension(agent, machine, true, now));
+        let mut base_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x56; 1184]);
+        base_caps.digest_support = false;
+        assert!(store.insert(agent, machine, base_caps, now + 1));
+        assert!(store.lookup(&agent).expect("binding").digest_support);
+
+        // A same-version card import with a fresher local timestamp: the
+        // unsigned card bit is still clamped, but the SIGNED bit must
+        // survive the replacement.
+        let mut card_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x57; 1184]);
+        card_caps.digest_support = true;
+        assert!(store.insert_from_card(agent, machine, card_caps, now + 2));
+        let binding = store.lookup_binding(&agent).expect("card-replaced binding");
+        assert_eq!(binding.machine_id, machine);
+        assert!(
+            binding.capabilities.digest_support,
+            "a fresh same-machine extension must survive a card import"
+        );
+
+        // Machine churn still bounds the merge: an extension from the OLD
+        // machine never speaks for a card from a NEW machine.
+        let machine_b = MachineId([0x58; 32]);
+        let mut card_caps_b = DmCapabilities::v2_durable_gossip_ready(vec![0x59; 1184]);
+        card_caps_b.digest_support = true;
+        assert!(store.insert_from_card(agent, machine_b, card_caps_b, now + 3));
+        assert!(
+            !store
+                .lookup(&agent)
+                .expect("churned binding")
+                .digest_support,
+            "an extension from another machine must not ride a card import"
+        );
     }
 }

@@ -579,8 +579,8 @@ pub fn advert_is_publishable(caps: &DmCapabilities) -> bool {
 
 /// Build the steady-topic advert in its FROZEN v1 wire shape (#448).
 ///
-/// `capabilities` is projected onto [`dm::DmCapabilitiesV1Wire`] before
-/// signing and encoding, so the published bytes — and the signed bytes a
+/// `capabilities` is projected onto
+/// [`crate::dm::DmCapabilitiesV1Wire`] before
 /// v0.40.4 verifier recomputes — carry exactly the five pre-#437 caps
 /// fields. A true `digest_support` bit must instead travel via
 /// [`build_signed_digest_extension`] on

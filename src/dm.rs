@@ -134,13 +134,18 @@ pub struct DmCapabilities {
 /// separately-signed extension on
 /// [`DM_CAPABILITY_DIGEST_TOPIC`](crate::dm_capability::DM_CAPABILITY_DIGEST_TOPIC).
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct DmCapabilitiesV1Wire {
-    pub(crate) max_protocol_version: u16,
-    pub(crate) gossip_inbox: bool,
-    pub(crate) kem_algorithm: String,
-    pub(crate) max_envelope_bytes: usize,
+pub struct DmCapabilitiesV1Wire {
+    /// Highest DM protocol version (frozen v1 shape).
+    pub max_protocol_version: u16,
+    /// Gossip-inbox subscription + KEM publication state.
+    pub gossip_inbox: bool,
+    /// KEM algorithm identifier (`"ML-KEM-768"`).
+    pub kem_algorithm: String,
+    /// Maximum accepted envelope size.
+    pub max_envelope_bytes: usize,
+    /// ML-KEM-768 public key bytes (empty = not yet available).
     #[serde(default)]
-    pub(crate) kem_public_key: Vec<u8>,
+    pub kem_public_key: Vec<u8>,
 }
 
 /// Serde helper: omit `digest_support` when false so the encoding stays
@@ -224,7 +229,7 @@ impl DmCapabilities {
     /// [`DmCapabilitiesV1Wire`] for why no post-v1 field may ever enter
     /// a signed caps encoding.
     #[must_use]
-    pub(crate) fn to_v1_wire(&self) -> DmCapabilitiesV1Wire {
+    pub fn to_v1_wire(&self) -> DmCapabilitiesV1Wire {
         DmCapabilitiesV1Wire {
             max_protocol_version: self.max_protocol_version,
             gossip_inbox: self.gossip_inbox,

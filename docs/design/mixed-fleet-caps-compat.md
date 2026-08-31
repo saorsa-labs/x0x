@@ -57,8 +57,14 @@ fix), so the bit is accepted ONLY from signed sources:
 `CapabilityStore::insert_from_card` clamps a card-carried bit to `false`:
 a mid-flight flip of an unsigned field can never steer relay lane selection
 (the bit's only consumer, via `peer_relay::peer_advertises_inner_digest`).
+Because a card import replaces the binding wholesale with a fresh local
+timestamp, the clamp is followed by the same fresh-extension re-merge a
+base-advert insert performs (review r2) — an import cannot erase signed
+knowledge, and a stale/foreign-machine extension still cannot ride in.
 Fail-safe in both directions — `false` only ever degrades relay frames to the
 byte-identical v1 shape, which every receiver accepts.
+The extension topic `x0x/caps/v2/digest` is registered as Bulk admission
+priority in the X0X-0074 topic classifier, same as the steady advert.
 
 ### Store merge semantics
 
