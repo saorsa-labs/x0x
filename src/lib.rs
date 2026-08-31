@@ -3357,6 +3357,17 @@ const CAPABILITY_REFRESH_CONVERGENCE_WAIT: std::time::Duration = std::time::Dura
 /// Poll cadence while waiting for the subscriber task to ingest the response.
 const CAPABILITY_REFRESH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
 
+/// Requester-side cooldown between completed refresh flights for one
+/// recipient (the 2026-08-30 proof report §3 caps storm: one targeted
+/// request per strict send, no cooldown, so a product retry loop to an
+/// unreachable or pre-0.40.4 peer re-published on every attempt). Within
+/// the window the gate fails fast instead of re-requesting — the peer
+/// just answered (or could not), so a second request inside seconds
+/// cannot change the answer. Must exceed
+/// [`CAPABILITY_REFRESH_CONVERGENCE_WAIT`] so a cooldown-skip never cuts
+/// short an otherwise-healthy convergence.
+const CAPABILITY_REFRESH_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(10);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum CapabilityRefreshState {
     Pending,
@@ -3375,20 +3386,45 @@ struct CapabilityRefreshRegistryState {
     closed: bool,
     next_flight_id: u64,
     inflight: std::collections::HashMap<[u8; 32], CapabilityRefreshEntry>,
+    /// Wall-clock finish time of the last flight per recipient, feeding
+    /// the requester-side cooldown. Zero-duration cooldown (tests,
+    /// pre-cooldown behaviour) disables the check.
+    last_finished: std::collections::HashMap<[u8; 32], std::time::Instant>,
+    cooldown: std::time::Duration,
 }
-
 /// Bounded, recipient-keyed single-flight registry for strict capability
 /// discovery.
 ///
 /// Without it, N concurrent strict sends to the same not-yet-known recipient
 /// would each publish their own targeted request — turning the gate into a
 /// gossip amplifier exactly when the mesh is already struggling to converge.
+/// A per-recipient cooldown between COMPLETED flights (proof report §3, the
+/// prod caps storm) extends the same protection across sequential retries:
+/// within [`CAPABILITY_REFRESH_COOLDOWN`] of a finished flight the gate
+/// fails fast instead of re-requesting.
 /// The synchronous mutex is deliberate: registration and Drop cleanup are
 /// tiny non-awaiting operations, which lets an aborted worker remove its slot
 /// deterministically.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct CapabilityRefreshRegistry {
     state: std::sync::Mutex<CapabilityRefreshRegistryState>,
+}
+
+impl Default for CapabilityRefreshRegistry {
+    fn default() -> Self {
+        Self::with_cooldown(CAPABILITY_REFRESH_COOLDOWN)
+    }
+}
+
+impl CapabilityRefreshRegistry {
+    fn with_cooldown(cooldown: std::time::Duration) -> Self {
+        Self {
+            state: std::sync::Mutex::new(CapabilityRefreshRegistryState {
+                cooldown,
+                ..CapabilityRefreshRegistryState::default()
+            }),
+        }
+    }
 }
 
 enum CapabilityRefreshRegistration {
@@ -3421,6 +3457,19 @@ impl CapabilityRefreshRegistry {
             return CapabilityRefreshRegistration::Joined(existing.completion.clone());
         }
         if state.closed || state.inflight.len() >= MAX_INFLIGHT_CAPABILITY_REFRESHES {
+            return CapabilityRefreshRegistration::Unavailable;
+        }
+        // Requester-side cooldown: a flight for this recipient finished
+        // moments ago, so its targeted request was answered (or provably
+        // could not be) within the convergence window. Fail the send
+        // straight through the gate instead of re-amplifying the request
+        // on every product retry.
+        if state.cooldown > std::time::Duration::ZERO
+            && state
+                .last_finished
+                .get(&recipient_key)
+                .is_some_and(|finished_at| finished_at.elapsed() < state.cooldown)
+        {
             return CapabilityRefreshRegistration::Unavailable;
         }
         state.next_flight_id = state.next_flight_id.wrapping_add(1);
@@ -3485,6 +3534,19 @@ impl CapabilityRefreshRegistry {
             .is_some_and(|entry| entry.flight_id == flight_id)
         {
             state.inflight.remove(recipient_key);
+            // Stamp the cooldown clock and, while we hold the lock, evict
+            // stamps that can never gate again (bounded memory on
+            // long-lived daemons with churny recipient sets). Runs before
+            // the insert below, so the fresh stamp is never a candidate.
+            if state.cooldown > std::time::Duration::ZERO {
+                let cooldown = state.cooldown;
+                state
+                    .last_finished
+                    .retain(|_, finished_at| finished_at.elapsed() < cooldown);
+                state
+                    .last_finished
+                    .insert(*recipient_key, std::time::Instant::now());
+            }
         }
     }
 
@@ -17472,6 +17534,63 @@ mod tests {
             2,
             "two recipients means two flights, not three"
         );
+    }
+
+    /// Proof-report §3 (prod caps storm): sequential strict sends to one
+    /// recipient each published their own targeted request. A completed
+    /// flight must start a cooldown during which the gate fails fast
+    /// (`Unavailable`), and a zero cooldown preserves the old behaviour.
+    #[tokio::test]
+    async fn capability_refresh_registry_cooldown_blocks_immediate_reflight() {
+        let recipient = identity::AgentId([0x81_u8; 32]);
+        let finish_now =
+            |guard: CapabilityRefreshGuard,
+             completion_tx: tokio::sync::watch::Sender<CapabilityRefreshState>| async move {
+                completion_tx.send_replace(CapabilityRefreshState::Finished);
+                drop(guard);
+            };
+
+        let registry = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::from_secs(3_600),
+        ));
+        assert!(matches!(
+            registry.register_or_start(recipient, finish_now),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        for _ in 0..200 {
+            if registry.len() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert_eq!(registry.len(), 0, "flight drained");
+        assert!(
+            matches!(
+                registry.register_or_start(recipient, finish_now),
+                CapabilityRefreshRegistration::Unavailable
+            ),
+            "an immediate reflight within the cooldown must fail fast"
+        );
+
+        // Zero cooldown (explicit) keeps the pre-cooldown behaviour: a new
+        // flight starts right after the previous one finished.
+        let eager = std::sync::Arc::new(CapabilityRefreshRegistry::with_cooldown(
+            std::time::Duration::ZERO,
+        ));
+        assert!(matches!(
+            eager.register_or_start(recipient, finish_now),
+            CapabilityRefreshRegistration::Started(_)
+        ));
+        for _ in 0..200 {
+            if eager.len() == 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(matches!(
+            eager.register_or_start(recipient, finish_now),
+            CapabilityRefreshRegistration::Started(_)
+        ));
     }
 
     #[tokio::test]
