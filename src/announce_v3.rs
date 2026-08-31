@@ -25,9 +25,12 @@
 //!   decoder drop the beat (and V2 is retired by default) — the agent would
 //!   vanish from old peers. A named install therefore dual-publishes: `X0A3`
 //!   (name dropped, byte-identical to pre-0036) for old peers, `X0A4`
-//!   (carrying `self_name`) for new ones. The name stays outside the machine
-//!   signature and outside `cert_digest`, so verification and the blob
-//!   fetch path are untouched by either envelope.
+//!   (carrying `self_name`) for new ones. The name stays outside
+//!   `cert_digest` and outside the legacy `X0A3` machine signature; on
+//!   `X0A4` it rides INSIDE the V3.1 machine signature (`sign_v3_1`
+//!   signing the private `IdentityAnnouncementV31Unsigned` body), so
+//!   verification and the blob fetch path are untouched by either
+//!   envelope.
 
 use crate::{error, identity};
 
