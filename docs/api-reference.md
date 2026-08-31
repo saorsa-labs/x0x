@@ -64,14 +64,15 @@ Auth-class labels used throughout this reference:
   any session token), `POST /exec/run`, `POST /exec/cancel`,
   `POST /shutdown`, `POST /upgrade/apply` (binary swap + restart =
   lifecycle act), `POST /sync/devices/enroll`,
-  `DELETE /sync/devices/:machine_id`, `POST /groups/:id/delegate`
-  (signed capability with caller-chosen expiry), `POST /home/rename`,
-  and `PATCH /groups/:id` **when the target group is the Home**.
+  `POST /groups/:id/delegate` (signed capability with caller-chosen
+  expiry), `POST /home/rename`, and `PATCH /groups/:id` /
+  `PATCH /groups/:id/policy` **when the target carries Home metadata**
+  (metadata presence is the marker — never the current policy axes, so
+  the Home cannot be policy-flipped around the rename gate).
   Payload-conditional durable gates (body or prefix inspected, enforced
   in the handler): `POST /announce` **with
   `include_user_identity: true`**, and `POST /direct/send` / WS
   `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
-  (`GET /owner/agents` is bearer — a read-only roster view.)
 - **rider-allowed** — the three surfaces a rider token may reach (see the
   harness-boundary section below). Rider tokens authenticate in the
   `Authorization` header only.
@@ -481,10 +482,11 @@ uncertified holder of a valid invite is refused (`403`).
 **POST /home/rename** takes `{"name": "…"}`; it is a convenience wrapper over
 `PATCH /groups/:id` (admin-gated, sealed, persisted). Errors: `404` un-owned /
 no Home; `409` admin-gate failures. Requires the **durable-owner** token
-(#446 review round 2) — and `PATCH /groups/:id` requires it too when the
-target is the Home, so the alias cannot be bypassed by PATCHing the Home
-`group_id` revealed by session-readable `GET /home`. Ordinary groups keep
-the bearer PATCH path.
+(#446) — and `PATCH /groups/:id` **and** `PATCH /groups/:id/policy` require
+it too when the target carries Home metadata. Home is identified by metadata
+presence, NEVER by its current policy axes, so a session cannot
+policy-flip around the rename gate. Ordinary groups keep the bearer
+PATCH paths.
 
 **Known limitation (#449):** Home dedup is per-machine — each of the owner's
 devices provisions its own Home (observed live: two daemons sharing one

@@ -1195,6 +1195,80 @@ mod tests {
         }
     }
 
+    /// Review round 3 (verdict item 4): WebSocket actor PROPAGATION
+    /// through the real auth middleware. The probe mirrors exactly what
+    /// `ws_handler`/`ws_direct_handler` extract at upgrade
+    /// (`Extension<ActorContext>`); asserting its value per token class
+    /// proves the flag `handle_ws_connection` receives — combined with
+    /// `ws_send_direct_exec_prefix_requires_durable_owner` (the gate
+    /// honoring that flag), a session-authenticated WS connection cannot
+    /// craft reserved exec frames. A full socket-level handshake needs a
+    /// live listener (hyper upgrade) and is covered by the daemon-level
+    /// `tests/ws_integration.rs` suite.
+    #[tokio::test]
+    async fn ws_route_actor_propagation_through_real_middleware() -> anyhow::Result<()> {
+        use axum::extract::Extension;
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        async fn probe(
+            Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+        ) -> impl IntoResponse {
+            axum::Json(serde_json::json!({ "durable": actor.is_durable_owner() }))
+        }
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(std::sync::Arc::clone(&state));
+
+        let read = |uri: String, auth: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut builder = axum::http::Request::get(uri);
+                if let Some(token) = auth {
+                    builder = builder.header("authorization", format!("Bearer {token}"));
+                }
+                let resp = app
+                    .oneshot(builder.body(axum::body::Body::empty())?)
+                    .await?;
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await?;
+                Ok::<_, anyhow::Error>((
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                ))
+            }
+        };
+
+        // Browser path: session token via ?token= → durable=false.
+        let session = state.sessions.issue(std::time::Instant::now());
+        let (status, body) = read(format!("/ws?token={session}"), None).await?;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body["durable"], false,
+            "a session-authenticated WS connection must resolve durable=false"
+        );
+
+        // Durable header → durable=true.
+        let (status, body) = read("/ws".to_string(), Some("test-token".to_string())).await?;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body["durable"], true,
+            "durable bearer must resolve durable=true"
+        );
+
+        // No credential → 401 before the handler.
+        let (status, _body) = read("/ws".to_string(), None).await?;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
     // ========================================================================
     // Issue #120 — WS `direct_message` observed-origin serialization.
     // ========================================================================

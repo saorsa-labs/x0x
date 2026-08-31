@@ -14261,17 +14261,13 @@ pub(in crate::server) async fn update_named_group(
     if let Some(resp) = reject_withdrawn_group(info) {
         return resp;
     }
-    // Issue #446: Home-targeted PATCH = owner act (durable required).
-    // `find_home` re-locks the groups table, so match the same predicate
-    // inline: Home metadata + EXACTLY the Home policy for this owner.
-    if info.home.is_some()
-        && state
-            .agent
-            .identity()
-            .user_keypair()
-            .is_some_and(|kp| info.policy == super::home::home_policy(&kp.user_id()))
-        && !actor.is_durable_owner()
-    {
+    // Issue #446 (review round 3): Home-targeted PATCH = owner act
+    // (durable required). The marker is Home METADATA PRESENCE —
+    // deliberately NOT the current policy axes: a session could
+    // otherwise flip discoverability via PATCH /groups/:id/policy,
+    // rename while the exact-policy check is false, and restore it
+    // (round-2 bypass). Any group carrying Home metadata is durable.
+    if info.home.is_some() && !actor.is_durable_owner() {
         return api_error(
             StatusCode::FORBIDDEN,
             "mutating the Home requires the durable API token (not a session token)",
@@ -14336,10 +14332,18 @@ pub(in crate::server) async fn update_named_group(
         })),
     )
 }
-
 /// PATCH /groups/:id/policy — update policy (admin+).
+///
+/// Issue #446 (review round 3): a group carrying Home metadata is the
+/// owner-certified Home regardless of its CURRENT policy axes — a
+/// session must not be able to flip a Home's discoverability (or any
+/// other mutable axis) any more than rename it. Metadata presence, not
+/// policy shape, is the durable marker.
 pub(in crate::server) async fn update_group_policy(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupPolicyRequest>,
 ) -> impl IntoResponse {
@@ -14354,6 +14358,18 @@ pub(in crate::server) async fn update_group_policy(
     };
     if let Err(e) = require_admin_or_above(info, &caller_hex) {
         return e;
+    }
+    if let Some(resp) = reject_withdrawn_group(info) {
+        return resp;
+    }
+    // Issue #446 (review round 3): policy flips are how a session could
+    // disguise the Home (round-2 bypass chain) — gate them on the same
+    // Home-metadata marker as the rename PATCH.
+    if info.home.is_some() && !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "changing the Home policy requires the durable API token (not a session token)",
+        );
     }
     if let Some(resp) = reject_withdrawn_group(info) {
         return resp;

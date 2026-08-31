@@ -1361,9 +1361,10 @@ mod owner_act_tests {
     //! - admit the DURABLE token past the gate (the asserted non-403
     //!   outcome is whatever the handler does next with the given body).
     //!
-    //! `POST /home/rename` is pinned session-allowed in
-    //! `routes::home::tests` (issue #446 decision: wrapper over the
-    //! session-allowed `PATCH /groups/:id`).
+    //! `owner_act_matrix_universal` below asserts all three arms for
+    //! every static gated surface in ONE test. Target-conditional
+    //! surfaces (`PATCH /groups/:id` and `PATCH /groups/:id/policy` on a
+    //! Home-metadata group) are pinned in `routes::home::tests`.
     use super::*;
     use crate::server::rider_auth::ActorContext;
     use axum::body::to_bytes;
@@ -1926,6 +1927,111 @@ mod owner_act_tests {
                 resp.status(),
                 StatusCode::FORBIDDEN,
                 "{path} with a session bearer and a malformed body must be 403 pre-extractor"
+            );
+        }
+        Ok(())
+    }
+
+    /// Review round 3 (verdict item 4): the universal typed-403 proof in
+    /// ONE matrix test — every static gated surface through the REAL
+    /// `auth_middleware` + real handler: session → typed 403, rider →
+    /// 403, durable → past the gate. This is the production decision
+    /// path itself; the auth.rs matrix pins the pure route table.
+    #[tokio::test]
+    async fn owner_act_matrix_universal() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        crate::server::routes::home::provision_home(&state).await;
+        let app = matrix_router(Arc::clone(&state));
+        let exec_payload = {
+            let mut bytes = x0x::exec::EXEC_DM_PREFIX.to_vec();
+            bytes.extend_from_slice(b"bincode");
+            serde_json::json!({
+                "agent_id": "ab".repeat(32),
+                "payload": BASE64.encode(bytes),
+            })
+        };
+        // (method, path, body). The durable arm asserts ≠403 — the exact
+        // past-gate outcome is pinned per surface in the tests above.
+        let surfaces: &[(&str, &str, serde_json::Value)] = &[
+            (
+                "POST",
+                "/agent/sign",
+                serde_json::json!({
+                    "context": "example.test",
+                    "payload_b64": BASE64.encode(b"universal"),
+                }),
+            ),
+            (
+                "POST",
+                "/exec/run",
+                serde_json::json!({
+                    "agent_id": "ab".repeat(32), "argv": []
+                }),
+            ),
+            (
+                "POST",
+                "/exec/cancel",
+                serde_json::json!({ "request_id": "not-hex" }),
+            ),
+            ("POST", "/shutdown", serde_json::json!({})),
+            ("POST", "/upgrade/apply", serde_json::json!({})),
+            ("POST", "/sync/devices/enroll", serde_json::json!({})),
+            (
+                "DELETE",
+                &format!("/sync/devices/{}", "00".repeat(32)),
+                serde_json::json!({}),
+            ),
+            (
+                "POST",
+                "/groups/some-group/delegate",
+                serde_json::json!({
+                    "to_agent": "cd".repeat(32),
+                    "scope": "send_as",
+                    "expiry_ms": 1735689600000_u64,
+                }),
+            ),
+            (
+                "POST",
+                "/home/rename",
+                serde_json::json!({ "name": "Universal" }),
+            ),
+            ("POST", "/direct/send", exec_payload),
+        ];
+        for (method, path, body) in surfaces {
+            let (status, json) = call(
+                &app,
+                method,
+                path,
+                &session_token(&state).await,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} session: {json}"
+            );
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{method} {path} session 403 must name the durable requirement: {json}"
+            );
+
+            let (status, json) =
+                call(&app, method, path, &rider_token(&state).await, body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} rider: {json}"
+            );
+
+            let (status, json) = call(&app, method, path, DURABLE, body.clone()).await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} durable must clear the gate: {json}"
             );
         }
         Ok(())

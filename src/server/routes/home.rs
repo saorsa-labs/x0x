@@ -1279,6 +1279,141 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
+    /// WHY (issue #446, review round 3): the round-2 gate matched the
+    /// EXACT current Home policy, so a session could flip discoverability
+    /// via PATCH /groups/:id/policy, rename while the check was false,
+    /// and restore — renaming the Home with a session token. The round-3
+    /// fix gates on Home METADATA presence in BOTH PATCH handlers. This
+    /// test drives the entire exploit chain and asserts every step fails.
+    #[tokio::test]
+    async fn home_policy_flip_rename_bypass_is_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x46; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .route(
+                "/groups/:id/policy",
+                axum::routing::patch(super::super::named_groups::update_group_policy),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let call = |bearer: String, path: String, body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::patch(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("body builds"),
+                )
+                .await
+            }
+        };
+        let rename_body = serde_json::json!({ "name": "Stolen Rename" }).to_string();
+        let flip_body = serde_json::json!({ "discoverability": "listed_to_contacts" }).to_string();
+        let session = state.sessions.issue(std::time::Instant::now());
+
+        // Chain step 1 — flip the Home's discoverability: refused.
+        let response = call(
+            session.clone(),
+            format!("/groups/{home_id}/policy"),
+            flip_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session must not flip the Home policy: {body}"
+        );
+
+        // Chain step 2 — even with the policy ALREADY non-Home (flipped
+        // by the durable owner), the rename PATCH stays gated: the marker
+        // is Home metadata, not the policy shape.
+        let response = call(
+            "test-token".to_string(),
+            format!("/groups/{home_id}/policy"),
+            flip_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "durable may flip the Home policy: {body}"
+        );
+        let response = call(
+            session.clone(),
+            format!("/groups/{home_id}"),
+            rename_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session rename on a policy-flipped Home must STILL be refused: {body}"
+        );
+
+        // Chain step 3 — restoring the policy is the durable owner's act.
+        let restore = serde_json::json!({ "discoverability": "hidden" }).to_string();
+        let response = call(
+            session,
+            format!("/groups/{home_id}/policy"),
+            restore.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session must not restore the Home policy either: {body}"
+        );
+        let response = call(
+            "test-token".to_string(),
+            format!("/groups/{home_id}"),
+            rename_body,
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "durable renames the Home: {body}");
+
+        // Rider arm: the policy PATCH is not rider-allowed at all.
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "cd".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let response = call(rider, format!("/groups/{home_id}/policy"), restore).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rider must be denied on the policy PATCH: {body}"
+        );
+        Ok(())
+    }
+
     /// WHY: GET /home on an un-owned install is a clean 404.
     #[tokio::test]
     async fn get_home_without_home_is_404() -> anyhow::Result<()> {

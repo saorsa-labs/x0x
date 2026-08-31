@@ -562,10 +562,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": "invite_only"
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
@@ -584,10 +588,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": {"owner_certified": hex::encode(stranger.user_id().as_bytes())}
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "owner swap refused: {body}");
 
@@ -595,10 +603,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": {"owner_certified": hex::encode(owner_kp.user_id().as_bytes())}
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "same-owner policy retained: {body}");
     Ok(())
@@ -641,10 +653,14 @@ async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Resu
     }
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert!(
         status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::CONFLICT,
@@ -1096,10 +1112,14 @@ async fn ordinary_mutation_retains_member_inside_grace_window() -> Result<()> {
     // Unrelated metadata mutation through the ORDINARY seal path.
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert!(
         status == StatusCode::CONFLICT || status == StatusCode::INTERNAL_SERVER_ERROR,
