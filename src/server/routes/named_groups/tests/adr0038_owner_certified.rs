@@ -799,7 +799,8 @@ async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()>
     }
     // Persist + reload through the real restore path.
     assert!(save_named_groups(&state).await);
-    let reloaded = load_named_groups(&state.named_groups_path).await?;
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
     assert!(
         reloaded
             .get(&group_id)
@@ -1282,7 +1283,8 @@ async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()
     }
     // Restore: the loader's quarantine marker, as after a restart.
     assert!(save_named_groups(&state).await);
-    let mut reloaded = load_named_groups(&state.named_groups_path).await?;
+    let mut reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
     reloaded
         .get_mut(&group_id)
         .expect("group")

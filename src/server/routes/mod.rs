@@ -83,9 +83,10 @@ pub(super) use named_groups::{
     handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
     import_group_card, ingest_public_message, join_group_via_invite, leave_group,
     list_discovery_subscriptions, list_join_requests, list_named_groups,
-    load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
-    load_treekem_member_key_packages, named_group_metadata_event_group_id,
-    named_group_metadata_event_kind, now_millis_u64, publish_group_card_to_discovery,
+    load_causal_approval_queue, load_named_groups_merged, load_predecessor_relay_outbox,
+    load_treekem_member_key_packages, migrate_unsplit_home_suite_store_if_needed,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, now_millis_u64,
+    publish_group_card_to_discovery, recover_home_suite_sidecar_journals,
     recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
     remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
     save_named_groups_checked, save_named_groups_checked_unlocked,
@@ -104,7 +105,7 @@ pub(super) use named_groups::{
     CAUSAL_RELAY_OUTBOX_PER_DAEMON_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP,
     CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP, CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP,
     DIRECTORY_DIGEST_INTERVAL_SECS, DIRECTORY_RESUBSCRIBE_JITTER_MS,
-    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX,
+    GROUP_PREDECESSOR_RELAY_DM_PREFIX, GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE,
 };
 pub(super) use network::{
     ack_diagnostics, bootstrap_cache_stats, connectivity_diagnostics, dm_diagnostics,

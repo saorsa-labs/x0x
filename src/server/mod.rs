@@ -58,17 +58,18 @@ use routes::{
     ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
     list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
     list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_causal_approval_queue, load_named_groups, load_predecessor_relay_outbox,
-    load_treekem_member_key_packages, machine_for_agent_handler, machines_by_user_handler,
-    mls_decrypt, mls_encrypt, named_group_metadata_event_group_id, named_group_metadata_event_kind,
-    network_status, now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke,
-    owner_riders_issue, owner_riders_list, owner_riders_revoke, peer_health_handler, peers,
-    pin_machine, presence, presence_find, presence_foaf, presence_online, presence_status,
-    probe_peer_handler, publish, publish_group_card_to_discovery, put_kv_value, quick_trust,
-    recover_treekem_named_journals, reject_join_request, reject_unverified_direct_public_message,
-    relay_diagnostics, remove_mls_member, remove_named_group_member,
-    replay_pending_causal_approvals, restore_treekem_groups, revoke_contact,
-    run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
+    list_tasks, load_causal_approval_queue, load_named_groups_merged,
+    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
+    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
+    now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
+    owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
+    presence_find, presence_foaf, presence_online, presence_status, probe_peer_handler, publish,
+    publish_group_card_to_discovery, put_kv_value, quick_trust,
+    recover_home_suite_sidecar_journals, recover_treekem_named_journals, reject_join_request,
+    reject_unverified_direct_public_message, relay_diagnostics, remove_mls_member,
+    remove_named_group_member, replay_pending_causal_approvals, restore_treekem_groups,
+    revoke_contact, run_fallback_github_poll, run_gossip_update_listener, run_startup_update_check,
     save_named_groups_checked, save_named_groups_checked_unlocked,
     save_predecessor_relay_outbox_unlocked, seal_group_state, secure_group_decrypt,
     secure_group_encrypt, secure_group_reseal, secure_open_envelope_adversarial,
@@ -86,7 +87,7 @@ use routes::{
     CAUSAL_RELAY_OUTBOX_PER_GROUP_BYTE_CAP, CAUSAL_RELAY_OUTBOX_PER_GROUP_CAP,
     CAUSAL_RELAY_TARGETS_PER_DAEMON_CAP, DIRECTORY_DIGEST_INTERVAL_SECS,
     DIRECTORY_RESUBSCRIBE_JITTER_MS, GROUP_PREDECESSOR_RELAY_DM_PREFIX,
-    GROUP_PUBLIC_MESSAGE_DM_PREFIX, KV_STORE_DELTA_DM_PREFIX,
+    GROUP_PUBLIC_MESSAGE_DM_PREFIX, HOME_SUITE_GROUPS_FILE, KV_STORE_DELTA_DM_PREFIX,
 };
 use sse::{direct_events_sse, events_sse, peer_events_handler, presence_events, SseEvent};
 pub use state::{
@@ -200,7 +201,7 @@ fn owner_profile_path(config: &DaemonConfig, identity_dir: &Option<PathBuf>) -> 
     // dir — the user key lives at ~/.x0x/user.key, so the owner record is
     // its sibling. Returning None here would silently disable enforcement
     // for every default install.
-    dirs::home_dir().map(|home| home.join(".x0x").join(x0x::profile::OWNER_PROFILE_FILE))
+    crate::storage::x0x_home_dir().map(|dir| dir.join(x0x::profile::OWNER_PROFILE_FILE))
 }
 
 /// ADR-0036 owner singleton enforcement (daemon side).
@@ -229,7 +230,7 @@ async fn enforce_owner_singleton_prebuild(
     let key_path = match (&config.user_key_path, identity_dir) {
         (Some(path), _) => Some(path.clone()),
         (None, Some(dir)) => Some(dir.join("user.key")),
-        (None, None) => dirs::home_dir().map(|h| h.join(".x0x").join("user.key")),
+        (None, None) => crate::storage::x0x_home_dir().map(|dir| dir.join("user.key")),
     };
     // R3 fix: load the OWNER RECORD FIRST — a recorded owner demands a
     // matching key, whatever the key slot looks like. Only an UNRECORDED
@@ -424,9 +425,10 @@ pub async fn serve_with_options(
             Some(dir.clone())
         }
         (None, Some(name)) => {
-            let dir = dirs::home_dir()
-                .context("home directory required for instance identity directory")?
-                .join(format!(".x0x-{name}"));
+            // Issue #456: instance dirs are siblings of the default x0x
+            // home, so X0X_HOME relocates them too.
+            let dir = crate::storage::x0x_instance_dir(name)
+                .context("home directory required for instance identity directory")?;
             tokio::fs::create_dir_all(&dir)
                 .await
                 .context("failed to create instance identity directory")?;
@@ -589,6 +591,9 @@ pub async fn serve_with_options(
 
     // Load named groups from disk (if any)
     let named_groups_path = config.data_dir.join("named_groups.json");
+    // Issue #451: Home-Suite groups (owner-certified admission) persist in
+    // a sidecar old binaries never read; named_groups.json carries only
+    let home_suite_groups_path = config.data_dir.join(HOME_SUITE_GROUPS_FILE);
     let causal_approval_queue_path = config.data_dir.join("causal_approval_queue.json");
     let predecessor_relay_outbox_path = config.data_dir.join("predecessor_relay_outbox.json");
     let public_group_bootstrap_outbox_path =
@@ -603,7 +608,15 @@ pub async fn serve_with_options(
     recover_treekem_named_journals(&named_groups_path, &treekem_dir)
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
-    let named_groups = load_named_groups(&named_groups_path).await?;
+    // Review r2 (#451): replay leftover Home-Suite sidecar journals before
+    // the merged load, so a crash inside the atomic TreeKEM persist
+    // transaction heals before the roster is read.
+    recover_home_suite_sidecar_journals(&home_suite_groups_path, &treekem_dir)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to recover Home-Suite sidecar journal: {e}"))?;
+    let named_groups = load_named_groups_merged(&named_groups_path, &home_suite_groups_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to load named groups: {e}"))?;
     let treekem_member_key_packages = load_treekem_member_key_packages(
         &treekem_dir.join("member-key-packages.json"),
         &named_groups,
@@ -828,6 +841,7 @@ pub async fn serve_with_options(
         crdt_handle_locks: RwLock::new(HashMap::new()),
         named_groups: RwLock::new(named_groups),
         named_groups_path,
+        home_suite_groups_path,
         named_groups_persistence_lock: Mutex::new(()),
         named_groups_requires_durability_confirmation: AtomicBool::new(false),
         causal_approval_queue_persistence_lock: Mutex::new(()),
@@ -909,6 +923,14 @@ pub async fn serve_with_options(
         forward_service,
         owner_sync,
     });
+
+    // Review r2 (#451): a store written by a pre-#451 Home-Suite binary
+    // still holds owner-certified entries in named_groups.json — v0.40.x
+    // would crash-loop on it. Migrate to the split layout immediately so
+    // the data dir is downgrade-safe from this start onward.
+    migrate_unsplit_home_suite_store_if_needed(&state)
+        .await
+        .map_err(|e| anyhow::anyhow!("failed to migrate unsplit Home-Suite store: {e}"))?;
 
     let port_file = config.data_dir.join("api.port");
 
@@ -3316,7 +3338,13 @@ mod owner_singleton_tests {
             ..DaemonConfig::default()
         };
         let path = owner_profile_path(&config, &None).expect("default install must resolve");
-        assert!(path.ends_with(".x0x/owner.json") || path.ends_with(".x0x\\owner.json"));
+        // Issue #456: the default routes through the storage resolver —
+        // `$X0X_HOME/owner.json` when overridden (the test harness sets
+        // X0X_HOME), `<home>/.x0x/owner.json` otherwise.
+        let expected_home =
+            crate::storage::x0x_home_dir().expect("default identity dir resolvable");
+        assert!(path.starts_with(&expected_home));
+        assert!(path.ends_with("owner.json"));
 
         // Explicit user key path wins (sibling of that key).
         let custom = PathBuf::from("/custom/dir/user.key");

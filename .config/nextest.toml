@@ -1,3 +1,25 @@
+# Issue #456: the workspace suite must never write Home-Suite state into a
+# developer's real ~/.x0x (owner-cert journal, agent.cert, move/placement
+# files, history.db, contacts). nextest has no config-level env table, so
+# every test process runs through an `env` wrapper that pins
+# X0X_HOME (honoured by the storage default-dir resolver) and HOME (the
+# backstop for any site not yet routed through the resolver) to a scratch
+# directory. To debug against a different location, change it here.
+#
+# Review r2fix (PR #465 CI abort): RUST_MIN_STACK=16MiB gives the libtest
+# worker threads real headroom. The deep async fixtures (the shared
+# secure_endpoint_test_state machine nests the whole Agent builder future)
+# sit just past the 2 MiB std default on x86_64 debug builds — the suite
+# crashed there with SIGABRT stack overflows. The memory is reserved, not
+# committed, so the cost is negligible.
+experimental = ["wrapper-scripts"]
+
+[scripts.wrapper.x0x-test-home]
+command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home'
+
+[[profile.default.scripts]]
+filter = 'all()'
+run-wrapper = 'x0x-test-home'
 [profile.default]
 # Network integration tests need longer timeouts for QUIC handshakes
 # and gossip propagation on macOS

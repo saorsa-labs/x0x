@@ -309,6 +309,81 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
+/// temp file (0600) → `sync_all` the file → atomic rename into place →
+/// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
+/// loss can never leave a torn/half-written destination or a rename the
+/// directory does not remember — required for the persistence journals
+/// that must be durable BEFORE the live state they protect changes.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created, the write, the
+/// file sync, the rename, or the parent-directory sync fails.
+pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .await
+        .map_err(IdentityError::from)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        IdentityError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid path: missing file name",
+        ))
+    })?;
+    let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique
+    ));
+
+    let mut file = fs::File::create(&tmp_path)
+        .await
+        .map_err(IdentityError::from)?;
+    if let Err(err) = file.write_all(&bytes).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+    // Durable point 1: the journal bytes reach stable storage BEFORE the
+    // rename makes them visible.
+    if let Err(err) = file.sync_all().await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&tmp_path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&tmp_path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+
+    // Durable point 2: the rename itself survives power loss.
+    let dir = fs::File::open(parent).await.map_err(IdentityError::from)?;
+    if let Err(err) = dir.sync_all().await {
+        return Err(IdentityError::from(err));
+    }
+    Ok(())
+}
+
 /// Write arbitrary secret bytes to `path` with the same protection x0x gives
 /// key material: an atomic write (temp file + rename) with Unix mode `0600`.
 ///
@@ -325,19 +400,97 @@ pub async fn write_private_bytes(path: &Path, bytes: Vec<u8>) -> Result<()> {
     write_private_file(path, bytes).await
 }
 
+/// Pure resolution core for [`x0x_home_dir`] (issue #456): the default x0x
+/// identity directory is `$X0X_HOME` when set, else `<home>/.x0x`.
+///
+/// Split out so tests can exercise precedence without racing the process
+/// environment (unit tests run multi-threaded; `std::env::set_var` is
+/// process-global).
+#[must_use]
+pub fn resolve_x0x_home(
+    env_override: Option<&str>,
+    home: Option<std::path::PathBuf>,
+) -> Option<std::path::PathBuf> {
+    let overridden = env_override
+        .filter(|s| !s.is_empty())
+        .map(std::path::PathBuf::from);
+    overridden.or_else(|| home.map(|h| h.join(X0X_DIR)))
+}
+
+/// The process-wide default x0x identity directory (issue #456).
+///
+/// Every `~/.x0x` fallback in the codebase resolves through here:
+/// - precedence: `$X0X_HOME` (if set and non-empty) > `$HOME/.x0x`;
+/// - the test harness sets `X0X_HOME` (`.config/nextest.toml` wrapper), so
+///   the workspace suite never writes Home-Suite state (owner-cert journal,
+///   `agent.cert`, move/placement files, history, contacts) into a
+///   developer's real `~/.x0x`;
+/// - in UNIT-TEST builds only (`#[cfg(test)]`, compiled out of every
+///   shipped target — review r4: the production resolver must never
+///   panic), a test reaching the real-home fallback without an override
+///   PANICS by design: that is exactly the #456 pollution bug, so it
+///   fails loudly instead of silently dirtying the maintainer's node.
+///   Integration binaries are covered by the harness env (the wrapper
+///   sets `X0X_HOME` for every test process, so their fallbacks redirect
+///   rather than reach the real home).
+///
+/// # Panics
+/// In `#[cfg(test)]` builds when no override is active — never in debug
+/// or release binaries shipped to users.
+pub fn x0x_home_dir() -> Option<std::path::PathBuf> {
+    let env_override = std::env::var("X0X_HOME").ok();
+    if env_override.as_deref().is_some_and(|s| !s.is_empty()) {
+        return env_override.map(std::path::PathBuf::from);
+    }
+    #[cfg(test)]
+    {
+        panic!(
+            "#456 test-home guard: a test reached the real ~/.x0x fallback. \
+             Set X0X_HOME (the nextest harness does), or give the builder \
+             explicit paths (identity_dir / key / cert / store paths)."
+        );
+    }
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir();
+        resolve_x0x_home(None, home)
+    }
+}
+
+/// The identity directory of a NAMED daemon instance (issue #456): a
+/// sibling of the default x0x home named `.x0x-<name>`. With `X0X_HOME`
+/// set, instances live beside the override's parent — the same "instances
+/// sit next to the default dir" rule as `~/.x0x-<name>` on a real home.
+#[must_use]
+pub fn resolve_x0x_instance_dir(
+    home: Option<std::path::PathBuf>,
+    name: &str,
+) -> Option<std::path::PathBuf> {
+    let home = home?;
+    let parent = home.parent().map(std::path::Path::to_path_buf)?;
+    Some(parent.join(format!(".x0x-{name}")))
+}
+
+/// See [`resolve_x0x_instance_dir`]; resolves the default home first.
+#[must_use]
+pub fn x0x_instance_dir(name: &str) -> Option<std::path::PathBuf> {
+    resolve_x0x_instance_dir(x0x_home_dir(), name)
+}
+
 /// Get the x0x configuration directory path.
+///
+/// Honours `X0X_HOME` (issue #456) via [`x0x_home_dir`].
 ///
 /// # Returns
 ///
-/// The path to the .x0x directory in the user's home directory
+/// The path to the .x0x directory (default identity directory)
 pub(crate) async fn x0x_dir() -> Result<std::path::PathBuf> {
-    let home = dirs::home_dir().ok_or_else(|| {
+    x0x_home_dir().ok_or_else(|| {
         IdentityError::from(std::io::Error::new(
             std::io::ErrorKind::NotFound,
-            "home directory not found",
+            "no home directory and no X0X_HOME override",
         ))
-    })?;
-    Ok(home.join(X0X_DIR))
+    })
 }
 
 /// Save a MachineKeypair to the default storage location.
@@ -652,10 +805,9 @@ pub async fn load_agent_certificate_from<P: AsRef<Path>>(path: P) -> Result<Agen
 fn revocation_path(identity_dir: Option<&Path>) -> Option<std::path::PathBuf> {
     match identity_dir {
         Some(dir) => Some(dir.join(REVOCATION_FILE)),
-        None => {
-            let home = dirs::home_dir()?;
-            Some(home.join(X0X_DIR).join(REVOCATION_FILE))
-        }
+        // Issue #456: honor X0X_HOME (tests relocate this; never the real
+        // home under the test harness).
+        None => x0x_home_dir().map(|dir| dir.join(REVOCATION_FILE)),
     }
 }
 
@@ -1157,5 +1309,104 @@ mod tests {
             kp.public_key().as_bytes(),
             "the plain loader must recover key material from a v2 file"
         );
+    }
+
+    // ── Default-dir resolution (issue #456) ──
+
+    #[test]
+    fn resolve_x0x_home_prefers_override_over_real_home() {
+        let real_home = std::path::PathBuf::from("/home/developer");
+        // Override wins.
+        assert_eq!(
+            super::resolve_x0x_home(Some("/tmp/xt"), Some(real_home.clone())),
+            Some(std::path::PathBuf::from("/tmp/xt"))
+        );
+        // An EMPTY override is ignored (unset semantics), never a
+        // resolve-to-empty-dir footgun.
+        assert_eq!(
+            super::resolve_x0x_home(Some(""), Some(real_home.clone())),
+            Some(real_home.join(".x0x"))
+        );
+        // Default: <home>/.x0x.
+        assert_eq!(
+            super::resolve_x0x_home(None, Some(real_home)),
+            Some(std::path::PathBuf::from("/home/developer/.x0x"))
+        );
+        // Nothing resolvable at all.
+        assert_eq!(super::resolve_x0x_home(None, None), None);
+    }
+
+    #[test]
+    fn instance_dir_is_sibling_of_default_home() {
+        let home = std::path::PathBuf::from("/home/developer/.x0x");
+        assert_eq!(
+            super::resolve_x0x_instance_dir(Some(home.clone()), "alice"),
+            Some(std::path::PathBuf::from("/home/developer/.x0x-alice"))
+        );
+        // An override home relocates instances beside the override.
+        let override_home = std::path::PathBuf::from("/tmp/xt");
+        assert_eq!(
+            super::resolve_x0x_instance_dir(Some(override_home), "alice"),
+            Some(std::path::PathBuf::from("/tmp/.x0x-alice"))
+        );
+        assert_eq!(super::resolve_x0x_instance_dir(None, "alice"), None);
+    }
+
+    /// #456 tripwire proof: outside the harness env (`X0X_HOME` unset, as
+    /// with a bare `cargo test`), the resolver REFUSES to hand back the
+    /// real `~/.x0x` in test builds — it panics, so a polluting test fails
+    /// loudly instead of dirtying the maintainer's node. Self-skipping
+    /// under the nextest harness (which sets X0X_HOME).
+    #[test]
+    fn x0x_home_dir_test_guard_panics_without_override() {
+        if std::env::var_os("X0X_HOME").is_some_and(|v| !v.is_empty()) {
+            // Harness env active: the guard cannot fire; nothing to prove.
+            return;
+        }
+        let result = std::panic::catch_unwind(super::x0x_home_dir);
+        assert!(
+            result.is_err(),
+            "#456 guard must panic when a test would touch the real ~/.x0x"
+        );
+    }
+
+    /// Review r3 (PR #465 item 1): the durable journal write is
+    /// content-correct, 0600, and leaves no temp debris.
+    #[tokio::test]
+    async fn write_private_bytes_durable_is_atomic_and_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join("journal.bin");
+        super::write_private_bytes_durable(&path, vec![1, 2, 3, 4])
+            .await
+            .expect("durable write");
+        let bytes = tokio::fs::read(&path).await.expect("read back");
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "journal bytes are private");
+        }
+        let mut entries = tokio::fs::read_dir(dir.path().join("sub"))
+            .await
+            .expect("read_dir");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp"),
+                "no temp debris: {}",
+                name.to_string_lossy()
+            );
+        }
+        // Overwrite in place stays clean too (the rename path).
+        super::write_private_bytes_durable(&path, vec![9])
+            .await
+            .expect("rewrite");
+        let bytes = tokio::fs::read(&path).await.expect("reread");
+        assert_eq!(bytes, vec![9]);
     }
 }
