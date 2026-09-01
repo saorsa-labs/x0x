@@ -2830,33 +2830,52 @@ async fn try_adopt_member_added_across_gap(
         );
     }
 
-    // #458 r5 — THE ANCHOR. Adoption is only permitted for OwnerCertified
-    // groups AND only when the terminal commit is CAS-anchored to the
-    // ADMISSION OWNER's signed attestation of the authority's real
-    // current head. A forked/removed admin can sign arbitrary internally
-    // consistent commits with its agent key, but it never holds the
-    // owner's USER key, so its fork is either unattested (unanchorable
-    // gap → refuse) or fails the CAS against the terminal's parent.
-    // Non-OwnerCertified groups have no unforgeable head anchor at all —
-    // fast-forward adoption is refused for them outright.
-    let Some(owner) = current.policy.admission.owner_certified_user_id().copied() else {
-        return refuse("adoption requires an OwnerCertified anchor (no owner axis)");
-    };
-    let owner_public_key = owner_certified_certificate
-        .as_ref()
-        .and_then(|cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok());
-    let Some(owner_public_key) = owner_public_key else {
-        return refuse("no trusted owner public key available to anchor the head");
-    };
-    let Some(attestation) = head_attestation.as_ref() else {
-        return refuse("no owner head attestation — unanchorable gap, refusing fast-forward");
-    };
-    if !attestation.verify_against_terminal(&owner_public_key, &owner, commit, agent_id) {
-        return refuse("owner head attestation fails verification or CAS against the terminal");
-    }
-    // The attested head must ALSO be the head the served chain reaches.
-    if attestation.head_state_hash != previous_hash_initial(&chain, current) {
-        return refuse("attested head does not match the served chain head");
+    // #458 r5/r6b — THE ANCHOR, in TWO TIERS.
+    //
+    // TIER 1 (OwnerCertified groups — the Home shape): the terminal commit
+    // MUST be CAS-anchored to the ADMISSION OWNER's signed attestation of
+    // the authority's real current head. A forked/removed admin can sign
+    // arbitrary internally consistent commits with its agent key, but it
+    // never holds the owner's USER key, so its fork is either unattested
+    // (unanchorable gap → refuse) or fails the CAS against the terminal's
+    // parent.
+    //
+    // TIER 2 (groups with NO owner axis — ordinary invite-only groups):
+    // there is no unforgeable head anchor, so the anchor is skipped and
+    // the round-4 reconstruction ALONE decides — per-link signature +
+    // linkage + snapshot/meta re-derivation, committer authority in the
+    // RECONSTRUCTED predecessor roster, withdrawal terminality, per-link
+    // last-admin invariants, the binding-change refusal above, and full
+    // terminal hash equality. #458 was reproduced on exactly these groups
+    // (LAN P4 joiner rev 0 vs commit rev 2; VPS groups harness), so
+    // refusing them outright would re-open the wedge. Tier 2 is no weaker
+    // than the DIRECT GAPLESS apply path (state_commit.rs validate_apply:
+    // signature + prev-hash from the stub's known-good base + admin
+    // authority per the same base roster) — both trust the invite base
+    // and the admins it seats; the stale-base residual is therefore the
+    // pre-existing gapless-path property, tracked as #468.
+    if let Some(owner) = current.policy.admission.owner_certified_user_id().copied() {
+        let owner_public_key = owner_certified_certificate.as_ref().and_then(|cert| {
+            ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok()
+        });
+        let Some(owner_public_key) = owner_public_key else {
+            return refuse("no trusted owner public key available to anchor the head");
+        };
+        let Some(attestation) = head_attestation.as_ref() else {
+            return refuse("no owner head attestation — unanchorable gap, refusing fast-forward");
+        };
+        if !attestation.verify_against_terminal(&owner_public_key, &owner, commit, agent_id) {
+            return refuse("owner head attestation fails verification or CAS against the terminal");
+        }
+        // The attested head must ALSO be the head the served chain reaches.
+        if attestation.head_state_hash != previous_hash_initial(&chain, current) {
+            return refuse("attested head does not match the served chain head");
+        }
+    } else {
+        tracing::debug!(
+            group_id = %LogHexId::group(stable_id),
+            "#458 r6b tier 2: no owner axis — anchor skipped, reconstruction alone decides (stale-base residual tracked as #468)"
+        );
     }
 
     // Reconstructed state, folded link by link.
@@ -3462,8 +3481,13 @@ async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyh
         .map_err(|e| anyhow::anyhow!("TreeKEM journal read: {e}"))?;
     let journal: TreeKemNamedPersistJournal = postcard::from_bytes(&journal_bytes)
         .map_err(|e| anyhow::anyhow!("TreeKEM journal decode: {e}"))?;
-    // Live files, each now repairable from the journals: the sidecar
-    // first (authoritative for Home-Suite groups), then the snapshot.
+    // #457 r7 — live files in the SAME deterministic order as replay
+    // (sidecar → named → snapshot): the named store was already written
+    // (durably) by save_named_groups_checked_unlocked BEFORE this apply;
+    // the sidecar journal's record merges into the live sidecar now, then
+    // the snapshot; BOTH journals are deleted strictly after every live
+    // file is durable — a crash anywhere before the deletes is replayed
+    // forward by the still-present journals.
     apply_home_suite_sidecar_journal(state, group_id).await?;
     persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, journal.snapshot_envelope)
         .await
@@ -19381,17 +19405,17 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal because durable named groups contain a withdrawn record");
             continue;
         }
-        // #457 r6 — PAIRED REPLAY (order matches the hsjournal-first
-        // write order): apply this group's `.hsjournal` half to the LIVE
-        // SIDECAR first (merging only this group's record — the journal is
-        // a whole-file image captured at stage time, and a later durable
-        // save of OTHER groups must survive the replay), then the legacy
-        // half's record into the named store, then the snapshot; delete
-        // BOTH journals only after every live file is durable. A crash at
-        // any point leaves either the full pair (replayed again, idempotent
-        // record merges) or — for a legacy-only orphan written by a
-        // pre-r6 binary — the legacy replay with the orphan rule below
-        // guarding the sidecar.
+        // #457 r6/r7 — PAIRED REPLAY. Apply this group's `.hsjournal` half
+        // to the LIVE SIDECAR first (merging only this group's record —
+        // the journal is a whole-file image captured at stage time, and a
+        // later durable save of OTHER groups must survive the replay),
+        // then the legacy half's record into the named store, then the
+        // snapshot — the SAME sidecar → named → snapshot order the live
+        // apply uses. Delete BOTH journals only after EVERY live file is
+        // durably written: the journals are the sole recovery source, so a
+        // crash at any intermediate point is replayed forward to the
+        // consistent post-rebind state. A legacy-only orphan (pre-r6
+        // binary) is guarded by the orphan rule below.
         let hsjournal_path = treekem_home_suite_journal_path(treekem_dir, &journal.group_id_hex);
         if let Ok(hs_bytes) = tokio::fs::read(&hsjournal_path).await {
             match postcard::from_bytes::<HomeSuiteSidecarJournal>(&hs_bytes) {
@@ -19418,17 +19442,23 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                 }
             }
         }
-        persist_treekem_snapshot_bytes(
-            treekem_dir,
-            &journal.group_id_hex,
-            journal.snapshot_envelope,
-        )
-        .await?;
+        // #457 r7 — the DETERMINISTIC order, identical to the live-apply
+        // (sidecar → named store → snapshot): the journals are the SOLE
+        // recovery source, so every intermediate on-disk state
+        // (sidecar-only, sidecar+named, all-three-before-delete) is a
+        // prefix of this order and the still-present journals replay it
+        // forward to consistency.
         merge_group_record_into_store_file(
             named_groups_path,
             &journal.group_id_hex,
             &journal.named_groups_json,
             "named groups",
+        )
+        .await?;
+        persist_treekem_snapshot_bytes(
+            treekem_dir,
+            &journal.group_id_hex,
+            journal.snapshot_envelope,
         )
         .await?;
         tokio::fs::remove_file(&path)
@@ -34425,6 +34455,117 @@ mod hs451_downgrade_safety {
         assert_eq!(snap, envelope);
         assert!(!treekem.join(format!("{home_id}.journal")).exists());
         assert!(!treekem.join(format!("{home_id}.hsjournal")).exists());
+    }
+
+    /// #457 r7: crash-injection matrix — a crash at ANY point during the
+    /// live apply (after the journals commit) leaves a PREFIX of the
+    /// deterministic sidecar → named → snapshot order on disk; replaying
+    /// the still-present journals must converge to the consistent
+    /// post-rebind state (all three live files hold the NEW record, both
+    /// journals consumed). Parametrized over every prefix.
+    #[tokio::test]
+    async fn r7_rebind_crash_matrix_replay_converges_at_every_live_write_boundary() {
+        for crash_after in 0..3 {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let treekem = dir.path().join("treekem");
+            tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+            let named_path = dir.path().join("named_groups.json");
+            let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+            let home_id = "aa".repeat(16);
+
+            // Pre-transaction durable state: OLD placeholder view, no sidecar.
+            let mut old_groups = HashMap::new();
+            old_groups.insert(
+                home_id.clone(),
+                legacy_safe_placeholder(&home_suite_entry()),
+            );
+            let old_json = serde_json::to_string(&old_groups).expect("old view json");
+            write_named_groups_json_atomic(&named_path, &old_json)
+                .await
+                .expect("old view write");
+
+            // The transaction payloads.
+            let mut next_groups = HashMap::new();
+            next_groups.insert(home_id.clone(), home_suite_entry());
+            let (legacy_json, sidecar_json) =
+                encode_named_groups_store(&next_groups).expect("encode");
+            let envelope = vec![7u8; 16];
+
+            // BOTH journals commit (hsjournal first, legacy last).
+            write_home_suite_sidecar_journal(&treekem, &home_id, &sidecar_json)
+                .await
+                .expect("hsjournal");
+            let journal = TreeKemNamedPersistJournal {
+                version: TREEKEM_NAMED_JOURNAL_VERSION,
+                group_id_hex: home_id.clone(),
+                named_groups_json: legacy_json.clone(),
+                snapshot_envelope: envelope.clone(),
+            };
+            x0x::storage::write_private_bytes(
+                &treekem_journal_path(&treekem, &home_id),
+                postcard::to_stdvec(&journal).expect("journal encode"),
+            )
+            .await
+            .expect("legacy journal");
+
+            // Live apply in the deterministic order, crashing after
+            // `crash_after` live writes (0 = none, 1 = sidecar, 2 = +named).
+            if crash_after >= 1 {
+                write_named_groups_json_atomic(&sidecar_path, &sidecar_json)
+                    .await
+                    .expect("live sidecar");
+            }
+            if crash_after >= 2 {
+                write_named_groups_json_atomic(&named_path, &legacy_json)
+                    .await
+                    .expect("live named");
+            }
+            // crash_after 3 (snapshot) would already be fully applied —
+            // replay is then a no-op re-merge; covered by 0..2 prefixes.
+
+            // Startup recovery exactly as serve() orders it.
+            recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+                .await
+                .expect("paired replay");
+            recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+                .await
+                .expect("orphan-only sidecar recovery");
+
+            // Converged: all three live files hold the NEW record, both
+            // journals consumed.
+            let merged = load_named_groups_merged(&named_path, &sidecar_path)
+                .await
+                .expect("merged load");
+            let real = merged
+                .get(&home_id)
+                .unwrap_or_else(|| panic!("crash_after={crash_after}: group missing"));
+            assert!(
+                matches!(
+                    real.policy.admission,
+                    x0x::groups::GroupAdmission::OwnerCertified(_)
+                ),
+                "crash_after={crash_after}: NEW sidecar record restored"
+            );
+            assert!(
+                real.home.is_some(),
+                "crash_after={crash_after}: home metadata"
+            );
+            let snap = tokio::fs::read(treekem.join(format!("{home_id}.snap")))
+                .await
+                .unwrap_or_else(|_| panic!("crash_after={crash_after}: snapshot missing"));
+            assert_eq!(
+                snap, envelope,
+                "crash_after={crash_after}: snapshot replayed"
+            );
+            assert!(
+                !treekem.join(format!("{home_id}.journal")).exists(),
+                "crash_after={crash_after}: legacy journal consumed"
+            );
+            assert!(
+                !treekem.join(format!("{home_id}.hsjournal")).exists(),
+                "crash_after={crash_after}: sidecar journal consumed"
+            );
+        }
     }
 
     /// #457 r5a: a crash BETWEEN the two journal writes (the .hsjournal is

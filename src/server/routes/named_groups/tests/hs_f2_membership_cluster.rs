@@ -581,6 +581,27 @@ struct Issue458Stage {
 }
 
 async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458Stage> {
+    issue458_stage_with_policy(group_byte, rename_first, owner_certified_policy_owner_f3).await
+}
+
+/// The r6b tier-2 fixtures use an ORDINARY (invite-only, no owner axis)
+/// policy — #458 was reproduced on exactly these groups.
+fn owner_certified_policy_owner_f3(owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
+    owner_certified_policy(owner_kp)
+}
+
+fn invite_only_policy(_owner_kp: &UserKeypair) -> x0x::groups::GroupPolicy {
+    x0x::groups::GroupPolicy::default()
+}
+
+async fn issue458_stage_with_policy<F>(
+    group_byte: u8,
+    rename_first: bool,
+    policy_fn: F,
+) -> Result<Issue458Stage>
+where
+    F: Fn(&UserKeypair) -> x0x::groups::GroupPolicy,
+{
     let dir = tempfile::tempdir()?;
     let owner_seed = [0xF3u8; 32];
     let owner_kp = UserKeypair::from_seed(&owner_seed)?;
@@ -601,10 +622,11 @@ async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458St
     let group_id = format!("{group_byte:02x}").repeat(32);
     let authority_hex = hex::encode(authority.agent.agent_id().as_bytes());
     let invite_secret = format!("issue458-{group_byte:02x}-secret");
+    let policy = policy_fn(&owner_kp);
     let base_info = insert_owner_group(
         authority.as_ref(),
         &group_id,
-        owner_certified_policy(&owner_kp),
+        policy.clone(),
         &invite_secret,
     )
     .await;
@@ -3176,5 +3198,178 @@ async fn issue458r5_certified_member_in_gap_refused() -> Result<()> {
         !result.accepted,
         "a gap adding a certified member is unreconstructable → refused (joiner stays pending)"
     );
+    Ok(())
+}
+
+// ── Review round 6b — tier 2 (no owner axis) ─────────────────────────────
+
+/// #458 r6b item 1: an ORDINARY (invite-only, no owner axis) group with an
+/// honest metadata-only gap DOES adopt through the production apply path —
+/// the tier-2 fallback. #458 was reproduced on exactly these groups (LAN
+/// P4 rev-0 joiner vs rev-2 commit), so refusing them would re-open the
+/// wedge. No attestation is served (none exists for tier 2); the
+/// reconstruction alone decides.
+#[tokio::test]
+async fn issue458r6b_tier2_ordinary_group_adopts_across_gap() -> Result<()> {
+    let stage = issue458_stage_with_policy(0xC1, true, invite_only_policy).await?;
+    let (joiner_state, _keep) = joiner_state_for(&stage).await?;
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stage.base_info.clone());
+
+    let chain = stage_intervening_chain(&stage, stage.base_info.state_revision).await;
+    assert!(!chain.is_empty(), "authority retains the gap link");
+    // Tier 2: NO head attestation inserted — the anchor is skipped.
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), chain);
+    let actor = crate::server::parse_agent_id_hex(&hex::encode(
+        stage.authority.agent.agent_id().as_bytes(),
+    ))
+    .expect("actor");
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        stage.member_added.clone(),
+        actor,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        result.accepted,
+        "#458 r6b: an ordinary group MUST adopt across an honest metadata-only gap (tier 2)"
+    );
+    let terminal_hash = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } => commit.state_hash.clone(),
+        _ => panic!("commit"),
+    };
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            info.has_active_member(&stage.joiner_hex),
+            "the joiner is seated via tier-2 adoption"
+        );
+        assert_eq!(
+            info.state_hash, terminal_hash,
+            "#458 r6b: tier-2 adoption is full-hash-equal too"
+        );
+        assert!(info.state_hash_is_current(), "hash == content");
+    }
+    Ok(())
+}
+
+/// #458 r6b item 1 (negative): the r4 converged-view removed-admin fork on
+/// an ORDINARY group is still REJECTED in tier 2 — the joiner's view has
+/// advanced past the fork's base (A removed canonically), so the arm's
+/// admin-authority gate and the reconstruction's linkage both refuse.
+#[tokio::test]
+async fn issue458r6b_tier2_removed_admin_fork_rejected() -> Result<()> {
+    let stage = issue458_stage_with_policy(0xC2, false, invite_only_policy).await?;
+    let (joiner_state, _keep) = joiner_state_for(&stage).await?;
+    let attacker = AgentKeypair::generate()?;
+    let attacker_hex = hex::encode(attacker.agent_id().as_bytes());
+
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        attacker_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        None,
+        None,
+    );
+    stub.recompute_state_hash();
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // Canonical advance (observed by the joiner): the authority removes A.
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let mut canonical = stub.clone();
+    canonical.remove_member(&attacker_hex, None);
+    let removal = x0x::groups::GroupStateCommit::sign(
+        canonical.stable_group_id().to_string(),
+        canonical.state_revision + 1,
+        Some(canonical.state_hash.clone()),
+        x0x::groups::compute_roster_root(&canonical.members_v2),
+        x0x::groups::compute_policy_hash(&canonical.policy),
+        x0x::groups::compute_public_meta_hash(&canonical.public_meta()),
+        canonical.security_binding.clone(),
+        false,
+        canonical.state_revision + 1,
+        &signer,
+    )?;
+    canonical.state_revision = removal.revision;
+    canonical.prev_state_hash = removal.prev_state_hash.clone();
+    canonical.state_hash = removal.state_hash.clone();
+    *joiner_state
+        .named_groups
+        .write()
+        .await
+        .get_mut(&stage.group_id)
+        .unwrap() = canonical;
+
+    // A's fork: a rev-(base+1) link retaining its seat (chained from the
+    // BASE, now stale against the joiner's canonical view).
+    let fork_roster = x0x::groups::state_commit::roster_projection(&stub.members_v2);
+    let fork_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        stub.state_revision + 1,
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_root_of_projection(&fork_roster),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        stub.state_revision + 1,
+        &attacker,
+    )?;
+    let fork_link = x0x::groups::state_commit::RetainedCommit {
+        commit: fork_commit,
+        roster: fork_roster,
+        meta: Some(stub.public_meta()),
+    };
+    // Terminal: the staged MemberAdded (rev base+2... the stage's terminal
+    // is base+1; the fork link already occupies base+1, so use the staged
+    // event — the arm's admin gate refuses A first).
+    let mut fork_event = stage.member_added.clone();
+    if let NamedGroupMetadataEvent::MemberAdded { actor, .. } = &mut fork_event {
+        *actor = attacker_hex.clone();
+    }
+    let attacker_id = attacker.agent_id();
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key, vec![fork_link]);
+    let result =
+        apply_named_group_metadata_event(&joiner_state, fork_event, attacker_id, true, None).await;
+    assert!(
+        !result.accepted,
+        "#458 r6b: the removed-admin fork is rejected on ordinary groups too"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the fork must not seat the joiner"
+        );
+        assert!(
+            !info.has_active_member(&attacker_hex),
+            "the canonical removal of A stays applied"
+        );
+    }
     Ok(())
 }
