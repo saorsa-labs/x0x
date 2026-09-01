@@ -15,7 +15,7 @@
 experimental = ["wrapper-scripts"]
 
 [scripts.wrapper.x0x-test-home]
-command = 'env RUST_MIN_STACK=16777216 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home'
+command = 'env RUST_MIN_STACK=16777216 X0X_TEST_HOME_GUARD=1 X0X_HOME=/tmp/x0x-nextest-home HOME=/tmp/x0x-nextest-home'
 
 [[profile.default.scripts]]
 filter = 'all()'

@@ -17722,7 +17722,10 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     let journal_bytes = postcard::to_stdvec(&journal)
         .map_err(|e| anyhow::anyhow!("TreeKEM journal encode: {e}"))?;
     let journal_path = treekem_journal_path(&state.treekem_dir, group_id_hex);
-    x0x::storage::write_private_bytes(&journal_path, journal_bytes)
+    // Review r3, item 1: durable + crash-atomic (temp → file fsync →
+    // rename → dir fsync) so a power loss can never leave a torn journal
+    // while the later-synced live files survive it.
+    x0x::storage::write_private_bytes_durable(&journal_path, journal_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
     write_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex, &home_suite_json).await?;
@@ -17944,7 +17947,9 @@ async fn write_home_suite_sidecar_journal(
     let bytes = postcard::to_stdvec(&journal)
         .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal encode: {e}"))?;
     let path = treekem_home_suite_journal_path(treekem_dir, group_id_hex);
-    x0x::storage::write_private_bytes(&path, bytes)
+    // Review r3, item 1: same crash-atomic durability as the legacy
+    // journal — this file is the repair payload for the sidecar.
+    x0x::storage::write_private_bytes_durable(&path, bytes)
         .await
         .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))
 }

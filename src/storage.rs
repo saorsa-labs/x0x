@@ -309,6 +309,81 @@ async fn write_private_file(path: &Path, bytes: Vec<u8>) -> Result<()> {
     Ok(())
 }
 
+/// Crash-atomic durable write for secret bytes (review r3, PR #465 item 1):
+/// temp file (0600) → `sync_all` the file → atomic rename into place →
+/// `sync_all` the parent directory. Unlike [`write_private_bytes`], a power
+/// loss can never leave a torn/half-written destination or a rename the
+/// directory does not remember — required for the persistence journals
+/// that must be durable BEFORE the live state they protect changes.
+///
+/// # Errors
+/// Returns an error if the directory cannot be created, the write, the
+/// file sync, the rename, or the parent-directory sync fails.
+pub async fn write_private_bytes_durable(path: &Path, bytes: Vec<u8>) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    fs::create_dir_all(parent)
+        .await
+        .map_err(IdentityError::from)?;
+
+    let file_name = path.file_name().ok_or_else(|| {
+        IdentityError::from(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "invalid path: missing file name",
+        ))
+    })?;
+    let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let tmp_path = parent.join(format!(
+        ".{}.{}.{}.tmp",
+        file_name.to_string_lossy(),
+        std::process::id(),
+        unique
+    ));
+
+    let mut file = fs::File::create(&tmp_path)
+        .await
+        .map_err(IdentityError::from)?;
+    if let Err(err) = file.write_all(&bytes).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+    // Durable point 1: the journal bytes reach stable storage BEFORE the
+    // rename makes them visible.
+    if let Err(err) = file.sync_all().await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+    drop(file);
+
+    #[cfg(unix)]
+    {
+        let mut perms = fs::metadata(&tmp_path)
+            .await
+            .map_err(IdentityError::from)?
+            .permissions();
+        perms.set_mode(0o600);
+        fs::set_permissions(&tmp_path, perms)
+            .await
+            .map_err(IdentityError::from)?;
+    }
+
+    if let Err(err) = fs::rename(&tmp_path, path).await {
+        let _ = fs::remove_file(&tmp_path).await;
+        return Err(IdentityError::from(err));
+    }
+
+    // Durable point 2: the rename itself survives power loss.
+    let dir = fs::File::open(parent).await.map_err(IdentityError::from)?;
+    if let Err(err) = dir.sync_all().await {
+        return Err(IdentityError::from(err));
+    }
+    Ok(())
+}
+
 /// Write arbitrary secret bytes to `path` with the same protection x0x gives
 /// key material: an atomic write (temp file + rename) with Unix mode `0600`.
 ///
@@ -364,19 +439,30 @@ pub fn x0x_home_dir() -> Option<std::path::PathBuf> {
     if env_override.as_deref().is_some_and(|s| !s.is_empty()) {
         return env_override.map(std::path::PathBuf::from);
     }
-    #[cfg(test)]
-    {
+    // #456 test-home guard (review r3): FAIL any test that would write
+    // under the real home fallback. Armed two ways so BOTH test-binary
+    // kinds are covered: unit tests (cfg(test), statically) and
+    // integration/e2e binaries spawned by the nextest harness (the
+    // X0X_TEST_HOME_GUARD sentinel, set by the .config/nextest.toml
+    // wrapper — integration binaries link the lib without cfg(test), so
+    // the env sentinel is what reaches them).
+    let sentinel = std::env::var_os("X0X_TEST_HOME_GUARD");
+    if test_home_guard_armed(cfg!(test), sentinel.as_deref()) {
         panic!(
             "#456 test-home guard: a test reached the real ~/.x0x fallback. \
              Set X0X_HOME (the nextest harness does), or give the builder \
              explicit paths (identity_dir / key / cert / store paths)."
         );
     }
-    #[cfg(not(test))]
-    {
-        let home = dirs::home_dir();
-        resolve_x0x_home(None, home)
-    }
+    let home = dirs::home_dir();
+    resolve_x0x_home(None, home)
+}
+
+/// Pure core of the #456 test-home guard (see [`x0x_home_dir`]); split out
+/// so the arming logic is testable without racing the process environment.
+#[must_use]
+pub fn test_home_guard_armed(cfg_test: bool, sentinel: Option<&std::ffi::OsStr>) -> bool {
+    cfg_test || sentinel == Some(std::ffi::OsStr::new("1"))
 }
 
 /// The identity directory of a NAMED daemon instance (issue #456): a
@@ -1290,5 +1376,62 @@ mod tests {
             result.is_err(),
             "#456 guard must panic when a test would touch the real ~/.x0x"
         );
+    }
+
+    /// Review r3 (#456): the test-home guard arming logic — cfg(test)
+    /// unit binaries OR the harness sentinel (integration binaries) — as a
+    /// pure truth table.
+    #[test]
+    fn test_home_guard_arming_truth_table() {
+        let one = std::ffi::OsStr::new("1");
+        let zero = std::ffi::OsStr::new("0");
+        assert!(super::test_home_guard_armed(true, None));
+        assert!(super::test_home_guard_armed(true, Some(zero)));
+        assert!(super::test_home_guard_armed(false, Some(one)));
+        assert!(
+            !super::test_home_guard_armed(false, None),
+            "production (no cfg(test), no sentinel) must never arm"
+        );
+        assert!(!super::test_home_guard_armed(false, Some(zero)));
+    }
+
+    /// Review r3 (PR #465 item 1): the durable journal write is
+    /// content-correct, 0600, and leaves no temp debris.
+    #[tokio::test]
+    async fn write_private_bytes_durable_is_atomic_and_clean() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("sub").join("journal.bin");
+        super::write_private_bytes_durable(&path, vec![1, 2, 3, 4])
+            .await
+            .expect("durable write");
+        let bytes = tokio::fs::read(&path).await.expect("read back");
+        assert_eq!(bytes, vec![1, 2, 3, 4]);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = tokio::fs::metadata(&path)
+                .await
+                .expect("metadata")
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o600, "journal bytes are private");
+        }
+        let mut entries = tokio::fs::read_dir(dir.path().join("sub"))
+            .await
+            .expect("read_dir");
+        while let Some(entry) = entries.next_entry().await.expect("entry") {
+            let name = entry.file_name();
+            assert!(
+                !name.to_string_lossy().contains(".tmp"),
+                "no temp debris: {}",
+                name.to_string_lossy()
+            );
+        }
+        // Overwrite in place stays clean too (the rename path).
+        super::write_private_bytes_durable(&path, vec![9])
+            .await
+            .expect("rewrite");
+        let bytes = tokio::fs::read(&path).await.expect("reread");
+        assert_eq!(bytes, vec![9]);
     }
 }
