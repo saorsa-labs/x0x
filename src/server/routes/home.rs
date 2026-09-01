@@ -1493,10 +1493,12 @@ pub(in crate::server::routes) mod tests {
 
         // (label, method, path, body, durable_expects_200). The durable
         // arm must prove AUTHORIZED pass: rename/policy really mutate
-        // (200); remove/role/ban/unban target a non-member stranger, so
-        // the durable arm passes fence+admin and lands in ordinary
-        // target resolution — asserted by "not the fence's typed error".
-        // add-member is handled separately (needs a certified agent).
+        // (200); remove/ban/unban target a non-member stranger, so the
+        // durable arm passes fence+admin and lands in ordinary target
+        // resolution — asserted by "not the fence's typed error".
+        // add-member and role-change are handled separately after the
+        // certified add seats a REAL target (an absent stranger would
+        // 404 before the admin check, proving nothing).
         let routes: &[(&str, &str, String, Option<serde_json::Value>, bool)] = &[
             (
                 "PATCH /groups/:id (rename)",
@@ -1517,13 +1519,6 @@ pub(in crate::server::routes) mod tests {
                 "DELETE",
                 format!("/groups/{home_id}/members/{stranger}"),
                 None,
-                false,
-            ),
-            (
-                "PATCH /groups/:id/members/:agent_id/role",
-                "PATCH",
-                format!("/groups/{home_id}/members/{stranger}/role"),
-                Some(serde_json::json!({ "role": "member" })),
                 false,
             ),
             (
@@ -1697,6 +1692,59 @@ pub(in crate::server::routes) mod tests {
                 .get(&home_id)
                 .is_some_and(|info| info.has_active_member(&target_hex)),
             "the durable add must really have seated the certified member"
+        );
+
+        // role-change: the target is the PRESENT, certified member just
+        // seated — the handler resolves the target BEFORE the admin
+        // check, so an absent stranger would 404 without ever proving
+        // the admin authority. With a real target: session/rider are
+        // fenced, durable performs an authorized role change (200).
+        let role_json = |bearer: String| {
+            let app = app.clone();
+            let path = format!("/groups/{home_id}/members/{target_hex}/role");
+            async move {
+                app.oneshot(
+                    Request::patch(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "role": "admin" }).to_string(),
+                        ))
+                        .expect("request builds"),
+                )
+                .await
+            }
+        };
+        let response = role_json(session.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "role-change session: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable API token"),
+            "role-change session 403 must be the fence: {out}"
+        );
+        let response = role_json(rider.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "role-change rider: {out}");
+        let response = role_json("test-token".to_string()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "role-change durable arm must be an AUTHORIZED 200 on the seated member: {out}"
+        );
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&home_id)
+                .is_some_and(
+                    |info| info.caller_role(&target_hex) == Some(crate::groups::GroupRole::Admin)
+                ),
+            "the durable role change must really have taken effect"
         );
 
         // leave: its OWN live sole-member Home on a fresh state (after

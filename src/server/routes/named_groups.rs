@@ -22911,6 +22911,22 @@ pub(in crate::server) mod tests {
             "ban_group_member must reject a non-admin caller, body: {ban_body}"
         );
 
+        let unban = unban_group_member(
+            State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path((group_id.clone(), target_hex.clone())),
+        )
+        .await
+        .into_response();
+        let (unban_status, unban_body) = response_json(unban).await?;
+        assert_eq!(
+            unban_status,
+            StatusCode::FORBIDDEN,
+            "unban_group_member must reject a non-admin caller, body: {unban_body}"
+        );
+
         let role = update_member_role(
             State(Arc::clone(&state)),
             axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
