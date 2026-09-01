@@ -783,6 +783,18 @@ pub(super) struct AppState {
     /// `join_result_key(stable_group_id, member)`. Bounded + TTL-pruned.
     pub(super) owner_cert_pending_joins:
         RwLock<HashMap<String, crate::server::routes::named_groups::PendingOwnerCertJoin>>,
+    /// #458 r3: map keys of UNCONFIRMED join stubs (inserted in memory by
+    /// `POST /groups/join`, not yet durable). Every named_groups.json
+    /// serialization EXCLUDES them, so no unrelated group save can durably
+    /// capture a stub before its `MemberAdded` lands. Cleared when the
+    /// group's next durable persist happens (the confirmation itself) and
+    /// on restart (the set is memory-only; the stub was never on disk).
+    pub(super) pending_join_stubs: StdMutex<std::collections::HashSet<String>>,
+    /// #458 r3: intervening state-commits delivered with a join-result
+    /// response, keyed by `join_result_key` — consumed (and verified) by
+    /// the joiner's chain-verified adoption. Transient, single-apply scope.
+    pub(super) pending_adoption_chains:
+        StdMutex<HashMap<String, Vec<x0x::groups::GroupStateCommit>>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

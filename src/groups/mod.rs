@@ -1286,6 +1286,24 @@ impl GroupInfo {
     /// A forked joiner converges on later authority commits through this
     /// same roster-root-verified path until a full resync (restart,
     /// catch-up) rebuilds the chain link.
+    /// #458 r3: the chain-verified variant — retains the ENTIRE verified
+    /// intervening chain (each link already signature- and linkage-checked
+    /// by the caller) ahead of the terminal commit, so the adopted view's
+    /// audit history matches what was actually verified.
+    pub fn finalize_adopted_commit_roster_checked_with_chain(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+        chain: &[state_commit::GroupStateCommit],
+    ) -> Result<(), state_commit::ApplyError> {
+        let result = self.finalize_adopted_commit_roster_checked(commit);
+        if result.is_ok() {
+            for link in chain {
+                self.retain_commit(link);
+            }
+        }
+        result
+    }
+
     pub fn finalize_adopted_commit_roster_checked(
         &mut self,
         commit: &state_commit::GroupStateCommit,
