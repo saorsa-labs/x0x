@@ -10629,10 +10629,16 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
 /// so a stale invite never produces unauthorized membership.
 pub(in crate::server) async fn create_group_invite(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp.into_response();
+    }
     let req: CreateInviteRequest = match parse_optional_json(&headers, &body) {
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
@@ -13449,8 +13455,14 @@ async fn owner_certified_seal_with_eviction(
 /// re-verification point — see `owner_certified_seal_with_eviction`.
 pub(in crate::server) async fn seal_group_state(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
     {
         let groups = state.named_groups.read().await;
@@ -14276,9 +14288,11 @@ fn last_admin_precheck(
 /// reads the groups table, before any other lock is taken): session
 /// bearers and riders get a typed 403; `None` = proceed. Gated
 /// surfaces: PATCH /groups/:id, PATCH /groups/:id/policy, POST
-/// /groups/:id/state/withdraw, DELETE /groups/:id (leave/terminal
-/// withdraw), POST+DELETE /groups/:id/members[...], PATCH
-/// /groups/:id/members/:agent_id/role, POST+DELETE /groups/:id/ban/...
+/// /groups/:id/state/seal, POST /groups/:id/state/withdraw, DELETE
+/// /groups/:id (leave/terminal withdraw), POST+DELETE
+/// /groups/:id/members[...], PATCH /groups/:id/members/:agent_id/role,
+/// POST+DELETE /groups/:id/ban/..., POST /groups/:id/invite, and POST
+/// /groups/:id/requests/:request_id/approve|reject.
 async fn home_mutation_requires_durable(
     state: &AppState,
     actor: &crate::server::rider_auth::ActorContext,
@@ -15263,8 +15277,14 @@ pub(in crate::server) async fn create_join_request(
 /// POST /groups/:id/requests/:request_id/approve — approve request (admin+).
 pub(in crate::server) async fn approve_join_request(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     // Serialize against concurrent membership applies + other API mutators (see
     // `AppState::group_membership_locks`). Held across the delegation to the
@@ -16179,8 +16199,14 @@ async fn approve_treekem_join_request(
 /// POST /groups/:id/requests/:request_id/reject — reject request (admin+).
 pub(in crate::server) async fn reject_join_request(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, request_id)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -25193,6 +25219,9 @@ pub(in crate::server) mod tests {
         let (status, body) = response_json(
             approve_join_request(
                 State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
                 Path((group_id.clone(), request_id.clone())),
             )
             .await

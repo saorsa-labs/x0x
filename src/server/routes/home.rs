@@ -1444,6 +1444,22 @@ pub(in crate::server::routes) mod tests {
                 axum::routing::patch(super::super::named_groups::update_group_policy),
             )
             .route(
+                "/groups/:id/state/seal",
+                axum::routing::post(super::super::named_groups::seal_group_state),
+            )
+            .route(
+                "/groups/:id/invite",
+                axum::routing::post(super::super::named_groups::create_group_invite),
+            )
+            .route(
+                "/groups/:id/requests/:request_id/approve",
+                axum::routing::post(super::super::named_groups::approve_join_request),
+            )
+            .route(
+                "/groups/:id/requests/:request_id/reject",
+                axum::routing::post(super::super::named_groups::reject_join_request),
+            )
+            .route(
                 "/groups/:id/state/withdraw",
                 axum::routing::post(super::super::named_groups::withdraw_group_state),
             )
@@ -1746,6 +1762,80 @@ pub(in crate::server::routes) mod tests {
                 ),
             "the durable role change must really have taken effect"
         );
+
+        // Review round 7: the four remaining Home-admin mutation routes.
+        // seal and invite perform real authorized mutations (200);
+        // approve/reject reference a nonexistent request, so the durable
+        // arm proves fence+authority passage by landing in ordinary
+        // request resolution — never the fence's typed error.
+        let round7: &[(&str, String, Option<serde_json::Value>, bool)] = &[
+            ("seal", format!("/groups/{home_id}/state/seal"), None, true),
+            ("invite", format!("/groups/{home_id}/invite"), None, true),
+            (
+                "approve",
+                format!("/groups/{home_id}/requests/{stranger}/approve"),
+                None,
+                false,
+            ),
+            (
+                "reject",
+                format!("/groups/{home_id}/requests/{stranger}/reject"),
+                None,
+                false,
+            ),
+        ];
+        for (label, path, body, durable_200) in round7 {
+            let send = |bearer: String, body: Option<serde_json::Value>| {
+                let app = app.clone();
+                let path = path.clone();
+                async move {
+                    let builder = Request::post(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json");
+                    let req = match body {
+                        Some(json) => builder.body(Body::from(json.to_string())),
+                        None => builder.body(Body::empty()),
+                    }
+                    .expect("request builds");
+                    app.oneshot(req).await
+                }
+            };
+            let response = send(session.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{label} session 403 must be the fence: {out}"
+            );
+            let response = send(rider.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {out}");
+            let response = send("test-token".to_string(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            if *durable_200 {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{label} durable arm must be an authorized 200: {out}"
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{label} durable must clear the fence: {out}"
+                );
+                assert!(
+                    !out["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "{label} durable outcome must not be the fence error: {out}"
+                );
+            }
+        }
 
         // leave: its OWN live sole-member Home on a fresh state (after
         // the certified add the main Home has a second member, so a
