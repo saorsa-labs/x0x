@@ -673,6 +673,15 @@ async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458St
 /// #458 r3: the verified intervening chain the authority would send with
 /// its join result — every retained commit strictly between the stub's
 /// revision and the terminal MemberAdded commit.
+async fn staged_head_attestation(
+    stage: &Issue458Stage,
+) -> Option<x0x::server::routes::named_groups::HeadAttestation> {
+    let results = stage.authority.pending_join_results.read().await;
+    results
+        .get(&join_result_key(&stage.group_id, &stage.joiner_hex))
+        .and_then(|pending| pending.head_attestation.clone())
+}
+
 async fn stage_intervening_chain(
     stage: &Issue458Stage,
     stub_revision: u64,
@@ -739,11 +748,22 @@ async fn issue458_joiner_adopts_member_added_across_rename_gap() -> Result<()> {
         !chain.is_empty(),
         "stage must retain the intervening rename commit"
     );
+    let attest_key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    let staged_attestation = staged_head_attestation(&stage).await;
+    assert!(
+        staged_attestation.is_some(),
+        "owner install stages the head attestation (the CAS anchor)"
+    );
     joiner_state
         .pending_adoption_chains
         .lock()
         .unwrap()
-        .insert(join_result_key(&stage.group_id, &stage.joiner_hex), chain);
+        .insert(attest_key.clone(), chain);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(attest_key, staged_attestation.expect("checked above"));
     let result = apply_named_group_metadata_event(
         &joiner_state,
         stage.member_added.clone(),
@@ -994,11 +1014,27 @@ async fn integration_rename_restart_certified_join_single_announce() -> Result<(
         !chain.is_empty(),
         "owner retains the intervening rename commit"
     );
+    let attest_key = join_result_key(&group_id, &joiner_hex);
+    let staged_attestation = {
+        let results = owner.pending_join_results.read().await;
+        results
+            .get(&attest_key)
+            .and_then(|pending| pending.head_attestation.clone())
+    };
+    assert!(
+        staged_attestation.is_some(),
+        "owner install stages the head attestation (the CAS anchor)"
+    );
     joiner_state
         .pending_adoption_chains
         .lock()
         .unwrap()
-        .insert(join_result_key(&group_id, &joiner_hex), chain);
+        .insert(attest_key.clone(), chain);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(attest_key, staged_attestation.expect("checked above"));
     assert!(
         apply_named_group_metadata_event(
             &joiner_state,
@@ -1801,6 +1837,9 @@ struct R3Stage {
     /// dropping it deletes the directory and every persist fails.
     _keep_alive: tempfile::TempDir,
     joiner_state: Arc<AppState>,
+    /// #458 r5: the owner-signed head attestation staged with the result —
+    /// the CAS anchor adoption now REQUIRES.
+    head_attestation: Option<x0x::server::routes::named_groups::HeadAttestation>,
     member_added: NamedGroupMetadataEvent,
     chain: Vec<x0x::groups::state_commit::RetainedCommit>,
     group_id: String,
@@ -1824,8 +1863,10 @@ async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
         let info = groups.get(&stage.group_id).expect("stub");
         x0x::groups::compute_policy_hash(&info.policy)
     };
+    let head_attestation = staged_head_attestation(&stage).await;
     Ok(R3Stage {
         _keep_alive,
+        head_attestation,
         joiner_state,
         member_added: stage.member_added.clone(),
         chain,
@@ -1848,12 +1889,21 @@ fn r3_apply_with_chain(
         .lock()
         .unwrap()
         .insert(key.clone(), chain);
+    if let Some(attestation) = &stage.head_attestation {
+        stage
+            .joiner_state
+            .pending_head_attestations
+            .lock()
+            .unwrap()
+            .insert(key.clone(), attestation.clone());
+    }
     let state = Arc::clone(&stage.joiner_state);
     let event = stage.member_added.clone();
     let actor = crate::server::parse_agent_id_hex(&stage.authority_hex).expect("actor id");
     async move {
         let result = apply_named_group_metadata_event(&state, event, actor, true, None).await;
         state.pending_adoption_chains.lock().unwrap().remove(&key);
+        state.pending_head_attestations.lock().unwrap().remove(&key);
         result
     }
 }
@@ -2396,21 +2446,23 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
 
 // ── Review round 4 ────────────────────────────────────────────────────────
 
-/// #458 r4 SECURITY regression — the removed-admin fork attack (Codex
-/// round-3 finding): admin A is valid at the invite base revision but
-/// REMOVED on the canonical chain afterwards. A serves an internally
-/// consistent fork (alternate commit retaining its admin seat + a
-/// MemberAdded for a certified joiner). The joiner — whose own view has
-/// ADVANCED over the canonical removal, exactly as the production
-/// metadata-topic listener delivers it — must REJECT the fork: its
-/// linkage is stale against the joiner's converged state.
+/// #458 r4/r5 SECURITY regression — the removed-admin fork attack, built
+/// for real: admin A is valid at the invite base revision but REMOVED on
+/// the canonical chain the joiner has already observed. A serves a full
+/// fork: an internally consistent rev-(base+1) link RETAINING its admin
+/// seat, then a rev-(base+2) `MemberAdded` terminal signed by A, chaining
+/// from A's fork hash with `roster_root` = fork roster + joiner — every
+/// invariant the fork relies on holds except the ones the joiner's
+/// CONVERGED view and the reconstruction enforce. The terminal PASSES the
+/// revision gate (base+2 > canonical base+1), so the refusal must come
+/// from the authority/linkage checks: A is not an admin in the joiner's
+/// current (canonical) roster, and A's chain links from the BASE hash,
+/// not the canonical head. If either check is removed the fork adopts and
+/// this test fails.
 #[tokio::test]
 async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
-    // Authority: base roster seats the authority (admin) AND attacker A
-    // (admin). A is the inviter of record.
     let stage = issue458_stage(0x71, false).await?;
-    let (joiner_state, _dir) = joiner_state_for(&stage).await?;
-    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let (joiner_state, _keep) = joiner_state_for(&stage).await?;
     let attacker = AgentKeypair::generate()?;
     let attacker_hex = hex::encode(attacker.agent_id().as_bytes());
 
@@ -2431,8 +2483,8 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         .insert(stage.group_id.clone(), stub.clone());
 
     // CANONICAL advance the joiner has already observed (the metadata
-    // topic delivered it): the authority REMOVES A at the next revision.
-    // The joiner applies it — it chains from the stub.
+    // topic delivered it): the authority REMOVES A at base+1. The joiner
+    // applies it — it chains from the stub.
     let signer =
         AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
     let mut canonical = stub.clone();
@@ -2466,47 +2518,99 @@ async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
         .get_mut(&stage.group_id)
         .unwrap() = canonical;
 
-    // A's FORK: served with the join result — an alternate next-commit
-    // that RETAINS A's seat, then nothing else. The joiner's current
-    // revision is now canonical removal revision; A's fork chains from the
-    // BASE revision. Every fork check the attack relies on (A is an
-    // admin, internally consistent) holds — the refusal must come from
-    // the stale linkage/revision against the joiner's converged view.
-    let mut fork_roster = x0x::groups::state_commit::roster_projection(&stub.members_v2);
-    let _ = &mut fork_roster; // base projection INCLUDING A
+    // ── A's FORK ──
+    // rev-(base+1): A's alternate commit retaining its own seat — the
+    // exact commit the r3 review's working attack used. Internally
+    // consistent: its projection re-derives its signed roster_root and
+    // its sealed meta its signed meta hash.
+    let fork_roster = x0x::groups::state_commit::roster_projection(&stub.members_v2);
+    let fork_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        stub.state_revision + 1,
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_root_of_projection(&fork_roster),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        stub.state_revision + 1,
+        &attacker,
+    )?;
     let fork_link = x0x::groups::state_commit::RetainedCommit {
-        commit: x0x::groups::GroupStateCommit::sign(
-            stub.stable_group_id().to_string(),
-            stub.state_revision + 1,
-            Some(stub.state_hash.clone()),
-            x0x::groups::state_commit::roster_root_of_projection(&fork_roster),
-            x0x::groups::compute_policy_hash(&stub.policy),
-            x0x::groups::compute_public_meta_hash(&stub.public_meta()),
-            stub.security_binding.clone(),
-            false,
-            stub.state_revision + 1,
-            &attacker,
-        )?,
-        roster: fork_roster,
+        commit: fork_commit.clone(),
+        roster: fork_roster.clone(),
         meta: Some(stub.public_meta()),
     };
-    // And a terminal MemberAdded for the joiner signed by A, chained on
-    // A's fork (reuses the staged event's commit fields but re-signed by
-    // A after A's link) — the apply path only reads the chain + terminal;
-    // a stale chain alone must already refuse.
+
+    // rev-(base+2): the REAL terminal — a MemberAdded for the certified
+    // joiner, signed by A, chained from A's fork hash, with
+    // `roster_root` = fork roster + joiner (with the committed cert
+    // digest, exactly as an honest authority would seal it).
+    let (joiner_cert_b64, joiner_kp_hash) = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            certificate_b64,
+            treekem_key_package_hash,
+            ..
+        } => (certificate_b64.clone(), treekem_key_package_hash.clone()),
+        _ => panic!("stage member_added"),
+    };
+    let mut fork_members = stub.members_v2.clone();
+    let mut added = x0x::groups::GroupMember::new_member(
+        stage.joiner_hex.clone(),
+        None,
+        Some(attacker_hex.clone()),
+        0,
+    );
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let Some(b64) = &joiner_cert_b64 {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    fork_members.insert(stage.joiner_hex.clone(), added);
+    let terminal_roster_root = x0x::groups::compute_roster_root(&fork_members);
+    let terminal_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        stub.state_revision + 2,
+        Some(fork_commit.state_hash.clone()),
+        terminal_roster_root,
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        stub.state_revision + 2,
+        &attacker,
+    )?;
+    let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.roster_revision + 2,
+        actor: attacker_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: joiner_kp_hash,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: joiner_cert_b64,
+        commit: Some(terminal_commit),
+    };
+
+    // Serve the fork with the join result: chain + terminal, actor = A,
+    // sender = A (A "authorized-as-of-invite" — that is the whole point).
     joiner_state.pending_adoption_chains.lock().unwrap().insert(
         join_result_key(&stage.group_id, &stage.joiner_hex),
         vec![fork_link],
     );
-    let actor_id = crate::server::parse_agent_id_hex(&authority_hex).expect("actor");
-    let result = apply_named_group_metadata_event(
-        &joiner_state,
-        stage.member_added.clone(),
-        actor_id,
-        true,
-        None,
-    )
-    .await;
+    let attacker_id = attacker.agent_id();
+    let result =
+        apply_named_group_metadata_event(&joiner_state, fork_event, attacker_id, true, None).await;
     assert!(
         !result.accepted,
         "#458 r4: the removed-admin fork must be REJECTED against the joiner's converged view"
@@ -2557,5 +2661,345 @@ async fn issue458r4_reconstruction_adopts_matching_hash() -> Result<()> {
             "hash == content by construction"
         );
     }
+    Ok(())
+}
+
+// ── Review round 5 ────────────────────────────────────────────────────────
+
+/// #458 r5 SECURITY — the STALE-JOINER removed-admin fork (the round-4
+/// review's working attack, now defended): the joiner sits at the invite
+/// base where A is still an admin; the CANONICAL chain removed A at
+/// base+1 (the joiner has NOT observed it); A serves a full, internally
+/// consistent fork — rev-(base+1) retaining its seat + rev-(base+2)
+/// `MemberAdded` for the certified joiner. Every reconstruction check A
+/// can satisfy, it does. The defense is the OWNER-SIGNED HEAD ATTESTATION:
+/// A never holds the owner's user key, so its fork is either unattested
+/// (unanchorable gap → refuse) or attested by the wrong key (verification
+/// fails). Both variants must be REJECTED; the joiner stays pending.
+#[tokio::test]
+async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
+    let stage = issue458_stage(0x81, false).await?;
+    let (joiner_state, _keep) = joiner_state_for(&stage).await?;
+    let attacker = AgentKeypair::generate()?;
+    let attacker_hex = hex::encode(attacker.agent_id().as_bytes());
+
+    // Joiner stub AT THE INVITE BASE with A seated as admin (A minted the
+    // invite while valid). The canonical removal is NOT applied here —
+    // that is what makes the joiner "stale".
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        attacker_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        None,
+        None,
+    );
+    stub.recompute_state_hash();
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // A's fork: rev-(base+1) retaining its seat (internally consistent:
+    // the projection re-derives the signed root, the sealed meta the meta
+    // hash), then a rev-(base+2) MemberAdded signed by A chaining from
+    // the fork hash with roster_root = fork roster + joiner (with the
+    // committed cert digest) — indistinguishable from an honest authority
+    // seal by every check except the owner anchor.
+    let fork_roster = x0x::groups::state_commit::roster_projection(&stub.members_v2);
+    let fork_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        stub.state_revision + 1,
+        Some(stub.state_hash.clone()),
+        x0x::groups::state_commit::roster_root_of_projection(&fork_roster),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        stub.state_revision + 1,
+        &attacker,
+    )?;
+    let fork_link = x0x::groups::state_commit::RetainedCommit {
+        commit: fork_commit.clone(),
+        roster: fork_roster.clone(),
+        meta: Some(stub.public_meta()),
+    };
+    let (joiner_cert_b64, joiner_kp_hash) = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            certificate_b64,
+            treekem_key_package_hash,
+            ..
+        } => (certificate_b64.clone(), treekem_key_package_hash.clone()),
+        _ => panic!("stage member_added"),
+    };
+    let mut fork_members = stub.members_v2.clone();
+    let mut added = x0x::groups::GroupMember::new_member(
+        stage.joiner_hex.clone(),
+        None,
+        Some(attacker_hex.clone()),
+        0,
+    );
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let Some(b64) = &joiner_cert_b64 {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    fork_members.insert(stage.joiner_hex.clone(), added);
+    let terminal_commit = x0x::groups::GroupStateCommit::sign(
+        stub.stable_group_id().to_string(),
+        stub.state_revision + 2,
+        Some(fork_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&fork_members),
+        x0x::groups::compute_policy_hash(&stub.policy),
+        x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+        stub.security_binding.clone(),
+        false,
+        stub.state_revision + 2,
+        &attacker,
+    )?;
+    let fork_event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: stub.roster_revision + 2,
+        actor: attacker_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: joiner_kp_hash,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: joiner_cert_b64,
+        commit: Some(terminal_commit.clone()),
+    };
+    let attacker_id = attacker.agent_id();
+
+    // Variant 1: NO attestation — the unanchorable gap. A cannot produce
+    // the owner's signature, so it serves the fork bare.
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![fork_link.clone()]);
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        fork_event.clone(),
+        attacker_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        !result.accepted,
+        "#458 r5: an unattested fork across a stale base must be REJECTED (unanchorable)"
+    );
+
+    // Variant 2: a FORGED attestation signed by A's AGENT key — the
+    // verification key must come from the trusted committed certificate's
+    // owner public key, so A's key fails both the owner-id binding and the
+    // signature check.
+    use base64::Engine as _;
+    let canonical = {
+        // Mirror HeadAttestation's canonical bytes (the field layout is
+        // fixed and versioned): build via sign on the real owner key path
+        // is impossible for A; hand-build the same bytes.
+        let mut buf = Vec::new();
+        buf.extend_from_slice(b"x0x.join-head-attest.v1\0");
+        buf.extend_from_slice(stub.stable_group_id().as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&(terminal_commit.revision - 1).to_le_bytes());
+        buf.extend_from_slice(
+            terminal_commit
+                .prev_state_hash
+                .as_deref()
+                .unwrap_or_default()
+                .as_bytes(),
+        );
+        buf.push(0);
+        buf.extend_from_slice(stage.joiner_hex.as_bytes());
+        buf
+    };
+    let forged_sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+        attacker.secret_key(),
+        &canonical,
+    )?;
+    let forged = x0x::server::routes::named_groups::HeadAttestation {
+        group_id: stub.stable_group_id().to_string(),
+        head_revision: terminal_commit.revision - 1,
+        head_state_hash: terminal_commit.prev_state_hash.clone().unwrap_or_default(),
+        member_agent_id: stage.joiner_hex.clone(),
+        signature_b64: BASE64.encode(forged_sig.as_bytes()),
+    };
+    joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![fork_link]);
+    joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key.clone(), forged);
+    let result =
+        apply_named_group_metadata_event(&joiner_state, fork_event, attacker_id, true, None).await;
+    assert!(
+        !result.accepted,
+        "#458 r5: a fork with an attestation signed by the WRONG key must be REJECTED"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the fork must never seat the joiner"
+        );
+        // A was active in the invite-base stub by construction; what must
+        // hold is that the fork advanced NOTHING — the stub is unchanged.
+        assert_eq!(
+            info.state_revision, stub.state_revision,
+            "the fork must not advance the stub at all"
+        );
+    }
+    Ok(())
+}
+
+/// #458 r5b: withdrawal is TERMINAL — a withdrawn link followed by an
+/// unwithdrawn MemberAdded terminal must be refused outright.
+#[tokio::test]
+async fn issue458r5_withdrawn_link_refused() -> Result<()> {
+    let stage = r3_stage(0x82).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let mut withdrawn_roster = real.roster.clone();
+    // A withdrawn commit's roster root covers the surviving projection;
+    // keep the base roster for internal consistency of the forged link.
+    let _ = &mut withdrawn_roster;
+    let withdrawn_commit = x0x::groups::GroupStateCommit::sign(
+        real.commit.group_id.clone(),
+        real.commit.revision,
+        real.commit.prev_state_hash.clone(),
+        real.commit.roster_root.clone(),
+        real.commit.policy_hash.clone(),
+        real.commit.public_meta_hash.clone(),
+        real.commit.security_binding.clone(),
+        true, // withdrawn
+        real.commit.committed_at,
+        &signer,
+    )?;
+    let withdrawn_link = x0x::groups::state_commit::RetainedCommit {
+        commit: withdrawn_commit,
+        roster: real.roster.clone(),
+        meta: real.meta.clone(),
+    };
+    // The staged terminal keeps its own hashes; the withdrawn check fires
+    // inside the fold loop (before terminal linkage), so the refusal
+    // reason is withdrawal terminality.
+    let mut chain = stage.chain.clone();
+    chain[0] = withdrawn_link;
+    let result = r3_apply_with_chain(&stage, chain).await;
+    assert!(!result.accepted, "withdrawn chain → adoption refused");
+    Ok(())
+}
+
+/// #458 r5c: a link that folds to a roster violating the LAST-ADMIN
+/// invariant (the sole admin demoted inside the gap) is refused per link.
+#[tokio::test]
+async fn issue458r5_last_admin_smuggle_refused() -> Result<()> {
+    let stage = r3_stage(0x83).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    // Demote the sole admin to Member inside the link's snapshot.
+    let mut smuggled = real.roster.clone();
+    for snap in smuggled.values_mut() {
+        if snap.role.at_least(x0x::groups::GroupRole::Admin) {
+            snap.role = x0x::groups::GroupRole::Member;
+        }
+    }
+    let smuggled_root = x0x::groups::state_commit::roster_root_of_projection(&smuggled);
+    let smuggled_commit = x0x::groups::GroupStateCommit::sign(
+        real.commit.group_id.clone(),
+        real.commit.revision,
+        real.commit.prev_state_hash.clone(),
+        smuggled_root,
+        real.commit.policy_hash.clone(),
+        real.commit.public_meta_hash.clone(),
+        real.commit.security_binding.clone(),
+        false,
+        real.commit.committed_at,
+        &signer,
+    )?;
+    let smuggled_link = x0x::groups::state_commit::RetainedCommit {
+        commit: smuggled_commit,
+        roster: smuggled,
+        meta: real.meta.clone(),
+    };
+    let mut chain = stage.chain.clone();
+    chain[0] = smuggled_link;
+    let result = r3_apply_with_chain(&stage, chain).await;
+    assert!(
+        !result.accepted,
+        "a smuggled roster stranding the last admin → refused"
+    );
+    Ok(())
+}
+
+/// #458 r5e: a chain whose gap ADDS A CERTIFIED MEMBER is unreconstructable
+/// (the projection carries only the cert digest, not the cert bytes, so
+/// the reconstructed roster cannot re-derive the terminal root) — the
+/// joiner must REFUSE and stay pending. Documented consequence: for
+/// OwnerCertified/Home groups only metadata-only gaps (renames etc.)
+/// adopt.
+#[tokio::test]
+async fn issue458r5_certified_member_in_gap_refused() -> Result<()> {
+    let stage = r3_stage(0x84).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    // A gap link that adds a certified member: the projection entry
+    // carries a cert digest the reconstruction cannot expand to bytes.
+    let mut churned = real.roster.clone();
+    churned.insert(
+        "cd".repeat(32),
+        x0x::groups::state_commit::RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: Some("ab".repeat(32)),
+        },
+    );
+    let churned_root = x0x::groups::state_commit::roster_root_of_projection(&churned);
+    let churned_commit = x0x::groups::GroupStateCommit::sign(
+        real.commit.group_id.clone(),
+        real.commit.revision,
+        real.commit.prev_state_hash.clone(),
+        churned_root,
+        real.commit.policy_hash.clone(),
+        real.commit.public_meta_hash.clone(),
+        real.commit.security_binding.clone(),
+        false,
+        real.commit.committed_at,
+        &signer,
+    )?;
+    let churned_link = x0x::groups::state_commit::RetainedCommit {
+        commit: churned_commit,
+        roster: churned,
+        meta: real.meta.clone(),
+    };
+    let mut chain = stage.chain.clone();
+    chain[0] = churned_link;
+    let result = r3_apply_with_chain(&stage, chain).await;
+    assert!(
+        !result.accepted,
+        "a gap adding a certified member is unreconstructable → refused (joiner stays pending)"
+    );
     Ok(())
 }

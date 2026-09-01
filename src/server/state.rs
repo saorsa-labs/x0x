@@ -801,6 +801,11 @@ pub(super) struct AppState {
     /// the joiner's chain-verified adoption. Transient, single-apply scope.
     pub(super) pending_adoption_chains:
         StdMutex<HashMap<String, Vec<x0x::groups::state_commit::RetainedCommit>>>,
+    /// #458 r5: owner-signed head attestations delivered with a join
+    /// result, keyed by `join_result_key` — the CAS anchor consumed (and
+    /// verified) by the joiner's chain-verified adoption. Single-apply.
+    pub(super) pending_head_attestations:
+        StdMutex<HashMap<String, crate::server::routes::named_groups::HeadAttestation>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

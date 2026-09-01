@@ -1379,6 +1379,15 @@ impl GroupInfo {
                 got: recomputed,
             });
         }
+        // #458 r5d — GSS/Legacy `security_binding`: for non-TreeKEM
+        // planes the binding string ("gss:epoch=N") is NOT tied to any
+        // key material a joiner can independently verify; adopting it from
+        // the verified terminal commit makes it HASH-CONSISTENT-ONLY (the
+        // full-hash equality above proves the authority committed to this
+        // exact string). TreeKEM planes bind epochs to the snapshot the
+        // rebind path verifies separately. Adoption itself is restricted
+        // to OwnerCertified groups anchored by the owner-signed head
+        // attestation, which is the real integrity bound here.
         self.security_binding = commit.security_binding.clone();
         self.state_revision = commit.revision;
         self.prev_state_hash = commit.prev_state_hash.clone();

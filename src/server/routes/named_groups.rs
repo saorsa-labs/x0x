@@ -433,7 +433,124 @@ pub(in crate::server) struct WelcomeRef {
 #[derive(Debug, Clone)]
 pub(in crate::server) struct PendingJoinResult {
     event: NamedGroupMetadataEvent,
+    /// #458 r5: the OWNER-SIGNED head attestation captured at stage time
+    /// (owner installs only) — the joiner's CAS anchor binding the staged
+    /// terminal to the authority's real current head.
+    head_attestation: Option<HeadAttestation>,
     created_at: Instant,
+}
+
+/// #458 r5 (security): the CAS anchor for chain-verified adoption. An
+/// owner install stages this alongside the `MemberAdded` result: the
+/// ADMISSION OWNER's user key (never held by any member agent, however
+/// senior) signs `(group_id, head_revision, head_state_hash,
+/// member_agent_id)` where `head_*` is the authority's current head the
+/// terminal commit chains from. A removed/forked admin can sign arbitrary
+/// commits with its agent key but CANNOT forge this attestation, so a
+/// forked terminal either carries no attestation (unanchorable gap →
+/// refuse) or one whose head hash fails the CAS against the terminal's
+/// own `prev_state_hash`/`revision`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(in crate::server) struct HeadAttestation {
+    pub group_id: String,
+    pub head_revision: u64,
+    pub head_state_hash: String,
+    pub member_agent_id: String,
+    pub signature_b64: String,
+}
+
+impl HeadAttestation {
+    fn canonical_bytes(
+        group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        member_agent_id: &str,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(160);
+        buf.extend_from_slice(b"x0x.join-head-attest.v1\0");
+        buf.extend_from_slice(group_id.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(&head_revision.to_le_bytes());
+        buf.extend_from_slice(head_state_hash.as_bytes());
+        buf.push(0);
+        buf.extend_from_slice(member_agent_id.as_bytes());
+        buf
+    }
+
+    /// Sign under the ADMISSION OWNER's user key (owner installs only).
+    fn sign(
+        group_id: &str,
+        head_revision: u64,
+        head_state_hash: &str,
+        member_agent_id: &str,
+        owner_kp: &crate::identity::UserKeypair,
+    ) -> Result<Self, String> {
+        use base64::Engine as _;
+        let canonical =
+            Self::canonical_bytes(group_id, head_revision, head_state_hash, member_agent_id);
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            owner_kp.secret_key(),
+            &canonical,
+        )
+        .map_err(|e| format!("owner head attestation sign: {e:?}"))?;
+        Ok(Self {
+            group_id: group_id.to_string(),
+            head_revision,
+            head_state_hash: head_state_hash.to_string(),
+            member_agent_id: member_agent_id.to_string(),
+            signature_b64: BASE64.encode(sig.as_bytes()),
+        })
+    }
+
+    /// Verify against the owner public key taken from TRUSTED material
+    /// (the ingress-verified committed certificate) and CAS it to the
+    /// terminal commit: the attested head must be exactly the commit's
+    /// parent.
+    fn verify_against_terminal(
+        &self,
+        owner_public_key: &ant_quic::MlDsaPublicKey,
+        expected_owner: &crate::identity::UserId,
+        terminal: &x0x::groups::GroupStateCommit,
+        member_agent_id: &str,
+    ) -> bool {
+        use base64::Engine as _;
+        // The key must BE the admission owner's.
+        if &crate::identity::UserId::from_public_key(owner_public_key) != expected_owner {
+            return false;
+        }
+        if self.member_agent_id != member_agent_id {
+            return false;
+        }
+        // CAS: the attested head is exactly the terminal's parent.
+        if terminal
+            .prev_state_hash
+            .as_deref()
+            .is_none_or(|prev| prev != self.head_state_hash.as_str())
+            || terminal.revision != self.head_revision.saturating_add(1)
+        {
+            return false;
+        }
+        let Ok(sig_bytes) = BASE64.decode(&self.signature_b64) else {
+            return false;
+        };
+        let Ok(sig) =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+        else {
+            return false;
+        };
+        let canonical = Self::canonical_bytes(
+            &self.group_id,
+            self.head_revision,
+            &self.head_state_hash,
+            &self.member_agent_id,
+        );
+        ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            owner_public_key,
+            &canonical,
+            &sig,
+        )
+        .is_ok()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -660,6 +777,10 @@ pub(in crate::server) enum JoinResultMessage {
         /// simply never send a chain — those joiners never blind-adopt).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         from_revision: Option<u64>,
+        /// #458 r5: the joiner's base state hash (with `from_revision`),
+        /// for diagnostics/CAS logging on the responder.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        base_state_hash: Option<String>,
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
@@ -673,6 +794,10 @@ pub(in crate::server) enum JoinResultMessage {
         /// adoption and stays pending.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         chain: Vec<x0x::groups::state_commit::RetainedCommit>,
+        /// #458 r5: the owner-signed head attestation staged with the
+        /// result (owner installs only) — the joiner's CAS anchor.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        head_attestation: Option<Box<HeadAttestation>>,
     },
 }
 
@@ -2553,6 +2678,38 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
+/// #458 r5c: run `enforce_last_admin_invariant` over a folded roster
+/// projection by materializing the minimal members view it checks.
+fn projection_last_admin_invariant(
+    projection: &std::collections::BTreeMap<
+        String,
+        x0x::groups::state_commit::RosterMemberSnapshot,
+    >,
+    withdrawn: bool,
+) -> Result<(), String> {
+    let mut members = std::collections::BTreeMap::new();
+    for (id, snap) in projection {
+        let mut member = x0x::groups::GroupMember::new_member(id.clone(), None, None, 0);
+        member.role = snap.role;
+        member.state = snap.state;
+        members.insert(id.clone(), member);
+    }
+    x0x::groups::enforce_last_admin_invariant(&members, withdrawn).map_err(|e| e.to_string())
+}
+
+/// The hash the served chain reaches (its last link's `state_hash`) — the
+/// value the owner attestation's head must equal for the CAS to bind the
+/// chain AND the terminal to one authority view.
+fn previous_hash_initial(
+    chain: &[x0x::groups::state_commit::RetainedCommit],
+    _current: &x0x::groups::GroupInfo,
+) -> String {
+    chain
+        .last()
+        .map(|link| link.commit.state_hash.clone())
+        .unwrap_or_default()
+}
+
 /// #458 (review r4): FULLY RECONSTRUCTING joiner adoption of an authority
 /// `MemberAdded` commit whose `prev_state_hash` cannot chain from the
 /// invite base state. The joiner is a VERIFYING node over the served
@@ -2614,6 +2771,7 @@ async fn try_adopt_member_added_across_gap(
     revision: u64,
     e: x0x::groups::state_commit::ApplyError,
     chain: Vec<x0x::groups::state_commit::RetainedCommit>,
+    head_attestation: Option<HeadAttestation>,
 ) -> Option<x0x::groups::GroupInfo> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let adoptable = matches!(
@@ -2657,12 +2815,50 @@ async fn try_adopt_member_added_across_gap(
         return refuse("no intervening chain provided");
     }
 
+    // #458 r5 — THE ANCHOR. Adoption is only permitted for OwnerCertified
+    // groups AND only when the terminal commit is CAS-anchored to the
+    // ADMISSION OWNER's signed attestation of the authority's real
+    // current head. A forked/removed admin can sign arbitrary internally
+    // consistent commits with its agent key, but it never holds the
+    // owner's USER key, so its fork is either unattested (unanchorable
+    // gap → refuse) or fails the CAS against the terminal's parent.
+    // Non-OwnerCertified groups have no unforgeable head anchor at all —
+    // fast-forward adoption is refused for them outright.
+    let Some(owner) = current.policy.admission.owner_certified_user_id().copied() else {
+        return refuse("adoption requires an OwnerCertified anchor (no owner axis)");
+    };
+    let owner_public_key = owner_certified_certificate
+        .as_ref()
+        .and_then(|cert| ant_quic::MlDsaPublicKey::from_bytes(cert.user_public_key_bytes()).ok());
+    let Some(owner_public_key) = owner_public_key else {
+        return refuse("no trusted owner public key available to anchor the head");
+    };
+    let Some(attestation) = head_attestation.as_ref() else {
+        return refuse("no owner head attestation — unanchorable gap, refusing fast-forward");
+    };
+    if !attestation.verify_against_terminal(&owner_public_key, &owner, commit, agent_id) {
+        return refuse("owner head attestation fails verification or CAS against the terminal");
+    }
+    // The attested head must ALSO be the head the served chain reaches.
+    if attestation.head_state_hash != previous_hash_initial(&chain, current) {
+        return refuse("attested head does not match the served chain head");
+    }
+
     // Reconstructed state, folded link by link.
     let mut roster = x0x::groups::state_commit::roster_projection(&current.members_v2);
     let mut meta = current.public_meta();
     let mut previous_hash = current.state_hash.clone();
     let mut previous_revision = current.state_revision;
+    let mut chain_withdrawn = false;
     for link in &chain {
+        if chain_withdrawn {
+            // #458 r5b: withdrawal is TERMINAL — a withdrawn link ends the
+            // group; nothing (link or terminal) may follow it.
+            return refuse("link follows a withdrawn (terminal) link in the chain");
+        }
+        if link.commit.withdrawn {
+            chain_withdrawn = true;
+        }
         let commit_link = &link.commit;
         if commit_link.revision != previous_revision + 1 {
             return refuse("chain is not consecutive from the stub revision");
@@ -2693,6 +2889,21 @@ async fn try_adopt_member_added_across_gap(
                 "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
             );
         }
+        // #458 r5c — ROLE-CHANGE SMUGGLING (documented limitation):
+        // `GroupStateCommit` carries no action kind (state_commit.rs), so
+        // a role change sealed inside an internally consistent retained
+        // snapshot is indistinguishable here from any other admin-committed
+        // role change — an admin can change roles via ordinary commits
+        // anyway (ADR-0016), so this is inherent to the commit format, not
+        // a new capability. The defense-in-depth actually binding is the
+        // OWNER-SIGNED head attestation above: a forked admin cannot get
+        // its smuggled chain anchored. The per-link guard added here is
+        // `enforce_last_admin_invariant` on every folded roster — a
+        // smuggled change that strands the last admin refuses the chain.
+        if let Err(inv) = projection_last_admin_invariant(&link.roster, link.commit.withdrawn) {
+            let _ = inv;
+            return refuse("link folds to a roster that violates the last-admin invariant");
+        }
         roster = link.roster.clone();
         meta = link_meta;
         previous_hash = commit_link.state_hash.clone();
@@ -2705,6 +2916,11 @@ async fn try_adopt_member_added_across_gap(
         || commit.prev_state_hash.as_deref() != Some(previous_hash.as_str())
     {
         return refuse("terminal commit does not chain from the reconstructed head");
+    }
+    if chain_withdrawn || commit.withdrawn {
+        // #458 r5b: a MemberAdded on a withdrawn group is meaningless —
+        // refuse adoption of any withdrawn chain or terminal outright.
+        return refuse("chain or terminal is withdrawn (terminal group state)");
     }
     if commit.group_id != stable_id {
         return refuse("terminal commit group binding invalid");
@@ -2975,11 +3191,20 @@ pub(in crate::server) async fn persist_named_group_info(
     // stale marker (the marker is RESTORED if this transaction rolls
     // back).
     let mut confirmed_stub = false;
-    async fn rollback(
+    // #457 r5b: the pre-transaction sidecar bytes (or absence) — restored
+    // by the pre-durable rollback so a named-write failure cannot leave
+    // the NEW sidecar on disk with no journal to explain it.
+    let pre_sidecar_bytes = tokio::fs::read(&state.home_suite_groups_path).await.ok();
+    // #457 r5b/r5c rollback — PRE-DURABLE only (the named save failed or
+    // the journal preparation failed): discard both journals, restore the
+    // in-memory map, the stub marker, AND the on-disk sidecar to its
+    // pre-transaction bytes.
+    async fn rollback_pre_durable(
         state: &AppState,
         group_id: &str,
         snapshot: &HashMap<String, x0x::groups::GroupInfo>,
         confirmed_stub: bool,
+        pre_sidecar_bytes: &Option<Vec<u8>>,
     ) {
         discard_rebind_journal(state, group_id).await;
         *state.named_groups.write().await = snapshot.clone();
@@ -2989,6 +3214,33 @@ pub(in crate::server) async fn persist_named_group_info(
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .insert(group_id.to_string());
+        }
+        match pre_sidecar_bytes {
+            Some(bytes) => {
+                if let Err(e) =
+                    write_home_suite_sidecar(state, &String::from_utf8_lossy(bytes)).await
+                {
+                    tracing::error!(
+                        group_id = %LogHexId::group(group_id),
+                        error = %e,
+                        "#457 r5b: sidecar RESTORE failed — on-disk sidecar may hold a rejected mutation"
+                    );
+                }
+            }
+            None => {
+                if tokio::fs::try_exists(&state.home_suite_groups_path)
+                    .await
+                    .unwrap_or(false)
+                {
+                    if let Err(e) = tokio::fs::remove_file(&state.home_suite_groups_path).await {
+                        tracing::error!(
+                            group_id = %LogHexId::group(group_id),
+                            error = %e,
+                            "#457 r5b: sidecar REMOVE failed — on-disk sidecar may hold a rejected mutation"
+                        );
+                    }
+                }
+            }
         }
     }
     let snapshot = {
@@ -3013,7 +3265,14 @@ pub(in crate::server) async fn persist_named_group_info(
         RebindOutcome::NotApplicable => {}
         RebindOutcome::Rebound => {}
         RebindOutcome::Failed(e) => {
-            rollback(state, group_id, &snapshot, confirmed_stub).await;
+            rollback_pre_durable(
+                state,
+                group_id,
+                &snapshot,
+                confirmed_stub,
+                &pre_sidecar_bytes,
+            )
+            .await;
             return Err(std::io::Error::other(format!(
                 "TreeKEM rebind preparation failed: {e}"
             )));
@@ -3021,7 +3280,14 @@ pub(in crate::server) async fn persist_named_group_info(
     }
     let outcome = save_named_groups_checked_unlocked(state).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        rollback(state, group_id, &snapshot, confirmed_stub).await;
+        rollback_pre_durable(
+            state,
+            group_id,
+            &snapshot,
+            confirmed_stub,
+            &pre_sidecar_bytes,
+        )
+        .await;
         return outcome;
     }
     match &outcome {
@@ -3038,14 +3304,20 @@ pub(in crate::server) async fn persist_named_group_info(
     {
         // Apply the journaled snapshot file and complete the sequence.
         if let Err(e) = apply_rebind_journal_snapshot(state, group_id).await {
+            // #457 r5c: the named save is ALREADY DURABLE — the mutation
+            // is committed. Deleting the journals now would leave
+            // named=new / snapshot=old with nothing on disk to repair it
+            // (the exact #457 restart wedge). LEAVE both journals in
+            // place: startup replay re-applies the consistent
+            // named+sidecar+snapshot triple. Do not touch disk; still
+            // return the error so the caller knows the apply incomplete.
             tracing::error!(
                 group_id = %LogHexId::group(group_id),
                 error = %e,
-                "#457 r4: journaled rebind apply failed — rolling back"
+                "#457 r5c: journaled rebind apply failed AFTER the durable named save — journals LEFT IN PLACE for startup replay (never discard a journal whose named half is durable)"
             );
-            rollback(state, group_id, &snapshot, confirmed_stub).await;
             return Err(std::io::Error::other(format!(
-                "TreeKEM snapshot rebind apply failed: {e}"
+                "TreeKEM snapshot rebind apply failed (journals retained for startup replay): {e}"
             )));
         }
     }
@@ -3123,6 +3395,18 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         // replay exactly this); the separate `.hsjournal` carries the
         // Home-Suite sidecar half so a crash-replay restores a consistent
         // named+sidecar pair (mirrors the non-rebind seal path).
+        // #457 r5a — ORDERING: the `.hsjournal` goes FIRST and the LEGACY
+        // journal LAST: the legacy journal is the COMMIT POINT (startup
+        // replay is keyed on its existence), so a crash between the two
+        // writes leaves an ORPHAN `.hsjournal` that recovery DISCARDS
+        // (never applies) instead of a half-committed pair. In both
+        // orders the orphan rule below is what makes the window safe; this
+        // order additionally guarantees the commit point is the LAST thing
+        // written, so a legacy journal on disk always has its sidecar
+        // journal already durable.
+        write_home_suite_sidecar_journal(&state.treekem_dir, group_id, &home_suite_json)
+            .await
+            .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
             group_id_hex: group_id.to_string(),
@@ -3137,9 +3421,6 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         x0x::storage::write_private_bytes_durable(&journal_path, journal_bytes)
             .await
             .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
-        write_home_suite_sidecar_journal(&state.treekem_dir, group_id, &home_suite_json)
-            .await
-            .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
         Ok(())
     }
     .await;
@@ -7108,12 +7389,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     let adopt_state = Arc::clone(state);
                     // #458 r3: the intervening chain delivered with the
                     // join-result response (transient, single-apply slot).
+                    let adopt_key = join_result_key(&event_group_id_for_chain, &agent_id);
                     let adopt_chain = state
                         .pending_adoption_chains
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .remove(&join_result_key(&event_group_id_for_chain, &agent_id))
+                        .remove(&adopt_key)
                         .unwrap_or_default();
+                    let adopt_attestation = state
+                        .pending_head_attestations
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner())
+                        .remove(&adopt_key);
                     let adopted = Box::pin(try_adopt_member_added_across_gap(
                         &adopt_state,
                         &current,
@@ -7128,6 +7415,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         revision,
                         e.clone(),
                         adopt_chain,
+                        adopt_attestation,
                     ))
                     .await;
                     match adopted {
@@ -19171,6 +19459,31 @@ pub(in crate::server) async fn recover_home_suite_sidecar_journals(
             if path.extension().and_then(|e| e.to_str()) != Some("hsjournal") {
                 continue;
             }
+            // #457 r5a — ORPHAN RULE: an `.hsjournal` whose group's LEGACY
+            // journal does not exist is a crash-between-journals artifact
+            // (the legacy journal is the commit point and is written
+            // LAST). It is DISCARDED — never applied — so a rejected or
+            // half-committed transaction cannot resurrect its sidecar.
+            let group_stem = path
+                .file_stem()
+                .and_then(|stem| stem.to_str())
+                .unwrap_or_default();
+            let legacy_journal = treekem_dir.join(format!("{group_stem}.journal"));
+            if !legacy_journal.exists() {
+                tracing::warn!(
+                    path = %path.display(),
+                    "discarding orphan Home-Suite sidecar journal (its legacy commit-point journal is absent)"
+                );
+                tokio::fs::remove_file(&path)
+                    .await
+                    .map_err(|e| {
+                        anyhow::anyhow!(
+                            "remove orphan sidecar journal {}: {e}",
+                            path.display()
+                        )
+                    })?;
+                continue;
+            }
             let bytes = tokio::fs::read(&path).await.map_err(|e| {
                 anyhow::anyhow!("read Home-Suite sidecar journal {}: {e}", path.display())
             })?;
@@ -22181,11 +22494,52 @@ async fn stage_join_result(
             ),
             _ => (false, false, false, None, None),
         };
+    // #458 r5: owner installs sign the HEAD ATTESTATION — the CAS anchor
+    // binding the staged terminal to the authority's CURRENT head. The
+    // attested head is the terminal commit's parent (the head the
+    // authority had applied when it sealed the terminal).
+    let head_attestation: Option<HeadAttestation> = async {
+        let owner_kp = state.agent.identity().user_keypair()?;
+        let owner = owner_kp.user_id();
+        let groups = state.named_groups.read().await;
+        let info = groups
+            .get(group_id)
+            .or_else(|| groups.values().find(|i| i.stable_group_id() == group_id))?;
+        if info.policy.admission.owner_certified_user_id() != Some(&owner) {
+            return None;
+        }
+        let terminal = match &event {
+            NamedGroupMetadataEvent::MemberAdded {
+                commit: Some(commit),
+                ..
+            } => commit,
+            _ => return None,
+        };
+        let head_hash = terminal.prev_state_hash.clone()?;
+        let head_revision = terminal.revision.checked_sub(1)?;
+        HeadAttestation::sign(
+            info.stable_group_id(),
+            head_revision,
+            &head_hash,
+            member_agent_id,
+            owner_kp,
+        )
+        .ok()
+        .or_else(|| {
+            tracing::warn!(
+                group_id = %LogHexId::group(group_id),
+                "#458 r5: owner head attestation sign failed — joiner will refuse adoption"
+            );
+            None
+        })
+    }
+    .await;
     let mut results = state.pending_join_results.write().await;
     results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
     results.insert(
         key.clone(),
         PendingJoinResult {
+            head_attestation: head_attestation.clone(),
             event,
             created_at: Instant::now(),
         },
@@ -22361,6 +22715,7 @@ pub(in crate::server) async fn handle_join_result_message(
             group_id,
             member_agent_id,
             from_revision,
+            base_state_hash: _base_state_hash,
         } => {
             let sender_hex = hex::encode(sender.as_bytes());
             tracing::debug!(
@@ -22381,11 +22736,14 @@ pub(in crate::server) async fn handle_join_result_message(
             // staged" can turn into a staged result on the next poll.
             retry_pending_owner_cert_joins(state, Some(&group_id)).await;
             let key = join_result_key(&group_id, &member_agent_id);
-            let (event, pending_count) = {
+            let (event, head_attestation, pending_count) = {
                 let mut results = state.pending_join_results.write().await;
                 results.retain(|_, pending| pending.created_at.elapsed() < PENDING_JOIN_RESULT_TTL);
                 (
                     results.get(&key).map(|pending| pending.event.clone()),
+                    results
+                        .get(&key)
+                        .and_then(|pending| pending.head_attestation.clone()),
                     results.len(),
                 )
             };
@@ -22453,6 +22811,7 @@ pub(in crate::server) async fn handle_join_result_message(
             let response = JoinResultMessage::Result {
                 event: Box::new(event),
                 chain,
+                head_attestation: head_attestation.map(Box::new),
             };
             let payload = match serde_json::to_vec(&response) {
                 Ok(payload) => payload,
@@ -22497,7 +22856,11 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
             }
         }
-        JoinResultMessage::Result { event, chain } => {
+        JoinResultMessage::Result {
+            event,
+            chain,
+            head_attestation,
+        } => {
             let event = *event;
             tracing::debug!(
                 target: "treekem.trace",
@@ -22551,8 +22914,8 @@ pub(in crate::server) async fn handle_join_result_message(
                 );
                 return;
             }
-            // #458 r3: expose the carried chain to the joiner's adoption
-            // path for exactly this apply.
+            // #458 r3/r5: expose the carried chain AND head attestation
+            // to the joiner's adoption path for exactly this apply.
             {
                 let mut chains = state
                     .pending_adoption_chains
@@ -22562,11 +22925,23 @@ pub(in crate::server) async fn handle_join_result_message(
                     chains.insert(expected_key.clone(), chain);
                 }
             }
+            if let Some(attestation) = head_attestation.as_deref() {
+                state
+                    .pending_head_attestations
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(expected_key.clone(), attestation.clone());
+            }
             let applied = apply_named_group_metadata_event(state, event, *sender, true, None)
                 .await
                 .accepted;
             state
                 .pending_adoption_chains
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&expected_key);
+            state
+                .pending_head_attestations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&expected_key);
@@ -22632,16 +23007,18 @@ async fn poll_join_result_until_membership_confirmed(
             break;
         }
         unconfirmed_polls = unconfirmed_polls.saturating_add(1);
-        let from_revision = state
-            .named_groups
-            .read()
-            .await
-            .get(&group_id)
-            .map(|info| info.state_revision);
+        let (from_revision, base_state_hash) = {
+            let groups = state.named_groups.read().await;
+            groups
+                .get(&group_id)
+                .map(|info| (Some(info.state_revision), Some(info.state_hash.clone())))
+                .unwrap_or((None, None))
+        };
         let request = JoinResultMessage::FetchRequest {
             group_id: event_group_id.clone(),
             member_agent_id: member_agent_id.clone(),
             from_revision,
+            base_state_hash,
         };
         let payload = match serde_json::to_vec(&request) {
             Ok(payload) => payload,
@@ -24009,6 +24386,7 @@ pub(in crate::server) mod tests {
             owner_cert_pending_joins: RwLock::new(HashMap::new()),
             pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
             pending_adoption_chains: StdMutex::new(HashMap::new()),
+            pending_head_attestations: StdMutex::new(HashMap::new()),
             pending_welcomes: RwLock::new(HashMap::new()),
             pending_welcome_receives: RwLock::new(HashMap::new()),
             pending_welcome_waiters: RwLock::new(HashMap::new()),
@@ -27284,10 +27662,10 @@ pub(in crate::server) mod tests {
         info
     }
 
-    struct MemberJoinedTreeKemFixture {
-        state: Arc<AppState>,
-        _dir: tempfile::TempDir,
-        group_id: String,
+    pub(in crate::server) struct MemberJoinedTreeKemFixture {
+        pub(in crate::server) state: Arc<AppState>,
+        pub(in crate::server) _dir: tempfile::TempDir,
+        pub(in crate::server) group_id: String,
         stable_group_id: String,
         member_id: AgentId,
         member_hex: String,
@@ -27296,7 +27674,7 @@ pub(in crate::server) mod tests {
         initial_epoch: u64,
     }
 
-    async fn member_joined_treekem_fixture(
+    pub(in crate::server) async fn member_joined_treekem_fixture(
         group_byte: u8,
         stable_byte: u8,
     ) -> Result<MemberJoinedTreeKemFixture> {
@@ -29803,6 +30181,7 @@ pub(in crate::server) mod tests {
             group_id: "aa".repeat(32),
             member_agent_id: "bb".repeat(32),
             from_revision: Some(3),
+            base_state_hash: None,
         };
         let payload = serde_json::to_vec(&request);
         assert!(payload.is_ok(), "join-result fetch request serializes");
@@ -29833,6 +30212,7 @@ pub(in crate::server) mod tests {
                 commit: None,
             }),
             chain: Vec::new(),
+            head_attestation: None,
         };
         let result_payload = serde_json::to_vec(&result);
         assert!(result_payload.is_ok(), "join-result response serializes");
@@ -33900,6 +34280,210 @@ mod hs451_downgrade_safety {
         assert_eq!(snap, envelope);
         assert!(!treekem.join(format!("{home_id}.journal")).exists());
         assert!(!treekem.join(format!("{home_id}.hsjournal")).exists());
+    }
+
+    /// #457 r5a: a crash BETWEEN the two journal writes (the .hsjournal is
+    /// written FIRST, the legacy journal LAST as the commit point) leaves
+    /// an ORPHAN .hsjournal with no legacy journal — recovery must
+    /// DISCARD it, never apply it, so a half-committed transaction cannot
+    /// resurrect its sidecar.
+    #[tokio::test]
+    async fn r5a_orphan_hsjournal_without_legacy_is_discarded() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let pre_sidecar = "{}";
+        write_named_groups_json_atomic(&sidecar_path, pre_sidecar)
+            .await
+            .expect("sidecar init");
+
+        // Crash point: the .hsjournal landed, the legacy (commit-point)
+        // journal did not.
+        write_home_suite_sidecar_journal(&treekem, &"aa".repeat(16), "{\"orphan\":true}")
+            .await
+            .expect("orphan hsjournal write");
+        assert!(treekem
+            .join(format!("{}.hsjournal", "aa".repeat(16)))
+            .exists());
+
+        recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+            .await
+            .expect("recovery tolerates the orphan");
+
+        let sidecar = tokio::fs::read_to_string(&sidecar_path)
+            .await
+            .expect("sidecar read");
+        assert_eq!(
+            sidecar, pre_sidecar,
+            "the orphan hsjournal must NEVER be applied"
+        );
+        assert!(
+            !treekem
+                .join(format!("{}.hsjournal", "aa".repeat(16)))
+                .exists(),
+            "the orphan hsjournal is discarded"
+        );
+    }
+
+    /// #457 r5b: a named-json write FAILURE after the sidecar write rolls
+    /// the on-disk sidecar back to its pre-transaction bytes and leaves
+    /// no journal — the rejected mutation cannot resurface from disk.
+    #[tokio::test]
+    async fn r5b_named_write_failure_restores_sidecar_and_discards_journals() {
+        let fixture = tests::member_joined_treekem_fixture(0xB1, 0xB1)
+            .await
+            .expect("fixture");
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+
+        let pre_sidecar = tokio::fs::read_to_string(&state.home_suite_groups_path)
+            .await
+            .ok()
+            .unwrap_or_else(|| "{}".to_string());
+
+        // Block the named-json write: a directory where the atomic rename
+        // must land makes every named write fail AFTER the sidecar write.
+        let named_path = &state.named_groups_path;
+        let _ = tokio::fs::remove_file(named_path).await;
+        tokio::fs::create_dir(named_path)
+            .await
+            .expect("block named");
+
+        let outcome = update_named_group(
+            State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path(group_id.clone()),
+            Json(UpdateGroupRequest {
+                name: Some("Must Fail And Roll Back".to_string()),
+                description: None,
+            }),
+        )
+        .await
+        .into_response();
+        assert_ne!(
+            outcome.status(),
+            StatusCode::OK,
+            "the mutation must fail when the named write fails"
+        );
+
+        // Unblock and verify the rollback: sidecar byte-identical to the
+        // pre-transaction content, no journals left.
+        tokio::fs::remove_dir(named_path).await.expect("unblock");
+        let post_sidecar = tokio::fs::read_to_string(&state.home_suite_groups_path)
+            .await
+            .ok()
+            .unwrap_or_else(|| "{}".to_string());
+        assert_eq!(
+            post_sidecar, pre_sidecar,
+            "#457 r5b: the on-disk sidecar must equal the pre-transaction bytes"
+        );
+        assert!(
+            !treekem_journal_path(&state.treekem_dir, &group_id).exists(),
+            "no legacy journal remains"
+        );
+        assert!(
+            !treekem_home_suite_journal_path(&state.treekem_dir, &group_id).exists(),
+            "no sidecar journal remains"
+        );
+        let info = state.named_groups.read().await.get(&group_id).cloned();
+        if let Some(info) = info {
+            assert_ne!(
+                info.name, "Must Fail And Roll Back",
+                "the visible map is rolled back"
+            );
+        }
+    }
+
+    /// #457 r5c: a snapshot-write failure AFTER the durable named save
+    /// keeps BOTH journals (the named half is durable — the mutation is
+    /// committed and deleting its repair payload would wedge the restart);
+    /// startup replay then completes the consistent triple.
+    #[tokio::test]
+    async fn r5c_apply_failure_after_durable_keeps_journals_and_replays() {
+        let fixture = tests::member_joined_treekem_fixture(0xB2, 0xB2)
+            .await
+            .expect("fixture");
+        let state = &fixture.state;
+        let group_id = fixture.group_id.clone();
+
+        // Block the SNAPSHOT write only: a directory at the .snap path.
+        // The named save stays writable, so the transaction reaches the
+        // durable named save and then fails applying the snapshot.
+        let snap_path = treekem_snapshot_path(&state.treekem_dir, &group_id);
+        let _ = tokio::fs::remove_file(&snap_path).await;
+        tokio::fs::create_dir(&snap_path)
+            .await
+            .expect("block snapshot");
+
+        let outcome = update_named_group(
+            State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
+            Path(group_id.clone()),
+            Json(UpdateGroupRequest {
+                name: Some("Committed Name".to_string()),
+                description: None,
+            }),
+        )
+        .await
+        .into_response();
+        // The mutation reports failure (apply incomplete)…
+        assert_ne!(
+            outcome.status(),
+            StatusCode::OK,
+            "the apply failure must surface"
+        );
+        // …but BOTH journals remain (never discard a journal whose named
+        // half is already durable).
+        assert!(
+            treekem_journal_path(&state.treekem_dir, &group_id).exists(),
+            "#457 r5c: the legacy journal MUST remain for startup replay"
+        );
+        assert!(
+            treekem_home_suite_journal_path(&state.treekem_dir, &group_id).exists(),
+            "#457 r5c: the sidecar journal MUST remain for startup replay"
+        );
+        // The named json on disk already holds the committed mutation.
+        let named_disk = tokio::fs::read_to_string(&state.named_groups_path)
+            .await
+            .expect("named read");
+        assert!(
+            named_disk.contains("Committed Name"),
+            "the durable named save is committed"
+        );
+
+        // Simulate the restart: unblock the snapshot path and run the
+        // production recovery exactly as serve() orders it.
+        tokio::fs::remove_dir(&snap_path).await.expect("unblock");
+        recover_treekem_named_journals(&state.named_groups_path, &state.treekem_dir)
+            .await
+            .expect("legacy journal recovery");
+        recover_home_suite_sidecar_journals(&state.home_suite_groups_path, &state.treekem_dir)
+            .await
+            .expect("sidecar journal recovery");
+
+        // No wedge: the snapshot exists and its envelope binding matches
+        // the (re-loaded) named state.
+        let snapshot_bytes = tokio::fs::read(&snap_path)
+            .await
+            .expect("snapshot replayed — no #457 wedge");
+        let envelope = decode_treekem_snapshot_envelope(&snapshot_bytes)
+            .expect("envelope decodes")
+            .expect("bound envelope");
+        let groups = state.named_groups.read().await;
+        let info = groups.get(&group_id).expect("group present after replay");
+        assert!(
+            treekem_snapshot_envelope_matches_info(&envelope, info),
+            "snapshot/named binding is consistent after the crash-replay"
+        );
+        assert!(
+            !treekem_journal_path(&state.treekem_dir, &group_id).exists(),
+            "journals consumed by the replay"
+        );
     }
 
     /// Review r2, item 1 (negative control): an unsupported .hsjournal
