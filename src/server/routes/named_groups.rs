@@ -3109,7 +3109,7 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         Ok(None) => return RebindOutcome::NotApplicable,
         Err(e) => return RebindOutcome::Failed(e),
     };
-    let journalled = (|| async {
+    let journalled = async {
         // #451 seam: the two-file split encode, stub-excluded — THIS
         // group's post-mutation entry is the confirmed state being
         // persisted, so it survives the filter.
@@ -3141,7 +3141,7 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
             .await
             .map_err(|e| anyhow::anyhow!("Home-Suite sidecar journal write: {e}"))?;
         Ok(())
-    })()
+    }
     .await;
     match journalled {
         Ok(()) => RebindOutcome::Rebound,
