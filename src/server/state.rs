@@ -794,7 +794,7 @@ pub(super) struct AppState {
     /// response, keyed by `join_result_key` — consumed (and verified) by
     /// the joiner's chain-verified adoption. Transient, single-apply scope.
     pub(super) pending_adoption_chains:
-        StdMutex<HashMap<String, Vec<x0x::groups::GroupStateCommit>>>,
+        StdMutex<HashMap<String, Vec<x0x::groups::state_commit::RetainedCommit>>>,
     /// ADR 0028: bounded per-group queue for `JoinRequestApproved` events that
     /// arrived before their matching `JoinRequestCreated` predecessor. The
     /// approval is retained without mutating group state and drained after

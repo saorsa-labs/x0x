@@ -193,6 +193,11 @@ pub fn roster_root_of_projection(projection: &BTreeMap<String, RosterMemberSnaps
 pub struct RetainedCommit {
     pub commit: GroupStateCommit,
     pub roster: BTreeMap<String, RosterMemberSnapshot>,
+    /// #458 r4: the public metadata the commit sealed over. Retained
+    /// entries predating this field decode as `None`; adoption chains can
+    /// only be served (and verified) when every link carries it.
+    #[serde(default)]
+    pub meta: Option<GroupPublicMeta>,
 }
 
 impl RetainedCommit {
@@ -200,10 +205,15 @@ impl RetainedCommit {
     /// commit that produced it. `members_v2` must already reflect the
     /// committed state.
     #[must_use]
-    pub fn capture(commit: GroupStateCommit, members_v2: &BTreeMap<String, GroupMember>) -> Self {
+    pub fn capture(
+        commit: GroupStateCommit,
+        members_v2: &BTreeMap<String, GroupMember>,
+        meta: GroupPublicMeta,
+    ) -> Self {
         Self {
             roster: roster_projection(members_v2),
             commit,
+            meta: Some(meta),
         }
     }
 
@@ -1134,7 +1144,11 @@ mod tests {
         )
         .unwrap();
 
-        let retained = RetainedCommit::capture(commit, &m);
+        let retained = RetainedCommit::capture(
+            commit,
+            &m,
+            crate::groups::state_commit::GroupPublicMeta::default(),
+        );
         assert!(
             retained.roster_root_consistent(),
             "captured projection must re-derive the commit's signed roster_root"

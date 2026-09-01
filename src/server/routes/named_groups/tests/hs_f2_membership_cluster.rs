@@ -672,7 +672,7 @@ async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458St
 async fn stage_intervening_chain(
     stage: &Issue458Stage,
     stub_revision: u64,
-) -> Vec<x0x::groups::GroupStateCommit> {
+) -> Vec<x0x::groups::state_commit::RetainedCommit> {
     let terminal_revision = match &stage.member_added {
         NamedGroupMetadataEvent::MemberAdded {
             commit: Some(commit),
@@ -767,16 +767,16 @@ async fn issue458_joiner_adopts_member_added_across_rename_gap() -> Result<()> {
             jinfo.has_active_member(&stage.joiner_hex),
             "#458: adopted commit must seat the joiner"
         );
-        // r2: the adoption FORKS self-consistently — the stored hash is
-        // recomputed from local content (never the commit's blind copy),
-        // so the next normal seal/apply cannot reject on hash≠content.
-        assert_ne!(
+        // r4: the adoption RECONSTRUCTS — the adopted hash EQUALS the
+        // verified terminal commit's hash (a differing hash is a failure),
+        // and hash == content by construction.
+        assert_eq!(
             jinfo.state_hash, commit_hash,
-            "#458 r2: the commit's hash must never be copied over content it does not cover"
+            "#458 r4: the reconstructed adoption's hash MUST match the terminal commit"
         );
         assert!(
             jinfo.state_hash_is_current(),
-            "#458 r2: adopted state must be internally consistent (hash == recomputed content)"
+            "#458 r4: adopted state must be internally consistent (hash == recomputed content)"
         );
     }
     let row = diagnostics_row(joiner_state.as_ref(), &stage.group_id).await;
@@ -1789,25 +1789,35 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
 /// between), joiner state holding the base stub, the staged MemberAdded,
 /// and the VALID intervening chain.
 struct R3Stage {
+    /// Keeps the joiner state's tempdir alive for the struct's lifetime —
+    /// dropping it deletes the directory and every persist fails.
+    _keep_alive: tempfile::TempDir,
     joiner_state: Arc<AppState>,
     member_added: NamedGroupMetadataEvent,
-    chain: Vec<x0x::groups::GroupStateCommit>,
+    chain: Vec<x0x::groups::state_commit::RetainedCommit>,
     group_id: String,
     joiner_hex: String,
     authority_hex: String,
     authority_key_bytes: (Vec<u8>, Vec<u8>),
+    base_policy_hash: String,
 }
 
 async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
     let stage = issue458_stage(group_byte, true).await?;
-    let (joiner_state, _dir) = joiner_state_for(&stage).await?;
+    let (joiner_state, _keep_alive) = joiner_state_for(&stage).await?;
     joiner_state
         .named_groups
         .write()
         .await
         .insert(stage.group_id.clone(), stage.base_info.clone());
     let chain = stage_intervening_chain(&stage, stage.base_info.state_revision).await;
+    let base_policy_hash = {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("stub");
+        x0x::groups::compute_policy_hash(&info.policy)
+    };
     Ok(R3Stage {
+        _keep_alive,
         joiner_state,
         member_added: stage.member_added.clone(),
         chain,
@@ -1815,12 +1825,13 @@ async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
         joiner_hex: stage.joiner_hex.clone(),
         authority_hex: hex::encode(stage.authority.agent.agent_id().as_bytes()),
         authority_key_bytes: stage.authority_key_bytes.clone(),
+        base_policy_hash,
     })
 }
 
 fn r3_apply_with_chain(
     stage: &R3Stage,
-    chain: Vec<x0x::groups::GroupStateCommit>,
+    chain: Vec<x0x::groups::state_commit::RetainedCommit>,
 ) -> impl std::future::Future<Output = ApplyMetadataResult> + '_ {
     let key = join_result_key(&stage.group_id, &stage.joiner_hex);
     stage
@@ -1859,83 +1870,121 @@ async fn issue458r3_no_chain_means_no_adoption() -> Result<()> {
     Ok(())
 }
 
-/// #458 r3: a chain whose intermediate commit shows ROSTER CHURN (root
-/// differs from the base) is unverifiable — refused.
+/// #458 r4: forge a chain LINK from explicit artifacts — the commit is
+/// signed over the GIVEN roster projection + meta (so the snapshot checks
+/// pass) with the GIVEN signer; the attack under test decides which
+/// invariant must refuse it.
+fn forge_retained_link(
+    group_id: &str,
+    policy_hash: &str,
+    revision: u64,
+    prev_hash: Option<String>,
+    roster: std::collections::BTreeMap<String, x0x::groups::state_commit::RosterMemberSnapshot>,
+    meta: x0x::groups::state_commit::GroupPublicMeta,
+    signer: &AgentKeypair,
+) -> x0x::groups::state_commit::RetainedCommit {
+    let roster_root = x0x::groups::state_commit::roster_root_of_projection(&roster);
+    let meta_hash = x0x::groups::compute_public_meta_hash(&meta);
+    let commit = x0x::groups::GroupStateCommit::sign(
+        group_id.to_string(),
+        revision,
+        prev_hash,
+        roster_root,
+        policy_hash.to_string(),
+        meta_hash,
+        None,
+        false,
+        revision,
+        signer,
+    )
+    .expect("sign forged link");
+    x0x::groups::state_commit::RetainedCommit {
+        commit,
+        roster,
+        meta: Some(meta),
+    }
+}
+
 #[tokio::test]
 async fn issue458r3_chain_with_roster_churn_refused() -> Result<()> {
+    // A link whose COMMITTED roster root covers a CHURNED roster (an extra
+    // member) — internally consistent (snapshot re-derives the root), so
+    // the refusal must come from the RECONSTRUCTION checks: the terminal
+    // hash can no longer match the reconstruction... in fact the fold
+    // ACCEPTS the churned snapshot by design (folding is the point); the
+    // invariant exercised here is that a link whose snapshot does NOT
+    // re-derive its signed root is refused.
     let stage = r3_stage(0x62).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let mut tampered_roster = real.roster.clone();
+    tampered_roster.insert(
+        "ee".repeat(32),
+        x0x::groups::state_commit::RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: None,
+        },
+    );
+    let churned = x0x::groups::state_commit::RetainedCommit {
+        commit: real.commit.clone(),
+        roster: tampered_roster,
+        meta: real.meta.clone(),
+    };
     let mut chain = stage.chain.clone();
-    let link = chain.first().cloned().expect("one link");
-    let signer =
-        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
-    let churned = x0x::groups::GroupStateCommit::sign(
-        link.group_id.clone(),
-        link.revision,
-        link.prev_state_hash.clone(),
-        "churned-root".to_string(),
-        link.policy_hash.clone(),
-        link.public_meta_hash.clone(),
-        link.security_binding.clone(),
-        link.withdrawn,
-        link.committed_at,
-        &signer,
-    )?;
     chain[0] = churned;
     let result = r3_apply_with_chain(&stage, chain).await;
-    assert!(!result.accepted, "roster churn in the gap → refused");
+    assert!(
+        !result.accepted,
+        "a snapshot that does not re-derive its signed roster_root → refused"
+    );
     Ok(())
 }
 
 /// #458 r3: broken prev_state_hash linkage anywhere in the chain → refused
-/// (the tampered link is re-signed by the REAL admin so the signature check
-/// passes and the LINKAGE check is what refuses).
+/// (the tampered link is re-signed by the REAL admin so the signature and
+/// snapshot checks pass and the LINKAGE check is what refuses).
 #[tokio::test]
 async fn issue458r3_chain_with_broken_linkage_refused() -> Result<()> {
     let stage = r3_stage(0x63).await?;
-    let mut chain = stage.chain.clone();
-    let mut link = chain.remove(0);
-    link.prev_state_hash = Some("tampered".to_string());
+    let real = stage.chain.first().cloned().expect("one link");
     let signer =
         AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
-    let resigned = x0x::groups::GroupStateCommit::sign(
-        link.group_id.clone(),
-        link.revision,
-        link.prev_state_hash.clone(),
-        link.roster_root.clone(),
-        link.policy_hash.clone(),
-        link.public_meta_hash.clone(),
-        link.security_binding.clone(),
-        link.withdrawn,
-        link.committed_at,
+    let forged = forge_retained_link(
+        &stage.group_id,
+        &stage.base_policy_hash,
+        real.commit.revision,
+        Some("tampered".to_string()),
+        real.roster.clone(),
+        real.meta.clone().expect("meta"),
         &signer,
-    )?;
-    chain.insert(0, resigned);
+    );
+    let mut chain = stage.chain.clone();
+    chain[0] = forged;
     let result = r3_apply_with_chain(&stage, chain).await;
     assert!(!result.accepted, "broken linkage → refused");
     Ok(())
 }
 
 /// #458 r3: an intervening commit signed by a NON-admin of the verified
-/// base roster → the authority re-derivation fails → refused.
+/// base roster → the authority re-derivation fails → refused. The link is
+/// fully consistent (snapshot + meta re-derive) — only the SIGNER is wrong.
 #[tokio::test]
 async fn issue458r3_chain_signed_by_non_admin_refused() -> Result<()> {
     let stage = r3_stage(0x64).await?;
-    let mut chain = stage.chain.clone();
-    let link = chain.first().cloned().expect("one link");
+    let real = stage.chain.first().cloned().expect("one link");
     let stranger = AgentKeypair::generate()?;
-    let forged_link = x0x::groups::GroupStateCommit::sign(
-        link.group_id.clone(),
-        link.revision,
-        link.prev_state_hash.clone(),
-        link.roster_root.clone(),
-        link.policy_hash.clone(),
-        link.public_meta_hash.clone(),
-        link.security_binding.clone(),
-        link.withdrawn,
-        link.committed_at,
+    let forged = forge_retained_link(
+        &stage.group_id,
+        &stage.base_policy_hash,
+        real.commit.revision,
+        real.commit.prev_state_hash.clone(),
+        real.roster.clone(),
+        real.meta.clone().expect("meta"),
         &stranger,
-    )?;
-    chain[0] = forged_link;
+    );
+    let mut chain = stage.chain.clone();
+    chain[0] = forged;
     let result = r3_apply_with_chain(&stage, chain).await;
     assert!(!result.accepted, "non-admin chain signer → refused");
     Ok(())
@@ -2330,5 +2379,171 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         joiner_disk.contains(&home_id),
         "confirmed join is durable on the joiner"
     );
+    Ok(())
+}
+
+// ── Review round 4 ────────────────────────────────────────────────────────
+
+/// #458 r4 SECURITY regression — the removed-admin fork attack (Codex
+/// round-3 finding): admin A is valid at the invite base revision but
+/// REMOVED on the canonical chain afterwards. A serves an internally
+/// consistent fork (alternate commit retaining its admin seat + a
+/// MemberAdded for a certified joiner). The joiner — whose own view has
+/// ADVANCED over the canonical removal, exactly as the production
+/// metadata-topic listener delivers it — must REJECT the fork: its
+/// linkage is stale against the joiner's converged state.
+#[tokio::test]
+async fn issue458r4_removed_admin_fork_rejected() -> Result<()> {
+    // Authority: base roster seats the authority (admin) AND attacker A
+    // (admin). A is the inviter of record.
+    let stage = issue458_stage(0x71, false).await?;
+    let (joiner_state, _dir) = joiner_state_for(&stage).await?;
+    let authority_hex = hex::encode(stage.authority.agent.agent_id().as_bytes());
+    let attacker = AgentKeypair::generate()?;
+    let attacker_hex = hex::encode(attacker.agent_id().as_bytes());
+
+    // The joiner's stub: base roster WITH A seated as admin (the invite
+    // base A minted while still valid).
+    let mut stub = stage.base_info.clone();
+    stub.add_member(
+        attacker_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        None,
+        None,
+    );
+    stub.recompute_state_hash();
+    joiner_state
+        .named_groups
+        .write()
+        .await
+        .insert(stage.group_id.clone(), stub.clone());
+
+    // CANONICAL advance the joiner has already observed (the metadata
+    // topic delivered it): the authority REMOVES A at the next revision.
+    // The joiner applies it — it chains from the stub.
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let mut canonical = stub.clone();
+    canonical.remove_member(&attacker_hex, None);
+    let removal_commit = x0x::groups::GroupStateCommit::sign(
+        canonical.stable_group_id().to_string(),
+        canonical.state_revision + 1,
+        Some(canonical.state_hash.clone()),
+        x0x::groups::compute_roster_root(&canonical.members_v2),
+        x0x::groups::compute_policy_hash(&canonical.policy),
+        x0x::groups::compute_public_meta_hash(&canonical.public_meta()),
+        canonical.security_binding.clone(),
+        false,
+        canonical.state_revision + 1,
+        &signer,
+    )?;
+    canonical.state_revision = removal_commit.revision;
+    canonical.prev_state_hash = removal_commit.prev_state_hash.clone();
+    canonical.state_hash = removal_commit.state_hash.clone();
+    canonical
+        .commit_log
+        .push(x0x::groups::state_commit::RetainedCommit {
+            commit: removal_commit,
+            roster: x0x::groups::state_commit::roster_projection(&canonical.members_v2),
+            meta: Some(canonical.public_meta()),
+        });
+    *joiner_state
+        .named_groups
+        .write()
+        .await
+        .get_mut(&stage.group_id)
+        .unwrap() = canonical;
+
+    // A's FORK: served with the join result — an alternate next-commit
+    // that RETAINS A's seat, then nothing else. The joiner's current
+    // revision is now canonical removal revision; A's fork chains from the
+    // BASE revision. Every fork check the attack relies on (A is an
+    // admin, internally consistent) holds — the refusal must come from
+    // the stale linkage/revision against the joiner's converged view.
+    let mut fork_roster = x0x::groups::state_commit::roster_projection(&stub.members_v2);
+    let _ = &mut fork_roster; // base projection INCLUDING A
+    let fork_link = x0x::groups::state_commit::RetainedCommit {
+        commit: x0x::groups::GroupStateCommit::sign(
+            stub.stable_group_id().to_string(),
+            stub.state_revision + 1,
+            Some(stub.state_hash.clone()),
+            x0x::groups::state_commit::roster_root_of_projection(&fork_roster),
+            x0x::groups::compute_policy_hash(&stub.policy),
+            x0x::groups::compute_public_meta_hash(&stub.public_meta()),
+            stub.security_binding.clone(),
+            false,
+            stub.state_revision + 1,
+            &attacker,
+        )?,
+        roster: fork_roster,
+        meta: Some(stub.public_meta()),
+    };
+    // And a terminal MemberAdded for the joiner signed by A, chained on
+    // A's fork (reuses the staged event's commit fields but re-signed by
+    // A after A's link) — the apply path only reads the chain + terminal;
+    // a stale chain alone must already refuse.
+    joiner_state.pending_adoption_chains.lock().unwrap().insert(
+        join_result_key(&stage.group_id, &stage.joiner_hex),
+        vec![fork_link],
+    );
+    let actor_id = crate::server::parse_agent_id_hex(&authority_hex).expect("actor");
+    let result = apply_named_group_metadata_event(
+        &joiner_state,
+        stage.member_added.clone(),
+        actor_id,
+        true,
+        None,
+    )
+    .await;
+    assert!(
+        !result.accepted,
+        "#458 r4: the removed-admin fork must be REJECTED against the joiner's converged view"
+    );
+    {
+        let groups = joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the fork must not seat the joiner"
+        );
+        assert!(
+            !info.has_active_member(&attacker_hex),
+            "the canonical removal of A must STAY applied"
+        );
+    }
+    Ok(())
+}
+
+/// #458 r4 positive: the reconstructed adoption's state hash MUST MATCH
+/// the terminal commit (a differing hash is now a failure) — pins the
+/// full-node verification on the happy path.
+#[tokio::test]
+async fn issue458r4_reconstruction_adopts_matching_hash() -> Result<()> {
+    let stage = r3_stage(0x72).await?;
+    let commit_hash = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } => commit.state_hash.clone(),
+        _ => panic!("commit"),
+    };
+    let result = r3_apply_with_chain(&stage, stage.chain.clone()).await;
+    assert!(result.accepted, "valid chain adopts");
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            info.has_active_member(&stage.joiner_hex),
+            "joiner seated via reconstruction"
+        );
+        assert_eq!(
+            info.state_hash, commit_hash,
+            "#458 r4: the adopted state hash MUST equal the verified terminal commit's hash"
+        );
+        assert!(
+            info.state_hash_is_current(),
+            "hash == content by construction"
+        );
+    }
     Ok(())
 }

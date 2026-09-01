@@ -663,13 +663,16 @@ pub(in crate::server) enum JoinResultMessage {
     },
     Result {
         event: Box<NamedGroupMetadataEvent>,
-        /// #458 r3: the authority-signed state-commits strictly after the
+        /// #458 r4: the authority's retained commits strictly after the
         /// fetcher's `from_revision`, ordered, consecutive, and ending at
-        /// the carried event's own commit — EMPTY when the authority's
-        /// retained history does not reach back that far (the joiner then
-        /// refuses adoption and stays pending).
+        /// the carried event's own commit — each with its VERIFIED roster
+        /// projection and sealed public metadata so the joiner can
+        /// deterministically RECONSTRUCT the chain. EMPTY when the
+        /// retained history does not reach back that far (or a legacy
+        /// entry lacks its sealed meta) — the joiner then refuses
+        /// adoption and stays pending.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
-        chain: Vec<x0x::groups::GroupStateCommit>,
+        chain: Vec<x0x::groups::state_commit::RetainedCommit>,
     },
 }
 
@@ -2550,41 +2553,47 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
     }
 }
 
-/// #458 (review r3): CHAIN-VERIFIED joiner adoption of an authority
+/// #458 (review r4): FULLY RECONSTRUCTING joiner adoption of an authority
 /// `MemberAdded` commit whose `prev_state_hash` cannot chain from the
-/// invite base state. Adoption happens ONLY when the FULL intervening
-/// chain — every state-commit strictly between the joiner's known-good
-/// base revision and the terminal commit — is present and verifies; the
-/// joiner never blind-adopts and never trusts the stale invite-base roster
-/// for authority it cannot prove.
+/// invite base state. The joiner is a VERIFYING node over the served
+/// chain, never a trustor of embedded snapshots:
 ///
-/// VERIFICATION (every link must pass, else refuse and stay pending):
-/// 1. CONSECUTIVENESS — `chain[0].revision == base+1`, each next is
-///    `prev+1`, and the terminal commit is `last+1` (no gaps at all).
-/// 2. LINKAGE — `chain[0].prev_state_hash == base.state_hash` (the
-///    authority-signed invite base is the anchor), each commit's
-///    `prev_state_hash` equals the previous commit's `state_hash`, and the
-///    terminal chains from the last chain commit.
-/// 3. SIGNATURES — every commit (chain and terminal) passes
-///    `verify_structure()` (signature + `committed_by` derived from the
-///    signing key) and carries the group's stable id.
-/// 4. AUTHORITY RE-DERIVATION FROM THE VERIFIED CHAIN — every chain
-///    commit's `committed_by` is an ACTIVE ADMIN of the BASE roster (the
-///    authority-signed invite base), and every chain commit's
-///    `roster_root` EQUALS the base roster's root — the roots PROVE no
-///    membership churn intervened, so the base admins provably remained
-///    admins at the terminal commit's parent. Any roster change in the
-///    gap (unreconstructable here) refuses adoption.
-/// 5. TERMINAL — the caller's reconstruction check (below) proves the
-///    terminal `roster_root` equals base-roster + this joiner (with its
-///    committed certificate); `committed_by == actor == sender`; for
-///    OwnerCertified groups the ingress gate already verified the event's
-///    certificate chains to the admission owner.
+/// RECONSTRUCTION (deterministic, from the known-good invite base):
+/// - Start from the base roster, base policy, base metadata.
+/// - For each retained link, in order:
+///   * consecutive revision from the base and prev-hash linkage anchored
+///     at the base's signed `state_hash`;
+///   * the link's signature + internal consistency (`verify_structure`)
+///     and stable-id binding;
+///   * the link's roster projection RE-DERIVES the commit's signed
+///     `roster_root` (snapshot trusted only after this equality);
+///   * the link's sealed metadata RE-DERIVES the commit's signed
+///     `public_meta_hash`;
+///   * the commit's `policy_hash` equals the base policy (a policy change
+///     in the gap is unreconstructable here → refuse);
+///   * the committer (`committed_by`) is an ACTIVE ADMIN in the
+///     RECONSTRUCTED roster at that revision's predecessor — NOT the
+///     invite base and NOT the commit's self-asserted view;
+///   * fold the projection into the reconstructed roster and the metadata
+///     into the reconstructed metadata.
+/// - The terminal commit must chain from the reconstruction head, its
+///   signature/group/policy/meta/binding must verify, its committer must
+///   be an active admin in the RECONSTRUCTED predecessor roster, and the
+///   roster after adding THIS joiner (with the committed certificate)
+///   must RE-DERIVE the terminal `roster_root`; the fully recomputed
+///   state hash over the reconstruction MUST EQUAL the terminal commit's
+///   claimed hash — a differing hash is a FAILURE, never success.
+/// - On success the joiner adopts the reconstruction (hash == content by
+///   construction) and retains the whole verified chain for audit.
+/// Any check failing → refuse; the joiner stays pending.
 ///
-/// The adopted state stays INTERNALLY CONSISTENT
-/// (`finalize_adopted_commit_roster_checked`): revision/binding follow the
-/// VERIFIED terminal commit, the local hash is recomputed from local
-/// content, and the whole verified chain is retained for audit.
+/// Fork note (threat model): a fork served by an admin who was valid at
+/// the base but since removed on the canonical chain is internally
+/// consistent and cannot be distinguished from the canonical chain by the
+/// chain alone — it is rejected here as soon as the joiner's own view has
+/// advanced (the canonical commits arrive over the metadata topic and the
+/// fork's linkage goes stale), which is the same convergence rule every
+/// honest receiver applies.
 ///
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
 /// frame must not absorb these locals (a deterministic 2 MiB-stack
@@ -2603,7 +2612,7 @@ async fn try_adopt_member_added_across_gap(
     owner_certified_certificate: Option<x0x::identity::AgentCertificate>,
     revision: u64,
     e: x0x::groups::state_commit::ApplyError,
-    chain: Vec<x0x::groups::GroupStateCommit>,
+    chain: Vec<x0x::groups::state_commit::RetainedCommit>,
 ) -> Option<x0x::groups::GroupInfo> {
     let local_agent_hex = hex::encode(state.agent.agent_id().as_bytes());
     let adoptable = matches!(
@@ -2620,59 +2629,101 @@ async fn try_adopt_member_added_across_gap(
         return None;
     }
     let stable_id = current.stable_group_id();
-    let base_admins: Vec<String> = current
-        .members_v2
-        .iter()
-        .filter(|(_, member)| {
-            member.is_active() && member.role.at_least(x0x::groups::GroupRole::Admin)
-        })
-        .map(|(hex, _)| hex.to_ascii_lowercase())
-        .collect();
-    let base_roster_root = x0x::groups::compute_roster_root(&current.members_v2);
-    // NOTE: the caller's `None` arm owns the rejection COUNTER (one
-    // count per refused apply, regardless of which check refused).
+    let base_policy_hash = x0x::groups::compute_policy_hash(&current.policy);
+    // NOTE: the caller's `None` arm owns the rejection COUNTER (one count
+    // per refused apply, regardless of which check refused).
     let refuse = |reason: &'static str| -> Option<x0x::groups::GroupInfo> {
         tracing::warn!(
             group_id = %LogHexId::group(stable_id),
             member = agent_id,
             reason,
-            "MemberAdded: chain-verified adoption refused — joiner stays pending (#458 r3)"
+            "MemberAdded: reconstructing adoption refused — joiner stays pending (#458 r4)"
         );
         None
     };
+    let admin_in = |roster: &std::collections::BTreeMap<
+        String,
+        x0x::groups::state_commit::RosterMemberSnapshot,
+    >,
+                    who: &str| {
+        roster.get(who).is_some_and(|snap| {
+            snap.state == x0x::groups::GroupMemberState::Active
+                && snap.role.at_least(x0x::groups::GroupRole::Admin)
+        })
+    };
 
-    // (1)+(2)+(3)+(4): the full intervening chain, verified link by link.
     if chain.is_empty() {
         return refuse("no intervening chain provided");
     }
+
+    // Reconstructed state, folded link by link.
+    let mut roster = x0x::groups::state_commit::roster_projection(&current.members_v2);
+    let mut meta = current.public_meta();
     let mut previous_hash = current.state_hash.clone();
     let mut previous_revision = current.state_revision;
     for link in &chain {
-        if link.revision != previous_revision + 1 {
+        let commit_link = &link.commit;
+        if commit_link.revision != previous_revision + 1 {
             return refuse("chain is not consecutive from the stub revision");
         }
-        if link.prev_state_hash.as_deref() != Some(previous_hash.as_str()) {
-            return refuse("chain prev_state_hash linkage broken");
+        if commit_link.prev_state_hash.as_deref() != Some(previous_hash.as_str()) {
+            return refuse("chain prev_state_hash linkage broken (stale or forked chain)");
         }
-        if link.group_id != stable_id || link.verify_structure().is_err() {
+        if commit_link.group_id != stable_id || commit_link.verify_structure().is_err() {
             return refuse("chain commit signature/group binding invalid");
         }
-        if !base_admins.contains(&link.committed_by.to_ascii_lowercase()) {
-            return refuse("chain commit signed by a non-admin of the verified base roster");
+        // Snapshot trust comes ONLY from re-deriving the signed root.
+        if x0x::groups::state_commit::roster_root_of_projection(&link.roster)
+            != commit_link.roster_root
+        {
+            return refuse("link roster snapshot does not re-derive its signed roster_root");
         }
-        if link.roster_root != base_roster_root {
-            return refuse("chain shows intervening roster churn the stub cannot reconstruct");
+        let Some(link_meta) = link.meta.clone() else {
+            return refuse("link predates sealed-meta retention (unreconstructable)");
+        };
+        if x0x::groups::compute_public_meta_hash(&link_meta) != commit_link.public_meta_hash {
+            return refuse("link sealed metadata does not re-derive its signed meta hash");
         }
-        previous_hash = link.state_hash.clone();
-        previous_revision = link.revision;
+        if commit_link.policy_hash != base_policy_hash {
+            return refuse("policy changed inside the gap (unreconstructable without the event)");
+        }
+        if !admin_in(&roster, &commit_link.committed_by) {
+            return refuse(
+                "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
+            );
+        }
+        roster = link.roster.clone();
+        meta = link_meta;
+        previous_hash = commit_link.state_hash.clone();
+        previous_revision = commit_link.revision;
     }
+
+    // Terminal: chain from the reconstruction head and verify EVERYTHING
+    // against the reconstruction — including a FULL hash equality.
     if commit.revision != previous_revision + 1
         || commit.prev_state_hash.as_deref() != Some(previous_hash.as_str())
     {
-        return refuse("terminal commit does not chain from the verified chain head");
+        return refuse("terminal commit does not chain from the reconstructed head");
+    }
+    if commit.group_id != stable_id {
+        return refuse("terminal commit group binding invalid");
+    }
+    if commit.policy_hash != base_policy_hash {
+        return refuse("terminal commit changes policy (unreconstructable)");
+    }
+    if commit.public_meta_hash != x0x::groups::compute_public_meta_hash(&meta) {
+        return refuse("terminal meta hash does not match the reconstruction");
+    }
+    if !admin_in(&roster, &commit.committed_by) {
+        return refuse(
+            "terminal committer is not an active admin in the reconstructed predecessor roster",
+        );
     }
 
+    // Fold the joiner into the reconstructed members and require the
+    // terminal roster root, then the FULL state hash, to re-derive.
     let mut adopted = current.clone();
+    adopted.apply_reconstructed_roster(&roster);
     adopted.roster_revision = revision.max(adopted.roster_revision);
     adopted.add_member(
         agent_id.to_string(),
@@ -2686,31 +2737,24 @@ async fn try_adopt_member_added_across_gap(
     if let Some(cert) = owner_certified_certificate {
         adopted.set_member_certificate(agent_id, cert);
     }
-    // Fast-forward checks: the roster the joiner reconstructs MUST equal
-    // the roster the authority's signature committed to (`roster_root`),
-    // and the last-admin invariant must hold. The full state-hash
-    // comparison is deliberately not required (the commit's hash covers
-    // intermediate metadata the stub cannot reconstruct) — instead the
-    // local chain forks SELF-CONSISTENTLY: revision/binding follow the
-    // signed commit, the hash is recomputed from local content.
-    match adopted.finalize_adopted_commit_roster_checked_with_chain(commit, &chain) {
+    match adopted.finalize_adopted_commit_reconstructed(commit, &meta, &chain) {
         Ok(()) => {
             state
                 .groups_diagnostics
-                .record_member_added_adopted(info.stable_group_id());
+                .record_member_added_adopted(stable_id);
             tracing::info!(
-                group_id = %LogHexId::group(info.stable_group_id()),
-                member = %agent_id,
+                group_id = %LogHexId::group(stable_id),
+                member = agent_id,
                 commit_revision = commit.revision,
-                "MemberAdded: joiner stub adopted authority commit across prev_state_hash gap (#458)"
+                "MemberAdded: joiner RECONSTRUCTED and adopted the authority chain (#458 r4)"
             );
             Some(adopted)
         }
         Err(adopt_err) => {
             tracing::warn!(
-                group_id = %LogHexId::group(info.stable_group_id()),
-                member = %agent_id,
-                "MemberAdded: adoption failed the roster-root/last-admin check (#458): {adopt_err}"
+                group_id = %LogHexId::group(stable_id),
+                member = agent_id,
+                "MemberAdded: reconstruction failed terminal verification (#458 r4): {adopt_err}"
             );
             None
         }
@@ -2904,13 +2948,14 @@ pub(in crate::server) async fn persist_named_group_info(
     group_id: &str,
     info: x0x::groups::GroupInfo,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    // #457 (review r2): the named write and the TreeKEM snapshot rebind
-    // are ONE transaction under the persistence lock — the rebind runs
-    // while the lock is still held, and its FAILURE fails the operation
-    // (after a best-effort rollback of the visible map). No caller can
-    // observe success with a torn named/snapshot pair, and the crash
-    // window (named durable, crash before the snapshot write) is exactly
-    // the window the STARTUP repair heals.
+    // #457 r4: the named write and the TreeKEM snapshot rebind are ONE
+    // crash-atomic transaction under the persistence lock — the journal
+    // (post-mutation named json + rebound envelope) is written FIRST, the
+    // named json and snapshot file applied, the journal removed; a crash
+    // at any point replays the consistent pair at startup. A failure at
+    // ANY step discards the journal (a replayed REJECTED mutation would be
+    // a correctness bug), rolls the visible map back, restores the
+    // pending-stub marker, and fails the operation.
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     if state
         .named_groups_requires_durability_confirmation
@@ -2923,25 +2968,59 @@ pub(in crate::server) async fn persist_named_group_info(
             outcome => return outcome,
         }
     }
+    // #458 r4 item 1: the pending-stub exclusion and the map mutation are
+    // one atomic step under this lock — a stub is never visible to a
+    // serializer without its marker, and a confirmed group never keeps a
+    // stale marker (the marker is RESTORED if this transaction rolls
+    // back).
+    let mut confirmed_stub = false;
+    async fn rollback(
+        state: &AppState,
+        group_id: &str,
+        snapshot: &HashMap<String, x0x::groups::GroupInfo>,
+        confirmed_stub: bool,
+    ) {
+        discard_rebind_journal(state, group_id).await;
+        *state.named_groups.write().await = snapshot.clone();
+        if confirmed_stub {
+            state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(group_id.to_string());
+        }
+    }
     let snapshot = {
         let mut groups = state.named_groups.write().await;
         let snapshot = groups.clone();
         if !store_named_group_info_locked(&mut groups, group_id, info) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
-        // #458 r3: this persist MAKES the group's state durable — end its
-        // (possible) tenure as an unconfirmed join stub BEFORE the save, so
-        // the serializer includes it in this very write.
-        state
+        if state
             .pending_join_stubs
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(group_id);
+            .remove(group_id)
+        {
+            confirmed_stub = true;
+        }
         snapshot
     };
+    // Journal-first (TreeKEM-plane groups only; NotApplicable otherwise).
+    let prejournaled = prepare_rebind_journal_locked(state, group_id).await;
+    match prejournaled {
+        RebindOutcome::NotApplicable => {}
+        RebindOutcome::Rebound => {}
+        RebindOutcome::Failed(e) => {
+            rollback(state, group_id, &snapshot, confirmed_stub).await;
+            return Err(std::io::Error::other(format!(
+                "TreeKEM rebind preparation failed: {e}"
+            )));
+        }
+    }
     let outcome = save_named_groups_checked_unlocked(state).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        *state.named_groups.write().await = snapshot;
+        rollback(state, group_id, &snapshot, confirmed_stub).await;
         return outcome;
     }
     match &outcome {
@@ -2953,26 +3032,20 @@ pub(in crate::server) async fn persist_named_group_info(
             .store(true, Ordering::Release),
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
-    if matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-        match rebind_treekem_snapshot_after_named_seal(state, group_id).await {
-            RebindOutcome::Failed(e) => {
-                // Roll the visible map back to the pre-write snapshot and
-                // try to make that rollback durable; the operation FAILS
-                // either way — success is never reported over a torn
-                // named/snapshot pair.
-                *state.named_groups.write().await = snapshot;
-                if let Err(restore_err) = save_named_groups_checked_unlocked(state).await {
-                    tracing::error!(
-                        group_id = %LogHexId::group(group_id),
-                        error = %restore_err,
-                        "#457: rollback save ALSO failed — named/snapshot state may be torn until the next restart repair"
-                    );
-                }
-                return Err(std::io::Error::other(format!(
-                    "TreeKEM snapshot rebind failed, named-group write rolled back: {e}"
-                )));
-            }
-            RebindOutcome::Rebound | RebindOutcome::NotApplicable => {}
+    if matches!(outcome, Ok(AtomicWriteOutcome::Durable))
+        && matches!(prejournaled, RebindOutcome::Rebound)
+    {
+        // Apply the journaled snapshot file and complete the sequence.
+        if let Err(e) = apply_rebind_journal_snapshot(state, group_id).await {
+            tracing::error!(
+                group_id = %LogHexId::group(group_id),
+                error = %e,
+                "#457 r4: journaled rebind apply failed — rolling back"
+            );
+            rollback(state, group_id, &snapshot, confirmed_stub).await;
+            return Err(std::io::Error::other(format!(
+                "TreeKEM snapshot rebind apply failed: {e}"
+            )));
         }
     }
     outcome
@@ -3019,18 +3092,22 @@ enum RebindOutcome {
 const REBIND_MUTEX_ATTEMPTS: usize = 10;
 const REBIND_MUTEX_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
 
-/// #457 r3: persist a rebound snapshot envelope CRASH-ATOMICALLY using the
-/// existing `TreeKemNamedPersistJournal` + startup replay: the journal
-/// (carrying the post-mutation named json and the rebound envelope) is
-/// written FIRST, then the snapshot file, then the journal is removed. A
-/// crash anywhere in the sequence replays the consistent named/snapshot
-/// pair at startup (`recover_treekem_named_journals`) instead of leaving a
-/// torn one. Returns `Rebound` or `Failed` — never a silent skip.
-async fn persist_rebound_snapshot_journaled(
-    state: &AppState,
-    group_id: &str,
-    envelope: Vec<u8>,
-) -> RebindOutcome {
+/// #457 r4: PREPARE the crash-atomic rebind — encode the rebound
+/// envelope (from the live group, or the repairable on-disk snapshot) and
+/// write the `TreeKemNamedPersistJournal` (post-mutation named json +
+/// envelope) so a crash at ANY later point replays the consistent pair.
+/// `Rebound` = journal written (or nothing to do for arm-2 live groups);
+/// `NotApplicable` = group not on the TreeKEM plane / no snapshot and no
+/// live group; `Failed` = nothing durable changed (caller rolls back).
+async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> RebindOutcome {
+    // Contention is RETRIED briefly (the mutex is also taken by short
+    // epoch READS, which promise no follow-up persistence); still
+    // contended is a FAILURE — never a silent success.
+    let envelope = match rebind_envelope_for(state, group_id).await {
+        Ok(Some(envelope)) => envelope,
+        Ok(None) => return RebindOutcome::NotApplicable,
+        Err(e) => return RebindOutcome::Failed(e),
+    };
     let journalled = (|| async {
         let named_groups_json = {
             let groups = state.named_groups.read().await;
@@ -3049,49 +3126,79 @@ async fn persist_rebound_snapshot_journaled(
         x0x::storage::write_private_bytes(&journal_path, journal_bytes)
             .await
             .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
-        persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, envelope)
-            .await
-            .map_err(|e| anyhow::anyhow!("snapshot write: {e}"))?;
-        // The named json on disk already holds this content (the caller
-        // wrote it durably before the rebind); the journal replay would
-        // rewrite the same view. Remove the journal to finish the sequence.
-        if let Err(e) = tokio::fs::remove_file(&journal_path).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
-            }
-        }
         Ok(())
     })()
     .await;
     match journalled {
         Ok(()) => RebindOutcome::Rebound,
-        Err(e) => RebindOutcome::Failed(e),
+        Err(e) => {
+            discard_rebind_journal(state, group_id).await;
+            RebindOutcome::Failed(e)
+        }
     }
 }
 
-async fn rebind_treekem_snapshot_after_named_seal(
+/// #457 r4: APPLY the journaled sequence — write the snapshot file, then
+/// remove the journal. Called only after the named json is durable and
+/// the journal exists; a crash before the journal removal replays the
+/// same pair idempotently at startup.
+async fn apply_rebind_journal_snapshot(state: &AppState, group_id: &str) -> anyhow::Result<()> {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id);
+    let journal_bytes = tokio::fs::read(&journal_path)
+        .await
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal read: {e}"))?;
+    let journal: TreeKemNamedPersistJournal = postcard::from_bytes(&journal_bytes)
+        .map_err(|e| anyhow::anyhow!("TreeKEM journal decode: {e}"))?;
+    persist_treekem_snapshot_bytes(&state.treekem_dir, group_id, journal.snapshot_envelope)
+        .await
+        .map_err(|e| anyhow::anyhow!("snapshot write: {e}"))?;
+    // Restore the repaired group into the live map when it was missing.
+    rebind_restore_live_group(state, group_id).await;
+    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            return Err(anyhow::anyhow!("TreeKEM journal cleanup: {e}"));
+        }
+    }
+    Ok(())
+}
+
+/// #457 r4: DISCARD any journal for this group — the rollback path. A
+/// journal left behind after a REJECTED mutation would be replayed at
+/// startup and resurrect the rejected state.
+async fn discard_rebind_journal(state: &AppState, group_id: &str) {
+    let journal_path = treekem_journal_path(&state.treekem_dir, group_id);
+    if let Err(e) = tokio::fs::remove_file(&journal_path).await {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            tracing::error!(
+                group_id = %LogHexId::group(group_id),
+                error = %e,
+                "#457 r4: journal DISCARD failed — startup may replay a rejected mutation"
+            );
+        }
+    }
+}
+
+async fn rebind_envelope_for(
     state: &AppState,
     group_id: &str,
-) -> RebindOutcome {
+) -> std::result::Result<Option<Vec<u8>>, anyhow::Error> {
     let info = {
         let groups = state.named_groups.read().await;
         groups.get(group_id).cloned()
     };
     let Some(info) = info else {
-        return RebindOutcome::NotApplicable;
+        return Ok(None);
     };
     if info.withdrawn || info.secure_plane != x0x::mls::SecureGroupPlane::TreeKem {
-        return RebindOutcome::NotApplicable;
+        return Ok(None);
     }
-    // Arm 1: live group — refresh the envelope binding in place.
+    // Arm 1: live group — encode the current snapshot under the new
+    // binding. Contention retried briefly, then failed.
     let live = {
         let map = state.treekem_groups.read().await;
         map.get(group_id).cloned()
     };
     if let Some(group) = live {
-        // #457 r3: contention is RETRIED briefly (the mutex is also taken
-        // by short epoch READS, which promise no follow-up persistence), and
-        // still-contended is a FAILURE — never a silent success.
         let mut guard = None;
         for _ in 0..REBIND_MUTEX_ATTEMPTS {
             match group.try_lock() {
@@ -3103,30 +3210,22 @@ async fn rebind_treekem_snapshot_after_named_seal(
             }
         }
         let Some(guard) = guard else {
-            return RebindOutcome::Failed(anyhow::anyhow!(
+            return Err(anyhow::anyhow!(
                 "TreeKEM group mutex contended after retries"
             ));
         };
-        let envelope = match encode_treekem_snapshot_envelope(&info, &guard) {
-            Ok(bytes) => bytes,
-            Err(e) => return RebindOutcome::Failed(e),
-        };
-        drop(guard);
-        return persist_rebound_snapshot_journaled(state, group_id, envelope).await;
+        let envelope = encode_treekem_snapshot_envelope(&info, &guard)?;
+        return Ok(Some(envelope));
     }
     // Arm 2: repair from disk — only a metadata-only divergence qualifies.
     let path = treekem_snapshot_path(&state.treekem_dir, group_id);
     let bytes = match tokio::fs::read(&path).await {
         Ok(bytes) => bytes,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return RebindOutcome::NotApplicable;
+            return Ok(None);
         }
         Err(e) => {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_id),
-                "TreeKEM snapshot rebind read failed (#457): {e}"
-            );
-            return RebindOutcome::Failed(anyhow::anyhow!("snapshot read: {e}"));
+            return Err(anyhow::anyhow!("snapshot read: {e}"));
         }
     };
     let envelope = match decode_treekem_snapshot_envelope(&bytes) {
@@ -3136,14 +3235,10 @@ async fn rebind_treekem_snapshot_after_named_seal(
                 group_id = %LogHexId::group(group_id),
                 "TreeKEM snapshot rebind skipped: legacy unbound snapshot (#457)"
             );
-            return RebindOutcome::NotApplicable;
+            return Ok(None);
         }
         Err(e) => {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_id),
-                "TreeKEM snapshot rebind skipped: undecodable snapshot (#457): {e}"
-            );
-            return RebindOutcome::Failed(e);
+            return Err(e);
         }
     };
     if envelope.security_binding != info.security_binding
@@ -3158,8 +3253,9 @@ async fn rebind_treekem_snapshot_after_named_seal(
             named_revision = info.state_revision,
             "TreeKEM snapshot rebind refused: epoch/binding diverged — failing the mutation (#457 r3)"
         );
-        return RebindOutcome::Failed(anyhow::anyhow!(
-            "snapshot/named binding diverged (epoch advanced without a new snapshot) —              secure content needs a fresh share"
+        return Err(anyhow::anyhow!(
+            "snapshot/named binding diverged (epoch advanced without a new snapshot) — \
+             secure content needs a fresh share"
         ));
     }
     let rebound = TreeKemSnapshotEnvelope {
@@ -3173,29 +3269,38 @@ async fn rebind_treekem_snapshot_after_named_seal(
     match postcard::to_stdvec(&rebound) {
         Ok(encoded) => rebound_bytes.extend(encoded),
         Err(e) => {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_id),
-                "TreeKEM snapshot rebind encode failed (#457): {e}"
-            );
-            return RebindOutcome::Failed(anyhow::anyhow!("envelope encode: {e}"));
+            return Err(anyhow::anyhow!("envelope encode: {e}"));
         }
     }
-    let outcome = persist_rebound_snapshot_journaled(state, group_id, rebound_bytes).await;
-    if let RebindOutcome::Failed(e) = &outcome {
-        tracing::warn!(
-            group_id = %LogHexId::group(group_id),
-            "TreeKEM snapshot rebind persist failed (#457 r3): {e}"
-        );
-        return outcome;
+    Ok(Some(rebound_bytes))
+}
+
+/// #457 r4: after a journaled rebind applies, restore the repaired group
+/// into the live map (arm-2 repair) so the secure plane is available
+/// immediately, not only after the next restart.
+async fn rebind_restore_live_group(state: &AppState, group_id: &str) {
+    if state.treekem_groups.read().await.contains_key(group_id) {
+        return;
     }
-    // Restore the repaired group into the live map so the secure plane is
-    // available immediately (not just after the next restart).
-    match restore_local_treekem_group_from_snapshot(state, &info, &rebound.snapshot) {
+    let info = {
+        let groups = state.named_groups.read().await;
+        groups.get(group_id).cloned()
+    };
+    let Some(info) = info else { return };
+    let path = treekem_snapshot_path(&state.treekem_dir, group_id);
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return;
+    };
+    let Ok(Some(envelope)) = decode_treekem_snapshot_envelope(&bytes) else {
+        return;
+    };
+    if !treekem_snapshot_envelope_matches_info(&envelope, &info) {
+        return;
+    }
+    match restore_local_treekem_group_from_snapshot(state, &info, &envelope.snapshot) {
         Ok(group) => {
             tracing::info!(
                 group_id = %LogHexId::group(group_id),
-                snapshot_revision = envelope.state_revision,
-                named_revision = info.state_revision,
                 "repaired TreeKEM snapshot/named-group binding mismatch; secure content restored (#457)"
             );
             state
@@ -3211,7 +3316,6 @@ async fn rebind_treekem_snapshot_after_named_seal(
             );
         }
     }
-    RebindOutcome::Rebound
 }
 
 fn restore_local_treekem_group_from_snapshot(
@@ -11687,13 +11791,15 @@ pub(in crate::server) async fn join_group_via_invite(
                     );
                 }
             } else {
+                // #458 r4: the stub insert AND its exclusion marker are
+                // ONE atomic step under the persistence lock — the stub is
+                // never visible to a serializer without its marker.
+                let _persistence_guard = state.named_groups_persistence_lock.lock().await;
                 state
                     .named_groups
                     .write()
                     .await
                     .insert(group_id_hex.clone(), info.clone());
-                // #458 r3: unconfirmed — excluded from every named_groups
-                // serialization until its MemberAdded applies.
                 state
                     .pending_join_stubs
                     .lock()
@@ -14513,25 +14619,27 @@ pub(in crate::server) fn intervening_chain_from(
     info: &x0x::groups::GroupInfo,
     from_revision: u64,
     terminal_revision: u64,
-) -> Vec<x0x::groups::GroupStateCommit> {
-    let mut chain: Vec<x0x::groups::GroupStateCommit> = info
+) -> Vec<x0x::groups::state_commit::RetainedCommit> {
+    let mut chain: Vec<x0x::groups::state_commit::RetainedCommit> = info
         .commit_log
         .iter()
-        .map(|retained| retained.commit.clone())
-        .filter(|commit| commit.revision > from_revision && commit.revision < terminal_revision)
+        .cloned()
+        .filter(|retained| {
+            retained.commit.revision > from_revision && retained.commit.revision < terminal_revision
+        })
         .collect();
-    chain.sort_by_key(|commit| commit.revision);
+    chain.sort_by_key(|retained| retained.commit.revision);
     let complete = !chain.is_empty()
-        && chain
-            .first()
-            .is_some_and(|first| first.revision == from_revision + 1)
+        && chain.first().is_some_and(|first| first.commit.revision == from_revision + 1)
         && chain
             .last()
-            .is_some_and(|last| last.revision + 1 == terminal_revision)
+            .is_some_and(|last| last.commit.revision + 1 == terminal_revision)
         && chain
             .iter()
             .zip(chain.iter().skip(1))
-            .all(|(prev, next)| next.revision == prev.revision + 1);
+            .all(|(prev, next)| next.commit.revision == prev.commit.revision + 1)
+        // r4: every link must carry its sealed meta for reconstruction.
+        && chain.iter().all(|retained| retained.meta.is_some());
     if complete {
         chain
     } else {
