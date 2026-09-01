@@ -1345,19 +1345,22 @@ async fn issue458r2_adoption_refuses_commit_signed_by_non_actor() -> Result<()> 
     Ok(())
 }
 
-/// #457 r2 item 4: a FAILED snapshot rebind fails the whole named persist
-/// (with a rollback of the visible map) — success is never reported over a
-/// torn named/snapshot pair.
+/// #457 r2 item 4 (r5 semantics): a failed rebind JOURNAL PREPARATION
+/// fails the whole named persist with a full rollback (map + sidecar +
+/// journals) — success is never reported over a torn pair. (A snapshot
+/// write failing AFTER the durable named save is the r5c case: journals
+/// retained for startup replay, no rollback.)
 #[tokio::test]
 async fn issue457r2_rebind_failure_fails_the_persist() -> Result<()> {
     let fixture = member_joined_treekem_fixture(0x53, 0x53).await?;
     let state = &fixture.state;
     let group_id = fixture.group_id.clone();
 
-    // Sabotage the snapshot path: a DIRECTORY where the .snap file must be
-    // written makes every snapshot write fail.
-    let snap_path = treekem_snapshot_path(&state.treekem_dir, &group_id);
-    tokio::fs::create_dir_all(&snap_path).await?;
+    // Sabotage the JOURNAL PREPARATION: a DIRECTORY where the legacy
+    // commit-point journal must land makes every journal write fail
+    // BEFORE the named save, so the entire transaction rolls back.
+    let journal_path = treekem_journal_path(&state.treekem_dir, &group_id);
+    tokio::fs::create_dir_all(&journal_path).await?;
 
     let (pre_name, pre_hash) = {
         let groups = state.named_groups.read().await;
