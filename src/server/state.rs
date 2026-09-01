@@ -705,6 +705,12 @@ pub(super) struct AppState {
     pub(super) crdt_handle_locks: RwLock<HashMap<String, Arc<Mutex<()>>>>,
     pub(super) named_groups: RwLock<HashMap<String, x0x::groups::GroupInfo>>,
     pub(super) named_groups_path: PathBuf,
+    /// Issue #451: disk location of the Home-Suite sidecar
+    /// (`home-suite-groups.json`) — the AUTHORITATIVE durable state for
+    /// owner-certified groups. `named_groups_path` holds only legacy-safe
+    /// placeholders for those entries so pre-ADR-0038 binaries can parse
+    /// (and downgrade-run) the same data dir without the #451 crash loop.
+    pub(super) home_suite_groups_path: PathBuf,
     /// Serializes snapshot-and-write of `named_groups.json` so an older
     /// snapshot cannot rename over a newer recovered KeyPackage.
     pub(super) named_groups_persistence_lock: Mutex<()>,

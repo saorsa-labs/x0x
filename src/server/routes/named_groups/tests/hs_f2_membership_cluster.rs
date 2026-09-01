@@ -391,6 +391,7 @@ async fn issue457_rename_keeps_treekem_snapshot_binding_across_restart() -> Resu
 
     let response = update_named_group(
         State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.clone()),
         Json(UpdateGroupRequest {
             name: Some("Renamed Home".to_string()),
@@ -620,6 +621,7 @@ async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458St
     if rename_first {
         let response = update_named_group(
             State(Arc::clone(&authority)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
             Path(group_id.clone()),
             Json(UpdateGroupRequest {
                 name: Some("Renamed mid-join".to_string()),
@@ -882,6 +884,7 @@ async fn integration_rename_restart_certified_join_single_announce() -> Result<(
     // later certified join.
     let response = update_named_group(
         State(Arc::clone(&owner)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.clone()),
         Json(UpdateGroupRequest {
             name: Some("David's Home".to_string()),
@@ -1325,6 +1328,7 @@ async fn issue457r2_rebind_failure_fails_the_persist() -> Result<()> {
     };
     let outcome = update_named_group(
         State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.clone()),
         Json(UpdateGroupRequest {
             name: Some("Must Not Stick".to_string()),
@@ -1568,6 +1572,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // RENAME the Home (the #457 trigger), durably.
     let response = update_named_group(
         State(Arc::clone(&owner_state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.clone()),
         Json(UpdateGroupRequest {
             name: Some("David's Home".to_string()),
@@ -1659,6 +1664,7 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // Invite via the real route.
     let response = create_group_invite(
         State(Arc::clone(&owner_state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(group_id.clone()),
         HeaderMap::new(),
         axum::body::Bytes::new(),
@@ -2203,7 +2209,11 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     let rename_req: crate::server::routes::home::RenameHomeRequest =
         serde_json::from_str(&format!("{{\"name\":\"{}\"}}", "Davids Home")).expect("rename body");
     let response =
-        crate::server::routes::home::rename_home(State(Arc::clone(&owner_state)), Json(rename_req))
+        crate::server::routes::home::rename_home(
+            State(Arc::clone(&owner_state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(rename_req)
+        )
             .await
             .into_response();
     assert_eq!(response.status(), StatusCode::OK, "real rename succeeds");
@@ -2274,6 +2284,7 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // Real invite + join routes.
     let response = create_group_invite(
         State(Arc::clone(&owner_state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
         Path(home_id.clone()),
         HeaderMap::new(),
         axum::body::Bytes::new(),

@@ -1473,6 +1473,7 @@ const BULK_TOPIC_PREFIXES: &[&str] = &[
     "x0x/release",             // Release manifests (slash style — x0x/release)
     "x0x.release.",            // Reserved for any future dot-style release topics
     "x0x/caps/v1",             // Mesh-wide DM capability advert (5-min republish)
+    "x0x/caps/v2/digest",      // #448 digest extension — same advert cadence, Bulk (r2)
     "x0x.group.cards",         // Group card anti-entropy
     "x0x.group.share.v2",      // Group share anti-entropy
 ];
@@ -1937,6 +1938,15 @@ mod tests {
             classify_x0x_topic("x0x/caps/v1"),
             TopicPriority::Bulk,
             "DM_CAPABILITY_TOPIC string from src/dm_capability.rs must classify as Bulk"
+        );
+        // #448 r2: the signed digest extension is published on the same
+        // fleet-wide cadence as the advert. Production constant
+        // `DM_CAPABILITY_DIGEST_TOPIC = x0x/caps/v2/digest`
+        // (src/dm_capability.rs); it must not default to Normal admission.
+        assert_eq!(
+            classify_x0x_topic("x0x/caps/v2/digest"),
+            TopicPriority::Bulk,
+            "DM_CAPABILITY_DIGEST_TOPIC string from src/dm_capability.rs must classify as Bulk"
         );
         assert_eq!(
             classify_x0x_topic("x0x.group.cards.v1"),

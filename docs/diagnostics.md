@@ -6,7 +6,7 @@
 
 ```bash
 curl http://127.0.0.1:12700/health
-# {"ok":true,"status":"healthy","version":"<current_version>","peers":4,"uptime_secs":300}
+# {"ok":true,"status":"healthy","version":"<current_version>","peers":4,"send_ready_peers":4,"uptime_secs":300}
 ```
 
 ## Rich Status
@@ -22,6 +22,7 @@ curl http://127.0.0.1:12700/status
 #   "external_addrs": ["203.0.113.5:5483"],
 #   "agent_id": "8a3f...",
 #   "peers": 4,
+#   "send_ready_peers": 4,
 #   "warnings": []
 # }
 ```

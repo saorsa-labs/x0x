@@ -469,17 +469,29 @@ R=$(s2_curl /network/bootstrap-cache); check_json "peer bootstrap cache" "$R" "o
 # ═════════════════════════════════════════════════════════════════════════
 echo -e "\n${CYAN}[4/18] GUI Endpoint${NC}"
 
-# /gui is unauthenticated — should return HTML
-R=$(s1_raw /gui)
-check_html "studio1 /gui serves HTML" "$R"
+# Clawpatch 7fc6183 (critical security): /gui is bearer-gated and NO injected
+# API token rides the served HTML. Contract: unauthenticated /gui answers 401;
+# /gui?token=<SESSION> (session token only — the durable token is never
+# accepted in a URL) serves the chat UI without token disclosure.
+GUI_CODE=$($SSH "$S1_TARGET" "curl -s -o /dev/null -w '%{http_code}' -m 10 'http://127.0.0.1:$S1_API_PORT/gui'" 2>/dev/null || echo "000")
+check_eq "studio1 /gui refuses unauthenticated access (401)" "$GUI_CODE" "401"
+
+S1_SESSION=$($SSH "$S1_TARGET" "curl -sf -m 10 -X POST -H 'Authorization: Bearer $S1_TK' -H 'Content-Type: application/json' -d '{}' 'http://127.0.0.1:$S1_API_PORT/auth/session'" 2>/dev/null | sed -n 's/.*"session_token":"\([^"]*\)".*/\1/p')
+R=$($SSH "$S1_TARGET" "curl -sf -m 10 'http://127.0.0.1:$S1_API_PORT/gui?token=$S1_SESSION'" 2>/dev/null || echo "")
+check_html "studio1 /gui?token=<session> serves HTML" "$R"
 check_contains "studio1 /gui contains 'x0x'" "$R" "x0x"
 
 # Check Content-Type header
-HEADERS=$(s1_raw_headers /gui)
+HEADERS=$($SSH "$S1_TARGET" "curl -sI -m 10 'http://127.0.0.1:$S1_API_PORT/gui?token=$S1_SESSION'" 2>/dev/null || echo "")
 check_contains "studio1 /gui Content-Type: text/html" "$HEADERS" "text/html"
 
-# GUI includes injected API token
-check_contains "studio1 /gui includes API token" "$R" "${S1_TK:0:8}"
+# The served HTML must NOT contain the API token or the old injection marker
+TOTAL=$((TOTAL+1))
+if [ -n "$R" ] && ! grep -q "${S1_TK:0:8}" <<<"$R" && ! grep -q "X0X_TOKEN" <<<"$R"; then
+    PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} studio1 /gui does not disclose the API token"
+else
+    FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} studio1 /gui disclosed API token material"
+fi
 
 # Constitution (also unauthenticated)
 R=$(s1_raw /constitution); check_contains "studio1 /constitution markdown" "$R" "x0x"

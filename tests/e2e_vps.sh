@@ -526,12 +526,27 @@ NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
 HEL_IP="${NODE_IPS[helsinki]}"; HEL_TK="${NODE_TOKENS[helsinki]:-}"
 HEL_AID="${NODE_AIDS[helsinki]:-}"
 if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
-    GUI_HTML=$(vps_ssh "$NYC_IP" "curl -sf -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui'" 2>/dev/null || echo "")
+    # Clawpatch 7fc6183 (critical security): /gui no longer injects the API
+    # token into the served HTML. The GUI contract is now: unauthenticated
+    # /gui answers 401; /gui?token=<SESSION> serves the chat UI with no token
+    # anywhere in the HTML; the browser proof bootstraps via the same
+    # ?token= query (session tokens only — the durable token is never
+    # accepted in a URL).
+    GUI_STATUS=$(vps_ssh "$NYC_IP" "curl -s -o /dev/null -w '%{http_code}' -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui'" 2>/dev/null || echo "000")
     TOTAL=$((TOTAL+1))
-    if grep -q "X0X_TOKEN" <<<"$GUI_HTML" && grep -q "sendDm" <<<"$GUI_HTML"; then
-        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui serves injected chat UI"
+    if [ "$GUI_STATUS" = "401" ]; then
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui refuses unauthenticated access (401)"
     else
-        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui missing expected injected chat markers"
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui unauthenticated status $GUI_STATUS (expected 401)"
+    fi
+
+    GUI_SESSION=$(vps_ssh "$NYC_IP" "curl -sf -m 15 -X POST 'http://127.0.0.1:${X0X_API_PORT}/auth/session' -H 'Authorization: Bearer $NYC_TK'" 2>/dev/null | jq -r '.session_token // empty')
+    GUI_HTML=$(vps_ssh "$NYC_IP" "curl -sf -m 15 'http://127.0.0.1:${X0X_API_PORT}/gui?token=$GUI_SESSION'" 2>/dev/null || echo "")
+    TOTAL=$((TOTAL+1))
+    if [ -n "$GUI_SESSION" ] && grep -q "sendDm" <<<"$GUI_HTML" && ! grep -q "X0X_TOKEN" <<<"$GUI_HTML"; then
+        PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} GET /gui?token=<session> serves chat UI without token disclosure"
+    else
+        FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} GET /gui?token=<session> missing chat UI or token leaked into HTML"
     fi
 
     GUI_TUNNEL_PID=$(start_tunnel "$NYC_IP" 22600)
@@ -541,7 +556,7 @@ if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]
     GUI_RECV_OUT="/tmp/x0x-vps-${PROOF_TOKEN}-gui-helsinki.sse"
     GUI_RECV_PID=$(start_remote_direct_listener "$HEL_IP" "$HEL_TK" "$GUI_RECV_OUT")
     GUI_MSG="GUI-${PROOF_TOKEN}-nyc-to-helsinki"
-    GUI_JSON=$(node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>/dev/null || echo '{"ok":false}')
+    GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>/dev/null || echo '{"ok":false}')
     check_contains "real GUI browser send visible locally" "$GUI_JSON" '"messageVisible":true'
     GUI_PAYLOAD_B64=$(jq_field "$GUI_JSON" "payloadB64")
     sleep 8

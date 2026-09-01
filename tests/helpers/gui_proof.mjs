@@ -15,8 +15,18 @@ async function waitForApp(page) {
   await page.goto(`${new URL('/gui', page.context()._options.baseURL || 'http://127.0.0.1').toString()}`, { waitUntil: 'domcontentloaded' });
 }
 
+function guiUrl(baseUrl) {
+  // Clawpatch 7fc6183: /gui no longer injects the API token into the HTML.
+  // Authenticate the way the GUI itself bootstraps — a session token in the
+  // ?token= query (durable tokens are never accepted in URLs). The page
+  // strips the query into sessionStorage and uses it as the Bearer.
+  const sessionToken = process.env.GUI_SESSION_TOKEN || '';
+  const base = baseUrl.replace(/\/$/, '');
+  return sessionToken ? `${base}/gui?token=${encodeURIComponent(sessionToken)}` : `${base}/gui`;
+}
+
 async function bootstrap(page, baseUrl) {
-  await page.goto(`${baseUrl.replace(/\/$/, '')}/gui`, { waitUntil: 'domcontentloaded' });
+  await page.goto(guiUrl(baseUrl), { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => typeof S !== 'undefined' && typeof navigate !== 'undefined' && typeof api === 'function');
   const agentId = await page.evaluate(async () => {
     const info = await api('/agent');

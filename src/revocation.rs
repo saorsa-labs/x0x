@@ -1269,4 +1269,48 @@ mod tests {
         assert!(set2.expire_records_older_than(0, u64::MAX) == 0);
         assert!(set2.is_binding_revoked(&binding.agent, &machine));
     }
+
+    /// HS-A review fixture gap (seam check 2026-08-30, concern 2 / MINOR-4):
+    /// the X0R2 carrier is isolated on its own topic and file today, but
+    /// nothing pinned the bincode shape of `PersistedRevocation` carrying a
+    /// `RevokedSubject::AgentMachineBinding` (variant 2 of the file era,
+    /// enum tag 0x03). A future field INSERTED into `PersistedRevocation`,
+    /// `RevocationRecord`, or before the existing `RevokedSubject` variants
+    /// would silently break every older v2 decoder. Pin the exact bytes.
+    #[test]
+    fn revocations_v2_file_bytes_match_frozen_vector() {
+        let record = RevocationRecord {
+            subject: RevokedSubject::AgentMachineBinding(AgentMachineBinding {
+                agent: AgentId([0xA1; 32]),
+                machine: MachineId([0xA2; 32]),
+                move_epoch: 7,
+            }),
+            issuer_public_key: vec![0xB1; 4],
+            revoked_at: 1_700_000_321,
+            reason: Some("key-move".to_string()),
+            signature: vec![0xC1; 4],
+        };
+        let mut set = RevocationSet::new();
+        assert!(set.insert_verified(PersistedRevocation {
+            record,
+            subject_cert: None,
+        }));
+
+        let bytes = set.to_bytes_v2().expect("encode v2 file");
+        println!(
+            "X0R2_FROZEN_HEX={}",
+            bytes.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        );
+        const FROZEN_X0R2_HEX: &str = "58305232010000000000000002000000a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a207000000000000000400000000000000b1b1b1b141f25365000000000108000000000000006b65792d6d6f76650400000000000000c1c1c1c100";
+        let frozen = hex::decode(FROZEN_X0R2_HEX).expect("frozen hex");
+        assert_eq!(
+            bytes, frozen,
+            "X0R2 file bytes must stay byte-identical (append-only fields/variants)"
+        );
+        // The pinned vector itself decodes as a v2 set (the record fails
+        // authority re-verification by construction — fake keys — so the
+        // decoded set is empty; the shape pin above is the contract).
+        let decoded = RevocationSet::from_bytes_v2(&frozen).expect("decode v2 file");
+        assert!(decoded.is_empty());
+    }
 }

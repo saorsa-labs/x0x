@@ -321,6 +321,9 @@ pub(in crate::server) async fn connect_machine(
 /// POST /direct/send — send a direct message to a connected agent.
 pub(in crate::server) async fn direct_send(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<DirectSendRequest>,
 ) -> impl IntoResponse {
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
@@ -355,6 +358,24 @@ pub(in crate::server) async fn direct_send(
         Ok(p) => p,
         Err(resp) => return resp,
     };
+
+    // Issue #446 (review round 2): exec frames ride DMs behind the
+    // reserved `x0x-exec-v1\0` prefix and the receiver routes them
+    // straight into the exec service. Crafting that prefix through this
+    // generic egress would bypass the durable-owner gate on
+    // /exec/run|cancel — so reserved exec payloads require the durable
+    // owner HERE too. The legitimate exec client path
+    // (`ExecService::send_frame`) calls the Agent API directly and is
+    // unaffected.
+    if payload.starts_with(x0x::exec::EXEC_DM_PREFIX) && !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "reserved exec payloads via /direct/send require the durable API token (not a session token)"
+            })),
+        );
+    }
 
     match state
         .agent

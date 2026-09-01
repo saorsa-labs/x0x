@@ -32,7 +32,13 @@ test('gui can import card and send direct message', async ({ page }) => {
   expect(targetAgentId, 'GUI_TARGET_AGENT_ID env is required').toBeTruthy();
   expect(message, 'GUI_MESSAGE env is required').toBeTruthy();
 
-  await page.goto(`${baseUrl.replace(/\/$/, '')}/gui`, { waitUntil: 'domcontentloaded' });
+  // Clawpatch 7fc6183: /gui serves no injected token — bootstrap via ?token=
+  // with a session token (GUI_SESSION_TOKEN), like the GUI itself does.
+  const guiSessionToken = process.env.GUI_SESSION_TOKEN || '';
+  const guiUrl = guiSessionToken
+    ? `${baseUrl.replace(/\/$/, '')}/gui?token=${encodeURIComponent(guiSessionToken)}`
+    : `${baseUrl.replace(/\/$/, '')}/gui`;
+  await page.goto(guiUrl, { waitUntil: 'domcontentloaded' });
   await page.waitForFunction(() => typeof window.S !== 'undefined' && typeof window.navigate !== 'undefined');
   await page.waitForFunction(() => window.S.get('agentId'));
 

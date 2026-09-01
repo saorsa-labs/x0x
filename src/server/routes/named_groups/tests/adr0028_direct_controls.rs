@@ -371,6 +371,9 @@ async fn approve_status(state: &Arc<AppState>, group_key: &str, request_id: &str
     let (status, _body) = response_json(
         approve_join_request(
             State(Arc::clone(state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Path((group_key.to_string(), request_id.to_string())),
         )
         .await

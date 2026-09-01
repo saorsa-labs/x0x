@@ -214,6 +214,13 @@ async fn test_default_cache_dir_when_not_specified() {
     let default_cache_dir = home_dir.join(".x0x").join("peers");
     std::fs::create_dir_all(&home_dir).expect("create isolated home");
     let _home = EnvVarOverride::set("HOME", &home_dir);
+    // Issue #456: the default cache dir resolves through the storage
+    // resolver, which prefers X0X_HOME over HOME. Pin it into the isolated
+    // home so this test stays hermetic under both a bare `cargo test`
+    // (X0X_HOME unset → HOME applies) and the nextest harness (which sets
+    // X0X_HOME for the whole suite).
+    let x0x_home_value = home_dir.join(".x0x");
+    let _x0x_home = EnvVarOverride::set("X0X_HOME", &x0x_home_value);
     let _user_profile = EnvVarOverride::set("USERPROFILE", &home_dir);
     let _xdg_cache = EnvVarOverride::set("XDG_CACHE_HOME", &xdg_cache_dir);
     let _xdg_config = EnvVarOverride::set("XDG_CONFIG_HOME", &xdg_config_dir);

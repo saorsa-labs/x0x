@@ -46,6 +46,25 @@ pub const DM_CAPABILITY_TARGETED_REQUEST_TOPIC: &str = "x0x/caps/v1/request/targ
 /// topics rather than being cooled behind the fleet-wide advert stream.
 pub const DM_CAPABILITY_TARGETED_RESPONSE_TOPIC: &str = "x0x/caps/v1/response/targeted-v2";
 
+/// Topic carrying the signed `digest_support` extension (#448).
+///
+/// The steady advert topic is frozen to the v1 wire shape so v0.40.4
+/// peers keep decoding and verifying new daemons' adverts; the true
+/// digest bit cannot ride those bytes (positional postcard — one extra
+/// byte makes the whole advert undecodable for an old peer). New peers
+/// additionally subscribe here and merge the bit into the cached
+/// capability. Old peers never subscribe, exactly the X0A3/X0A4
+/// topic-versioning pattern.
+pub const DM_CAPABILITY_DIGEST_TOPIC: &str = "x0x/caps/v2/digest";
+
+/// Domain-separation prefix for the digest-extension signature bytes.
+/// Distinct from [`ADVERT_SIGN_DOMAIN`] so an extension can never be
+/// reinterpreted as (or spliced into) an advert.
+const DIGEST_EXTENSION_SIGN_DOMAIN: &[u8] = b"x0x-caps-digest-v1";
+
+/// Wire version of the digest extension record.
+pub const DIGEST_EXTENSION_PROTOCOL_VERSION: u16 = 1;
+
 /// Domain-separation prefix for the advert signature bytes.
 const ADVERT_SIGN_DOMAIN: &[u8] = b"x0x-caps-v1";
 
@@ -70,6 +89,15 @@ fn timestamp_is_fresh_for_ttl(created_at_unix_ms: u64, now_unix_ms: u64, ttl_ms:
     ttl_ms > 0
         && created_at_unix_ms <= now_unix_ms.saturating_add(skew_ms)
         && now_unix_ms.saturating_sub(created_at_unix_ms) < ttl_ms
+}
+
+/// A cached digest extension that is still within its TTL, if any.
+fn fresh_digest_ext<'a>(
+    exts: &'a HashMap<[u8; 32], CachedDigestExt>,
+    agent_id: &[u8; 32],
+    now: Instant,
+) -> Option<&'a CachedDigestExt> {
+    exts.get(agent_id).filter(|ext| now <= ext.expires_at)
 }
 
 /// Signed capability advertisement broadcast on the mesh-wide capability
@@ -118,29 +146,22 @@ impl CapabilityAdvert {
     }
 }
 
-/// Legacy (pre-#437) wire shape of [`dm::DmCapabilities`] — the exact
-/// five-field sequence old peers advertise (no `digest_support`).
-/// Postcard is positional and the caps sit **inside** the advert before
-/// `signature`, so a naive single-struct decode would misparse the
-/// digest bit from the signature's length bytes; this mirror preserves
-/// the old byte layout for the two-stage decode below.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct DmCapabilitiesV1Wire {
-    max_protocol_version: u16,
-    gossip_inbox: bool,
-    kem_algorithm: String,
-    max_envelope_bytes: usize,
-    #[serde(default)]
-    kem_public_key: Vec<u8>,
-}
-
+/// Legacy (pre-#437) wire shape of the advert: the shared frozen
+/// [`dm::DmCapabilitiesV1Wire`](crate::dm::DmCapabilitiesV1Wire) caps —
+/// the exact five-field sequence old peers advertise (no
+/// `digest_support`). Postcard is positional and the caps sit **inside**
+/// the advert before `signature`, so a naive single-struct decode would
+/// misparse the digest bit from the signature's length bytes; this mirror
+/// preserves the old byte layout for the two-stage decode below — and,
+/// since #448, is the shape `build_signed_advert` PUBLISHES, so a
+/// v0.40.4 peer decodes and verifies a new daemon's advert unchanged.
 #[derive(Debug, Serialize, Deserialize)]
 struct CapabilityAdvertV1Wire {
     protocol_version: u16,
     agent_id: [u8; 32],
     machine_id: [u8; 32],
     created_at_unix_ms: u64,
-    capabilities: DmCapabilitiesV1Wire,
+    capabilities: crate::dm::DmCapabilitiesV1Wire,
     signature: Vec<u8>,
 }
 
@@ -178,14 +199,81 @@ impl CapabilityAdvert {
     }
 }
 
+/// Signed `digest_support` extension published on
+/// [`DM_CAPABILITY_DIGEST_TOPIC`] (#448).
+///
+/// Carries exactly the one capability bit that cannot ride the frozen
+/// v1-shaped advert. The SAME agent ML-DSA-65 key signs it, bound to the
+/// SAME agent + machine as the base advert, so a receiver merges it only
+/// into a cached binding whose machine matches. Domain-separated signed
+/// bytes: `DIGEST_EXTENSION_SIGN_DOMAIN || protocol_version || agent_id
+/// || machine_id || created_at_unix_ms || [digest byte]`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DigestSupportExtension {
+    /// Wire version. Bumped on breaking changes.
+    pub protocol_version: u16,
+    /// Advertising agent's id (must equal the authenticated pubsub sender).
+    pub agent_id: [u8; 32],
+    /// Machine binding — must match the base advert's machine for a merge.
+    pub machine_id: [u8; 32],
+    /// Sender-local unix-ms at extension generation.
+    pub created_at_unix_ms: u64,
+    /// The advertised digest bit.
+    pub digest_support: bool,
+    /// ML-DSA-65 signature over the domain-separated extension bytes.
+    pub signature: Vec<u8>,
+}
+
+impl DigestSupportExtension {
+    /// Canonical signed-bytes representation (what ML-DSA-65 signs and a
+    /// verifier recomputes). The trailing bool is exactly one postcard
+    /// byte, so the encoding is unambiguous.
+    pub fn signed_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        let mut out = Vec::with_capacity(DIGEST_EXTENSION_SIGN_DOMAIN.len() + 2 + 32 + 32 + 8 + 1);
+        out.extend_from_slice(DIGEST_EXTENSION_SIGN_DOMAIN);
+        out.extend_from_slice(&self.protocol_version.to_be_bytes());
+        out.extend_from_slice(&self.agent_id);
+        out.extend_from_slice(&self.machine_id);
+        out.extend_from_slice(&self.created_at_unix_ms.to_be_bytes());
+        out.push(u8::from(self.digest_support));
+        Ok(out)
+    }
+
+    /// Two-stage-free postcard decode: exactly one wire shape exists.
+    ///
+    /// # Errors
+    ///
+    /// Returns the postcard error on malformed bytes.
+    pub fn from_postcard(bytes: &[u8]) -> Result<Self, postcard::Error> {
+        postcard::from_bytes(bytes)
+    }
+}
+
 /// In-memory cache of `AgentId → latest CapabilityAdvert`, with TTL
 /// eviction.
 ///
 /// Senders consult this cache before each `send_direct` call to determine
 /// whether the recipient supports the gossip DM inbox path.
 pub struct CapabilityStore {
-    inner: Mutex<HashMap<[u8; 32], CachedAdvert>>,
+    inner: Mutex<CapabilityStoreInner>,
     ttl: Duration,
+}
+
+#[derive(Default)]
+struct CapabilityStoreInner {
+    adverts: HashMap<[u8; 32], CachedAdvert>,
+    /// Signed digest extensions (#448), kept separately so the bit merges
+    /// orthogonally to the base advert's ordering (a base advert and its
+    /// extension carry different created_at stamps and arrive in either
+    /// order).
+    digest_exts: HashMap<[u8; 32], CachedDigestExt>,
+}
+
+struct CachedDigestExt {
+    machine_id: [u8; 32],
+    digest_support: bool,
+    expires_at: Instant,
+    created_at_unix_ms: u64,
 }
 
 struct CachedAdvert {
@@ -220,7 +308,7 @@ impl CapabilityStore {
     #[must_use]
     pub fn new() -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(CapabilityStoreInner::default()),
             ttl: Duration::from_secs(ADVERT_CACHE_TTL_SECS),
         }
     }
@@ -229,7 +317,7 @@ impl CapabilityStore {
     #[must_use]
     pub fn with_ttl(ttl: Duration) -> Self {
         Self {
-            inner: Mutex::new(HashMap::new()),
+            inner: Mutex::new(CapabilityStoreInner::default()),
             ttl,
         }
     }
@@ -250,9 +338,9 @@ impl CapabilityStore {
         let Ok(mut inner) = self.inner.lock() else {
             return None;
         };
-        let entry = inner.get(agent_id.as_bytes())?;
+        let entry = inner.adverts.get_mut(agent_id.as_bytes())?;
         if now > entry.expires_at {
-            inner.remove(agent_id.as_bytes());
+            inner.adverts.remove(agent_id.as_bytes());
             return None;
         }
         Some(CapabilityBinding {
@@ -301,15 +389,27 @@ impl CapabilityStore {
         else {
             return false;
         };
+        let now = Instant::now();
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
-        if let Some(existing) = inner.get(agent_id.as_bytes()) {
+        if let Some(existing) = inner.adverts.get(agent_id.as_bytes()) {
             if created_at_unix_ms <= existing.created_at_unix_ms {
                 return false;
             }
         }
-        inner.insert(
+        let mut capabilities = capabilities;
+        // #448: the base advert rides the frozen v1 wire shape, so a
+        // true `digest_support` bit arrives here only from a pre-fix
+        // peer's v2-shaped advert (kept verbatim — the signer signed
+        // those bytes). Our own extension record, when present, fresh,
+        // and machine-bound, is the authoritative bit for this machine.
+        if let Some(ext) = fresh_digest_ext(&inner.digest_exts, agent_id.as_bytes(), now) {
+            if ext.machine_id == *machine_id.as_bytes() {
+                capabilities.digest_support = ext.digest_support;
+            }
+        }
+        inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
                 capabilities,
@@ -318,6 +418,55 @@ impl CapabilityStore {
                 created_at_unix_ms,
             },
         );
+        true
+    }
+
+    /// Merge a verified [`DigestSupportExtension`] (#448).
+    ///
+    /// The bit lands immediately when a base advert from the SAME machine
+    /// is cached, and otherwise waits in `digest_exts` for the next base
+    /// advert — either arrival order converges. Ordering between
+    /// extensions from the same agent is by signed timestamp (stale and
+    /// replayed records are ignored, exactly like base adverts), and the
+    /// machine binding is enforced at merge so an extension from a
+    /// superseded daemon process can never speak for its successor.
+    ///
+    /// Returns `true` when fresh signed state was recorded.
+    pub fn apply_digest_extension(
+        &self,
+        agent_id: AgentId,
+        machine_id: MachineId,
+        digest_support: bool,
+        created_at_unix_ms: u64,
+    ) -> bool {
+        let now = Instant::now();
+        let Some(expires_at) =
+            self.expiry_for_signed_timestamp_at(created_at_unix_ms, now_unix_ms(), now)
+        else {
+            return false;
+        };
+        let Ok(mut inner) = self.inner.lock() else {
+            return false;
+        };
+        if let Some(existing) = inner.digest_exts.get(agent_id.as_bytes()) {
+            if now <= existing.expires_at && created_at_unix_ms <= existing.created_at_unix_ms {
+                return false;
+            }
+        }
+        inner.digest_exts.insert(
+            *agent_id.as_bytes(),
+            CachedDigestExt {
+                machine_id: *machine_id.as_bytes(),
+                digest_support,
+                expires_at,
+                created_at_unix_ms,
+            },
+        );
+        if let Some(entry) = inner.adverts.get_mut(agent_id.as_bytes()) {
+            if now <= entry.expires_at && entry.machine_id == *machine_id.as_bytes() {
+                entry.capabilities.digest_support = digest_support;
+            }
+        }
         true
     }
 
@@ -348,7 +497,25 @@ impl CapabilityStore {
         let Ok(mut inner) = self.inner.lock() else {
             return false;
         };
-        if let Some(existing) = inner.get(agent_id.as_bytes()) {
+        // #450: the card's signable bytes are frozen to the v1 caps
+        // shape, so a card-carried `digest_support` bit is UNSIGNED —
+        // clamping it here means a mid-flight flip can never steer relay
+        // lane selection. Signed sources (the runtime advert and the
+        // digest extension) are the only trust path for the bit.
+        // #448 r2: the clamp must not ERASE signed knowledge either — a
+        // later card import replaces the binding wholesale, so re-merge
+        // a still-fresh extension from the SAME machine exactly like
+        // `insert` does (review round 2: without this, one card import
+        // knocked the bit off until the next extension publish, which
+        // on-demand mode never emits).
+        let mut capabilities = capabilities;
+        capabilities.digest_support = false;
+        if let Some(ext) = fresh_digest_ext(&inner.digest_exts, agent_id.as_bytes(), now) {
+            if ext.machine_id == *machine_id.as_bytes() {
+                capabilities.digest_support = ext.digest_support;
+            }
+        }
+        if let Some(existing) = inner.adverts.get(agent_id.as_bytes()) {
             if created_at_unix_ms < existing.created_at_unix_ms {
                 return false;
             }
@@ -367,12 +534,12 @@ impl CapabilityStore {
                     // or guess that the import is newer. A runtime advert has
                     // millisecond precision and can install the unambiguous
                     // current binding.
-                    inner.remove(agent_id.as_bytes());
+                    inner.adverts.remove(agent_id.as_bytes());
                 }
                 return false;
             }
         }
-        inner.insert(
+        inner.adverts.insert(
             *agent_id.as_bytes(),
             CachedAdvert {
                 capabilities,
@@ -413,7 +580,10 @@ impl CapabilityStore {
 
     /// Current cache size (diagnostic).
     pub fn len(&self) -> usize {
-        self.inner.lock().map(|g| g.len()).unwrap_or_default()
+        self.inner
+            .lock()
+            .map(|g| g.adverts.len())
+            .unwrap_or_default()
     }
 
     /// True if empty.
@@ -708,7 +878,7 @@ mod tests {
         // cards unchanged.
         let mut caps = DmCapabilities::v1_gossip_ready(vec![5u8; 16]);
         caps.digest_support = false;
-        let v1_caps = DmCapabilitiesV1Wire {
+        let v1_caps = crate::dm::DmCapabilitiesV1Wire {
             max_protocol_version: caps.max_protocol_version,
             gossip_inbox: caps.gossip_inbox,
             kem_algorithm: caps.kem_algorithm.clone(),
@@ -746,7 +916,7 @@ mod tests {
 
         let kp = AgentKeypair::generate().expect("keypair");
         let signing = SigningContext::from_keypair(&kp);
-        let v1_caps = DmCapabilitiesV1Wire {
+        let v1_caps = crate::dm::DmCapabilitiesV1Wire {
             max_protocol_version: 1,
             gossip_inbox: true,
             kem_algorithm: "ML-KEM-768".to_string(),
@@ -782,5 +952,262 @@ mod tests {
             &decoded,
             &signing.public_key_bytes
         ));
+    }
+
+    // ------------------------------------------------------------------
+    // #448 mixed-fleet fixtures: the published advert vs the v0.40.4
+    // decoder (`CapabilityAdvertV1Wire` IS that decoder's struct shape)
+    // ------------------------------------------------------------------
+
+    /// #448: an advert built by THIS build from `digest_support: true`
+    /// caps must be byte-identical v1 shape — a v0.40.4 peer decodes it
+    /// with its own single-struct parser, recomputes the signed bytes
+    /// over the five-field caps, and the signature must verify. Before
+    /// the freeze the true bit made the whole advert undecodable for old
+    /// peers and they silently dropped it (#448).
+    #[test]
+    fn true_caps_advert_from_new_code_is_old_decoder_verifiable() {
+        use crate::gossip::SigningContext;
+        use crate::identity::AgentKeypair;
+
+        let kp = AgentKeypair::generate().expect("keypair");
+        let signing = SigningContext::from_keypair(&kp);
+        let machine = [0x4D; 32];
+        let caps = DmCapabilities::v2_durable_gossip_ready(vec![7u8; 1184]);
+        assert!(caps.digest_support);
+
+        let encoded = crate::dm_capability_service::build_signed_advert(
+            &signing,
+            signing.agent_id,
+            MachineId(machine),
+            caps,
+        )
+        .expect("build advert");
+
+        // Proof of v1 shape: the new single-struct (v2) decode FAILS on
+        // these bytes — only the legacy stage can read them.
+        assert!(
+            postcard::from_bytes::<CapabilityAdvert>(&encoded).is_err(),
+            "the published advert must be v1-shaped, not v2"
+        );
+        // ...and the two-stage decode lifts it with digest_support=false.
+        let decoded = CapabilityAdvert::from_postcard(&encoded).expect("two-stage decode");
+        assert!(!decoded.capabilities.digest_support);
+
+        // The v0.40.4 decoder replica: its own struct, its own signed
+        // bytes, its own verify — all against the wire bytes we emitted.
+        let old = postcard::from_bytes::<CapabilityAdvertV1Wire>(&encoded)
+            .expect("v0.40.4 single-struct decode");
+        // Old peers retain FULL v1 capability knowledge: protocol version,
+        // inbox, and the KEM key are all present.
+        assert_eq!(old.capabilities.max_protocol_version, 2);
+        assert!(old.capabilities.gossip_inbox);
+        assert!(!old.capabilities.kem_public_key.is_empty());
+
+        let mut old_sign_buf = Vec::new();
+        old_sign_buf.extend_from_slice(ADVERT_SIGN_DOMAIN);
+        old_sign_buf.extend_from_slice(&old.protocol_version.to_be_bytes());
+        old_sign_buf.extend_from_slice(&old.agent_id);
+        old_sign_buf.extend_from_slice(&old.machine_id);
+        old_sign_buf.extend_from_slice(&old.created_at_unix_ms.to_be_bytes());
+        old_sign_buf.extend_from_slice(&postcard::to_stdvec(&old.capabilities).expect("caps"));
+        let public_key =
+            ant_quic::MlDsaPublicKey::from_bytes(&signing.public_key_bytes).expect("pk");
+        let signature =
+            ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&old.signature)
+                .expect("sig");
+        assert!(
+            ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                &public_key,
+                &old_sign_buf,
+                &signature
+            )
+            .is_ok(),
+            "a digest_support=true advert from this build must decode and verify on a v0.40.4 peer"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #448 digest extension: store merge semantics
+    // ------------------------------------------------------------------
+
+    /// Either arrival order converges: extension first waits in the
+    /// digest lane; the next base advert merges it at insert.
+    #[test]
+    fn digest_extension_before_base_advert_merges_on_arrival() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0xC1; 32]);
+        let machine = MachineId([0xC2; 32]);
+        let now = now_unix_ms();
+
+        assert!(store.apply_digest_extension(agent, machine, true, now));
+        assert!(
+            store.lookup(&agent).is_none(),
+            "an extension alone must not fabricate a capability binding"
+        );
+        assert!(store.insert(
+            agent,
+            machine,
+            DmCapabilities::v2_durable_gossip_ready(vec![0xC3; 1184]),
+            now + 1,
+        ));
+        let caps = store.lookup(&agent).expect("merged binding");
+        assert!(
+            caps.digest_support,
+            "the pending extension merges at insert"
+        );
+    }
+
+    /// The common order: base advert first, extension lands afterwards.
+    #[test]
+    fn digest_extension_after_base_advert_applies_immediately() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0xD1; 32]);
+        let machine = MachineId([0xD2; 32]);
+        let now = now_unix_ms();
+        let mut base_caps = DmCapabilities::v2_durable_gossip_ready(vec![0xD3; 1184]);
+        // Simulate exactly what the two-stage decode hands insert() for
+        // our own published (v1-shaped) advert: no digest knowledge.
+        base_caps.digest_support = false;
+        assert!(store.insert(agent, machine, base_caps, now));
+        assert!(
+            !store.lookup(&agent).expect("binding").digest_support,
+            "a v1-shaped base advert carries no digest knowledge"
+        );
+        assert!(store.apply_digest_extension(agent, machine, true, now + 1));
+        assert!(
+            store.lookup(&agent).expect("binding").digest_support,
+            "the extension flips the merged bit in place"
+        );
+    }
+
+    /// The extension is machine-bound: after daemon churn, an extension
+    /// from the superseded machine must not speak for the successor.
+    #[test]
+    fn digest_extension_is_machine_bound() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0xE1; 32]);
+        let machine_a = MachineId([0xE2; 32]);
+        let machine_b = MachineId([0xE3; 32]);
+        let now = now_unix_ms();
+        let mut base_caps = DmCapabilities::v2_durable_gossip_ready(vec![0xE4; 1184]);
+        assert!(store.apply_digest_extension(agent, machine_a, true, now));
+        base_caps.digest_support = false;
+        assert!(store.insert(agent, machine_b, base_caps, now + 1));
+        assert!(
+            !store.lookup(&agent).expect("binding").digest_support,
+            "an extension from another machine must not merge"
+        );
+    }
+
+    /// Stale, replayed, and future-skewed extensions are rejected with
+    /// the same freshness rules as base adverts.
+    #[test]
+    fn digest_extension_rejects_replay_and_stale_timestamps() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0xF1; 32]);
+        let machine = MachineId([0xF2; 32]);
+        let now = now_unix_ms();
+
+        // Older than the TTL.
+        assert!(!store.apply_digest_extension(agent, machine, true, now - 901_000));
+        // Further ahead than the tolerated skew.
+        assert!(!store.apply_digest_extension(
+            agent,
+            machine,
+            true,
+            now + MAX_CAPABILITY_FUTURE_SKEW_SECS * 1_000 + 1_000
+        ));
+        // Fresh, then a stale replay and an equal-timestamp replay.
+        assert!(store.apply_digest_extension(agent, machine, true, now));
+        assert!(!store.apply_digest_extension(agent, machine, false, now - 1));
+        assert!(!store.apply_digest_extension(agent, machine, false, now));
+        // A genuinely fresher record still wins.
+        assert!(store.apply_digest_extension(agent, machine, false, now + 1));
+
+        // An expired extension must not color a later base-advert insert.
+        let short_ttl = CapabilityStore::with_ttl(Duration::from_secs(1));
+        let other = AgentId([0xF3; 32]);
+        assert!(short_ttl.apply_digest_extension(other, machine, true, now));
+        std::thread::sleep(Duration::from_millis(1_100));
+        // The base advert is dated AFTER the sleep (fresh wall clock);
+        // only the extension record has expired by then.
+        let mut late_caps = DmCapabilities::v2_durable_gossip_ready(vec![0xF4; 1184]);
+        late_caps.digest_support = false;
+        assert!(short_ttl.insert(other, machine, late_caps, now_unix_ms()));
+        assert!(
+            !short_ttl.lookup(&other).expect("binding").digest_support,
+            "an expired extension must not merge into a later advert"
+        );
+    }
+
+    /// #450: the card signable bytes freeze to the v1 caps shape, so a
+    /// card-carried digest bit is UNSIGNED — `insert_from_card` must
+    /// clamp it and never let a mid-flight flip steer relay lane
+    /// selection.
+    #[test]
+    fn card_imported_digest_bit_is_clamped_untrusted() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0x51; 32]);
+        let machine = MachineId([0x52; 32]);
+        let mut caps = DmCapabilities::v2_durable_gossip_ready(vec![0x53; 1184]);
+        caps.digest_support = true;
+        assert!(store.insert_from_card(agent, machine, caps, now_unix_ms()));
+        assert!(
+            !store.lookup(&agent).expect("card binding").digest_support,
+            "the unsigned card bit must be clamped at the trust boundary"
+        );
+        // The signed extension remains the trust path for the bit.
+        assert!(store.apply_digest_extension(agent, machine, true, now_unix_ms() + 1));
+        assert!(store.lookup(&agent).expect("binding").digest_support);
+    }
+
+    /// Review r2 (#448): a later card import replaces the binding
+    /// wholesale with a FRESH local timestamp, so the unconditional clamp
+    /// used to erase a still-fresh, signed digest extension — in
+    /// on-demand mode nothing republishes the extension, so the bit stayed
+    /// lost indefinitely. The import must re-merge a fresh same-machine
+    /// extension exactly like a base-advert insert does.
+    #[test]
+    fn card_import_preserves_a_fresh_signed_digest_extension() {
+        let store = CapabilityStore::new();
+        let agent = AgentId([0x54; 32]);
+        let machine = MachineId([0x55; 32]);
+        let now = now_unix_ms();
+
+        // Signed knowledge lands first (extension before the card, and
+        // also materialized into an existing base binding).
+        assert!(store.apply_digest_extension(agent, machine, true, now));
+        let mut base_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x56; 1184]);
+        base_caps.digest_support = false;
+        assert!(store.insert(agent, machine, base_caps, now + 1));
+        assert!(store.lookup(&agent).expect("binding").digest_support);
+
+        // A same-version card import with a fresher local timestamp: the
+        // unsigned card bit is still clamped, but the SIGNED bit must
+        // survive the replacement.
+        let mut card_caps = DmCapabilities::v2_durable_gossip_ready(vec![0x57; 1184]);
+        card_caps.digest_support = true;
+        assert!(store.insert_from_card(agent, machine, card_caps, now + 2));
+        let binding = store.lookup_binding(&agent).expect("card-replaced binding");
+        assert_eq!(binding.machine_id, machine);
+        assert!(
+            binding.capabilities.digest_support,
+            "a fresh same-machine extension must survive a card import"
+        );
+
+        // Machine churn still bounds the merge: an extension from the OLD
+        // machine never speaks for a card from a NEW machine.
+        let machine_b = MachineId([0x58; 32]);
+        let mut card_caps_b = DmCapabilities::v2_durable_gossip_ready(vec![0x59; 1184]);
+        card_caps_b.digest_support = true;
+        assert!(store.insert_from_card(agent, machine_b, card_caps_b, now + 3));
+        assert!(
+            !store
+                .lookup(&agent)
+                .expect("churned binding")
+                .digest_support,
+            "an extension from another machine must not ride a card import"
+        );
     }
 }

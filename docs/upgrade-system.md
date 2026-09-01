@@ -86,6 +86,73 @@ launching the daemon normally later restores the configured updater behavior.
 
 All nodes verify and rebroadcast manifests (symmetric propagation — no privileged bootstrap role).
 
+## Downgrade safety (#451) — Home-Suite group state
+
+v0.40.4 crash-looped on data dirs holding a Home: its decoder rejects the
+`owner_certified` admission **variant** (an unknown enum variant is a hard
+serde error, unlike an unknown struct field, which is ignored) and exits 1 on
+every start — including the upgrade helper's rollback respawn after a failed
+health check. The rollback path (steps 5–7 above) could therefore brick an
+owned install.
+
+Since #451 the durable group store is split so a pre-Home-Suite binary never
+sees a shape it cannot parse:
+
+- **`named_groups.json`** — the legacy-safe view. Every entry whose
+  admission is `OwnerCertified` (the auto-provisioned Home and any manually
+  created owner-certified group) is written here as an inert PLACEHOLDER:
+  default (invite-only) policy, empty roster, GSS plane (so an old binary
+  restores no TreeKEM snapshot for it), no secrets — but the identity and
+  state-commit chain head (stable group id, genesis, revision/hash) are
+  preserved so the id stays reserved and forged lower-revision commits are
+  still rejected.
+- **`home-suite-groups.json`** — the authoritative sidecar holding the REAL
+  owner-certified state (roster with embedded certificates, Home metadata,
+  TreeKEM binding). Written before the matching `named_groups.json`
+  replacement in every save path, so a crash between writes never leaves a
+  Home-Suite entry without authoritative backing. Old binaries do not know
+  the file exists.
+- **`treekem/<group>.hsjournal`** — crash-recovery journal for the sidecar,
+  written BEFORE the sidecar changes inside the atomic TreeKEM persist
+  transaction (review r2). A crash between the sidecar write and the
+  snapshot/roster writes is healed at startup by replaying it (and the
+  legacy journal) — without it, the merged roster could be authoritative
+  with a stale/absent TreeKEM snapshot and nothing could repair it. The
+  extension is invisible to v0.40.x, whose recovery scan only reads
+  `*.journal`; the postcard shape of the legacy journal itself is unchanged
+  because old binaries decode the FULL struct before checking its version.
+- **Migration**: a store written by a pre-#451 Home-Suite binary (real
+  owner-certified entries directly in `named_groups.json`) is migrated to
+  the split layout automatically on the first post-#451 start — no
+  unrelated mutation needed — so the downgrade safety below applies to
+  existing data dirs from that start onward.
+
+What each binary does on the same data dir:
+
+- **v0.40.x** parses `named_groups.json` (placeholders only — clean parse),
+  parses and may replay leftover `treekem/*.journal` bodies (the embedded
+  roster is the legacy-safe view), skips snapshots for GSS-plane entries,
+  and never reads the sidecar or `home.json`. No exit-1 path remains, so the
+  helper's rollback respawn (§5–7) cannot crash-loop.
+- **A Home-Suite binary** loads both files and lets each sidecar entry
+  REPLACE its placeholder (the sidecar wins); restored owner-certified state
+  is quarantined until an evidence-bearing seal re-verifies it.
+
+Downgrade-window semantics: an old binary may rewrite or drop the
+placeholder (its map has no Home entry); that is harmless — the sidecar is
+authoritative and the re-upgraded daemon restores the real Home, adopting
+the same group id rather than duplicating. Changes an old binary makes to
+the placeholder are intentionally discarded.
+
+Recovery: a present-but-corrupt sidecar is a hard startup error (never a
+silent downgrade of Home security to the invite-only placeholder). Restore
+it from backup, or delete it to lose Home-Suite group state and re-provision.
+
+**Release-note caveat (v0.41):** data dirs written by v0.41 open safely in
+v0.40.x (the group-store downgrade trap is closed); the old binary merely
+sees owner-certified groups as inert unnamed-member shells. Wire-format
+caveats from #448/#450 still recommend short mixed-fleet windows.
+
 ## CI Integration
 
 `release.yml` generates `release-manifest.json` and `release-manifest.json.sig` via `x0x-keygen manifest` during the release signing job.

@@ -236,9 +236,13 @@ async fn revoked_cert_member_evicted_with_rekey_at_seal() -> Result<()> {
 
     // Seal: re-verification runs, the revoked member is evicted and the
     // GSS secret rotates (rekey via the existing rotation machinery).
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "seal must succeed: {body}");
     let evicted = body["evicted"]
@@ -304,9 +308,13 @@ async fn missing_evidence_gets_grace_window_then_evicts_at_seal() -> Result<()> 
     }
 
     // First seal: grace — not evicted, timestamp stamped.
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
@@ -343,9 +351,13 @@ async fn missing_evidence_gets_grace_window_then_evicts_at_seal() -> Result<()> 
             .expect("member");
         member.certificate_missing_since_ms = Some(0);
     }
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "post-grace seal: {body}");
     assert_eq!(
@@ -378,9 +390,13 @@ async fn owner_primary_agent_survives_the_seal() -> Result<()> {
     )
     .await;
     let owner_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "seal must succeed: {body}");
     assert_eq!(
@@ -562,10 +578,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": "invite_only"
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
@@ -584,10 +604,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": {"owner_certified": hex::encode(stranger.user_id().as_bytes())}
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::FORBIDDEN, "owner swap refused: {body}");
 
@@ -595,10 +619,14 @@ async fn policy_patch_cannot_remove_or_replace_owner_certified_axis() -> Result<
     let req: UpdateGroupPolicyRequest = serde_json::from_value(serde_json::json!({
         "admission": {"owner_certified": hex::encode(owner_kp.user_id().as_bytes())}
     }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "same-owner policy retained: {body}");
     Ok(())
@@ -641,10 +669,14 @@ async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Resu
     }
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert!(
         status == StatusCode::INTERNAL_SERVER_ERROR || status == StatusCode::CONFLICT,
@@ -712,9 +744,13 @@ async fn multi_eviction_seal_is_sequential_with_per_member_rekey() -> Result<()>
         let groups = state.named_groups.read().await;
         groups.get(&group_id).expect("group").state_revision
     };
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "sequential eviction seal: {body}");
     let evicted: Vec<String> = body["evicted"]
@@ -763,7 +799,8 @@ async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()>
     }
     // Persist + reload through the real restore path.
     assert!(save_named_groups(&state).await);
-    let reloaded = load_named_groups(&state.named_groups_path).await?;
+    let reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
     assert!(
         reloaded
             .get(&group_id)
@@ -793,9 +830,13 @@ async fn restore_from_disk_quarantines_secure_ops_until_resealed() -> Result<()>
     );
 
     // The evidence-bearing seal clears the quarantine.
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "seal clears quarantine: {body}");
     assert!(
@@ -974,10 +1015,14 @@ async fn direct_add_binds_certificate_into_roster() -> Result<()> {
     let req: AddNamedGroupMemberRequest = serde_json::from_value(serde_json::json!({
         "agent_id": target_hex
     }))?;
-    let response =
-        add_named_group_member(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = add_named_group_member(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "certified direct add: {body}");
     let groups = state.named_groups.read().await;
@@ -1096,10 +1141,14 @@ async fn ordinary_mutation_retains_member_inside_grace_window() -> Result<()> {
     // Unrelated metadata mutation through the ORDINARY seal path.
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
-    let response =
-        update_group_policy(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = update_group_policy(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert!(
         status == StatusCode::CONFLICT || status == StatusCode::INTERNAL_SERVER_ERROR,
@@ -1159,9 +1208,13 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
 
     // Seal: the (still-valid) embedded cert is STALE — the member is
     // not seated by it, but the pending fetch holds the seat via grace.
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
@@ -1186,9 +1239,13 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
     // again (and the stale embedded cert no longer matters).
     let renewed = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
     announce_cert_for(state.as_ref(), renewed).await;
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "post-rotation seal: {body}");
     assert_eq!(body["evicted"], serde_json::json!([]), "seated: {body}");
@@ -1226,7 +1283,8 @@ async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()
     }
     // Restore: the loader's quarantine marker, as after a restart.
     assert!(save_named_groups(&state).await);
-    let mut reloaded = load_named_groups(&state.named_groups_path).await?;
+    let mut reloaded =
+        load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path).await?;
     reloaded
         .get_mut(&group_id)
         .expect("group")
@@ -1234,9 +1292,13 @@ async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()
     *state.named_groups.write().await = reloaded;
 
     // Seal with an InGrace member: refused, quarantine intact.
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(
         status,
@@ -1258,9 +1320,13 @@ async fn in_grace_member_keeps_restore_quarantine_until_all_clean() -> Result<()
     // lifts the quarantine.
     let cert = x0x::identity::AgentCertificate::issue(&owner_kp, &member)?;
     announce_cert_for(state.as_ref(), cert).await;
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "all-clean seal: {body}");
     assert!(
@@ -1320,9 +1386,13 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
     // Explicit eviction seal: the Failed member is evicted, the owner
     // is Clean, nobody InGrace -> quarantine lifts in the same
     // operation.
-    let response = seal_group_state(State(Arc::clone(&state)), Path(group_id.clone()))
-        .await
-        .into_response();
+    let response = seal_group_state(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "explicit eviction seal: {body}");
     assert_eq!(body["evicted"], serde_json::json!([bad_hex]), "{body}");

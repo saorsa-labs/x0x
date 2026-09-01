@@ -17,7 +17,12 @@ pub struct PurgePath {
     pub path: PathBuf,
 }
 
-pub fn collect_purge_paths(data_dir: Option<&Path>, home_dir: Option<&Path>) -> Vec<PurgePath> {
+/// Collect purgeable paths. `x0x_home` is the RESOLVED default identity
+/// directory (issue #456: `$X0X_HOME` when set — which may be any path the
+/// operator chose, NOT necessarily `<something>/.x0x` — else `<home>/.x0x`).
+/// The keys dir is that directory itself; legacy named-instance key dirs
+/// (`.x0x-<name>`) are its siblings.
+pub fn collect_purge_paths(data_dir: Option<&Path>, x0x_home: Option<&Path>) -> Vec<PurgePath> {
     let mut paths = Vec::new();
 
     if let Some(data_dir) = data_dir {
@@ -37,18 +42,20 @@ pub fn collect_purge_paths(data_dir: Option<&Path>, home_dir: Option<&Path>) -> 
         }
     }
 
-    if let Some(home_dir) = home_dir {
-        push_existing_dir(&mut paths, PurgePathKind::Keys, home_dir.join(".x0x"));
+    if let Some(x0x_home) = x0x_home {
+        push_existing_dir(&mut paths, PurgePathKind::Keys, x0x_home.to_path_buf());
 
-        if let Ok(entries) = std::fs::read_dir(home_dir) {
-            for entry in entries.flatten() {
-                let name = entry.file_name();
-                let name_str = name.to_string_lossy();
-                if name_str.starts_with(".x0x-") && entry.path().is_dir() {
-                    paths.push(PurgePath {
-                        kind: PurgePathKind::LegacyInstanceKeys,
-                        path: entry.path(),
-                    });
+        if let Some(parent) = x0x_home.parent() {
+            if let Ok(entries) = std::fs::read_dir(parent) {
+                for entry in entries.flatten() {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with(".x0x-") && entry.path().is_dir() {
+                        paths.push(PurgePath {
+                            kind: PurgePathKind::LegacyInstanceKeys,
+                            path: entry.path(),
+                        });
+                    }
                 }
             }
         }
@@ -57,9 +64,12 @@ pub fn collect_purge_paths(data_dir: Option<&Path>, home_dir: Option<&Path>) -> 
     paths
 }
 
-pub fn agent_id_confirmation_hint(home_dir: Option<&Path>) -> anyhow::Result<String> {
-    let home_dir = home_dir.ok_or_else(|| anyhow::anyhow!("home directory is unavailable"))?;
-    let key_path = home_dir.join(".x0x/agent.key");
+/// Confirmation hint read from the resolved default identity directory
+/// (see [`collect_purge_paths`]).
+pub fn agent_id_confirmation_hint(x0x_home: Option<&Path>) -> anyhow::Result<String> {
+    let x0x_home =
+        x0x_home.ok_or_else(|| anyhow::anyhow!("default identity directory is unavailable"))?;
+    let key_path = x0x_home.join("agent.key");
     let data = std::fs::read(&key_path)
         .with_context(|| format!("failed to read {}", key_path.display()))?;
     let keypair = crate::storage::deserialize_agent_keypair(&data)
@@ -103,7 +113,7 @@ mod tests {
         std::fs::create_dir_all(&legacy_keys)?;
         std::fs::create_dir_all(&misleading_home_data)?;
 
-        let paths = collect_purge_paths(Some(&data_dir), Some(&home_dir));
+        let paths = collect_purge_paths(Some(&data_dir), Some(&keys));
 
         assert!(paths
             .iter()
@@ -130,7 +140,7 @@ mod tests {
     #[test]
     fn agent_id_confirmation_hint_errors_when_key_is_missing() -> anyhow::Result<()> {
         let tmp = tempfile::tempdir()?;
-        let result = agent_id_confirmation_hint(Some(tmp.path()));
+        let result = agent_id_confirmation_hint(Some(&tmp.path().join(".x0x")));
 
         assert!(result.is_err());
         assert!(!matches!(result.as_deref(), Ok("unknown")));
@@ -145,7 +155,7 @@ mod tests {
         std::fs::create_dir_all(&key_dir)?;
         std::fs::write(key_dir.join("agent.key"), b"not an agent key")?;
 
-        let result = agent_id_confirmation_hint(Some(tmp.path()));
+        let result = agent_id_confirmation_hint(Some(&key_dir));
 
         assert!(result.is_err());
         assert!(!matches!(result.as_deref(), Ok("unknown")));
@@ -166,8 +176,38 @@ mod tests {
             serialize_agent_keypair(&keypair)?,
         )?;
 
-        assert_eq!(agent_id_confirmation_hint(Some(tmp.path()))?, expected);
+        assert_eq!(agent_id_confirmation_hint(Some(&key_dir))?, expected);
 
+        Ok(())
+    }
+
+    /// Review r2 (#456): with an X0X_HOME override of arbitrary shape
+    /// (e.g. `/tmp/site/x0x` — not `<parent>/.x0x`), the KEYS purge target
+    /// is the override directory ITSELF; nothing may target
+    /// `<parent>/.x0x`, and the confirmation hint reads the override's
+    /// agent.key.
+    #[test]
+    fn override_shaped_x0x_home_is_purged_directly() -> std::io::Result<()> {
+        let tmp = tempfile::tempdir()?;
+        let site = tmp.path().join("site");
+        let override_home = site.join("x0x"); // X0X_HOME=/…/site/x0x
+        let decoy = site.join(".x0x"); // must NOT be targeted (does not exist)
+        let sibling_instance = site.join(".x0x-alice"); // sibling instances still are
+        std::fs::create_dir_all(&override_home)?;
+        std::fs::create_dir_all(&sibling_instance)?;
+
+        let paths = collect_purge_paths(None, Some(&override_home));
+
+        assert!(paths
+            .iter()
+            .any(|path| path.kind == PurgePathKind::Keys && path.path == override_home));
+        assert!(
+            !paths.iter().any(|path| path.path == decoy),
+            "the parent's .x0x must not be targeted when the override differs"
+        );
+        assert!(paths.iter().any(|path| {
+            path.kind == PurgePathKind::LegacyInstanceKeys && path.path == sibling_instance
+        }));
         Ok(())
     }
 }
