@@ -1414,6 +1414,233 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
+    /// WHY (issue #446, review round 4): the central Home-mutation fence
+    /// (`home_mutation_requires_durable`) covers EVERY mutating group
+    /// route. This matrix drives each through the REAL auth middleware:
+    /// session → typed 403, rider → 403, durable → past the gate (the
+    /// exact past-gate outcome is body/state dependent; ≠403 proves the
+    /// fence passed). Benign bodies keep the durable arms non-destructive
+    /// except withdraw, which runs last.
+    #[tokio::test]
+    async fn home_all_mutation_routes_three_principal_matrix() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x47; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+        let stranger = "ef".repeat(32);
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .route(
+                "/groups/:id",
+                axum::routing::delete(super::super::named_groups::leave_group),
+            )
+            .route(
+                "/groups/:id/policy",
+                axum::routing::patch(super::super::named_groups::update_group_policy),
+            )
+            .route(
+                "/groups/:id/state/withdraw",
+                axum::routing::post(super::super::named_groups::withdraw_group_state),
+            )
+            .route(
+                "/groups/:id/members",
+                axum::routing::post(super::super::named_groups::add_named_group_member),
+            )
+            .route(
+                "/groups/:id/members/:agent_id",
+                axum::routing::delete(super::super::named_groups::remove_named_group_member),
+            )
+            .route(
+                "/groups/:id/members/:agent_id/role",
+                axum::routing::patch(super::super::named_groups::update_member_role),
+            )
+            .route(
+                "/groups/:id/ban/:agent_id",
+                axum::routing::post(super::super::named_groups::ban_group_member),
+            )
+            .route(
+                "/groups/:id/ban/:agent_id",
+                axum::routing::delete(super::super::named_groups::unban_group_member),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _record) = store
+                .issue(
+                    "99".repeat(32),
+                    Vec::new(),
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                )
+                .await?;
+            token
+        };
+        let session = state.sessions.issue(std::time::Instant::now());
+
+        // (label, method, path suffix, body)
+        let routes: &[(&str, &str, String, Option<serde_json::Value>)] = &[
+            (
+                "PATCH /groups/:id (rename)",
+                "PATCH",
+                format!("/groups/{home_id}"),
+                Some(serde_json::json!({ "name": "X" })),
+            ),
+            (
+                "PATCH /groups/:id/policy",
+                "PATCH",
+                format!("/groups/{home_id}/policy"),
+                Some(serde_json::json!({ "discoverability": "listed_to_contacts" })),
+            ),
+            (
+                "POST /groups/:id/members",
+                "POST",
+                format!("/groups/{home_id}/members"),
+                Some(serde_json::json!({ "agent_id": stranger })),
+            ),
+            (
+                "DELETE /groups/:id/members/:agent_id",
+                "DELETE",
+                format!("/groups/{home_id}/members/{stranger}"),
+                None,
+            ),
+            (
+                "PATCH /groups/:id/members/:agent_id/role",
+                "PATCH",
+                format!("/groups/{home_id}/members/{stranger}/role"),
+                Some(serde_json::json!({ "role": "member" })),
+            ),
+            (
+                "POST /groups/:id/ban/:agent_id",
+                "POST",
+                format!("/groups/{home_id}/ban/{stranger}"),
+                None,
+            ),
+            (
+                "DELETE /groups/:id/ban/:agent_id",
+                "DELETE",
+                format!("/groups/{home_id}/ban/{stranger}"),
+                None,
+            ),
+        ];
+        for (label, method, path, body) in routes {
+            let send = |bearer: String, body: Option<serde_json::Value>| {
+                let app = app.clone();
+                let method: &'static str = match *method {
+                    "PATCH" => "PATCH",
+                    "POST" => "POST",
+                    _ => "DELETE",
+                };
+                let path = path.clone();
+                async move {
+                    let builder = Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json");
+                    let req = match body {
+                        Some(json) => builder.body(Body::from(json.to_string())),
+                        None => builder.body(Body::empty()),
+                    }
+                    .expect("request builds");
+                    app.oneshot(req).await
+                }
+            };
+            let response = send(session.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{label} session 403 must be typed: {out}"
+            );
+            let response = send(rider.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {out}");
+            // Benign bodies: the durable arm passes the fence and lands
+            // in ordinary handler validation (stranger is not a member).
+            let response = send("test-token".to_string(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} durable must clear the fence: {out}"
+            );
+        }
+
+        // Destructible pair, durable arm LAST: leave, then withdraw (the
+        // terminal delete) on the Home — both must clear the fence.
+        for (label, method_str, path) in [
+            (
+                "DELETE /groups/:id (leave)",
+                "DELETE",
+                format!("/groups/{home_id}"),
+            ),
+            (
+                "POST /groups/:id/state/withdraw",
+                "POST",
+                format!("/groups/{home_id}/state/withdraw"),
+            ),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method_str)
+                        .uri(&path)
+                        .header("authorization", format!("Bearer {session}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let (status, body) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {body}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method_str)
+                        .uri(&path)
+                        .header("authorization", format!("Bearer {rider}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let (status, body) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {body}");
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method(method_str)
+                        .uri(&path)
+                        .header("authorization", "Bearer test-token")
+                        .body(Body::empty())?,
+                )
+                .await?;
+            let (status, body) = response_json(response).await?;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{label} durable must clear the fence: {body}"
+            );
+        }
+        Ok(())
+    }
+
     /// WHY: GET /home on an un-owned install is a clean 404.
     #[tokio::test]
     async fn get_home_without_home_is_404() -> anyhow::Result<()> {

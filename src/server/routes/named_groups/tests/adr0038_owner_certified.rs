@@ -990,10 +990,14 @@ async fn direct_add_binds_certificate_into_roster() -> Result<()> {
     let req: AddNamedGroupMemberRequest = serde_json::from_value(serde_json::json!({
         "agent_id": target_hex
     }))?;
-    let response =
-        add_named_group_member(State(Arc::clone(&state)), Path(group_id.clone()), Json(req))
-            .await
-            .into_response();
+    let response = add_named_group_member(
+        State(Arc::clone(&state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.clone()),
+        Json(req),
+    )
+    .await
+    .into_response();
     let (status, body) = response_json(response).await?;
     assert_eq!(status, StatusCode::OK, "certified direct add: {body}");
     let groups = state.named_groups.read().await;

@@ -1263,6 +1263,29 @@ mod tests {
             "durable bearer must resolve durable=true"
         );
 
+        // Rider token → 403 at the middleware (GET /ws is not in the
+        // ADR-0039 rider route set) — the third principal for the WS path.
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "77".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let (status, _body) = read("/ws".to_string(), Some(rider)).await?;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "a rider token must be denied on /ws"
+        );
+
         // No credential → 401 before the handler.
         let (status, _body) = read("/ws".to_string(), None).await?;
         assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
@@ -1284,6 +1307,10 @@ mod tests {
             observed_origin,
         }
     }
+
+    // ========================================================================
+    // Issue #120 — WS `direct_message` observed-origin serialization.
+    // ========================================================================
 
     #[test]
     fn ws_direct_message_frame_is_byte_identical_without_origin() {

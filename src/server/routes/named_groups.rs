@@ -11275,9 +11275,15 @@ pub(in crate::server) async fn set_group_display_name(
 /// POST /groups/:id/members — add a member to the named-group roster.
 pub(in crate::server) async fn add_named_group_member(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
     Json(req): Json<AddNamedGroupMemberRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let agent_id = match parse_agent_id_hex(&req.agent_id) {
         Ok(id) => id,
         Err(e) => {
@@ -11708,8 +11714,14 @@ async fn add_treekem_named_group_member(
 /// DELETE /groups/:id/members/:agent_id — remove a member from the named-group roster.
 pub(in crate::server) async fn remove_named_group_member(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let agent_id = match parse_agent_id_hex(&agent_id_hex) {
         Ok(id) => id,
         Err(e) => {
@@ -13494,8 +13506,14 @@ pub(in crate::server) async fn seal_group_state(
 /// Admin or higher only.
 pub(in crate::server) async fn withdraw_group_state(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let membership_lock = group_membership_lock(&state, &id).await;
     let membership_guard = membership_lock.lock().await;
     match withdraw_named_group_terminal(&state, &id, "withdraw_delete", membership_guard, true)
@@ -13642,8 +13660,14 @@ async fn withdraw_named_group_terminal(
 /// DELETE /groups/:id — leave a group.
 pub(in crate::server) async fn leave_group(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let local_agent = state.agent.agent_id();
     let local_agent_hex = hex::encode(local_agent.as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
@@ -14228,14 +14252,44 @@ fn last_admin_precheck(
         .map(|error| api_error(StatusCode::CONFLICT, error))
 }
 
+/// Issue #446 (review round 4): the CENTRAL Home-mutation fence.
+///
+/// A group carrying Home metadata is the owner-certified Home regardless
+/// of its current policy axes; mutating it is an owner act. EVERY
+/// handler that mutates a named group calls this at ENTRY (it only
+/// reads the groups table, before any other lock is taken): session
+/// bearers and riders get a typed 403; `None` = proceed. Gated
+/// surfaces: PATCH /groups/:id, PATCH /groups/:id/policy, POST
+/// /groups/:id/state/withdraw, DELETE /groups/:id (leave/terminal
+/// withdraw), POST+DELETE /groups/:id/members[...], PATCH
+/// /groups/:id/members/:agent_id/role, POST+DELETE /groups/:id/ban/...
+async fn home_mutation_requires_durable(
+    state: &AppState,
+    actor: &crate::server::rider_auth::ActorContext,
+    group_id: &str,
+) -> Option<(StatusCode, Json<serde_json::Value>)> {
+    let is_home = state
+        .named_groups
+        .read()
+        .await
+        .get(group_id)
+        .is_some_and(|info| info.home.is_some());
+    if is_home && !actor.is_durable_owner() {
+        return Some(api_error(
+            StatusCode::FORBIDDEN,
+            "mutating the Home requires the durable API token (not a session token)",
+        ));
+    }
+    None
+}
+
 /// PATCH /groups/:id — update name/description (admin+).
 ///
-/// Issue #446 (review round 2): when the target group is the
-/// owner-certified HOME (Home metadata + exact Home policy), the
-/// mutation requires the DURABLE owner — the same authority as
-/// `POST /home/rename`, so the convenience alias cannot be bypassed by
-/// PATCHing the Home `group_id` directly. Ordinary groups keep the
-/// session-allowed admin path.
+/// Issue #446: a target carrying Home metadata requires the DURABLE
+/// owner (central fence: [`home_mutation_requires_durable`]) — the same
+/// authority as `POST /home/rename`, so neither the alias nor the
+/// underlying PATCH can be driven by a session. Ordinary groups keep
+/// the session-allowed admin path.
 pub(in crate::server) async fn update_named_group(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<
@@ -14244,6 +14298,9 @@ pub(in crate::server) async fn update_named_group(
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -14260,18 +14317,6 @@ pub(in crate::server) async fn update_named_group(
     }
     if let Some(resp) = reject_withdrawn_group(info) {
         return resp;
-    }
-    // Issue #446 (review round 3): Home-targeted PATCH = owner act
-    // (durable required). The marker is Home METADATA PRESENCE —
-    // deliberately NOT the current policy axes: a session could
-    // otherwise flip discoverability via PATCH /groups/:id/policy,
-    // rename while the exact-policy check is false, and restore it
-    // (round-2 bypass). Any group carrying Home metadata is durable.
-    if info.home.is_some() && !actor.is_durable_owner() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "mutating the Home requires the durable API token (not a session token)",
-        );
     }
     let name_update = req.name.clone();
     let desc_update = req.description.clone();
@@ -14347,6 +14392,9 @@ pub(in crate::server) async fn update_group_policy(
     Path(id): Path<String>,
     Json(req): Json<UpdateGroupPolicyRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -14362,18 +14410,7 @@ pub(in crate::server) async fn update_group_policy(
     if let Some(resp) = reject_withdrawn_group(info) {
         return resp;
     }
-    // Issue #446 (review round 3): policy flips are how a session could
-    // disguise the Home (round-2 bypass chain) — gate them on the same
-    // Home-metadata marker as the rename PATCH.
-    if info.home.is_some() && !actor.is_durable_owner() {
-        return api_error(
-            StatusCode::FORBIDDEN,
-            "changing the Home policy requires the durable API token (not a session token)",
-        );
-    }
-    if let Some(resp) = reject_withdrawn_group(info) {
-        return resp;
-    }
+    // (Home fence applied at entry via `home_mutation_requires_durable`.)
 
     let mut new_policy = info.policy.clone();
     if let Some(preset_name) = req.preset.as_deref() {
@@ -14485,9 +14522,15 @@ pub(in crate::server) async fn update_group_policy(
 /// role rather than a partial-transfer stub (issue #107 item (d)).
 pub(in crate::server) async fn update_member_role(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, agent_id_hex)): Path<(String, String)>,
     Json(req): Json<UpdateMemberRoleRequest>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -14589,8 +14632,14 @@ pub(in crate::server) async fn update_member_role(
 /// POST /groups/:id/ban/:agent_id — ban a member (admin+).
 pub(in crate::server) async fn ban_group_member(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -14925,8 +14974,14 @@ async fn ban_treekem_group_member(
 /// DELETE /groups/:id/ban/:agent_id — unban a member (admin+).
 pub(in crate::server) async fn unban_group_member(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Path((id, agent_id_hex)): Path<(String, String)>,
 ) -> impl IntoResponse {
+    if let Some(resp) = home_mutation_requires_durable(&state, &actor, &id).await {
+        return resp;
+    }
     let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
     let signing_kp = state.agent.identity().agent_keypair();
     let now_ms = now_millis_u64();
@@ -22810,6 +22865,9 @@ pub(in crate::server) mod tests {
 
         let remove = remove_named_group_member(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Path((group_id.clone(), target_hex.clone())),
         )
         .await
@@ -22823,6 +22881,9 @@ pub(in crate::server) mod tests {
 
         let ban = ban_group_member(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Path((group_id.clone(), target_hex.clone())),
         )
         .await
@@ -22836,6 +22897,9 @@ pub(in crate::server) mod tests {
 
         let role = update_member_role(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Path((group_id.clone(), target_hex.clone())),
             Json(UpdateMemberRoleRequest {
                 role: "member".to_string(),
@@ -24260,6 +24324,9 @@ pub(in crate::server) mod tests {
         let (status, body) = response_json(
             remove_named_group_member(
                 State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
                 Path((group_id.clone(), victim_hex.clone())),
             )
             .await
@@ -24428,6 +24495,9 @@ pub(in crate::server) mod tests {
         let (status, body) = response_json(
             remove_named_group_member(
                 State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
                 Path((group_id.clone(), victim_hex.clone())),
             )
             .await
@@ -24526,9 +24596,15 @@ pub(in crate::server) mod tests {
             .clear();
 
         let (status, body) = response_json(
-            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
-                .await
-                .into_response(),
+            leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(group_id.clone()),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "self-leave failed: {body}");
@@ -24587,9 +24663,15 @@ pub(in crate::server) mod tests {
             .insert(group_id.clone(), info);
 
         let (status, body) = response_json(
-            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
-                .await
-                .into_response(),
+            leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(group_id.clone()),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(
@@ -24645,9 +24727,15 @@ pub(in crate::server) mod tests {
             .insert(group_id.clone(), info);
 
         let (status, body) = response_json(
-            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
-                .await
-                .into_response(),
+            leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(group_id.clone()),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
@@ -24700,9 +24788,15 @@ pub(in crate::server) mod tests {
             .insert(group_id.clone(), info);
 
         let (status, body) = response_json(
-            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
-                .await
-                .into_response(),
+            leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(group_id.clone()),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(status, StatusCode::CONFLICT, "body: {body}");
@@ -24746,9 +24840,15 @@ pub(in crate::server) mod tests {
             .insert(group_id.clone(), info);
 
         let (status, body) = response_json(
-            leave_group(State(Arc::clone(&state)), Path(group_id.clone()))
-                .await
-                .into_response(),
+            leave_group(
+                State(Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(group_id.clone()),
+            )
+            .await
+            .into_response(),
         )
         .await?;
         assert_eq!(status, StatusCode::OK, "sole non-admin member: {body}");
