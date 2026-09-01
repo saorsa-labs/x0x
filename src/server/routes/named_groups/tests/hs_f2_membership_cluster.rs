@@ -621,7 +621,9 @@ async fn issue458_stage(group_byte: u8, rename_first: bool) -> Result<Issue458St
     if rename_first {
         let response = update_named_group(
             State(Arc::clone(&authority)),
-            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Path(group_id.clone()),
             Json(UpdateGroupRequest {
                 name: Some("Renamed mid-join".to_string()),
@@ -2208,14 +2210,13 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
     // REAL rename route (POST /home/rename).
     let rename_req: crate::server::routes::home::RenameHomeRequest =
         serde_json::from_str(&format!("{{\"name\":\"{}\"}}", "Davids Home")).expect("rename body");
-    let response =
-        crate::server::routes::home::rename_home(
-            State(Arc::clone(&owner_state)),
-            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-            Json(rename_req)
-        )
-            .await
-            .into_response();
+    let response = crate::server::routes::home::rename_home(
+        State(Arc::clone(&owner_state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Json(rename_req),
+    )
+    .await
+    .into_response();
     assert_eq!(response.status(), StatusCode::OK, "real rename succeeds");
 
     // RESTART the owner daemon.

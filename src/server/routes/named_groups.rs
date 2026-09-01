@@ -2585,6 +2585,7 @@ async fn stop_named_group_metadata_listener(state: &AppState, group_id: &str) {
 ///   claimed hash — a differing hash is a FAILURE, never success.
 /// - On success the joiner adopts the reconstruction (hash == content by
 ///   construction) and retains the whole verified chain for audit.
+///
 /// Any check failing → refuse; the joiner stays pending.
 ///
 /// Fork note (threat model): a fork served by an admin who was valid at
@@ -3114,12 +3115,8 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
         // persisted, so it survives the filter.
         let (legacy_json, home_suite_json) = {
             let groups = state.named_groups.read().await;
-            encode_named_groups_store_excluding_pending_stubs(
-                state,
-                &groups,
-                Some(group_id),
-            )
-            .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?
+            encode_named_groups_store_excluding_pending_stubs(state, &groups, Some(group_id))
+                .map_err(|e| anyhow::anyhow!("named groups encode for journal: {e}"))?
         };
         // The LEGACY journal carries the legacy half (its postcard shape
         // is the downgrade-safe replay carrier — old binaries decode and
@@ -14728,10 +14725,10 @@ pub(in crate::server) fn intervening_chain_from(
     let mut chain: Vec<x0x::groups::state_commit::RetainedCommit> = info
         .commit_log
         .iter()
-        .cloned()
         .filter(|retained| {
             retained.commit.revision > from_revision && retained.commit.revision < terminal_revision
         })
+        .cloned()
         .collect();
     chain.sort_by_key(|retained| retained.commit.revision);
     let complete = !chain.is_empty()
@@ -21884,9 +21881,8 @@ fn encode_named_groups_store_excluding_pending_stubs(
         return encode_named_groups_store(groups);
     }
     let mut durable_view = groups.clone();
-    durable_view.retain(|key, _| {
-        Some(key.as_str()) == always_include || !pending.contains(key.as_str())
-    });
+    durable_view
+        .retain(|key, _| Some(key.as_str()) == always_include || !pending.contains(key.as_str()));
     encode_named_groups_store(&durable_view)
 }
 
