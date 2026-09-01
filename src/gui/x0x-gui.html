@@ -696,10 +696,35 @@ const WS_URL=BASE.replace(/^http/,'ws')+'/ws/direct'+(SESSION_TOKEN?'?token='+SE
 let ws=null;
 const wsSubs=new Set();
 
-async function api(path,opt){
+async function api(path,opt){return apiWith(SESSION_TOKEN,path,opt)}
+
+// Issue #446: owner-act surfaces (/agent/sign, /exec/*, /shutdown,
+// /sync/devices*, /announce with user identity, /home/rename,
+// /upgrade/apply, PATCH on the Home group, and /direct/send with
+// reserved exec payloads) require the DURABLE API token — a session
+// bearer gets a typed 403 naming it. ownerApi() prefers a remembered
+// owner token, and on the durable-required 403 prompts once, keeps it
+// in sessionStorage ONLY (never localStorage, never a URL), and
+// retries.
+function readOwnerToken(){try{return sessionStorage.getItem('x0x_owner_token')||''}catch(e){return ''}}
+let OWNER_TOKEN=readOwnerToken();
+function durableRequired(r){return !!(r&&r._http_status===403&&String(r.error||'').indexOf('durable')!==-1)}
+async function ownerApi(path,opt){
+  let r=await apiWith(OWNER_TOKEN||SESSION_TOKEN,path,opt);
+  if(durableRequired(r)&&!OWNER_TOKEN){
+    const t=prompt("This action requires the durable API token (owner authority).\nPaste it — it is kept only in this tab's sessionStorage:");
+    if(t&&t.trim()){
+      OWNER_TOKEN=t.trim();
+      try{sessionStorage.setItem('x0x_owner_token',OWNER_TOKEN)}catch(e){}
+      r=await apiWith(OWNER_TOKEN,path,opt);
+    }
+  }
+  return r;
+}
+async function apiWith(bearer,path,opt){
   try{
     const hdrs={'Content-Type':'application/json',...(opt||{}).headers};
-    if(SESSION_TOKEN)hdrs['Authorization']='Bearer '+SESSION_TOKEN;
+    if(bearer)hdrs['Authorization']='Bearer '+bearer;
     const r=await fetch(BASE+path,{...opt,headers:hdrs});
     const data=await r.json().catch(()=>({ok:false,error:r.statusText||'request failed'}));
     if(data&&typeof data==='object'){
@@ -1771,7 +1796,7 @@ function renameHomeSpace(){
   const cur=hd?(hd.name||'Home'):'Home';
   const name=prompt('Rename Home:',cur);
   if(!name||name===cur)return;
-  api('/home/rename',{method:'POST',body:JSON.stringify({name})}).then(r=>{
+  ownerApi('/home/rename',{method:'POST',body:JSON.stringify({name})}).then(r=>{
     if(r&&r.ok){mountHomeSpace();renderSidebar();}
   });
 }
@@ -1844,7 +1869,7 @@ async function pollDash(){
 async function applyUpgrade(){
   const btn=document.getElementById('upg-apply-btn');
   if(btn){btn.disabled=true;btn.textContent='Applying…'}
-  const r=await api('/upgrade/apply',{method:'POST'});
+  const r=await ownerApi('/upgrade/apply',{method:'POST'});
   if(!r){toast('Apply failed: no response','error');if(btn){btn.disabled=false;btn.textContent='Apply update'}return}
   if(r.ok&&r.applied){
     toast('Upgrade applied: v'+(r.version||'?')+'. Daemon will restart.','success');
@@ -3920,7 +3945,7 @@ function adminOut(id,obj,err){
 }
 
 async function adminAnnounce(withUser){
-  const r=await api('/announce',{method:'POST',body:JSON.stringify({include_user_identity:withUser,human_consent:withUser})});
+  const r=await ownerApi('/announce',{method:'POST',body:JSON.stringify({include_user_identity:withUser,human_consent:withUser})});
   adminOut('admin-identity-out',r&&r.ok?'Announcement sent.':r);
 }
 async function adminFetchUserId(){
@@ -3934,7 +3959,7 @@ async function adminFetchIntroduction(){
 async function adminSignPayload(){
   const payload=document.getElementById('admin-sign-payload').value||'';
   if(!payload){adminOut('admin-identity-out',null,'Enter a payload to sign');return}
-  const r=await api('/agent/sign',{method:'POST',body:JSON.stringify({payload_b64:u8encode(payload)})});
+  const r=await ownerApi('/agent/sign',{method:'POST',body:JSON.stringify({payload_b64:u8encode(payload)})});
   adminOut('admin-identity-out',r);
 }
 
@@ -4067,7 +4092,7 @@ async function adminExecRun(){
   if(!agent_id||!argv.length){adminOut('admin-exec-out',null,'Need target agent ID and argv');return}
   const body={agent_id,argv};
   if(Number.isFinite(timeout)&&timeout>0)body.timeout_ms=timeout;
-  const r=await api('/exec/run',{method:'POST',body:JSON.stringify(body)});
+  const r=await ownerApi('/exec/run',{method:'POST',body:JSON.stringify(body)});
   adminOut('admin-exec-out',r);
 }
 async function adminExecCancel(){
@@ -4076,7 +4101,7 @@ async function adminExecCancel(){
   if(!request_id){adminOut('admin-exec-out',null,'Need request ID');return}
   const body={request_id};
   if(agent_id)body.agent_id=agent_id;
-  const r=await api('/exec/cancel',{method:'POST',body:JSON.stringify(body)});
+  const r=await ownerApi('/exec/cancel',{method:'POST',body:JSON.stringify(body)});
   adminOut('admin-exec-out',r);
 }
 async function adminExecSessions(){
@@ -4224,13 +4249,13 @@ async function loadSyncDevices(){
 }
 
 async function enrollThisMachine(){
-  const r=await api('/sync/devices/enroll',{method:'POST',body:JSON.stringify({})});
+  const r=await ownerApi('/sync/devices/enroll',{method:'POST',body:JSON.stringify({})});
   if(r&&r._http_ok){toast('Machine enrolled into the owner device set','success');loadSyncDevices();}
   else{toast(r&&r.error?r.error:'Enroll failed','error');}
 }
 
 async function revokeSyncDevice(machineId){
-  const r=await api('/sync/devices/'+encodeURIComponent(machineId),{method:'DELETE'});
+  const r=await ownerApi('/sync/devices/'+encodeURIComponent(machineId),{method:'DELETE'});
   if(r&&r._http_ok){toast('Machine revoked from the owner device set','success');loadSyncDevices();}
   else{toast(r&&r.error?r.error:'Revoke failed','error');}
 }
@@ -5021,7 +5046,7 @@ async function nagRenameGroup(gid){
   if(name)body.name=name;
   if(desc)body.description=desc;
   nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Working…');
-  const r=await api('/groups/'+gid,{method:'PATCH',body:JSON.stringify(body)});
+  const r=await ownerApi('/groups/'+gid,{method:'PATCH',body:JSON.stringify(body)});
   if(r&&r.ok){
     nagSetFeedback(`[data-nag-policy="${gid}"] [data-k="rename-feedback"]`,'Saved.','ok');
     nagRenderAdmin(gid);

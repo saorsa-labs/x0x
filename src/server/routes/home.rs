@@ -667,10 +667,28 @@ pub(in crate::server) struct RenameHomeRequest {
 
 /// POST /home/rename — convenience wrapper over the existing
 /// PATCH /groups/:id (admin-gated, sealed, persisted).
+///
+/// Issue #446 (review round 2): requires the DURABLE owner — and the
+/// underlying PATCH requires it too when the target is the Home (see
+/// `update_named_group`), so the alias cannot be bypassed via PATCH.
+/// Enforced at the route layer (`requires_durable_owner`) and here.
 pub(in crate::server) async fn rename_home(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<RenameHomeRequest>,
 ) -> Response {
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "renaming the Home requires the durable API token (not a session token)"
+            })),
+        )
+            .into_response();
+    }
     let Some(user_kp) = state.agent.identity().user_keypair() else {
         return (
             StatusCode::NOT_FOUND,
@@ -695,13 +713,18 @@ pub(in crate::server) async fn rename_home(
         name: Some(req.name),
         description: None,
     };
-    update_named_group(State(state), Path(group_id), Json(update))
-        .await
-        .into_response()
+    update_named_group(
+        State(state),
+        axum::extract::Extension(actor),
+        Path(group_id),
+        Json(update),
+    )
+    .await
+    .into_response()
 }
 
 #[cfg(test)]
-mod tests {
+pub(in crate::server::routes) mod tests {
     use super::*;
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
@@ -709,7 +732,7 @@ mod tests {
 
     /// Owned test state: user key (deterministic seed so the owner id is
     /// stable across the "restart" arm) + builder-issued agent certificate.
-    pub(in crate::server::routes::home) async fn owned_state(
+    pub(in crate::server::routes) async fn owned_state(
         data_dir: &std::path::Path,
         owner_seed: [u8; 32],
     ) -> anyhow::Result<Arc<AppState>> {
@@ -1072,6 +1095,9 @@ mod tests {
         provision_home(&state).await;
         let response = rename_home(
             State(Arc::clone(&state)),
+            axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                durable: true,
+            }),
             Json(RenameHomeRequest {
                 name: "Irvine HQ".to_string(),
             }),
@@ -1082,6 +1108,836 @@ mod tests {
         let owner = owner_of(&state);
         let (_, info) = find_home(&state, &owner).await.expect("home");
         assert_eq!(info.name, "Irvine HQ");
+        Ok(())
+    }
+
+    /// WHY (issue #446, review round 2): `/home/rename` requires the
+    /// DURABLE owner — session bearers and riders get 403, the durable
+    /// token renames. Pinned end-to-end through the real auth middleware
+    /// (route classification + handler gate).
+    #[tokio::test]
+    async fn home_rename_requires_durable_owner() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x44; 32]).await?;
+        provision_home(&state).await;
+        let app = axum::Router::new()
+            .route("/home/rename", axum::routing::post(rename_home))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let call = |bearer: String, name: &'static str| {
+            let app = app.clone();
+            async move {
+                app.clone()
+                    .oneshot(
+                        Request::post("/home/rename")
+                            .header("authorization", format!("Bearer {bearer}"))
+                            .header("content-type", "application/json")
+                            .body(Body::from(serde_json::json!({ "name": name }).to_string()))
+                            .expect("body builds"),
+                    )
+                    .await
+            }
+        };
+
+        let session = state.sessions.issue(std::time::Instant::now());
+        let response = call(session, "Session Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session bearer must be refused: {body}"
+        );
+
+        // A rider token is denied (ADR-0039 deny-by-default).
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "ab".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let response = call(rider, "Rider Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rider must be denied: {body}"
+        );
+
+        let response = call("test-token".to_string(), "Durable Rename").await?;
+        let (status, body) = response_json(response.into_response()).await?;
+        assert_eq!(status, StatusCode::OK, "durable bearer must rename: {body}");
+        let owner = owner_of(&state);
+        let (_, info) = find_home(&state, &owner).await.expect("home");
+        assert_eq!(info.name, "Durable Rename");
+        Ok(())
+    }
+
+    /// WHY (issue #446, review round 2): the underlying PATCH must fence
+    /// the SAME authority for the HOME group (else the /home/rename gate
+    /// is bypassable by PATCHing the Home `group_id` revealed by
+    /// session-readable GET /home), while ordinary groups keep the
+    /// session-allowed admin path.
+    #[tokio::test]
+    async fn patch_on_home_requires_durable_owner_plain_groups_stay_session_allowed(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x45; 32]).await?;
+        provision_home(&state).await;
+
+        // A plain (non-Home) group created through the real handler.
+        let created = super::super::named_groups::create_named_group(
+            State(Arc::clone(&state)),
+            axum::Json(super::super::named_groups::CreateGroupRequest {
+                name: "Plain Space".to_string(),
+                description: String::new(),
+                display_name: None,
+                preset: None,
+                policy: None,
+            }),
+        )
+        .await
+        .into_response();
+        let (status, body) = response_json(created).await?;
+        assert_eq!(status, StatusCode::CREATED, "plain group created: {body}");
+        let plain_id = body["group_id"]
+            .as_str()
+            .map(str::to_string)
+            .filter(|id| !id.is_empty())
+            .unwrap_or_default();
+        assert!(
+            !plain_id.is_empty(),
+            "create response carries the id: {body}"
+        );
+
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let patch = |bearer: String, id: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::patch(format!("/groups/{id}"))
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "name": "Renamed" }).to_string(),
+                        ))
+                        .expect("body builds"),
+                )
+                .await
+            }
+        };
+
+        // Session bearer: Home PATCH → 403 …
+        let session = state.sessions.issue(std::time::Instant::now());
+        let response = patch(session.clone(), home_id.clone()).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session PATCH on the Home must be refused: {body}"
+        );
+        // … but a PLAIN group PATCH stays session-allowed (boundary pin).
+        let response = patch(session.clone(), plain_id).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "session PATCH on a plain group must keep working: {body}"
+        );
+
+        // Durable bearer: Home PATCH succeeds through the same path.
+        let response = patch("test-token".to_string(), home_id).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "durable PATCH on the Home must rename: {body}"
+        );
+        Ok(())
+    }
+
+    /// WHY (issue #446, review round 3): the round-2 gate matched the
+    /// EXACT current Home policy, so a session could flip discoverability
+    /// via PATCH /groups/:id/policy, rename while the check was false,
+    /// and restore — renaming the Home with a session token. The round-3
+    /// fix gates on Home METADATA presence in BOTH PATCH handlers. This
+    /// test drives the entire exploit chain and asserts every step fails.
+    #[tokio::test]
+    async fn home_policy_flip_rename_bypass_is_closed() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x46; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .route(
+                "/groups/:id/policy",
+                axum::routing::patch(super::super::named_groups::update_group_policy),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+        let call = |bearer: String, path: String, body: String| {
+            let app = app.clone();
+            async move {
+                app.oneshot(
+                    Request::patch(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body))
+                        .expect("body builds"),
+                )
+                .await
+            }
+        };
+        let rename_body = serde_json::json!({ "name": "Stolen Rename" }).to_string();
+        let flip_body = serde_json::json!({ "discoverability": "listed_to_contacts" }).to_string();
+        let session = state.sessions.issue(std::time::Instant::now());
+
+        // Chain step 1 — flip the Home's discoverability: refused.
+        let response = call(
+            session.clone(),
+            format!("/groups/{home_id}/policy"),
+            flip_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session must not flip the Home policy: {body}"
+        );
+
+        // Chain step 2 — even with the policy ALREADY non-Home (flipped
+        // by the durable owner), the rename PATCH stays gated: the marker
+        // is Home metadata, not the policy shape.
+        let response = call(
+            "test-token".to_string(),
+            format!("/groups/{home_id}/policy"),
+            flip_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "durable may flip the Home policy: {body}"
+        );
+        let response = call(
+            session.clone(),
+            format!("/groups/{home_id}"),
+            rename_body.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session rename on a policy-flipped Home must STILL be refused: {body}"
+        );
+
+        // Chain step 3 — restoring the policy is the durable owner's act.
+        let restore = serde_json::json!({ "discoverability": "hidden" }).to_string();
+        let response = call(
+            session,
+            format!("/groups/{home_id}/policy"),
+            restore.clone(),
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session must not restore the Home policy either: {body}"
+        );
+        let response = call(
+            "test-token".to_string(),
+            format!("/groups/{home_id}"),
+            rename_body,
+        )
+        .await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(status, StatusCode::OK, "durable renames the Home: {body}");
+
+        // Rider arm: the policy PATCH is not rider-allowed at all.
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "cd".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let response = call(rider, format!("/groups/{home_id}/policy"), restore).await?;
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "rider must be denied on the policy PATCH: {body}"
+        );
+        Ok(())
+    }
+
+    /// WHY (issue #446, review round 4): the central Home-mutation fence
+    /// (`home_mutation_requires_durable`) covers EVERY mutating group
+    /// route. This matrix drives each through the REAL auth middleware:
+    /// session → typed 403, rider → 403, durable → past the gate (the
+    /// exact past-gate outcome is body/state dependent; ≠403 proves the
+    /// fence passed). Benign bodies keep the durable arms non-destructive
+    /// except withdraw, which runs last.
+    #[tokio::test]
+    async fn home_all_mutation_routes_three_principal_matrix() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x47; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (home_id, _) = find_home(&state, &owner).await.expect("home");
+        let stranger = "ef".repeat(32);
+
+        let app = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::patch(super::super::named_groups::update_named_group),
+            )
+            .route(
+                "/groups/:id",
+                axum::routing::delete(super::super::named_groups::leave_group),
+            )
+            .route(
+                "/groups/:id/policy",
+                axum::routing::patch(super::super::named_groups::update_group_policy),
+            )
+            .route(
+                "/groups/:id/state/seal",
+                axum::routing::post(super::super::named_groups::seal_group_state),
+            )
+            .route(
+                "/groups/:id/invite",
+                axum::routing::post(super::super::named_groups::create_group_invite),
+            )
+            .route(
+                "/groups/:id/requests/:request_id/approve",
+                axum::routing::post(super::super::named_groups::approve_join_request),
+            )
+            .route(
+                "/groups/:id/requests/:request_id/reject",
+                axum::routing::post(super::super::named_groups::reject_join_request),
+            )
+            .route(
+                "/groups/:id/state/withdraw",
+                axum::routing::post(super::super::named_groups::withdraw_group_state),
+            )
+            .route(
+                "/groups/:id/members",
+                axum::routing::post(super::super::named_groups::add_named_group_member),
+            )
+            .route(
+                "/groups/:id/members/:agent_id",
+                axum::routing::delete(super::super::named_groups::remove_named_group_member),
+            )
+            .route(
+                "/groups/:id/members/:agent_id/role",
+                axum::routing::patch(super::super::named_groups::update_member_role),
+            )
+            .route(
+                "/groups/:id/ban/:agent_id",
+                axum::routing::post(super::super::named_groups::ban_group_member),
+            )
+            .route(
+                "/groups/:id/ban/:agent_id",
+                axum::routing::delete(super::super::named_groups::unban_group_member),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state));
+
+        let rider = {
+            let mut store = state.rider_tokens.lock().await;
+            let (token, _record) = store
+                .issue(
+                    "99".repeat(32),
+                    Vec::new(),
+                    None,
+                    60,
+                    String::new(),
+                    None,
+                    None,
+                    crate::server::rider_auth::unix_now_secs(),
+                )
+                .await?;
+            token
+        };
+        let session = state.sessions.issue(std::time::Instant::now());
+
+        // (label, method, path, body, durable_expects_200). The durable
+        // arm must prove AUTHORIZED pass: rename/policy really mutate
+        // (200); remove/ban/unban target a non-member stranger, so the
+        // durable arm passes fence+admin and lands in ordinary target
+        // resolution — asserted by "not the fence's typed error".
+        // add-member and role-change are handled separately after the
+        // certified add seats a REAL target (an absent stranger would
+        // 404 before the admin check, proving nothing).
+        let routes: &[(&str, &str, String, Option<serde_json::Value>, bool)] = &[
+            (
+                "PATCH /groups/:id (rename)",
+                "PATCH",
+                format!("/groups/{home_id}"),
+                Some(serde_json::json!({ "name": "X" })),
+                true,
+            ),
+            (
+                "PATCH /groups/:id/policy",
+                "PATCH",
+                format!("/groups/{home_id}/policy"),
+                Some(serde_json::json!({ "discoverability": "listed_to_contacts" })),
+                true,
+            ),
+            (
+                "DELETE /groups/:id/members/:agent_id",
+                "DELETE",
+                format!("/groups/{home_id}/members/{stranger}"),
+                None,
+                false,
+            ),
+            (
+                "POST /groups/:id/ban/:agent_id",
+                "POST",
+                format!("/groups/{home_id}/ban/{stranger}"),
+                None,
+                false,
+            ),
+            (
+                "DELETE /groups/:id/ban/:agent_id",
+                "DELETE",
+                format!("/groups/{home_id}/ban/{stranger}"),
+                None,
+                false,
+            ),
+        ];
+        for (label, method, path, body, durable_200) in routes {
+            let send = |bearer: String, body: Option<serde_json::Value>| {
+                let app = app.clone();
+                let method: &'static str = match *method {
+                    "PATCH" => "PATCH",
+                    "POST" => "POST",
+                    _ => "DELETE",
+                };
+                let path = path.clone();
+                async move {
+                    let builder = Request::builder()
+                        .method(method)
+                        .uri(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json");
+                    let req = match body {
+                        Some(json) => builder.body(Body::from(json.to_string())),
+                        None => builder.body(Body::empty()),
+                    }
+                    .expect("request builds");
+                    app.oneshot(req).await
+                }
+            };
+            let response = send(session.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{label} session 403 must be typed: {out}"
+            );
+            let response = send(rider.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {out}");
+            let response = send("test-token".to_string(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            if *durable_200 {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{label} durable arm must be an authorized 200: {out}"
+                );
+            } else {
+                // Authorized past fence AND admin gate; the outcome is
+                // ordinary target resolution (stranger is not a member),
+                // never the fence's typed error.
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{label} durable must clear the fence: {out}"
+                );
+                assert!(
+                    !out["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "{label} durable outcome must not be the fence error: {out}"
+                );
+            }
+        }
+
+        // add-member: a REAL authorized add. The candidate is certified
+        // by this install's owner (cert announced into the discovery
+        // cache) and supplies a real TreeKEM key package — Home is
+        // MlsEncrypted/TreeKEM, so the direct-add path requires both.
+        // Session and rider are fenced; durable gets a real 200.
+        let user_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned fixture has a user key");
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+        let cert = crate::identity::AgentCertificate::issue(user_kp, &target_kp)?;
+        {
+            let cache = state.agent.identity_discovery_cache();
+            cache.write().await.insert(
+                target_id,
+                crate::DiscoveredAgent {
+                    agent_id: target_id,
+                    machine_id: crate::identity::MachineId([0u8; 32]),
+                    user_id: cert.user_id().ok(),
+                    self_name: None,
+                    addresses: Vec::new(),
+                    announced_at: 0,
+                    last_seen: 0,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    cert_not_after: cert.not_after(),
+                    agent_certificate: Some(cert),
+                    agent_public_key: Vec::new(),
+                    cert_digest: None,
+                },
+            );
+        }
+        let prepared = crate::mls::TreeKemMlsGroup::prepare_member(target_id, &[0x5e; 32])?;
+        let kp_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes())
+        };
+        let add_body = serde_json::json!({
+            "agent_id": target_hex,
+            "treekem_key_package_b64": kp_b64,
+        });
+        let add_json = |bearer: String| {
+            let app = app.clone();
+            let body = add_body.clone();
+            let path = format!("/groups/{home_id}/members");
+            async move {
+                app.oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request builds"),
+                )
+                .await
+            }
+        };
+        let response = add_json(session.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "add-member session: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable API token"),
+            "add-member session 403 must be the fence: {out}"
+        );
+        let response = add_json(rider.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "add-member rider: {out}");
+        let response = add_json("test-token".to_string()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "add-member durable arm must be an AUTHORIZED 200 (certified agent + key package): {out}"
+        );
+        assert_eq!(out["ok"], true);
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&home_id)
+                .is_some_and(|info| info.has_active_member(&target_hex)),
+            "the durable add must really have seated the certified member"
+        );
+
+        // role-change: the target is the PRESENT, certified member just
+        // seated — the handler resolves the target BEFORE the admin
+        // check, so an absent stranger would 404 without ever proving
+        // the admin authority. With a real target: session/rider are
+        // fenced, durable performs an authorized role change (200).
+        let role_json = |bearer: String| {
+            let app = app.clone();
+            let path = format!("/groups/{home_id}/members/{target_hex}/role");
+            async move {
+                app.oneshot(
+                    Request::patch(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(
+                            serde_json::json!({ "role": "admin" }).to_string(),
+                        ))
+                        .expect("request builds"),
+                )
+                .await
+            }
+        };
+        let response = role_json(session.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "role-change session: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable API token"),
+            "role-change session 403 must be the fence: {out}"
+        );
+        let response = role_json(rider.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "role-change rider: {out}");
+        let response = role_json("test-token".to_string()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "role-change durable arm must be an AUTHORIZED 200 on the seated member: {out}"
+        );
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&home_id)
+                .is_some_and(
+                    |info| info.caller_role(&target_hex) == Some(crate::groups::GroupRole::Admin)
+                ),
+            "the durable role change must really have taken effect"
+        );
+
+        // Review round 7: the four remaining Home-admin mutation routes.
+        // seal and invite perform real authorized mutations (200);
+        // approve/reject reference a nonexistent request, so the durable
+        // arm proves fence+authority passage by landing in ordinary
+        // request resolution — never the fence's typed error.
+        let round7: &[(&str, String, Option<serde_json::Value>, bool)] = &[
+            ("seal", format!("/groups/{home_id}/state/seal"), None, true),
+            ("invite", format!("/groups/{home_id}/invite"), None, true),
+            (
+                "approve",
+                format!("/groups/{home_id}/requests/{stranger}/approve"),
+                None,
+                false,
+            ),
+            (
+                "reject",
+                format!("/groups/{home_id}/requests/{stranger}/reject"),
+                None,
+                false,
+            ),
+        ];
+        for (label, path, body, durable_200) in round7 {
+            let send = |bearer: String, body: Option<serde_json::Value>| {
+                let app = app.clone();
+                let path = path.clone();
+                async move {
+                    let builder = Request::post(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json");
+                    let req = match body {
+                        Some(json) => builder.body(Body::from(json.to_string())),
+                        None => builder.body(Body::empty()),
+                    }
+                    .expect("request builds");
+                    app.oneshot(req).await
+                }
+            };
+            let response = send(session.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {out}");
+            assert!(
+                out["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{label} session 403 must be the fence: {out}"
+            );
+            let response = send(rider.clone(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {out}");
+            let response = send("test-token".to_string(), body.clone()).await?;
+            let (status, out) = response_json(response).await?;
+            if *durable_200 {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{label} durable arm must be an authorized 200: {out}"
+                );
+            } else {
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{label} durable must clear the fence: {out}"
+                );
+                assert!(
+                    !out["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "{label} durable outcome must not be the fence error: {out}"
+                );
+            }
+        }
+
+        // leave: its OWN live sole-member Home on a fresh state (after
+        // the certified add the main Home has a second member, so a
+        // self-leave there would be LastAdminBlocked — a 409, not an
+        // authorized pass). The durable arm proves a real SoleMemberDelete.
+        let dir_leave = tempfile::tempdir()?;
+        let state_l = owned_state(dir_leave.path(), [0x49; 32]).await?;
+        provision_home(&state_l).await;
+        let (home_l, _) = find_home(&state_l, &owner_of(&state_l))
+            .await
+            .expect("leave home");
+        let app_l = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::delete(super::super::named_groups::leave_group),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state_l),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state_l));
+        let response = app_l
+            .clone()
+            .oneshot(
+                Request::delete(format!("/groups/{home_l}"))
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            state_l.sessions.issue(std::time::Instant::now())
+                        ),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "leave session: {out}");
+        let response = app_l
+            .clone()
+            .oneshot(
+                Request::delete(format!("/groups/{home_l}"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "leave durable arm must be an authorized SoleMemberDelete of a LIVE Home: {out}"
+        );
+        assert_eq!(out["ok"], true);
+
+        // withdraw: its OWN live Home on a fresh state — the durable arm
+        // proves an authorized terminal withdrawal of a live group, not
+        // of the tombstone the leave above just created.
+        let dir2 = tempfile::tempdir()?;
+        let state2 = owned_state(dir2.path(), [0x48; 32]).await?;
+        provision_home(&state2).await;
+        let (home2, _) = find_home(&state2, &owner_of(&state2))
+            .await
+            .expect("home 2");
+        let app2 = axum::Router::new()
+            .route(
+                "/groups/:id/state/withdraw",
+                axum::routing::post(super::super::named_groups::withdraw_group_state),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state2),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state2));
+        let response = app2
+            .clone()
+            .oneshot(
+                Request::post(format!("/groups/{home2}/state/withdraw"))
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            state2.sessions.issue(std::time::Instant::now())
+                        ),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "withdraw session: {out}");
+        let response = app2
+            .clone()
+            .oneshot(
+                Request::post(format!("/groups/{home2}/state/withdraw"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "withdraw durable arm must be an authorized terminal withdrawal of a LIVE Home: {out}"
+        );
         Ok(())
     }
 

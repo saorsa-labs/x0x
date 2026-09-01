@@ -275,8 +275,22 @@ pub(in crate::server) struct EnrollData {
 /// is never reported on a swallowed write (review R2 finding 2).
 pub(in crate::server) async fn enroll_device(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<EnrollRequest>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Issue #446: enrolling a machine widens the Tier-1 owner device
+    // set — the enrollment is owner-key signed, but a 10-minute session
+    // bearer must not be able to widen (or, below, shrink) the device
+    // set. Checked FIRST so the 403 does not depend on sync being
+    // configured.
+    if !actor.is_durable_owner() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "device enrollment requires the durable API token (not a session token)",
+        );
+    }
     let Some(sync) = state.owner_sync.as_ref() else {
         return error_response(StatusCode::CONFLICT, "no owner identity configured");
     };
@@ -345,8 +359,19 @@ pub(in crate::server) struct UnenrollData {
 /// torn down mid-flight (per-accept gating, ADR-0022 posture).
 pub(in crate::server) async fn unenroll_device(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     axum::extract::Path(machine_hex): axum::extract::Path<String>,
 ) -> (StatusCode, Json<serde_json::Value>) {
+    // Issue #446: removing a real device is an availability act on the
+    // owner device set — durable token required, symmetric with enroll.
+    if !actor.is_durable_owner() {
+        return error_response(
+            StatusCode::FORBIDDEN,
+            "device removal requires the durable API token (not a session token)",
+        );
+    }
     let Some(sync) = state.owner_sync.as_ref() else {
         return error_response(StatusCode::CONFLICT, "no owner identity configured");
     };
@@ -460,7 +485,9 @@ mod tests {
     /// every stream accept).
     #[tokio::test]
     async fn sync_routes_wired() -> anyhow::Result<()> {
+        use crate::server::rider_auth::ActorContext;
         use tower::ServiceExt;
+        const OWNER: ActorContext = ActorContext::Owner { durable: true };
 
         // Ownerless: 409 on both routes.
         let _dir = tempfile::tempdir()?;
@@ -475,6 +502,7 @@ mod tests {
                 .oneshot(
                     axum::http::Request::post("/sync/devices/enroll")
                         .header("content-type", "application/json")
+                        .extension(OWNER)
                         .body(axum::body::Body::from("{}"))?,
                 )
                 .await?,
@@ -498,6 +526,7 @@ mod tests {
                 .oneshot(
                     axum::http::Request::post("/sync/devices/enroll")
                         .header("content-type", "application/json")
+                        .extension(OWNER)
                         .body(axum::body::Body::from("{}"))?,
                 )
                 .await?,
@@ -528,6 +557,7 @@ mod tests {
                 .oneshot(
                     axum::http::Request::post("/sync/devices/enroll")
                         .header("content-type", "application/json")
+                        .extension(OWNER)
                         .body(axum::body::Body::from(r#"{"ttl_secs":3600}"#))?,
                 )
                 .await?,
@@ -542,6 +572,7 @@ mod tests {
             app.clone()
                 .oneshot(
                     axum::http::Request::delete(format!("/sync/devices/{this_machine}"))
+                        .extension(OWNER)
                         .body(axum::body::Body::empty())?,
                 )
                 .await?,
@@ -563,6 +594,7 @@ mod tests {
         let (status, body) = response_json(
             app.oneshot(
                 axum::http::Request::delete(format!("/sync/devices/{this_machine}"))
+                    .extension(OWNER)
                     .body(axum::body::Body::empty())?,
             )
             .await?,
@@ -584,6 +616,7 @@ mod tests {
             app.oneshot(
                 axum::http::Request::post("/sync/devices/enroll")
                     .header("content-type", "application/json")
+                    .extension(OWNER)
                     .body(axum::body::Body::from(r#"{"machine_id":"zz"}"#))?,
             )
             .await?,

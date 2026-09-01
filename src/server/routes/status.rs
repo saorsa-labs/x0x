@@ -231,7 +231,21 @@ pub(in crate::server) async fn status(
 /// POST /shutdown — trigger graceful daemon shutdown.
 pub(in crate::server) async fn shutdown_handler(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> impl IntoResponse {
+    // Issue #446: daemon lifecycle is an owner act — a 10-minute
+    // browser session must not be able to kill the daemon (availability).
+    if !actor.is_durable_owner() {
+        return (
+            StatusCode::FORBIDDEN,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "shutdown requires the durable API token (not a session token)"
+            })),
+        );
+    }
     tracing::info!("Shutdown requested via API");
     let _ = state.shutdown_notify.send(true);
     let _ = state.shutdown_tx.send(()).await;

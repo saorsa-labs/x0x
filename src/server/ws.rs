@@ -198,8 +198,13 @@ const WS_SLOW_CONSUMER_CLOSE_REASON: &str = "slow consumer";
 pub(super) async fn ws_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, false, None))
+    ws.on_upgrade(move |socket| {
+        handle_ws_connection(socket, state, false, None, actor.is_durable_owner())
+    })
 }
 
 /// Query parameters for `GET /ws/direct` (ADR-0023 §7 backfill).
@@ -215,8 +220,19 @@ pub(super) async fn ws_direct_handler(
     ws: axum::extract::WebSocketUpgrade,
     State(state): State<Arc<AppState>>,
     axum::extract::Query(params): axum::extract::Query<DirectWsParams>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| handle_ws_connection(socket, state, true, params.backfill))
+    ws.on_upgrade(move |socket| {
+        handle_ws_connection(
+            socket,
+            state,
+            true,
+            params.backfill,
+            actor.is_durable_owner(),
+        )
+    })
 }
 
 /// GET /ws/sessions — list active WebSocket sessions.
@@ -406,6 +422,7 @@ async fn handle_ws_connection(
     state: Arc<AppState>,
     direct_mode: bool,
     direct_backfill: Option<usize>,
+    durable_owner: bool,
 ) {
     use axum::extract::ws::Message;
     use futures::StreamExt as FutStreamExt;
@@ -608,7 +625,7 @@ async fn handle_ws_connection(
                 };
                 match msg {
                     Message::Text(text) => {
-                        handle_ws_command(&state, &session_id, &text, &outbound_tx, &stats).await;
+                        handle_ws_command(&state, &session_id, &text, &outbound_tx, &stats, durable_owner).await;
                     }
                     Message::Close(_) => break,
                     _ => {}
@@ -681,6 +698,7 @@ async fn handle_ws_command(
     text: &str,
     tx: &mpsc::Sender<WsOutbound>,
     stats: &WsOutboundStats,
+    durable_owner: bool,
 ) {
     let cmd: WsInbound = match serde_json::from_str(text) {
         Ok(c) => c,
@@ -989,6 +1007,23 @@ async fn handle_ws_command(
                 }
             };
 
+            // Issue #446 (review round 2): reserved exec frames must not
+            // be craftable over a session-authenticated WS connection —
+            // same egress fence as REST /direct/send. The connection's
+            // actor class was resolved once at upgrade.
+            if bytes.starts_with(crate::exec::EXEC_DM_PREFIX) && !durable_owner {
+                feed_droppable(
+                    tx,
+                    WsOutbound::Error {
+                        message:
+                            "reserved exec payloads via send_direct require the durable API token"
+                                .to_string(),
+                    },
+                    stats,
+                );
+                return;
+            }
+
             if let Err(e) = state
                 .agent
                 .send_direct_with_config(&aid, bytes, direct_message_send_config())
@@ -1107,6 +1142,157 @@ mod tests {
     }
 
     // ========================================================================
+    // Issue #446 (review round 2) — reserved exec frames over WS send_direct.
+    // ========================================================================
+
+    #[tokio::test]
+    async fn ws_send_direct_exec_prefix_requires_durable_owner() {
+        use base64::Engine as _;
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state()
+                .await
+                .expect("test state");
+        let mut exec_payload = crate::exec::EXEC_DM_PREFIX.to_vec();
+        exec_payload.extend_from_slice(b"bincode-frame");
+        let cmd = serde_json::json!({
+            "type": "send_direct",
+            "agent_id": hex::encode([0xab; 32]),
+            "payload": base64::engine::general_purpose::STANDARD.encode(exec_payload),
+        })
+        .to_string();
+
+        // Session-authenticated connection (durable_owner = false): the
+        // reserved exec payload is refused with the typed error.
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s1", &cmd, &tx, &stats, false).await;
+        let refused = rx.recv().await.expect("error frame");
+        match refused {
+            WsOutbound::Error { message } => {
+                assert!(
+                    message.contains("durable API token"),
+                    "typed refusal naming the durable requirement, got: {message}"
+                );
+            }
+            other => panic!("expected error frame, got {other:?}"),
+        }
+
+        // Durable-owner connection: no refusal frame — the payload
+        // proceeds to the (routeless) send, which fails with the generic
+        // send error instead.
+        let (tx, mut rx) = mpsc::channel::<WsOutbound>(8);
+        let stats = WsOutboundStats::default();
+        handle_ws_command(&state, "s2", &cmd, &tx, &stats, true).await;
+        let outcome = rx.recv().await.expect("outcome frame");
+        match outcome {
+            WsOutbound::Error { message } => {
+                assert_eq!(
+                    message, "send failed",
+                    "past the gate, ordinary send failure"
+                );
+            }
+            other => panic!("expected send-failure frame, got {other:?}"),
+        }
+    }
+
+    /// Review round 3 (verdict item 4): WebSocket actor PROPAGATION
+    /// through the real auth middleware. The probe mirrors exactly what
+    /// `ws_handler`/`ws_direct_handler` extract at upgrade
+    /// (`Extension<ActorContext>`); asserting its value per token class
+    /// proves the flag `handle_ws_connection` receives — combined with
+    /// `ws_send_direct_exec_prefix_requires_durable_owner` (the gate
+    /// honoring that flag), a session-authenticated WS connection cannot
+    /// craft reserved exec frames. A full socket-level handshake needs a
+    /// live listener (hyper upgrade) and is covered by the daemon-level
+    /// `tests/ws_integration.rs` suite.
+    #[tokio::test]
+    async fn ws_route_actor_propagation_through_real_middleware() -> anyhow::Result<()> {
+        use axum::extract::Extension;
+        use axum::response::IntoResponse;
+        use tower::ServiceExt;
+
+        async fn probe(
+            Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+        ) -> impl IntoResponse {
+            axum::Json(serde_json::json!({ "durable": actor.is_durable_owner() }))
+        }
+
+        let (state, _dir) =
+            crate::server::routes::named_groups::tests::secure_endpoint_test_state().await?;
+        let app = axum::Router::new()
+            .route("/ws", axum::routing::get(probe))
+            .layer(axum::middleware::from_fn_with_state(
+                std::sync::Arc::clone(&state),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(std::sync::Arc::clone(&state));
+
+        let read = |uri: String, auth: Option<String>| {
+            let app = app.clone();
+            async move {
+                let mut builder = axum::http::Request::get(uri);
+                if let Some(token) = auth {
+                    builder = builder.header("authorization", format!("Bearer {token}"));
+                }
+                let resp = app
+                    .oneshot(builder.body(axum::body::Body::empty())?)
+                    .await?;
+                let status = resp.status();
+                let bytes = axum::body::to_bytes(resp.into_body(), 1 << 16).await?;
+                Ok::<_, anyhow::Error>((
+                    status,
+                    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap_or_default(),
+                ))
+            }
+        };
+
+        // Browser path: session token via ?token= → durable=false.
+        let session = state.sessions.issue(std::time::Instant::now());
+        let (status, body) = read(format!("/ws?token={session}"), None).await?;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body["durable"], false,
+            "a session-authenticated WS connection must resolve durable=false"
+        );
+
+        // Durable header → durable=true.
+        let (status, body) = read("/ws".to_string(), Some("test-token".to_string())).await?;
+        assert_eq!(status, axum::http::StatusCode::OK, "{body}");
+        assert_eq!(
+            body["durable"], true,
+            "durable bearer must resolve durable=true"
+        );
+
+        // Rider token → 403 at the middleware (GET /ws is not in the
+        // ADR-0039 rider route set) — the third principal for the WS path.
+        let mut store = state.rider_tokens.lock().await;
+        let (rider, _record) = store
+            .issue(
+                "77".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await?;
+        drop(store);
+        let (status, _body) = read("/ws".to_string(), Some(rider)).await?;
+        assert_eq!(
+            status,
+            axum::http::StatusCode::FORBIDDEN,
+            "a rider token must be denied on /ws"
+        );
+
+        // No credential → 401 before the handler.
+        let (status, _body) = read("/ws".to_string(), None).await?;
+        assert_eq!(status, axum::http::StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    // ========================================================================
     // Issue #120 — WS `direct_message` observed-origin serialization.
     // ========================================================================
 
@@ -1121,6 +1307,10 @@ mod tests {
             observed_origin,
         }
     }
+
+    // ========================================================================
+    // Issue #120 — WS `direct_message` observed-origin serialization.
+    // ========================================================================
 
     #[test]
     fn ws_direct_message_frame_is_byte_identical_without_origin() {

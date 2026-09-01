@@ -277,6 +277,9 @@ pub(in crate::server) async fn introduction(
 /// POST /announce — accepts optional JSON body (empty body defaults to no user identity).
 pub(in crate::server) async fn announce_identity(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
@@ -284,6 +287,18 @@ pub(in crate::server) async fn announce_identity(
         Ok(r) => r,
         Err(resp) => return resp.into_response(),
     };
+    // Issue #446: binding the HUMAN user identity into the public
+    // announce is an owner act — the binding propagates through the
+    // network and cannot be retracted by expiring the token that
+    // minted it. A session bearer may still announce the agent alone
+    // (`include_user_identity` unset/false).
+    if req.include_user_identity && !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "announcing the human user identity requires the durable API token (owner act)",
+        )
+        .into_response();
+    }
     match state
         .agent
         .announce_identity(req.include_user_identity, req.human_consent)
@@ -869,8 +884,22 @@ const AGENT_SIGN_SCHEME_ID: &str = crate::api::agent_signing::SCHEME_ID;
 /// the signed record.
 pub(in crate::server) async fn agent_sign(
     State(state): State<Arc<AppState>>,
+    axum::extract::Extension(actor): axum::extract::Extension<
+        crate::server::rider_auth::ActorContext,
+    >,
     Json(req): Json<AgentSignRequest>,
 ) -> impl IntoResponse {
+    // Issue #446: signing mints PERMANENT detached ML-DSA-65 signatures
+    // that outlive any token by design — the owner.rs rationale ("a
+    // 10-minute session bearer must not mint 90-day credentials")
+    // applies verbatim. Riders never reach this handler (ADR-0039
+    // deny-by-default); session bearers are fenced here.
+    if !actor.is_durable_owner() {
+        return api_error(
+            StatusCode::FORBIDDEN,
+            "agent signing requires the durable API token (detached signatures outlive any session token)",
+        );
+    }
     let payload = match BASE64.decode(&req.payload_b64) {
         Ok(bytes) => bytes,
         Err(e) => {
@@ -1318,4 +1347,709 @@ pub(in crate::server) async fn identity_revocations(
         StatusCode::OK,
         Json(serde_json::json!({ "revocations": items })),
     )
+}
+
+#[cfg(test)]
+mod owner_act_tests {
+    //! Issue #446: the owner-act matrix, end-to-end through the REAL
+    //! `auth_middleware` and the REAL handlers on a mini-router — no
+    //! test-only shims. Every surface listed here must:
+    //!
+    //! - 403 a browser SESSION bearer (typed error naming the durable
+    //!   requirement),
+    //! - 403 a rider token (ADR-0039 deny-by-default middleware),
+    //! - admit the DURABLE token past the gate (the asserted non-403
+    //!   outcome is whatever the handler does next with the given body).
+    //!
+    //! `owner_act_matrix_universal` below asserts all three arms for
+    //! every static gated surface in ONE test. Target-conditional
+    //! surfaces (`PATCH /groups/:id` and `PATCH /groups/:id/policy` on a
+    //! Home-metadata group) are pinned in `routes::home::tests`.
+    use super::*;
+    use crate::server::rider_auth::ActorContext;
+    use axum::body::to_bytes;
+    use axum::http::Request;
+    use axum::routing::{delete, post};
+    use tower::ServiceExt;
+
+    /// The fixture's durable API token (`secure_endpoint_test_state_at`
+    /// hard-codes `"test-token"`).
+    const DURABLE: &str = "test-token";
+
+    async fn matrix_state() -> anyhow::Result<(Arc<AppState>, tempfile::TempDir)> {
+        let dir = tempfile::tempdir()?;
+        let state = crate::server::routes::home::tests::owned_state(dir.path(), [0x42; 32]).await?;
+        Ok((state, dir))
+    }
+
+    fn matrix_router(state: Arc<AppState>) -> axum::Router {
+        use crate::server::auth::auth_middleware;
+        use crate::server::delegations::delegate_group_authority;
+        use crate::server::routes::direct::direct_send;
+        use crate::server::routes::exec::{exec_cancel, exec_run};
+        use crate::server::routes::home::rename_home;
+        use crate::server::routes::status::shutdown_handler;
+        use crate::server::routes::sync::{enroll_device, unenroll_device};
+        use crate::server::routes::upgrade::apply_upgrade;
+        axum::Router::new()
+            .route("/agent/sign", post(agent_sign))
+            .route("/announce", post(announce_identity))
+            .route("/exec/run", post(exec_run))
+            .route("/exec/cancel", post(exec_cancel))
+            .route("/shutdown", post(shutdown_handler))
+            .route("/sync/devices/enroll", post(enroll_device))
+            .route("/sync/devices/:machine_id", delete(unenroll_device))
+            .route("/groups/:id/delegate", post(delegate_group_authority))
+            .route("/home/rename", post(rename_home))
+            .route("/upgrade/apply", post(apply_upgrade))
+            .route("/direct/send", post(direct_send))
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state),
+                auth_middleware,
+            ))
+            .with_state(state)
+    }
+
+    async fn call(
+        app: &axum::Router,
+        method: &str,
+        path: &str,
+        bearer: &str,
+        body: serde_json::Value,
+    ) -> (axum::http::StatusCode, serde_json::Value) {
+        let req = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("authorization", format!("Bearer {bearer}"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body.to_string()))
+            .expect("request builds");
+        let resp = app.clone().oneshot(req).await.expect("router answers");
+        let status = resp.status();
+        let bytes = to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .expect("body reads");
+        let json = serde_json::from_slice(&bytes).unwrap_or_default();
+        (status, json)
+    }
+
+    async fn session_token(state: &AppState) -> String {
+        state.sessions.issue(std::time::Instant::now())
+    }
+
+    async fn rider_token(state: &AppState) -> String {
+        let mut store = state.rider_tokens.lock().await;
+        let (token, _record) = store
+            .issue(
+                "aa".repeat(32),
+                Vec::new(),
+                None,
+                60,
+                String::new(),
+                None,
+                None,
+                crate::server::rider_auth::unix_now_secs(),
+            )
+            .await
+            .expect("rider token issues");
+        token
+    }
+
+    fn assert_durable_403(json: &serde_json::Value) {
+        let err = json["error"].as_str().unwrap_or_default();
+        assert!(
+            err.contains("durable API token"),
+            "typed 403 must name the durable requirement, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_agent_sign() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let body = serde_json::json!({
+            "context": "example.test",
+            "payload_b64": BASE64.encode(b"matrix payload"),
+        });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/agent/sign",
+            &session_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/agent/sign",
+            &rider_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        assert!(json["error"].as_str().unwrap_or_default().contains("rider"));
+
+        let (status, json) = call(&app, "POST", "/agent/sign", DURABLE, body).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer: {json}");
+        assert_eq!(json["ok"], true);
+        assert!(json["signature_b64"]
+            .as_str()
+            .is_some_and(|s| !s.is_empty()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_exec() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        // Empty argv: the handler's own validation must be REACHED by the
+        // durable bearer (400) but never by the session bearer (403 fires
+        // first — the gate precedes validation).
+        let run_body = serde_json::json!({ "agent_id": "ab".repeat(32), "argv": [] });
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/exec/run",
+            &session_token(&state).await,
+            run_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/exec/run",
+            &rider_token(&state).await,
+            run_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "POST", "/exec/run", DURABLE, run_body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "durable reaches validation: {json}"
+        );
+
+        let cancel_body = serde_json::json!({ "request_id": "not-hex" });
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/exec/cancel",
+            &session_token(&state).await,
+            cancel_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/exec/cancel",
+            &rider_token(&state).await,
+            cancel_body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "POST", "/exec/cancel", DURABLE, cancel_body).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "durable reaches validation: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_shutdown() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let empty = serde_json::json!({});
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/shutdown",
+            &session_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/shutdown",
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        let (status, json) = call(&app, "POST", "/shutdown", DURABLE, empty).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer: {json}");
+        assert_eq!(json["ok"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_sync_devices() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let empty = serde_json::json!({});
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/sync/devices/enroll",
+            &session_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/sync/devices/enroll",
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        // Durable: a true end-to-end enrollment of THIS machine.
+        let (status, json) =
+            call(&app, "POST", "/sync/devices/enroll", DURABLE, empty.clone()).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer: {json}");
+        assert_eq!(json["ok"], true);
+        let machine = json["machine_id"].as_str().expect("machine_id").to_string();
+
+        let path = format!("/sync/devices/{machine}");
+        let (status, json) = call(
+            &app,
+            "DELETE",
+            &path,
+            &session_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "DELETE",
+            &path,
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "DELETE", &path, DURABLE, empty).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer: {json}");
+        assert_eq!(json["ok"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_delegate() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        // Well-formed body so ONLY the gate can produce the 403; the
+        // durable arm reaches the group lookup (404 — no such group).
+        let body = serde_json::json!({
+            "to_agent": "cd".repeat(32),
+            "scope": "send_as",
+            "expiry_ms": 1735689600000_u64,
+        });
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/groups/some-group/delegate",
+            &session_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/groups/some-group/delegate",
+            &rider_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "POST", "/groups/some-group/delegate", DURABLE, body).await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "durable reaches group lookup: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_announce_user_identity() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let with_identity =
+            serde_json::json!({ "include_user_identity": true, "human_consent": true });
+        let without_identity = serde_json::json!({ "include_user_identity": false });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &session_token(&state).await,
+            with_identity.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &rider_token(&state).await,
+            with_identity.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+
+        // Durable passes the gate; the fixture agent has no gossip
+        // runtime, so the handler's own error (400) is the proof the
+        // gate was cleared — a 200 needs a networked daemon, which the
+        // ignored daemon_api suite covers with the durable token.
+        let (status, json) = call(&app, "POST", "/announce", DURABLE, with_identity).await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "durable clears the gate: {json}"
+        );
+
+        // The gate is body-conditional: announcing the agent ALONE
+        // stays session-allowed (unchanged behavior, not a 403).
+        let (status, _json) = call(
+            &app,
+            "POST",
+            "/announce",
+            &session_token(&state).await,
+            without_identity,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::BAD_REQUEST,
+            "plain announce stays session-allowed (400 = gossip runtime absent, NOT 403)"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_home_rename() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        crate::server::routes::home::provision_home(&state).await;
+        let app = matrix_router(Arc::clone(&state));
+        let body = serde_json::json!({ "name": "Round 2 Home" });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/home/rename",
+            &session_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/home/rename",
+            &rider_token(&state).await,
+            body.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        let (status, json) = call(&app, "POST", "/home/rename", DURABLE, body).await;
+        assert_eq!(status, StatusCode::OK, "durable bearer renames: {json}");
+        assert_eq!(json["ok"], true);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_upgrade_apply() -> anyhow::Result<()> {
+        // Verdict item 3: /upgrade/apply swaps the binary and drives the
+        // SAME shutdown channels as /shutdown — it must not be reachable
+        // with a session token. Gated at the ROUTE layer (auth.rs
+        // classification) so the upgrade handler itself is untouched
+        // (sibling session HS-F4 owns the rollback work).
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let empty = serde_json::json!({});
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/upgrade/apply",
+            &session_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "session bearer: {json}");
+        assert_durable_403(&json);
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/upgrade/apply",
+            &rider_token(&state).await,
+            empty.clone(),
+        )
+        .await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "rider token: {json}");
+        // Durable clears the route gate; the fixture has self-update
+        // disabled, so the handler reports its own (non-403) outcome —
+        // the point is that the lifecycle gate was passed only with
+        // the durable token.
+        let (status, json) = call(&app, "POST", "/upgrade/apply", DURABLE, empty).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "durable clears the route gate: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_direct_send_exec_prefix() -> anyhow::Result<()> {
+        // Verdict item 1: reserved exec frames ride DMs behind
+        // `x0x-exec-v1\0`; the receiver routes them into the exec
+        // service. Crafting that prefix through the generic /direct/send
+        // egress must require the durable owner, while ordinary DM
+        // payloads stay session-allowed.
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        let exec_payload = {
+            let mut bytes = x0x::exec::EXEC_DM_PREFIX.to_vec();
+            bytes.extend_from_slice(b"bincode-frame-bytes");
+            serde_json::json!({
+                "agent_id": "ab".repeat(32),
+                "payload": BASE64.encode(bytes),
+            })
+        };
+        let plain_payload = serde_json::json!({
+            "agent_id": "ab".repeat(32),
+            "payload": BASE64.encode(b"an ordinary dm"),
+        });
+
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/direct/send",
+            &session_token(&state).await,
+            exec_payload.clone(),
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::FORBIDDEN,
+            "session bearer must not craft exec frames: {json}"
+        );
+        assert!(json["error"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("durable"));
+
+        // The same session bearer may still send an ordinary DM (the
+        // fixture agent has no route to the peer, so the handler
+        // reports a send failure — anything but 403).
+        let (status, json) = call(
+            &app,
+            "POST",
+            "/direct/send",
+            &session_token(&state).await,
+            plain_payload.clone(),
+        )
+        .await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "ordinary DM payloads stay session-allowed: {json}"
+        );
+
+        // Durable may carry the reserved prefix (its /exec/* authority
+        // subsumes the transport); with no route the send fails past
+        // the gate.
+        let (status, json) = call(&app, "POST", "/direct/send", DURABLE, exec_payload).await;
+        assert_ne!(
+            status,
+            StatusCode::FORBIDDEN,
+            "durable clears the exec-prefix egress gate: {json}"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn owner_act_matrix_session_403_precedes_body_extraction() -> anyhow::Result<()> {
+        // Verdict item 4: the typed 403 must be universal for the routed
+        // surfaces — the route-layer gate fires BEFORE axum's Json
+        // extractor, so even a MALFORMED body cannot surface an
+        // extraction error in front of the authorization decision.
+        let (state, _dir) = matrix_state().await?;
+        let app = matrix_router(Arc::clone(&state));
+        for path in [
+            "/agent/sign",
+            "/exec/run",
+            "/exec/cancel",
+            "/home/rename",
+            "/upgrade/apply",
+            "/groups/x/delegate",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(
+                    "authorization",
+                    format!("Bearer {}", session_token(&state).await),
+                )
+                .header("content-type", "application/json")
+                .body(axum::body::Body::from("this is {{{ not json"))
+                .expect("request builds");
+            let resp = app.clone().oneshot(req).await.expect("router answers");
+            assert_eq!(
+                resp.status(),
+                StatusCode::FORBIDDEN,
+                "{path} with a session bearer and a malformed body must be 403 pre-extractor"
+            );
+        }
+        Ok(())
+    }
+
+    /// Review round 3 (verdict item 4): the universal typed-403 proof in
+    /// ONE matrix test — every static gated surface through the REAL
+    /// `auth_middleware` + real handler: session → typed 403, rider →
+    /// 403, durable → past the gate. This is the production decision
+    /// path itself; the auth.rs matrix pins the pure route table.
+    #[tokio::test]
+    async fn owner_act_matrix_universal() -> anyhow::Result<()> {
+        let (state, _dir) = matrix_state().await?;
+        crate::server::routes::home::provision_home(&state).await;
+        let app = matrix_router(Arc::clone(&state));
+        let exec_payload = {
+            let mut bytes = x0x::exec::EXEC_DM_PREFIX.to_vec();
+            bytes.extend_from_slice(b"bincode");
+            serde_json::json!({
+                "agent_id": "ab".repeat(32),
+                "payload": BASE64.encode(bytes),
+            })
+        };
+        // (method, path, body). The durable arm asserts ≠403 — the exact
+        // past-gate outcome is pinned per surface in the tests above.
+        let surfaces: &[(&str, &str, serde_json::Value)] = &[
+            (
+                "POST",
+                "/agent/sign",
+                serde_json::json!({
+                    "context": "example.test",
+                    "payload_b64": BASE64.encode(b"universal"),
+                }),
+            ),
+            (
+                "POST",
+                "/exec/run",
+                serde_json::json!({
+                    "agent_id": "ab".repeat(32), "argv": []
+                }),
+            ),
+            (
+                "POST",
+                "/exec/cancel",
+                serde_json::json!({ "request_id": "not-hex" }),
+            ),
+            ("POST", "/shutdown", serde_json::json!({})),
+            ("POST", "/upgrade/apply", serde_json::json!({})),
+            ("POST", "/sync/devices/enroll", serde_json::json!({})),
+            (
+                "DELETE",
+                &format!("/sync/devices/{}", "00".repeat(32)),
+                serde_json::json!({}),
+            ),
+            (
+                "POST",
+                "/groups/some-group/delegate",
+                serde_json::json!({
+                    "to_agent": "cd".repeat(32),
+                    "scope": "send_as",
+                    "expiry_ms": 1735689600000_u64,
+                }),
+            ),
+            (
+                "POST",
+                "/home/rename",
+                serde_json::json!({ "name": "Universal" }),
+            ),
+            ("POST", "/direct/send", exec_payload),
+        ];
+        for (method, path, body) in surfaces {
+            let (status, json) = call(
+                &app,
+                method,
+                path,
+                &session_token(&state).await,
+                body.clone(),
+            )
+            .await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} session: {json}"
+            );
+            assert!(
+                json["error"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("durable API token"),
+                "{method} {path} session 403 must name the durable requirement: {json}"
+            );
+
+            let (status, json) =
+                call(&app, method, path, &rider_token(&state).await, body.clone()).await;
+            assert_eq!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} rider: {json}"
+            );
+
+            let (status, json) = call(&app, method, path, DURABLE, body.clone()).await;
+            assert_ne!(
+                status,
+                StatusCode::FORBIDDEN,
+                "{method} {path} durable must clear the gate: {json}"
+            );
+        }
+        Ok(())
+    }
+
+    /// Belt-and-braces: the resolved actor for the durable token is
+    /// `Owner { durable: true }` and for a session bearer
+    /// `Owner { durable: false }` — the exact predicate the gates use.
+    #[test]
+    fn actor_context_durability_predicate() {
+        assert!(ActorContext::Owner { durable: true }.is_durable_owner());
+        assert!(!ActorContext::Owner { durable: false }.is_durable_owner());
+        assert!(!ActorContext::Rider {
+            sub_agent_id: String::new(),
+            token_id: 1,
+            token_hash: String::new(),
+            groups: Vec::new(),
+        }
+        .is_durable_owner());
+    }
 }

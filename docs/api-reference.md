@@ -52,22 +52,39 @@ Auth-class labels used throughout this reference:
 - **bearer** — the durable API token or a session token in the
   `Authorization` header (the default for ordinary surfaces).
 - **durable-owner** — requires the durable API token; a session token or
-  rider token answers `403`. Applies to the whole owner registry and ledger:
-  `POST /owner/agents/issue`, `DELETE /owner/agents/:id`, `POST /owner/riders`,
-  `GET /owner/riders`, `DELETE /owner/riders/:id`, `/owner/placement`,
-  `/owner/agents/:id/placement`, the `/agent/move*` ceremony, and the
-  ADR-0043 binding form of `/identity/revoke`. (`GET /owner/agents` is
-  bearer — a read-only roster view.)
+  rider token answers a typed `403`. Enforced at the ROUTE layer
+  (`requires_durable_owner` in `src/server/auth.rs`, before any body
+  extraction) plus handler-side defense-in-depth. Applies to the whole
+  owner registry and ledger: `POST /owner/agents/issue`,
+  `DELETE /owner/agents/:id`, `POST /owner/riders`, `GET /owner/riders`,
+  `DELETE /owner/riders/:id`, `/owner/placement`,
+  `/owner/agents/:id/placement`, the `/agent/move*` ceremony, the
+  ADR-0043 binding form of `/identity/revoke`, and (since #446) the
+  owner-act surfaces `POST /agent/sign` (detached signatures outlive
+  any session token), `POST /exec/run`, `POST /exec/cancel`,
+  `POST /shutdown`, `POST /upgrade/apply` (binary swap + restart =
+  lifecycle act), `POST /sync/devices/enroll`,
+  `POST /groups/:id/delegate` (signed capability with caller-chosen
+  expiry), `POST /home/rename`, and `PATCH /groups/:id` /
+  `PATCH /groups/:id/policy` **when the target carries Home metadata**
+  (metadata presence is the marker — never the current policy axes, so
+  the Home cannot be policy-flipped around the rename gate).
+  Payload-conditional durable gates (body or prefix inspected, enforced
+  in the handler): `POST /announce` **with
+  `include_user_identity: true`**, and `POST /direct/send` / WS
+  `send_direct` carrying a reserved `x0x-exec-v1\0` exec frame.
 - **rider-allowed** — the three surfaces a rider token may reach (see the
   harness-boundary section below). Rider tokens authenticate in the
   `Authorization` header only.
 
-**Known limitation (#446, v0.41 pre-release):** several owner-act surfaces
-specified durable-only currently *accept* a session token — `/agent/sign`,
-`/exec/run|cancel`, `/shutdown`, `/sync/devices/enroll`, `DELETE /sync/devices/:id`,
-`POST /groups/:id/delegate`, `POST /home/rename`, and `POST /announce`. Until
-#446 lands, treat session tokens as being as sensitive as the durable token
-and use the durable token for owner actions.
+**#446 resolution notes:** `POST /announce` without
+`include_user_identity` and `PATCH /groups/:id` on ordinary
+ (non-Home) groups stay bearer — no credential or capability is
+involved. `DELETE /groups/:id` requires **active membership** for any
+group (self-leave is its purpose; a non-member cannot delete the local
+view of a foreign group). The GUI prompts for the durable token (kept
+in tab-scoped `sessionStorage`, never a URL) the first time an
+owner-act surface is used from a session.
 
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
@@ -426,7 +443,7 @@ agents).
 | Method | Endpoint | CLI | Auth | Purpose |
 |---|---|---|---|---|
 | GET | `/home` | `x0x home` | bearer | Resolve the owner's Home space |
-| POST | `/home/rename` | `x0x home rename <NAME>` | bearer | Rename the Home (admin-gated, sealed into the state chain) |
+| POST | `/home/rename` | `x0x home rename <NAME>` | durable-owner (#446) | Rename the Home (admin-gated, sealed into the state chain) |
 
 The first start of an owned install provisions exactly one Home:
 `Hidden + OwnerCertified(owner) + MlsEncrypted + MembersOnly/MembersOnly`,
@@ -467,7 +484,12 @@ uncertified holder of a valid invite is refused (`403`).
 
 **POST /home/rename** takes `{"name": "…"}`; it is a convenience wrapper over
 `PATCH /groups/:id` (admin-gated, sealed, persisted). Errors: `404` un-owned /
-no Home; `409` admin-gate failures.
+no Home; `409` admin-gate failures. Requires the **durable-owner** token
+(#446) — and `PATCH /groups/:id` **and** `PATCH /groups/:id/policy` require
+it too when the target carries Home metadata. Home is identified by metadata
+presence, NEVER by its current policy axes, so a session cannot
+policy-flip around the rename gate. Ordinary groups keep the bearer
+PATCH paths.
 
 **Known limitation (#449):** Home dedup is per-machine — each of the owner's
 devices provisions its own Home (observed live: two daemons sharing one
@@ -482,13 +504,11 @@ must locally delete + rejoin.
 | Method | Endpoint | CLI | Auth | Purpose |
 |---|---|---|---|---|
 | GET | `/sync/devices` | `x0x sync devices` | bearer | Owner device set + last-sync status |
-| POST | `/sync/devices/enroll` | `x0x sync enroll` | bearer (see #446) | Owner-key-sign a DeviceEnrollment for a machine |
-| DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | bearer (see #446) | Remove a machine from the device set |
+| POST | `/sync/devices/enroll` | `x0x sync enroll` | durable-owner (#446) | Owner-key-sign a DeviceEnrollment for a machine |
+| DELETE | `/sync/devices/:machine_id` | `x0x sync revoke <MACHINE_ID>` | durable-owner (#446) | Remove a machine from the device set |
 
 All three answer `409` when no owner identity is configured. Sync replicates
 owner state **owner-to-owner only** — Tier 1: profile/names, the Home
-roster pointer (stored for future adoption), and sub-agent issuance facts
-(ADR-0041; see "What Tier 1 actually applies today" below). Other groups'
 history, DMs, and exec data
 never replicate, and no third party receives the state. Inbound SyncV1 streams
 are refused at the enrollment gate unless the enrollment signature and

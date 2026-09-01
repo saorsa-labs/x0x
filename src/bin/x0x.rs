@@ -1814,11 +1814,15 @@ async fn run(
             // session token *before* constructing the URL, so the durable
             // secret never appears in the browser's address bar / history.
             client.ensure_running().await?;
-            let Some(durable) = client.api_token() else {
-                anyhow::bail!("API token not found; set X0X_API_TOKEN or restart x0xd");
-            };
             let session = client.post_empty("/auth/session").await?;
-            let token = session["session_token"].as_str().unwrap_or(durable);
+            // Review round 2 (verdict item 5): no durable-token fallback —
+            // a malformed exchange must fail closed, never put the
+            // long-lived secret into the browser's address bar/history.
+            let Some(token) = session["session_token"].as_str() else {
+                anyhow::bail!(
+                    "daemon did not return a session token for the GUI URL (response: {session})"
+                );
+            };
             let url = format!("{}/gui?token={token}", client.base_url());
             eprintln!("x0x GUI: {}/gui", client.base_url());
 

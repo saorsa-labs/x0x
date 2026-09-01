@@ -148,52 +148,59 @@ fn gui_api_calls() -> Vec<ApiCall> {
     let bytes = GUI_HTML.as_bytes();
     let mut out = Vec::new();
     let mut i = 0;
-    while i + 4 <= bytes.len() {
-        if &bytes[i..i + 4] == b"api(" {
-            let start = i + 4;
-            // Find the matching close paren, respecting strings and
-            // brace nesting.
-            let mut depth = 1usize;
-            let mut j = start;
-            let mut in_str: Option<u8> = None;
-            while j < bytes.len() && depth > 0 {
-                let c = bytes[j];
-                if let Some(q) = in_str {
-                    if c == b'\\' {
-                        j += 2;
-                        continue;
-                    }
-                    if c == q {
-                        in_str = None;
-                    }
-                } else {
-                    match c {
-                        b'\'' | b'"' | b'`' => in_str = Some(c),
-                        b'(' | b'{' | b'[' => depth += 1,
-                        b')' | b'}' | b']' => depth -= 1,
-                        _ => {}
-                    }
-                }
-                j += 1;
-            }
-            // `j` is now one past the closing `)`; arguments span [start, j-1].
-            let args_end = j.saturating_sub(1);
-            let args = &GUI_HTML[start..args_end];
-            // Split into first-arg expression + remainder by the
-            // first top-level comma.
-            let (expr, rest) = split_top_level_comma(args);
-            let expr = expr.trim().to_string();
-            let method = extract_method_kw(rest);
-            // Heuristic: only keep calls whose first arg looks like a
-            // path literal (starts with a quote followed by `/`).
-            let is_pathish = looks_like_path_arg(&expr);
-            if is_pathish {
-                out.push(ApiCall { expr, method });
-            }
-            i = j;
+    while i < bytes.len() {
+        // Issue #446: owner-act call sites go through `ownerApi(...)` —
+        // the same daemon base URL and path surface as `api(...)`, so it
+        // counts for parity. (`symApi(...)` targets the separate
+        // symphony daemon and deliberately does NOT match.)
+        let start = if bytes[i..].starts_with(b"ownerApi(") {
+            i + "ownerApi(".len()
+        } else if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"api(" {
+            i + 4
         } else {
             i += 1;
+            continue;
+        };
+        // Find the matching close paren, respecting strings and
+        // brace nesting.
+        let mut depth = 1usize;
+        let mut j = start;
+        let mut in_str: Option<u8> = None;
+        while j < bytes.len() && depth > 0 {
+            let c = bytes[j];
+            if let Some(q) = in_str {
+                if c == b'\\' {
+                    j += 2;
+                    continue;
+                }
+                if c == q {
+                    in_str = None;
+                }
+            } else {
+                match c {
+                    b'\'' | b'"' | b'`' => in_str = Some(c),
+                    b'(' | b'{' | b'[' => depth += 1,
+                    b')' | b'}' | b']' => depth -= 1,
+                    _ => {}
+                }
+            }
+            j += 1;
         }
+        // `j` is now one past the closing `)`; arguments span [start, j-1].
+        let args_end = j.saturating_sub(1);
+        let args = &GUI_HTML[start..args_end];
+        // Split into first-arg expression + remainder by the
+        // first top-level comma.
+        let (expr, rest) = split_top_level_comma(args);
+        let expr = expr.trim().to_string();
+        let method = extract_method_kw(rest);
+        // Heuristic: only keep calls whose first arg looks like a
+        // path literal (starts with a quote followed by `/`).
+        let is_pathish = looks_like_path_arg(&expr);
+        if is_pathish {
+            out.push(ApiCall { expr, method });
+        }
+        i = j;
     }
     out
 }
