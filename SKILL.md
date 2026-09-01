@@ -156,7 +156,7 @@ x0x subscribe hello-world && x0x publish hello-world "Hello!"
 # REST equivalent
 curl -X POST "http://$API/subscribe" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"topic":"hello-world"}'
 curl -X POST "http://$API/publish"   -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
-  -d '{"topic":"hello-world","payload":"'$(echo -n "Hello!" | base64)'"}'
+  -d '{"topic":"hello-world","payload":"'$(echo -n "Hello!" | base64 | tr -d '\n')'"}'   # tr -d '\n': BOTH GNU and BSD base64 wrap long output at 76 cols — unwrapped it breaks the JSON
 curl -N -H "Authorization: Bearer $TOKEN" "http://$API/events"     # SSE; fields nested under "data"
 ```
 
@@ -212,7 +212,7 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off (§5.2).
 
-**Second owner device joining the Home — current limitation (#447).** A certified second device's join currently succeeds only after the cert becomes visible in the Home owner's discovery cache, which happens on the *next announce ingest* (heartbeats every 600 s). Workaround: on the new device, run `POST /announce` **twice, ~10 s apart, BEFORE attempting the join**. A premature join wedges the joiner (it reports `already_joined: true` forever; recovery = delete the local group state and rejoin). Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+**Second owner device joining the Home — current limitation (#447).** A certified second device's join currently succeeds only after the cert becomes visible in the Home owner's discovery cache, which happens on the *next announce ingest* (heartbeats every 600 s). Workaround: on the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` **twice, ~10 s apart, BEFORE attempting the join** — a bodyless announce publishes the ANONYMOUS cert digest, so the owner can never resolve the joiner's certificate and the join cannot succeed. A premature join wedges the joiner (it reports `already_joined: true` forever; recovery = remove the joiner's LOCAL group state — the `named_groups.json` entry itself, not just a `local_only` leave — and rejoin). Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
 
 **Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
 
@@ -233,11 +233,13 @@ curl -X POST "http://$API/owner/agents/issue" -H "Authorization: Bearer $TOKEN" 
 # -> {agent_id, certificate:{storage_b64,...}}   (certificate returned for ACP-attached instances)
 ```
 
-**Mint a rider token** — REST ONLY (the `x0x owner riders issue` CLI cannot mint: it omits the required `delegation` capability, so the daemon rejects it with 400; CLI is list/revoke only):
+**Mint a rider token** — REST or CLI. Both carry the harness-signed delegation capability (minting without it answers `400 delegation is required…`):
 
 ```bash
 # harness signs rider_delegation_bytes(sub_agent_id, daemon_agent_id, groups, not_after) with the sub key
-# (helper: x0x::groups::sign_rider_delegation in the Rust crate), then the owner mints:
+# (helper: x0x::groups::sign_rider_delegation in the Rust crate), then the owner mints —
+x0x owner riders issue <AGENT_ID> --group <gid> --group <home_gid> \
+    --delegation-payload-b64 <base64> --delegation-signature <hex>   # both flags required (clap-enforced)
 curl -X POST "http://$API/owner/riders" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"sub_agent_id":"<64-hex>","groups":["<gid>","<home_gid>"],"ttl_secs":604800,
        "delegation":{"payload_b64":"<base64>","signature":"<hex>"}}'
@@ -301,9 +303,12 @@ x0x trust evaluate <agent_id> <machine_id>     # POST /trust/evaluate — would 
 x0x direct send <agent_id> "hello"       # POST /direct/send {"agent_id","payload":<base64>}
 x0x direct events                        # GET /direct/events — SSE, flat frames
 x0x direct connections                   # GET /direct/connections
+# Reading ALREADY-DELIVERED DMs — both streams accept ?backfill=N (ADR-0023 §7):
+curl -N -H "Authorization: Bearer $TOKEN" "http://$API/direct/events?backfill=50"   # SSE: history rows, then a `live` marker, then live frames
+# (or the WS flavor: /ws/direct?backfill=50 — replays stored dm: rows before the live stream)
 ```
 
-DMs default to **durable application-ACK semantics** (ADR-0030): `ok: true` means the recipient's daemon durably committed the message; a typed refusal is never a black hole. Opt OUT explicitly with `"require_durable_app_ack": false` (v1 "accepted for delivery" semantics — for peers that have not upgraded). Do not confuse it with `"require_ack_ms"` — that only asks for a post-send peer-liveness probe. The response reports the path (`direct`/`loopback`/…), request_id, and retry counters.
+DMs default to **durable application-ACK semantics** (ADR-0030): `ok: true` means the recipient's daemon durably committed the message; a typed refusal is never a black hole. Opt OUT explicitly with `"require_durable_app_ack": false` (v1 "accepted for delivery" semantics — for peers that have not upgraded). Do not confuse it with `"require_ack_ms"` — that only asks for a post-send peer-liveness probe. The response reports the path (`loopback`/`gossip_inbox`/`raw_quic`/`raw_quic_acked`/`relayed`), request_id, and retry counters. Caveat: `path` names the send *strategy*, not the physical transport of the receipt — a durable send reports `gossip_inbox` even when the ACK was hedged home over the direct/raw-QUIC path, and the same label feeds `/diagnostics/dm` (per-peer `preferred_path` and the aggregate `outgoing_path_*` counters). Aggregate hedge-ACTIVITY counters exist (`ack_direct_hedge_*`), but no surface reports which transport actually carried an individual durable ACK (#461).
 
 > **Mixed-fleet caveat #448:** a v0.40.4 (old) peer cannot verify a new peer's capability advert (`digest_support`), so a strict (durable-ack) DM to such a peer returns **409 `recipient_ack_semantics_unavailable`** — there is **no automatic fallback**. Your options: retry later, upgrade the peer, or explicitly resend with `"require_durable_app_ack": false` (v1 best-effort; delivery then works). See also #450 (agent cards, §2.1). Both self-heal when the fleet upgrades.
 
@@ -338,13 +343,13 @@ curl -X POST "http://$API/groups/<gid>/send" -H "Authorization: Bearer $TOKEN" -
 curl "http://$API/groups/<gid>/messages" -H "Authorization: Bearer $TOKEN"
 ```
 
-`mentions` is a **daemon-side structured field** (ADR-0040) — hex AgentIds inside the signed bytes, not GUI string-matching (REST only; the CLI `group send` has no mentions flag). Threads (ADR-0029): `thread_root` = msg_id of the thread's first message; `thread_parent` = the direct parent you are replying to (requires `thread_root`). CLI: `x0x group send <gid> "body" --thread-root <id> --reply-to <id>`. Unknown fields are silently ignored — a typo'd field name just posts an unthreaded message, so spell them exactly.
+`mentions` is a **daemon-side structured field** (ADR-0040) — hex AgentIds inside the signed bytes, not GUI string-matching. CLI: `x0x group send <gid> "body" --mentions <64-hex> --mentions <64-hex> ... --delegation-digest <hex>` (repeatable `--mentions`; `--delegation-digest` authorizes send-as attribution). Threads (ADR-0029): `thread_root` = msg_id of the thread's first message; `thread_parent` = the direct parent you are replying to (requires `thread_root`). CLI: `x0x group send <gid> "body" --thread-root <id> --reply-to <id>`. Unknown fields are silently ignored — a typo'd field name just posts an unthreaded message, so spell them exactly.
 
 **Encrypted messaging** (encrypted presets; payload base64):
 
 ```bash
 curl -X POST "http://$API/groups/<gid>/secure/encrypt" -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" -d '{"payload_b64":"'$(echo -n secret | base64)'"}'
+  -H "Content-Type: application/json" -d '{"payload_b64":"'$(echo -n secret | base64 | tr -d '\n')'"}'
 ```
 
 **Admin & advanced** (full shapes in the [API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)): roles (`PATCH .../members/:id/role`), policy axes (`PATCH .../policy`), bans, access requests (`.../requests`), the signed state chain (`.../state`, `.../state/commits`, `.../state/seal`, `.../state/withdraw`), discovery (`/groups/discover?q=`, `nearby`, `discover/subscribe`), group cards (`x0x://group/...`), and the sealed-envelope family (`secure/decrypt`, `secure/reseal`, `/groups/secure/open-envelope`). CLI: `x0x group set-role|policy|ban|requests|state|state-seal|delete|discover|card|secure-decrypt|secure-reseal|...`.
@@ -375,13 +380,15 @@ x0x tasks add hsd1-tasks "Write integration tests" # POST /task-lists/<id>/tasks
 x0x tasks claim hsd1-tasks <task_id>               # PATCH .../tasks/<tid> {"action":"claim"} | complete
 x0x store create shared-config team-config         # POST /stores {"name","topic"} -> {id}
 curl -X PUT "http://$API/stores/team-config/greeting" -H "Authorization: Bearer $TOKEN" \
-  -H "Content-Type: application/json" -d '{"value":"'$(echo -n hello | base64)'","content_type":"text/plain"}'
+  -H "Content-Type: application/json" -d '{"value":"'$(echo -n hello | base64 | tr -d '\n')'","content_type":"text/plain"}'
 # Join a store another agent created — anchor with the owner's agent_id learned OUT-OF-BAND:
 curl -X POST "http://$API/stores/team-config/join" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"expected_owner":"<owner agent_id>"}'
 ```
 
 Claims are advisory (never exclusive); `fence_token` fences your own local replica across restarts. Task ownership transfer rides ADR-0040 delegation (claiming ≠ ownership).
+
+**Joining a task list from a second machine = create a list with the SAME topic.** There is no join verb for task lists: the list id derives from the topic alone (`TaskListId::from_topic`), so a second machine runs `x0x tasks create <any-name> <same-topic>` and its replica converges via the state-sync side channel (cold-start bootstrap, then deltas). A plain `x0x subscribe <topic>` does NOT materialize the list — without the create, no replica exists to answer the bootstrap. KV stores are the contrast: they DO have a join verb (`POST /stores/:id/join`, anchored on the owner's agent_id).
 
 ### 4.6 Files
 
@@ -409,7 +416,7 @@ curl -H "Authorization: Bearer $TOKEN" "http://$API/ws/sessions"
 ```
 
 Client → server: `{"type":"subscribe","topics":[...]}`, `{"type":"publish","topic","payload"}`, `{"type":"send_direct","agent_id","payload"}`, `{"type":"ping"}`. **`payload` values in `publish`/`send_direct` are base64** — the server rejects non-base64 payloads with an error frame.
-Server → client: `connected` (session_id, agent_id), `message` (topic, payload, origin), `direct_message` (sender, machine_id, payload, received_at), `subscribed`, `pong`. Multiple sessions on one topic share a single gossip subscription. Plain `ws://` is fine because the API is loopback by default; if you bind it non-loopback (§1.3), front it with TLS before using `wss://`-grade flows.
+Server → client: `connected` (session_id, agent_id), `message` (topic, payload, origin), `direct_message` (sender, machine_id, payload, received_at), `mention` (topic, group_id, msg_id, author_agent_id, reason `mention`|`delegation`), `subscribed`, `pong`. **`mention` frames require this session to be SUBSCRIBED to the group's topic** — routing still happens daemon-side, but an unsubscribed `/ws` session receives nothing. Multiple sessions on one topic share a single gossip subscription. Plain `ws://` is fine because the API is loopback by default; if you bind it non-loopback (§1.3), front it with TLS before using `wss://`-grade flows.
 
 ### 4.9 Identity ops (sign / verify / revoke)
 
@@ -418,7 +425,8 @@ Detached ML-DSA-65 signatures with a mandatory domain-separation `context` (`[a-
 ```bash
 x0x agent sign --context my-app-v1 --file -      # POST /agent/sign {"context","payload_b64"} -> signature_b64
 x0x agent verify ...                             # POST /agent/verify (stateless; 200 {valid:false} on bad sig)
-x0x identity revoke --agent-id <64-hex>          # POST /identity/revoke {"agent_id","reason"} — exactly one of agent_id/machine_id
+x0x identity revoke --agent-id <64-hex>          # POST /identity/revoke {"agent_id","reason"} — one-id forms: exactly one of agent_id/machine_id
+x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>   # ADR-0043 binding form: permanent (agent,machine) tombstone (all three required together)
 ```
 
 `/agent/sign` is owner-plane (never reachable by riders). Revoking a third party requires a user-signed AgentCertificate for the subject.
@@ -441,7 +449,7 @@ x0x sync revoke <machine_id>       # DELETE /sync/devices/:machine_id — next s
 - **Tier 2 — pull-on-demand Home history: DESIGNED, NOT SHIPPED.** ADR-0041 defines it, but the current SyncV1 module implements Tier 1 only; there is no peer history backfill. `GET /history?scope=group:<gid>` is a purely LOCAL query against your own durable history.
 - **Tier 3 — never replicates:** non-Home group history, DM history, exec session state. Per-machine, full stop.
 
-Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. Cross-machine Tier-1 convergence is proven in-process; daemon-level sync sessions currently share the #447 announce-visibility root cause — expect the second device to need its announce beats before the first session succeeds. (#449 also applies: each device still provisions its own Home; the Tier-1 Home pointer is stored for future cross-machine adoption, not merged.)
+Enrollment is the ADR-0043 direction: the daemon holding the owner key signs the enrollment; a non-enrolled machine's SyncV1 stream is rejected at accept (verified on the testnet), and each side proves possession of the owner key by signing a fresh nonce. **Trust prerequisite:** SyncV1 streams ride ADR-0022 byte streams through the same stream gate as every other protocol — BOTH sides must have each other as `trusted` contacts, or the dial is silently refused with `stream peer trust rejected: agent […]` (visible in the dialer's log as `Tier-1 dial skipped/failed until next pass`; set trust on both sides with `x0x trust set <agent_id> trusted`). Cross-machine Tier-1 convergence is proven in-process; daemon-level sync sessions currently share the #447 announce-visibility root cause — expect the second device to need its announce beats before the first session succeeds. (#449 also applies: each device still provisions its own Home; the Tier-1 Home pointer is stored for future cross-machine adoption, not merged.)
 
 ### 5.2 Placement: Pinned / Roaming (ADR-0037/0043)
 
@@ -462,7 +470,7 @@ x0x move list                      # GET /agent/moves — move-log view (custodi
 Voice is a **library** surface (`voice` crate feature), not REST: signaling rides real DMs (typed `x0x-voice-sig-v1\n` prefix, classified Ephemeral — never recorded to history), and audio rides ADR-0022 streams under `StreamProtocol::WebRtcV1` (0x04). One stream per (direction, lane); identity gate + connect-ACL apply exactly as for every other protocol.
 
 - **Datagram lane** (ADR-0042c): audio frames ride unreliable QUIC datagrams (`AudioDatagram` wire framing, one datagram per frame) once both ends exchange the capability advert — with the **reliable stream as fallback**. The jitter buffer is mandatory on receive.
-- **SessionConflict**: the lane manager is a single-acceptor — a second concurrent call to the same peer fails with `VoiceLaneError::SessionConflict` rather than interleaving.
+- **SessionConflict (single acceptor)**: the lane manager accepts one call session per agent — a second concurrent call is refused instead of interleaving. Typed surface: `X0xLinkTransport::start_lane()` fails with `VoiceLaneError::SessionConflict`. Through the `LinkTransport` trait's `start()` the SAME refusal surfaces today as `LinkTransportError::IoError("WebRtcV1 stream acceptor already held by a concurrent call session on this agent")` (the typed variant is flattened to a string there — #460); match on the message or use `start_lane()` when you need the typed error.
 - **1:1 only today.** Group calls (ADR-0042d: mesh ≤4, SFU beyond) and browser gateways are explicit follow-ups — only the 1:1 transport + example ship.
 
 ```bash
@@ -514,7 +522,7 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Second device can't join owner's Home (`no agent certificate resolved`) | #447: cert blob merges into discovery only on next announce ingest | `POST /announce` twice ~10 s apart BEFORE joining; a wedged joiner must delete local group state and rejoin |
+| Second device can't join owner's Home (`no agent certificate resolved`) | #447: cert blob merges into discovery only on next announce ingest; a BODYLESS announce publishes the anonymous digest, which the owner can never resolve | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` twice ~10 s apart BEFORE joining; a wedged joiner must remove its local `named_groups.json` entry (not just a `local_only` leave) and rejoin |
 | Two Homes for one owner | #449: per-device provisioning, no reconciliation yet | expected until #449; use either Home, don't fight it |
 | Strict (durable-ack) DM to v0.40.4 peer → 409 `recipient_ack_semantics_unavailable` | #448 mixed-fleet: peer can't verify new advert; no auto-fallback | upgrade the peer, retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
 | Peer rejects your agent card | #450 mixed-fleet card signature mismatch | upgrade the verifying peer |
@@ -596,12 +604,12 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Identity + names | `/profile` `/agent` `/announce` | `x0x profile set` `agent` | GA |
 | Owner key + roster | `/owner/agents(+/issue,/:id)` | `x0x user-id create` `owner agents` | GA |
 | Home space | `/home` `/home/rename` | `x0x home` `home rename` | GA · joins #447, per-device #449 |
-| Sub-agents (ACP + rider) | `/owner/agents/issue` `/owner/riders*` | `x0x owner agents issue/revoke` · riders list/revoke (mint REST-only — CLI omits the delegation capability) | GA |
+| Sub-agents (ACP + rider) | `/owner/agents/issue` `/owner/riders*` | `x0x owner agents issue/revoke` · `owner riders issue --delegation-payload-b64/--delegation-signature` (mint) / list / revoke | GA |
 | Rider deny-by-default scopes | middleware (403 matrix) | — | GA |
 | Session tokens read-mostly | `/auth/session` | — | **caveat #446** |
 | Named groups + policy + discovery | `/groups*` | `x0x group ...` | GA |
 | Public messages + threads | `/groups/:id/send` `/messages` (`thread_root`/`thread_parent`) | `x0x group send --thread-root/--reply-to` | GA |
-| Structured mentions | `/groups/:id/send` `mentions:[...]` | — (REST only; no CLI flag) | GA |
+| Structured mentions | `/groups/:id/send` `mentions:[...]` | `x0x group send --mentions <hex>... [--delegation-digest <hex>]` | GA |
 | MLS/TreeKEM encryption | `/mls/groups*`, `/groups/:id/secure/*` | `x0x groups`, `group secure-*` | GA · cards #450 |
 | Delegation (send-as / task-execute) | `/groups/:id/delegate(+/delegations)` | `x0x group delegate` | GA |
 | Task lists (CRDT) | `/task-lists*` | `x0x tasks ...` | GA |
@@ -616,11 +624,11 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Device enrollment + SyncV1 | `/sync/devices*` | `x0x sync enroll/devices/revoke` | GA (Tier-1) · sessions #447 |
 | Placement ledger | `/owner/placement` | `x0x owner placement` | GA (read) |
 | Roaming move ceremony | `/agent/move*` `/agent/moves` | `x0x move ...` | **gated off (501)** |
-| Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · `SessionConflict` on 2nd call |
 | Relay (header v2, digest-bound) | `--relay` + `/diagnostics/relay` | — | GA |
-| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA · #451 on owned installs |
+| Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | — | GA (local-only; Tier-2 Home backfill designed, not shipped — §5.1) |
+| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA · #451 on owned installs |
 
 ---
 

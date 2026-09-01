@@ -595,10 +595,11 @@ enum OwnerAgentsSub {
 enum OwnerRidersSub {
     /// Mint a scoped rider token for a registered rider-mode sub-agent.
     ///
-    /// Note: minting requires the harness-signed delegation capability,
-    /// which this command cannot supply — use POST /owner/riders (REST)
-    /// or the x0x crate's sign_rider_delegation helper. This command
-    /// will answer 400 on a registered sub-agent.
+    /// Minting requires the harness-signed delegation capability: pass
+    /// BOTH `--delegation-payload-b64` and `--delegation-signature`
+    /// (both are required); without them the daemon refuses to mint.
+    /// Build the payload with the x0x crate's `sign_rider_delegation`
+    /// helper.
     Issue {
         /// Hex agent id of the registered sub-agent.
         #[arg(value_name = "AGENT_ID")]

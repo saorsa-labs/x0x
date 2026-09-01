@@ -317,11 +317,12 @@ string, "ttl_secs"?: ≤ 90 days, default 7, "delegation": {
 "payload_b64", "signature" } }`) are stored hashed at rest (SHA-256),
 expire, and are revocable per-token or by revoking their sub-agent.
 The `delegation` capability is REQUIRED — a request without it answers
-`400 delegation is required…` — so **the CLI `x0x owner riders issue`
-cannot mint tokens** (it never sends the capability). Certify the
-sub-agent (`POST /owner/agents/issue` with `"mode": "rider"` — the CLI
-equivalent is `x0x owner agents issue <PUB_HEX> --mode rider`), then mint
-via REST with a harness-side capability:
+`400 delegation is required…`. The CLI `x0x owner riders issue` mints
+fine **when given both `--delegation-payload-b64` and
+`--delegation-signature`** (clap-required, mutually `requires`-bound).
+Certify the sub-agent first (`POST /owner/agents/issue` with
+`"mode": "rider"` — the CLI equivalent is `x0x owner agents issue
+<PUB_HEX> --mode rider`), then mint with a harness-side capability:
 
 the harness signs `rider_delegation_bytes(sub_agent_id,
 daemon_agent_id, groups, not_after)` with the sub-agent's OWN key
@@ -522,6 +523,15 @@ when each holds the other's enrollment — run `enroll` on **both** machines,
 each naming the other's machine id (plus itself), or no session is ever
 established.
 
+**Trust prerequisite:** SyncV1 rides ADR-0022 byte streams through the same
+stream gate as every other protocol — each side's peer-trust decision for the
+other's agent must be plain `Accept` (`trusted`), or the stream is refused with
+`stream peer trust rejected: agent […]`. Symptom of a missing trust mark: the
+dialer logs `Tier-1 dial skipped/failed until next pass` every sync pass and
+`GET /sync/devices` shows `last_session_ok: false` forever despite bilateral
+enrollment. Set trust on **both** sides (`x0x trust set <agent_id> trusted` /
+`POST /contacts/trust`).
+
 **What Tier 1 actually applies today:** profile/names converge; the Home
 pointer is synced and **stored for future adoption — it is not applied**
 (each device keeps its own Home, #449); sub-agent issuance journal lines are
@@ -531,7 +541,9 @@ boundary), so a synced roster row is not itself mint-capable for riders.
 
 **DELETE /sync/devices/:machine_id** — the *next* inbound stream from that
 machine is refused; existing streams are not torn down mid-flight. `404` when
-the machine is not enrolled; `400` for a malformed id.
+the machine is not enrolled; `400` for a malformed id — but the owner gate runs
+FIRST: on a daemon with no owner identity the DELETE answers `409 no owner
+identity configured` regardless of the id's shape.
 
 ## Placement and agent key-move (ADR-0043)
 
@@ -560,7 +572,9 @@ Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
 placement ledger. **Binding revocation** is the permanent tombstone form of
 `POST /identity/revoke`: send **both** `agent_id` and `machine_id` (32-byte
 hex each) **plus** `move_epoch` (u64, orders the tombstone against placement
-records). Durable-owner only — a session token answers `403`; a missing
+records). CLI (all three flags together):
+`x0x identity revoke --agent-id <hex> --machine-id <hex> --move-epoch <N>`.
+Durable-owner only — a session token answers `403`; a missing
 `move_epoch` answers `400`. The one-id forms remain the agent/machine
 self- or user-authority revocations.
 
@@ -716,7 +730,7 @@ Identity types: `anonymous`, `known`, `trusted`, `pinned`
 | POST | `/direct/send` | `x0x direct send <agent_id> <message> [--require-ack-ms <ms>] [--prefer-raw-quic-if-connected <BOOL>] [--raw-quic-receive-ack-ms <ms>] [--stop-fallback-on-raw-error] [--require-gossip] [--no-durable-ack] [--logical-id <token>]` | Send a direct base64 payload. Durable-by-default since v0.38.0 |
 | GET | `/direct/connections` | `x0x direct connections` | List active direct connections |
 | GET | `/history/message/:msg_id` | `x0x history message` | Point lookup of one durable history row by exposed `msg_id` (64 hex; canonical group ids need `?scope=`); 404 when absent, 400 on malformed id. Same record shape as `/history` (issue #319) |
-| GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages |
+| GET | `/direct/events` | `x0x direct events` | SSE stream of direct messages; `?backfill=N` first replays up to N stored `dm:` rows as `history_direct_message` events, then a `live` marker, then live frames (ADR-0023 §7) — this (or `/ws/direct?backfill=N`) is how a client READS already-delivered DMs |
 
 ### Direct send request body
 
@@ -1099,7 +1113,7 @@ Each row: `delegation_digest`, `from_agent`, `to_agent`, `scope`, `verbs`,
 
 Verified behaviour (this campaign): delegate → B sends citing the digest →
 message accepted and attributed (author = B); the same send with a forged
-digest answers `400 send_as unauthorized: referenced delegation is not durably
+digest answers `409 send_as unauthorized: referenced delegation is not durably
 committed in this group's history`.
 
 For groups whose `confidentiality == SignedPublic` (the `public_open`
@@ -1288,6 +1302,14 @@ plane. See `docs/primers/groups.md`.
 | GET | `/task-lists/:id/tasks` | `x0x tasks show <list_id>` | List tasks |
 | POST | `/task-lists/:id/tasks` | `x0x tasks add ...` | Add a task |
 | PATCH | `/task-lists/:id/tasks/:tid` | `x0x tasks claim <list> <task> [--fence-token <t>] [--delegation <hex>]` / `x0x tasks complete ...` | Update task state (`action` is chosen by the subcommand). `--fence-token` is the local-replica CAS precondition (409 on mismatch); `--delegation` is the hex ADR-0040 digest authorizing the claim |
+
+**Joining from a second machine = create a list with the SAME topic.** There
+is no join verb: the list id derives from the topic alone (`TaskListId::from_topic`),
+so another replica runs `POST /task-lists {"name":…,"topic":"<same topic>"}` and
+converges via the state-sync side channel (cold-start bootstrap request, then
+deltas). A plain topic subscription does NOT materialize the list on the new
+machine — the create is what arms the bootstrap. (KV stores differ: they have
+`POST /stores/:id/join` with `expected_owner`.)
 
 Update task request body:
 
@@ -1633,7 +1655,7 @@ Server → client (complete outbound frame set):
 | `direct_message` | `sender`, `machine_id`, `payload`, `received_at`, `verified`, `trust_decision?`, `observed_origin?` | DM arrives (`/ws/direct` only; `?backfill=N` replays history rows first) |
 | `live` | `topic` (`"direct"` on `/ws/direct?backfill=N`) | Backfill ended, live frames begin (ADR-0023) |
 | `subscribed` / `unsubscribed` | `topics[]` | After the corresponding client command |
-| `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
+| `mention` | `topic`, `group_id`, `msg_id`, `author_agent_id`, `reason` (`"mention"` \| `"delegation"`), `mentions[]` (omitted when empty), `timestamp` | An ingested, validated group message names the local agent (ADR-0040). **Emitted only on the group's shared topic channel — the session must be subscribed to the group's topic; an unsubscribed `/ws` session gets nothing (routing still happens daemon-side).** A delegation carrier directed at the local agent produces the same frame with `reason: "delegation"` — there is no separate `delegation` event type |
 | `pong` | — | Reply to `ping`; also the 30 s keepalive |
 | `error` | `message` | Malformed command, invalid base64, publish/send failure |
 
