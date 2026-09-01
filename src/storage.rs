@@ -421,48 +421,40 @@ pub fn resolve_x0x_home(
 ///
 /// Every `~/.x0x` fallback in the codebase resolves through here:
 /// - precedence: `$X0X_HOME` (if set and non-empty) > `$HOME/.x0x`;
-/// - the test harness sets `X0X_HOME` (`.config/nextest.toml` `[env]`), so
+/// - the test harness sets `X0X_HOME` (`.config/nextest.toml` wrapper), so
 ///   the workspace suite never writes Home-Suite state (owner-cert journal,
 ///   `agent.cert`, move/placement files, history, contacts) into a
 ///   developer's real `~/.x0x`;
-/// - under `cfg(test)` with NO override this PANICS by design: a test
-///   touching the real home fallback is exactly the #456 pollution bug, so
-///   it fails loudly instead of silently dirtying the maintainer's node.
-///   Tests that need a default-dir path must run under the harness env or
-///   configure explicit paths (`identity_dir`, `with_agent_cert_path`, …).
+/// - in UNIT-TEST builds only (`#[cfg(test)]`, compiled out of every
+///   shipped target — review r4: the production resolver must never
+///   panic), a test reaching the real-home fallback without an override
+///   PANICS by design: that is exactly the #456 pollution bug, so it
+///   fails loudly instead of silently dirtying the maintainer's node.
+///   Integration binaries are covered by the harness env (the wrapper
+///   sets `X0X_HOME` for every test process, so their fallbacks redirect
+///   rather than reach the real home).
 ///
 /// # Panics
-/// In test builds when neither `X0X_HOME` nor `$HOME`-based isolation is
-/// active — see above.
+/// In `#[cfg(test)]` builds when no override is active — never in debug
+/// or release binaries shipped to users.
 pub fn x0x_home_dir() -> Option<std::path::PathBuf> {
     let env_override = std::env::var("X0X_HOME").ok();
     if env_override.as_deref().is_some_and(|s| !s.is_empty()) {
         return env_override.map(std::path::PathBuf::from);
     }
-    // #456 test-home guard (review r3): FAIL any test that would write
-    // under the real home fallback. Armed two ways so BOTH test-binary
-    // kinds are covered: unit tests (cfg(test), statically) and
-    // integration/e2e binaries spawned by the nextest harness (the
-    // X0X_TEST_HOME_GUARD sentinel, set by the .config/nextest.toml
-    // wrapper — integration binaries link the lib without cfg(test), so
-    // the env sentinel is what reaches them).
-    let sentinel = std::env::var_os("X0X_TEST_HOME_GUARD");
-    if test_home_guard_armed(cfg!(test), sentinel.as_deref()) {
+    #[cfg(test)]
+    {
         panic!(
             "#456 test-home guard: a test reached the real ~/.x0x fallback. \
              Set X0X_HOME (the nextest harness does), or give the builder \
              explicit paths (identity_dir / key / cert / store paths)."
         );
     }
-    let home = dirs::home_dir();
-    resolve_x0x_home(None, home)
-}
-
-/// Pure core of the #456 test-home guard (see [`x0x_home_dir`]); split out
-/// so the arming logic is testable without racing the process environment.
-#[must_use]
-pub fn test_home_guard_armed(cfg_test: bool, sentinel: Option<&std::ffi::OsStr>) -> bool {
-    cfg_test || sentinel == Some(std::ffi::OsStr::new("1"))
+    #[cfg(not(test))]
+    {
+        let home = dirs::home_dir();
+        resolve_x0x_home(None, home)
+    }
 }
 
 /// The identity directory of a NAMED daemon instance (issue #456): a
@@ -1376,23 +1368,6 @@ mod tests {
             result.is_err(),
             "#456 guard must panic when a test would touch the real ~/.x0x"
         );
-    }
-
-    /// Review r3 (#456): the test-home guard arming logic — cfg(test)
-    /// unit binaries OR the harness sentinel (integration binaries) — as a
-    /// pure truth table.
-    #[test]
-    fn test_home_guard_arming_truth_table() {
-        let one = std::ffi::OsStr::new("1");
-        let zero = std::ffi::OsStr::new("0");
-        assert!(super::test_home_guard_armed(true, None));
-        assert!(super::test_home_guard_armed(true, Some(zero)));
-        assert!(super::test_home_guard_armed(false, Some(one)));
-        assert!(
-            !super::test_home_guard_armed(false, None),
-            "production (no cfg(test), no sentinel) must never arm"
-        );
-        assert!(!super::test_home_guard_armed(false, Some(zero)));
     }
 
     /// Review r3 (PR #465 item 1): the durable journal write is
