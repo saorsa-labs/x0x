@@ -1491,52 +1491,57 @@ pub(in crate::server::routes) mod tests {
         };
         let session = state.sessions.issue(std::time::Instant::now());
 
-        // (label, method, path suffix, body)
-        let routes: &[(&str, &str, String, Option<serde_json::Value>)] = &[
+        // (label, method, path, body, durable_expects_200). The durable
+        // arm must prove AUTHORIZED pass: rename/policy really mutate
+        // (200); remove/role/ban/unban target a non-member stranger, so
+        // the durable arm passes fence+admin and lands in ordinary
+        // target resolution — asserted by "not the fence's typed error".
+        // add-member is handled separately (needs a certified agent).
+        let routes: &[(&str, &str, String, Option<serde_json::Value>, bool)] = &[
             (
                 "PATCH /groups/:id (rename)",
                 "PATCH",
                 format!("/groups/{home_id}"),
                 Some(serde_json::json!({ "name": "X" })),
+                true,
             ),
             (
                 "PATCH /groups/:id/policy",
                 "PATCH",
                 format!("/groups/{home_id}/policy"),
                 Some(serde_json::json!({ "discoverability": "listed_to_contacts" })),
-            ),
-            (
-                "POST /groups/:id/members",
-                "POST",
-                format!("/groups/{home_id}/members"),
-                Some(serde_json::json!({ "agent_id": stranger })),
+                true,
             ),
             (
                 "DELETE /groups/:id/members/:agent_id",
                 "DELETE",
                 format!("/groups/{home_id}/members/{stranger}"),
                 None,
+                false,
             ),
             (
                 "PATCH /groups/:id/members/:agent_id/role",
                 "PATCH",
                 format!("/groups/{home_id}/members/{stranger}/role"),
                 Some(serde_json::json!({ "role": "member" })),
+                false,
             ),
             (
                 "POST /groups/:id/ban/:agent_id",
                 "POST",
                 format!("/groups/{home_id}/ban/{stranger}"),
                 None,
+                false,
             ),
             (
                 "DELETE /groups/:id/ban/:agent_id",
                 "DELETE",
                 format!("/groups/{home_id}/ban/{stranger}"),
                 None,
+                false,
             ),
         ];
-        for (label, method, path, body) in routes {
+        for (label, method, path, body, durable_200) in routes {
             let send = |bearer: String, body: Option<serde_json::Value>| {
                 let app = app.clone();
                 let method: &'static str = match *method {
@@ -1572,72 +1577,229 @@ pub(in crate::server::routes) mod tests {
             let response = send(rider.clone(), body.clone()).await?;
             let (status, out) = response_json(response).await?;
             assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {out}");
-            // Benign bodies: the durable arm passes the fence and lands
-            // in ordinary handler validation (stranger is not a member).
             let response = send("test-token".to_string(), body.clone()).await?;
             let (status, out) = response_json(response).await?;
-            assert_ne!(
-                status,
-                StatusCode::FORBIDDEN,
-                "{label} durable must clear the fence: {out}"
-            );
+            if *durable_200 {
+                assert_eq!(
+                    status,
+                    StatusCode::OK,
+                    "{label} durable arm must be an authorized 200: {out}"
+                );
+            } else {
+                // Authorized past fence AND admin gate; the outcome is
+                // ordinary target resolution (stranger is not a member),
+                // never the fence's typed error.
+                assert_ne!(
+                    status,
+                    StatusCode::FORBIDDEN,
+                    "{label} durable must clear the fence: {out}"
+                );
+                assert!(
+                    !out["error"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .contains("durable API token"),
+                    "{label} durable outcome must not be the fence error: {out}"
+                );
+            }
         }
 
-        // Destructible pair, durable arm LAST: leave, then withdraw (the
-        // terminal delete) on the Home — both must clear the fence.
-        for (label, method_str, path) in [
-            (
-                "DELETE /groups/:id (leave)",
-                "DELETE",
-                format!("/groups/{home_id}"),
-            ),
-            (
-                "POST /groups/:id/state/withdraw",
-                "POST",
-                format!("/groups/{home_id}/state/withdraw"),
-            ),
-        ] {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method_str)
-                        .uri(&path)
-                        .header("authorization", format!("Bearer {session}"))
-                        .body(Body::empty())?,
-                )
-                .await?;
-            let (status, body) = response_json(response).await?;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{label} session: {body}");
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method_str)
-                        .uri(&path)
-                        .header("authorization", format!("Bearer {rider}"))
-                        .body(Body::empty())?,
-                )
-                .await?;
-            let (status, body) = response_json(response).await?;
-            assert_eq!(status, StatusCode::FORBIDDEN, "{label} rider: {body}");
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .method(method_str)
-                        .uri(&path)
-                        .header("authorization", "Bearer test-token")
-                        .body(Body::empty())?,
-                )
-                .await?;
-            let (status, body) = response_json(response).await?;
-            assert_ne!(
-                status,
-                StatusCode::FORBIDDEN,
-                "{label} durable must clear the fence: {body}"
+        // add-member: a REAL authorized add. The candidate is certified
+        // by this install's owner (cert announced into the discovery
+        // cache) and supplies a real TreeKEM key package — Home is
+        // MlsEncrypted/TreeKEM, so the direct-add path requires both.
+        // Session and rider are fenced; durable gets a real 200.
+        let user_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned fixture has a user key");
+        let target_kp = crate::identity::AgentKeypair::generate()?;
+        let target_id = target_kp.agent_id();
+        let target_hex = hex::encode(target_id.as_bytes());
+        let cert = crate::identity::AgentCertificate::issue(user_kp, &target_kp)?;
+        {
+            let cache = state.agent.identity_discovery_cache();
+            cache.write().await.insert(
+                target_id,
+                crate::DiscoveredAgent {
+                    agent_id: target_id,
+                    machine_id: crate::identity::MachineId([0u8; 32]),
+                    user_id: cert.user_id().ok(),
+                    self_name: None,
+                    addresses: Vec::new(),
+                    announced_at: 0,
+                    last_seen: 0,
+                    machine_public_key: Vec::new(),
+                    nat_type: None,
+                    can_receive_direct: None,
+                    is_relay: None,
+                    is_coordinator: None,
+                    reachable_via: Vec::new(),
+                    relay_candidates: Vec::new(),
+                    cert_not_after: cert.not_after(),
+                    agent_certificate: Some(cert),
+                    agent_public_key: Vec::new(),
+                    cert_digest: None,
+                },
             );
         }
+        let prepared = crate::mls::TreeKemMlsGroup::prepare_member(target_id, &[0x5e; 32])?;
+        let kp_b64 = {
+            use base64::Engine as _;
+            base64::engine::general_purpose::STANDARD.encode(prepared.key_package_bytes())
+        };
+        let add_body = serde_json::json!({
+            "agent_id": target_hex,
+            "treekem_key_package_b64": kp_b64,
+        });
+        let add_json = |bearer: String| {
+            let app = app.clone();
+            let body = add_body.clone();
+            let path = format!("/groups/{home_id}/members");
+            async move {
+                app.oneshot(
+                    Request::post(path)
+                        .header("authorization", format!("Bearer {bearer}"))
+                        .header("content-type", "application/json")
+                        .body(Body::from(body.to_string()))
+                        .expect("request builds"),
+                )
+                .await
+            }
+        };
+        let response = add_json(session.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "add-member session: {out}");
+        assert!(
+            out["error"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("durable API token"),
+            "add-member session 403 must be the fence: {out}"
+        );
+        let response = add_json(rider.clone()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "add-member rider: {out}");
+        let response = add_json("test-token".to_string()).await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "add-member durable arm must be an AUTHORIZED 200 (certified agent + key package): {out}"
+        );
+        assert_eq!(out["ok"], true);
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&home_id)
+                .is_some_and(|info| info.has_active_member(&target_hex)),
+            "the durable add must really have seated the certified member"
+        );
+
+        // leave: its OWN live sole-member Home on a fresh state (after
+        // the certified add the main Home has a second member, so a
+        // self-leave there would be LastAdminBlocked — a 409, not an
+        // authorized pass). The durable arm proves a real SoleMemberDelete.
+        let dir_leave = tempfile::tempdir()?;
+        let state_l = owned_state(dir_leave.path(), [0x49; 32]).await?;
+        provision_home(&state_l).await;
+        let (home_l, _) = find_home(&state_l, &owner_of(&state_l))
+            .await
+            .expect("leave home");
+        let app_l = axum::Router::new()
+            .route(
+                "/groups/:id",
+                axum::routing::delete(super::super::named_groups::leave_group),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state_l),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state_l));
+        let response = app_l
+            .clone()
+            .oneshot(
+                Request::delete(format!("/groups/{home_l}"))
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            state_l.sessions.issue(std::time::Instant::now())
+                        ),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "leave session: {out}");
+        let response = app_l
+            .clone()
+            .oneshot(
+                Request::delete(format!("/groups/{home_l}"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "leave durable arm must be an authorized SoleMemberDelete of a LIVE Home: {out}"
+        );
+        assert_eq!(out["ok"], true);
+
+        // withdraw: its OWN live Home on a fresh state — the durable arm
+        // proves an authorized terminal withdrawal of a live group, not
+        // of the tombstone the leave above just created.
+        let dir2 = tempfile::tempdir()?;
+        let state2 = owned_state(dir2.path(), [0x48; 32]).await?;
+        provision_home(&state2).await;
+        let (home2, _) = find_home(&state2, &owner_of(&state2))
+            .await
+            .expect("home 2");
+        let app2 = axum::Router::new()
+            .route(
+                "/groups/:id/state/withdraw",
+                axum::routing::post(super::super::named_groups::withdraw_group_state),
+            )
+            .layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&state2),
+                crate::server::auth::auth_middleware,
+            ))
+            .with_state(Arc::clone(&state2));
+        let response = app2
+            .clone()
+            .oneshot(
+                Request::post(format!("/groups/{home2}/state/withdraw"))
+                    .header(
+                        "authorization",
+                        format!(
+                            "Bearer {}",
+                            state2.sessions.issue(std::time::Instant::now())
+                        ),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(status, StatusCode::FORBIDDEN, "withdraw session: {out}");
+        let response = app2
+            .clone()
+            .oneshot(
+                Request::post(format!("/groups/{home2}/state/withdraw"))
+                    .header("authorization", "Bearer test-token")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let (status, out) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "withdraw durable arm must be an authorized terminal withdrawal of a LIVE Home: {out}"
+        );
         Ok(())
     }
 

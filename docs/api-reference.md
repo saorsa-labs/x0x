@@ -80,9 +80,11 @@ Auth-class labels used throughout this reference:
 **#446 resolution notes:** `POST /announce` without
 `include_user_identity` and `PATCH /groups/:id` on ordinary
  (non-Home) groups stay bearer — no credential or capability is
-involved. The GUI prompts for the durable token (kept in tab-scoped
-`sessionStorage`, never a URL) the first time an owner-act surface is
-used from a session.
+involved. `DELETE /groups/:id` requires **active membership** for any
+group (self-leave is its purpose; a non-member cannot delete the local
+view of a foreign group). The GUI prompts for the durable token (kept
+in tab-scoped `sessionStorage`, never a URL) the first time an
+owner-act surface is used from a session.
 
 `GET /gui`, `/ws`, `/ws/direct`, and the SSE streams additionally accept a
 **session token** as a `?token=` query parameter (browser constraint). The
