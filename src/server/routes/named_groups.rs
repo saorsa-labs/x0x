@@ -17966,50 +17966,56 @@ pub(in crate::server) async fn recover_home_suite_sidecar_journals(
     sidecar_path: &FsPath,
     treekem_dir: &FsPath,
 ) -> anyhow::Result<()> {
-    let mut entries = match tokio::fs::read_dir(treekem_dir).await {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => {
-            return Err(anyhow::anyhow!(
-                "read TreeKEM dir for sidecar journals: {e}"
-            ))
-        }
-    };
-    while let Some(entry) = entries
-        .next_entry()
-        .await
-        .map_err(|e| anyhow::anyhow!("read TreeKEM dir entry for sidecar journals: {e}"))?
-    {
-        let path = entry.path();
-        if path.extension().and_then(|e| e.to_str()) != Some("hsjournal") {
-            continue;
-        }
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
-            anyhow::anyhow!("read Home-Suite sidecar journal {}: {e}", path.display())
-        })?;
-        let journal: HomeSuiteSidecarJournal = postcard::from_bytes(&bytes).map_err(|e| {
-            anyhow::anyhow!("decode Home-Suite sidecar journal {}: {e}", path.display())
-        })?;
-        if journal.version != TREEKEM_HOME_SUITE_JOURNAL_VERSION {
-            tracing::warn!(
-                path = %path.display(),
-                version = journal.version,
-                "ignoring unsupported Home-Suite sidecar journal version"
-            );
-            continue;
-        }
-        let outcome = write_named_groups_json_atomic(sidecar_path, &journal.home_suite_json)
+    // Stack-budget note (review r2fix): Box::pin keeps the replay loop's
+    // futures out of the caller's async state machine (see
+    // load_named_groups_merged).
+    Box::pin(async {
+        let mut entries = match tokio::fs::read_dir(treekem_dir).await {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "read TreeKEM dir for sidecar journals: {e}"
+                ))
+            }
+        };
+        while let Some(entry) = entries
+            .next_entry()
             .await
-            .map_err(|e| anyhow::anyhow!("replay Home-Suite sidecar journal: {e}"))?;
-        if outcome != AtomicWriteOutcome::Durable {
-            anyhow::bail!("replayed Home-Suite sidecar journal was not directory-durable");
+            .map_err(|e| anyhow::anyhow!("read TreeKEM dir entry for sidecar journals: {e}"))?
+        {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("hsjournal") {
+                continue;
+            }
+            let bytes = tokio::fs::read(&path).await.map_err(|e| {
+                anyhow::anyhow!("read Home-Suite sidecar journal {}: {e}", path.display())
+            })?;
+            let journal: HomeSuiteSidecarJournal = postcard::from_bytes(&bytes).map_err(|e| {
+                anyhow::anyhow!("decode Home-Suite sidecar journal {}: {e}", path.display())
+            })?;
+            if journal.version != TREEKEM_HOME_SUITE_JOURNAL_VERSION {
+                tracing::warn!(
+                    path = %path.display(),
+                    version = journal.version,
+                    "ignoring unsupported Home-Suite sidecar journal version"
+                );
+                continue;
+            }
+            let outcome = write_named_groups_json_atomic(sidecar_path, &journal.home_suite_json)
+                .await
+                .map_err(|e| anyhow::anyhow!("replay Home-Suite sidecar journal: {e}"))?;
+            if outcome != AtomicWriteOutcome::Durable {
+                anyhow::bail!("replayed Home-Suite sidecar journal was not directory-durable");
+            }
+            tokio::fs::remove_file(&path).await.map_err(|e| {
+                anyhow::anyhow!("remove replayed sidecar journal {}: {e}", path.display())
+            })?;
+            tracing::warn!("replayed Home-Suite sidecar persistence journal after prior crash");
         }
-        tokio::fs::remove_file(&path).await.map_err(|e| {
-            anyhow::anyhow!("remove replayed sidecar journal {}: {e}", path.display())
-        })?;
-        tracing::warn!("replayed Home-Suite sidecar persistence journal after prior crash");
-    }
-    Ok(())
+        Ok(())
+    })
+    .await
 }
 
 /// Rebuild the live TreeKEM group map from on-disk snapshots at startup
@@ -18369,9 +18375,16 @@ pub(in crate::server) async fn load_named_groups_merged(
     named_groups_path: &FsPath,
     sidecar_path: &FsPath,
 ) -> Result<HashMap<String, x0x::groups::GroupInfo>> {
-    let named = load_named_groups(named_groups_path).await?;
-    let sidecar = load_home_suite_groups(sidecar_path).await?;
-    Ok(merge_home_suite_groups(named, sidecar))
+    // Stack-budget note (review r2fix): Box::pin keeps the two loader
+    // futures out of the caller's async state machine (daemon serve() /
+    // the shared test fixture), which sit close to the Linux CI
+    // test-thread stack ceiling (PR #465 CI abort).
+    Box::pin(async move {
+        let named = load_named_groups(named_groups_path).await?;
+        let sidecar = load_home_suite_groups(sidecar_path).await?;
+        Ok(merge_home_suite_groups(named, sidecar))
+    })
+    .await
 }
 
 /// Review r2 (#451, item 3): a store written by a pre-#451 Home-Suite
@@ -18385,31 +18398,41 @@ pub(in crate::server) async fn load_named_groups_merged(
 pub(in crate::server) async fn migrate_unsplit_home_suite_store_if_needed(
     state: &AppState,
 ) -> std::io::Result<()> {
-    let legacy = match tokio::fs::read_to_string(&state.named_groups_path).await {
-        Ok(json) => json,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-        Err(e) => return Err(e),
-    };
-    let unsplit: HashMap<String, x0x::groups::GroupInfo> = match serde_json::from_str(&legacy) {
-        Ok(groups) => groups,
-        Err(e) => {
-            // load_named_groups has already rejected a corrupt file by the
-            // time this runs; a race here is not worth failing startup over.
-            tracing::warn!("could not re-parse named groups for migration check: {e}");
+    // Stack-budget note (review r2fix): this whole tail is Box::pin'd so
+    // its (deep: save -> unlocked save -> two atomic writers) future lives
+    // on the heap — callers embed this in already-large async state
+    // machines (the daemon `serve()` future, the shared test fixture), and
+    // the unboxed inline future pushed a borderline-deep fixture test past
+    // the Linux CI test-thread stack (PR #465 CI abort).
+    Box::pin(async move {
+        let legacy = match tokio::fs::read_to_string(&state.named_groups_path).await {
+            Ok(json) => json,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        let unsplit: HashMap<String, x0x::groups::GroupInfo> = match serde_json::from_str(&legacy) {
+            Ok(groups) => groups,
+            Err(e) => {
+                // load_named_groups has already rejected a corrupt file by
+                // the time this runs; a race here is not worth failing
+                // startup over.
+                tracing::warn!("could not re-parse named groups for migration check: {e}");
+                return Ok(());
+            }
+        };
+        if !unsplit.values().any(is_home_suite_group_entry) {
             return Ok(());
         }
-    };
-    if !unsplit.values().any(is_home_suite_group_entry) {
-        return Ok(());
-    }
-    tracing::info!("migrating pre-#451 named-groups store to the Home-Suite sidecar layout");
-    let outcome = save_named_groups_checked(state).await?;
-    if outcome == AtomicWriteOutcome::NotReplaced {
-        return Err(std::io::Error::other(
-            "unsplit Home-Suite store migration did not replace the roster",
-        ));
-    }
-    Ok(())
+        tracing::info!("migrating pre-#451 named-groups store to the Home-Suite sidecar layout");
+        let outcome = save_named_groups_checked(state).await?;
+        if outcome == AtomicWriteOutcome::NotReplaced {
+            return Err(std::io::Error::other(
+                "unsplit Home-Suite store migration did not replace the roster",
+            ));
+        }
+        Ok(())
+    })
+    .await
 }
 
 /// ADR 0028: versioned sidecar for the causal approval queue. The version
@@ -20569,15 +20592,22 @@ async fn write_home_suite_sidecar(
     state: &AppState,
     home_suite_json: &str,
 ) -> std::io::Result<AtomicWriteOutcome> {
-    write_named_groups_json_atomic(&state.home_suite_groups_path, home_suite_json)
-        .await
-        .map_err(|e| {
-            tracing::error!(
-                path = %state.home_suite_groups_path.display(),
-                "failed to save Home-Suite sidecar: {e}"
-            );
-            e
-        })
+    // Stack-budget note (review r2fix): Box::pin keeps the atomic-writer
+    // future off the caller's async state machine — every save path embeds
+    // this, and the doubled writer futures pushed borderline-deep fixture
+    // tests past the Linux CI test-thread stack (PR #465 CI abort).
+    Box::pin(write_named_groups_json_atomic(
+        &state.home_suite_groups_path,
+        home_suite_json,
+    ))
+    .await
+    .map_err(|e| {
+        tracing::error!(
+            path = %state.home_suite_groups_path.display(),
+            "failed to save Home-Suite sidecar: {e}"
+        );
+        e
+    })
 }
 
 /// ADR 0028: checked version of save_named_groups that returns an error on
