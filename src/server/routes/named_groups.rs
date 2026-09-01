@@ -2815,6 +2815,21 @@ async fn try_adopt_member_added_across_gap(
         return refuse("no intervening chain provided");
     }
 
+    // #458 r6 item 4 — GSS/Legacy `security_binding` (confidentiality
+    // gate): adoption is non-TreeKEM only, and for those planes the
+    // binding string ("gss:epoch=N") ties the roster to a GSS secret
+    // epoch the joiner CANNOT verify from the chain. A binding that
+    // CHANGED inside the gap is therefore an unverifiable secret
+    // rotation — REFUSE it (fail-closed, exactly like the TreeKEM epoch
+    // exclusion) instead of copying the terminal's binding unverified.
+    // The adoptable shape is a metadata-only gap (rename etc.) whose
+    // binding is byte-identical to the invite base's.
+    if commit.security_binding != current.security_binding {
+        return refuse(
+            "security_binding changed inside the gap (unverifiable GSS/legacy epoch rotation)",
+        );
+    }
+
     // #458 r5 — THE ANCHOR. Adoption is only permitted for OwnerCertified
     // groups AND only when the terminal commit is CAS-anchored to the
     // ADMISSION OWNER's signed attestation of the authority's real
@@ -2889,17 +2904,20 @@ async fn try_adopt_member_added_across_gap(
                 "link committer is not an active admin in the RECONSTRUCTED predecessor roster",
             );
         }
-        // #458 r5c — ROLE-CHANGE SMUGGLING (documented limitation):
-        // `GroupStateCommit` carries no action kind (state_commit.rs), so
-        // a role change sealed inside an internally consistent retained
-        // snapshot is indistinguishable here from any other admin-committed
-        // role change — an admin can change roles via ordinary commits
-        // anyway (ADR-0016), so this is inherent to the commit format, not
-        // a new capability. The defense-in-depth actually binding is the
-        // OWNER-SIGNED head attestation above: a forked admin cannot get
-        // its smuggled chain anchored. The per-link guard added here is
-        // `enforce_last_admin_invariant` on every folded roster — a
-        // smuggled change that strands the last admin refuses the chain.
+        // #458 r5c/r6 — ROLE-CHANGE SMUGGLING (WONTFIX-with-justification,
+        // both reviewers): `GroupStateCommit` carries no action kind
+        // (state_commit.rs:193,438), so a role change sealed inside an
+        // internally consistent retained snapshot is indistinguishable
+        // here from any other admin-committed role change. That is NOT a
+        // new capability: an admin can change roles via ordinary commits
+        // anyway (ADR-0016 — role management IS an admin authority), and
+        // every adopted chain is anchored to the OWNER-SIGNED head
+        // attestation of the authority's REAL current head — so any role
+        // delta inside the chain is the authority's own sealed history,
+        // not attacker-injected state. A forked admin cannot get a
+        // smuggled chain anchored (it never holds the owner user key).
+        // The per-link `enforce_last_admin_invariant` below adds
+        // fail-closed coverage for deltas that strand the last admin.
         if let Err(inv) = projection_last_admin_invariant(&link.roster, link.commit.withdrawn) {
             let _ = inv;
             return refuse("link folds to a roster that violates the last-admin invariant");
@@ -19183,10 +19201,16 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
     // Review r3, item 1: durable + crash-atomic (temp → file fsync →
     // rename → dir fsync) so a power loss can never leave a torn journal
     // while the later-synced live files survive it.
+    // #457 r6 — ORDERING: the `.hsjournal` goes FIRST and the LEGACY
+    // journal LAST (the commit point), matching the rebind path: startup
+    // replay treats the pair atomically (apply the sidecar half, then the
+    // legacy half, then delete both), and an orphan `.hsjournal` (crash
+    // between the two writes) is DISCARDED — never applied. A legacy
+    // journal on disk therefore always has its sidecar journal durable.
+    write_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex, &home_suite_json).await?;
     x0x::storage::write_private_bytes_durable(&journal_path, journal_bytes)
         .await
         .map_err(|e| anyhow::anyhow!("TreeKEM journal write: {e}"))?;
-    write_home_suite_sidecar_journal(&state.treekem_dir, group_id_hex, &home_suite_json).await?;
     // 2) Live files, each now repairable from the journals above.
     let sidecar_outcome = write_home_suite_sidecar(state, &home_suite_json).await?;
     if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
@@ -19252,6 +19276,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
 
 pub(in crate::server) async fn recover_treekem_named_journals(
     named_groups_path: &FsPath,
+    home_suite_groups_path: &FsPath,
     treekem_dir: &FsPath,
 ) -> anyhow::Result<()> {
     let mut entries = match tokio::fs::read_dir(treekem_dir).await {
@@ -19356,21 +19381,60 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal because durable named groups contain a withdrawn record");
             continue;
         }
+        // #457 r6 — PAIRED REPLAY (order matches the hsjournal-first
+        // write order): apply this group's `.hsjournal` half to the LIVE
+        // SIDECAR first (merging only this group's record — the journal is
+        // a whole-file image captured at stage time, and a later durable
+        // save of OTHER groups must survive the replay), then the legacy
+        // half's record into the named store, then the snapshot; delete
+        // BOTH journals only after every live file is durable. A crash at
+        // any point leaves either the full pair (replayed again, idempotent
+        // record merges) or — for a legacy-only orphan written by a
+        // pre-r6 binary — the legacy replay with the orphan rule below
+        // guarding the sidecar.
+        let hsjournal_path = treekem_home_suite_journal_path(treekem_dir, &journal.group_id_hex);
+        if let Ok(hs_bytes) = tokio::fs::read(&hsjournal_path).await {
+            match postcard::from_bytes::<HomeSuiteSidecarJournal>(&hs_bytes) {
+                Ok(hs_journal) if hs_journal.version == TREEKEM_HOME_SUITE_JOURNAL_VERSION => {
+                    merge_group_record_into_store_file(
+                        home_suite_groups_path,
+                        &journal.group_id_hex,
+                        &hs_journal.home_suite_json,
+                        "Home-Suite sidecar",
+                    )
+                    .await?;
+                }
+                Ok(_) => {
+                    tracing::warn!(
+                        group_id = %journal.group_id_hex,
+                        "ignoring unsupported .hsjournal version during paired replay"
+                    );
+                }
+                Err(e) => {
+                    return Err(anyhow::anyhow!(
+                        "decode .hsjournal for paired replay {}: {e}",
+                        hsjournal_path.display()
+                    ));
+                }
+            }
+        }
         persist_treekem_snapshot_bytes(
             treekem_dir,
             &journal.group_id_hex,
             journal.snapshot_envelope,
         )
         .await?;
-        let outcome = write_named_groups_json_atomic(named_groups_path, &journal.named_groups_json)
-            .await
-            .map_err(|e| anyhow::anyhow!("replay named groups journal: {e}"))?;
-        if outcome != AtomicWriteOutcome::Durable {
-            anyhow::bail!("replayed TreeKEM/named-groups journal was not directory-durable");
-        }
+        merge_group_record_into_store_file(
+            named_groups_path,
+            &journal.group_id_hex,
+            &journal.named_groups_json,
+            "named groups",
+        )
+        .await?;
         tokio::fs::remove_file(&path)
             .await
             .map_err(|e| anyhow::anyhow!("remove replayed TreeKEM journal: {e}"))?;
+        let _ = tokio::fs::remove_file(&hsjournal_path).await;
         tracing::warn!(group_id = %journal.group_id_hex, "replayed TreeKEM/named-group persistence journal after prior crash");
     }
     Ok(())
@@ -19433,6 +19497,50 @@ async fn remove_home_suite_sidecar_journal(treekem_dir: &FsPath, group_id_hex: &
 /// rewrite the sidecar from the journaled body, then remove the journal.
 /// At most one exists at a time (the atomic persist holds the persistence
 /// lock and removes it on every exit path after a successful commit).
+/// #457 r6/#4c: apply ONE group's record from a journal's whole-file image
+/// to the live store file — parse the journal image, take only
+/// `group_id_hex`'s entry, merge it into the CURRENT on-disk store (later
+/// durable saves of OTHER groups survive the replay), and write it back.
+/// A missing store file gets the journal's entry alone.
+async fn merge_group_record_into_store_file(
+    store_path: &FsPath,
+    group_id_hex: &str,
+    journal_image_json: &str,
+    label: &str,
+) -> anyhow::Result<()> {
+    let mut journal_view: HashMap<String, x0x::groups::GroupInfo> =
+        serde_json::from_str(journal_image_json)
+            .with_context(|| format!("parse {label} journal image"))?;
+    let Some(record) = journal_view.remove(group_id_hex) else {
+        // The journal predates this group's presence in that half —
+        // nothing to merge for it.
+        return Ok(());
+    };
+    // Try every alias the record may be keyed under in the live store.
+    let mut live: HashMap<String, x0x::groups::GroupInfo> =
+        match tokio::fs::read_to_string(store_path).await {
+            Ok(json) => serde_json::from_str(&json)
+                .with_context(|| format!("parse live {label} store during replay"))?,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+            Err(e) => {
+                return Err(e).with_context(|| format!("read live {label} store during replay"));
+            }
+        };
+    // Remove stale aliases (the record's stable id supersedes them).
+    let stable = record.stable_group_id().to_string();
+    live.retain(|_key, info| info.stable_group_id() != stable);
+    live.insert(group_id_hex.to_string(), record);
+    let merged =
+        serde_json::to_string(&live).with_context(|| format!("encode merged {label} store"))?;
+    let outcome = write_named_groups_json_atomic(store_path, &merged)
+        .await
+        .with_context(|| format!("replay {label} journal"))?;
+    if outcome != AtomicWriteOutcome::Durable {
+        anyhow::bail!("replayed {label} journal was not directory-durable");
+    }
+    Ok(())
+}
+
 pub(in crate::server) async fn recover_home_suite_sidecar_journals(
     sidecar_path: &FsPath,
     treekem_dir: &FsPath,
@@ -29428,12 +29536,24 @@ pub(in crate::server) mod tests {
         let journal_path = treekem_journal_path(&treekem_dir, &journal.group_id_hex);
         x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
 
-        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+        recover_treekem_named_journals(
+            &named_path,
+            &dir.path().join(HOME_SUITE_GROUPS_FILE),
+            &treekem_dir,
+        )
+        .await?;
 
-        assert_eq!(
-            tokio::fs::read_to_string(&named_path).await?,
-            named_groups_json
-        );
+        let replayed: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&tokio::fs::read_to_string(&named_path).await?)?;
+        // #457 r6: replay MERGES the journal's group record into the live
+        // store (record-semantic equality, not whole-file byte equality —
+        // the whole-file image is stale by design and later saves of other
+        // groups must survive).
+        let expected: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&named_groups_json)?;
+        let replayed_json = serde_json::to_string(&replayed)?;
+        let expected_json = serde_json::to_string(&expected)?;
+        assert_eq!(replayed_json, expected_json, "journal record replayed");
         assert_eq!(
             tokio::fs::read(treekem_snapshot_path(&treekem_dir, &journal.group_id_hex)).await?,
             snapshot_envelope
@@ -29480,7 +29600,12 @@ pub(in crate::server) mod tests {
         let journal_path = treekem_journal_path(&treekem_dir, &group_id);
         x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
 
-        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+        recover_treekem_named_journals(
+            &named_path,
+            &dir.path().join(HOME_SUITE_GROUPS_FILE),
+            &treekem_dir,
+        )
+        .await?;
 
         assert_eq!(
             tokio::fs::read_to_string(&named_path).await?,
@@ -29521,7 +29646,12 @@ pub(in crate::server) mod tests {
         let journal_path = treekem_journal_path(&treekem_dir, &group_id);
         x0x::storage::write_private_bytes(&journal_path, postcard::to_stdvec(&journal)?).await?;
 
-        recover_treekem_named_journals(&named_path, &treekem_dir).await?;
+        recover_treekem_named_journals(
+            &named_path,
+            &dir.path().join(HOME_SUITE_GROUPS_FILE),
+            &treekem_dir,
+        )
+        .await?;
 
         assert!(
             !named_path.exists(),
@@ -34234,8 +34364,14 @@ mod hs451_downgrade_safety {
         let (legacy_json, sidecar_json) = encode_named_groups_store(&next_groups).expect("encode");
         let envelope = vec![7u8; 16];
 
-        // Crash point: BOTH journals written, sidecar WRITTEN (new),
-        // snapshot NOT yet (stale file absent), roster NOT yet (old view).
+        // #457 r6 — crash point: BOTH journals committed (hsjournal first,
+        // legacy = commit point last, matching BOTH write paths), NO live
+        // file touched yet (sidecar absent, snapshot absent, roster = old
+        // placeholder view). The old test PRE-WROTE the live sidecar,
+        // masking the recovery-order defect this round fixes.
+        write_home_suite_sidecar_journal(&treekem, &home_id, &sidecar_json)
+            .await
+            .expect("hsjournal write (first)");
         let journal = TreeKemNamedPersistJournal {
             version: TREEKEM_NAMED_JOURNAL_VERSION,
             group_id_hex: home_id.clone(),
@@ -34247,33 +34383,42 @@ mod hs451_downgrade_safety {
             postcard::to_stdvec(&journal).expect("journal encode"),
         )
         .await
-        .expect("journal write");
-        write_home_suite_sidecar_journal(&treekem, &home_id, &sidecar_json)
-            .await
-            .expect("hsjournal write");
-        write_named_groups_json_atomic(&sidecar_path, &sidecar_json)
-            .await
-            .expect("sidecar write (crash point)");
+        .expect("legacy journal write (last, commit point)");
 
         // Startup recovery, exactly as serve() orders it.
-        recover_treekem_named_journals(&named_path, &treekem)
+        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
             .await
-            .expect("treekem journal recovery");
+            .expect("treekem journal recovery (paired)");
         recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
             .await
-            .expect("sidecar journal recovery");
+            .expect("sidecar journal recovery (orphans only)");
 
-        // The trio is consistent and every journal is consumed.
+        // The trio is consistent and every journal is consumed. The
+        // sidecar must now hold the NEW record — applied by the PAIRED
+        // replay, not pre-written by the test.
         let legacy = tokio::fs::read_to_string(&named_path).await.expect("read");
-        assert_eq!(
-            legacy, legacy_json,
-            "roster replayed from the legacy journal"
-        );
         old_decoder_451::parse_roster(&legacy).expect("old decoder still parses");
+        let merged = load_named_groups_merged(&named_path, &sidecar_path)
+            .await
+            .expect("merged load after replay");
+        let real = &merged[&home_id];
+        assert!(
+            matches!(
+                real.policy.admission,
+                x0x::groups::GroupAdmission::OwnerCertified(_)
+            ),
+            "the merged group carries the NEW sidecar record (paired replay applied it)"
+        );
+        assert!(real.home.is_some(), "new sidecar fields survive the replay");
         let sidecar_after = tokio::fs::read_to_string(&sidecar_path)
             .await
             .expect("sidecar read");
-        assert_eq!(sidecar_after, sidecar_json);
+        let sidecar_view: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&sidecar_after).expect("sidecar parses");
+        assert!(
+            sidecar_view.contains_key(&home_id),
+            "the live sidecar holds the group record"
+        );
         let snap = tokio::fs::read(treekem.join(format!("{home_id}.snap")))
             .await
             .expect("snapshot replayed");
@@ -34456,26 +34601,72 @@ mod hs451_downgrade_safety {
             "the durable named save is committed"
         );
 
+        // #457 r6/4c: BEFORE the restart, mutate a DIFFERENT group and
+        // save it durably — the journal is a WHOLE-FILE image captured at
+        // stage time, so a naive replay would clobber this newer save.
+        // The paired record-merging replay must preserve BOTH.
+        let witness_id = "B3".repeat(32);
+        {
+            let mut groups = state.named_groups.write().await;
+            let mut witness = x0x::groups::GroupInfo::with_policy(
+                "Witness".to_string(),
+                String::new(),
+                state.agent.agent_id(),
+                witness_id.clone(),
+                x0x::groups::GroupPolicy::default(),
+            );
+            witness.recompute_state_hash();
+            groups.insert(witness_id.clone(), witness.clone());
+        }
+        let witness_info = {
+            let groups = state.named_groups.read().await;
+            groups.get(&witness_id).cloned().expect("witness")
+        };
+        persist_named_group_info(state, &witness_id, witness_info)
+            .await
+            .expect("witness saved durably before the restart");
+
         // Simulate the restart: unblock the snapshot path and run the
         // production recovery exactly as serve() orders it.
         tokio::fs::remove_dir(&snap_path).await.expect("unblock");
-        recover_treekem_named_journals(&state.named_groups_path, &state.treekem_dir)
-            .await
-            .expect("legacy journal recovery");
+        recover_treekem_named_journals(
+            &state.named_groups_path,
+            &state.home_suite_groups_path,
+            &state.treekem_dir,
+        )
+        .await
+        .expect("legacy journal recovery");
         recover_home_suite_sidecar_journals(&state.home_suite_groups_path, &state.treekem_dir)
             .await
             .expect("sidecar journal recovery");
 
-        // No wedge: the snapshot exists and its envelope binding matches
-        // the (re-loaded) named state.
+        // No wedge: reload ENTIRELY from disk (not the in-memory map) and
+        // assert the journaled group is present with the rebound binding,
+        // the witness group's newer state survived, and BOTH journals are
+        // consumed.
+        let merged =
+            load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                .await
+                .expect("merged reload after replay");
+        let info = merged.get(&group_id).expect("group present after replay");
         let snapshot_bytes = tokio::fs::read(&snap_path)
             .await
             .expect("snapshot replayed — no #457 wedge");
         let envelope = decode_treekem_snapshot_envelope(&snapshot_bytes)
             .expect("envelope decodes")
             .expect("bound envelope");
-        let groups = state.named_groups.read().await;
-        let info = groups.get(&group_id).expect("group present after replay");
+        assert!(
+            merged.contains_key(&witness_id),
+            "#457 r6/4c: the OTHER group's later durable save survives the journal replay"
+        );
+        assert!(
+            !treekem_journal_path(&state.treekem_dir, &group_id).exists(),
+            "legacy journal consumed"
+        );
+        assert!(
+            !treekem_home_suite_journal_path(&state.treekem_dir, &group_id).exists(),
+            "sidecar journal consumed"
+        );
         assert!(
             treekem_snapshot_envelope_matches_info(&envelope, info),
             "snapshot/named binding is consistent after the crash-replay"

@@ -605,7 +605,7 @@ pub async fn serve_with_options(
             treekem_dir.display()
         );
     }
-    recover_treekem_named_journals(&named_groups_path, &treekem_dir)
+    recover_treekem_named_journals(&named_groups_path, &home_suite_groups_path, &treekem_dir)
         .await
         .map_err(|e| anyhow::anyhow!("failed to recover TreeKEM persistence journal: {e}"))?;
     // Review r2 (#451): replay leftover Home-Suite sidecar journals before

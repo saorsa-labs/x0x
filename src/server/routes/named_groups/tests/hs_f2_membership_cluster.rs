@@ -1850,6 +1850,10 @@ struct R3Stage {
     authority_hex: String,
     authority_key_bytes: (Vec<u8>, Vec<u8>),
     base_policy_hash: String,
+    /// r6: the stage authority's OWNER USER key (seed [0xF3]) — tests
+    /// re-issue head attestations for mutated heads so the ONLY refusing
+    /// check is the one under test.
+    owner_kp: UserKeypair,
 }
 
 async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
@@ -1866,6 +1870,7 @@ async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
         let info = groups.get(&stage.group_id).expect("stub");
         x0x::groups::compute_policy_hash(&info.policy)
     };
+    let owner_kp = UserKeypair::from_seed(&[0xF3u8; 32])?;
     let head_attestation = staged_head_attestation(&stage).await;
     Ok(R3Stage {
         _keep_alive,
@@ -1878,6 +1883,7 @@ async fn r3_stage(group_byte: u8) -> Result<R3Stage> {
         authority_hex: hex::encode(stage.authority.agent.agent_id().as_bytes()),
         authority_key_bytes: stage.authority_key_bytes.clone(),
         base_policy_hash,
+        owner_kp,
     })
 }
 
@@ -2873,18 +2879,18 @@ async fn issue458r5_stale_joiner_removed_admin_fork_rejected() -> Result<()> {
     Ok(())
 }
 
-/// #458 r5b: withdrawal is TERMINAL — a withdrawn link followed by an
-/// unwithdrawn MemberAdded terminal must be refused outright.
+/// #458 r5b/r6 item 3: withdrawal is TERMINAL — a WITHDRAWN intermediate
+/// link followed by an UNWITHDRAWN MemberAdded terminal must be refused
+/// outright. The terminal is RE-SIGNED to chain from the withdrawn link
+/// and the owner attestation is RE-ISSUED for the mutated head, so the
+/// anchor CAS, linkage, roster and hash checks all PASS and the ONLY
+/// refusing check is withdrawal terminality.
 #[tokio::test]
 async fn issue458r5_withdrawn_link_refused() -> Result<()> {
     let stage = r3_stage(0x82).await?;
     let real = stage.chain.first().cloned().expect("one link");
     let signer =
         AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
-    let mut withdrawn_roster = real.roster.clone();
-    // A withdrawn commit's roster root covers the surviving projection;
-    // keep the base roster for internal consistency of the forged link.
-    let _ = &mut withdrawn_roster;
     let withdrawn_commit = x0x::groups::GroupStateCommit::sign(
         real.commit.group_id.clone(),
         real.commit.revision,
@@ -2898,17 +2904,183 @@ async fn issue458r5_withdrawn_link_refused() -> Result<()> {
         &signer,
     )?;
     let withdrawn_link = x0x::groups::state_commit::RetainedCommit {
-        commit: withdrawn_commit,
+        commit: withdrawn_commit.clone(),
         roster: real.roster.clone(),
         meta: real.meta.clone(),
     };
-    // The staged terminal keeps its own hashes; the withdrawn check fires
-    // inside the fold loop (before terminal linkage), so the refusal
-    // reason is withdrawal terminality.
-    let mut chain = stage.chain.clone();
-    chain[0] = withdrawn_link;
-    let result = r3_apply_with_chain(&stage, chain).await;
-    assert!(!result.accepted, "withdrawn chain → adoption refused");
+
+    // UNWITHDRAWN terminal chained from the withdrawn link: roster =
+    // withdrawn link's roster + joiner, all hashes consistent, signed by
+    // the authority.
+    let (joiner_cert_b64, joiner_kp_hash) = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            certificate_b64,
+            treekem_key_package_hash,
+            ..
+        } => (certificate_b64.clone(), treekem_key_package_hash.clone()),
+        _ => panic!("stage member_added"),
+    };
+    let mut members = std::collections::BTreeMap::new();
+    for (id, snap) in &real.roster {
+        let mut m = x0x::groups::GroupMember::new_member(id.clone(), None, None, 0);
+        m.role = snap.role;
+        m.state = snap.state;
+        members.insert(id.clone(), m);
+    }
+    let mut added = x0x::groups::GroupMember::new_member(stage.joiner_hex.clone(), None, None, 0);
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let Some(b64) = &joiner_cert_b64 {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    members.insert(stage.joiner_hex.clone(), added);
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        withdrawn_commit.group_id.clone(),
+        withdrawn_commit.revision + 1,
+        Some(withdrawn_commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(&members),
+        withdrawn_commit.policy_hash.clone(),
+        withdrawn_commit.public_meta_hash.clone(),
+        withdrawn_commit.security_binding.clone(),
+        false, // UNWITHDRAWN terminal after a withdrawn link
+        withdrawn_commit.revision + 1,
+        &signer,
+    )?;
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: stage.authority_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: joiner_kp_hash,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: joiner_cert_b64,
+        commit: Some(terminal.clone()),
+    };
+    // Fresh owner attestation for the MUTATED head (the withdrawn link's
+    // hash) so the anchor CAS passes.
+    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
+        &stage.group_id,
+        terminal.revision - 1,
+        terminal.prev_state_hash.as_deref().unwrap_or_default(),
+        &stage.joiner_hex,
+        &stage.owner_kp,
+    )
+    .expect("attest");
+
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    stage
+        .joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![withdrawn_link]);
+    stage
+        .joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let actor = crate::server::parse_agent_id_hex(&stage.authority_hex).expect("actor");
+    let result =
+        apply_named_group_metadata_event(&stage.joiner_state, event, actor, true, None).await;
+    assert!(
+        !result.accepted,
+        "#458 r6: an unwithdrawn terminal after a withdrawn link MUST be refused"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "the joiner stays pending"
+        );
+        assert!(
+            !info.withdrawn,
+            "the withdrawn fork must not touch the stub"
+        );
+    }
+    Ok(())
+}
+
+/// #458 r6 item 4: a GSS/legacy `security_binding` that CHANGED inside the
+/// gap (an unverifiable secret rotation) refuses adoption — the binding is
+/// never copied unverified. Terminal re-signed with a CHANGED binding,
+/// owner attestation re-issued, so ONLY the binding gate refuses.
+#[tokio::test]
+async fn issue458r6_gss_binding_change_refused() -> Result<()> {
+    let stage = r3_stage(0x86).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let stage2 = &stage;
+    let _ = stage2;
+    // Terminal identical to the staged one EXCEPT the binding string.
+    let terminal = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            commit: Some(commit),
+            ..
+        } => commit.clone(),
+        _ => panic!("commit"),
+    };
+    let rotated = x0x::groups::GroupStateCommit::sign(
+        terminal.group_id.clone(),
+        terminal.revision,
+        terminal.prev_state_hash.clone(),
+        terminal.roster_root.clone(),
+        terminal.policy_hash.clone(),
+        terminal.public_meta_hash.clone(),
+        Some("gss:epoch=99".to_string()), // CHANGED binding
+        terminal.withdrawn,
+        terminal.committed_at,
+        &signer,
+    )?;
+    let mut event = stage.member_added.clone();
+    if let NamedGroupMetadataEvent::MemberAdded {
+        commit: commit_slot,
+        ..
+    } = &mut event
+    {
+        *commit_slot = Some(rotated.clone());
+    }
+    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
+        &stage.group_id,
+        rotated.revision - 1,
+        rotated.prev_state_hash.as_deref().unwrap_or_default(),
+        &stage.joiner_hex,
+        &stage.owner_kp,
+    )
+    .expect("attest");
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    stage
+        .joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![real]);
+    stage
+        .joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let actor = crate::server::parse_agent_id_hex(&stage.authority_hex).expect("actor");
+    let result =
+        apply_named_group_metadata_event(&stage.joiner_state, event, actor, true, None).await;
+    assert!(
+        !result.accepted,
+        "#458 r6: a changed GSS/legacy binding inside the gap must be REFUSED"
+    );
     Ok(())
 }
 
