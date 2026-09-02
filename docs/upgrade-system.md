@@ -146,15 +146,22 @@ sees a shape it cannot parse:
      never replay these bytes: DELETE the quarantined files to accept
      the live state (renaming them back re-enters the same branch).
   4. **Legacy-only** — no `.hsjournal` exists (the shape every released
-     v0.40.x leaves); only the legacy journal is quarantined. Accept the
-     live state by deleting it, or replay it by the fork procedure in (1).
-  5. **Split pair** (log: "SPLIT pair ... legacy quarantined, sidecar
-     live") — a quarantine partially completed: the legacy half is aside,
-     the `.hsjournal` is STILL at its live name and is deliberately left
-     there. To accept the live state: delete the aside legacy file AND
-     the live `.hsjournal`. To retry the quarantine: delete the aside
-     legacy file and restart (the pair is re-evaluated from the live
-     `.hsjournal` as an orphan and discarded — the live state stands).
+     v0.40.x leaves); only the legacy journal is quarantined. SINGLE-HALF
+     procedure: to accept the live state, delete the one quarantined
+     `.journal.quarantined-*` file. To replay the legacy journal instead,
+     delete the group's live state (`named_groups.json` entry + sidecar
+     entry + `<group>.snap`) and rename that one file back to
+     `<group>.journal` — there is NO second half to restore.
+  5. **Split pair** (log: "SPLIT pair"; files: `<group>.journal.
+     quarantined-…` plus `<group>.hsjournal.split-<ms>-<seq>`) — a
+     quarantine partially completed. To ACCEPT THE LIVE STATE: delete
+     both aside files. To RETRY the transaction: delete the group's live
+     state files, rename the quarantined `.journal.quarantined-*` file
+     back to `<group>.journal`, rename the `.hsjournal.split-*` file back
+     to `<group>.hsjournal`, and restart — the paired pass re-runs the
+     verdict on the restored pair. (Deleting the aside legacy and leaving
+     the `.split-*` file is NOT a retry: the next boot sees no live
+     journals and simply keeps the live state.)
   6. **Durability-uncertain** (log: "durability uncertain") — both halves
      are renamed aside but the directory fsync failed; they may revert on
      power loss. Treat as (1)/(2) per the triggering cause.

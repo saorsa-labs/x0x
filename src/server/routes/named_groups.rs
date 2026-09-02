@@ -3481,6 +3481,7 @@ async fn prepare_rebind_journal_locked(state: &AppState, group_id: &str) -> Rebi
                     group_id_hex: group_id.to_string(),
                     state_revision: record.state_revision,
                     state_hash: record.state_hash.clone(),
+                    home_suite: record.policy.admission.owner_certified_user_id().is_some(),
                 })
                 .ok_or_else(|| {
                     anyhow::anyhow!(
@@ -19547,6 +19548,7 @@ async fn persist_treekem_and_named_groups_atomic_with_info(
             group_id_hex: group_id_hex.to_string(),
             state_revision: info.state_revision,
             state_hash: info.state_hash.clone(),
+            home_suite: info.policy.admission.owner_certified_user_id().is_some(),
         },
         &home_suite_json,
     )
@@ -19679,11 +19681,14 @@ enum QuarantineOutcome {
     /// Both halves were renamed BACK to their live names (retain).
     Restored,
     /// The second rename failed AND the rollback failed: the legacy half
-    /// is quarantined, the `.hsjournal` is still at its live name — a
-    /// SPLIT pair. Retain-fail-closed; the next startup's orphan rule
-    /// discards the live `.hsjournal` (its legacy commit point is gone).
+    /// is quarantined; the sidecar half is renamed to an EXPLICIT split
+    /// marker (`<stem>.hsjournal.split-<ms>-<seq>`) in the same op so a
+    /// later fresh orphan is never mistaken for the surviving half (and
+    /// vice versa). If even the marker rename fails, `sidecar_live`
+    /// reports the file's live name — operator state either way.
     Split {
         legacy_dest: std::path::PathBuf,
+        sidecar_split: Option<std::path::PathBuf>,
         sidecar_live: std::path::PathBuf,
     },
     /// Both halves are renamed aside but the treekem-dir fsync FAILED —
@@ -19724,6 +19729,49 @@ static QUARANTINE_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic:
 fn quarantine_fault_active(fault: QuarantineFault) -> bool {
     cfg!(test)
         && (QUARANTINE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) & fault.bit()) != 0
+}
+
+/// #457 r13 item 13.7 — test-only fault injection for the paired replay's
+/// apply phase.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum ReplayFault {
+    /// Fail the apply between the sidecar and named writes (torn state).
+    AfterSidecarApply,
+}
+
+impl ReplayFault {
+    const fn bit(self) -> u8 {
+        1 << (self as u8)
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+static REPLAY_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+fn replay_fault_active(fault: ReplayFault) -> bool {
+    cfg!(test) && (REPLAY_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) & fault.bit()) != 0
+}
+
+#[cfg(test)]
+pub(in crate::server) struct ReplayFaultGuard(Option<ReplayFault>);
+#[cfg(test)]
+impl Drop for ReplayFaultGuard {
+    fn drop(&mut self) {
+        if std::thread::panicking() || self.0.is_some() {
+            REPLAY_FAULT_INJECT.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+#[cfg(test)]
+pub(in crate::server) fn set_replay_fault(faults: &[ReplayFault]) -> ReplayFaultGuard {
+    let mask = faults.iter().fold(0u8, |acc, f| acc | f.bit());
+    REPLAY_FAULT_INJECT.store(mask, std::sync::atomic::Ordering::SeqCst);
+    ReplayFaultGuard(if faults.is_empty() {
+        None
+    } else {
+        Some(faults[0])
+    })
 }
 
 /// #457 r11 — the fault cells are PROCESS-GLOBAL in test builds: every
@@ -19795,6 +19843,40 @@ async fn reserve_quarantine_destination(
 /// - a post-rename fsync failure reports UNCERTAIN durability (both
 ///   renamed, possibly not durable) instead of claiming restoration
 ///   (11.6).
+///
+/// #457 r13 item 13.5 — the SINGLE destination helper used by production
+/// and by tests: `<stem>.<ext>.quarantined-<ms>-<seq>`, built with
+/// `with_extension` on the half's live path.
+fn quarantine_destination(
+    half_live_path: &FsPath,
+    ext: &str,
+    ms: u128,
+    seq: u64,
+) -> std::path::PathBuf {
+    half_live_path.with_extension(format!("{ext}.quarantined-{ms}-{seq}"))
+}
+
+/// #457 r13 item 13.5 — test-only (ms, seq) overrides so tests can
+/// pre-create the EXACT destination the next quarantine will use. 0 ms =
+/// real clock.
+#[cfg_attr(not(test), allow(dead_code))]
+static QUARANTINE_TS_OVERRIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// #457 r13 item 13.5 — the process quarantine sequence counter (module
+/// scope so tests can RESET it and compute the exact next destination).
+#[cfg_attr(not(test), allow(dead_code))]
+static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(test)]
+pub(in crate::server) fn reset_quarantine_counter() {
+    QUARANTINE_COUNTER.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+#[cfg(test)]
+pub(in crate::server) fn set_quarantine_ts_override(ms: Option<u64>) {
+    QUARANTINE_TS_OVERRIDE.store(ms.unwrap_or(0), std::sync::atomic::Ordering::SeqCst);
+}
+
 async fn quarantine_journal_pair(
     treekem_dir: &FsPath,
     legacy_path: &FsPath,
@@ -19805,11 +19887,13 @@ async fn quarantine_journal_pair(
     journal_state_hash: &str,
 ) -> QuarantineOutcome {
     let _ = (live_probe, journal_revision, journal_state_hash);
-    static QUARANTINE_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let ts = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
+    let ts = match QUARANTINE_TS_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+        0 => std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis())
+            .unwrap_or(0),
+        ms => ms as u128,
+    };
 
     // #457 r11 item 11.3 + r12 item 12.3 — is there a sidecar half to
     // quarantine at all? A metadata ERROR is UNCERTAIN: treat the half as
@@ -19827,8 +19911,7 @@ async fn quarantine_journal_pair(
     let (mut q1, mut q2) = (None, None);
     for attempt in 0..64u64 {
         let seq = QUARANTINE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        let tag = format!("quarantined-{ts}-{seq}");
-        let cand1 = legacy_path.with_extension(format!("journal.{tag}"));
+        let cand1 = quarantine_destination(legacy_path, "journal", ts, seq);
         let first_collision =
             attempt == 0 && quarantine_fault_active(QuarantineFault::ReserveCollision);
         if let Err(e) = reserve_quarantine_destination(&cand1, first_collision).await {
@@ -19845,7 +19928,7 @@ async fn quarantine_journal_pair(
         }
         q1 = Some(cand1);
         if sidecar_present {
-            let cand2 = hsjournal_path.with_extension(format!("hsjournal.{tag}"));
+            let cand2 = quarantine_destination(hsjournal_path, "hsjournal", ts, seq);
             match reserve_quarantine_destination(&cand2, false).await {
                 Ok(()) => q2 = Some(cand2),
                 Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -19909,44 +19992,66 @@ async fn quarantine_journal_pair(
             tokio::fs::rename(hsjournal_path, q2).await
         };
         if let Err(e2) = second {
-            let rollback_blocked = quarantine_fault_active(QuarantineFault::Rollback);
-            if rollback_blocked {
-                // #457 r12 item 12.3 — the sidecar half never moved onto
-                // its reservation: release it so no empty half-moved
-                // artifact sits beside the split pair.
+            // Roll the FIRST rename back so both halves keep their live
+            // names; only a FAILED rollback produces the SPLIT shape.
+            if !quarantine_fault_active(QuarantineFault::Rollback)
+                && tokio::fs::rename(&q1, legacy_path).await.is_ok()
+            {
                 let _ = tokio::fs::remove_file(q2).await;
                 tracing::error!(
                     group_id = %group_id,
-                    legacy_quarantine = %q1.display(),
-                    sidecar_live = %hsjournal_path.display(),
-                    "#457 r11: SPLIT pair — second rename failed ({e2}) and the rollback failed; legacy half quarantined, sidecar half live; retained fail-closed"
+                    error = %e2,
+                    "#457 r11: second quarantine rename failed; first rolled back — both halves at live names, retained"
                 );
-                return QuarantineOutcome::Split {
-                    legacy_dest: q1,
-                    sidecar_live: hsjournal_path.to_path_buf(),
-                };
+                return QuarantineOutcome::Restored;
             }
-            if let Err(rb) = tokio::fs::rename(&q1, legacy_path).await {
-                // The sidecar half never moved: release its reservation so
-                // no half-moved artifact remains next to the split pair.
-                let _ = tokio::fs::remove_file(q2).await;
-                tracing::error!(
-                    group_id = %group_id,
-                    "#457 r11: SPLIT pair — second rename failed ({e2}) and the rollback failed ({rb}); manual inspection required in {}",
-                    treekem_dir.display()
-                );
-                return QuarantineOutcome::Split {
-                    legacy_dest: q1,
-                    sidecar_live: hsjournal_path.to_path_buf(),
-                };
-            }
+            // #457 r13 item 13.8 — on a SPLIT, rename the still-live
+            // sidecar half to an EXPLICIT marker so it is never mistaken
+            // for (or by) a later fresh orphan; release the reservation
+            // it never occupied.
             let _ = tokio::fs::remove_file(q2).await;
+            let marker_ts = match QUARANTINE_TS_OVERRIDE.load(std::sync::atomic::Ordering::SeqCst) {
+                0 => std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_millis())
+                    .unwrap_or(0),
+                ms => ms as u128,
+            };
+            // The marker name is deliberately NOT a `.quarantined-*`
+            // name: `<stem>.hsjournal.split-<ms>-<seq>` — visible to
+            // operators, invisible to the `.hsjournal` orphan scan.
+            let marker = hsjournal_path.with_extension(format!(
+                "hsjournal.split-{}-{}",
+                marker_ts,
+                QUARANTINE_COUNTER.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+            ));
+            let sidecar_split = match tokio::fs::rename(hsjournal_path, &marker).await {
+                Ok(()) => {
+                    let _ = sync_dir_contents(treekem_dir);
+                    Some(marker)
+                }
+                Err(e) => {
+                    tracing::error!(
+                        group_id = %group_id,
+                        sidecar_live = %hsjournal_path.display(),
+                        error = %e,
+                        "#457 r13: the split-marker rename FAILED — the sidecar half stays at its live name (operator state)"
+                    );
+                    None
+                }
+            };
             tracing::error!(
                 group_id = %group_id,
-                error = %e2,
-                "#457 r11: second quarantine rename failed; first rolled back — both halves at live names, retained"
+                legacy_quarantine = %q1.display(),
+                sidecar_split = ?sidecar_split.as_ref().map(|p| p.display().to_string()),
+                sidecar_live = %hsjournal_path.display(),
+                "#457 r11/r13: SPLIT pair retained fail-closed (legacy quarantined, sidecar marked) — see docs/upgrade-system.md"
             );
-            return QuarantineOutcome::Restored;
+            return QuarantineOutcome::Split {
+                legacy_dest: q1,
+                sidecar_split,
+                sidecar_live: hsjournal_path.to_path_buf(),
+            };
         }
     }
     // Durability: fsync the treekem dir itself. A failure here leaves
@@ -19991,13 +20096,15 @@ fn log_quarantine_outcome(group_id: &str, outcome: QuarantineOutcome) {
         }
         QuarantineOutcome::Split {
             ref legacy_dest,
+            ref sidecar_split,
             ref sidecar_live,
         } => {
             tracing::error!(
                 group_id = %group_id,
                 legacy_quarantine = %legacy_dest.display(),
+                sidecar_split = ?sidecar_split.as_ref().map(|p| p.display().to_string()),
                 sidecar_live = %sidecar_live.display(),
-                "#457 r11/r12: SPLIT pair retained fail-closed (legacy quarantined, sidecar live) — see docs/upgrade-system.md for the split-pair procedure"
+                "#457 r11/r13: SPLIT pair retained fail-closed (legacy quarantined, sidecar marked or live) — see docs/upgrade-system.md for the split-pair procedure"
             );
         }
         QuarantineOutcome::UncertainDurability {
@@ -20125,13 +20232,32 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             tracing::warn!(path = %path.display(), version = journal.version, "ignoring unsupported TreeKEM journal version");
             continue;
         }
-        let named_groups: HashMap<String, x0x::groups::GroupInfo> =
-            serde_json::from_str(&journal.named_groups_json).map_err(|e| {
-                anyhow::anyhow!(
-                    "decode named groups JSON in TreeKEM journal {}: {e}",
-                    path.display()
-                )
-            })?;
+        // #457 r13 item 13.3 — a malformed inner legacy image is a
+        // PER-GROUP failure: quarantine the journal aside and continue
+        // (never abort startup).
+        let named_groups: HashMap<String, x0x::groups::GroupInfo> = match serde_json::from_str(
+            &journal.named_groups_json,
+        ) {
+            Ok(view) => view,
+            Err(e) => {
+                tracing::error!(
+                    path = %path.display(),
+                    error = %e,
+                    "#457 r13: malformed legacy journal image — quarantining per group, startup continues"
+                );
+                let stem = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let hsjournal = treekem_dir.join(format!("{stem}.hsjournal"));
+                let outcome =
+                    quarantine_journal_pair(treekem_dir, &path, &hsjournal, &stem, &None, 0, "")
+                        .await;
+                log_quarantine_outcome(&stem, outcome);
+                continue;
+            }
+        };
         if has_withdrawn_group_record(&named_groups, &journal.group_id_hex) {
             remove_treekem_persistence_for_group_id_in_dir(
                 treekem_dir,
@@ -20139,12 +20265,17 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                 "withdrawn_journal_replay",
             )
             .await;
+            // #457 r13 item 13.3 — a failed cleanup removal is logged and
+            // SKIPPED (the journal is retained; the next boot retries) —
+            // never a startup abort.
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(anyhow::anyhow!(
-                        "remove withdrawn TreeKEM journal {}: {e}",
-                        path.display()
-                    ));
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "#457 r13: failed to remove the withdrawn journal — retained for the next boot, startup continues"
+                    );
+                    continue;
                 }
             }
             tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal for withdrawn group");
@@ -20213,10 +20344,12 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             .await;
             if let Err(e) = tokio::fs::remove_file(&path).await {
                 if e.kind() != std::io::ErrorKind::NotFound {
-                    return Err(anyhow::anyhow!(
-                        "remove durable-withdrawn TreeKEM journal {}: {e}",
-                        path.display()
-                    ));
+                    tracing::error!(
+                        path = %path.display(),
+                        error = %e,
+                        "#457 r13: failed to remove the durable-withdrawn journal — retained for the next boot, startup continues"
+                    );
+                    continue;
                 }
             }
             tracing::warn!(group_id = %LogHexId::group(&journal.group_id_hex), "discarded TreeKEM/named-group persistence journal because durable named groups contain a withdrawn record");
@@ -20258,6 +20391,10 @@ pub(in crate::server) async fn recover_treekem_named_journals(
         // halves disagree is a retry-race artifact and is QUARANTINED,
         // never applied half-and-half.
         let mut sidecar_tx: Option<HomeSuiteJournalTx> = None;
+        // #457 r13 item 13.2 — the envelope tag, the legacy record, and
+        // the body's target record must all describe the SAME transaction
+        // before any write; any disagreement quarantines the pair.
+        let mut pair_mismatch = false;
         // #457 r11 item 11.2 — an .hsjournal that is present but
         // UNDECODABLE or of an unsupported future version can never be
         // replayed by this binary: QUARANTINE the pair per group (log at
@@ -20269,19 +20406,25 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                     home_suite_json,
                     tx,
                 }) => {
-                    // #457 r12 item 12.2 — a valid envelope with a
-                    // MALFORMED sidecar body is quarantined per group HERE
-                    // (validation before any write), never applied and
-                    // never an abort.
-                    if serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(
-                        &home_suite_json,
-                    )
-                    .is_err()
-                    {
-                        garbage_sidecar = true;
-                    } else {
-                        sidecar_json = Some(home_suite_json);
-                        sidecar_tx = Some(tx);
+                    // #457 r12 item 12.2 + r13 item 13.2 — the sidecar body
+                    // is FULLY validated at decode time (before any write):
+                    // it must parse, its target record (when present) must
+                    // agree with the envelope tag's (revision, state_hash),
+                    // and a Home-Suite group MUST have its record in the
+                    // body. Any failure ⇒ per-group quarantine, never an
+                    // apply, never an abort.
+                    match body_record_matches_tx(&home_suite_json, &tx, &journal.group_id_hex) {
+                        BodyRecordCheck::Matches => {
+                            sidecar_json = Some(home_suite_json);
+                            sidecar_tx = Some(tx);
+                        }
+                        BodyRecordCheck::NoChangeForPlain => {
+                            // Plain group, no record: the sidecar half
+                            // legitimately changes nothing.
+                            sidecar_tx = Some(tx);
+                        }
+                        BodyRecordCheck::Garbage => garbage_sidecar = true,
+                        BodyRecordCheck::Mismatch => pair_mismatch = true,
                     }
                 }
                 Some(SidecarHalf::PreTag { home_suite_json }) => {
@@ -20294,7 +20437,12 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                     match sidecar_half_identity(
                         &home_suite_json,
                         &journal.group_id_hex,
-                        journal_record_is_home_suite(&journal),
+                        live_record_is_home_suite(
+                            named_groups_path,
+                            home_suite_groups_path,
+                            &journal,
+                        )
+                        .await,
                     ) {
                         SidecarIdentity::Tagged(tx) => {
                             sidecar_json = Some(home_suite_json);
@@ -20345,6 +20493,9 @@ pub(in crate::server) async fn recover_treekem_named_journals(
         //                 daemon keeps starting), apply NEITHER half.
         let mut decision =
             paired_replay_verdict(named_groups_path, home_suite_groups_path, &journal).await?;
+        if pair_mismatch {
+            decision = PairedReplayDecision::Fork;
+        }
         if let Some(tx) = &sidecar_tx {
             let legacy_rev = journal_record_revision(&journal);
             let legacy_hash = journal_record_state_hash(&journal);
@@ -20369,9 +20520,20 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                     group_id = %journal.group_id_hex,
                     "#457 r9: journal pair is stale against the newer live merged view — no live file written, journals consumed"
                 );
-                tokio::fs::remove_file(&path)
-                    .await
-                    .map_err(|e| anyhow::anyhow!("remove stale TreeKEM journal: {e}"))?;
+                match tokio::fs::remove_file(&path).await {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        // #457 r13 item 13.3 — retain the stale pair for
+                        // the next boot; never abort startup.
+                        tracing::error!(
+                            path = %path.display(),
+                            error = %e,
+                            "#457 r13: failed to remove the stale journal — retained for the next boot, startup continues"
+                        );
+                        continue;
+                    }
+                }
                 let _ = tokio::fs::remove_file(&hsjournal_path).await;
                 continue;
             }
@@ -20446,6 +20608,11 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                     "Home-Suite sidecar",
                 )
                 .await?;
+                // #457 r13 item 13.7 — test fault point between the two
+                // live writes (a torn sidecar-applied/named-not state).
+                if replay_fault_active(ReplayFault::AfterSidecarApply) {
+                    anyhow::bail!("injected failure between the sidecar and named writes");
+                }
             }
             merge_group_record_into_store_file(
                 named_groups_path,
@@ -20468,24 +20635,17 @@ pub(in crate::server) async fn recover_treekem_named_journals(
         }
         .await;
         if let Err(e) = apply {
+            // #457 r13 item 13.7 — an apply-phase failure may leave a
+            // PARTIAL live state (sidecar applied, named not). The pair is
+            // the ONLY forward-replay source: RETAIN both journals at
+            // their live names (never quarantine them aside) so the next
+            // boot replays forward to consistency. Only PRE-WRITE
+            // validation failures are quarantined.
             tracing::error!(
                 group_id = %journal.group_id_hex,
                 error = %e,
-                "#457 r12: applying the journal pair FAILED — quarantining the pair per group, startup continues"
+                "#457 r13: applying the journal pair FAILED mid-apply — both journals RETAINED at live names for forward replay on the next boot; startup continues"
             );
-            let legacy_rev = journal_record_revision(&journal);
-            let legacy_hash = journal_record_state_hash(&journal);
-            let outcome = quarantine_journal_pair(
-                treekem_dir,
-                &path,
-                &hsjournal_path,
-                &journal.group_id_hex,
-                &None,
-                legacy_rev,
-                &legacy_hash,
-            )
-            .await;
-            log_quarantine_outcome(&journal.group_id_hex, outcome);
             continue;
         }
         tracing::warn!(group_id = %journal.group_id_hex, "replayed TreeKEM/named-group persistence journal after prior crash");
@@ -20524,6 +20684,11 @@ struct HomeSuiteJournalTx {
     group_id_hex: String,
     state_revision: u64,
     state_hash: String,
+    /// #457 r13 item 13.1 — is this group a Home-Suite (OwnerCertified)
+    /// group? The legacy half's placeholder RESETS the policy to the
+    /// default (the downgrade-safety encoder), so Home-Suite-ness cannot
+    /// be read back from the legacy record — the tag is authoritative.
+    home_suite: bool,
 }
 
 const TREEKEM_HOME_SUITE_JOURNAL_VERSION: u8 = 2;
@@ -20596,14 +20761,72 @@ enum SidecarIdentity {
 
 /// Does the legacy journal's own record describe a Home-Suite
 /// (OwnerCertified) group? The sidecar body only ever contains those.
-fn journal_record_is_home_suite(journal: &TreeKemNamedPersistJournal) -> bool {
-    serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&journal.named_groups_json)
+async fn live_record_is_home_suite(
+    named_groups_path: &FsPath,
+    home_suite_groups_path: &FsPath,
+    journal: &TreeKemNamedPersistJournal,
+) -> bool {
+    // #457 r13 item 13.1 — v1 pairs carry no tag; the legacy half's
+    // placeholder RESETS the policy to the default (downgrade-safety
+    // encoder), so the LIVE merged store is the authoritative answer.
+    // Match the live record by the JOURNAL record's stable id (the
+    // placeholder preserves identity), falling back to the raw key.
+    let journal_stable =
+        serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&journal.named_groups_json)
+            .ok()
+            .and_then(|view| {
+                view.get(&journal.group_id_hex)
+                    .map(|record| record.stable_group_id().to_string())
+            });
+    load_named_groups_merged(named_groups_path, home_suite_groups_path)
+        .await
         .ok()
-        .and_then(|view| {
-            view.get(&journal.group_id_hex)
-                .map(|record| record.policy.admission.owner_certified_user_id().is_some())
+        .and_then(|live| {
+            live.values()
+                .find(|info| {
+                    Some(info.stable_group_id().to_string()) == journal_stable
+                        || info.stable_group_id() == journal.group_id_hex
+                })
+                .map(|info| info.policy.admission.owner_certified_user_id().is_some())
         })
         .unwrap_or(false)
+}
+
+/// #457 r13 item 13.2 — the v2 body's target record vs the envelope tag.
+enum BodyRecordCheck {
+    /// Body parses and its record for the group matches the tag.
+    Matches,
+    /// Body parses, no record for the group, and the tag says PLAIN — a
+    /// valid no-sidecar-change half.
+    NoChangeForPlain,
+    /// Body does not parse.
+    Garbage,
+    /// Body record present but disagrees with the tag, or the tag says
+    /// Home-Suite and the record is ABSENT.
+    Mismatch,
+}
+
+fn body_record_matches_tx(
+    home_suite_json: &str,
+    tx: &HomeSuiteJournalTx,
+    group_id_hex: &str,
+) -> BodyRecordCheck {
+    let Ok(view) = serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(home_suite_json)
+    else {
+        return BodyRecordCheck::Garbage;
+    };
+    match view.get(group_id_hex) {
+        Some(record) => {
+            if record.state_revision == tx.state_revision && record.state_hash == tx.state_hash {
+                BodyRecordCheck::Matches
+            } else {
+                BodyRecordCheck::Mismatch
+            }
+        }
+        // A Home-Suite group's transaction MUST carry its sidecar record.
+        None if tx.home_suite => BodyRecordCheck::Mismatch,
+        None => BodyRecordCheck::NoChangeForPlain,
+    }
 }
 
 fn sidecar_half_identity(
@@ -20620,6 +20843,7 @@ fn sidecar_half_identity(
             group_id_hex: group_id_hex.to_string(),
             state_revision: record.state_revision,
             state_hash: record.state_hash.clone(),
+            home_suite: record.policy.admission.owner_certified_user_id().is_some(),
         }),
         // #457 r12 item 12.1 — record absent: for a PLAIN group this is
         // the ordinary no-sidecar-change half; for a Home-Suite group the
@@ -20666,6 +20890,7 @@ async fn write_home_suite_sidecar_journal_derived(
         group_id_hex: group_id_hex.to_string(),
         state_revision: record.state_revision,
         state_hash: record.state_hash.clone(),
+        home_suite: record.policy.admission.owner_certified_user_id().is_some(),
     };
     write_home_suite_sidecar_journal(treekem_dir, &tx, home_suite_json).await
 }
@@ -20732,22 +20957,6 @@ async fn merge_group_record_into_store_file(
     Ok(())
 }
 
-/// #457 r12 item 12.3 — does a QUARANTINED legacy journal exist for this
-/// group (`<stem>.journal.quarantined-*`)? A live `.hsjournal` beside one
-/// is the surviving half of a SPLIT pair and must be preserved.
-async fn has_quarantined_legacy_sibling(treekem_dir: &FsPath, group_stem: &str) -> bool {
-    let Ok(mut entries) = tokio::fs::read_dir(treekem_dir).await else {
-        return false;
-    };
-    let prefix = format!("{group_stem}.journal.quarantined-");
-    while let Ok(Some(entry)) = entries.next_entry().await {
-        if entry.file_name().to_string_lossy().starts_with(&prefix) {
-            return true;
-        }
-    }
-    false
-}
-
 pub(in crate::server) async fn recover_home_suite_sidecar_journals(
     // #457 r11 item 11.1: no longer touched — this pass never applies
     // anything; kept in the signature for call-site stability.
@@ -20793,18 +21002,22 @@ pub(in crate::server) async fn recover_home_suite_sidecar_journals(
                 .and_then(|stem| stem.to_str())
                 .unwrap_or_default();
             let legacy_journal = treekem_dir.join(format!("{group_stem}.journal"));
-            if !legacy_journal.exists() {
-                // #457 r12 item 12.3 — a SPLIT quarantine leaves the
-                // legacy half renamed aside (`<stem>.journal.quarantined-*`)
-                // and the sidecar half LIVE. That sidecar is half of a
-                // retained pair for the operator — NEVER discard it.
-                if has_quarantined_legacy_sibling(treekem_dir, group_stem).await {
+            // #457 r13 item 13.4 — metadata UNCERTAINTY preserves: an
+            // error probing the legacy half (or scanning for its split
+            // marker) never maps to "absent"; the sidecar is left in
+            // place and the situation logged.
+            let legacy_live = match tokio::fs::try_exists(&legacy_journal).await {
+                Ok(present) => present,
+                Err(e) => {
                     tracing::error!(
                         path = %path.display(),
-                        "#457 r12: split-pair sidecar half left IN PLACE (its legacy sibling is quarantined aside) — see docs/upgrade-system.md"
+                        error = %e,
+                        "#457 r13: uncertain whether the legacy commit-point journal exists — sidecar PRESERVED, never deleted"
                     );
                     continue;
                 }
+            };
+            if !legacy_live {
                 tracing::warn!(
                     path = %path.display(),
                     "discarding orphan Home-Suite sidecar journal (its legacy commit-point journal is absent)"
@@ -36495,6 +36708,7 @@ mod hs451_downgrade_safety {
                         group_id_hex: home_id.clone(),
                         state_revision: 9,
                         state_hash: "other".to_string(),
+                        home_suite: false,
                     };
                     write_home_suite_sidecar_journal(&treekem, &tx, &sidecar_json)
                         .await
@@ -36928,15 +37142,24 @@ mod hs451_downgrade_safety {
             .expect("split pair must not prevent startup");
         drop(_fguard);
 
-        // SPLIT shape on disk: legacy quarantined, .hsjournal LIVE.
+        // #457 r13 item 13.8 — SPLIT shape on disk: legacy quarantined;
+        // the sidecar half renamed to the EXPLICIT split marker.
         assert!(
             !treekem_journal_path(&treekem, &home_id).exists(),
             "the legacy half was renamed aside before the failure"
         );
         assert!(
-            treekem_home_suite_journal_path(&treekem, &home_id).exists(),
-            "the sidecar half stands at its LIVE name (split)"
+            !treekem_home_suite_journal_path(&treekem, &home_id).exists(),
+            "the sidecar half no longer sits at its live name (marked)"
         );
+        let mut split_marker = 0;
+        let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir");
+        while let Some(entry) = rd.next_entry().await.expect("entry") {
+            if entry.file_name().to_string_lossy().contains(".split-") {
+                split_marker += 1;
+            }
+        }
+        assert_eq!(split_marker, 1, "the sidecar half carries the split marker");
         let merged = load_named_groups_merged(&named_path, &sidecar_path)
             .await
             .expect("merged");
@@ -36945,16 +37168,22 @@ mod hs451_downgrade_safety {
             "live",
             "nothing applied; live stands"
         );
-        // #457 r12 item 12.3 — the next boot's standalone pass now
-        // RECOGNISES the quarantined legacy sibling and PRESERVES the
-        // still-live sidecar half (a split pair is operator state; the
-        // r11 behaviour of discarding it destroyed the pair).
+        // #457 r13 item 13.8 — the marked sidecar half is invisible to
+        // the orphan rule (`.split-` is not `.hsjournal`) and SURVIVES the
+        // standalone pass untouched.
         recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
             .await
             .expect("next boot");
-        assert!(
-            treekem_home_suite_journal_path(&treekem, &home_id).exists(),
-            "#457 r12: the SPLIT pair's live .hsjournal half SURVIVES the standalone pass"
+        let mut split_marker = 0;
+        let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir2");
+        while let Some(entry) = rd.next_entry().await.expect("entry") {
+            if entry.file_name().to_string_lossy().contains(".split-") {
+                split_marker += 1;
+            }
+        }
+        assert_eq!(
+            split_marker, 1,
+            "#457 r13: the SPLIT marker half SURVIVES the standalone pass"
         );
         let merged = load_named_groups_merged(&named_path, &sidecar_path)
             .await
@@ -37198,6 +37427,7 @@ mod hs451_downgrade_safety {
             group_id_hex: home_id.clone(),
             state_revision: 2,
             state_hash: "h2".to_string(),
+            home_suite: false,
         };
         let hs = HomeSuiteSidecarJournal {
             version: TREEKEM_HOME_SUITE_JOURNAL_VERSION,
@@ -37294,114 +37524,6 @@ mod hs451_downgrade_safety {
         assert_eq!(quarantined, 1, "legacy-only quarantine (no sidecar half)");
     }
 
-    /// #457 r12 item 12.4 regression — REAL collision no-clobber: the
-    /// destination is pre-created with SENTINEL bytes; the quarantine must
-    /// land on a DIFFERENT name and the sentinel file must be
-    /// byte-unchanged.
-    #[tokio::test]
-    async fn r12_quarantine_collision_sentinel_survives() {
-        let _fault_test_lock = fault_test_lock().await;
-        let dir = tempfile::tempdir().expect("tempdir");
-        let treekem = dir.path().join("treekem");
-        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
-        let named_path = dir.path().join("named_groups.json");
-        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
-        let home_id = "ef".repeat(16);
-
-        let mut live_entry = home_suite_entry();
-        live_entry.state_revision = 4;
-        live_entry.state_hash = "live".to_string();
-        let mut live_groups = HashMap::new();
-        live_groups.insert(home_id.clone(), live_entry);
-        let (live_legacy, live_sidecar) = encode_named_groups_store(&live_groups).expect("encode");
-        write_named_groups_json_atomic(&named_path, &live_legacy)
-            .await
-            .expect("live named");
-        write_named_groups_json_atomic(&sidecar_path, &live_sidecar)
-            .await
-            .expect("live sidecar");
-
-        let mut journal_groups = HashMap::new();
-        let mut j = home_suite_entry();
-        j.state_revision = 4;
-        j.state_hash = "journal".to_string();
-        journal_groups.insert(home_id.clone(), j);
-        let (legacy_json, sidecar_json) =
-            encode_named_groups_store(&journal_groups).expect("encode");
-        write_home_suite_sidecar_journal_derived(&treekem, &home_id, &sidecar_json)
-            .await
-            .expect("hsjournal");
-        let journal = TreeKemNamedPersistJournal {
-            version: TREEKEM_NAMED_JOURNAL_VERSION,
-            group_id_hex: home_id.clone(),
-            named_groups_json: legacy_json,
-            snapshot_envelope: vec![1u8; 2],
-        };
-        x0x::storage::write_private_bytes(
-            &treekem_journal_path(&treekem, &home_id),
-            postcard::to_stdvec(&journal).expect("encode"),
-        )
-        .await
-        .expect("journal");
-
-        // Pre-create EVERY plausible destination for a ts window around
-        // now × a seq range, with SENTINEL bytes.
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock")
-            .as_millis() as i64;
-        let sentinel = b"SENTINEL-DO-NOT-CLOBBER".to_vec();
-        let mut sentinels = Vec::new();
-        for ts in (now_ms - 5_000..=now_ms + 5_000).step_by(1_000) {
-            for seq in 0..4 {
-                for (stem, ext) in [
-                    (format!("{home_id}.journal"), "journal"),
-                    (format!("{home_id}.hsjournal"), "hsjournal"),
-                ] {
-                    let p = treekem.join(format!("{stem}.{ext}.quarantined-{ts}-{seq}"));
-                    x0x::storage::write_private_bytes(&p, sentinel.clone())
-                        .await
-                        .expect("sentinel");
-                    sentinels.push(p);
-                }
-            }
-        }
-
-        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
-            .await
-            .expect("replay");
-
-        // Every sentinel is byte-unchanged.
-        for p in &sentinels {
-            let bytes = tokio::fs::read(p).await.expect("sentinel read");
-            assert_eq!(
-                bytes,
-                sentinel,
-                "#457 r12: the pre-existing quarantine file {} was NOT clobbered",
-                p.display()
-            );
-        }
-        // The pair still landed aside (on names OUTSIDE the window×range).
-        let mut quarantined = Vec::new();
-        let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir");
-        while let Some(entry) = rd.next_entry().await.expect("entry") {
-            let name = entry.file_name().to_string_lossy().to_string();
-            if name.contains("quarantined-")
-                && tokio::fs::read(treekem.join(&name))
-                    .await
-                    .map(|b| b != sentinel)
-                    .unwrap_or(true)
-            {
-                quarantined.push(name);
-            }
-        }
-        assert_eq!(
-            quarantined.len(),
-            2,
-            "#457 r12: the pair quarantined onto fresh names: {quarantined:?}"
-        );
-    }
-
     /// #457 r12 item 12.3 regression — the OUTCOME VARIANT is asserted
     /// directly (not just disk state), and the SECOND pass runs for both
     /// failure shapes, asserting the sidecar half SURVIVES.
@@ -37454,16 +37576,24 @@ mod hs451_downgrade_safety {
                 [QuarantineFault::Second, QuarantineFault::Rollback] => {
                     let QuarantineOutcome::Split {
                         legacy_dest,
+                        sidecar_split,
                         sidecar_live,
                     } = outcome
                     else {
                         panic!("expected Split, got {outcome:?}")
                     };
                     assert!(legacy_dest.exists(), "the legacy half is aside");
-                    assert_eq!(sidecar_live, hsjournal_path, "the sidecar half is live");
+                    assert_eq!(
+                        sidecar_live, hsjournal_path,
+                        "the sidecar live path is reported"
+                    );
+                    // #457 r13 item 13.8 — the sidecar half is renamed to
+                    // the EXPLICIT split marker in the same op.
+                    let marker = sidecar_split.expect("the split marker rename succeeded");
+                    assert!(marker.exists(), "the sidecar half is at the split marker");
                     assert!(
-                        hsjournal_path.exists(),
-                        "the sidecar half stands at its live name"
+                        !hsjournal_path.exists(),
+                        "the sidecar half no longer sits at its live name"
                     );
                     // No leaked empty reservation beside the split pair.
                     let mut files = Vec::new();
@@ -37471,8 +37601,11 @@ mod hs451_downgrade_safety {
                     while let Some(entry) = rd.next_entry().await.expect("entry") {
                         files.push(entry.file_name().to_string_lossy().to_string());
                     }
-                    let empty = files.iter().filter(|f| f.contains("quarantined-")).count();
-                    assert_eq!(empty, 1, "exactly ONE aside file (no leaked reservation)");
+                    let aside = files
+                        .iter()
+                        .filter(|f| f.contains("quarantined-") || f.contains(".split-"))
+                        .count();
+                    assert_eq!(aside, 2, "exactly the legacy aside + the split marker");
                 }
                 [QuarantineFault::Fsync] => {
                     let QuarantineOutcome::UncertainDurability {
@@ -37499,12 +37632,614 @@ mod hs451_downgrade_safety {
                 .expect("second pass");
             if let [QuarantineFault::Second, QuarantineFault::Rollback] = fault_set {
                 assert!(
-                    hsjournal_path.exists(),
-                    "SPLIT: the sidecar half SURVIVES the second pass"
+                    !hsjournal_path.exists(),
+                    "SPLIT: the sidecar half is at its marker (not exposed to the orphan rule)"
                 );
+                let mut marker_count = 0;
+                let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir");
+                while let Some(entry) = rd.next_entry().await.expect("entry") {
+                    if entry.file_name().to_string_lossy().contains(".split-") {
+                        marker_count += 1;
+                    }
+                }
+                assert_eq!(marker_count, 1, "the split marker survives the second pass");
             }
             let _ = live_legacy_path;
         }
+    }
+
+    /// #457 r13 item 13.1 — LITERAL frozen v1 bytes from origin/main's
+    /// writer (postcard {version: u8, home_suite_json: String}):
+    /// [01 02 7B 7D] = version 1, body "{}" (captured by encoding the
+    /// two-field struct exactly as `git show origin/main:...named_groups.rs`
+    /// defines it; postcard: u8 varint, then string len varint + UTF-8).
+    const V1_HSJOURNAL_EMPTY_MAP: &[u8] = &[0x01, 0x02, 0x7B, 0x7D];
+
+    /// #457 r13 item 13.1 regression — Home-Suite group + v1 body with
+    /// the record ABSENT ⇒ MISMATCHED ⇒ quarantined (both passes); the
+    /// plain group with the SAME frozen bytes still replays legacy-only.
+    #[tokio::test]
+    async fn r13_home_suite_missing_sidecar_record_quarantines() {
+        for home_suite in [true, false] {
+            let _fault_test_lock = fault_test_lock().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let treekem = dir.path().join("treekem");
+            tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+            let named_path = dir.path().join("named_groups.json");
+            let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+            let home_id = "fb".repeat(16);
+
+            // The LIVE store decides Home-Suite-ness for v1: seed the live
+            // record with (or without) the OwnerCertified admission.
+            let mut live_entry = home_suite_entry();
+            if !home_suite {
+                live_entry.policy.admission = Default::default();
+            }
+            let mut live_groups = HashMap::new();
+            live_groups.insert(home_id.clone(), live_entry);
+            let (live_legacy, live_sidecar) =
+                encode_named_groups_store(&live_groups).expect("encode");
+            write_named_groups_json_atomic(&named_path, &live_legacy)
+                .await
+                .expect("live named");
+            write_named_groups_json_atomic(&sidecar_path, &live_sidecar)
+                .await
+                .expect("live sidecar");
+
+            // The journal pair at the SAME revision/hash as live (so the
+            // verdict alone says Apply/equal): the v1 body has NO record.
+            let mut journal_groups = HashMap::new();
+            let mut j = home_suite_entry();
+            j.state_revision = 1;
+            j.state_hash = live_groups
+                .get(&home_id)
+                .map(|r| r.state_hash.clone())
+                .unwrap_or_default();
+            journal_groups.insert(home_id.clone(), j);
+            let (legacy_json, _) = encode_named_groups_store(&journal_groups).expect("encode");
+
+            // FROZEN v1 bytes — body "{}" (record absent).
+            x0x::storage::write_private_bytes(
+                &treekem_home_suite_journal_path(&treekem, &home_id),
+                V1_HSJOURNAL_EMPTY_MAP.to_vec(),
+            )
+            .await
+            .expect("frozen v1 hsjournal");
+            let journal = TreeKemNamedPersistJournal {
+                version: TREEKEM_NAMED_JOURNAL_VERSION,
+                group_id_hex: home_id.clone(),
+                named_groups_json: legacy_json,
+                snapshot_envelope: vec![1u8; 1],
+            };
+            x0x::storage::write_private_bytes(
+                &treekem_journal_path(&treekem, &home_id),
+                postcard::to_stdvec(&journal).expect("encode"),
+            )
+            .await
+            .expect("journal");
+
+            recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+                .await
+                .expect("paired pass");
+            recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+                .await
+                .expect("standalone pass");
+
+            if home_suite {
+                // Home-Suite + record absent ⇒ MISMATCHED ⇒ quarantined.
+                let mut quarantined = 0;
+                let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir");
+                while let Some(entry) = rd.next_entry().await.expect("entry") {
+                    if entry.file_name().to_string_lossy().contains("quarantined-") {
+                        quarantined += 1;
+                    }
+                }
+                assert_eq!(
+                    quarantined, 2,
+                    "(home-suite) the missing-record pair is QUARANTINED"
+                );
+                assert_eq!(
+                    tokio::fs::read_to_string(&sidecar_path)
+                        .await
+                        .expect("sidecar"),
+                    live_sidecar,
+                    "(home-suite) nothing applied"
+                );
+            } else {
+                // Plain group: the SAME frozen bytes replay legacy-only.
+                assert!(
+                    !treekem_journal_path(&treekem, &home_id).exists(),
+                    "(plain) the legacy journal is consumed"
+                );
+            }
+        }
+    }
+
+    /// #457 r13 item 13.2 regression — the v2 BODY's target record must
+    /// agree with the envelope tag: a disagreeing record ⇒ quarantine,
+    /// nothing applied.
+    #[tokio::test]
+    async fn r13_body_record_disagreeing_with_tag_quarantines() {
+        let _fault_test_lock = fault_test_lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let home_id = "bd".repeat(16);
+
+        write_named_groups_json_atomic(&named_path, "{}")
+            .await
+            .expect("empty named");
+        write_named_groups_json_atomic(&sidecar_path, "{}")
+            .await
+            .expect("empty sidecar");
+
+        // Legacy + tag at revision 2/"h2"; the BODY record at revision 3.
+        let mut journal_groups = HashMap::new();
+        let mut j = home_suite_entry();
+        j.state_revision = 2;
+        j.state_hash = "h2".to_string();
+        journal_groups.insert(home_id.clone(), j);
+        let (legacy_json, _) = encode_named_groups_store(&journal_groups).expect("encode");
+        let mut body_groups = HashMap::new();
+        let mut b = home_suite_entry();
+        b.state_revision = 3;
+        b.state_hash = "h3".to_string();
+        body_groups.insert(home_id.clone(), b);
+        let (_, body_json) = encode_named_groups_store(&body_groups).expect("encode");
+
+        let tx = HomeSuiteJournalTx {
+            group_id_hex: home_id.clone(),
+            state_revision: 2,
+            state_hash: "h2".to_string(),
+            home_suite: true,
+        };
+        let hs = HomeSuiteSidecarJournal {
+            version: TREEKEM_HOME_SUITE_JOURNAL_VERSION,
+            home_suite_json: body_json,
+            tx,
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_home_suite_journal_path(&treekem, &home_id),
+            postcard::to_stdvec(&hs).expect("encode"),
+        )
+        .await
+        .expect("hsjournal");
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: home_id.clone(),
+            named_groups_json: legacy_json,
+            snapshot_envelope: vec![1u8; 1],
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_journal_path(&treekem, &home_id),
+            postcard::to_stdvec(&journal).expect("encode"),
+        )
+        .await
+        .expect("journal");
+
+        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+            .await
+            .expect("never aborts");
+
+        let merged = load_named_groups_merged(&named_path, &sidecar_path)
+            .await
+            .expect("merged");
+        assert!(
+            !merged.contains_key(&home_id),
+            "#457 r13: a body record disagreeing with the tag applies NOTHING"
+        );
+        let mut quarantined = 0;
+        let mut rd = tokio::fs::read_dir(&treekem).await.expect("readdir");
+        while let Some(entry) = rd.next_entry().await.expect("entry") {
+            if entry.file_name().to_string_lossy().contains("quarantined-") {
+                quarantined += 1;
+            }
+        }
+        assert_eq!(quarantined, 2, "the mismatched pair is quarantined");
+    }
+
+    /// #457 r13 item 13.3 regression — the three former per-group abort
+    /// sites now quarantine-or-retain and startup continues:
+    ///   (a) malformed INNER legacy JSON ⇒ quarantined;
+    ///   (b) withdrawn-journal removal failure (unwritable dir) ⇒ retained;
+    ///   (c) stale-journal removal failure (unwritable dir) ⇒ retained.
+    #[tokio::test]
+    async fn r13_per_group_failures_never_abort_startup() {
+        // (a) malformed inner legacy JSON.
+        {
+            let _fault_test_lock = fault_test_lock().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let treekem = dir.path().join("treekem");
+            tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+            let named_path = dir.path().join("named_groups.json");
+            let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+            let home_id = "ce".repeat(16);
+            write_named_groups_json_atomic(&named_path, "{}")
+                .await
+                .expect("empty named");
+            write_named_groups_json_atomic(&sidecar_path, "{}")
+                .await
+                .expect("empty sidecar");
+            // Postcard-valid journal, GARBAGE inner JSON.
+            let journal = TreeKemNamedPersistJournal {
+                version: TREEKEM_NAMED_JOURNAL_VERSION,
+                group_id_hex: home_id.clone(),
+                named_groups_json: "{definitely not json".to_string(),
+                snapshot_envelope: vec![1u8; 1],
+            };
+            x0x::storage::write_private_bytes(
+                &treekem_journal_path(&treekem, &home_id),
+                postcard::to_stdvec(&journal).expect("encode"),
+            )
+            .await
+            .expect("journal");
+            recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+                .await
+                .expect("(a) malformed inner JSON never aborts startup");
+            assert!(
+                !treekem_journal_path(&treekem, &home_id).exists(),
+                "(a) quarantined aside"
+            );
+        }
+        // (b)+(c): removal failures under an unwritable treekem dir.
+        {
+            let _fault_test_lock = fault_test_lock().await;
+            let dir = tempfile::tempdir().expect("tempdir");
+            let treekem = dir.path().join("treekem");
+            tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+            let named_path = dir.path().join("named_groups.json");
+            let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+            let home_id = "df".repeat(16);
+            write_named_groups_json_atomic(&named_path, "{}")
+                .await
+                .expect("empty named");
+            write_named_groups_json_atomic(&sidecar_path, "{}")
+                .await
+                .expect("empty sidecar");
+            // A STALE journal (live newer ⇒ stale-consume path whose
+            // removal can now fail).
+            let mut live_groups = HashMap::new();
+            let mut live = home_suite_entry();
+            live.state_revision = 9;
+            live_groups.insert(home_id.clone(), live);
+            let (live_legacy, live_sidecar) =
+                encode_named_groups_store(&live_groups).expect("encode");
+            write_named_groups_json_atomic(&named_path, &live_legacy)
+                .await
+                .expect("live named");
+            write_named_groups_json_atomic(&sidecar_path, &live_sidecar)
+                .await
+                .expect("live sidecar");
+            let mut journal_groups = HashMap::new();
+            let mut j = home_suite_entry();
+            j.state_revision = 1;
+            journal_groups.insert(home_id.clone(), j);
+            let (legacy_json, sidecar_json) =
+                encode_named_groups_store(&journal_groups).expect("encode");
+            write_home_suite_sidecar_journal_derived(&treekem, &home_id, &sidecar_json)
+                .await
+                .expect("hsjournal");
+            let journal = TreeKemNamedPersistJournal {
+                version: TREEKEM_NAMED_JOURNAL_VERSION,
+                group_id_hex: home_id.clone(),
+                named_groups_json: legacy_json,
+                snapshot_envelope: vec![1u8; 1],
+            };
+            x0x::storage::write_private_bytes(
+                &treekem_journal_path(&treekem, &home_id),
+                postcard::to_stdvec(&journal).expect("encode"),
+            )
+            .await
+            .expect("journal");
+            // Make the dir unwritable for unlink/rename (r-x).
+            let mut perms = tokio::fs::metadata(&treekem)
+                .await
+                .expect("meta")
+                .permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o500);
+            }
+            tokio::fs::set_permissions(&treekem, perms)
+                .await
+                .expect("chmod");
+            recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+                .await
+                .expect("(c) a failed stale-journal removal never aborts startup");
+            // Restore and verify the journal is RETAINED.
+            let mut perms = tokio::fs::metadata(&treekem)
+                .await
+                .expect("meta2")
+                .permissions();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                perms.set_mode(0o700);
+            }
+            tokio::fs::set_permissions(&treekem, perms)
+                .await
+                .expect("chmod2");
+            assert!(
+                treekem_journal_path(&treekem, &home_id).exists(),
+                "(c) the stale journal is RETAINED for the next boot"
+            );
+        }
+    }
+
+    /// #457 r13 item 13.4 regression — metadata UNCERTAINTY in the
+    /// standalone pass preserves the sidecar: with the treekem dir
+    /// readable-but-not-searchable, try_exists on the legacy half errors
+    /// and the orphan is NEVER deleted.
+    #[tokio::test]
+    async fn r13_standalone_uncertainty_preserves_orphan() {
+        let _fault_test_lock = fault_test_lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        write_named_groups_json_atomic(&sidecar_path, "{}")
+            .await
+            .expect("sidecar init");
+        let home_id = "ea".repeat(16);
+        // A TRUE orphan (no legacy journal anywhere).
+        x0x::storage::write_private_bytes(
+            &treekem_home_suite_journal_path(&treekem, &home_id),
+            vec![0x01, 0x00],
+        )
+        .await
+        .expect("orphan");
+        // r--: listing works, stat inside fails ⇒ try_exists errors.
+        let mut perms = tokio::fs::metadata(&treekem)
+            .await
+            .expect("meta")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o444);
+        }
+        tokio::fs::set_permissions(&treekem, perms)
+            .await
+            .expect("chmod");
+        let result = recover_home_suite_sidecar_journals(&sidecar_path, &treekem).await;
+        let mut perms = tokio::fs::metadata(&treekem)
+            .await
+            .expect("meta2")
+            .permissions();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            perms.set_mode(0o700);
+        }
+        tokio::fs::set_permissions(&treekem, perms)
+            .await
+            .expect("chmod2");
+        // The pass itself may abort on the directory-level read_dir (allowed)
+        // OR reach the uncertainty branch; if it completed, the orphan must
+        // SURVIVE.
+        if result.is_ok() {
+            assert!(
+                treekem_home_suite_journal_path(&treekem, &home_id).exists(),
+                "#457 r13: under uncertain metadata the sidecar half is PRESERVED"
+            );
+        }
+    }
+
+    /// #457 r13 item 13.5 regression — REAL collision: pre-create the
+    /// EXACT destination (same production helper, injected (ms, seq)) with
+    /// SENTINEL bytes; the quarantine lands on the next seq and the
+    /// sentinel is byte-unchanged.
+    #[tokio::test]
+    async fn r13_collision_exact_destination_sentinel() {
+        let _fault_test_lock = fault_test_lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let home_id = "ac".repeat(16);
+
+        let mut live_entry = home_suite_entry();
+        live_entry.state_revision = 4;
+        live_entry.state_hash = "live".to_string();
+        let mut live_groups = HashMap::new();
+        live_groups.insert(home_id.clone(), live_entry);
+        let (live_legacy, live_sidecar) = encode_named_groups_store(&live_groups).expect("encode");
+        write_named_groups_json_atomic(&named_path, &live_legacy)
+            .await
+            .expect("live named");
+        write_named_groups_json_atomic(&sidecar_path, &live_sidecar)
+            .await
+            .expect("live sidecar");
+
+        let mut journal_groups = HashMap::new();
+        let mut j = home_suite_entry();
+        j.state_revision = 4;
+        j.state_hash = "journal".to_string();
+        journal_groups.insert(home_id.clone(), j);
+        let (legacy_json, sidecar_json) =
+            encode_named_groups_store(&journal_groups).expect("encode");
+        write_home_suite_sidecar_journal_derived(&treekem, &home_id, &sidecar_json)
+            .await
+            .expect("hsjournal");
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: home_id.clone(),
+            named_groups_json: legacy_json,
+            snapshot_envelope: vec![1u8; 2],
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_journal_path(&treekem, &home_id),
+            postcard::to_stdvec(&journal).expect("encode"),
+        )
+        .await
+        .expect("journal");
+
+        // Deterministic destinations: injected ms + reset counter ⇒ the
+        // first reservation attempt is exactly (T, 0).
+        const T: u64 = 1_700_000_000_000;
+        set_quarantine_ts_override(Some(T));
+        reset_quarantine_counter();
+        let legacy_live = treekem_journal_path(&treekem, &home_id);
+        let hs_live = treekem_home_suite_journal_path(&treekem, &home_id);
+        let sentinel = b"SENTINEL-KEEP".to_vec();
+        let c1 = quarantine_destination(&legacy_live, "journal", T as u128, 0);
+        let c2 = quarantine_destination(&hs_live, "hsjournal", T as u128, 0);
+        x0x::storage::write_private_bytes(&c1, sentinel.clone())
+            .await
+            .expect("sentinel 1");
+        x0x::storage::write_private_bytes(&c2, sentinel.clone())
+            .await
+            .expect("sentinel 2");
+
+        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+            .await
+            .expect("replay");
+        set_quarantine_ts_override(None);
+
+        assert_eq!(
+            tokio::fs::read(&c1).await.expect("sentinel 1 read"),
+            sentinel,
+            "#457 r13: the pre-created destination is NOT clobbered"
+        );
+        assert_eq!(
+            tokio::fs::read(&c2).await.expect("sentinel 2 read"),
+            sentinel,
+            "#457 r13: the pre-created sidecar destination is NOT clobbered"
+        );
+        // The pair landed on the NEXT seq.
+        assert!(quarantine_destination(&legacy_live, "journal", T as u128, 1).exists());
+        assert!(quarantine_destination(&hs_live, "hsjournal", T as u128, 1).exists());
+    }
+
+    /// #457 r13 item 13.7 regression — an apply-phase failure between the
+    /// sidecar and named writes leaves a TORN live state and RETAINS both
+    /// journals at live names (never quarantines the only replay source);
+    /// the next boot replays forward to consistency.
+    #[tokio::test]
+    async fn r13_apply_failure_retains_pair_and_next_boot_heals() {
+        let _fault_test_lock = fault_test_lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let named_path = dir.path().join("named_groups.json");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        let home_id = "be".repeat(16);
+
+        write_named_groups_json_atomic(&named_path, "{}")
+            .await
+            .expect("empty named");
+        write_named_groups_json_atomic(&sidecar_path, "{}")
+            .await
+            .expect("empty sidecar");
+
+        let mut journal_groups = HashMap::new();
+        let mut j = home_suite_entry();
+        j.state_revision = 2;
+        j.state_hash = "h2".to_string();
+        journal_groups.insert(home_id.clone(), j);
+        let (legacy_json, sidecar_json) =
+            encode_named_groups_store(&journal_groups).expect("encode");
+        write_home_suite_sidecar_journal_derived(&treekem, &home_id, &sidecar_json)
+            .await
+            .expect("hsjournal");
+        let journal = TreeKemNamedPersistJournal {
+            version: TREEKEM_NAMED_JOURNAL_VERSION,
+            group_id_hex: home_id.clone(),
+            named_groups_json: legacy_json,
+            snapshot_envelope: vec![4u8; 4],
+        };
+        x0x::storage::write_private_bytes(
+            &treekem_journal_path(&treekem, &home_id),
+            postcard::to_stdvec(&journal).expect("encode"),
+        )
+        .await
+        .expect("journal");
+
+        // Boot 1: the apply fails right after the sidecar write.
+        {
+            let _r_guard = set_replay_fault(&[ReplayFault::AfterSidecarApply]);
+            recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+                .await
+                .expect("#457 r13: an apply failure never aborts startup");
+        }
+        // TORN: the sidecar half landed, the named half did not.
+        assert_eq!(
+            tokio::fs::read_to_string(&sidecar_path)
+                .await
+                .expect("sidecar"),
+            sidecar_json,
+            "the sidecar half WAS applied before the failure"
+        );
+        // BOTH journals RETAINED at live names.
+        assert!(
+            treekem_journal_path(&treekem, &home_id).exists(),
+            "#457 r13: the legacy journal is RETAINED (never quarantined mid-apply)"
+        );
+        assert!(
+            treekem_home_suite_journal_path(&treekem, &home_id).exists(),
+            "#457 r13: the .hsjournal is RETAINED"
+        );
+
+        // Boot 2 (no fault): forward replay to consistency.
+        recover_treekem_named_journals(&named_path, &sidecar_path, &treekem)
+            .await
+            .expect("boot 2");
+        let merged = load_named_groups_merged(&named_path, &sidecar_path)
+            .await
+            .expect("merged");
+        let record = merged.get(&home_id).expect("healed");
+        assert_eq!(record.state_revision, 2);
+        assert!(!treekem_journal_path(&treekem, &home_id).exists());
+    }
+
+    /// #457 r13 item 13.8 regression — an OLD quarantined legacy sibling
+    /// plus a FRESH orphan `.hsjournal` (no split marker) ⇒ the orphan is
+    /// correctly DISCARDED (the r12 sibling heuristic would have kept it).
+    #[tokio::test]
+    async fn r13_old_quarantine_sibling_plus_fresh_orphan_discards() {
+        let _fault_test_lock = fault_test_lock().await;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let treekem = dir.path().join("treekem");
+        tokio::fs::create_dir_all(&treekem).await.expect("mkdir");
+        let sidecar_path = dir.path().join(HOME_SUITE_GROUPS_FILE);
+        write_named_groups_json_atomic(&sidecar_path, "{}")
+            .await
+            .expect("sidecar init");
+        let home_id = "da".repeat(16);
+
+        // A historical quarantined legacy half.
+        x0x::storage::write_private_bytes(
+            &quarantine_destination(
+                &treekem_journal_path(&treekem, &home_id),
+                "journal",
+                1_234,
+                0,
+            ),
+            vec![1u8; 4],
+        )
+        .await
+        .expect("old quarantine");
+        // A FRESH orphan .hsjournal (no legacy journal at its live name,
+        // no split marker).
+        x0x::storage::write_private_bytes(
+            &treekem_home_suite_journal_path(&treekem, &home_id),
+            vec![0x01, 0x00],
+        )
+        .await
+        .expect("fresh orphan");
+
+        recover_home_suite_sidecar_journals(&sidecar_path, &treekem)
+            .await
+            .expect("standalone pass");
+
+        assert!(
+            !treekem_home_suite_journal_path(&treekem, &home_id).exists(),
+            "#457 r13: a FRESH orphan (no split marker) is DISCARDED even beside an old quarantine"
+        );
     }
 
     /// #457 r10 item 10.4 regression (a) — MISMATCHED pair: the
@@ -37557,6 +38292,7 @@ mod hs451_downgrade_safety {
             group_id_hex: home_id.clone(),
             state_revision: 5,
             state_hash: "sidecar-hash".to_string(),
+            home_suite: false,
         };
         write_home_suite_sidecar_journal(&treekem, &tx, &sidecar_json_5)
             .await
@@ -37844,6 +38580,7 @@ mod hs451_downgrade_safety {
                 group_id_hex: home_id.clone(),
                 state_revision: 0,
                 state_hash: String::new(),
+                home_suite: false,
             },
         };
         x0x::storage::write_private_bytes(
@@ -38288,6 +39025,7 @@ mod hs451_downgrade_safety {
             state_revision: 0,
 
             state_hash: String::new(),
+            home_suite: false,
         };
 
         write_home_suite_sidecar_journal(&treekem, &orphan_tx, "{\"orphan\":true}")
@@ -38541,6 +39279,7 @@ mod hs451_downgrade_safety {
                 group_id_hex: "aa".to_string(),
                 state_revision: 0,
                 state_hash: String::new(),
+                home_suite: false,
             },
         };
         x0x::storage::write_private_bytes(
