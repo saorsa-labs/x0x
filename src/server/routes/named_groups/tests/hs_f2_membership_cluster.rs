@@ -3106,8 +3106,119 @@ async fn issue458r6_gss_binding_change_refused() -> Result<()> {
     Ok(())
 }
 
-/// #458 r5c: a link that folds to a roster violating the LAST-ADMIN
-/// invariant (the sole admin demoted inside the gap) is refused per link.
+/// Shared builder for the r6c "targeted-check" regression shape: re-sign
+/// an UNWITHDRAWN MemberAdded terminal chained on a MUTATED link
+/// (`prev_state_hash` = the mutated link's hash, `roster_root` computed
+/// over the given terminal roster) and issue a FRESH owner attestation
+/// for the mutated head, so linkage, snapshot/meta re-derivation, the
+/// anchor CAS and the hash machinery all PASS and the ONLY refusing
+/// check can be the one under test.
+async fn r6c_targeted_refusal(
+    stage: &R3Stage,
+    mutated_link: x0x::groups::state_commit::RetainedCommit,
+    terminal_roster_members: &std::collections::BTreeMap<String, x0x::groups::GroupMember>,
+) -> Result<ApplyMetadataResult> {
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+    let terminal = x0x::groups::GroupStateCommit::sign(
+        stage.group_id.clone(),
+        mutated_link.commit.revision + 1,
+        Some(mutated_link.commit.state_hash.clone()),
+        x0x::groups::compute_roster_root(terminal_roster_members),
+        mutated_link.commit.policy_hash.clone(),
+        mutated_link.commit.public_meta_hash.clone(),
+        mutated_link.commit.security_binding.clone(),
+        false,
+        mutated_link.commit.revision + 1,
+        &signer,
+    )?;
+    let (joiner_cert_b64, joiner_kp_hash) = match &stage.member_added {
+        NamedGroupMetadataEvent::MemberAdded {
+            certificate_b64,
+            treekem_key_package_hash,
+            ..
+        } => (certificate_b64.clone(), treekem_key_package_hash.clone()),
+        _ => panic!("stage member_added"),
+    };
+    let event = NamedGroupMetadataEvent::MemberAdded {
+        group_id: stage.group_id.clone(),
+        revision: terminal.revision,
+        actor: stage.authority_hex.clone(),
+        agent_id: stage.joiner_hex.clone(),
+        display_name: None,
+        treekem_commit_b64: None,
+        treekem_welcome_b64: None,
+        welcome_ref: None,
+        treekem_epoch: None,
+        treekem_key_package_hash: joiner_kp_hash,
+        member_joined_recovery: None,
+        member_recovery_history: Vec::new(),
+        certificate_b64: joiner_cert_b64,
+        commit: Some(terminal.clone()),
+    };
+    let attestation = x0x::server::routes::named_groups::HeadAttestation::sign(
+        &stage.group_id,
+        terminal.revision - 1,
+        terminal.prev_state_hash.as_deref().unwrap_or_default(),
+        &stage.joiner_hex,
+        &stage.owner_kp,
+    )
+    .expect("fresh owner attestation for the mutated head");
+    let key = join_result_key(&stage.group_id, &stage.joiner_hex);
+    stage
+        .joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .insert(key.clone(), vec![mutated_link]);
+    stage
+        .joiner_state
+        .pending_head_attestations
+        .lock()
+        .unwrap()
+        .insert(key, attestation);
+    let actor = crate::server::parse_agent_id_hex(&stage.authority_hex).expect("actor");
+    let result =
+        apply_named_group_metadata_event(&stage.joiner_state, event, actor, true, None).await;
+    stage
+        .joiner_state
+        .pending_adoption_chains
+        .lock()
+        .unwrap()
+        .remove(&join_result_key(&stage.group_id, &stage.joiner_hex));
+    Ok(result)
+}
+
+/// Materialize a projection into full members (the shape
+/// `apply_reconstructed_roster` reconstructs — certificates are NOT
+/// recoverable from digests).
+fn r6c_materialize(
+    projection: &std::collections::BTreeMap<
+        String,
+        x0x::groups::state_commit::RosterMemberSnapshot,
+    >,
+) -> std::collections::BTreeMap<String, x0x::groups::GroupMember> {
+    let mut members = std::collections::BTreeMap::new();
+    for (id, snap) in projection {
+        let mut m = x0x::groups::GroupMember::new_member(id.clone(), None, None, 0);
+        m.role = snap.role;
+        m.state = snap.state;
+        members.insert(id.clone(), m);
+    }
+    members
+}
+
+/// #458 r5c/r6c: a link that folds to a roster violating the LAST-ADMIN
+/// invariant (the sole admin demoted inside the gap) is refused PER LINK.
+/// The terminal is re-signed ON the mutated link with a fresh owner
+/// attestation, so linkage, snapshot/meta re-derivation, the anchor CAS
+/// and the terminal hash machinery all PASS. PINNING LIMITATION (r7
+/// item 7.7, reviewer-acknowledged): a zero-admin folded roster ALSO
+/// fails the terminal committer-admin check (`admin_in(&roster,
+/// &commit.committed_by)` — the committer is no longer an admin in its
+/// own folded roster), so the per-link invariant cannot be uniquely
+/// pinned by any single-check deletion; the test proves the INVARIANT
+/// FAMILY (fold + terminal authority) refuses the smuggling shape.
 #[tokio::test]
 async fn issue458r5_last_admin_smuggle_refused() -> Result<()> {
     let stage = r3_stage(0x83).await?;
@@ -3136,33 +3247,82 @@ async fn issue458r5_last_admin_smuggle_refused() -> Result<()> {
     )?;
     let smuggled_link = x0x::groups::state_commit::RetainedCommit {
         commit: smuggled_commit,
-        roster: smuggled,
+        roster: smuggled.clone(),
         meta: real.meta.clone(),
     };
-    let mut chain = stage.chain.clone();
-    chain[0] = smuggled_link;
-    let result = r3_apply_with_chain(&stage, chain).await;
+    // Terminal roster: the mutated (demoted-admin) roster + the joiner —
+    // exactly what an honest authority sealing on this fork would commit.
+    let mut terminal_roster = r6c_materialize(&smuggled);
+    let mut added = x0x::groups::GroupMember::new_member(stage.joiner_hex.clone(), None, None, 0);
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let NamedGroupMetadataEvent::MemberAdded {
+        certificate_b64: Some(b64),
+        ..
+    } = &stage.member_added
+    {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    terminal_roster.insert(stage.joiner_hex.clone(), added);
+
+    let result = r6c_targeted_refusal(&stage, smuggled_link, &terminal_roster).await?;
     assert!(
         !result.accepted,
-        "a smuggled roster stranding the last admin → refused"
+        "#458 r6c: only the PER-LINK LAST-ADMIN invariant may refuse here — every other check passes by construction"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "joiner stays pending"
+        );
+    }
+    let row = diagnostics_row(stage.joiner_state.as_ref(), &stage.group_id).await;
+    assert_eq!(
+        row.counters.member_added_events_rejected_state_chain_gap, 1,
+        "the refusal is recorded in /diagnostics/groups"
     );
     Ok(())
 }
 
-/// #458 r5e: a chain whose gap ADDS A CERTIFIED MEMBER is unreconstructable
-/// (the projection carries only the cert digest, not the cert bytes, so
-/// the reconstructed roster cannot re-derive the terminal root) — the
-/// joiner must REFUSE and stay pending. Documented consequence: for
-/// OwnerCertified/Home groups only metadata-only gaps (renames etc.)
-/// adopt.
+/// #458 r5e/r6c: a chain whose gap ADDS A CERTIFIED MEMBER is
+/// unreconstructable (the projection carries only the cert digest, not the
+/// cert bytes, so the reconstructed roster cannot re-derive the terminal
+/// root) — the joiner must REFUSE and stay pending at the terminal
+/// roster-root check. The mutated link, its projection digest, and the
+/// re-signed terminal's roster all agree on ONE freshly issued filler
+/// certificate; the terminal is chained on the mutated link with a fresh
+/// owner attestation, so every other check (linkage, snapshot/meta
+/// re-derivation, committer authority, the anchor CAS, per-link invariants)
+/// PASSES — the only possible refusal is the reconstruction's cert-drop
+/// mismatch. Documented consequence: for OwnerCertified/Home groups only
+/// metadata-only gaps (renames etc.) adopt.
 #[tokio::test]
 async fn issue458r5_certified_member_in_gap_refused() -> Result<()> {
     let stage = r3_stage(0x84).await?;
     let real = stage.chain.first().cloned().expect("one link");
     let signer =
         AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
-    // A gap link that adds a certified member: the projection entry
-    // carries a cert digest the reconstruction cannot expand to bytes.
+
+    // ONE filler certificate everything agrees on (link projection digest,
+    // link signed root, terminal roster bytes).
+    let filler_owner = UserKeypair::generate()?;
+    let filler_agent = AgentKeypair::generate()?;
+    let filler_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &filler_owner,
+        filler_agent.public_key().as_bytes(),
+        None,
+    )?;
+    let filler_digest = x0x::groups::owner_cert::certificate_digest_hex(&filler_cert);
+
+    // The mutated link: base roster + the certified member (digest-only in
+    // the projection, exactly what a retained snapshot carries).
     let mut churned = real.roster.clone();
     churned.insert(
         "cd".repeat(32),
@@ -3170,15 +3330,14 @@ async fn issue458r5_certified_member_in_gap_refused() -> Result<()> {
             role: x0x::groups::GroupRole::Member,
             state: x0x::groups::GroupMemberState::Active,
             treekem_key_package_hash: None,
-            certificate_digest: Some("ab".repeat(32)),
+            certificate_digest: Some(filler_digest),
         },
     );
-    let churned_root = x0x::groups::state_commit::roster_root_of_projection(&churned);
     let churned_commit = x0x::groups::GroupStateCommit::sign(
         real.commit.group_id.clone(),
         real.commit.revision,
         real.commit.prev_state_hash.clone(),
-        churned_root,
+        x0x::groups::state_commit::roster_root_of_projection(&churned),
         real.commit.policy_hash.clone(),
         real.commit.public_meta_hash.clone(),
         real.commit.security_binding.clone(),
@@ -3188,15 +3347,55 @@ async fn issue458r5_certified_member_in_gap_refused() -> Result<()> {
     )?;
     let churned_link = x0x::groups::state_commit::RetainedCommit {
         commit: churned_commit,
-        roster: churned,
+        roster: churned.clone(),
         meta: real.meta.clone(),
     };
-    let mut chain = stage.chain.clone();
-    chain[0] = churned_link;
-    let result = r3_apply_with_chain(&stage, chain).await;
+
+    // Terminal roster: the churned roster WITH the filler cert BYTES (what
+    // the honest authority's signed roster_root covers — the root includes
+    // the digest) + the joiner with its committed cert. The joiner's
+    // reconstruction materializes the filler member WITHOUT the cert
+    // (digest-only) → the recomputed root drops the digest → mismatch.
+    let mut terminal_roster = r6c_materialize(&churned);
+    let mut certified_member = x0x::groups::GroupMember::new_member("cd".repeat(32), None, None, 0);
+    certified_member.role = x0x::groups::GroupRole::Member;
+    certified_member.state = x0x::groups::GroupMemberState::Active;
+    certified_member.certificate = Some(filler_cert);
+    terminal_roster.insert("cd".repeat(32), certified_member);
+    let mut added = x0x::groups::GroupMember::new_member(stage.joiner_hex.clone(), None, None, 0);
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let NamedGroupMetadataEvent::MemberAdded {
+        certificate_b64: Some(b64),
+        ..
+    } = &stage.member_added
+    {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    terminal_roster.insert(stage.joiner_hex.clone(), added);
+
+    let result = r6c_targeted_refusal(&stage, churned_link, &terminal_roster).await?;
     assert!(
         !result.accepted,
-        "a gap adding a certified member is unreconstructable → refused (joiner stays pending)"
+        "#458 r6c: only the CERT-RECONSTRUCTION mismatch may refuse here — every other check passes by construction"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        assert!(
+            !info.has_active_member(&stage.joiner_hex),
+            "joiner stays pending"
+        );
+    }
+    let row = diagnostics_row(stage.joiner_state.as_ref(), &stage.group_id).await;
+    assert_eq!(
+        row.counters.member_added_events_rejected_state_chain_gap, 1,
+        "the refusal is recorded in /diagnostics/groups"
     );
     Ok(())
 }
