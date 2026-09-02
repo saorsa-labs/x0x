@@ -3273,7 +3273,7 @@ async fn issue458r5_last_admin_smuggle_refused() -> Result<()> {
     let result = r6c_targeted_refusal(&stage, smuggled_link, &terminal_roster).await?;
     assert!(
         !result.accepted,
-        "#458 r6c: only the PER-LINK LAST-ADMIN invariant may refuse here — every other check passes by construction"
+        "#458 r6c: the last-admin INVARIANT FAMILY refuses here (per-link fold invariant + terminal committer-admin; see the docstring's pinning limitation) — every other check passes by construction"
     );
     {
         let groups = stage.joiner_state.named_groups.read().await;
@@ -3552,6 +3552,11 @@ async fn issue458r6b_tier2_removed_admin_fork_rejected() -> Result<()> {
         .lock()
         .unwrap()
         .insert(key, vec![fork_link]);
+    // NOTE (r7 item 7.9): the refusal here fires at the PRE-ADOPTION actor
+    // gate (A is not an admin in the joiner's converged current roster) —
+    // not inside the tier-2 reconstruction. That is acceptable: the fold
+    // checks are tier-independent and would also refuse (the fork chains
+    // from the BASE hash, stale against the canonical head).
     let result =
         apply_named_group_metadata_event(&joiner_state, fork_event, attacker_id, true, None).await;
     assert!(
