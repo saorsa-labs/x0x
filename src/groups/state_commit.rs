@@ -2074,7 +2074,10 @@ mod tests {
         // And a digest-only seat is still distinguishable from a member
         // with NO certificate commitment at all.
         let mut no_commitment = digest_only.clone();
-        no_commit.get_mut(&agent_hex).unwrap().certificate_digest = None;
+        no_commitment
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = None;
         assert_ne!(
             compute_roster_root(&no_commitment),
             root_with_bytes,

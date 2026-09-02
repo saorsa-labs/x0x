@@ -1,139 +1,178 @@
-METHOD  PATH                                                CLI COMMAND               DESCRIPTION
---------------------------------------------------------------------------------------------------------------
-GET  /health                                             health                    Health check
-GET  /status                                             status                    Runtime status with uptime
-POST  /shutdown                                           stop                      Gracefully stop the daemon
-POST  /auth/session                                       auth session              Exchange the durable API token for a short-lived browser session token
-GET  /constitution                                       constitution              Display the x0x Constitution (Markdown)
-GET  /constitution/json                                  constitution --json       Constitution with version metadata (JSON)
-GET  /agent                                              agent                     Agent identity info
-POST  /announce                                           announce                  Announce identity to network
-GET  /agent/user-id                                      agent user-id             Current agent user ID
-GET  /agent/card                                         agent card                Generate shareable identity card
-GET  /introduction                                       agent introduction        Introduction card with trust-scoped disclosure
-POST  /agent/card/import                                  agent import              Import agent card to contacts
-POST  /agent/sign                                         agent sign                Detached ML-DSA-65 signature over a caller-supplied payload
-POST  /agent/verify                                       agent verify              Verify a detached ML-DSA-65 signature against a caller-supplied public key
-GET  /peers                                              peers                     Connected gossip peers
-GET  /network/status                                     network status            Network connectivity details
-GET  /network/bootstrap-cache                            network cache             Bootstrap peer cache stats
-GET  /diagnostics/connectivity                           diagnostics connectivity  Connectivity snapshot (NodeStatus + transport_environment VPN/MTU assessment)
-GET  /diagnostics/ack                                    diagnostics ack           ACK-v2 per-stage latency buckets and outcome counters
-GET  /diagnostics/gossip                                 diagnostics gossip        PubSub drop-detection counters (publish/deliver deltas)
-GET  /diagnostics/dm                                     diagnostics dm            Direct-message send/receive counters and per-peer health
-GET  /diagnostics/groups                                 diagnostics groups        Per-group ingest counters, listener state, and drop buckets
-GET  /diagnostics/ws                                     diagnostics ws            WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters
-POST  /peers/:peer_id/probe                               peer probe                Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)
-GET  /peers/:peer_id/health                              peer health               Connection health snapshot for a peer (ant-quic 0.27.1 #170)
-GET  /peers/events                                       peer events               SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)
-GET  /presence                                           presence                  Online agents (alias for /presence/online)
-GET  /presence/online                                    presence online           List all currently online agents (network view, non-blocked)
-GET  /presence/foaf                                      presence foaf             FOAF random-walk discovery of nearby agents (social view)
-GET  /presence/find/:id                                  presence find             Find a specific agent by ID via FOAF random walk
-GET  /presence/status/:id                                presence status           Get local cache presence status for an agent
-GET  /presence/events                                    presence events           Server-Sent Events stream of presence online/offline events
-GET  /diagnostics/exec                                   diagnostics exec          Remote exec counters, warnings, active sessions, and ACL summary
-POST  /exec/run                                           exec                      Run a strictly allowlisted non-interactive command on a remote daemon
-POST  /exec/cancel                                        exec cancel               Cancel an in-flight remote exec request
-GET  /exec/sessions                                      exec sessions             List local pending and remote active exec sessions
-POST  /publish                                            publish                   Publish message to topic
-POST  /subscribe                                          subscribe                 Subscribe to topic
-DELETE  /subscribe/:id                                      unsubscribe               Unsubscribe by ID
-GET  /events                                             events                    SSE event stream
-GET  /agents/discovered                                  agents list               List discovered agents
-GET  /agents/discovered/:agent_id                        agents get                Get discovered agent details
-GET  /agents/:agent_id/machine                           agents machine            Resolve agent to current machine endpoint
-POST  /agents/find/:agent_id                              agents find               Find agent on network
-GET  /agents/reachability/:agent_id                      agents reachability       Agent reachability info
-GET  /users/:user_id/agents                              agents by-user            Agents by user ID
-GET  /machines/discovered                                machines discovered       List discovered machine endpoints
-GET  /machines/discovered/:machine_id                    machines get              Get discovered machine endpoint details
-GET  /users/:user_id/machines                            machines by-user          Machine endpoints by user ID
-GET  /contacts/:agent_id/machines                        machines list             List machines for contact
-POST  /contacts/:agent_id/machines                        machines add              Add machine record
-DELETE  /contacts/:agent_id/machines/:machine_id            machines remove           Remove machine record
-POST  /contacts/:agent_id/machines/:machine_id/pin        machines pin              Pin machine
-DELETE  /contacts/:agent_id/machines/:machine_id/pin        machines unpin            Unpin machine
-GET  /contacts                                           contacts list             List contacts
-POST  /contacts                                           contacts add              Add contact
-POST  /contacts/trust                                     trust set                 Quick trust/block
-PATCH  /contacts/:agent_id                                 contacts update           Update contact trust
-DELETE  /contacts/:agent_id                                 contacts remove           Remove contact
-POST  /contacts/:agent_id/revoke                          contacts revoke           Revoke contact
-GET  /contacts/:agent_id/revocations                     contacts revocations      List revocations
-POST  /trust/evaluate                                     trust evaluate            Evaluate trust for agent+machine
-POST  /agents/connect                                     direct connect            Connect to agent
-POST  /machines/connect                                   machines connect          Connect to machine
-POST  /direct/send                                        direct send               Send direct message
-GET  /direct/connections                                 direct connections        List direct connections
-GET  /direct/events                                      direct events             Stream direct messages
-POST  /mls/groups                                         groups create             Create encrypted group
-GET  /mls/groups                                         groups list               List groups
-GET  /mls/groups/:id                                     groups get                Get group details
-POST  /mls/groups/:id/members                             groups add-member         Add member to group
-DELETE  /mls/groups/:id/members/:agent_id                   groups remove-member      Remove member
-POST  /mls/groups/:id/encrypt                             groups encrypt            Encrypt for group
-POST  /mls/groups/:id/decrypt                             groups decrypt            Decrypt from group
-POST  /mls/groups/:id/welcome                             groups welcome            Create welcome for member
-POST  /groups                                             group create              Create named group
-GET  /groups                                             group list                List groups
-GET  /groups/:id                                         group info                Get group info
-GET  /groups/:id/members                                 group members             List named-group members
-POST  /groups/:id/members                                 group add-member          Add named-group member
-DELETE  /groups/:id/members/:agent_id                       group remove-member       Remove named-group member
-POST  /groups/:id/send                                    group send                Publish a signed message to a SignedPublic group
-GET  /groups/:id/messages                                group messages            Retrieve cached public messages (non-members on Public read)
-POST  /groups/:id/invite                                  group invite              Generate invite link
-POST  /groups/join                                        group join                Join group via invite
-PUT  /groups/:id/display-name                            group set-name            Set display name in group
-DELETE  /groups/:id                                         group leave               Leave a group
-GET  /groups/:id/state                                   group state               Inspect the signed state-commit chain for a group
-GET  /groups/:id/state/commits                           group state-commits       Read retained state-commit history (members only, paged)
-POST  /groups/:id/state/seal                              group state-seal          Advance the state-commit chain and republish signed card
-POST  /groups/:id/state/withdraw                          group delete              Delete a group with a terminal withdrawal commit
-PATCH  /groups/:id                                         group update              Update group name/description (admin+)
-PATCH  /groups/:id/policy                                  group policy              Update group policy (admin+)
-PATCH  /groups/:id/members/:agent_id/role                  group set-role            Change a member's role (admin+)
-POST  /groups/:id/ban/:agent_id                           group ban                 Ban a member (admin+)
-DELETE  /groups/:id/ban/:agent_id                           group unban               Unban a member (admin+)
-GET  /groups/:id/requests                                group requests            List join requests (admin+)
-POST  /groups/:id/requests                                group request-access      Submit a join request
-POST  /groups/:id/requests/:request_id/approve            group approve-request     Approve a join request (admin+)
-POST  /groups/:id/requests/:request_id/reject             group reject-request      Reject a join request (admin+)
-DELETE  /groups/:id/requests/:request_id                    group cancel-request      Cancel own pending join request
-GET  /groups/discover                                    group discover            List locally known discoverable groups
-GET  /groups/discover/nearby                             group discover-nearby     Presence-social browse of PublicDirectory groups
-GET  /groups/discover/subscriptions                      group discover-subscriptions  List active shard subscriptions
-POST  /groups/discover/subscribe                          group discover-subscribe  Subscribe to a tag/name/id directory shard
-DELETE  /groups/discover/subscribe/:kind/:shard             group discover-unsubscribe  Unsubscribe from a directory shard
-GET  /groups/cards/:id                                   group card                Fetch a single group card
-POST  /groups/cards/import                                group card-import         Import a group card into local cache
-POST  /groups/:id/secure/encrypt                          group secure-encrypt      Encrypt content with the group's shared secret (member-only)
-POST  /groups/:id/secure/decrypt                          group secure-decrypt      Decrypt content with the group's shared secret (member-only, epoch must match)
-POST  /groups/:id/secure/reseal                           group secure-reseal       Re-seal the current group shared secret to a named recipient (produces a real SecureShareDelivered-format envelope)
-POST  /groups/secure/open-envelope                        group secure-open-envelope  Attempt to open a SecureShareDelivered envelope with this daemon's KEM key (adversarial test)
-GET  /task-lists                                         tasks list                List task lists
-POST  /task-lists                                         tasks create              Create task list
-GET  /task-lists/:id/tasks                               tasks show                Show tasks in list
-POST  /task-lists/:id/tasks                               tasks add                 Add task to list
-PATCH  /task-lists/:id/tasks/:tid                          tasks claim / tasks complete  Claim or complete a task (action: claim|complete)
-GET  /stores                                             store list                List key-value stores
-POST  /stores                                             store create              Create key-value store
-POST  /stores/:id/join                                    store join                Join existing store
-GET  /stores/:id/keys                                    store keys                List keys in store
-PUT  /stores/:id/:key                                    store put                 Put value in store
-GET  /stores/:id/:key                                    store get                 Get value from store
-DELETE  /stores/:id/:key                                    store rm                  Remove key from store
-POST  /files/send                                         send-file                 Send file to agent
-GET  /files/transfers                                    transfers                 List file transfers
-GET  /files/transfers/:id                                transfer-status           Transfer status
-POST  /files/accept/:id                                   accept-file               Accept incoming transfer
-POST  /files/reject/:id                                   reject-file               Reject incoming transfer
-GET  /upgrade                                            upgrade                   Check for updates
-POST  /upgrade/apply                                      upgrade --apply           Apply the latest verified release manifest
-GET  /ws                                                 ws                        General-purpose WebSocket session
-GET  /ws/direct                                          ws direct                 WebSocket session for direct messaging
-GET  /ws/sessions                                        ws sessions               List WebSocket sessions
-GET  /gui                                                gui                       Open the embedded GUI
+METHOD  PATH                                                CLI COMMAND               REQUEST                       DESCRIPTION
+--------------------------------------------------------------------------------------------------------------------------
+GET  /health                                             health                                                  Health check
+GET  /status                                             status                                                  Runtime status with uptime
+POST  /shutdown                                           stop                                                    Gracefully stop the daemon
+POST  /auth/session                                       auth session                                            Exchange the durable API token for a short-lived browser session token
+GET  /constitution                                       constitution                                            Display the x0x Constitution (Markdown)
+GET  /constitution/json                                  constitution --json                                     Constitution with version metadata (JSON)
+GET  /agent                                              agent                                                   Agent identity info
+POST  /announce                                           announce                  body: include_user_identity,human_consent  Announce identity to network
+GET  /agent/user-id                                      agent user-id                                           Current agent user ID
+GET  /agent/card                                         agent card                query: display_name,include_groups,include_local_addresses  Generate shareable identity card
+GET  /introduction                                       agent introduction        query: peer                   Introduction card with trust-scoped disclosure
+POST  /agent/card/import                                  agent import              body: card,trust_level        Import agent card to contacts
+POST  /agent/sign                                         agent sign                body: context,payload_b64     Detached ML-DSA-65 signature over a caller-supplied payload
+POST  /agent/verify                                       agent verify              body: payload_b64,signature_b64,public_key_b64,context,algorithm  Verify a detached ML-DSA-65 signature against a caller-supplied public key
+POST  /identity/revoke                                    identity revoke           body: agent_id,machine_id,move_epoch,reason  Issue a signed revocation for an agent-id or machine-id keypair
+GET  /identity/revocations                               identity revocations                                    List all revocation records held by this daemon
+POST  /agent/move                                         move authorize            body: agent_id,to_machine,placement,pin  Owner-authorize an agent move (chain MoveAuthorization; source seals)
+POST  /agent/move/export                                  move export               passthrough                   Source machine seals the export envelope + ExportReceipt
+POST  /agent/move/import                                  move import               passthrough                   Target machine imports a transfer bundle (unwrap + store + receipt)
+POST  /agent/move/activate                                move activate             body: agent_id,move_epoch     Owner commits a move (ActivationBundle on the activation topic)
+POST  /agent/move/abort                                   move abort                body: agent_id,move_epoch,reason  Owner rolls back a pre-activation move (epoch burned)
+POST  /agent/move/retire                                  move retire               body: agent_id,move_epoch     Source machine retires after activation (delete key + receipt)
+GET  /agent/moves                                        move list                                               Move-log view + derived state (custodian, quiesce, placement)
+GET  /owner/placement                                    owner placement                                         Derived placement ledger (lazy mint + ≥1-Roaming Home invariant)
+GET  /owner/agents/:id/placement                         owner agents placement                                  One agent's placement record + fold
+GET  /profile                                            profile                                                 Daemon self-profile names (human/display/machine)
+PUT  /profile                                            profile set               body: human_name,display_name,machine_name  Update stored self-profile names (partial update)
+GET  /owner/agents                                       owner agents                                            Roster of agents certified by this install's owner (journal-backed; survives restarts)
+POST  /owner/agents/issue                                 owner agents issue        body: agent_public_key,mode,label,not_after  Owner-sign an AgentCertificate over a harness-submitted agent public key (ADR-0039)
+DELETE  /owner/agents/:id                                   owner agents revoke       body: reason                  ADR-0018 owner issuer-revocation of a registered sub-agent
+POST  /owner/riders                                       owner riders issue        body: sub_agent_id,groups,label,ttl_secs,delegation  Mint a scoped rider token for a registered rider-mode sub-agent (ADR-0039; the required harness-signed delegation is supplied via --delegation-payload-b64/--delegation-signature)
+GET  /owner/riders                                       owner riders                                            List rider-token records (no secrets; hashed identifiers only)
+DELETE  /owner/riders/:id                                   owner riders revoke                                     Revoke a rider token; it fails on the next request
+GET  /sync/devices                                       sync devices                                            ADR-0041 Tier-1: enrolled owner devices + last-sync status
+POST  /sync/devices/enroll                                sync enroll               body: machine_id,ttl_secs     Owner-key-sign a DeviceEnrollment for a machine (ADR-0041 Tier-1; owner-gated)
+DELETE  /sync/devices/:machine_id                           sync revoke                                             Remove a machine from the owner device set (ADR-0041 Tier-1; owner-gated)
+GET  /home                                               home                                                    ADR-0038 Home space: group id, primary agent, members, warnings
+POST  /home/rename                                        home rename               body: name                    Rename the Home space (admin-gated, sealed)
+POST  /mls/groups                                         groups create             body: group_id                Create encrypted group
+GET  /mls/groups                                         groups list                                             List groups
+GET  /mls/groups/:id                                     groups get                                              Get group details
+POST  /mls/groups/:id/members                             groups add-member         body: agent_id                Add member to group
+DELETE  /mls/groups/:id/members/:agent_id                   groups remove-member                                    Remove member
+POST  /mls/groups/:id/encrypt                             groups encrypt            body: payload                 Encrypt for group
+POST  /mls/groups/:id/decrypt                             groups decrypt            body: ciphertext,epoch        Decrypt from group
+POST  /mls/groups/:id/welcome                             groups welcome            body: agent_id                Create welcome for member
+GET  /peers                                              peers                                                   Connected gossip peers
+GET  /network/status                                     network status                                          Network connectivity details
+GET  /network/bootstrap-cache                            network cache                                           Bootstrap peer cache stats
+GET  /diagnostics/connectivity                           diagnostics connectivity                                Connectivity snapshot (NodeStatus + transport_environment VPN/MTU assessment)
+GET  /diagnostics/ack                                    diagnostics ack                                         ACK-v2 per-stage latency buckets and outcome counters
+GET  /diagnostics/gossip                                 diagnostics gossip                                      PubSub drop-detection counters (publish/deliver deltas)
+GET  /diagnostics/transport                              diagnostics transport                                   Transport connection accounting (zombie-connection hunt, #368)
+GET  /diagnostics/relay                                  diagnostics relay                                       ADR-0035 relay-decentralization metering: advert census + inbound-dialer evidence
+GET  /diagnostics/dm                                     diagnostics dm                                          Direct-message send/receive counters and per-peer health
+GET  /diagnostics/groups                                 diagnostics groups                                      Per-group ingest counters, listener state, and drop buckets
+GET  /diagnostics/history                                diagnostics history                                     Durable-history writer/reaper counters (ADR-0023)
+GET  /diagnostics/ws                                     diagnostics ws                                          WebSocket outbound-queue health: capacity and drop/slow-consumer-close counters
+POST  /peers/:peer_id/probe                               peer probe                query: timeout_ms             Active ant-quic probe_peer liveness + RTT (ant-quic 0.27.2 #173)
+GET  /peers/:peer_id/health                              peer health                                             Connection health snapshot for a peer (ant-quic 0.27.1 #170)
+GET  /peers/events                                       peer events                                             SSE stream of peer lifecycle events (ant-quic 0.27.1 #171)
+GET  /presence                                           presence                                                Online agents (gossip presence view; /presence/online is the discovery-cache view)
+GET  /presence/online                                    presence online                                         List all currently online agents (network view, non-blocked)
+GET  /presence/foaf                                      presence foaf             query: ttl,timeout_ms         FOAF random-walk discovery of nearby agents (social view)
+GET  /presence/find/:id                                  presence find             query: ttl,timeout_ms         Find a specific agent by ID via FOAF random walk
+GET  /presence/status/:id                                presence status                                         Get local cache presence status for an agent
+GET  /presence/events                                    presence events                                         Server-Sent Events stream of presence online/offline events
+GET  /history                                            history list              query: scope,since_ms,until_ms,limit,before_id  List durable history for one scope (dm:/group:/topic:), keyset-paginated
+GET  /history/message/:msg_id                            history message           query: scope                  Point lookup of one durable history row by exposed msg_id (canonical group ids need ?scope=)
+GET  /history/search                                     history search            query: scope,q,since_ms,until_ms,limit,before_id  Full-text search over text history payloads within a scope
+GET  /history/stats                                      history stats                                           History row counts, database size, and retention bounds
+DELETE  /history                                            history purge             query: scope                  Purge one scope from the local history store (local-only)
+GET  /diagnostics/exec                                   diagnostics exec                                        Remote exec counters, warnings, active sessions, and ACL summary
+POST  /exec/run                                           exec                      body: agent_id,argv,stdin_b64,timeout_ms,cwd  Run a strictly allowlisted non-interactive command on a remote daemon
+POST  /exec/cancel                                        exec cancel               body: request_id,agent_id     Cancel an in-flight remote exec request
+GET  /exec/sessions                                      exec sessions                                           List local pending and remote active exec sessions
+GET  /diagnostics/connect                                diagnostics connect                                     Connect-ACL policy summary and stream allow/deny counters
+POST  /forwards                                           forward add               body: local_addr,peer_agent,target_host,target_port  Add a local port forward to a peer's loopback service
+GET  /forwards                                           forward list                                            List registered port forwards
+DELETE  /forwards/:local_addr                               forward rm                                              Remove a port forward by its local bind address
+GET  /streams                                            streams                                                 Active forward-stream count + connect-ACL counters
+POST  /publish                                            publish                   body: topic,payload           Publish message to topic
+POST  /subscribe                                          subscribe                 body: topic                   Subscribe to topic
+DELETE  /subscribe/:id                                      unsubscribe                                             Unsubscribe by ID
+GET  /events                                             events                                                  SSE event stream
+GET  /agents/discovered                                  agents list               query: unfiltered             List discovered agents
+GET  /agents/discovered/:agent_id                        agents get                query: wait                   Get discovered agent details
+GET  /agents/:agent_id/machine                           agents machine                                          Resolve agent to current machine endpoint
+POST  /agents/find/:agent_id                              agents find                                             Find agent on network
+GET  /agents/reachability/:agent_id                      agents reachability                                     Agent reachability info
+GET  /users/:user_id/agents                              agents by-user                                          Agents by user ID
+GET  /machines/discovered                                machines discovered       query: unfiltered             List discovered machine endpoints
+GET  /machines/discovered/:machine_id                    machines get              query: wait                   Get discovered machine endpoint details
+GET  /users/:user_id/machines                            machines by-user                                        Machine endpoints by user ID
+GET  /contacts/:agent_id/machines                        machines list                                           List machines for contact
+POST  /contacts/:agent_id/machines                        machines add              body: machine_id,label,pinned  Add machine record
+DELETE  /contacts/:agent_id/machines/:machine_id            machines remove                                         Remove machine record
+POST  /contacts/:agent_id/machines/:machine_id/pin        machines pin                                            Pin machine
+DELETE  /contacts/:agent_id/machines/:machine_id/pin        machines unpin                                          Unpin machine
+GET  /contacts                                           contacts list                                           List contacts
+POST  /contacts                                           contacts add              body: agent_id,trust_level,label  Add contact
+POST  /contacts/trust                                     trust set                 body: agent_id,level          Quick trust/block
+PATCH  /contacts/:agent_id                                 contacts update           body: trust_level,identity_type  Update contact trust
+DELETE  /contacts/:agent_id                                 contacts remove                                         Remove contact
+POST  /contacts/:agent_id/revoke                          contacts revoke           body: reason                  Revoke contact
+GET  /contacts/:agent_id/revocations                     contacts revocations                                    List revocations
+POST  /trust/evaluate                                     trust evaluate            body: agent_id,machine_id     Evaluate trust for agent+machine
+POST  /agents/connect                                     direct connect            body: agent_id                Connect to agent
+POST  /machines/connect                                   machines connect          body: machine_id              Connect to machine
+POST  /direct/send                                        direct send               body: agent_id,payload,prefer_raw_quic_if_connected,raw_quic_receive_ack_ms,stop_fallback_on_raw_error,require_gossip,require_ack_ms,require_durable_app_ack,logical_id  Send direct message
+GET  /direct/connections                                 direct connections                                      List direct connections
+GET  /direct/events                                      direct events             query: backfill               Stream direct messages
+POST  /groups                                             group create              body: name,description,display_name,preset,policy  Create named group
+GET  /groups                                             group list                                              List groups
+GET  /groups/:id                                         group info                                              Get group info
+GET  /groups/:id/members                                 group members                                           List named-group members
+POST  /groups/:id/members                                 group add-member          body: agent_id,display_name,treekem_key_package_b64  Add named-group member
+DELETE  /groups/:id/members/:agent_id                       group remove-member                                     Remove named-group member
+POST  /groups/:id/send                                    group send                body: body,kind,thread_root,thread_parent,mentions,delegation_digest  Publish a signed message to a SignedPublic group
+GET  /groups/:id/messages                                group messages            query: thread_root            Retrieve cached public messages (non-members on Public read)
+POST  /groups/:id/delegate                                group delegate            body: to_agent,scope,verbs,expiry_ms,task,parent  Issue a signed delegation (effective on durable history commit)
+GET  /groups/:id/delegations                             group delegations                                       List effective delegations re-derived from durable history
+POST  /groups/:id/invite                                  group invite              body: expiry_secs             Generate invite link
+POST  /groups/join                                        group join                body: invite,display_name,mode,expected_owner_user_id  Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)
+PUT  /groups/:id/display-name                            group set-name            body: name                    Set display name in group
+DELETE  /groups/:id                                         group leave                                             Leave a group (sole-member leave deletes the group)
+GET  /groups/:id/state                                   group state                                             Inspect the signed state-commit chain for a group
+GET  /groups/:id/state/commits                           group state-commits       query: from_revision,limit    Read retained state-commit history (members only, paged)
+POST  /groups/:id/state/seal                              group state-seal                                        Advance the state-commit chain and republish signed card
+POST  /groups/:id/state/withdraw                          group delete                                            Delete a group with a terminal withdrawal commit
+PATCH  /groups/:id                                         group update              body: name,description        Update group name/description (admin+)
+PATCH  /groups/:id/policy                                  group policy              body: preset,discoverability,admission,confidentiality,read_access,write_access  Update group policy (admin+)
+PATCH  /groups/:id/members/:agent_id/role                  group set-role            body: role                    Change a member's role (admin+)
+POST  /groups/:id/ban/:agent_id                           group ban                                               Ban a member (admin+)
+DELETE  /groups/:id/ban/:agent_id                           group unban                                             Unban a member (admin+)
+GET  /groups/:id/requests                                group requests                                          List join requests (admin+)
+POST  /groups/:id/requests                                group request-access      body: message                 Submit a join request
+POST  /groups/:id/requests/:request_id/approve            group approve-request                                   Approve a join request (admin+)
+POST  /groups/:id/requests/:request_id/reject             group reject-request                                    Reject a join request (admin+)
+DELETE  /groups/:id/requests/:request_id                    group cancel-request                                    Cancel own pending join request
+GET  /groups/discover                                    group discover                                          List locally known discoverable groups
+GET  /groups/discover/nearby                             group discover-nearby                                   Presence-social browse of PublicDirectory groups
+GET  /groups/discover/subscriptions                      group discover-subscriptions                                List active shard subscriptions
+POST  /groups/discover/subscribe                          group discover-subscribe  body: kind,key,shard          Subscribe to a tag/name/id directory shard
+DELETE  /groups/discover/subscribe/:kind/:shard             group discover-unsubscribe                                Unsubscribe from a directory shard
+GET  /groups/cards/:id                                   group card                                              Fetch a single group card
+POST  /groups/cards/import                                group card-import         passthrough                   Import a group card into local cache
+POST  /groups/:id/secure/encrypt                          group secure-encrypt      body: payload_b64             Encrypt content with the group's shared secret (member-only)
+POST  /groups/:id/secure/decrypt                          group secure-decrypt      body: ciphertext_b64,nonce_b64,secret_epoch  Decrypt content with the group's shared secret (member-only, epoch must match)
+POST  /groups/:id/secure/reseal                           group secure-reseal       body: recipient               Re-seal the current group shared secret to a named recipient (produces a real SecureShareDelivered-format envelope)
+POST  /groups/secure/open-envelope                        group secure-open-envelope  body: group_id,recipient,secret_epoch,kem_ciphertext_b64,aead_nonce_b64,aead_ciphertext_b64  Attempt to open a SecureShareDelivered envelope with this daemon's KEM key (adversarial test)
+GET  /task-lists                                         tasks list                                              List task lists
+POST  /task-lists                                         tasks create              body: name,topic              Create task list
+GET  /task-lists/:id/tasks                               tasks show                                              Show tasks in list
+POST  /task-lists/:id/tasks                               tasks add                 body: title,description       Add task to list
+PATCH  /task-lists/:id/tasks/:tid                          tasks claim / tasks complete  body: action,fence_token,delegation  Claim or complete a task (action: claim|complete)
+GET  /stores                                             store list                                              List key-value stores
+POST  /stores                                             store create              body: name,topic,policy       Create key-value store
+POST  /stores/:id/join                                    store join                body: expected_owner,policy   Join existing store
+GET  /stores/:id/keys                                    store keys                                              List keys in store
+PUT  /stores/:id/:key                                    store put                 body: value,content_type      Put value in store
+GET  /stores/:id/:key                                    store get                                               Get value from store
+DELETE  /stores/:id/:key                                    store rm                                                Remove key from store
+POST  /files/send                                         send-file                 passthrough                   Send file to agent
+GET  /files/transfers                                    transfers                                               List file transfers
+GET  /files/transfers/:id                                transfer-status                                         Transfer status
+POST  /files/accept/:id                                   accept-file                                             Accept incoming transfer
+POST  /files/reject/:id                                   reject-file               body: reason                  Reject incoming transfer
+GET  /upgrade                                            upgrade                                                 Daemon-side check for updates over x0x/release manifests (the CLI x0x upgrade is a standalone GitHub updater and does not call this)
+POST  /upgrade/apply                                      upgrade --apply                                         Daemon applies the latest verified release manifest with transactional restart (CLI x0x upgrade applies via its standalone GitHub path instead)
+GET  /ws                                                 ws                                                      General-purpose WebSocket session
+GET  /ws/direct                                          ws direct                 query: backfill               WebSocket session for direct messaging
+GET  /ws/sessions                                        ws sessions                                             List WebSocket sessions
+GET  /gui                                                gui                                                     Open the embedded GUI
 
-135 endpoints total
+174 endpoints total

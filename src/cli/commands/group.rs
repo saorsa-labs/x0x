@@ -955,7 +955,7 @@ mod tests {
         let mock_resp = serde_json::json!({"id": "joined-group"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = join(&client, "invite-code-123", None).await;
+        let result = join(&client, "invite-code-123", None, false, None).await;
         assert!(result.is_ok(), "join should succeed: {:?}", result);
     }
 

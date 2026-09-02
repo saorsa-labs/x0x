@@ -2581,6 +2581,9 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     if group.withdrawn
         || group.policy.confidentiality != x0x::groups::GroupConfidentiality::SignedPublic
         || group.shared_secret.is_some()
+        // #468 A5: lineage is strictly local — an inbound snapshot
+        // carrying it is malformed or hostile; reject the whole record.
+        || group.invite_lineage.is_some()
         || group.security_binding.is_some()
     {
         return None;
@@ -2591,6 +2594,9 @@ pub(in crate::server) fn signed_public_bootstrap_snapshot(
     // daemon. These fields do not contribute to the signed public state hash.
     group.issued_invite_secrets.clear();
     group.issued_invites.clear();
+    // #468 A5: lineage is strictly LOCAL provenance — it must never leak
+    // into the hashed bootstrap obligation nor ride an outbound snapshot.
+    group.invite_lineage = None;
     group.join_requests.clear();
     group.shared_secret = None;
     group.secret_epoch = 0;
@@ -2768,6 +2774,156 @@ fn previous_hash_initial(
 /// fork's linkage goes stale), which is the same convergence rule every
 /// honest receiver applies.
 ///
+/// #468 A5: evaluate one rejected state-commit as FORK EVIDENCE.
+///
+/// Rules (design v4 A5 + v3 review item 6 — no false evidence, no replay
+/// amplification):
+/// - `PrevHashMismatch` is always a candidate.
+/// - `StaleRevision` is a candidate ONLY when a retained local commit
+///   exists at that exact revision with a DIFFERENT `state_hash`
+///   (identical hash = ordinary duplicate replay; revision outside
+///   retained history = unclassifiable).
+/// - A candidate becomes ONE recorded `ForkEvidence` only when its
+///   signature verifies (`verify_structure`) AND its committer was an
+///   ACTIVE ADMIN in the retained predecessor roster (the retained commit
+///   at `revision - 1`, whose projection is the signed base roster).
+/// - Evidence is deduplicated by `(revision, state_hash, committed_by)`:
+///   first COMPLETE evidence wins; repeats change nothing (no repeated
+///   persistence, warn, or counter).
+/// - Candidates failing either check increment the per-packet
+///   `conflict_unauthenticated` counter (documented as per-packet).
+/// - NO state change, eviction, or quarantine (#472 owns those).
+fn record_fork_evidence_candidate(
+    state: &AppState,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    error: &x0x::groups::state_commit::ApplyError,
+) {
+    let candidate_revision = match error {
+        x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. } => commit.revision,
+        x0x::groups::state_commit::ApplyError::StaleRevision { got, .. } => {
+            let Some(retained) = current
+                .commit_log
+                .iter()
+                .rev()
+                .find(|rc| rc.commit.revision == *got)
+            else {
+                // Outside retained history — unclassifiable, no evidence.
+                return;
+            };
+            if retained.commit.state_hash == commit.state_hash {
+                // Same revision, identical hash — an ordinary duplicate
+                // replay, NOT evidence.
+                return;
+            }
+            *got
+        }
+        _ => return,
+    };
+
+    // Authenticate the candidate: structure + signature + signer binding.
+    if commit.verify_structure().is_err() {
+        state
+            .groups_diagnostics
+            .record_conflict_unauthenticated(group_key);
+        return;
+    }
+    // The retained predecessor roster is the signed base the alternate
+    // commit claims to chain from.
+    let Some(predecessor) = current
+        .commit_log
+        .iter()
+        .rev()
+        .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
+    else {
+        state
+            .groups_diagnostics
+            .record_conflict_unauthenticated(group_key);
+        return;
+    };
+    let signer_is_base_admin = predecessor.roster.get(&commit.committed_by).is_some_and(
+        |snap| {
+            snap.state == x0x::groups::GroupMemberState::Active
+                && snap.role.at_least(x0x::groups::GroupRole::Admin)
+        },
+    );
+    if !signer_is_base_admin {
+        state
+            .groups_diagnostics
+            .record_conflict_unauthenticated(group_key);
+        return;
+    }
+
+    // Deduplicate by identity; first COMPLETE evidence wins.
+    if let Some(lineage) = current.invite_lineage.as_ref() {
+        if let Some(existing) = lineage.fork_evidence.as_ref() {
+            if existing.revision == candidate_revision
+                && existing.state_hash == commit.state_hash
+                && existing.committed_by.eq_ignore_ascii_case(&commit.committed_by)
+            {
+                return;
+            }
+        }
+    }
+    tracing::warn!(
+        group_id = %LogHexId::group(group_key),
+        revision = candidate_revision,
+        state_hash = %commit.state_hash,
+        committed_by = %LogHexId::agent(&commit.committed_by),
+        "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
+    );
+    state.groups_diagnostics.record_adoption_fork_evidence(group_key);
+
+    // Install the evidence on the live lineage record (first complete
+    // evidence wins). Best-effort `try_write`: the apply path may hold a
+    // read guard — contention merely defers the record to the next
+    // evidence observation; the counter above and this warn have already
+    // fired exactly once thanks to the identity dedupe.
+    let evidence = x0x::groups::ForkEvidence {
+        revision: candidate_revision,
+        state_hash: commit.state_hash.clone(),
+        committed_by: commit.committed_by.clone(),
+        observed_at_ms: now_millis_u64(),
+    };
+    if let Ok(mut groups) = state.named_groups.try_write() {
+        if let Some(info) = groups.get_mut(group_key) {
+            if let Some(lineage) = info.invite_lineage.as_mut() {
+                let is_duplicate = lineage.fork_evidence.as_ref().is_some_and(|existing| {
+                    existing.revision == evidence.revision
+                        && existing.state_hash == evidence.state_hash
+                        && existing.committed_by.eq_ignore_ascii_case(&evidence.committed_by)
+                });
+                if !is_duplicate && lineage.fork_evidence.is_none() {
+                    lineage.fork_evidence = Some(evidence);
+                }
+            }
+        }
+    }
+}
+
+/// #468 A5: the CENTRAL apply hook — every state-commit event variant
+/// passes through here, so every PrevHashMismatch/StaleRevision rejection
+/// is evaluated as fork evidence exactly once.
+fn apply_stateful_event_with_evidence(
+    state: &AppState,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    action: x0x::groups::ActionKind,
+    mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
+) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
+    match apply_stateful_event_to_group(current, commit, action, mutate) {
+        Ok(next) => Ok(next),
+        Err(e) => {
+            if current.invite_lineage.is_some() {
+                record_fork_evidence_candidate(state, group_key, current, commit, &e);
+            }
+            Err(e)
+        }
+    }
+}
+
 /// Separate fn + `Box::pin` at the call site: the giant apply fn's async
 /// frame must not absorb these locals (a deterministic 2 MiB-stack
 /// overflow appeared when they were inline).
@@ -7451,7 +7607,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let mut next = match apply_stateful_event_to_group(
+            let mut next = match apply_stateful_event_with_evidence(
+                &state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -7519,6 +7677,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .remove(&adopt_key);
+                    // #468 A5: a successful across-gap adoption under a
+                    // verified owner head attestation is TIER-1
+                    // corroboration of the seat.
+                    let attestation_corroborates = adopt_attestation.is_some();
                     let adopted = Box::pin(try_adopt_member_added_across_gap(
                         &adopt_state,
                         &current,
@@ -7537,7 +7699,14 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     ))
                     .await;
                     match adopted {
-                        Some(next) => next,
+                        Some(mut next) => {
+                            if attestation_corroborates {
+                                if let Some(lineage) = next.invite_lineage.as_mut() {
+                                    lineage.corroborated = true;
+                                }
+                            }
+                            next
+                        }
                         None => {
                             tracing::debug!(
                                 target: "treekem.trace",
@@ -7562,6 +7731,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     }
                 }
             };
+            // #468 A5: this commit SEATED the local agent (gapless direct
+            // apply or across-gap adoption) — finalize the pending
+            // lineage's `seated_at_revision` so intermediate commits
+            // before the seat never lose the recorded base.
+            {
+                let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+                if agent_id.eq_ignore_ascii_case(&local_hex)
+                    && !current.has_active_member(&local_hex)
+                {
+                    if let Some(lineage) = next.invite_lineage.as_mut() {
+                        if lineage.seated_at_revision.is_none() {
+                            lineage.seated_at_revision = Some(commit.revision);
+                        }
+                    }
+                }
+            }
             let mut recovery_cache_entries = Vec::new();
             if let Some(recovery) = member_joined_recovery.as_deref() {
                 if !verify_authority_attested_member_joined_recovery(&next, recovery) {
@@ -7800,7 +7985,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(&current, &commit, action_kind, |next| {
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key, &current, &commit, action_kind, |next| {
                 next.roster_revision = revision.max(next.roster_revision);
                 next.remove_member(&agent_id, Some(actor.clone()));
                 if let Some((_, epoch)) = treekem_payload.as_ref() {
@@ -7988,7 +8173,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8050,7 +8235,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8102,7 +8287,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8206,7 +8391,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8271,7 +8456,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::NonMemberRequest,
@@ -8437,7 +8622,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8633,7 +8818,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8684,7 +8869,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::NonMemberRequest,
@@ -8751,7 +8936,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_to_group(
+            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -9113,6 +9298,26 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         return ApplyMetadataResult::REJECTED;
                     }
                 };
+
+            // #469 A4: an ADDRESSED invite is consumed only by its
+            // intended joiner. The compare happens BEFORE consumption —
+            // a mismatched joiner leaves the one-time secret intact (the
+            // rightful recipient can still use it) and is refused here.
+            // Unaddressed invites keep first-MemberJoined-wins semantics.
+            if let Some(intended) = info.issued_invite_intended_joiner(&invite_secret) {
+                if !intended.eq_ignore_ascii_case(&member_agent_id) {
+                    tracing::warn!(
+                        group_id = %resolved_group_key,
+                        intended = %intended,
+                        member = %member_agent_id,
+                        "MemberJoined: invite is addressed to another agent; not consumed"
+                    );
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(&resolved_group_key, "invite_not_addressed_to_joiner");
+                    return ApplyMetadataResult::REJECTED;
+                }
+            }
 
             // 8. Build the authoritative committed add on a clone first. If
             //    validation/signing fails, the live group remains unchanged.
@@ -9955,6 +10160,9 @@ pub(in crate::server) async fn get_named_group(
             "roster_revision": info.roster_revision,
             "member_count": members.len(),
             "members": members,
+            // #468 A5: local invite-seat provenance (base, seat revision,
+            // corroboration, first authenticated fork evidence).
+            "invite_lineage": info.invite_lineage,
             "home": info.home.as_ref().map(|home| serde_json::json!({
                 "primary_agent": home.primary_agent,
                 "provisioned_at_ms": home.provisioned_at_ms,
@@ -12094,7 +12302,48 @@ fn invite_join_group_info(
         info.state_revision = base_revision;
         info.roster_revision = base_revision;
     }
-    if let Some(base_members) = invite.base_members_v2.clone() {
+    // #469 A2/v6 E2: seat the stub from the PROJECTION. Members are
+    // materialized with (id, role, state, treekem key-package hash,
+    // certificate digest) — `added_by`/timestamps are None/now (not
+    // hashed, display-only) — so `compute_roster_root` over the stub
+    // equals the authority's root WITHOUT certificate bytes: D2 makes a
+    // digest-only member hash identically to its byte-bearing form, and
+    // the announce/discovery hydration bridge fills the bytes later
+    // (digest-matched, mismatch ignored+logged).
+    if let Some(base_roster) = invite.base_roster.clone() {
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        info.members_v2 = base_roster
+            .into_iter()
+            .map(|(agent_hex, snap)| {
+                (
+                    agent_hex.clone(),
+                    x0x::groups::GroupMember {
+                        agent_id: agent_hex,
+                        user_id: None,
+                        role: snap.role,
+                        state: snap.state,
+                        display_name: None,
+                        joined_at: now_secs,
+                        updated_at: now_secs,
+                        added_by: None,
+                        removed_by: None,
+                        kem_public_key_b64: None,
+                        treekem_key_package_b64: None,
+                        treekem_key_package_hash: snap.treekem_key_package_hash,
+                        certificate: None,
+                        certificate_digest: snap.certificate_digest,
+                        certificate_missing_since_ms: None,
+                    },
+                )
+            })
+            .collect();
+    } else if let Some(base_members) = invite.base_members_v2.clone() {
+        // Legacy carrier (pre-v4 invites never reach here — refused at
+        // authentication — but defensive materialization keeps the helper
+        // total for internal callers).
         info.members_v2 = base_members;
     }
     if let Some(base_home) = invite.base_home.clone() {
@@ -12474,7 +12723,7 @@ pub(in crate::server) async fn join_group_via_invite(
             }
 
             let joiner_hex = hex::encode(agent_id.as_bytes());
-            let info = invite_join_group_info(
+            let mut info = invite_join_group_info(
                 &invite,
                 creator,
                 &creator_hex,
@@ -12483,6 +12732,20 @@ pub(in crate::server) async fn join_group_via_invite(
                 req.display_name.clone(),
                 treekem_key_package_b64.clone(),
             );
+            // #468 A5: PENDING lineage marker at stub creation — the base
+            // the authenticated invite committed to, before any seat.
+            // Intermediate commits that apply before our own seat cannot
+            // lose the base this way (v3 review item 5).
+            info.invite_lineage = Some(x0x::groups::InviteLineage {
+                base_revision: view.base_state_revision,
+                base_hash: view.base_state_hash.clone(),
+                base_roster_root: x0x::groups::state_commit::roster_root_of_projection(
+                    &view.base_roster,
+                ),
+                seated_at_revision: None,
+                corroborated: false,
+                fork_evidence: None,
+            });
 
             let chat_topic = info.general_chat_topic();
 
@@ -12497,6 +12760,11 @@ pub(in crate::server) async fn join_group_via_invite(
             // confirmation — keep the durable write for that shape.
             let base_seats_joiner = info.has_active_member(&joiner_hex);
             if base_seats_joiner {
+                // #468 A5: the signed base already seats the local joiner
+                // (self-rejoin shape) — the base IS the confirmation.
+                if let Some(lineage) = info.invite_lineage.as_mut() {
+                    lineage.seated_at_revision = Some(info.state_revision);
+                }
                 if !matches!(
                     persist_named_groups_mutation(&state, |groups| {
                         groups.insert(group_id_hex.clone(), info.clone());

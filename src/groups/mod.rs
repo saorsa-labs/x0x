@@ -71,6 +71,49 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// #468 A5: provenance of an invite-derived group seat — which base the
+/// stub adopted, when (if ever) the local roster seat landed, and the
+/// FIRST complete authenticated fork evidence observed afterwards.
+/// Strictly LOCAL diagnostic state: outside `compute_state_hash` (the
+/// hash's inputs are explicit), STRIPPED from every outbound bootstrap
+/// snapshot, and non-empty lineage on an INBOUND bootstrap is rejected.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct InviteLineage {
+    /// The base revision the invite committed to.
+    pub base_revision: u64,
+    /// The base state hash the invite committed to.
+    pub base_hash: String,
+    /// Roster root over the invite's projection at the base revision.
+    pub base_roster_root: String,
+    /// Revision at which THIS daemon's own seat landed (`None` = pending:
+    /// the stub exists but the seat has not been observed yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seated_at_revision: Option<u64>,
+    /// Tier-1: the seat was corroborated by a verified owner head
+    /// attestation (across-gap adoption under an OwnerCertified policy).
+    #[serde(default)]
+    pub corroborated: bool,
+    /// First COMPLETE authenticated fork evidence (#468): an alternate
+    /// commit at a retained revision, signature-verified, committed by an
+    /// active admin in the retained base roster. Deduplicated by
+    /// `(revision, state_hash, committed_by)`; first evidence wins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fork_evidence: Option<ForkEvidence>,
+}
+
+/// One authenticated fork-evidence record (#468 A5).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ForkEvidence {
+    /// Revision the alternate commit claims.
+    pub revision: u64,
+    /// Its (different) state hash.
+    pub state_hash: String,
+    /// The admin that committed it (hex agent id).
+    pub committed_by: String,
+    /// Local observation time (unix ms).
+    pub observed_at_ms: u64,
+}
+
 /// #469 E3: where an invite was minted. Card links are REUSED on
 /// subsequent card reads (their exact `signed_link` is stored so the
 /// identical token is returned); explicit mints are never republished.
@@ -282,6 +325,12 @@ pub struct GroupInfo {
     /// ADR-0037 wave.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home: Option<HomeMetadata>,
+
+    /// #468 A5: invite-derived provenance for this group's local seat.
+    /// `None` on every group not joined (or created) via invite; strictly
+    /// local (see [`InviteLineage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invite_lineage: Option<InviteLineage>,
 
     /// Retained, applied state-commit history (issue #111, follow-up to
     /// ADR-0016). Each entry pairs a signed
@@ -589,6 +638,7 @@ impl GroupInfo {
             withdrawn: false,
             owner_cert_reverify_required: false,
             home: None,
+            invite_lineage: None,
             issued_invite_secrets: HashSet::new(),
             issued_invites: HashMap::new(),
         };
