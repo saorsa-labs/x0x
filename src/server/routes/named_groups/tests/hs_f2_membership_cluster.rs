@@ -3467,9 +3467,11 @@ async fn issue458r6b_tier2_ordinary_group_adopts_across_gap() -> Result<()> {
 }
 
 /// #458 r6b item 1 (negative): the r4 converged-view removed-admin fork on
-/// an ORDINARY group is still REJECTED in tier 2 — the joiner's view has
-/// advanced past the fork's base (A removed canonically), so the arm's
-/// admin-authority gate and the reconstruction's linkage both refuse.
+/// an ORDINARY group is rejected at the PRE-ADOPTION actor gate (A is not
+/// an admin in the joiner's converged current roster) BEFORE the tier-2
+/// reconstruction runs. The reconstruction's linkage would also refuse
+/// (the fork chains from the stale BASE hash), but this test does NOT pin
+/// that inner refusal — see the actor-gate NOTE at the apply call below.
 #[tokio::test]
 async fn issue458r6b_tier2_removed_admin_fork_rejected() -> Result<()> {
     let stage = issue458_stage_with_policy(0xC2, false, invite_only_policy).await?;

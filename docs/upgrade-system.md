@@ -121,6 +121,18 @@ sees a shape it cannot parse:
   extension is invisible to v0.40.x, whose recovery scan only reads
   `*.journal`; the postcard shape of the legacy journal itself is unchanged
   because old binaries decode the FULL struct before checking its version.
+- **Quarantined journal pairs (`.journal.quarantined-<ts>` /
+  `.hsjournal.quarantined-<ts>`)** — at startup, when a group's live merged
+  state (named + sidecar) and its retained journal pair disagree at the
+  SAME `state_revision` with DIFFERENT `state_hash` (an equal-revision
+  fork — e.g. two daemons each sealed a transition from the same parent),
+  the daemon does NOT pick a side and does NOT fail startup: it renames
+  BOTH journals aside with a `.quarantined-<unix-ts>` suffix, applies
+  neither half, and logs the exact paths plus the (revision, hash) pair.
+  The live state stands. To RESOLVE: delete the quarantined files to
+  accept the live state, or remove the live state files and rename the
+  quarantined journals back to replay the journal pair instead. Stale
+  journals (older revision than live) are consumed automatically.
 - **Migration**: a store written by a pre-#451 Home-Suite binary (real
   owner-certified entries directly in `named_groups.json`) is migrated to
   the split layout automatically on the first post-#451 start — no
