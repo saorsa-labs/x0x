@@ -19787,6 +19787,19 @@ pub(in crate::server) fn set_replay_fault(faults: &[ReplayFault]) -> ReplayFault
 /// test that injects a fault must hold this lock for its whole body so
 /// concurrent tests never observe (or overwrite) another's mask.
 #[cfg(test)]
+fn is_root() -> bool {
+    #[cfg(unix)]
+    {
+        // SAFETY: getuid is async-signal-safe and trivial.
+        unsafe { libc::getuid() == 0 }
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+#[cfg(test)]
 pub(in crate::server) static FAULT_TEST_LOCK: tokio::sync::Mutex<()> =
     tokio::sync::Mutex::const_new(());
 
@@ -20611,26 +20624,9 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             }
         }
         match decision {
+            // Unreachable-by-construction: the stale consume above already
+            // `continue`d for this decision. Defensive retain.
             PairedReplayDecision::StaleLiveNewer => {
-                tracing::warn!(
-                    group_id = %journal.group_id_hex,
-                    "#457 r9: journal pair is stale against the newer live merged view — no live file written, journals consumed"
-                );
-                match tokio::fs::remove_file(&path).await {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                    Err(e) => {
-                        // #457 r13 item 13.3 — retain the stale pair for
-                        // the next boot; never abort startup.
-                        tracing::error!(
-                            path = %path.display(),
-                            error = %e,
-                            "#457 r13: failed to remove the stale journal — retained for the next boot, startup continues"
-                        );
-                        continue;
-                    }
-                }
-                let _ = tokio::fs::remove_file(&hsjournal_path).await;
                 continue;
             }
             PairedReplayDecision::BodyMismatch => {
@@ -20910,11 +20906,15 @@ fn live_classification(
                 LiveClassification::Plain
             }
         }
-        // #457 r14 (accepted limitation): with NO live record to consult,
-        // a record-absent v1 body is treated as PLAIN (the legitimate
-        // fresh-upgrade shape, pinned by the frozen-bytes regression). A
-        // genuinely Home-Suite pair in this shape is indistinguishable and
-        // relies on the tx binding of its v2 successor.
+        // #457 r15 (revised 15.2): a READABLE live store with NO record
+        // for the group classifies as PLAIN — deliberately, NOT
+        // retain-on-not-found: a NEW plain group's first-persist crash
+        // leaves no live record yet, and retaining on that shape would
+        // make its recovery journal unrecoverable. A genuinely Home-Suite
+        // pair in this shape is indistinguishable without a live record;
+        // the tx binding of its v2 successor covers it. Only a live-store
+        // read/parse FAILURE is uncertain — and that is already the
+        // global fail-closed abort.
         None => LiveClassification::Plain,
     }
 }
@@ -37908,8 +37908,11 @@ mod hs451_downgrade_safety {
 
             // The LIVE store decides Home-Suite-ness for v1: seed the live
             // record with (or without) the OwnerCertified admission.
+            // #457 r15 item 15.3 — the plain arm seeds a PLAIN LIVE RECORD
+            // (not an empty store) at the journal's revision/hash.
             let mut live_entry = home_suite_entry();
             live_entry.state_revision = 1;
+            live_entry.state_hash = "lit".to_string();
             if !home_suite {
                 live_entry.policy.admission = Default::default();
             }
@@ -37981,10 +37984,49 @@ mod hs451_downgrade_safety {
                     "(home-suite) nothing applied"
                 );
             } else {
-                // Plain group: the SAME frozen bytes replay legacy-only.
+                // #457 r15 item 15.3 — the plain arm took the LEGACY-ONLY
+                // path: merged record at the journal's revision, snapshot
+                // bytes == the journaled envelope, and ZERO
+                // quarantined/split artifacts.
                 assert!(
                     !treekem_journal_path(&treekem, &home_id).exists(),
                     "(plain) the legacy journal is consumed"
+                );
+                assert!(
+                    !treekem_home_suite_journal_path(&treekem, &home_id).exists(),
+                    "(plain) the .hsjournal is consumed"
+                );
+                let merged = load_named_groups_merged(&named_path, &sidecar_path)
+                    .await
+                    .expect("(plain) merged");
+                let record = merged
+                    .get(&home_id)
+                    .expect("(plain) the legacy-only path was TAKEN");
+                assert_eq!(record.state_revision, 1, "(plain) merged at rev 1");
+                assert_eq!(
+                    record.state_hash, "lit",
+                    "(plain) the journal's record state"
+                );
+                assert_eq!(
+                    tokio::fs::read(treekem.join(format!("{home_id}.snap")))
+                        .await
+                        .expect("(plain) snapshot written"),
+                    vec![1u8; 1],
+                    "(plain) snapshot bytes == the journaled envelope"
+                );
+                let mut artifacts = 0;
+                let mut rd = tokio::fs::read_dir(&treekem)
+                    .await
+                    .expect("(plain) readdir");
+                while let Some(entry) = rd.next_entry().await.expect("entry") {
+                    let name = entry.file_name().to_string_lossy().to_string();
+                    if name.contains("quarantined-") || name.contains(".split-") {
+                        artifacts += 1;
+                    }
+                }
+                assert_eq!(
+                    artifacts, 0,
+                    "(plain) ZERO quarantine/split artifacts remain"
                 );
             }
         }
@@ -38082,6 +38124,10 @@ mod hs451_downgrade_safety {
     ///   (c) stale-journal removal failure (unwritable dir) ⇒ retained.
     #[tokio::test]
     async fn r13_per_group_failures_never_abort_startup() {
+        if is_root() {
+            tracing::warn!("skipped under root (chmod is not a barrier there)");
+            return;
+        }
         // (a) malformed inner legacy JSON.
         {
             let _fault_test_lock = fault_test_lock().await;
@@ -38637,9 +38683,14 @@ mod hs451_downgrade_safety {
             }
             journal_groups.insert(home_id.clone(), j);
             let (legacy_json, _) = encode_named_groups_store(&journal_groups).expect("encode");
+            // #457 r15 item 15.1 — the body is HAND-BUILT: the splitting
+            // encoder EXCLUDES plain records from the sidecar body, which
+            // would turn the spoof=true case into "tag + ABSENT record".
+            // Serializing the map directly puts the plain record IN the
+            // body, so the spoof is "tag + PRESENT plain record".
             let mut body_groups = HashMap::new();
             body_groups.insert(home_id.clone(), body_entry);
-            let (_, body_json) = encode_named_groups_store(&body_groups).expect("encode");
+            let body_json = serde_json::to_string(&body_groups).expect("hand-built sidecar body");
             let tx = HomeSuiteJournalTx {
                 group_id_hex: home_id.clone(),
                 state_revision: 4,
@@ -38832,13 +38883,8 @@ mod hs451_downgrade_safety {
         .await
         .expect("journal");
 
-        // Second rename fails; the rollback fails too — AND the split
-        // MARKER rename must also fail to leave the unmarked shape. The
-        // marker rename fails naturally? No: fault Second+Rollback drives
-        // the branch; the marker rename then runs. Make it fail via a
-        // Marker fault bit — reuse Fsync? Add dedicated handling: the
-        // marker rename fails when the Second bit is ALSO active (the
-        // same injected IO failure domain).
+        // Second rename, rollback, AND the split-marker rename all fail
+        // (the MarkerRename fault bit) — the UNMARKED split shape.
         let _fguard = set_quarantine_fault(&[
             QuarantineFault::Second,
             QuarantineFault::Rollback,
@@ -38869,11 +38915,12 @@ mod hs451_downgrade_safety {
         );
     }
 
-    /// #457 r14 item 14.3 (accepted limitation, addendum) — a v1 pair with
-    /// NO live record to consult and a record-absent body replays as PLAIN
-    /// (the legitimate fresh-upgrade shape). Documented limitation: a
-    /// genuinely Home-Suite pair in this exact shape is indistinguishable
-    /// without a live record; the tx binding of its v2 successor covers it.
+    /// #457 r14 item 14.3 + r15 (revised 15.2) — a v1 pair with NO live
+    /// record to consult and a record-absent body replays as PLAIN: a new
+    /// plain group's first-persist crash leaves no live record yet, and
+    /// retain-on-not-found would make its recovery journal unrecoverable.
+    /// Only a live-store read/parse failure is uncertain (the global
+    /// fail-closed abort).
     #[tokio::test]
     async fn r14_v1_no_live_record_replays_as_plain() {
         let _fault_test_lock = fault_test_lock().await;
@@ -38941,9 +38988,14 @@ mod hs451_downgrade_safety {
 
     /// #457 r14 item 14.4 regression — the withdrawn-cleanup failure
     /// retains the journal (never aborts): a withdrawn journal image plus
-    /// an unwritable treekem dir.
+    /// an unwritable treekem dir. SKIPPED as root (chmod cannot block
+    /// root).
     #[tokio::test]
     async fn r14_withdrawn_cleanup_failure_retains() {
+        if is_root() {
+            tracing::warn!("skipped under root (chmod is not a barrier there)");
+            return;
+        }
         let _fault_test_lock = fault_test_lock().await;
         let dir = tempfile::tempdir().expect("tempdir");
         let treekem = dir.path().join("treekem");
