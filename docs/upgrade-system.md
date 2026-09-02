@@ -121,18 +121,32 @@ sees a shape it cannot parse:
   extension is invisible to v0.40.x, whose recovery scan only reads
   `*.journal`; the postcard shape of the legacy journal itself is unchanged
   because old binaries decode the FULL struct before checking its version.
-- **Quarantined journal pairs (`.journal.quarantined-<ts>` /
-  `.hsjournal.quarantined-<ts>`)** — at startup, when a group's live merged
-  state (named + sidecar) and its retained journal pair disagree at the
-  SAME `state_revision` with DIFFERENT `state_hash` (an equal-revision
-  fork — e.g. two daemons each sealed a transition from the same parent),
-  the daemon does NOT pick a side and does NOT fail startup: it renames
-  BOTH journals aside with a `.quarantined-<unix-ts>` suffix, applies
-  neither half, and logs the exact paths plus the (revision, hash) pair.
-  The live state stands. To RESOLVE: delete the quarantined files to
-  accept the live state, or remove the live state files and rename the
-  quarantined journals back to replay the journal pair instead. Stale
-  journals (older revision than live) are consumed automatically.
+- **Quarantined journals (`<group>.journal.quarantined-<ms>-<seq>` /
+  `<group>.hsjournal.quarantined-<ms>-<seq>`)** — the daemon quarantines a
+  group's journals aside (never aborts startup, applies nothing, live
+  state stands) in these cases:
+  1. **Equal-revision fork** — the live merged state and the retained
+     journal pair disagree at the same `state_revision` with different
+     `state_hash` (e.g. two daemons each sealed from the same parent).
+  2. **Mismatched transaction tag** — the `.hsjournal`'s v2 tag
+     (group, revision, hash) disagrees with the retained legacy journal's
+     record: a retry race wrote one half but not the other.
+  3. **Undecodable `.hsjournal`** — present but not decodable by this
+     binary (garbage or an unsupported future version).
+  4. **Legacy-only fork** — no `.hsjournal` exists (the shape every
+     released v0.40.x leaves); only the legacy journal is quarantined
+     (`<group>.journal.quarantined-<ms>-<seq>` alone).
+  Resolution for every case: DELETE the quarantined files to accept the
+  live state, or remove the live state files and rename the quarantined
+  journals back to replay the journal pair instead. Destinations are
+  reserved exclusively (a pre-existing quarantine file is never
+  replaced). Stale journals (older revision than live) are consumed
+  automatically. A v1 (pre-#457-tag) `.hsjournal` with a consistent pair
+  is REPLAYED as a pair (the tag check is derived from the sidecar
+  record itself). If a quarantine cannot complete (rename/fsync
+  failure), the pair is RETAINED fail-closed at its live names and the
+  error log states the exact on-disk shape (restored / split /
+  durability-uncertain).
 - **Migration**: a store written by a pre-#451 Home-Suite binary (real
   owner-certified entries directly in `named_groups.json`) is migrated to
   the split layout automatically on the first post-#451 start — no
