@@ -88,9 +88,16 @@ pub fn compute_roster_root(members_v2: &BTreeMap<String, GroupMember>) -> String
                 id.as_str(),
                 m.role,
                 m.state,
+                // #468/#469 (design v5 D2 / v6 E2): a digest-only member
+                // (bytes stripped / projection-materialized) contributes its
+                // stored `certificate_digest`; a byte-bearing member always
+                // contributes the bytes' own digest, so both forms of the
+                // SAME member hash identically and the stored digest can
+                // never rewrite a byte-bearing entry's root.
                 m.certificate
                     .as_ref()
-                    .map(crate::groups::owner_cert::certificate_digest_hex),
+                    .map(crate::groups::owner_cert::certificate_digest_hex)
+                    .or(m.certificate_digest.clone()),
             )
         })
         .collect();
@@ -156,10 +163,16 @@ pub fn roster_projection(
                     role: m.role,
                     state: m.state,
                     treekem_key_package_hash: m.treekem_key_package_hash.clone(),
+                    // Mirrors `compute_roster_root`'s digest preference
+                    // exactly: bytes' digest when present, else the stored
+                    // digest-only commitment. A projection taken from a
+                    // digest-only roster must re-derive the same signed
+                    // root (`RetainedCommit::roster_root_consistent`).
                     certificate_digest: m
                         .certificate
                         .as_ref()
-                        .map(crate::groups::owner_cert::certificate_digest_hex),
+                        .map(crate::groups::owner_cert::certificate_digest_hex)
+                        .or(m.certificate_digest.clone()),
                 },
             )
         })
@@ -2011,5 +2024,61 @@ mod tests {
         };
         let err = validate_apply(&ctx, &commit, ActionKind::AdminOrHigher).unwrap_err();
         assert!(matches!(err, ApplyError::GroupIdMismatch { .. }));
+    }
+
+    // ── #468/#469 (design v5 D2): digest-only roster seats ──────────────
+
+    /// Why: a member whose certificate bytes were stripped (key-stripped
+    /// recovery / invite state) but whose digest was kept MUST hash
+    /// identically to its byte-bearing form — the signed roster root binds
+    /// the digest either way, so stripping bytes can never silently change
+    /// the committed root.
+    #[test]
+    fn digest_only_member_hashes_identically_to_byte_bearing() {
+        let user = crate::identity::UserKeypair::generate().unwrap();
+        let agent = crate::identity::AgentKeypair::generate().unwrap();
+        let cert = crate::identity::AgentCertificate::issue(&user, &agent).unwrap();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+
+        let mut byte_bearing = BTreeMap::new();
+        let mut m = make_member(&agent_hex, GroupRole::Member);
+        m.certificate = Some(cert.clone());
+        byte_bearing.insert(agent_hex.clone(), m);
+        let root_with_bytes = compute_roster_root(&byte_bearing);
+
+        // Strip the bytes, keep the digest (what set_member_certificate
+        // recorded at install time).
+        let mut digest_only = byte_bearing.clone();
+        let stripped = digest_only.get_mut(&agent_hex).unwrap();
+        stripped.certificate = None;
+        stripped.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(
+            &cert,
+        ));
+        assert_eq!(
+            compute_roster_root(&digest_only),
+            root_with_bytes,
+            "digest-only and byte-bearing forms of the same member must share a roster root"
+        );
+
+        // The projection path must agree for BOTH forms: a retained commit
+        // re-derives the same signed root after a byte strip.
+        assert_eq!(
+            roster_root_of_projection(&roster_projection(&digest_only)),
+            root_with_bytes
+        );
+        assert_eq!(
+            roster_root_of_projection(&roster_projection(&byte_bearing)),
+            root_with_bytes
+        );
+
+        // And a digest-only seat is still distinguishable from a member
+        // with NO certificate commitment at all.
+        let mut no_commitment = digest_only.clone();
+        no_commit.get_mut(&agent_hex).unwrap().certificate_digest = None;
+        assert_ne!(
+            compute_roster_root(&no_commitment),
+            root_with_bytes,
+            "a member with no cert and no digest is a different committed roster"
+        );
     }
 }

@@ -71,6 +71,24 @@ fn now_millis() -> u64 {
         .as_millis() as u64
 }
 
+/// #469 E3: where an invite was minted. Card links are REUSED on
+/// subsequent card reads (their exact `signed_link` is stored so the
+/// identical token is returned); explicit mints are never republished.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum InviteOrigin {
+    /// `POST /groups/:id/invite` — never appears on cards. Also the
+    /// serde default for pre-#469 records.
+    #[default]
+    Explicit,
+    /// Auto-minted by `GET /agent/card?include_groups=true`.
+    Card,
+}
+
+/// #469 E3: hard cap on unconsumed + unexpired issued-invite records per
+/// group; minting refuses with `invite_cap_reached` at the cap (after
+/// pruning consumed/expired records).
+pub const MAX_LIVE_ISSUED_INVITES_PER_GROUP: usize = 64;
+
 /// Locally-issued invite record used to authenticate joiner-authored
 /// `MemberJoined` requests at the original inviter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +109,19 @@ pub struct IssuedInviteRecord {
     /// Unix milliseconds when the invite was consumed locally.
     #[serde(default)]
     pub consumed_at_ms: Option<u64>,
+    /// #469 A4: the agent this invite was addressed to, when minted for a
+    /// specific joiner. The authority compares it with
+    /// `MemberJoined.member_agent_id` BEFORE consuming the secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_joiner: Option<String>,
+    /// #469 E3: mint surface this record came from.
+    #[serde(default)]
+    pub origin: InviteOrigin,
+    /// #469 E3: the exact signed link for Card-origin records, so card
+    /// reads return the identical token instead of re-minting. Explicit
+    /// mints store None and are never republished.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub signed_link: Option<String>,
 }
 
 fn default_invite_max_role() -> GroupRole {
@@ -417,6 +448,30 @@ pub fn leave_disposition(info: &GroupInfo, leaver_hex: &str) -> LeaveDisposition
         return LeaveDisposition::PendingJoinBlocked;
     }
     LeaveDisposition::LastAdminBlocked
+}
+
+/// Invite-auth #468/#469 (design v5 D2): why
+/// [`GroupInfo::set_member_certificate`] refused to install certificate
+/// bytes. Refusal leaves the roster entry untouched — the caller keeps the
+/// committed state and must resolve the conflict out-of-band.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetMemberCertificateError {
+    /// The member entry carries a committed `certificate_digest` (part of
+    /// the signed roster root) and the incoming bytes hash to a DIFFERENT
+    /// digest. Installing them would silently rewrite committed state under
+    /// the chain, so the install is rejected; the seat stays as-is
+    /// (digest-only members remain `DigestPending`).
+    CertificateDigestMismatch,
+}
+
+impl std::fmt::Display for SetMemberCertificateError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::CertificateDigestMismatch => {
+                f.write_str("certificate digest does not match the committed roster digest")
+            }
+        }
+    }
 }
 
 impl GroupInfo {
@@ -946,6 +1001,31 @@ impl GroupInfo {
                 );
                 continue;
             }
+            // Invite-auth #468/#469 (design v5 D2 / v6 E2): a DIGEST-ONLY
+            // seat — the signed roster root commits to this member's
+            // certificate digest but the bytes are not embedded
+            // (key-stripped invite/recovery state, a projection-materialized
+            // adoption member, or a restart before hydration). PENDING,
+            // never missing evidence: no grace-window stamping and no
+            // missing-evidence eviction can touch the seat, while every
+            // operation needing the certificate BYTES fails closed
+            // (`is_all_clean` stays false until
+            // `hydrate_member_certificates` installs them). Only revocation
+            // (checked above) outranks it.
+            let digest_only = embedded.is_none()
+                && self
+                    .members_v2
+                    .get(&agent_hex)
+                    .and_then(|m| m.certificate_digest.as_ref())
+                    .is_some();
+            if digest_only {
+                clear_ts(&mut self.members_v2);
+                per_member.insert(
+                    agent_hex,
+                    owner_cert::MemberCertStatus::DigestPending,
+                );
+                continue;
+            }
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
                 evidence.digest_for(&agent_hex).is_some_and(|announced| {
                     announced
@@ -1083,15 +1163,127 @@ impl GroupInfo {
 
     /// ADR-0038: bind the verified `AgentCertificate` into a member's roster
     /// entry so the signed state-commit's roster root covers it.
+    ///
+    /// Invite-auth #468/#469 (design v5 D2): a member whose entry already
+    /// carries a committed `certificate_digest` (e.g. re-admitted from a
+    /// key-stripped roster or a projection) may ONLY receive bytes hashing
+    /// to that digest — the digest is part of the signed roster root, so
+    /// silently installing different bytes would rewrite committed state
+    /// under the chain. On success BOTH the bytes and their digest are
+    /// stored, so a later strip can drop the bytes without losing the
+    /// commitment. A missing member entry remains a no-op success (callers
+    /// seed the roster entry first).
     pub fn set_member_certificate(
         &mut self,
         agent_id_hex: &str,
         certificate: crate::identity::AgentCertificate,
-    ) {
-        if let Some(m) = self.members_v2.get_mut(agent_id_hex) {
-            m.certificate = Some(certificate);
-            m.updated_at = now_millis();
+    ) -> Result<(), SetMemberCertificateError> {
+        let digest = owner_cert::certificate_digest_hex(&certificate);
+        let Some(m) = self.members_v2.get_mut(agent_id_hex) else {
+            return Ok(());
+        };
+        if m.certificate_digest.as_deref().is_some_and(|committed| committed != digest) {
+            return Err(SetMemberCertificateError::CertificateDigestMismatch);
         }
+        m.certificate = Some(certificate);
+        m.certificate_digest = Some(digest);
+        m.updated_at = now_millis();
+        Ok(())
+    }
+
+    /// Invite-auth #468/#469 (design v5 D2 / v6 E2): hydrate DIGEST-ONLY
+    /// seats with certificate bytes. For every member with
+    /// `certificate == None` and a committed `certificate_digest` whose
+    /// digest equals a provided certificate's digest, the bytes are
+    /// installed via [`Self::set_member_certificate`] (which re-checks the
+    /// digest and stamps both fields). A provided certificate that matches
+    /// no committed digest (or belongs to a byte-bearing member) is ignored
+    /// and logged — hydration never rewrites committed state. Returns the
+    /// number of members hydrated; the server broadcast bridge is the
+    /// intended caller.
+    pub fn hydrate_member_certificates(
+        &mut self,
+        certificates: &[(String, crate::identity::AgentCertificate)],
+    ) -> usize {
+        let mut hydrated = 0usize;
+        for (agent_hex, cert) in certificates {
+            let Some(member) = self.members_v2.get(agent_hex) else {
+                continue;
+            };
+            if member.certificate.is_some() {
+                // Bytes already seated — the committed entry is complete;
+                // hydration targets digest-only seats exclusively.
+                continue;
+            }
+            let Some(committed) = member.certificate_digest.clone() else {
+                // No committed digest: nothing binds this certificate to
+                // the seat — hydration is digest-anchored by design.
+                tracing::debug!(
+                    group_id = %self.stable_group_id(),
+                    member = %agent_hex,
+                    "hydrate_member_certificates: member has no committed digest; skipping"
+                );
+                continue;
+            };
+            let digest = owner_cert::certificate_digest_hex(cert);
+            if digest != committed {
+                // Evidence for a DIFFERENT admission (e.g. the owner
+                // re-keyed while this roster still commits to the old
+                // digest): the seat stays pending; never rewrite the
+                // commitment.
+                tracing::debug!(
+                    group_id = %self.stable_group_id(),
+                    member = %agent_hex,
+                    "hydrate_member_certificates: certificate digest does not match the committed digest; ignoring"
+                );
+                continue;
+            }
+            if self
+                .set_member_certificate(agent_hex, cert.clone())
+                .is_ok()
+            {
+                hydrated += 1;
+            }
+        }
+        hydrated
+    }
+
+    /// Invite-auth #468/#469 (design v5 D2): load-time repair for persisted
+    /// records. An entry carrying BOTH certificate bytes and a stored
+    /// `certificate_digest` that does not match those bytes is repaired to
+    /// the bytes' digest — the BYTES are the authority when present (they
+    /// are what verification and the roster root actually consumed at seal
+    /// time; a mismatching stored digest is write-path corruption, e.g. a
+    /// torn update across versions, and would go live the moment the bytes
+    /// are stripped). Returns the number of entries repaired; the
+    /// persisted-store load path calls this once per deserialized record.
+    pub fn repair_member_certificate_digests(&mut self) -> usize {
+        let group_id = self.stable_group_id().to_string();
+        let mut repaired = 0usize;
+        for (agent_hex, member) in &mut self.members_v2 {
+            let Some(cert) = member.certificate.as_ref() else {
+                continue;
+            };
+            let actual = owner_cert::certificate_digest_hex(cert);
+            // Repair ONLY the both-present mismatch: a digest-less legacy
+            // entry stays digest-less (its root already covers the bytes).
+            if member
+                .certificate_digest
+                .as_deref()
+                .is_some_and(|stored| stored != actual)
+            {
+                tracing::warn!(
+                    group_id = %group_id,
+                    member = %agent_hex,
+                    stored = ?member.certificate_digest,
+                    actual = %actual,
+                    "repairing mismatched member certificate digest to the certificate bytes' digest at load"
+                );
+                member.certificate_digest = Some(actual);
+                repaired += 1;
+            }
+        }
+        repaired
     }
 
     /// ADR-0038: the roster-embedded certificate for `agent_id_hex` — the
@@ -1293,7 +1485,12 @@ impl GroupInfo {
     /// projection are removed (the projection is authoritative), and
     /// projection-only members are added minimally. Certificates already
     /// embedded in the local roster are preserved when their digest still
-    /// matches the projection's.
+    /// matches the projection's. Invite-auth #468/#469 (design v5 D2):
+    /// every materialized/updated entry also adopts the projection's
+    /// `certificate_digest` — a mismatching local cert drops its bytes but
+    /// keeps the committed digest, so projection members without local
+    /// bytes seat digest-only (`MemberCertStatus::DigestPending`) instead
+    /// of losing their committed evidence.
     pub fn apply_reconstructed_roster(
         &mut self,
         projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
@@ -1318,16 +1515,27 @@ impl GroupInfo {
                         .as_ref()
                         .map(owner_cert::certificate_digest_hex);
                     if local_digest.as_deref() != snap.certificate_digest.as_deref() {
-                        // The projection is authoritative for cert presence;
-                        // a matching local cert keeps its full bytes.
+                        // The projection is authoritative for cert identity:
+                        // a local cert whose digest no longer matches is
+                        // STALE — drop the BYTES but KEEP the projection's
+                        // digest (assigned below), so the member stays
+                        // digest-seated instead of evidence-less.
                         member.certificate = None;
                     }
+                    // Invite-auth #468/#469 (design v5 D2): the projection's
+                    // digest rides onto the entry whether or not local bytes
+                    // survived, so `compute_roster_root` re-derives the
+                    // projection's signed root and a byte-less member
+                    // remains digest-committed
+                    // (`MemberCertStatus::DigestPending`).
+                    member.certificate_digest = snap.certificate_digest.clone();
                 }
                 None => {
                     let mut member =
                         GroupMember::new_member(id.clone(), None, None, self.updated_at);
                     member.role = snap.role;
                     member.state = snap.state;
+                    member.certificate_digest = snap.certificate_digest.clone();
                     self.members_v2.insert(id.clone(), member);
                 }
             }
@@ -1562,6 +1770,29 @@ impl GroupInfo {
         expires_at_secs: u64,
         max_role: GroupRole,
     ) {
+        self.record_issued_invite_v2(
+            secret,
+            created_at_secs,
+            expires_at_secs,
+            max_role,
+            None,
+            InviteOrigin::Explicit,
+            None,
+        );
+    }
+
+    /// #469 A4/E3: full-arity mint recorder — intended joiner, origin and
+    /// (for Card origin) the exact signed link to reuse.
+    pub fn record_issued_invite_v2(
+        &mut self,
+        secret: String,
+        created_at_secs: u64,
+        expires_at_secs: u64,
+        max_role: GroupRole,
+        intended_joiner: Option<String>,
+        origin: InviteOrigin,
+        signed_link: Option<String>,
+    ) {
         self.issued_invite_secrets.insert(secret.clone());
         self.issued_invites.insert(
             secret,
@@ -1571,8 +1802,62 @@ impl GroupInfo {
                 max_role,
                 consumed_by: None,
                 consumed_at_ms: None,
+                intended_joiner,
+                origin,
+                signed_link,
             },
         );
+    }
+
+    /// #469 E3: drop consumed/expired records. Called before the live-cap
+    /// check at every mint.
+    pub fn prune_issued_invites(&mut self, now_secs: u64) {
+        self.issued_invites.retain(|secret, record| {
+            let live = record.consumed_by.is_none()
+                && (record.expires_at_secs == 0 || record.expires_at_secs > now_secs);
+            if live {
+                return true;
+            }
+            self.issued_invite_secrets.remove(secret);
+            false
+        });
+    }
+
+    /// #469 E3: unconsumed + unexpired record count (both origins).
+    #[must_use]
+    pub fn live_issued_invite_count(&self, now_secs: u64) -> usize {
+        self.issued_invites
+            .values()
+            .filter(|record| {
+                record.consumed_by.is_none()
+                    && (record.expires_at_secs == 0 || record.expires_at_secs > now_secs)
+            })
+            .count()
+    }
+
+    /// #469 E3: newest unconsumed, unexpired, unaddressed CARD-origin
+    /// record — the only shape a card read may republish.
+    #[must_use]
+    pub fn reusable_card_invite(&self, now_secs: u64) -> Option<&IssuedInviteRecord> {
+        self.issued_invites
+            .values()
+            .filter(|record| {
+                record.consumed_by.is_none()
+                    && record.intended_joiner.is_none()
+                    && matches!(record.origin, InviteOrigin::Card)
+                    && (record.expires_at_secs == 0 || record.expires_at_secs > now_secs)
+            })
+            .max_by_key(|record| record.created_at_secs)
+    }
+
+    /// #469 A4: the intended joiner recorded for `secret`, if any — the
+    /// authority compares it with `MemberJoined.member_agent_id` BEFORE
+    /// consuming.
+    #[must_use]
+    pub fn issued_invite_intended_joiner(&self, secret: &str) -> Option<&str> {
+        self.issued_invites
+            .get(secret)
+            .and_then(|record| record.intended_joiner.as_deref())
     }
 
     /// Consume a previously-recorded one-time invite for `member_agent_id`.
@@ -1668,6 +1953,7 @@ impl GroupInfo {
                 treekem_key_package_hash: None,
                 certificate: None,
                 certificate_missing_since_ms: None,
+                certificate_digest: None,
             });
     }
 
@@ -1749,6 +2035,7 @@ impl GroupInfo {
                 treekem_key_package_hash: None,
                 certificate: None,
                 certificate_missing_since_ms: None,
+                certificate_digest: None,
             });
     }
 
@@ -2466,5 +2753,332 @@ mod tests {
     #[test]
     fn default_invite_max_role_is_member() {
         assert_eq!(default_invite_max_role(), GroupRole::Member);
+    }
+
+    // ── #468/#469 (design v5 D2 / v6 E2): digest-only roster seats ──────
+
+    /// Owner + freshly certified agent — the minimal admission fixture.
+    fn certified_fixture()
+    -> (
+        crate::identity::UserKeypair,
+        crate::identity::AgentKeypair,
+        crate::identity::AgentCertificate,
+    ) {
+        let user = crate::identity::UserKeypair::generate().expect("user keypair");
+        let agent = crate::identity::AgentKeypair::generate().expect("agent keypair");
+        let cert = crate::identity::AgentCertificate::issue(&user, &agent).expect("cert issue");
+        (user, agent, cert)
+    }
+
+    #[test]
+    fn set_member_certificate_rejects_digest_mismatch_and_sets_both_on_match() {
+        // WHY: the committed `certificate_digest` is part of the signed
+        // roster root. Installing bytes that hash to a different digest
+        // would silently rewrite committed state under the chain, so the
+        // install must be refused without touching the entry; a matching
+        // install records BOTH the bytes and their digest so a later strip
+        // keeps the commitment (#468/#469 design v5 D2).
+        let (user, agent, cert) = certified_fixture();
+        let other_agent = crate::identity::AgentKeypair::generate().unwrap();
+        let other_cert =
+            crate::identity::AgentCertificate::issue(&user, &other_agent).expect("other cert");
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        // Digest-only seat keyed to `cert`.
+        info.members_v2.get_mut(&agent_hex).unwrap().certificate_digest = Some(committed.clone());
+
+        // Mismatching bytes: refused, entry untouched.
+        let err = info
+            .set_member_certificate(&agent_hex, other_cert)
+            .expect_err("mismatching digest must be refused");
+        assert_eq!(err, SetMemberCertificateError::CertificateDigestMismatch);
+        let m = info.members_v2.get(&agent_hex).unwrap();
+        assert!(m.certificate.is_none(), "refused install must not touch the entry");
+        assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
+
+        // Matching bytes: accepted, BOTH fields set.
+        info.set_member_certificate(&agent_hex, cert.clone())
+            .expect("matching digest installs");
+        let m = info.members_v2.get(&agent_hex).unwrap();
+        assert!(m.certificate.as_ref().is_some_and(|c| *c == cert));
+        assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
+
+        // Absent member entry: no-op success (callers seed entries first).
+        info.set_member_certificate(&"ff".repeat(32), {
+            let (u, a) = (
+                crate::identity::UserKeypair::generate().unwrap(),
+                crate::identity::AgentKeypair::generate().unwrap(),
+            );
+            crate::identity::AgentCertificate::issue(&u, &a).unwrap()
+        })
+        .expect("absent member is a no-op success");
+    }
+
+    #[test]
+    fn owner_cert_verdict_digest_pending_never_graced_nor_evicted() {
+        // WHY: a digest-only seat is PENDING evidence hydration, not
+        // MISSING evidence — the signed roster root already commits to the
+        // member's cert digest. Sending it down the missing-evidence path
+        // would let a cold cache evict a committed member after the grace
+        // window; instead it must be reported DigestPending (fail closed
+        // for clean-required operations) and never evictable (#468/#469
+        // design v5 D2 / v6 E2).
+        let (user, _agent, cert) = certified_fixture();
+        let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
+        policy.admission = GroupAdmission::OwnerCertified(user.user_id());
+        let mut info =
+            GroupInfo::with_policy("T".into(), String::new(), agent(1), "aabb".repeat(8), policy);
+        let creator_hex = hex::encode([1u8; 32]);
+        {
+            let m = info.members_v2.get_mut(&creator_hex).unwrap();
+            m.certificate_digest = Some(owner_cert::certificate_digest_hex(&cert));
+            // An EXPIRED missing-evidence stamp from a pre-digest era: the
+            // pending branch must neither evict on it nor keep it.
+            m.certificate_missing_since_ms = Some(1);
+        }
+
+        // Cold-cache evidence: bytes unresolved. The old ladder would treat
+        // this as expired missing evidence → Failed(NoCertificate).
+        let evidence = owner_cert::OwnerCertEvidence::new(10_000_000);
+        let verdict = info.owner_cert_verdict(&evidence);
+        assert_eq!(
+            verdict.per_member.get(&creator_hex),
+            Some(&owner_cert::MemberCertStatus::DigestPending),
+            "digest-only seat must be reported pending"
+        );
+        // NEVER the grace/eviction path...
+        assert!(verdict.in_grace().is_empty());
+        assert!(verdict.failed().is_empty());
+        assert_eq!(verdict.digest_pending(), vec![creator_hex.clone()]);
+        // ...and it fails closed for operations needing the certificate.
+        assert!(!verdict.is_all_clean());
+        // The stale grace stamp was cleared: pending is not "missing since".
+        assert_eq!(
+            info.members_v2[&creator_hex].certificate_missing_since_ms,
+            None
+        );
+
+        // Contrast: a byte-less, digest-LESS member still takes the ordinary
+        // grace path (first observation stamps the window), proving the
+        // DigestPending branch captured exactly the digest-only shape.
+        let plain_hex = hex::encode([7u8; 32]);
+        info.add_member(plain_hex.clone(), GroupRole::Member, None, None);
+        let verdict2 = info.owner_cert_verdict(&evidence);
+        assert!(matches!(
+            verdict2.per_member.get(&plain_hex),
+            Some(owner_cert::MemberCertStatus::InGrace { .. })
+        ));
+        assert_eq!(verdict2.digest_pending(), vec![creator_hex]);
+    }
+
+    #[test]
+    fn apply_reconstructed_roster_copies_certificate_digest_across_gap() {
+        // WHY (#458 ac-gap + #468/#469 design v5 D2): a joiner adopting
+        // across a prev-hash gap materializes members from the VERIFIED
+        // projection. Digest-only projection entries must materialize with
+        // their committed digest so the adoption check mirrored from
+        // `finalize_adopted_commit_reconstructed` (recomputed roster root ==
+        // signed roster_root) holds — the digest IS the commitment the
+        // authority signed.
+        let (_user, agent, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        let creator_hex = hex::encode([1u8; 32]);
+        source
+            .set_member_certificate(&creator_hex, cert.clone())
+            .expect("creator cert installs");
+        // A second member that exists ONLY digest-only at the source.
+        source.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        source
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+
+        let projection = state_commit::roster_projection(&source.members_v2);
+        let signed_root = state_commit::roster_root_of_projection(&projection);
+
+        // Fresh stub that knows NEITHER member (its own creator seat is
+        // dropped — the projection is authoritative).
+        let mut adopted = GroupInfo::new("S".into(), String::new(), agent(9), "aabb".repeat(8));
+        adopted.apply_reconstructed_roster(&projection);
+
+        assert_eq!(
+            state_commit::compute_roster_root(&adopted.members_v2),
+            signed_root,
+            "materialized roster must re-derive the projection's signed root"
+        );
+        for hex in [&creator_hex, &agent_hex] {
+            let m = adopted.members_v2.get(hex).unwrap();
+            assert!(
+                m.certificate.is_none(),
+                "projection materialization carries no bytes, only the digest"
+            );
+            assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
+        }
+    }
+
+    #[test]
+    fn apply_reconstructed_roster_mismatched_local_cert_keeps_committed_digest() {
+        // WHY: when the local roster holds certificate bytes whose digest
+        // contradicts the (authoritative) projection digest, the BYTES are
+        // stale and must be dropped — but the committed digest is KEPT, so
+        // the member stays digest-seated (pending hydration) instead of
+        // losing its committed evidence entirely (#468/#469 design v5 D2).
+        let (_user, agent, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+
+        let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
+        source.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        source
+            .members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
+        let projection = state_commit::roster_projection(&source.members_v2);
+        let signed_root = state_commit::roster_root_of_projection(&projection);
+
+        // Local roster holds DIFFERENT bytes for the same seat.
+        let (_user2, _agent2, other_cert) = certified_fixture();
+        let mut adopted = GroupInfo::new("S".into(), String::new(), agent(9), "aabb".repeat(8));
+        adopted.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        adopted
+            .set_member_certificate(&agent_hex, other_cert)
+            .expect("local bytes install before the fold");
+        assert!(adopted.members_v2[&agent_hex].certificate.is_some());
+
+        adopted.apply_reconstructed_roster(&projection);
+
+        let m = adopted.members_v2.get(&agent_hex).unwrap();
+        assert!(m.certificate.is_none(), "mismatching local bytes must be dropped");
+        assert_eq!(
+            m.certificate_digest.as_deref(),
+            Some(committed.as_str()),
+            "committed digest must be kept"
+        );
+        assert_eq!(
+            state_commit::compute_roster_root(&adopted.members_v2),
+            signed_root
+        );
+    }
+
+    #[test]
+    fn hydrate_member_certificates_installs_only_digest_matching_bytes() {
+        // WHY: hydration is digest-anchored — only bytes hashing to a
+        // seat's COMMITTED digest may install. Evidence for a different
+        // admission (owner re-keyed) must be ignored, never allowed to
+        // rewrite the commitment (#468/#469 design v5 D2).
+        let (_user, agent, cert) = certified_fixture();
+        let (_user2, agent2, other_cert) = certified_fixture();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let other_hex = hex::encode(agent2.agent_id().as_bytes());
+        let committed = owner_cert::certificate_digest_hex(&cert);
+        let other_committed = owner_cert::certificate_digest_hex(&other_cert);
+
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
+        for (hex, digest) in [
+            (agent_hex.clone(), committed.clone()),
+            (other_hex.clone(), other_committed.clone()),
+        ] {
+            info.add_member(hex.clone(), GroupRole::Member, None, None);
+            info.members_v2.get_mut(&hex).unwrap().certificate_digest = Some(digest);
+        }
+
+        // Wrong bytes for seat 1, right bytes for seat 2.
+        let hydrated = info.hydrate_member_certificates(&[
+            (agent_hex.clone(), other_cert.clone()),
+            (other_hex.clone(), other_cert.clone()),
+        ]);
+        assert_eq!(hydrated, 1, "only the digest-matching install counts");
+        assert!(
+            info.members_v2[&agent_hex].certificate.is_none(),
+            "mismatch is ignored; the seat stays digest-only"
+        );
+        assert_eq!(
+            info.members_v2[&agent_hex].certificate_digest.as_deref(),
+            Some(committed.as_str())
+        );
+        let seated = info.members_v2.get(&other_hex).unwrap();
+        assert!(seated.certificate.as_ref().is_some_and(|c| *c == other_cert));
+        assert_eq!(
+            seated.certificate_digest.as_deref(),
+            Some(other_committed.as_str())
+        );
+
+        // The right bytes now hydrate the first seat...
+        assert_eq!(
+            info.hydrate_member_certificates(&[(agent_hex.clone(), cert.clone())]),
+            1
+        );
+        assert!(info.members_v2[&agent_hex]
+            .certificate
+            .as_ref()
+            .is_some_and(|c| *c == cert));
+        // ...and a byte-bearing member is never re-hydrated.
+        assert_eq!(
+            info.hydrate_member_certificates(&[(agent_hex.clone(), cert)]),
+            0
+        );
+    }
+
+    #[test]
+    fn repair_member_certificate_digests_adopts_bytes_digest_on_mismatch() {
+        // WHY: at load, a persisted record carrying BOTH bytes and a
+        // mismatching stored digest is corruption-in-waiting — the stale
+        // digest goes live the moment the bytes are stripped. The bytes are
+        // the authority when present; digest-less legacy entries and
+        // digest-only entries are left exactly as persisted (#468/#469
+        // design v5 D2).
+        let (_user, agent, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let real = owner_cert::certificate_digest_hex(&cert);
+
+        let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
+        info.add_member(agent_hex.clone(), GroupRole::Member, None, None);
+        {
+            let m = info.members_v2.get_mut(&agent_hex).unwrap();
+            m.certificate = Some(cert.clone());
+            m.certificate_digest = Some("00".repeat(32)); // torn/stale write
+        }
+        // Legacy byte-bearing entry with NO digest: no backfill.
+        let (_u3, _a3, legacy_cert) = certified_fixture();
+        let legacy_hex = hex::encode([2u8; 32]);
+        info.add_member(legacy_hex.clone(), GroupRole::Member, None, None);
+        info.members_v2.get_mut(&legacy_hex).unwrap().certificate = Some(legacy_cert);
+        // Digest-only entry: no bytes to arbitrate.
+        let digest_only_hex = hex::encode([3u8; 32]);
+        let orphan_digest = "11".repeat(32);
+        info.add_member(digest_only_hex.clone(), GroupRole::Member, None, None);
+        info.members_v2
+            .get_mut(&digest_only_hex)
+            .unwrap()
+            .certificate_digest = Some(orphan_digest.clone());
+
+        assert_eq!(info.repair_member_certificate_digests(), 1);
+        let m = info.members_v2.get(&agent_hex).unwrap();
+        assert!(
+            m.certificate.as_ref().is_some_and(|c| *c == cert),
+            "repair never touches the bytes"
+        );
+        assert_eq!(m.certificate_digest.as_deref(), Some(real.as_str()));
+        assert!(
+            info.members_v2[&legacy_hex]
+                .certificate_digest
+                .is_none(),
+            "legacy no-digest entry must not be backfilled"
+        );
+        assert_eq!(
+            info.members_v2[&digest_only_hex].certificate_digest.as_deref(),
+            Some(orphan_digest.as_str()),
+            "digest-only entry is left alone"
+        );
+        // Idempotent: a second sweep finds nothing to repair.
+        assert_eq!(info.repair_member_certificate_digests(), 0);
     }
 }

@@ -172,6 +172,17 @@ pub struct GroupMember {
     pub certificate_missing_since_ms: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub certificate: Option<crate::identity::AgentCertificate>,
+    /// BLAKE3-256 hex digest (`owner_cert::certificate_digest_hex`) of the
+    /// member's admission `AgentCertificate`, carried when the certificate
+    /// BYTES are intentionally absent from this entry (invite-auth #468/#469,
+    /// design v5 D2 / v6 E2: key-stripped invite/recovery state and
+    /// projection-materialized adoption members). Authoritative ONLY when
+    /// `certificate` is `None` — `compute_roster_root` prefers the bytes'
+    /// own digest whenever bytes are present, so a digest-only entry hashes
+    /// byte-identically to its byte-bearing form and legacy rosters (no
+    /// digest, no cert) hash exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub certificate_digest: Option<String>,
 }
 
 impl GroupMember {
@@ -193,6 +204,7 @@ impl GroupMember {
             treekem_key_package_hash: None,
             certificate: None,
             certificate_missing_since_ms: None,
+            certificate_digest: None,
         }
     }
 
@@ -215,6 +227,7 @@ impl GroupMember {
             treekem_key_package_hash: None,
             certificate: None,
             certificate_missing_since_ms: None,
+            certificate_digest: None,
         }
     }
 
@@ -241,6 +254,7 @@ impl GroupMember {
             treekem_key_package_hash: None,
             certificate: None,
             certificate_missing_since_ms: None,
+            certificate_digest: None,
         }
     }
 
@@ -361,5 +375,27 @@ mod tests {
         m.state = GroupMemberState::Banned;
         assert!(m.is_banned());
         assert!(!m.is_active());
+    }
+
+    #[test]
+    fn certificate_digest_serializes_only_when_present() {
+        // WHY (#468/#469 design v5 D2): `certificate_digest` must be absent
+        // from persisted JSON while None — rosters written by every earlier
+        // build stay byte-identical — and blobs predating the field must
+        // deserialize with the digest defaulting to None.
+        let mut m = GroupMember::new_member("aa".repeat(32), None, None, 1);
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(!json.contains("certificate_digest"));
+        let restored: GroupMember = serde_json::from_str(&json).expect("deserialize");
+        assert!(restored.certificate_digest.is_none());
+
+        m.certificate_digest = Some("00".repeat(32));
+        let json = serde_json::to_string(&m).expect("serialize");
+        assert!(json.contains("certificate_digest"));
+        let restored: GroupMember = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(
+            restored.certificate_digest.as_deref(),
+            Some("00".repeat(32).as_str())
+        );
     }
 }

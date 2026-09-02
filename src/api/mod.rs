@@ -1173,9 +1173,17 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/groups/join",
         cli_name: "group join",
-        description: "Join group via invite",
+        description: "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::body_as("invite", true, "INVITE"), RequestField::body("display_name", false)]),
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("invite", true, "INVITE"),
+            RequestField::body("display_name", false),
+            // #468/#469: `--home` serializes as the literal "home" mode
+            // value; `--owner <HEX>` is the expected owner user id pin.
+            // Both are only sent together (clap `requires` both ways).
+            RequestField::body_as("mode", false, "--home"),
+            RequestField::body_as("expected_owner_user_id", false, "--owner"),
+        ]),
     },
     EndpointDef {
         method: Method::Put,

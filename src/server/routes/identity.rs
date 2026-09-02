@@ -379,6 +379,19 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     invite: &mut x0x::groups::invite::SignedInvite,
     info: &x0x::groups::GroupInfo,
 ) {
+    populate_invite_base_state_v4(invite, info, None);
+}
+
+/// #469 A1b: v4 mint population — the SAME base-state fields plus the v4
+/// additions (public-meta snapshot, roster projection, explicit signed
+/// creator, intended joiner) and NO legacy fat roster. Signing and the
+/// size/secret bookkeeping happen in `mint_signed_invite`
+/// (named_groups.rs) — the single mint authority; this only assembles.
+pub(in crate::server) fn populate_invite_base_state_v4(
+    invite: &mut x0x::groups::invite::SignedInvite,
+    info: &x0x::groups::GroupInfo,
+    intended_joiner: Option<x0x::identity::AgentId>,
+) {
     invite.stable_group_id = Some(info.stable_group_id().to_string());
     invite.group_created_at = Some(info.created_at);
     invite.group_description = Some(info.description.clone());
@@ -389,25 +402,33 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     // #458 r3: the base hash commits to the Home metadata digest — carry
     // the metadata so the joiner's stub can actually recompute it.
     invite.base_home = info.home.clone();
-    // Issue #205: strip per-member crypto material that contributes nothing to
-    // invite validation. `roster_root` commits only to `(id, role, state)`
-    // triples (state_commit.rs), the link is unsigned, and admission is the
-    // `invite_secret` handshake + authority-signed `MemberAdded`. Each member's
-    // ~15.7 KiB TreeKEM KeyPackage + ~1.2 KiB ML-KEM pubkey would otherwise be
-    // copy-pasted into the join cmd-DM, crossing the 49 152-byte gossip cap at
-    // the 3rd roster member (issue #188). Joiners learn both keys out-of-band
-    // (MemberAdded / Welcome / GET /agent), so the slim roster is sufficient.
-    let slim_roster = info
-        .members_v2
-        .iter()
-        .map(|(agent_id, member)| {
-            let mut slim = member.clone();
-            slim.treekem_key_package_b64 = None;
-            slim.kem_public_key_b64 = None;
-            (agent_id.clone(), slim)
-        })
-        .collect();
-    invite.base_members_v2 = Some(slim_roster);
+    // #469 A1: the v4 roster carrier is the PROJECTION — exactly what
+    // `roster_root_of_projection` hashes (role, state, TreeKEM key-package
+    // hash, certificate digest). No certificate BYTES, no KEM/TreeKEM
+    // material: the base-consistency recompute works from the projection
+    // alone (D2 makes digest-only members hash identically on the joiner),
+    // and the size budget holds at a roster cap instead of the 3rd member
+    // (issue #188/#205). The legacy fat `base_members_v2` is never set on
+    // v4 invites — the E1 view constructor refuses it.
+    invite.base_roster = Some(x0x::groups::state_commit::roster_projection(
+        &info.members_v2,
+    ));
+    invite.base_members_v2 = None;
+    // #469 D1: exact public-meta snapshot — the precise input of
+    // `compute_public_meta_hash`, so the joiner recomputes the base state
+    // hash bit-for-bit even for non-default tags/avatar/banner.
+    invite.public_meta = Some(info.public_meta());
+    // #469 D1: explicit signed creator — genesis creator when known (the
+    // genesis record is the stable identity), else the local creator field.
+    invite.creator = Some(
+        info.genesis
+            .as_ref()
+            .map(|g| g.creator_agent_id.clone())
+            .unwrap_or_else(|| hex::encode(info.creator.as_bytes())),
+    );
+    // #469 A4: addressed invites carry the intended joiner.
+    invite.intended_joiner =
+        intended_joiner.map(|agent| hex::encode(agent.as_bytes()));
     invite.base_prev_state_hash = info.prev_state_hash.clone();
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);

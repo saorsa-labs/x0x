@@ -63,6 +63,16 @@ pub enum MemberCertStatus {
     /// Evidence verified (live digest-coupled, or a non-stale committed
     /// cert). The member is seated.
     Clean,
+    /// Invite-auth #468/#469 (design v5 D2 / v6 E2): the roster root
+    /// commits to this member's certificate DIGEST but the bytes are not
+    /// embedded (`certificate == None && certificate_digest.is_some()` —
+    /// key-stripped recovery state, a projection-materialized adoption
+    /// member, or a pre-hydrate restart). PENDING, never missing
+    /// evidence: the seat never enters the missing-evidence grace window
+    /// and can never be evicted by it, while every operation that needs
+    /// the certificate BYTES fails closed (`is_all_clean` stays false
+    /// until `GroupInfo::hydrate_member_certificates` installs them).
+    DigestPending,
     /// Evidence missing or in flight (fetch lag, mid-rotation). The member
     /// stays seated for now; a seal that requires a clean roster must
     /// REFUSE, and the restore quarantine must NOT lift.
@@ -103,13 +113,27 @@ impl OwnerCertVerdict {
             .collect()
     }
 
-    /// Members that are neither Clean nor Failed (inside the grace
-    /// window).
+    /// Members that are inside the missing-evidence grace window
+    /// ([`MemberCertStatus::InGrace`] only — a [`MemberCertStatus::DigestPending`]
+    /// seat is pending, not graced, and is reported by
+    /// [`Self::digest_pending`] instead).
     #[must_use]
     pub fn in_grace(&self) -> Vec<String> {
         self.per_member
             .iter()
             .filter(|(_, status)| matches!(status, MemberCertStatus::InGrace { .. }))
+            .map(|(hex, _)| hex.clone())
+            .collect()
+    }
+
+    /// Invite-auth #468/#469: members whose roster seat carries a committed
+    /// certificate digest but not the bytes — awaiting hydration, never
+    /// eviction.
+    #[must_use]
+    pub fn digest_pending(&self) -> Vec<String> {
+        self.per_member
+            .iter()
+            .filter(|(_, status)| matches!(status, MemberCertStatus::DigestPending))
             .map(|(hex, _)| hex.clone())
             .collect()
     }

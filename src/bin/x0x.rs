@@ -1282,6 +1282,16 @@ enum GroupSub {
         /// Your display name in this group.
         #[arg(long)]
         display_name: Option<String>,
+        /// Join this invite's group as your Home space (ADR-0038
+        /// owner-axis join, #469). Home joins must pin the owner you
+        /// expect, so this flag requires `--owner` (and vice versa).
+        #[arg(long, requires = "owner")]
+        home: bool,
+        /// 64-hex-char user id of the Home owner you expect to be
+        /// joining (the #469 pin; mismatch is rejected server-side as
+        /// `owner_mismatch`). Only meaningful with `--home`.
+        #[arg(long, value_name = "HEX", requires = "home")]
+        owner: Option<String>,
     },
     /// Set your display name in a group.
     SetName {
@@ -2371,7 +2381,18 @@ async fn run(
             Some(GroupSub::Join {
                 invite,
                 display_name,
-            }) => commands::group::join(&client, &invite, display_name.as_deref()).await,
+                home,
+                owner,
+            }) => {
+                commands::group::join(
+                    &client,
+                    &invite,
+                    display_name.as_deref(),
+                    home,
+                    owner.as_deref(),
+                )
+                .await
+            }
             Some(GroupSub::SetName { group_id, name }) => {
                 commands::group::set_name(&client, &group_id, &name).await
             }

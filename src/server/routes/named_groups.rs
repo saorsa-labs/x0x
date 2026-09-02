@@ -16,7 +16,6 @@ use super::files::{
     file_transfer_send_config, wait_for_chunk_window, wait_for_final_acks, FileChunkAckSlot,
 };
 use super::groups::save_mls_groups;
-use super::identity::populate_invite_base_state_from_group_info;
 use super::public_group_bootstrap_outbox::{
     cancel_public_group_bootstrap_obligations_for_removal,
     persist_named_group_info_with_bootstrap_obligation, public_group_bootstrap_obligation_for_add,
@@ -374,7 +373,6 @@ pub(in crate::server) struct CreateGroupRequest {
     #[serde(default)]
     pub(in crate::server) policy: Option<x0x::groups::GroupPolicy>,
 }
-
 /// Request body for POST /groups/join.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct JoinGroupRequest {
@@ -383,20 +381,37 @@ pub(in crate::server) struct JoinGroupRequest {
     /// Optional display name for the joiner.
     #[serde(default)]
     display_name: Option<String>,
+    /// #469 A3: join mode — `"group"` (default) or `"home"`. Home mode
+    /// pins the expected admission owner and refuses an owner-axis
+    /// invite whose owner countersignature does not cover that exact
+    /// owner (`expected_owner_user_id` required).
+    #[serde(default)]
+    mode: Option<String>,
+    /// #469 A3: the expected OwnerCertified user id (64-char hex). Only
+    /// meaningful in home mode; supplying it in group mode is a typed
+    /// misuse error (`pin_requires_home_mode`).
+    #[serde(default)]
+    expected_owner_user_id: Option<String>,
 }
-
 /// Request body for POST /groups/:id/invite.
 #[derive(Debug, Deserialize)]
 pub(in crate::server) struct CreateInviteRequest {
     /// Seconds until expiry (default: 7 days, 0 = never).
     #[serde(default = "default_expiry")]
     expiry_secs: u64,
+    /// #469 A4: mint the invite for ONE specific agent (64-char hex).
+    /// The authority compares it with `MemberJoined.member_agent_id`
+    /// before consuming the secret; unaddressed invites stay
+    /// first-joiner-wins.
+    #[serde(default)]
+    intended_joiner: Option<String>,
 }
 
 impl Default for CreateInviteRequest {
     fn default() -> Self {
         Self {
             expiry_secs: default_expiry(),
+            intended_joiner: None,
         }
     }
 }
@@ -3001,7 +3016,12 @@ async fn try_adopt_member_added_across_gap(
         adopted.set_member_treekem_key_package_hash(agent_id, package_hash);
     }
     if let Some(cert) = owner_certified_certificate {
-        adopted.set_member_certificate(agent_id, cert);
+        // #468/#469 (design v5 D2): the reconstructed roster's committed
+        // digest is authoritative — cert bytes hashing to a different
+        // digest cannot be seated on the adopted roster.
+        if adopted.set_member_certificate(agent_id, cert).is_err() {
+            return refuse("joiner certificate digest contradicts the reconstructed roster commitment");
+        }
     }
     match adopted.finalize_adopted_commit_reconstructed(commit, &meta, &chain) {
         Ok(()) => {
@@ -7449,8 +7469,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                     if let Some(cert) = owner_certified_certificate.clone() {
                         // ADR-0038: install the committed evidence so the
                         // apply-side roster-root check (which covers the
-                        // cert digest) validates.
-                        next.set_member_certificate(&agent_id, cert);
+                        // cert digest) validates. #468/#469 (design v5 D2):
+                        // bytes contradicting the seat's committed digest
+                        // are NOT installed — the roster-root check below
+                        // then rejects the apply if the commit covered them.
+                        if let Err(err) = next.set_member_certificate(&agent_id, cert) {
+                            tracing::warn!(
+                                member = %agent_id,
+                                "MemberAdded: certificate digest contradicts the committed roster digest; committed seat unchanged ({err})"
+                            );
+                        }
                     }
                     if let Some(name) = display_name.clone() {
                         next.set_display_name(&agent_id, name);
@@ -8285,6 +8313,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                 treekem_key_package_hash: None,
                                 certificate: None,
                                 certificate_missing_since_ms: None,
+                                certificate_digest: None,
                             });
                     }
                     if let Some(kp_b64) = treekem_key_package_b64.clone() {
@@ -9152,17 +9181,24 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if let Some(ref dn) = display_name {
                 next.set_display_name(&member_agent_id, dn.clone());
             }
-            if let Some(kp_b64) = treekem_key_package_b64.clone() {
-                next.set_member_treekem_key_package(&member_agent_id, kp_b64);
-            }
-            let revision = next.roster_revision;
-
             if let Some(cert) = owner_certified_admission.clone() {
                 // Constraint 2: the certificate the joiner was admitted
                 // under becomes COMMITTED evidence — sealed into the roster
                 // entry the MemberAdded commit's roster root covers.
-                next.set_member_certificate(&member_agent_id, cert);
+                // #468/#469 (design v5 D2): a seat already committed to a
+                // different digest (re-join after an owner re-key) cannot
+                // be overwritten — reject so admission re-runs on fresh
+                // evidence.
+                if next.set_member_certificate(&member_agent_id, cert).is_err() {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "MemberJoined: certificate digest contradicts the committed roster digest"
+                    );
+                    return ApplyMetadataResult::REJECTED;
+                }
             }
+            let revision = next.roster_revision;
             let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
                     Ok(id) => id,
@@ -11746,6 +11782,123 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
+
+/// #469 A1b: the SINGLE v4 invite assembly authority. Builds the invite
+/// (projection, public-meta snapshot, explicit creator, inline keys),
+/// adds the owner countersignature when the policy admission carries an
+/// OwnerCertified axis, enforces the D5 caps and the AUTHORITATIVE final
+/// encoded-size check — all BEFORE any secret is recorded or persisted.
+///
+/// The owner-axis fence: minting a countersigned invite is an owner act,
+/// so it requires a loaded local user key whose `UserId` equals the
+/// policy's owner id; anything else is the typed `owner_key_unavailable`
+/// 409 (the #446 durable-owner fence extended from "is Home" to "has an
+/// owner axis", per design A1b). Ordinary groups sign with the inviter
+/// agent key only.
+///
+/// # Errors
+///
+/// Typed mint failures (owner key unavailable, cap violations, size
+/// budget, signing) — callers map these to 4xx responses and MUST NOT
+/// record a secret when one is returned.
+pub(in crate::server) fn assemble_signed_v4_invite(
+    state: &AppState,
+    info: &x0x::groups::GroupInfo,
+    expiry_secs: u64,
+    intended_joiner: Option<AgentId>,
+) -> Result<(x0x::groups::invite::SignedInvite, String), MintInviteError> {
+    let agent_id = state.agent.agent_id();
+    let mut invite = x0x::groups::invite::SignedInvite::new(
+        info.mls_group_id.clone(),
+        info.name.clone(),
+        &agent_id,
+        expiry_secs,
+    );
+    super::identity::populate_invite_base_state_v4(&mut invite, info, intended_joiner);
+
+    let owner_axis = info.policy.admission.owner_certified_user_id().copied();
+    let user_kp = owner_axis.and_then(|_| state.agent.identity().user_keypair());
+    if owner_axis.is_some() && user_kp.is_none() {
+        return Err(MintInviteError::OwnerKeyUnavailable);
+    }
+    // The countersigning key must BE the policy owner (design A1b:
+    // durable-owner authority + key/owner equality).
+    if let (Some(owner_id), Some(user_kp)) = (owner_axis, user_kp) {
+        let derived = x0x::identity::UserId::from_public_key(user_kp.public_key());
+        if derived != owner_id {
+            return Err(MintInviteError::OwnerKeyUnavailable);
+        }
+    }
+    invite
+        .sign_v4(
+            state.agent.identity().agent_keypair(),
+            user_kp,
+        )
+        .map_err(|e| MintInviteError::Signing(e))?;
+    // D5 caps + the authoritative final encoded-size gate (v7 F4),
+    // before the caller records anything.
+    if let Some((field, size)) = invite.v4_field_caps_violation() {
+        return Err(MintInviteError::TooLarge { field, size });
+    }
+    let link = invite.encode_link().map_err(|e| MintInviteError::TooLargeBytes {
+        actual: e.actual,
+        limit: e.limit,
+    })?;
+    Ok((invite, link))
+}
+
+/// Typed mint failures for [`assemble_signed_v4_invite`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) enum MintInviteError {
+    /// Owner-axis group without a usable local owner user key.
+    OwnerKeyUnavailable,
+    /// A D5 field cap was exceeded (`field`, measured size/count).
+    TooLarge { field: &'static str, size: usize },
+    /// The final encoded link exceeded the safety budget.
+    TooLargeBytes { actual: usize, limit: usize },
+    /// Signing failed (crypto error detail).
+    Signing(String),
+}
+
+/// Map a mint failure to its typed response (#469 A1b/D5/E3).
+fn mint_error_response(
+    group_id: &str,
+    error: MintInviteError,
+) -> (StatusCode, Json<serde_json::Value>) {
+    match error {
+        MintInviteError::OwnerKeyUnavailable => api_error(
+            StatusCode::CONFLICT,
+            "owner_key_unavailable: minting an owner-axis (Home-capable) invite requires the durable owner's loaded user key",
+        ),
+        MintInviteError::TooLarge { field, size } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "invite_too_large",
+                "field": field,
+                "size": size,
+            })),
+        ),
+        MintInviteError::TooLargeBytes { actual, limit } => (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "invite_too_large",
+                "detail": format!(
+                    "encoded invite link ({actual} B) exceeds safe DM budget ({limit} B)"
+                ),
+                "actual_bytes": actual,
+                "limit_bytes": limit,
+            })),
+        ),
+        MintInviteError::Signing(detail) => {
+            tracing::warn!(group_id = %LogHexId::group(group_id), %detail, "invite signing failed");
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("invite signing failed: {detail}"))
+        }
+    }
+}
+
+/// POST /groups/:id/invite — generate an invite link (admin+; body optional).
 ///
 /// Authority follows ADR-0016: any active Admin-or-higher member may mint
 /// invites (issue #107 — invite minting is an admission/routing act, not a
@@ -11798,51 +11951,63 @@ pub(in crate::server) async fn create_group_invite(
             return resp.into_response();
         }
         let mut next = info.clone();
-        let mut invite = x0x::groups::invite::SignedInvite::new(
-            next.mls_group_id.clone(),
-            next.name.clone(),
-            &agent_id,
+
+        // #469 E3: the live-invite cap. Prune consumed/expired records
+        // first, then refuse at the cap — an unbounded mint surface would
+        // grow `issued_invites` forever on card-heavy installs.
+        let now_secs = now_millis_u64() / 1_000;
+        next.prune_issued_invites(now_secs);
+        if next.live_issued_invite_count(now_secs)
+            >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
+        {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "invite_cap_reached",
+                    "limit": x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP,
+                })),
+            )
+                .into_response();
+        }
+
+        // #469 A1b: the SINGLE mint authority — signed v4 assembly, owner
+        // countersignature fence, D5 caps and the authoritative final
+        // encoded-size check all happen BEFORE the secret is recorded.
+        let intended_joiner = match req.intended_joiner.as_deref() {
+            None => None,
+            Some(hex_id) => match parse_agent_id_hex(hex_id) {
+                Ok(agent) => Some(agent),
+                Err(e) => {
+                    return bad_request(format!("invalid intended_joiner: {e}")).into_response();
+                }
+            },
+        };
+        let (invite, link) = match assemble_signed_v4_invite(
+            &state,
+            &next,
             req.expiry_secs,
-        );
-        populate_invite_base_state_from_group_info(&mut invite, &next);
+            intended_joiner,
+        ) {
+            Ok(minted) => minted,
+            Err(e) => return mint_error_response(&id, e).into_response(),
+        };
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
         // expiry-checked, and consumed locally before the inviter publishes an
-        // authority-signed MemberAdded commit.
-        next.record_issued_invite(
+        // authority-signed MemberAdded commit. #469 A4: the intended joiner
+        // rides the record and is compared at consumption.
+        next.record_issued_invite_v2(
             invite.invite_secret.clone(),
             invite.created_at,
             invite.expires_at,
             x0x::groups::GroupRole::Member,
+            req.intended_joiner.clone(),
+            x0x::groups::InviteOrigin::Explicit,
+            None,
         );
 
-        // Issue #205: enforce the DM-safe budget at mint so a roster that
-        // would blow the gossip-DM cap fails loudly here, not as an opaque
-        // `envelope_construction` rejection at /direct/send later (issue
-        // #188; that path now reports `payload_too_large` 413).
-        let link = match invite.encode_link() {
-            Ok(link) => link,
-            Err(e) => {
-                tracing::warn!(
-                    group_id = %LogHexId::group(&id),
-                    actual = e.actual,
-                    limit = e.limit,
-                    "refusing to mint oversized invite link: {e}"
-                );
-                return (
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": "invite_too_large",
-                        "detail": e.to_string(),
-                        "actual_bytes": e.actual,
-                        "limit_bytes": e.limit,
-                    })),
-                )
-                    .into_response();
-            }
-        };
         let mls_group_id = next.mls_group_id.clone();
         let group_name = next.name.clone();
         let expires_at = invite.expires_at;
@@ -12008,19 +12173,149 @@ pub(in crate::server) async fn join_group_via_invite(
     }
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
 
+    // ── #469 A2: v4 authentication. EVERY check below runs BEFORE any
+    //    duplicate/stub/listener handling — an unauthenticated invite
+    //    can no longer create local state (#469: previously the inviter
+    //    supplied policy + base roster seeded the joiner's admission
+    //    tier and trust root unauthenticated).
+    let refuse_invite = |state: &AppState,
+                         invite: &x0x::groups::invite::SignedInvite,
+                         reason: &str|
+     -> (StatusCode, Json<serde_json::Value>) {
+        state
+            .groups_diagnostics
+            .record_invite_refusal(&invite.group_id, reason);
+        tracing::debug!(
+            group_id = %LogHexId::group(&invite.group_id),
+            inviter = %invite.inviter,
+            reason,
+            "join refused: invite authentication failed"
+        );
+        api_error(StatusCode::CONFLICT, reason)
+    };
+
+    let view = match x0x::groups::invite::InviteSignedViewV4::from_invite(&invite) {
+        Ok(view) => view,
+        Err(refusal) => {
+            // `invite_unsigned` covers version < 4 (including the legacy
+            // sentinel 0), a missing projection, or a legacy fat roster;
+            // `invite_malformed` covers the E1 id invariant and the D1
+            // duplicated-meta/home-digest equality rules.
+            return refuse_invite(&state, &invite, refusal.reason());
+        }
+    };
+    // Revocation of the inline inviter key (v7 F3: agent subject only —
+    // there is no user revocation subject; see the ADR-0016 amendment).
+    {
+        let inviter_agent = match parse_agent_id_hex(&invite.inviter) {
+            Ok(id) => id,
+            Err(e) => return bad_request(format!("invalid inviter: {e}")),
+        };
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&inviter_agent) {
+            drop(revoked);
+            return refuse_invite(&state, &invite, "inviter_key_revoked");
+        }
+    }
+    // Legacy `signature` must be empty, inline keys must bind to their
+    // claimed ids (F2: domain-separated from_public_key), and both v4
+    // signatures must verify.
+    if let Err(refusal) = invite.verify_v4_signatures() {
+        return refuse_invite(&state, &invite, refusal.reason());
+    }
+    // Base consistency: recompute the authority's base state hash from
+    // the projection + snapshot exactly as the stub will materialize
+    // them (A2; a tampered roster/policy/meta cannot seed the joiner).
+    {
+        let roster_root = x0x::groups::state_commit::roster_root_of_projection(&view.base_roster);
+        let policy_hash = x0x::groups::state_commit::compute_policy_hash(&view.policy);
+        let meta_hash =
+            x0x::groups::state_commit::compute_public_meta_hash(&view.public_meta);
+        let recomputed = x0x::groups::state_commit::compute_state_hash(
+            &view.stable_group_id,
+            view.base_state_revision,
+            (view.base_prev_state_hash.is_empty())
+                .then_some(String::new())
+                .as_deref(),
+            &roster_root,
+            &policy_hash,
+            &meta_hash,
+            (view.base_security_binding.is_empty())
+                .then_some(String::new())
+                .as_deref(),
+            false,
+        );
+        if recomputed != view.base_state_hash {
+            return refuse_invite(&state, &invite, "invite_base_inconsistent");
+        }
+    }
+    // Addressed invites are one-recipient (#469 A4 joiner side).
+    if let Some(intended) = view.intended_joiner.as_deref() {
+        if !intended.eq_ignore_ascii_case(&hex::encode(state.agent.agent_id().as_bytes())) {
+            return refuse_invite(&state, &invite, "invite_not_addressed_to_me");
+        }
+    }
+
+    // ── #469 A3: Home-join mode matrix (fail closed on every misuse) ──
+    let invite_owner_id = view
+        .policy
+        .admission
+        .owner_certified_user_id()
+        .copied();
+    let join_mode = match req.mode.as_deref() {
+        None | Some("group") => None,
+        Some("home") => Some(()),
+        Some(other) => {
+            return bad_request(format!("unknown join mode {other:?}: expected \"group\" or \"home\""));
+        }
+    };
+    match (join_mode, req.expected_owner_user_id.as_deref(), invite_owner_id) {
+        (None, None, None) => { /* ordinary group join — proceed */ }
+        (None, None, Some(_owner)) => {
+            return refuse_invite(&state, &invite, "use_home_mode");
+        }
+        (None, Some(_pin), _) => {
+            return refuse_invite(&state, &invite, "pin_requires_home_mode");
+        }
+        (Some(()), None, _) => {
+            return refuse_invite(&state, &invite, "home_mode_requires_pin");
+        }
+        (Some(()), Some(_pin), None) => {
+            return refuse_invite(&state, &invite, "invite_downgraded");
+        }
+        (Some(()), Some(pin), Some(owner)) => {
+            let pin_bytes = match hex::decode(pin.trim()) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    return bad_request(format!("invalid expected_owner_user_id hex: {e}"));
+                }
+            };
+            let pin_id = match <[u8; 32]>::try_from(pin_bytes) {
+                Ok(arr) => x0x::identity::UserId(arr),
+                Err(bytes) => {
+                    return bad_request(format!(
+                        "expected_owner_user_id must be 32 bytes, got {}",
+                        bytes.len()
+                    ));
+                }
+            };
+            if pin_id != owner {
+                return refuse_invite(&state, &invite, "owner_mismatch");
+            }
+            // Valid pin + verified owner countersignature (above) — the
+            // joiner has pinned the exact admission owner this invite's
+            // policy names. Proceed through the ordinary join flow.
+        }
+    }
     // ADR-0038 fail-fast: an invite into an OwnerCertified group is
     // unusable without a certificate chaining to the admission owner. The
     // authority re-checks at invite-accept (and every seal) — this local
-    // check exists so an uncertified joiner learns WHY immediately instead
-    // of creating a stub and waiting for a rejection that never arrives as
-    // a REST response. `invite.policy` is the authority's own snapshot, so
-    // the owner id it names is authoritative.
-    if let Some(owner) = invite
-        .policy
-        .as_ref()
-        .and_then(|p| p.admission.owner_certified_user_id())
-        .copied()
-    {
+    // check exists so an uncertified joiner learns WHY immediately
+    // instead of creating a stub and waiting for a rejection that never
+    // arrives as a REST response. `invite_owner_id` comes from the
+    // verified v4 policy snapshot above.
+    if let Some(owner) = invite_owner_id {
         let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
         let evidence = owner_cert_evidence_for(&state, &[&joiner_hex]).await;
         if let Err(failure) =
@@ -12031,7 +12326,6 @@ pub(in crate::server) async fn join_group_via_invite(
             ));
         }
     }
-
     let agent_id = state.agent.agent_id();
     let group_id_hex = invite.group_id.clone();
     let invite_stable_group_id = invite.stable_group_id.as_deref().unwrap_or(&group_id_hex);
@@ -12567,7 +12861,14 @@ pub(in crate::server) async fn add_named_group_member(
             next.set_display_name(&agent_hex, display_name);
         }
         if let Some(cert) = owner_certified_admission.clone() {
-            next.set_member_certificate(&agent_hex, cert);
+            // #468/#469 (design v5 D2): a pre-existing (e.g. removed) seat
+            // already committed to a different digest cannot be re-seated
+            // with new bytes — refuse the admission.
+            if let Err(err) = next.set_member_certificate(&agent_hex, cert) {
+                return forbidden(format!(
+                    "group admission requires a certificate matching the committed roster digest ({err})"
+                ));
+            }
         }
         let revision = next.roster_revision;
         let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await
@@ -12786,7 +13087,18 @@ async fn add_treekem_named_group_member(
     };
     next.set_member_treekem_key_package(&agent_hex, kp_b64.clone());
     if let Some(cert) = owner_certified_admission.clone() {
-        next.set_member_certificate(&agent_hex, cert);
+        // #468/#469 (design v5 D2): a pre-existing seat already committed
+        // to a different digest cannot be re-seated with new bytes —
+        // refuse the admission.
+        if next.set_member_certificate(&agent_hex, cert).is_err() {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "group admission requires a certificate matching the committed roster digest"
+                })),
+            );
+        }
     }
     next.secret_epoch = treekem_epoch;
     let Some(binding) = treekem_recovery_security_binding(treekem_epoch, &direct_recovery_original)
@@ -22870,6 +23182,7 @@ fn build_listener_request_candidate_for_restart(
                         removed_by: None,
                         kem_public_key_b64: Some(kem_b64),
                         treekem_key_package_b64: treekem_key_package_b64.clone(),
+                        certificate_digest: None,
                         treekem_key_package_hash: None,
                         certificate: None,
                         certificate_missing_since_ms: None,

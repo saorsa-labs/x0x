@@ -69,6 +69,24 @@ pub struct GroupCounters {
     /// Number of `MemberJoined` events rejected because the invite secret was
     /// not issued by this local inviter.
     pub member_joined_events_rejected_invite_secret_unknown: u64,
+    /// #469 A2: v4 joiner-side invite refusals by typed reason
+    /// (`invite_unsigned`, `invite_signature_invalid`,
+    /// `inviter_key_mismatch|revoked`, `invite_base_inconsistent`,
+    /// `invite_owner_countersignature_missing|invalid`,
+    /// `invite_not_addressed_to_me`, mode/pin matrix outcomes).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub invites_refused_reasons: std::collections::BTreeMap<String, u64>,
+    /// #468 A5: UNIQUE authenticated fork-evidence records adopted into
+    /// `invite_lineage` (deduplicated by `(revision, state_hash,
+    /// committed_by)`; replays do not increment).
+    pub adoption_fork_evidence: u64,
+    /// #468 A5: unauthenticated fork CONFLICT attempts (per-packet,
+    /// rate-limited by the caller; explicitly NOT unique evidence).
+    pub conflict_unauthenticated: u64,
+    /// #469 D2: members whose certificate bytes have not yet hydrated
+    /// from the announce/discovery cache (gauge at snapshot time).
+    #[serde(default, skip_serializing_if = "is_zero")]
+    pub members_awaiting_certificate: u64,
     /// Number of `MemberJoined` events rejected because the joiner's
     /// OwnerCertified certificate evidence had not resolved yet (#447). The
     /// event is retained pending evidence, so this counts retries too.
@@ -113,6 +131,11 @@ pub struct CausalGauges {
     pub queue_bytes: usize,
     /// Current predecessor relay outbox obligations.
     pub relay_obligations: usize,
+}
+
+/// Public snapshot of all known groups, returned by `GET /diagnostics/groups`.
+fn is_zero(value: &u64) -> bool {
+    *value == 0
 }
 
 /// Public snapshot of all known groups, returned by `GET /diagnostics/groups`.
@@ -179,6 +202,29 @@ impl GroupsDiagnostics {
         self.with_counters(group_id, |c| {
             c.messages_received = c.messages_received.saturating_add(1);
             c.last_message_at_ms = Some(now_ms);
+        });
+    }
+
+    /// #469 A2: record a typed invite refusal reason.
+    pub fn record_invite_refusal(&self, group_id: &str, reason: &str) {
+        self.with_counters(group_id, |c| {
+            let entry = c.invites_refused_reasons.entry(reason.to_string()).or_insert(0);
+            *entry = entry.saturating_add(1);
+        });
+    }
+
+    /// #468 A5: record ONE new unique authenticated fork-evidence record.
+    pub fn record_adoption_fork_evidence(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.adoption_fork_evidence = c.adoption_fork_evidence.saturating_add(1);
+        });
+    }
+
+    /// #468 A5: record an unauthenticated conflict attempt (per-packet,
+    /// rate-limited by the caller).
+    pub fn record_conflict_unauthenticated(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.conflict_unauthenticated = c.conflict_unauthenticated.saturating_add(1);
         });
     }
 
