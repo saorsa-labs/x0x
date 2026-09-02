@@ -33645,7 +33645,7 @@ pub(in crate::server) mod tests {
             let full_root = compute_roster_root(&info.members_v2);
             let mut invite =
                 SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
-            populate_invite_base_state_from_group_info(&mut invite, &info);
+            crate::server::routes::identity::populate_invite_base_state_v4(&mut invite, &info, None);
 
             let roster = invite
                 .base_members_v2
@@ -33701,7 +33701,7 @@ pub(in crate::server) mod tests {
         // gracefully on an old daemon (kp reads as None).
         let mut slim_invite =
             SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
-        populate_invite_base_state_from_group_info(&mut slim_invite, &info3);
+        crate::server::routes::identity::populate_invite_base_state_v4(&mut slim_invite, &info3, None);
         let slim_link = slim_invite.encode_link().expect("slim under budget");
         let parsed_slim = SignedInvite::from_link(&slim_link).expect("slim link round-trips");
         assert!(parsed_slim
