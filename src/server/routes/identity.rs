@@ -530,13 +530,10 @@ pub(in crate::server) async fn get_agent_card(
                         continue;
                     }
                 }
-                if info.policy.admission.owner_certified_user_id().is_some() {
-                    // No durable-owner actor on a GET surface — omit.
-                    state
-                        .groups_diagnostics
-                        .record_invite_refusal(map_key, "card_invite_omitted_owner_axis");
-                    continue;
-                }
+                // r1 (Fable 7): owner-axis groups DO mint on an owner
+                // install — the mint's own user-key equality fence is the
+                // owner proof (the countersignature authenticates the
+                // link). Non-owner installs omit at mint time below.
                 mint_candidates.push(map_key.clone());
             }
         }
@@ -551,6 +548,20 @@ pub(in crate::server) async fn get_agent_card(
                 continue;
             };
             let mut next = info.clone();
+            // r1 (Codex 9): re-check admin authority UNDER the membership
+            // lock — the phase-1 preselection ran under a read lock and a
+            // demotion could have landed in between (TOCTOU).
+            {
+                let inviter_hex = hex::encode(agent_id.as_bytes());
+                if crate::server::routes::named_groups::require_admin_or_above(&next, &inviter_hex)
+                    .is_err()
+                {
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(&map_key, "card_invite_omitted_non_admin");
+                    continue;
+                }
+            }
             let now_secs = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())
@@ -603,13 +614,19 @@ pub(in crate::server) async fn get_agent_card(
                     });
                 }
                 Err(e) => {
+                    let reason = match e {
+                        crate::server::routes::named_groups::MintInviteError::OwnerKeyUnavailable => {
+                            "card_invite_omitted_owner_axis"
+                        }
+                        _ => "card_invite_omitted_mint_failed",
+                    };
                     tracing::warn!(
                         group_id = %map_key,
                         "card invite mint failed; omitting group from card: {e:?}"
                     );
                     state
                         .groups_diagnostics
-                        .record_invite_refusal(&map_key, "card_invite_omitted_mint_failed");
+                        .record_invite_refusal(&map_key, reason);
                 }
             }
         }

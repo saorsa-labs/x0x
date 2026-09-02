@@ -2096,13 +2096,13 @@
             "required": false
           },
           {
-            "cli": "--home",
+            "cli": "derived",
             "in": "body",
             "name": "mode",
             "required": false
           },
           {
-            "cli": "--owner",
+            "cli": "derived",
             "in": "body",
             "name": "expected_owner_user_id",
             "required": false

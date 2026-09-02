@@ -240,32 +240,3 @@ Phased; each phase independently shippable.
    surfaces in Phase 1 so none *requires* an owner to exist.
 2. **Fork-choice for equal-revision siblings** (Decision 7) — deliberately
    deferred; needs rollback machinery and its own ADR when prioritised.
-
----
-
-## §7 Amendment (2026-09-02, issues #468/#469, v0.41.0 hardening — PR #474)
-
-Decision 7's equal-revision fork-choice limitation is now **instrumented**,
-not yet closed:
-
-1. **Authenticated invites (InviteV4, #469).** Invites are signed by the
-   inviter's agent key (ML-DSA-65 over `x0x.invite.v4\0‖postcard(view)`,
-   with the inviter key carried INLINE and bound by the domain-separated
-   `AgentId::from_public_key` id check), and — for policies carrying an
-   OwnerCertified axis — countersigned by the owner USER key. The joiner
-   verifies signatures, re-derives the base state hash from the carried
-   roster PROJECTION and public-meta snapshot, and only then seats a stub.
-   An inviter can therefore no longer silently select the joiner's
-   admission tier or trust root. Owner user-key **revocation has no
-   subject** today (revocation covers Agent/Machine/AgentMachineBinding
-   only) — deliberately out of scope here; #472 may add a `User` subject.
-2. **Fork evidence (#468).** The stale-base fork of this ADR's Decision 7
-   discussion remains: a joiner at revision N cannot distinguish an
-   admin's internally-consistent alternate N+1 from the canonical chain.
-   v0.41.0 records LOCAL, deduplicated, authenticated `ForkEvidence` in
-   `invite_lineage` (first complete evidence wins; unauthenticated
-   attempts count per-packet) and changes NO authorization state.
-3. **The full fix is deferred to #472**: pre-commit owner mandate on
-   `MemberAdded`, alternate-chain authority validation anchored on an
-   independent owner/head key, persistent route-complete quarantine, and
-   a content-addressed base snapshot for over-budget rosters.

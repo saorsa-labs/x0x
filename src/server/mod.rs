@@ -698,6 +698,12 @@ pub async fn serve_with_options(
     let (shutdown_tx, mut shutdown_rx) = mpsc::channel::<()>(1);
     let (shutdown_notify, _) = watch::channel(false);
     let agent = Arc::new(agent);
+    // Invite-auth #468/#469 (design v6 E2d / v7 F1): subscribe to the
+    // verified-certificate stream BEFORE the AppState group state exists,
+    // so no certificate landing can be missed. The bridge task below
+    // consumes this receiver and never relies on channel history — every
+    // (re)start additionally reconciles the full discovery cache.
+    let cert_events_rx = agent.subscribe_verified_certificates();
     let (exec_dm_tx, exec_dm_rx) = mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
     let (group_public_dm_tx, mut group_public_dm_rx) =
         mpsc::channel::<x0x::dm_inbox::DmTypedPayload>(1024);
@@ -1072,6 +1078,17 @@ pub async fn serve_with_options(
     // Phase E: subscribe to a stable global SignedPublic message fallback so
     // first messages are not dependent on a brand-new per-group topic tree.
     bg_tasks.extend(spawn_global_public_message_listener(Arc::clone(&state)).await);
+
+    // Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
+    // bridge. `cert_events_rx` was subscribed before the AppState groups
+    // existed; the supervised worker reconciles the full discovery cache on
+    // every (re)start, then hydrates digest-only member seats per event
+    // (Lagged falls back to another full reconcile — no landing is ever
+    // lost to backpressure).
+    bg_tasks.push(tokio::spawn(supervise_member_certificate_bridge(
+        Arc::clone(&state),
+        cert_events_rx,
+    )));
 
     // ADR-0040 (review r5): reconstruct the global delegation-id
     // registry from ALL groups' durable history at boot — cross-group
@@ -3325,6 +3342,199 @@ pub(in crate::server) async fn handle_predecessor_relay_typed_payload(
     }
 }
 
+// ---------------------------------------------------------------------------
+// Invite-auth #468/#469 — member-certificate hydration bridge (F1)
+// ---------------------------------------------------------------------------
+
+/// F1 (design v7): idempotent sweep hydrating DIGEST-ONLY member seats
+/// (`certificate == None && certificate_digest.is_some()`) from the agent's
+/// authenticated certificate cache. Per group: under the group membership
+/// lock, [`x0x::groups::GroupInfo::hydrate_member_certificates`] installs
+/// ONLY bytes hashing to the seat's committed digest (mismatch is ignored
+/// inside the helper), and the normal roster mutation helper persists —
+/// ONLY when at least one member was hydrated, so a settled roster is never
+/// churned. Returns the number of members hydrated.
+async fn reconcile_member_certificates_from_cache(state: &AppState) -> usize {
+    let cached: Vec<(String, x0x::identity::AgentCertificate)> = state
+        .agent
+        .cached_verified_certificates()
+        .await
+        .into_iter()
+        .map(|(agent_id, cert)| (hex::encode(agent_id.as_bytes()), cert))
+        .collect();
+    if cached.is_empty() {
+        return 0;
+    }
+    let group_ids: Vec<String> = state.named_groups.read().await.keys().cloned().collect();
+    let mut hydrated_total = 0usize;
+    for group_id in group_ids {
+        // Restrict the pairs to THIS group's digest-pending seats so the
+        // hydrate logs stay signal; the helper re-checks every digest
+        // regardless.
+        let pending: Vec<(String, x0x::identity::AgentCertificate)> = {
+            let groups = state.named_groups.read().await;
+            let Some(info) = groups.get(&group_id) else {
+                continue;
+            };
+            info.members_v2
+                .iter()
+                .filter(|(_, m)| m.certificate.is_none() && m.certificate_digest.is_some())
+                .filter_map(|(agent_hex, _)| {
+                    cached.iter().find(|(hex, _)| hex == agent_hex).cloned()
+                })
+                .collect()
+        };
+        if pending.is_empty() {
+            continue;
+        }
+        let membership = routes::named_groups::group_membership_lock(state, &group_id).await;
+        let _serialized = membership.lock().await;
+        let mut hydrated = 0usize;
+        let group_key = group_id.clone();
+        let outcome = routes::named_groups::persist_named_groups_mutation(state, |groups| {
+            let count = groups
+                .get_mut(&group_key)
+                .map_or(0, |info| info.hydrate_member_certificates(&pending));
+            hydrated = count;
+            count > 0
+        })
+        .await;
+        match outcome {
+            Ok(_) => hydrated_total += hydrated,
+            Err(e) => tracing::warn!(
+                group_id = %group_id,
+                "member-certificate reconcile: roster persist failed: {e}"
+            ),
+        }
+    }
+    hydrated_total
+}
+
+/// F1: apply one [`VerifiedCertificate`] event — hydrate this agent's
+/// digest-only seats in every group that has one, under each group's
+/// membership lock, persisting only on change.
+async fn apply_verified_certificate_event(state: &AppState, event: &x0x::VerifiedCertificate) {
+    let agent_hex = hex::encode(event.agent_id.as_bytes());
+    let digest_hex = event.digest_hex();
+    let candidate_groups: Vec<String> = {
+        let groups = state.named_groups.read().await;
+        groups
+            .iter()
+            .filter(|(_, info)| {
+                info.members_v2.get(&agent_hex).is_some_and(|m| {
+                    m.certificate.is_none()
+                        && m.certificate_digest.as_deref() == Some(digest_hex.as_str())
+                })
+            })
+            .map(|(id, _)| id.clone())
+            .collect()
+    };
+    for group_id in candidate_groups {
+        let membership = routes::named_groups::group_membership_lock(state, &group_id).await;
+        let _serialized = membership.lock().await;
+        let pairs = vec![(agent_hex.clone(), event.certificate.clone())];
+        let group_key = group_id.clone();
+        let outcome = routes::named_groups::persist_named_groups_mutation(state, |groups| {
+            groups
+                .get_mut(&group_key)
+                .is_some_and(|info| info.hydrate_member_certificates(&pairs) > 0)
+        })
+        .await;
+        if let Err(e) = outcome {
+            tracing::warn!(
+                group_id = %group_id,
+                member = %agent_hex,
+                "member-certificate bridge: roster persist failed: {e}"
+            );
+        }
+    }
+}
+
+/// F1: one bridge run — a full cache reconcile, then event consumption.
+/// `RecvError::Lagged` (the subscriber fell more than the 256-slot event
+/// ring behind) logs and re-runs the FULL reconcile — mirroring the
+/// network gatekeeper's Lagged handling (network.rs) — so backpressure can
+/// never silently drop a hydration. Exits when shutdown is requested or
+/// the event ring closes.
+async fn run_member_certificate_bridge(
+    state: Arc<AppState>,
+    mut events: broadcast::Receiver<x0x::VerifiedCertificate>,
+) {
+    reconcile_member_certificates_from_cache(&state).await;
+    let mut shutdown = state.shutdown_notify.subscribe();
+    loop {
+        tokio::select! {
+            changed = shutdown.changed() => {
+                if changed.is_err() {
+                    // Watch sender dropped during teardown — nothing more
+                    // to consume for.
+                }
+                break;
+            }
+            received = events.recv() => match received {
+                Ok(event) => apply_verified_certificate_event(&state, &event).await,
+                Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::warn!(
+                        skipped,
+                        "verified-certificate ring overflowed; re-running full member-certificate reconcile"
+                    );
+                    reconcile_member_certificates_from_cache(&state).await;
+                }
+                Err(broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    }
+}
+
+/// F1: supervise the bridge worker for the daemon's lifetime, following the
+/// server background-task pattern (handle collected in `bg_tasks`, aborted
+/// at shutdown). The worker should only return once shutdown was requested;
+/// if it exits or panics anyway it is re-spawned with backoff so a fault
+/// cannot hot-loop — and every (re)start re-runs the full reconcile, so a
+/// restart never leaves a member seat un-hydrated.
+async fn supervise_member_certificate_bridge(
+    state: Arc<AppState>,
+    initial_events: broadcast::Receiver<x0x::VerifiedCertificate>,
+) {
+    let mut pending_events = Some(initial_events);
+    let mut shutdown = state.shutdown_notify.subscribe();
+    let mut backoff = Duration::from_secs(1);
+    loop {
+        if *state.shutdown_notify.borrow() {
+            break;
+        }
+        let events = pending_events
+            .take()
+            .unwrap_or_else(|| state.agent.subscribe_verified_certificates());
+        let mut worker = tokio::spawn(run_member_certificate_bridge(Arc::clone(&state), events));
+        tokio::select! {
+            _ = shutdown.changed() => {
+                worker.abort();
+                let _ = worker.await;
+                break;
+            }
+            joined = &mut worker => {
+                if *state.shutdown_notify.borrow() {
+                    // Worker observed the same shutdown request this select
+                    // raced against — clean exit.
+                    break;
+                }
+                if joined.is_ok() {
+                    tracing::warn!(
+                        "member-certificate bridge worker exited early; restarting with a full reconcile"
+                    );
+                } else {
+                    tracing::warn!(
+                        "member-certificate bridge worker panicked; restarting with a full reconcile"
+                    );
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = std::cmp::min(backoff * 2, Duration::from_secs(60));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod owner_singleton_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -3486,5 +3696,286 @@ mod owner_singleton_tests {
             err.to_string().contains("unreadable"),
             "error names the reason: {err}"
         );
+    }
+}
+
+/// Invite-auth #468/#469 (design v6 E2d / v7 F1): the member-certificate
+/// hydration bridge — pre-populated cache ⇒ reconcile hydrates with no
+/// event; ring overflow (`Lagged`) ⇒ the full reconcile recovers; a second
+/// reconcile run hydrates nothing.
+#[cfg(test)]
+mod member_certificate_bridge_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::{
+        reconcile_member_certificates_from_cache, run_member_certificate_bridge, AppState,
+    };
+    use crate as x0x;
+    use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
+    use std::sync::Arc;
+
+    /// Zeroed machine id keeps the insert purely in the identity cache
+    /// (no direct-messaging registration).
+    fn cached_cert_entry(
+        agent_id: x0x::identity::AgentId,
+        cert: x0x::identity::AgentCertificate,
+    ) -> x0x::DiscoveredAgent {
+        x0x::DiscoveredAgent {
+            agent_id,
+            machine_id: x0x::identity::MachineId([0u8; 32]),
+            user_id: None,
+            addresses: vec![],
+            announced_at: 1,
+            last_seen: 1,
+            machine_public_key: Vec::new(),
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: cert.not_after(),
+            agent_certificate: Some(cert),
+            agent_public_key: Vec::new(),
+            cert_digest: None,
+            self_name: None,
+        }
+    }
+
+    /// A group whose members are all DIGEST-ONLY seats:
+    /// `certificate == None && certificate_digest == Some(digest)`.
+    fn group_with_digest_only_members(
+        members: &[(x0x::identity::AgentId, x0x::identity::AgentCertificate)],
+    ) -> (String, x0x::groups::GroupInfo) {
+        let mut info = x0x::groups::GroupInfo::new(
+            "bridge-test".to_string(),
+            String::new(),
+            x0x::identity::AgentId([0xB7; 32]),
+            format!("bridge-{}-mls", members.len()),
+        );
+        for (agent_id, cert) in members {
+            let agent_hex = hex::encode(agent_id.as_bytes());
+            info.add_member(
+                agent_hex.clone(),
+                x0x::groups::GroupRole::Member,
+                None,
+                None,
+            );
+            let digest = x0x::groups::owner_cert::certificate_digest_hex(cert);
+            if let Some(m) = info.members_v2.get_mut(&agent_hex) {
+                m.certificate_digest = Some(digest);
+            }
+        }
+        let stable_id = info.stable_group_id().to_string();
+        (stable_id, info)
+    }
+
+    async fn member_of(
+        state: &AppState,
+        group_id: &str,
+        agent_hex: &str,
+    ) -> x0x::groups::GroupMember {
+        let groups = state.named_groups.read().await;
+        groups
+            .get(group_id)
+            .unwrap_or_else(|| panic!("group {group_id} present"))
+            .members_v2
+            .get(agent_hex)
+            .cloned()
+            .expect("member seat present")
+    }
+
+    /// WHY (F1 (i)): certificates that landed in the discovery cache BEFORE
+    /// the bridge ever subscribed (restart, or a peer announced while the
+    /// daemon was starting) must still hydrate their digest-only seats —
+    /// the startup reconcile is cache-driven, not event-driven. No event
+    /// is delivered in this test at all.
+    #[tokio::test]
+    async fn prepopulated_cache_reconciles_without_any_event() {
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let member_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert = x0x::identity::AgentCertificate::issue(&user, &member_kp).unwrap();
+        let agent_hex = hex::encode(member_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        let (group_id, info) =
+            group_with_digest_only_members(&[(member_kp.agent_id(), cert.clone())]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // No subscription exists — the fired event goes nowhere. The cache
+        // alone must drive hydration.
+        state
+            .agent
+            .insert_discovered_agent_for_testing(cached_cert_entry(
+                member_kp.agent_id(),
+                cert.clone(),
+            ))
+            .await;
+
+        let hydrated = reconcile_member_certificates_from_cache(&state).await;
+        assert_eq!(hydrated, 1, "the digest-only seat must hydrate from cache");
+        let m = member_of(&state, &group_id, &agent_hex).await;
+        assert!(m.certificate.as_ref().is_some_and(|c| *c == cert));
+        assert_eq!(
+            m.certificate_digest.as_deref(),
+            Some(x0x::groups::owner_cert::certificate_digest_hex(&cert).as_str()),
+            "hydration keeps the committed digest"
+        );
+
+        // The normal mutation helper persisted the hydrated roster: the
+        // durable store carries the member.
+        let on_disk = tokio::fs::read_to_string(state.named_groups_path.clone())
+            .await
+            .unwrap();
+        assert!(
+            on_disk.contains(&agent_hex),
+            "hydration must reach the persisted roster store"
+        );
+    }
+
+    /// WHY (F1 (iii)): a slow consumer that falls more than the 256-slot
+    /// event ring behind gets `RecvError::Lagged` — the missed events are
+    /// GONE from the channel, so the bridge must re-run the full reconcile
+    /// and hydrate from the cache. The flood below is serialized behind the
+    /// worker's own `named_groups` read (the test holds the write lock
+    /// while 300+ certificates land), making the overflow deterministic:
+    /// the worker cannot poll while blocked in its first apply.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn lagged_receiver_recovers_via_full_reconcile() {
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let a_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let b_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert_a = x0x::identity::AgentCertificate::issue(&user, &a_kp).unwrap();
+        let cert_b = x0x::identity::AgentCertificate::issue(&user, &b_kp).unwrap();
+        let hex_a = hex::encode(a_kp.agent_id().as_bytes());
+        let hex_b = hex::encode(b_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        let (group_id, info) = group_with_digest_only_members(&[
+            (a_kp.agent_id(), cert_a.clone()),
+            (b_kp.agent_id(), cert_b.clone()),
+        ]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // The receiver the bridge will consume — created BEFORE any
+        // certificate lands, exactly like daemon startup (F1 order).
+        let rx = state.agent.subscribe_verified_certificates();
+        let worker = tokio::spawn(run_member_certificate_bridge(Arc::clone(&state), rx));
+
+        // Block the worker inside its first apply, then overflow the ring:
+        // A's event, 300 filler agents sharing one filler certificate, and
+        // finally B's event (guaranteed past the 256-slot tail).
+        {
+            let _roster_guard = state.named_groups.write().await;
+            state
+                .agent
+                .insert_discovered_agent_for_testing(cached_cert_entry(
+                    a_kp.agent_id(),
+                    cert_a.clone(),
+                ))
+                .await;
+            let filler_kp = x0x::identity::AgentKeypair::generate().unwrap();
+            let filler_cert = x0x::identity::AgentCertificate::issue(&user, &filler_kp).unwrap();
+            for i in 0u16..300 {
+                let mut id = [0u8; 32];
+                id[..2].copy_from_slice(&i.to_be_bytes());
+                state
+                    .agent
+                    .insert_discovered_agent_for_testing(cached_cert_entry(
+                        x0x::identity::AgentId(id),
+                        filler_cert.clone(),
+                    ))
+                    .await;
+            }
+            state
+                .agent
+                .insert_discovered_agent_for_testing(cached_cert_entry(
+                    b_kp.agent_id(),
+                    cert_b.clone(),
+                ))
+                .await;
+        }
+
+        // The worker unblocks: applies A, observes Lagged, re-runs the full
+        // reconcile (which is what must hydrate B — its event was dropped
+        // by the ring), then drains the surviving tail.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let b = member_of(&state, &group_id, &hex_b).await;
+            if b.certificate.is_some() {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "Lagged recovery must re-hydrate member B within the deadline"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        let a = member_of(&state, &group_id, &hex_a).await;
+        let b = member_of(&state, &group_id, &hex_b).await;
+        assert!(a.certificate.as_ref().is_some_and(|c| *c == cert_a));
+        assert!(b.certificate.as_ref().is_some_and(|c| *c == cert_b));
+
+        // Clean shutdown: the worker exits when the daemon's shutdown
+        // watch fires.
+        let _ = state.shutdown_notify.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(10), worker)
+            .await
+            .expect("bridge worker exits on shutdown")
+            .expect("bridge worker exited cleanly");
+    }
+
+    /// WHY (F1 (i) idempotence): a settled roster must not be churned — the
+    /// second reconcile run hydrates ZERO seats (byte-bearing seats are
+    /// skipped by `hydrate_member_certificates`), which the unchanged
+    /// `updated_at` stamp proves: a real hydration re-stamps it via
+    /// `set_member_certificate`.
+    #[tokio::test]
+    async fn second_reconcile_run_hydrates_nothing() {
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let member_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert = x0x::identity::AgentCertificate::issue(&user, &member_kp).unwrap();
+        let agent_hex = hex::encode(member_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        let (group_id, info) =
+            group_with_digest_only_members(&[(member_kp.agent_id(), cert.clone())]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+        state
+            .agent
+            .insert_discovered_agent_for_testing(cached_cert_entry(
+                member_kp.agent_id(),
+                cert.clone(),
+            ))
+            .await;
+
+        assert_eq!(reconcile_member_certificates_from_cache(&state).await, 1);
+        let first = member_of(&state, &group_id, &agent_hex).await;
+        assert!(first.certificate.is_some());
+
+        assert_eq!(
+            reconcile_member_certificates_from_cache(&state).await,
+            0,
+            "the second sweep must find no digest-only seat to hydrate"
+        );
+        let second = member_of(&state, &group_id, &agent_hex).await;
+        assert_eq!(
+            second.updated_at, first.updated_at,
+            "an idempotent sweep must not re-stamp the member"
+        );
+        assert_eq!(second.certificate, first.certificate);
     }
 }

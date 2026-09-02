@@ -272,9 +272,11 @@ pub struct InviteSignedViewV4 {
     /// Human-readable name; must equal `public_meta.name` (D1).
     pub group_name: String,
     /// Human-readable description; must equal `public_meta.description`.
-    pub group_description: String,
-    /// Authority genesis nonce.
-    pub genesis_creation_nonce: String,
+    /// Option-preserving (r1 Codex 8): None and Some("") are DISTINCT
+    /// signed states — postcard encodes the Option tag.
+    pub group_description: Option<String>,
+    /// Authority genesis nonce (Option-preserving, r1 Codex 8).
+    pub genesis_creation_nonce: Option<String>,
     /// Explicit signed creator agent id (hex).
     pub creator: String,
     /// Exact public-metadata snapshot (tags/avatar/banner/home_digest).
@@ -290,14 +292,16 @@ pub struct InviteSignedViewV4 {
     pub base_state_revision: u64,
     /// Base state hash (hex).
     pub base_state_hash: String,
-    /// Base previous state hash (hex; empty at genesis).
-    pub base_prev_state_hash: String,
+    /// Base previous state hash (hex; None at genesis — Option-preserving,
+    /// r1 Codex 8).
+    pub base_prev_state_hash: Option<String>,
     /// The roster PROJECTION at the base revision.
     pub base_roster: BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>,
     /// Base secret epoch.
     pub base_secret_epoch: u64,
-    /// Base security binding (hex-encoded string; empty when absent).
-    pub base_security_binding: String,
+    /// Base security binding (None when absent — Option-preserving, r1
+    /// Codex 8).
+    pub base_security_binding: Option<String>,
     /// Inviter agent id (hex).
     pub inviter: String,
     /// Inviter ML-DSA-65 public key (base64) — self-authenticating via
@@ -408,7 +412,12 @@ impl InviteSignedViewV4 {
         }
 
         // Raw-secret normalization: strictly 32 bytes after hex decode.
-        let secret_bytes = hex::decode(invite_secret.trim())
+        // r1 (Codex 8): STRICT 64-hex — no trimming; a padded secret is
+        // malformed, not normalized.
+        if invite_secret.len() != 64 || hex::decode(invite_secret.as_bytes()).is_err() {
+            return Err(InviteRefusal::Malformed);
+        }
+        let secret_bytes = hex::decode(invite_secret.as_bytes())
             .map_err(|_| InviteRefusal::Malformed)
             .and_then(|bytes| <[u8; 32]>::try_from(bytes).map_err(|_| InviteRefusal::Malformed))?;
         let secret_hash = *blake3::hash(&secret_bytes).as_bytes();
@@ -419,8 +428,8 @@ impl InviteSignedViewV4 {
             stable_group_id,
             group_created_at,
             group_name: group_name.clone(),
-            group_description: group_description.clone().unwrap_or_default(),
-            genesis_creation_nonce: genesis_creation_nonce.clone().unwrap_or_default(),
+            group_description: group_description.clone(),
+            genesis_creation_nonce: genesis_creation_nonce.clone(),
             creator,
             public_meta,
             base_home: base_home.clone(),
@@ -428,10 +437,10 @@ impl InviteSignedViewV4 {
             policy: policy.clone().unwrap_or_default(),
             base_state_revision,
             base_state_hash,
-            base_prev_state_hash: base_prev_state_hash.clone().unwrap_or_default(),
+            base_prev_state_hash: base_prev_state_hash.clone(),
             base_roster,
             base_secret_epoch,
-            base_security_binding: base_security_binding.clone().unwrap_or_default(),
+            base_security_binding: base_security_binding.clone(),
             inviter: inviter.clone(),
             inviter_public_key_b64: inviter_public_key_b64.clone(),
             owner_public_key_b64: owner_public_key_b64.clone(),
@@ -920,6 +929,10 @@ impl SignedInvite {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::groups::policy::{GroupAdmission, GroupConfidentiality};
+    use crate::groups::state_commit::{compute_home_digest, GroupPublicMeta, RosterMemberSnapshot};
+    use crate::groups::{GroupMemberState, GroupRole, HomeMetadata};
+    use crate::identity::{AgentKeypair, UserId, UserKeypair};
 
     fn agent(n: u8) -> AgentId {
         AgentId([n; 32])
@@ -1134,5 +1147,765 @@ mod tests {
             serde_json::from_value(json).expect("deserialize legacy invite");
         assert_eq!(restored.secure_plane, None);
         assert_ne!(restored.secure_plane, Some(SecureGroupPlane::TreeKem));
+    }
+
+    // ─── #469 InviteV4: canonical bytes, typed refusals, caps, budget ────
+
+    /// Deterministic shared fixture roster: two projection entries with
+    /// 64-hex member ids and both hash fields populated.
+    fn fixture_roster() -> BTreeMap<String, RosterMemberSnapshot> {
+        [0x11u8, 0xee]
+            .into_iter()
+            .map(|byte| {
+                (
+                    format!("{byte:02x}").repeat(32),
+                    RosterMemberSnapshot {
+                        role: GroupRole::Admin,
+                        state: GroupMemberState::Active,
+                        treekem_key_package_hash: Some("0f".repeat(32)),
+                        certificate_digest: Some("5a".repeat(32)),
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Deterministic v4 invite fixture. `owner_kp` switches the policy to
+    /// the OwnerCertified axis (the countersignature path); timestamps,
+    /// secret, and roster are fixed so failures localize to the mutation.
+    fn v4_fixture(inviter_kp: &AgentKeypair, owner_kp: Option<&UserKeypair>) -> SignedInvite {
+        let mut policy = GroupPolicy::default();
+        if let Some(owner) = owner_kp {
+            policy.admission =
+                GroupAdmission::OwnerCertified(UserId::from_public_key(owner.public_key()));
+        }
+        let mut invite = SignedInvite::new(
+            "cd".repeat(32),
+            "fixture group".to_string(),
+            &AgentId::from_public_key(inviter_kp.public_key()),
+            86_400,
+        );
+        invite.stable_group_id = Some("cd".repeat(32));
+        invite.group_created_at = Some(1_699_000_000);
+        invite.group_description = Some("fixture description".to_string());
+        invite.invite_secret = "ab".repeat(32);
+        invite.created_at = 1_700_000_000;
+        invite.expires_at = 1_700_086_400;
+        invite.policy = Some(policy);
+        invite.genesis_creation_nonce = Some("ee".repeat(32));
+        invite.base_state_revision = Some(7);
+        invite.base_state_hash = Some("aa".repeat(32));
+        invite.base_prev_state_hash = Some("bb".repeat(32));
+        invite.secure_plane = Some(SecureGroupPlane::TreeKem);
+        invite.base_secret_epoch = Some(3);
+        invite.base_security_binding = Some("cc".repeat(32));
+        invite.public_meta = Some(GroupPublicMeta {
+            name: "fixture group".to_string(),
+            description: "fixture description".to_string(),
+            tags: vec!["fixture".to_string()],
+            avatar_url: None,
+            banner_url: None,
+            home_digest: None,
+        });
+        invite.base_roster = Some(fixture_roster());
+        invite.creator = Some("12".repeat(32));
+        invite.inviter_public_key_b64 = B64_STD.encode(inviter_kp.public_key().as_bytes());
+        invite
+    }
+
+    /// Pinned BLAKE3-256 (hex) over the canonical bytes of the fixed-field
+    /// view below — any field reorder, insertion, or representation change
+    /// in `InviteSignedViewV4` (or one of its member types) moves this
+    /// digest and fails the pin.
+    const PINNED_VIEW_CANONICAL_BLAKE3: &str =
+        "d19b8c48198a63aac9d7263f867cf9a325f2aa8d7adc5970b33c5b20c72ae4ea";
+
+    /// The fixed-field view pinned by `canonical_bytes_pinned_vector`:
+    /// deterministic key bytes, secret, timestamps, roster, and metadata —
+    /// no generated key material anywhere.
+    fn pinned_view() -> InviteSignedViewV4 {
+        InviteSignedViewV4 {
+            version: INVITE_VERSION_V4,
+            group_id: "cd".repeat(32),
+            stable_group_id: "cd".repeat(32),
+            group_created_at: 1_699_000_000,
+            group_name: "pinned vector group".to_string(),
+            group_description: Some("pinned vector fixture".to_string()),
+            genesis_creation_nonce: Some("ee".repeat(32)),
+            creator: "12".repeat(32),
+            public_meta: GroupPublicMeta {
+                name: "pinned vector group".to_string(),
+                description: "pinned vector fixture".to_string(),
+                tags: vec!["pinned".to_string()],
+                avatar_url: Some("https://example.com/a.png".to_string()),
+                banner_url: None,
+                home_digest: None,
+            },
+            base_home: None,
+            secure_plane: SecureGroupPlane::TreeKem,
+            policy: GroupPolicy::default(),
+            base_state_revision: 7,
+            base_state_hash: "aa".repeat(32),
+            base_prev_state_hash: Some("bb".repeat(32)),
+            base_roster: fixture_roster(),
+            base_secret_epoch: 3,
+            base_security_binding: Some("cc".repeat(32)),
+            inviter: "ab".repeat(32),
+            inviter_public_key_b64: B64_STD.encode([7u8; 1952]),
+            owner_public_key_b64: None,
+            secret_hash: *blake3::hash(&[0xAB; 32]).as_bytes(),
+            created_at: 1_700_000_000,
+            expires_at: 1_700_086_400,
+            intended_joiner: None,
+        }
+    }
+
+    /// An invite whose `from_invite` view is EXACTLY `pinned_view()` —
+    /// pins the constructor's field mapping, including the raw-secret
+    /// hash derivation (`blake3(hex-decoded 32 bytes)`, not the text).
+    fn invite_matching_pinned_view() -> SignedInvite {
+        let view = pinned_view();
+        let mut invite = SignedInvite::new(
+            view.group_id.clone(),
+            view.group_name.clone(),
+            &agent(0xAB),
+            86_400,
+        );
+        invite.stable_group_id = Some(view.stable_group_id.clone());
+        invite.group_created_at = Some(view.group_created_at);
+        invite.group_description = view.group_description.clone();
+        invite.invite_secret = "ab".repeat(32);
+        invite.created_at = view.created_at;
+        invite.expires_at = view.expires_at;
+        invite.policy = Some(view.policy.clone());
+        invite.genesis_creation_nonce = view.genesis_creation_nonce.clone();
+        invite.base_state_revision = Some(view.base_state_revision);
+        invite.base_state_hash = Some(view.base_state_hash.clone());
+        invite.base_prev_state_hash = view.base_prev_state_hash.clone();
+        invite.secure_plane = Some(view.secure_plane);
+        invite.base_secret_epoch = Some(view.base_secret_epoch);
+        invite.base_security_binding = view.base_security_binding.clone();
+        invite.public_meta = Some(view.public_meta.clone());
+        invite.base_roster = Some(view.base_roster.clone());
+        invite.creator = Some(view.creator.clone());
+        invite.inviter = view.inviter.clone();
+        invite.inviter_public_key_b64 = view.inviter_public_key_b64.clone();
+        invite
+    }
+
+    #[test]
+    fn canonical_bytes_pinned_vector() {
+        let view = pinned_view();
+        let canonical = view.canonical_bytes().expect("canonical bytes");
+        assert!(
+            canonical.starts_with(INVITE_V4_CANONICAL_DOMAIN),
+            "canonical bytes must open with the signing domain"
+        );
+        // Determinism: a fresh identical view serializes byte-identically.
+        assert_eq!(
+            canonical,
+            pinned_view()
+                .canonical_bytes()
+                .expect("canonical bytes (rebuild)")
+        );
+        // The pinned digest freezes the whole value graph.
+        assert_eq!(
+            hex::encode(blake3::hash(&canonical).as_bytes()),
+            PINNED_VIEW_CANONICAL_BLAKE3,
+            "v4 canonical-byte layout changed — repin deliberately"
+        );
+        // BTreeMap insertion order never leaks into the canonical bytes.
+        let mut reversed = pinned_view();
+        reversed.base_roster = fixture_roster().into_iter().rev().collect();
+        assert_eq!(
+            canonical,
+            reversed
+                .canonical_bytes()
+                .expect("canonical bytes (reversed insertion)")
+        );
+        // The constructor maps a matching invite onto exactly this view.
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&invite_matching_pinned_view()).expect("view"),
+            view
+        );
+    }
+
+    #[test]
+    fn v4_missing_field_matrix_maps_typed_refusals() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let owner_kp = UserKeypair::generate().expect("user keypair");
+        let mut invite = v4_fixture(&inviter_kp, Some(&owner_kp));
+        invite
+            .sign_v4(&inviter_kp, Some(&owner_kp))
+            .expect("sign baseline");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+
+        // Pre-v4 versions — including the absent-field legacy sentinel 0.
+        for version in [0u8, 3] {
+            let mut t = invite.clone();
+            t.version = version;
+            assert_eq!(
+                t.verify_v4_signatures(),
+                Err(InviteRefusal::Unsigned),
+                "version {version}"
+            );
+        }
+        // A non-empty legacy `signature` is refused before anything else.
+        let mut t = invite.clone();
+        t.signature = "deadbeef".to_string();
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::SignatureInvalid)
+        );
+        // A legacy fat roster would ride unsigned next to the projection.
+        let mut t = invite.clone();
+        let mut fat = BTreeMap::new();
+        fat.insert(
+            "11".repeat(32),
+            GroupMember::new_admin("11".repeat(32), None, 0),
+        );
+        t.base_members_v2 = Some(fat);
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        // stable ≠ MLS id breaks the signed id invariant (E1).
+        let mut t = invite.clone();
+        t.stable_group_id = Some("ce".repeat(32));
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Malformed));
+        // Required v4 inputs absent ⇒ Unsigned.
+        let mut t = invite.clone();
+        t.stable_group_id = None;
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        let mut t = invite.clone();
+        t.public_meta = None;
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        let mut t = invite.clone();
+        t.base_roster = None;
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        let mut t = invite.clone();
+        t.creator = None;
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        // invite_secret: non-hex text, and valid hex of the wrong length.
+        let mut t = invite.clone();
+        t.invite_secret = "zz".repeat(32);
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Malformed));
+        let mut t = invite.clone();
+        t.invite_secret = "ab".repeat(31);
+        assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Malformed));
+    }
+
+    #[test]
+    fn v4_sign_verify_roundtrip_and_tamper_matrix() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let owner_kp = UserKeypair::generate().expect("user keypair");
+
+        // Owner axis: both signatures mint, verify, and survive the link.
+        let mut invite = v4_fixture(&inviter_kp, Some(&owner_kp));
+        invite
+            .sign_v4(&inviter_kp, Some(&owner_kp))
+            .expect("sign owner-axis invite");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+        let restored =
+            SignedInvite::from_link(&invite.encode_link().expect("link fits")).expect("parse");
+        assert_eq!(restored.inviter_signature_b64, invite.inviter_signature_b64);
+        assert_eq!(
+            restored.owner_countersignature_b64,
+            invite.owner_countersignature_b64
+        );
+        assert_eq!(restored.verify_v4_signatures(), Ok(()));
+
+        // Tampering any signed field yields its typed refusal.
+        let mut t = invite.clone();
+        t.group_name.push('!');
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::Malformed),
+            "renamed group breaks the meta equality rule first"
+        );
+        let mut t = invite.clone();
+        t.policy.as_mut().expect("policy").confidentiality = GroupConfidentiality::SignedPublic;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "policy rides the signed view"
+        );
+        let mut t = invite.clone();
+        let mut roster = t.base_roster.clone().expect("roster");
+        let first = roster.keys().next().cloned().expect("roster entry");
+        roster.get_mut(&first).expect("entry").role = GroupRole::Member;
+        t.base_roster = Some(roster);
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "roster entries ride the signed view"
+        );
+        let mut t = invite.clone();
+        t.public_meta
+            .as_mut()
+            .expect("meta")
+            .tags
+            .push("tampered".to_string());
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "public-meta tags ride the signed view"
+        );
+        let mut t = invite.clone();
+        t.invite_secret = format!("{}ac", "ab".repeat(31));
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "one secret hex char flips the signed secret hash"
+        );
+        let mut t = invite.clone();
+        t.expires_at += 1;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "expiry rides the signed view"
+        );
+
+        // r1 Option-preserving fields (Codex 8): Some(value) → None flips
+        // the signed bytes. A dropped description ALSO trips the equality
+        // rule (None ≡ "" there) and refuses as Malformed — still caught.
+        let mut t = invite.clone();
+        t.group_description = None;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::Malformed),
+            "dropping a present description breaks the equality rule"
+        );
+        type InviteMutator<'a> = (&'a str, &'a dyn Fn(&mut SignedInvite));
+        let flip_to_none: [InviteMutator; 3] = [
+            ("genesis_creation_nonce", &|t: &mut SignedInvite| {
+                t.genesis_creation_nonce = None;
+            }),
+            ("base_prev_state_hash", &|t: &mut SignedInvite| {
+                t.base_prev_state_hash = None;
+            }),
+            ("base_security_binding", &|t: &mut SignedInvite| {
+                t.base_security_binding = None;
+            }),
+        ];
+        for (label, mutate) in flip_to_none {
+            let mut t = invite.clone();
+            mutate(&mut t);
+            assert_eq!(
+                t.verify_v4_signatures(),
+                Err(InviteRefusal::InviterSignatureInvalid),
+                "{label}: Some(..) → None must change the signed bytes"
+            );
+        }
+        // The other direction on a genesis-shape fixture (all four Option
+        // fields None, empty description): None → Some("") is a DISTINCT
+        // signed state on every one of them.
+        let mut genesis = v4_fixture(&inviter_kp, None);
+        genesis.group_description = None;
+        genesis.genesis_creation_nonce = None;
+        genesis.base_prev_state_hash = None;
+        genesis.base_security_binding = None;
+        genesis.public_meta.as_mut().expect("meta").description = String::new();
+        genesis
+            .sign_v4(&inviter_kp, None)
+            .expect("sign genesis-shape invite");
+        assert_eq!(genesis.verify_v4_signatures(), Ok(()));
+        let flip_to_some_empty: [InviteMutator; 4] = [
+            ("group_description", &|t: &mut SignedInvite| {
+                t.group_description = Some(String::new());
+            }),
+            ("genesis_creation_nonce", &|t: &mut SignedInvite| {
+                t.genesis_creation_nonce = Some(String::new());
+            }),
+            ("base_prev_state_hash", &|t: &mut SignedInvite| {
+                t.base_prev_state_hash = Some(String::new());
+            }),
+            ("base_security_binding", &|t: &mut SignedInvite| {
+                t.base_security_binding = Some(String::new());
+            }),
+        ];
+        for (label, mutate) in flip_to_some_empty {
+            let mut t = genesis.clone();
+            mutate(&mut t);
+            assert_eq!(
+                t.verify_v4_signatures(),
+                Err(InviteRefusal::InviterSignatureInvalid),
+                "{label}: None → Some(\"\") must change the signed bytes"
+            );
+        }
+
+        // Key swaps. Swapped inviter key: id binding fails first.
+        let stranger_kp = AgentKeypair::generate().expect("stranger agent keypair");
+        let mut t = invite.clone();
+        t.inviter_public_key_b64 = B64_STD.encode(stranger_kp.public_key().as_bytes());
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterKeyMismatch)
+        );
+        // Swapped inline owner key: the key rides the SIGNED view, so the
+        // inviter signature catches the swap before the owner checks run.
+        let stranger_user = UserKeypair::generate().expect("stranger user keypair");
+        let mut t = invite.clone();
+        t.owner_public_key_b64 = Some(B64_STD.encode(stranger_user.public_key().as_bytes()));
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::InviterSignatureInvalid),
+            "the inline owner key rides the signed view"
+        );
+        // Right owner key, but the countersignature is by the WRONG user
+        // key over the same canonical bytes (binding passes, sig fails).
+        let mut t = invite.clone();
+        let canonical = InviteSignedViewV4::from_invite(&t)
+            .expect("view")
+            .canonical_bytes()
+            .expect("canonical bytes");
+        let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+        owner_input.extend_from_slice(&canonical);
+        let forged = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            stranger_user.secret_key(),
+            &owner_input,
+        )
+        .expect("forge countersignature");
+        t.owner_countersignature_b64 = Some(B64_STD.encode(forged.as_bytes()));
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::OwnerCountersignatureInvalid)
+        );
+        // Swapped owner key that IS covered by a fresh inviter signature,
+        // plus a matching stranger countersignature: the inviter signature
+        // now verifies and the owner UserId binding is what fails.
+        let mut t = invite.clone();
+        t.owner_public_key_b64 = Some(B64_STD.encode(stranger_user.public_key().as_bytes()));
+        t.owner_countersignature_b64 = None;
+        t.sign_v4(&inviter_kp, None)
+            .expect("re-sign over the swapped owner key");
+        let swapped_canonical = InviteSignedViewV4::from_invite(&t)
+            .expect("view")
+            .canonical_bytes()
+            .expect("canonical bytes");
+        let mut swapped_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+        swapped_input.extend_from_slice(&swapped_canonical);
+        let swapped_forged = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            stranger_user.secret_key(),
+            &swapped_input,
+        )
+        .expect("forge swapped-owner countersignature");
+        t.owner_countersignature_b64 = Some(B64_STD.encode(swapped_forged.as_bytes()));
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::OwnerCountersignatureInvalid),
+            "a stranger owner key fails the UserId binding even when signed"
+        );
+        // Stripped countersignature on an owner-axis invite.
+        let mut t = invite.clone();
+        t.owner_countersignature_b64 = None;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::OwnerCountersignatureMissing)
+        );
+
+        // Non-owner axis: no countersignature required or present.
+        let mut plain = v4_fixture(&inviter_kp, None);
+        plain
+            .sign_v4(&inviter_kp, None)
+            .expect("sign invite-only invite");
+        assert!(plain.owner_countersignature_b64.is_none());
+        assert_eq!(plain.verify_v4_signatures(), Ok(()));
+    }
+
+    #[test]
+    fn v4_equality_rules_and_non_default_meta_roundtrip() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let home = HomeMetadata {
+            primary_agent: "12".repeat(32),
+            placements: BTreeMap::new(),
+            provisioned_at_ms: 1_699_000_000_000,
+        };
+
+        // Name mismatch between the top-level field and the meta snapshot.
+        let mut t = v4_fixture(&inviter_kp, None);
+        t.group_name = "different".to_string();
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+        // Description mismatch.
+        let mut t = v4_fixture(&inviter_kp, None);
+        t.group_description = Some("different".to_string());
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+        // Home preimage present but digest mismatched.
+        let mut t = v4_fixture(&inviter_kp, None);
+        t.base_home = Some(home.clone());
+        t.public_meta.as_mut().expect("meta").home_digest = Some("00".repeat(32));
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+        // Digest claimed with no preimage.
+        let mut t = v4_fixture(&inviter_kp, None);
+        t.public_meta.as_mut().expect("meta").home_digest = Some(compute_home_digest(&home));
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&t),
+            Err(InviteRefusal::Malformed)
+        );
+
+        // Non-default metadata (tags, avatar, banner, Home preimage +
+        // matching digest) signs, verifies, and round-trips exactly.
+        let meta = GroupPublicMeta {
+            name: "fixture group".to_string(),
+            description: "fixture description".to_string(),
+            tags: vec!["one".to_string(), "two".to_string()],
+            avatar_url: Some("https://example.com/avatar.png".to_string()),
+            banner_url: Some("https://example.com/banner.png".to_string()),
+            home_digest: Some(compute_home_digest(&home)),
+        };
+        let mut invite = v4_fixture(&inviter_kp, None);
+        invite.public_meta = Some(meta.clone());
+        invite.base_home = Some(home);
+        invite
+            .sign_v4(&inviter_kp, None)
+            .expect("sign non-default meta");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+        let restored =
+            SignedInvite::from_link(&invite.encode_link().expect("link fits")).expect("parse");
+        assert_eq!(restored.public_meta, Some(meta));
+        assert_eq!(restored.verify_v4_signatures(), Ok(()));
+    }
+
+    #[test]
+    fn v4_field_caps_matrix() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        // Boundary: every capped field AT its cap — and the invite is
+        // fully mintable (structural rules hold, signs and verifies).
+        let mut boundary = SignedInvite::new(
+            "cd".repeat(32),
+            "n".repeat(INVITE_MAX_GROUP_NAME),
+            &AgentId::from_public_key(inviter_kp.public_key()),
+            0,
+        );
+        boundary.stable_group_id = Some("cd".repeat(32));
+        boundary.group_created_at = Some(1);
+        boundary.group_description = Some("d".repeat(INVITE_MAX_GROUP_DESCRIPTION));
+        boundary.invite_secret = "ab".repeat(32);
+        boundary.policy = Some(GroupPolicy::default());
+        boundary.base_state_revision = Some(1);
+        boundary.base_state_hash = Some("aa".repeat(32));
+        boundary.base_secret_epoch = Some(1);
+        boundary.public_meta = Some(GroupPublicMeta {
+            name: "n".repeat(INVITE_MAX_GROUP_NAME),
+            description: "d".repeat(INVITE_MAX_GROUP_DESCRIPTION),
+            tags: vec!["t".repeat(INVITE_MAX_TAG_LEN); INVITE_MAX_TAGS],
+            avatar_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
+            banner_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
+            home_digest: None,
+        });
+        boundary.base_roster = Some(
+            (0..MAX_INVITE_ROSTER_ENTRIES)
+                .map(|i| {
+                    (
+                        format!("{i:064x}"),
+                        RosterMemberSnapshot {
+                            role: GroupRole::Admin,
+                            state: GroupMemberState::Active,
+                            treekem_key_package_hash: Some("0f".repeat(32)),
+                            certificate_digest: Some("5a".repeat(32)),
+                        },
+                    )
+                })
+                .collect(),
+        );
+        boundary.creator = Some("12".repeat(32));
+        assert_eq!(boundary.v4_field_caps_violation(), None);
+        boundary
+            .sign_v4(&inviter_kp, None)
+            .expect("sign at the caps boundary");
+        assert_eq!(boundary.verify_v4_signatures(), Ok(()));
+
+        // Each cap exceeded in isolation reports (field, measured size).
+        let over = |mutate: &dyn Fn(&mut SignedInvite)| -> (&'static str, usize) {
+            let mut t = boundary.clone();
+            mutate(&mut t);
+            t.v4_field_caps_violation()
+                .unwrap_or_else(|| panic!("expected a caps violation"))
+        };
+        assert_eq!(
+            over(&|t| {
+                t.group_name = "n".repeat(INVITE_MAX_GROUP_NAME + 1);
+            }),
+            ("group_name", INVITE_MAX_GROUP_NAME + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.group_description = Some("d".repeat(INVITE_MAX_GROUP_DESCRIPTION + 1));
+            }),
+            ("group_description", INVITE_MAX_GROUP_DESCRIPTION + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.public_meta.as_mut().expect("meta").name = "n".repeat(INVITE_MAX_GROUP_NAME + 1);
+            }),
+            ("public_meta.name", INVITE_MAX_GROUP_NAME + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.public_meta.as_mut().expect("meta").description =
+                    "d".repeat(INVITE_MAX_GROUP_DESCRIPTION + 1);
+            }),
+            ("public_meta.description", INVITE_MAX_GROUP_DESCRIPTION + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.public_meta.as_mut().expect("meta").tags =
+                    vec!["t".repeat(INVITE_MAX_TAG_LEN); INVITE_MAX_TAGS + 1];
+            }),
+            ("public_meta.tags", INVITE_MAX_TAGS + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                let mut tags = vec!["t".repeat(INVITE_MAX_TAG_LEN); INVITE_MAX_TAGS];
+                tags[0] = "t".repeat(INVITE_MAX_TAG_LEN + 1);
+                t.public_meta.as_mut().expect("meta").tags = tags;
+            }),
+            ("public_meta.tag_len", INVITE_MAX_TAG_LEN + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.public_meta.as_mut().expect("meta").avatar_url =
+                    Some("u".repeat(INVITE_MAX_URL_LEN + 1));
+            }),
+            ("public_meta.avatar_url", INVITE_MAX_URL_LEN + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                t.public_meta.as_mut().expect("meta").banner_url =
+                    Some("u".repeat(INVITE_MAX_URL_LEN + 1));
+            }),
+            ("public_meta.banner_url", INVITE_MAX_URL_LEN + 1)
+        );
+        assert_eq!(
+            over(&|t| {
+                let mut roster = t.base_roster.clone().expect("roster");
+                roster.insert(
+                    "ff".repeat(32),
+                    RosterMemberSnapshot {
+                        role: GroupRole::Admin,
+                        state: GroupMemberState::Active,
+                        treekem_key_package_hash: None,
+                        certificate_digest: None,
+                    },
+                );
+                t.base_roster = Some(roster);
+            }),
+            ("base_roster", MAX_INVITE_ROSTER_ENTRIES + 1)
+        );
+    }
+
+    /// v7 F4: `MAX_INVITE_ROSTER_ENTRIES` is DERIVED, not chosen. The
+    /// worst-case mintable fixture below puts every capped string at its
+    /// cap, carries both inline ML-DSA-65 keys (1 952 B → 2 604 base64
+    /// chars) and both signatures (3 309 B → 4 412 base64 chars), and N
+    /// projection entries with max-length ids/hashes and the longest role
+    /// and state wire strings — measured through the FINAL encoder
+    /// (`to_link`). The largest N fitting the 40 960-byte link budget is
+    /// the derived maximum; raising the constant above it fails here.
+    #[test]
+    fn f4_worst_case_link_budget_pins_roster_cap() {
+        fn worst_case(n: usize) -> SignedInvite {
+            let hex64 = || "ab".repeat(32);
+            let mut invite = SignedInvite::new(
+                "cd".repeat(32),
+                "n".repeat(INVITE_MAX_GROUP_NAME),
+                &agent(1),
+                0,
+            );
+            invite.stable_group_id = Some("cd".repeat(32));
+            invite.group_created_at = Some(u64::MAX);
+            invite.group_description = Some("d".repeat(INVITE_MAX_GROUP_DESCRIPTION));
+            invite.invite_secret = hex64();
+            invite.created_at = u64::MAX;
+            invite.expires_at = u64::MAX;
+            invite.policy = Some(GroupPolicy {
+                admission: GroupAdmission::OwnerCertified(UserId([0x5A; 32])),
+                ..GroupPolicy::default()
+            });
+            invite.genesis_creation_nonce = Some(hex64());
+            invite.base_state_revision = Some(u64::MAX);
+            invite.base_state_hash = Some(hex64());
+            invite.base_prev_state_hash = Some(hex64());
+            let home = HomeMetadata {
+                primary_agent: hex64(),
+                placements: BTreeMap::new(),
+                provisioned_at_ms: u64::MAX,
+            };
+            invite.base_home = Some(home.clone());
+            invite.secure_plane = Some(SecureGroupPlane::TreeKem);
+            invite.base_secret_epoch = Some(u64::MAX);
+            invite.base_security_binding = Some(hex64());
+            invite.public_meta = Some(GroupPublicMeta {
+                name: "n".repeat(INVITE_MAX_GROUP_NAME),
+                description: "d".repeat(INVITE_MAX_GROUP_DESCRIPTION),
+                tags: vec!["t".repeat(INVITE_MAX_TAG_LEN); INVITE_MAX_TAGS],
+                avatar_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
+                banner_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
+                home_digest: Some(compute_home_digest(&home)),
+            });
+            invite.base_roster = Some(
+                (0..n)
+                    .map(|i| {
+                        (
+                            format!("{i:064x}"),
+                            RosterMemberSnapshot {
+                                role: GroupRole::Moderator,
+                                state: GroupMemberState::Pending,
+                                treekem_key_package_hash: Some(hex64()),
+                                certificate_digest: Some(hex64()),
+                            },
+                        )
+                    })
+                    .collect(),
+            );
+            invite.creator = Some(hex64());
+            invite.intended_joiner = Some(hex64());
+            invite.inviter = hex64();
+            invite.inviter_public_key_b64 = B64_STD.encode([0u8; 1952]);
+            invite.owner_public_key_b64 = Some(B64_STD.encode([0u8; 1952]));
+            invite.inviter_signature_b64 = B64_STD.encode([0u8; 3309]);
+            invite.owner_countersignature_b64 = Some(B64_STD.encode([0u8; 3309]));
+            invite
+        }
+
+        // The fixture is a MINTABLE worst case at the constant: structural
+        // rules hold, no D5 cap fires, and the final encoder accepts it.
+        let at_cap = worst_case(MAX_INVITE_ROSTER_ENTRIES);
+        assert!(InviteSignedViewV4::from_invite(&at_cap).is_ok());
+        assert_eq!(at_cap.v4_field_caps_violation(), None);
+        let cap_link = at_cap
+            .encode_link()
+            .expect("worst case at the roster cap fits the budget");
+        assert!(cap_link.len() <= INVITE_LINK_MAX_BYTES);
+
+        // Derive the largest N whose worst-case link fits (link length is
+        // monotonic in N, so stop at the first overflow).
+        let mut derived_max = 0usize;
+        for n in 1..=1024usize {
+            if worst_case(n).to_link().len() <= INVITE_LINK_MAX_BYTES {
+                derived_max = n;
+            } else {
+                break;
+            }
+        }
+        assert!(
+            MAX_INVITE_ROSTER_ENTRIES <= derived_max,
+            "MAX_INVITE_ROSTER_ENTRIES ({MAX_INVITE_ROSTER_ENTRIES}) exceeds the \
+             worst-case derived maximum ({derived_max})"
+        );
+        // The final encoder refuses the first over-budget N.
+        let over_budget = worst_case(derived_max + 1);
+        let err = over_budget
+            .encode_link()
+            .expect_err("first over-budget N must be refused");
+        assert_eq!(err.limit, INVITE_LINK_MAX_BYTES);
+        assert_eq!(err.actual, over_budget.to_link().len());
+        assert!(err.actual > INVITE_LINK_MAX_BYTES);
     }
 }

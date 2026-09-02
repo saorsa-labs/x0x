@@ -88,6 +88,18 @@ pub struct RequestField {
 }
 
 impl RequestField {
+    /// Body field whose CLI surface is DERIVED (synthesized from flag
+    /// pairs, not a 1:1 name/value mapping) — the generic parity shape
+    /// check skips it; a targeted exact-wire test owns the contract.
+    pub const fn derived_body(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required: false,
+            cli: CliExpose::Derived,
+        }
+    }
+
     /// Body field using the default CLI naming convention.
     pub const fn body(name: &'static str, required: bool) -> Self {
         Self {
@@ -1181,8 +1193,12 @@ pub const ENDPOINTS: &[EndpointDef] = &[
             // #468/#469: `--home` serializes as the literal "home" mode
             // value; `--owner <HEX>` is the expected owner user id pin.
             // Both are only sent together (clap `requires` both ways).
-            RequestField::body_as("mode", false, "--home"),
-            RequestField::body_as("expected_owner_user_id", false, "--owner"),
+            // #469 A3: mode/owner pin are Derived — `--home` is a bool
+            // flag pair whose VALUES the CLI synthesizes ("home" mode +
+            // the --owner token), so the generic shape check skips them;
+            // tests/cli_group_join_wire.rs pins the exact wire instead.
+            RequestField::derived_body("mode"),
+            RequestField::derived_body("expected_owner_user_id"),
         ]),
     },
     EndpointDef {
