@@ -73,7 +73,9 @@ fn now_millis() -> u64 {
 
 /// Locally-issued invite record used to authenticate joiner-authored
 /// `MemberJoined` requests at the original inviter.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// #470: full equality (consumption state included) so `GroupInfo`'s
+/// derived `PartialEq` covers `issued_invites` completely.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IssuedInviteRecord {
     /// Unix seconds when the invite was minted.
     #[serde(default)]
@@ -136,7 +138,15 @@ pub struct HomeMetadata {
 /// are deserialised (`#[serde(default)]`) but never written back
 /// (`skip_serializing`). Call [`GroupInfo::migrate_from_v1`] at load time to
 /// fold any v1 data into v2.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// #470: FULL record equality — derived over EVERY field, including the
+/// `#[serde(skip)]`/local-only ones (`owner_cert_reverify_required`,
+/// `issued_invite_secrets`, `issued_invites`, Home metadata, commit log).
+/// The compare-and-restore rollback in
+/// `persist_named_groups_mutation_unlocked` uses this to decide whether a
+/// concurrent writer touched a key; any subset equality would call a
+/// concurrently changed record "unchanged" and clobber it (the original
+/// #470 failure).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GroupInfo {
     // ── v1 compat (read-only) ───────────────────────────────────────────
     #[serde(default, skip_serializing)]
