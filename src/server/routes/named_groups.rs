@@ -40480,19 +40480,21 @@ mod cas_rollback_470 {
                     );
                 }
                 YVariant::InviteConsumed => {
-                    let record = y.issued_invites.entry("invite-secret-0".to_string());
-                    record
-                        .and_modify(|r| {
-                            r.consumed_by = Some(Y_MEMBER.to_string());
-                            r.consumed_at_ms = Some(2_222);
-                        })
-                        .or_insert(x0x::groups::IssuedInviteRecord {
-                            created_at_secs: 1,
-                            expires_at_secs: 9_999,
-                            max_role: x0x::groups::GroupRole::Member,
-                            consumed_by: Some(Y_MEMBER.to_string()),
-                            consumed_at_ms: Some(2_222),
-                        });
+                    // Review r2: mutate the EXISTING unconsumed record
+                    // seeded on Y — no or_insert fallback, so a missing
+                    // seed fails loudly instead of manufacturing an
+                    // already-consumed record that equality-ignoring
+                    // consumption fields could not distinguish.
+                    let record = y
+                        .issued_invites
+                        .get_mut("invite-secret-0")
+                        .expect("unconsumed invite pre-seeded on Y");
+                    assert!(
+                        record.consumed_by.is_none() && record.consumed_at_ms.is_none(),
+                        "seeded record must start unconsumed"
+                    );
+                    record.consumed_by = Some(Y_MEMBER.to_string());
+                    record.consumed_at_ms = Some(2_222);
                 }
                 YVariant::JoinRequest => {
                     y.join_requests.insert(
@@ -40538,9 +40540,13 @@ mod cas_rollback_470 {
         let (state, dir) = secure_endpoint_test_state().await.expect("test state");
         {
             let mut groups = state.named_groups.write().await;
-            let mut x = plain_group(0x11, X_ID, "x-original");
-            // Pre-seed an unconsumed invite for the consumption variant.
-            x.issued_invites.insert(
+            let x = plain_group(0x11, X_ID, "x-original");
+            let mut y = plain_group(0x22, Y_ID, "y-original");
+            // Review r2: pre-seed the UNCONSUMED invite on Y (not X) —
+            // the consumption variant must mutate THIS existing record so
+            // the test fails if record equality ignores the consumption
+            // fields (seeding elsewhere let or_insert paper over it).
+            y.issued_invites.insert(
                 "invite-secret-0".to_string(),
                 x0x::groups::IssuedInviteRecord {
                     created_at_secs: 1,
@@ -40550,7 +40556,6 @@ mod cas_rollback_470 {
                     consumed_at_ms: None,
                 },
             );
-            let mut y = plain_group(0x22, Y_ID, "y-original");
             y.home = Some(x0x::groups::HomeMetadata {
                 primary_agent: Y_MEMBER.to_string(),
                 placements: std::collections::BTreeMap::new(),
@@ -40792,8 +40797,6 @@ mod cas_rollback_470 {
     #[tokio::test]
     async fn noop_mutation_rewrites_nothing() {
         let case = seeded_state().await;
-        let map_before: HashMap<String, x0x::groups::GroupInfo> =
-            case.state.named_groups.read().await.clone();
         let reached = Arc::new(tokio::sync::Notify::new());
         let release = Arc::new(tokio::sync::Notify::new());
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
@@ -40811,12 +40814,51 @@ mod cas_rollback_470 {
         *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
             .lock()
             .expect("hook lock") = None;
+        // Review r2: rewrite-sensitivity — value equality alone would also
+        // pass under the OLD whole-map restore (it restores equal values),
+        // so a concurrent writer changes Y DURING the no-op transaction.
+        // The old restore would clobber it back to the pre-transaction
+        // snapshot; the CAS rollback must leave it untouched.
+        YVariant::CertMissingSince.apply(&case.state).await;
         release.notify_one();
         let outcome = join.await.expect("task").expect("Ok");
         assert_eq!(outcome, AtomicWriteOutcome::NotReplaced);
-        let map_after: HashMap<String, x0x::groups::GroupInfo> =
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert_eq!(
+            y_now.members_v2[Y_MEMBER].certificate_missing_since_ms,
+            Some(1_234_567),
+            "concurrent change made during a NO-OP transaction survives — \
+             the old whole-map restore would have clobbered it"
+        );
+        // Everything else is exactly the pre-transaction value.
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        let mut map_after: HashMap<String, x0x::groups::GroupInfo> =
             case.state.named_groups.read().await.clone();
-        assert_eq!(map_before, map_after, "no-op mutation rewrites nothing");
+        let mut y_expected = case.y_before.clone();
+        y_expected
+            .members_v2
+            .get_mut(Y_MEMBER)
+            .expect("Y member")
+            .certificate_missing_since_ms = Some(1_234_567);
+        map_after.insert(Y_ID.to_string(), y_expected);
+        assert_eq!(
+            map_after,
+            {
+                let mut expected: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+                expected.insert(X_ID.to_string(), case.x_before.expect("X seeded"));
+                expected.insert(Y_ID.to_string(), {
+                    let mut y = case.y_before.clone();
+                    y.members_v2
+                        .get_mut(Y_MEMBER)
+                        .expect("Y member")
+                        .certificate_missing_since_ms = Some(1_234_567);
+                    y
+                });
+                expected
+            },
+            "no-op mutation rewrites nothing — the map equals the seed plus \
+             exactly the concurrent Y change"
+        );
     }
 
     /// The #471 residual, pinned as a test: the ordinary save writes the
