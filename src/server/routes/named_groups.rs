@@ -3326,12 +3326,25 @@ where
     persist_named_groups_mutation_unlocked(state, mutate).await
 }
 
-/// #457 r10 item 10.1 — the SAME semantics as the locked variant (map
-/// snapshot + restore on failure, the durability-confirmation flag)
+/// #457 r10 item 10.1 — the SAME semantics as the locked variant (the
+/// durability-confirmation flag, snapshot-and-restore failure semantics)
 /// callable while `named_groups_persistence_lock` is ALREADY held (the
 /// local delete path runs the journal removals and the absence persist
 /// under one guard; calling the locking wrapper there self-deadlocks —
 /// r9 item 9.1).
+///
+/// #470 compare-and-restore: on `NotReplaced`/`Err` the rollback is
+/// per-key CAS, NOT a whole-map snapshot restore. Some map writers do not
+/// take `named_groups_persistence_lock` (owner-cert verdict evaluation,
+/// invite bookkeeping), so the map may change under us between `mutate`
+/// and the restore — a whole-map restore clobbers those concurrent
+/// cross-group writes. The rule: a key is rolled back to its pre-mutation
+/// record ONLY if the live map still holds EXACTLY the post-mutation
+/// record (`current == after`, full `PartialEq` equality including every
+/// `#[serde(skip)]`/local-only field); a key someone else changed keeps
+/// the concurrent value, and keys the mutation never touched are never
+/// rewritten. `ReplacedNotDurable` does NOT roll back: the replacement is
+/// visible on disk, so memory stays aligned with it (r2 Watson ruling).
 pub(in crate::server) async fn persist_named_groups_mutation_unlocked<F>(
     state: &AppState,
     mutate: F,
@@ -3350,22 +3363,19 @@ where
             outcome => return outcome,
         }
     }
-    let snapshot = {
+    let (before, after) = {
         let mut groups = state.named_groups.write().await;
-        let snapshot = groups.clone();
+        let before = groups.clone();
         if !mutate(&mut groups) {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
-        snapshot
+        let after = groups.clone();
+        (before, after)
     };
 
     let outcome = save_named_groups_checked_unlocked(state).await;
     if matches!(&outcome, Ok(AtomicWriteOutcome::NotReplaced) | Err(_)) {
-        // NOTE(#470): restoring the WHOLE map can clobber a concurrent
-        // cross-group write made outside the persistence mutex — a
-        // PRE-EXISTING race identical to the old locked body; tracked in
-        // issue #470, deliberately not fixed in this PR.
-        *state.named_groups.write().await = snapshot;
+        compare_and_restore_named_groups(state, &before, &after).await;
     }
     match &outcome {
         Ok(AtomicWriteOutcome::Durable) => state
@@ -3377,6 +3387,104 @@ where
         Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {}
     }
     outcome
+}
+
+/// #470 compare-and-restore rollback (see
+/// [`persist_named_groups_mutation_unlocked`]): for every key the failed
+/// transaction touched (`before.get(k) != after.get(k)`), roll the live map
+/// back to the pre-mutation record ONLY when nobody changed that key since
+/// our write (`current.get(k) == after.get(k)` — complete `GroupInfo`
+/// equality). Keys with concurrent changes keep them; untouched keys are
+/// never rewritten.
+async fn compare_and_restore_named_groups(
+    state: &AppState,
+    before: &HashMap<String, x0x::groups::GroupInfo>,
+    after: &HashMap<String, x0x::groups::GroupInfo>,
+) {
+    let mut groups = state.named_groups.write().await;
+    let mut touched: Vec<&String> = before
+        .keys()
+        .chain(after.keys())
+        .filter(|k| before.get(*k) != after.get(*k))
+        .collect();
+    touched.sort_unstable();
+    touched.dedup();
+    for key in touched {
+        let after_record = after.get(key);
+        // CAS precondition: the live record is still exactly what this
+        // transaction wrote (or, for deletions, still absent).
+        let still_ours = groups.get(key) == after_record;
+        if !still_ours {
+            tracing::debug!(
+                group_id = %key,
+                "#470 CAS rollback skipped: concurrent writer changed the key"
+            );
+            continue;
+        }
+        match before.get(key) {
+            Some(previous) => {
+                groups.insert(key.clone(), previous.clone());
+            }
+            None => {
+                groups.remove(key);
+            }
+        }
+    }
+}
+
+/// #470 test fault cell for the roster save itself (same idiom as
+/// [`DeleteFault`]): forces `save_named_groups_checked_unlocked` to return
+/// a chosen outcome so the compare-and-restore rollback matrix can be
+/// exercised through the PRODUCTION persist path. The check is compiled
+/// into production code but constant-false there (`cfg!(test)`); only the
+/// setter is test-gated, and the RAII guard clears the cell on drop so a
+/// failing test cannot leak it.
+#[cfg_attr(not(test), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub(in crate::server) enum SaveFault {
+    /// `Ok(AtomicWriteOutcome::NotReplaced)` — nothing reached disk.
+    NotReplaced = 1,
+    /// `Err` — the save itself failed.
+    Error = 2,
+    /// `Ok(AtomicWriteOutcome::ReplacedNotDurable)` — replacement visible,
+    /// parent-dir fsync failed (rollback must NOT run).
+    ReplacedNotDurable = 3,
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+static SAVE_FAULT_INJECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+#[cfg_attr(not(test), allow(dead_code))]
+fn save_fault_short_circuit() -> Option<AtomicWriteOutcome> {
+    if !cfg!(test) {
+        return None;
+    }
+    match SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) {
+        1 => Some(AtomicWriteOutcome::NotReplaced),
+        3 => Some(AtomicWriteOutcome::ReplacedNotDurable),
+        _ => None,
+    }
+}
+
+#[cfg_attr(not(test), allow(dead_code))]
+fn save_fault_legacy_write_fails() -> bool {
+    cfg!(test) && SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) == 2
+}
+
+/// #470 — RAII fault guard (see [`DeleteFaultGuard`]).
+#[cfg(test)]
+pub(in crate::server) struct SaveFaultGuard;
+#[cfg(test)]
+impl Drop for SaveFaultGuard {
+    fn drop(&mut self) {
+        SAVE_FAULT_INJECT.store(0, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[cfg(test)]
+pub(in crate::server) fn set_save_fault(fault: SaveFault) -> SaveFaultGuard {
+    SAVE_FAULT_INJECT.store(fault as u8, std::sync::atomic::Ordering::SeqCst);
+    SaveFaultGuard
 }
 
 /// Re-establish directory durability for a previously visible roster
@@ -24548,11 +24656,18 @@ fn encode_named_groups_store_excluding_pending_stubs(
 pub(in crate::server) async fn save_named_groups_checked_unlocked(
     state: &AppState,
 ) -> std::io::Result<AtomicWriteOutcome> {
+    // (#470 fault cells are checked after the deterministic-interleave
+    // hook below so tests can race a concurrent writer between the
+    // mutation and the rollback for EVERY fault variant.)
     // Issue #451: encode both durable views up front. The sidecar (the
     // authoritative Home-Suite record) is written FIRST; the legacy-safe
     // named_groups.json replacement follows only on sidecar success, so a
     // crash between the writes can never leave a named-groups view whose
-    // Home-Suite entry has no authoritative backing.
+    // Home-Suite entry has no authoritative backing. NOTE(#471): this
+    // ordinary-save two-file split is NOT transactional on FAILURE (sidecar
+    // new / named old survives a failed second write); tracked in #471,
+    // deliberately out of scope for the #470 CAS rollback — the CAS path
+    // makes no cross-file atomicity claim.
     let (legacy_json, home_suite_json) = {
         let groups = state.named_groups.read().await;
         encode_named_groups_store_excluding_pending_stubs(state, &groups, None)?
@@ -24568,6 +24683,13 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             release.notified().await;
         }
     }
+    // #470 test fault cell: force a chosen save outcome through the
+    // production path (constant-false outside test builds). Checked after
+    // the hook above so every fault variant shares the deterministic
+    // interleave point; before any durable write.
+    if let Some(outcome) = save_fault_short_circuit() {
+        return Ok(outcome);
+    }
     // A non-empty sidecar body must reach disk before the roster view
     // changes; an empty body only needs writing when a sidecar already
     // exists (a Home-Suite group was removed and the stale sidecar must
@@ -24580,6 +24702,14 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
         if sidecar_outcome == AtomicWriteOutcome::NotReplaced {
             return Ok(AtomicWriteOutcome::NotReplaced);
         }
+    }
+    // #470/#471 fault shape: the sidecar above has already been written;
+    // failing HERE reproduces the documented #471 split outcome
+    // (sidecar new / named old) through the production path.
+    if save_fault_legacy_write_fails() {
+        return Err(std::io::Error::other(
+            "injected legacy roster write failure (#470/#471 test)",
+        ));
     }
     let outcome = write_named_groups_json_atomic(&state.named_groups_path, &legacy_json)
         .await
@@ -40809,5 +40939,541 @@ mod hs451_downgrade_safety {
             .await
             .expect("reread2");
         assert_eq!(before, after, "an already-split store is not rewritten");
+    }
+}
+
+/// #470 compare-and-restore regression matrix: a failed roster save must
+/// roll back ONLY the keys this transaction touched, and only when no
+/// concurrent writer (one that does not hold the persistence lock) changed
+/// them since. Every case drives the PRODUCTION `persist_named_groups_
+/// mutation` path; the save outcome is forced by the `SaveFault` cell and
+/// the concurrent writer is interleaved deterministically through the
+/// save-race notify hook (it parks the save between the mutation and the
+/// rollback).
+#[cfg(test)]
+mod cas_rollback_470 {
+    use super::tests::secure_endpoint_test_state;
+    use super::{
+        persist_named_groups_mutation, save_named_groups, set_save_fault, AtomicWriteOutcome,
+        SaveFault, NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY,
+    };
+    use crate as x0x;
+    use crate::server::AppState;
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    const X_ID: &str = "aa4178787878787878787878787878787878";
+    const Y_ID: &str = "bb4278787878787878787878787878787878";
+    const Y_MEMBER: &str = "227878787878787878787878787878787878";
+
+    fn plain_group(seed: u8, id: &str, name: &str) -> x0x::groups::GroupInfo {
+        let mut info = x0x::groups::GroupInfo::new(
+            name.to_string(),
+            String::new(),
+            x0x::identity::AgentId([seed; 32]),
+            id.to_string(),
+        );
+        info.members_v2.insert(
+            Y_MEMBER.to_string(),
+            x0x::groups::GroupMember::new_admin(Y_MEMBER.to_string(), None, 1),
+        );
+        info
+    }
+
+    fn home_suite_group(seed: u8, id: &str) -> x0x::groups::GroupInfo {
+        let owner = x0x::identity::UserKeypair::from_seed(&[seed; 32])
+            .expect("owner seed")
+            .user_id();
+        let policy = x0x::groups::GroupPolicy {
+            admission: x0x::groups::GroupAdmission::OwnerCertified(owner),
+            ..x0x::groups::GroupPolicy::default()
+        };
+        let mut info = plain_group(seed, id, "home-x");
+        info.policy = policy;
+        info.home = Some(x0x::groups::HomeMetadata {
+            primary_agent: Y_MEMBER.to_string(),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1,
+        });
+        info
+    }
+
+    #[derive(Clone, Copy)]
+    enum XOp {
+        Insert,
+        Update,
+        Delete,
+    }
+
+    impl XOp {
+        fn apply(&self, groups: &mut HashMap<String, x0x::groups::GroupInfo>) {
+            match self {
+                XOp::Insert => {
+                    groups.insert(X_ID.to_string(), plain_group(0x58, X_ID, "x-inserted"));
+                }
+                XOp::Update => {
+                    if let Some(info) = groups.get_mut(X_ID) {
+                        info.name = "x-renamed-by-mutation".to_string();
+                    }
+                }
+                XOp::Delete => {
+                    groups.remove(X_ID);
+                }
+            }
+        }
+    }
+
+    #[derive(Clone, Copy)]
+    enum YVariant {
+        /// Only `certificate_missing_since_ms` changes — the field the
+        /// tuple-equality shortcut would miss (binding review point 1).
+        CertMissingSince,
+        InviteIssued,
+        InviteConsumed,
+        JoinRequest,
+        HomeMetadata,
+    }
+
+    impl YVariant {
+        /// The concurrent writer: mutates Y DIRECTLY through the shared map,
+        /// deliberately NOT under `named_groups_persistence_lock` — the
+        /// exact #470 premise.
+        async fn apply(&self, state: &AppState) {
+            let mut groups = state.named_groups.write().await;
+            let y = groups.get_mut(Y_ID).expect("Y present");
+            match self {
+                YVariant::CertMissingSince => {
+                    y.members_v2
+                        .get_mut(Y_MEMBER)
+                        .expect("Y member")
+                        .certificate_missing_since_ms = Some(1_234_567);
+                }
+                YVariant::InviteIssued => {
+                    y.issued_invites.insert(
+                        "invite-secret-1".to_string(),
+                        x0x::groups::IssuedInviteRecord {
+                            created_at_secs: 1,
+                            expires_at_secs: 9_999,
+                            max_role: x0x::groups::GroupRole::Member,
+                            consumed_by: None,
+                            consumed_at_ms: None,
+                        },
+                    );
+                }
+                YVariant::InviteConsumed => {
+                    // Review r2: mutate the EXISTING unconsumed record
+                    // seeded on Y — no or_insert fallback, so a missing
+                    // seed fails loudly instead of manufacturing an
+                    // already-consumed record that equality-ignoring
+                    // consumption fields could not distinguish.
+                    let record = y
+                        .issued_invites
+                        .get_mut("invite-secret-0")
+                        .expect("unconsumed invite pre-seeded on Y");
+                    assert!(
+                        record.consumed_by.is_none() && record.consumed_at_ms.is_none(),
+                        "seeded record must start unconsumed"
+                    );
+                    record.consumed_by = Some(Y_MEMBER.to_string());
+                    record.consumed_at_ms = Some(2_222);
+                }
+                YVariant::JoinRequest => {
+                    y.join_requests.insert(
+                        "req-1".to_string(),
+                        x0x::groups::JoinRequest {
+                            request_id: "req-1".to_string(),
+                            group_id: Y_ID.to_string(),
+                            requester_agent_id: Y_MEMBER.to_string(),
+                            requester_user_id: None,
+                            requested_role: x0x::groups::GroupRole::Member,
+                            message: Some("concurrent".to_string()),
+                            treekem_key_package_b64: None,
+                            created_at: 42,
+                            reviewed_at: None,
+                            reviewed_by: None,
+                            status: x0x::groups::JoinRequestStatus::Pending,
+                            predecessor_envelope_digest: None,
+                            predecessor_first_seen_ms: None,
+                        },
+                    );
+                }
+                YVariant::HomeMetadata => {
+                    let mut home = y.home.clone().unwrap_or(x0x::groups::HomeMetadata {
+                        primary_agent: Y_MEMBER.to_string(),
+                        placements: std::collections::BTreeMap::new(),
+                        provisioned_at_ms: 0,
+                    });
+                    home.provisioned_at_ms = 987_654_321;
+                    y.home = Some(home);
+                }
+            }
+        }
+    }
+
+    struct CaseOutcome {
+        _dir: tempfile::TempDir,
+        state: Arc<crate::server::AppState>,
+        x_before: Option<x0x::groups::GroupInfo>,
+        y_before: x0x::groups::GroupInfo,
+    }
+
+    async fn seeded_state() -> CaseOutcome {
+        let (state, dir) = secure_endpoint_test_state().await.expect("test state");
+        {
+            let mut groups = state.named_groups.write().await;
+            let x = plain_group(0x11, X_ID, "x-original");
+            let mut y = plain_group(0x22, Y_ID, "y-original");
+            // Review r2: pre-seed the UNCONSUMED invite on Y (not X) —
+            // the consumption variant must mutate THIS existing record so
+            // the test fails if record equality ignores the consumption
+            // fields (seeding elsewhere let or_insert paper over it).
+            y.issued_invites.insert(
+                "invite-secret-0".to_string(),
+                x0x::groups::IssuedInviteRecord {
+                    created_at_secs: 1,
+                    expires_at_secs: 9_999,
+                    max_role: x0x::groups::GroupRole::Member,
+                    consumed_by: None,
+                    consumed_at_ms: None,
+                },
+            );
+            y.home = Some(x0x::groups::HomeMetadata {
+                primary_agent: Y_MEMBER.to_string(),
+                placements: std::collections::BTreeMap::new(),
+                provisioned_at_ms: 1,
+            });
+            groups.insert(X_ID.to_string(), x);
+            groups.insert(Y_ID.to_string(), y);
+        }
+        assert!(save_named_groups(&state).await, "seed save");
+        let (x_before, y_before) = {
+            let groups = state.named_groups.read().await;
+            (
+                groups.get(X_ID).cloned(),
+                groups.get(Y_ID).expect("Y").clone(),
+            )
+        };
+        CaseOutcome {
+            _dir: dir,
+            state,
+            x_before,
+            y_before,
+        }
+    }
+
+    /// Drive the production persist path with the save fault set and a
+    /// concurrent writer interleaved through the notify hook; returns the
+    /// persist outcome.
+    async fn run_failed_persist(
+        state: &Arc<crate::server::AppState>,
+        fault: SaveFault,
+        x_op: XOp,
+        y: Option<YVariant>,
+        same_key_overwrite: Option<x0x::groups::GroupInfo>,
+    ) -> std::io::Result<AtomicWriteOutcome> {
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
+        let _fault_guard = set_save_fault(fault);
+        let task_state = Arc::clone(state);
+        let join = tokio::spawn(async move {
+            persist_named_groups_mutation(&task_state, |groups| {
+                x_op.apply(groups);
+                true
+            })
+            .await
+        });
+        reached.notified().await;
+        // The save is parked between the mutation and the rollback: this is
+        // the concurrent-writer window.
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("hook lock") = None;
+        if let Some(variant) = y {
+            variant.apply(state).await;
+        }
+        if let Some(record) = same_key_overwrite {
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(X_ID.to_string(), record);
+        }
+        release.notify_one();
+        join.await.expect("persist task panicked")
+    }
+
+    async fn current(
+        state: &Arc<crate::server::AppState>,
+        id: &str,
+    ) -> Option<x0x::groups::GroupInfo> {
+        state.named_groups.read().await.get(id).cloned()
+    }
+
+    #[tokio::test]
+    async fn notreplaced_update_restores_x_preserves_y_cert_window() {
+        let case = seeded_state().await;
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::NotReplaced,
+            XOp::Update,
+            Some(YVariant::CertMissingSince),
+            None,
+        )
+        .await
+        .expect("NotReplaced is Ok");
+        assert_eq!(outcome, AtomicWriteOutcome::NotReplaced);
+        // X restored to the pre-mutation record...
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        // ...Y keeps the concurrent certificate-window change.
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert_ne!(y_now, case.y_before, "concurrent Y change preserved");
+        assert_eq!(
+            y_now.members_v2[Y_MEMBER].certificate_missing_since_ms,
+            Some(1_234_567)
+        );
+    }
+
+    #[tokio::test]
+    async fn err_update_restores_x_preserves_y_invite_issuance() {
+        let case = seeded_state().await;
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::Error,
+            XOp::Update,
+            Some(YVariant::InviteIssued),
+            None,
+        )
+        .await;
+        assert!(outcome.is_err(), "Error fault surfaces the error");
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert!(y_now.issued_invites.contains_key("invite-secret-1"));
+        assert_ne!(y_now, case.y_before);
+    }
+
+    #[tokio::test]
+    async fn err_delete_restores_x_preserves_y_invite_consumption() {
+        let case = seeded_state().await;
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::Error,
+            XOp::Delete,
+            Some(YVariant::InviteConsumed),
+            None,
+        )
+        .await;
+        assert!(outcome.is_err());
+        // The delete is rolled back: X is back.
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        let invite = y_now.issued_invites.get("invite-secret-0").expect("kept");
+        assert_eq!(invite.consumed_by.as_deref(), Some(Y_MEMBER));
+        assert_ne!(y_now, case.y_before);
+    }
+
+    #[tokio::test]
+    async fn notreplaced_insert_removes_x_preserves_y_join_request() {
+        // Fresh state WITHOUT X: exercise the insert variant.
+        let case = seeded_state().await;
+        {
+            let mut groups = case.state.named_groups.write().await;
+            groups.remove(X_ID);
+        }
+        assert!(save_named_groups(&case.state).await, "re-seed without X");
+        let no_x = CaseOutcome {
+            _dir: case._dir,
+            state: case.state,
+            x_before: None,
+            y_before: case.y_before,
+        };
+        let outcome = run_failed_persist(
+            &no_x.state,
+            SaveFault::NotReplaced,
+            XOp::Insert,
+            Some(YVariant::JoinRequest),
+            None,
+        )
+        .await
+        .expect("NotReplaced is Ok");
+        assert_eq!(outcome, AtomicWriteOutcome::NotReplaced);
+        // The insert is rolled back: X is absent again...
+        assert_eq!(current(&no_x.state, X_ID).await, None);
+        // ...and Y's concurrent join request survives.
+        let y_now = current(&no_x.state, Y_ID).await.expect("Y kept");
+        assert!(y_now.join_requests.contains_key("req-1"));
+        assert_ne!(y_now, no_x.y_before);
+    }
+
+    #[tokio::test]
+    async fn notreplaced_update_restores_x_preserves_y_home_metadata() {
+        let case = seeded_state().await;
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::NotReplaced,
+            XOp::Update,
+            Some(YVariant::HomeMetadata),
+            None,
+        )
+        .await
+        .expect("NotReplaced is Ok");
+        assert_eq!(outcome, AtomicWriteOutcome::NotReplaced);
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert_eq!(
+            y_now.home.as_ref().expect("home kept").provisioned_at_ms,
+            987_654_321
+        );
+        assert_ne!(y_now, case.y_before);
+    }
+
+    #[tokio::test]
+    async fn same_key_concurrent_change_is_preserved_not_partially_rolled_back() {
+        let case = seeded_state().await;
+        // A third writer replaces X entirely during the window: the CAS
+        // precondition (current == after) fails, so the concurrent value
+        // must survive the rollback untouched.
+        let mut concurrent_x = case.x_before.clone().expect("X seeded");
+        concurrent_x.name = "x-written-by-third-party".to_string();
+        let expected = concurrent_x.clone();
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::Error,
+            XOp::Update,
+            None,
+            Some(concurrent_x),
+        )
+        .await;
+        assert!(outcome.is_err());
+        assert_eq!(current(&case.state, X_ID).await, Some(expected));
+    }
+
+    #[tokio::test]
+    async fn replaced_not_durable_does_not_roll_back() {
+        let case = seeded_state().await;
+        let outcome = run_failed_persist(
+            &case.state,
+            SaveFault::ReplacedNotDurable,
+            XOp::Update,
+            Some(YVariant::CertMissingSince),
+            None,
+        )
+        .await
+        .expect("RND is Ok");
+        assert_eq!(outcome, AtomicWriteOutcome::ReplacedNotDurable);
+        // Memory stays aligned with the VISIBLE replacement: the mutation
+        // is kept (no rollback at all)...
+        let x_now = current(&case.state, X_ID).await.expect("X kept");
+        assert_eq!(x_now.name, "x-renamed-by-mutation");
+        // ...and the concurrent writer's change is of course also kept.
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert_eq!(
+            y_now.members_v2[Y_MEMBER].certificate_missing_since_ms,
+            Some(1_234_567)
+        );
+    }
+
+    #[tokio::test]
+    async fn noop_mutation_rewrites_nothing() {
+        let case = seeded_state().await;
+        let reached = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("hook lock") = Some((Arc::clone(&reached), Arc::clone(&release)));
+        let _fault_guard = set_save_fault(SaveFault::NotReplaced);
+        let task_state = Arc::clone(&case.state);
+        let join = tokio::spawn(async move {
+            // Returns true (a "successful" mutation) but changes nothing:
+            // the touched set is empty, so the rollback must rewrite zero
+            // keys.
+            persist_named_groups_mutation(&task_state, |_| true).await
+        });
+        reached.notified().await;
+        *NAMED_GROUP_SAVE_AFTER_SNAPSHOT_NOTIFY
+            .lock()
+            .expect("hook lock") = None;
+        // Review r2: rewrite-sensitivity — value equality alone would also
+        // pass under the OLD whole-map restore (it restores equal values),
+        // so a concurrent writer changes Y DURING the no-op transaction.
+        // The old restore would clobber it back to the pre-transaction
+        // snapshot; the CAS rollback must leave it untouched.
+        YVariant::CertMissingSince.apply(&case.state).await;
+        release.notify_one();
+        let outcome = join.await.expect("task").expect("Ok");
+        assert_eq!(outcome, AtomicWriteOutcome::NotReplaced);
+        let y_now = current(&case.state, Y_ID).await.expect("Y kept");
+        assert_eq!(
+            y_now.members_v2[Y_MEMBER].certificate_missing_since_ms,
+            Some(1_234_567),
+            "concurrent change made during a NO-OP transaction survives — \
+             the old whole-map restore would have clobbered it"
+        );
+        // Everything else is exactly the pre-transaction value.
+        assert_eq!(current(&case.state, X_ID).await, case.x_before);
+        // Review r3: the OBSERVED map is compared UNTOUCHED against a
+        // separately constructed expected map — overwriting the observed Y
+        // with the expectation first (round 2's shape) would mask any
+        // other unintended Y change.
+        let map_after: HashMap<String, x0x::groups::GroupInfo> =
+            case.state.named_groups.read().await.clone();
+        let mut expected: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+        expected.insert(X_ID.to_string(), case.x_before.expect("X seeded"));
+        let mut y_expected = case.y_before.clone();
+        y_expected
+            .members_v2
+            .get_mut(Y_MEMBER)
+            .expect("Y member")
+            .certificate_missing_since_ms = Some(1_234_567);
+        expected.insert(Y_ID.to_string(), y_expected);
+        assert_eq!(
+            map_after, expected,
+            "no-op mutation rewrites nothing — the map equals the seed plus \
+             exactly the concurrent Y change"
+        );
+    }
+
+    /// The #471 residual, pinned as a test: the ordinary save writes the
+    /// authoritative sidecar BEFORE the legacy file, so an `Err` at the
+    /// legacy write leaves (sidecar new / named old / memory rolled back).
+    /// #470's CAS makes no cross-file atomicity claim — this split is
+    /// filed as #471 and deliberately not fixed here.
+    #[tokio::test]
+    async fn err_after_sidecar_leaves_471_split_with_memory_rolled_back() {
+        let (state, dir) = secure_endpoint_test_state().await.expect("test state");
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(X_ID.to_string(), home_suite_group(0x33, X_ID));
+            groups.insert(Y_ID.to_string(), plain_group(0x22, Y_ID, "y-original"));
+        }
+        assert!(save_named_groups(&state).await, "seed save");
+        let x_before = current(&state, X_ID).await.expect("X seeded");
+
+        let outcome = run_failed_persist(&state, SaveFault::Error, XOp::Update, None, None).await;
+        assert!(outcome.is_err());
+
+        // Memory: rolled back per-key (the #470 rule).
+        assert_eq!(current(&state, X_ID).await, Some(x_before.clone()));
+        // Disk: the #471 split — sidecar holds the NEW record...
+        let sidecar = tokio::fs::read_to_string(dir.path().join(super::HOME_SUITE_GROUPS_FILE))
+            .await
+            .expect("sidecar exists");
+        let sidecar_map: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&sidecar).expect("sidecar json");
+        assert_eq!(
+            sidecar_map.get(X_ID).expect("X in sidecar").name,
+            "x-renamed-by-mutation",
+            "#471: sidecar retains the new record after the legacy write fails"
+        );
+        // ...while the legacy file still serves the OLD (legacy-safe) view.
+        let legacy = tokio::fs::read_to_string(dir.path().join("named_groups.json"))
+            .await
+            .expect("legacy file");
+        let legacy_map: HashMap<String, x0x::groups::GroupInfo> =
+            serde_json::from_str(&legacy).expect("legacy json");
+        let legacy_x = legacy_map.get(X_ID).expect("X in legacy view");
+        assert_ne!(legacy_x.name, "x-renamed-by-mutation");
     }
 }
