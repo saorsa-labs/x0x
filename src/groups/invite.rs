@@ -13,6 +13,8 @@ use crate::identity::AgentId;
 use crate::mls::SecureGroupPlane;
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use base64::engine::general_purpose::STANDARD as B64_STD;
+use base64::Engine as _;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default invite expiry: 7 days in seconds.
@@ -103,7 +105,357 @@ pub struct SignedInvite {
     pub expires_at: u64,
     /// Optional future-facing ML-DSA-65 signature over the invite fields
     /// (hex-encoded). Currently not validated by the join flow.
+    #[serde(default)]
     pub signature: String,
+
+    // ── #469 InviteV4 (authenticated invites) ───────────────────────────
+    /// Wire format version. `0` (absent) is the legacy sentinel; v4
+    /// constructors emit `4`. The joiner refuses anything below 4 with a
+    /// typed `invite_unsigned` (issue #469).
+    #[serde(default)]
+    pub version: u8,
+    /// #469: exact `GroupPublicMeta` snapshot at the base revision — the
+    /// precise input of `compute_public_meta_hash`, so the joiner can
+    /// recompute the base state hash bit-for-bit (previously tags, avatar
+    /// and banner were silently dropped and non-default metadata could
+    /// never round-trip).
+    #[serde(default)]
+    pub public_meta: Option<crate::groups::state_commit::GroupPublicMeta>,
+    /// #469: the roster PROJECTION at the base revision — exactly what
+    /// `roster_root_of_projection` hashes (role, state, TreeKEM key-package
+    /// hash, certificate digest). Replaces `base_members_v2` for v4;
+    /// certificate BYTES are not carried (joiners hydrate them later via
+    /// the announce/discovery cache, matching the authoritative digest).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_roster: Option<BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>>,
+    /// #469: the agent this invite was minted for, if addressed. The
+    /// authority compares it with `MemberJoined.member_agent_id` before
+    /// consuming the secret (issue #469/A4); any other agent's join is
+    /// refused with a typed `invite_not_addressed_to_me`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub intended_joiner: Option<String>,
+    /// #469: explicit signed creator agent id (hex). Replaces the
+    /// best-effort `added_by`/timestamp derivation for v4 invites.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator: Option<String>,
+    /// #469 (v6 E4): the inviter's ML-DSA-65 public key, INLINE and
+    /// self-authenticating — `AgentId::from_public_key` of these bytes must
+    /// equal `inviter` (the id IS SHA-256 of the key). Carried inside the
+    /// signed view, so a swapped key breaks the inviter signature anyway;
+    /// the id check makes the failure typed and immediate. Base64.
+    #[serde(default)]
+    pub inviter_public_key_b64: String,
+    /// #469 (v6 E4): the admission owner's ML-DSA-65 USER public key for
+    /// owner-axis invites, INLINE and self-authenticating against
+    /// `policy.admission`'s OwnerCertified user id. Base64.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_public_key_b64: Option<String>,
+    /// #469: ML-DSA-65 signature by the INVITER's agent key over the v4
+    /// canonical bytes (base64). Required on every v4 invite; verified
+    /// against the inline key above after its id binding.
+    #[serde(default)]
+    pub inviter_signature_b64: String,
+    /// #469: ML-DSA-65 countersignature by the OWNER USER key over the v4
+    /// canonical bytes (base64). Present iff the policy admission carries
+    /// an OwnerCertified axis; required by the Home-join mode pin.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner_countersignature_b64: Option<String>,
+}
+
+// ─── #469 InviteV4: signing domains, caps, signed view ───────────────────
+
+/// Current invite wire-format version (#469).
+pub const INVITE_VERSION_V4: u8 = 4;
+
+/// Domain prefix for the v4 canonical signed bytes.
+pub const INVITE_V4_CANONICAL_DOMAIN: &[u8] = b"x0x.invite.v4\0";
+/// Domain prefix for the inviter agent-key signature over the canonical
+/// bytes.
+pub const INVITE_V4_INVITER_DOMAIN: &[u8] = b"x0x.invite.v4.inviter\0";
+/// Domain prefix for the owner user-key countersignature over the
+/// canonical bytes.
+pub const INVITE_V4_OWNER_DOMAIN: &[u8] = b"x0x.invite.v4.owner\0";
+
+// ─── D5: per-field caps ──────────────────────────────────────────────────
+//
+// A roster-entry count alone cannot bound the encoded link while metadata
+// strings are unbounded input, so every non-roster field is capped at mint
+// AND verified at join. The FINAL encoded-size check (`encode_link`)
+// remains authoritative regardless of these caps.
+
+/// Maximum `group_name` length (#469 D5).
+pub const INVITE_MAX_GROUP_NAME: usize = 128;
+/// Maximum `group_description` length (#469 D5).
+pub const INVITE_MAX_GROUP_DESCRIPTION: usize = 1024;
+/// Maximum number of public-meta tags (#469 D5).
+pub const INVITE_MAX_TAGS: usize = 16;
+/// Maximum length of one public-meta tag (#469 D5).
+pub const INVITE_MAX_TAG_LEN: usize = 32;
+/// Maximum `avatar_url` / `banner_url` length (#469 D5).
+pub const INVITE_MAX_URL_LEN: usize = 512;
+/// Maximum roster entries in a v4 invite (#469 D5 / v7 F4). DERIVED from
+/// the final-encoder worst-case fixture (all string caps simultaneous,
+/// two inline keys + two signatures, N certificate-bearing projection
+/// entries with max-length ids/hashes) against BOTH the 40,960 link
+/// safety budget and the 49,152 DM ceiling — the pinned test fails if
+/// this constant is raised above the derived maximum. The final
+/// encoded-size check remains authoritative regardless.
+pub const MAX_INVITE_ROSTER_ENTRIES: usize = 32;
+
+/// Typed refusal reasons for v4 invite verification (#469 A2). These are
+/// the `reason` strings counted by `invites_refused{reason}` and surfaced
+/// as typed 4xx errors by the join route.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InviteRefusal {
+    /// `version < 4` (including the absent-field legacy sentinel).
+    Unsigned,
+    /// The vestigial legacy `signature` field is non-empty on a v4 invite.
+    SignatureInvalid,
+    /// The inviter signature does not verify under the inline inviter key.
+    InviterSignatureInvalid,
+    /// `AgentId::from_public_key(inviter_public_key_b64) != inviter`.
+    InviterKeyMismatch,
+    /// The inviter agent key is in the local revocation set.
+    InviterKeyRevoked,
+    /// The owner countersignature does not verify under the inline owner
+    /// key, or the inline owner key fails its `UserId` binding.
+    OwnerCountersignatureInvalid,
+    /// An owner-axis invite carries no owner countersignature.
+    OwnerCountersignatureMissing,
+    /// A D5 field cap or structural equality rule failed (duplicated meta
+    /// or home-digest mismatch).
+    Malformed,
+}
+
+impl InviteRefusal {
+    /// The stable wire/diagnostic string for this refusal.
+    #[must_use]
+    pub fn reason(self) -> &'static str {
+        match self {
+            Self::Unsigned => "invite_unsigned",
+            Self::SignatureInvalid => "invite_signature_invalid",
+            Self::InviterSignatureInvalid => "invite_signature_invalid",
+            Self::InviterKeyMismatch => "inviter_key_mismatch",
+            Self::InviterKeyRevoked => "inviter_key_revoked",
+            Self::OwnerCountersignatureInvalid => "invite_owner_countersignature_invalid",
+            Self::OwnerCountersignatureMissing => "invite_owner_countersignature_missing",
+            Self::Malformed => "invite_malformed",
+        }
+    }
+}
+
+/// The FROZEN v4 signed view: every semantically loadable field of
+/// [`SignedInvite`] EXCEPT the three signature outputs (`signature`,
+/// `inviter_signature_b64`, `owner_countersignature_b64`) and the legacy
+/// fat roster (`base_members_v2` — v4 carries the projection instead and
+/// the constructor refuses a non-empty legacy roster).
+///
+/// Field ORDER is frozen and pinned by a canonical-byte vector test;
+/// postcard is deterministic for this value graph, so any reorder,
+/// insert, or type change changes the canonical bytes.
+///
+/// #469 v6 E1: the constructor [`InviteSignedViewV4::from_invite`]
+/// destructures the WHOLE `SignedInvite` by name — adding a field to
+/// `SignedInvite` without routing it through the view is a compile
+/// error, so nothing can ride unsigned.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct InviteSignedViewV4 {
+    /// Wire version (always 4 on minted invites; the sentinel 0 never
+    /// reaches a signed view).
+    pub version: u8,
+    /// MLS group id (hex). Must equal `stable_group_id` (E1).
+    pub group_id: String,
+    /// Stable D.3 group id (hex).
+    pub stable_group_id: String,
+    /// Authority-created timestamp.
+    pub group_created_at: u64,
+    /// Human-readable name; must equal `public_meta.name` (D1).
+    pub group_name: String,
+    /// Human-readable description; must equal `public_meta.description`.
+    pub group_description: String,
+    /// Authority genesis nonce.
+    pub genesis_creation_nonce: String,
+    /// Explicit signed creator agent id (hex).
+    pub creator: String,
+    /// Exact public-metadata snapshot (tags/avatar/banner/home_digest).
+    pub public_meta: crate::groups::state_commit::GroupPublicMeta,
+    /// The `HomeMetadata` preimage; `compute_home_digest(base_home)` must
+    /// equal `public_meta.home_digest` when the latter is present (D1).
+    pub base_home: Option<crate::groups::HomeMetadata>,
+    /// Secure-group crypto plane at the base revision.
+    pub secure_plane: crate::mls::SecureGroupPlane,
+    /// Full policy snapshot.
+    pub policy: crate::groups::policy::GroupPolicy,
+    /// Base state revision.
+    pub base_state_revision: u64,
+    /// Base state hash (hex).
+    pub base_state_hash: String,
+    /// Base previous state hash (hex; empty at genesis).
+    pub base_prev_state_hash: String,
+    /// The roster PROJECTION at the base revision.
+    pub base_roster: BTreeMap<String, crate::groups::state_commit::RosterMemberSnapshot>,
+    /// Base secret epoch.
+    pub base_secret_epoch: u64,
+    /// Base security binding (hex-encoded string; empty when absent).
+    pub base_security_binding: String,
+    /// Inviter agent id (hex).
+    pub inviter: String,
+    /// Inviter ML-DSA-65 public key (base64) — self-authenticating via
+    /// `AgentId::from_public_key == inviter` (v6 E4).
+    pub inviter_public_key_b64: String,
+    /// Owner ML-DSA-65 USER public key (base64) on owner-axis invites —
+    /// self-authenticating via the policy's OwnerCertified user id.
+    pub owner_public_key_b64: Option<String>,
+    /// BLAKE3-256 of the strictly decoded 32 raw bytes of the hex
+    /// `invite_secret` — NOT of the hex text (v3 review item 1).
+    pub secret_hash: [u8; 32],
+    /// Mint time (unix seconds).
+    pub created_at: u64,
+    /// Expiry (unix seconds; 0 = never).
+    pub expires_at: u64,
+    /// Intended joiner agent id (hex), when addressed.
+    pub intended_joiner: Option<String>,
+}
+
+impl InviteSignedViewV4 {
+    /// Build the signed view from a whole invite. E1 compile-time
+    /// exhaustiveness guard: EVERY `SignedInvite` field is destructured
+    /// by name (no `..`) and consumed into a view field or an explicit
+    /// refusal — adding a field to `SignedInvite` without extending this
+    /// function is a compile error.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`InviteRefusal::Unsigned`] when a legacy fat roster is
+    /// present (v4 carries the projection) or any v4-required field is
+    /// missing, and [`InviteRefusal::Malformed`] when a duplicated-meta
+    /// equality rule fails.
+    pub fn from_invite(invite: &SignedInvite) -> Result<Self, InviteRefusal> {
+        // E1: exhaustive destructure — no `..`. The three signature
+        // outputs and the legacy fat roster are consumed by name into
+        // explicit refusals; everything else lands in the view.
+        let SignedInvite {
+            group_id,
+            stable_group_id,
+            group_created_at,
+            group_name,
+            group_description,
+            policy,
+            genesis_creation_nonce,
+            base_state_revision,
+            base_state_hash,
+            base_members_v2,
+            base_prev_state_hash,
+            base_home,
+            secure_plane,
+            base_secret_epoch,
+            base_security_binding,
+            inviter,
+            invite_secret,
+            created_at,
+            expires_at,
+            signature: _legacy_signature,
+            version,
+            public_meta,
+            base_roster,
+            intended_joiner,
+            creator,
+            inviter_public_key_b64,
+            owner_public_key_b64,
+            inviter_signature_b64: _inviter_signature,
+            owner_countersignature_b64: _owner_countersignature,
+        } = invite;
+
+        if *version != INVITE_VERSION_V4 {
+            return Err(InviteRefusal::Unsigned);
+        }
+        // v4 carries the projection; a fat legacy roster alongside is a
+        // malformed mint (and would ride unsigned).
+        if base_members_v2.is_some() {
+            return Err(InviteRefusal::Unsigned);
+        }
+        let stable_group_id = stable_group_id.clone().ok_or(InviteRefusal::Unsigned)?;
+        // E1: the MLS/stable-id invariant is part of the signed contract.
+        if *group_id != stable_group_id {
+            return Err(InviteRefusal::Malformed);
+        }
+        let group_created_at = (*group_created_at).ok_or(InviteRefusal::Unsigned)?;
+        let base_state_revision = (*base_state_revision).ok_or(InviteRefusal::Unsigned)?;
+        let base_state_hash = base_state_hash.clone().ok_or(InviteRefusal::Unsigned)?;
+        let base_roster = base_roster.clone().ok_or(InviteRefusal::Unsigned)?;
+        let base_secret_epoch = (*base_secret_epoch).ok_or(InviteRefusal::Unsigned)?;
+        let public_meta = public_meta.clone().ok_or(InviteRefusal::Unsigned)?;
+        let creator = creator.clone().ok_or(InviteRefusal::Unsigned)?;
+        if inviter_public_key_b64.is_empty() {
+            return Err(InviteRefusal::Unsigned);
+        }
+
+        // D1 equality rules: duplicated metadata must agree, and the Home
+        // preimage must hash to the committed digest.
+        if group_name != &public_meta.name {
+            return Err(InviteRefusal::Malformed);
+        }
+        if group_description.as_deref().unwrap_or("") != public_meta.description {
+            return Err(InviteRefusal::Malformed);
+        }
+        if let Some(home) = base_home.as_ref() {
+            let digest = crate::groups::state_commit::compute_home_digest(home);
+            if public_meta.home_digest.as_deref() != Some(digest.as_str()) {
+                return Err(InviteRefusal::Malformed);
+            }
+        } else if public_meta.home_digest.is_some() {
+            return Err(InviteRefusal::Malformed);
+        }
+
+        // Raw-secret normalization: strictly 32 bytes after hex decode.
+        let secret_bytes = hex::decode(invite_secret.trim())
+            .map_err(|_| InviteRefusal::Malformed)
+            .and_then(|bytes| {
+                <[u8; 32]>::try_from(bytes).map_err(|_| InviteRefusal::Malformed)
+            })?;
+        let secret_hash = *blake3::hash(&secret_bytes).as_bytes();
+
+        Ok(Self {
+            version: *version,
+            group_id: group_id.clone(),
+            stable_group_id,
+            group_created_at,
+            group_name: group_name.clone(),
+            group_description: group_description.clone().unwrap_or_default(),
+            genesis_creation_nonce: genesis_creation_nonce.clone().unwrap_or_default(),
+            creator,
+            public_meta,
+            base_home: base_home.clone(),
+            secure_plane: secure_plane.unwrap_or(crate::mls::SecureGroupPlane::Gss),
+            policy: policy.clone().unwrap_or_default(),
+            base_state_revision,
+            base_state_hash,
+            base_prev_state_hash: base_prev_state_hash.clone().unwrap_or_default(),
+            base_roster,
+            base_secret_epoch,
+            base_security_binding: base_security_binding.clone().unwrap_or_default(),
+            inviter: inviter.clone(),
+            inviter_public_key_b64: inviter_public_key_b64.clone(),
+            owner_public_key_b64: owner_public_key_b64.clone(),
+            secret_hash,
+            created_at: *created_at,
+            expires_at: *expires_at,
+            intended_joiner: intended_joiner.clone(),
+        })
+    }
+
+    /// Canonical signed bytes: `INVITE_V4_CANONICAL_DOMAIN ‖
+    /// postcard(view)`. Deterministic; pinned by a byte-vector test.
+    ///
+    /// # Errors
+    ///
+/// Returns the postcard error on serialization failure.
+    pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
+        let mut out = Vec::with_capacity(INVITE_V4_CANONICAL_DOMAIN.len() + 1024);
+        out.extend_from_slice(INVITE_V4_CANONICAL_DOMAIN);
+        out.extend_from_slice(&postcard::to_stdvec(self)?);
+        Ok(out)
+    }
 }
 /// Error returned when an encoded invite link exceeds the safe DM budget.
 ///
@@ -180,6 +532,15 @@ impl SignedInvite {
             created_at: now,
             expires_at,
             signature: String::new(),
+            version: INVITE_VERSION_V4,
+            public_meta: None,
+            base_roster: None,
+            intended_joiner: None,
+            creator: None,
+            inviter_public_key_b64: String::new(),
+            owner_public_key_b64: None,
+            inviter_signature_b64: String::new(),
+            owner_countersignature_b64: None,
         }
     }
 
@@ -318,6 +679,188 @@ impl SignedInvite {
         }
 
         Ok(creator_hex.to_string())
+    }
+
+    /// D5: validate every capped field. Returns the first violation.
+    #[must_use]
+    pub fn v4_field_caps_violation(&self) -> Option<(&'static str, usize)> {
+        if self.group_name.len() > INVITE_MAX_GROUP_NAME {
+            return Some(("group_name", self.group_name.len()));
+        }
+        if let Some(description) = self.group_description.as_ref() {
+            if description.len() > INVITE_MAX_GROUP_DESCRIPTION {
+                return Some(("group_description", description.len()));
+            }
+        }
+        if let Some(meta) = self.public_meta.as_ref() {
+            if meta.name.len() > INVITE_MAX_GROUP_NAME {
+                return Some(("public_meta.name", meta.name.len()));
+            }
+            if meta.description.len() > INVITE_MAX_GROUP_DESCRIPTION {
+                return Some(("public_meta.description", meta.description.len()));
+            }
+            if meta.tags.len() > INVITE_MAX_TAGS {
+                return Some(("public_meta.tags", meta.tags.len()));
+            }
+            if let Some(len) = meta.tags.iter().map(String::len).max() {
+                if len > INVITE_MAX_TAG_LEN {
+                    return Some(("public_meta.tag_len", len));
+                }
+            }
+            for (field, url) in [
+                ("public_meta.avatar_url", meta.avatar_url.as_deref()),
+                ("public_meta.banner_url", meta.banner_url.as_deref()),
+            ] {
+                if let Some(url) = url {
+                    if url.len() > INVITE_MAX_URL_LEN {
+                        return Some((field, url.len()));
+                    }
+                }
+            }
+        }
+        if let Some(roster) = self.base_roster.as_ref() {
+            if roster.len() > MAX_INVITE_ROSTER_ENTRIES {
+                return Some(("base_roster", roster.len()));
+            }
+        }
+        None
+    }
+
+    /// Sign this v4 invite with the inviter's agent key and, for
+    /// owner-axis policies, the owner's USER key (#469).
+    ///
+    /// Populates `inviter_public_key_b64`, `inviter_signature_b64` and
+    /// (when `owner_kp` is supplied) `owner_public_key_b64` +
+    /// `owner_countersignature_b64`. The view construction enforces the
+    /// D1/E1 structural rules (projection-only roster, id invariants,
+    /// duplicated-meta equality) BEFORE anything is signed.
+    ///
+    /// # Errors
+    ///
+    /// Returns the refusal reason when the invite is not a well-formed
+    /// v4 candidate, or a signing error string on ML-DSA failure.
+    pub fn sign_v4(
+        &mut self,
+        inviter_kp: &crate::identity::AgentKeypair,
+        owner_kp: Option<&crate::identity::UserKeypair>,
+    ) -> Result<(), String> {
+        self.inviter_public_key_b64 = B64_STD.encode(inviter_kp.public_key().as_bytes());
+        if let Some(owner) = owner_kp {
+            self.owner_public_key_b64 = Some(B64_STD.encode(owner.public_key().as_bytes()));
+        }
+        if let Some((field, size)) = self.v4_field_caps_violation() {
+            return Err(format!(
+                "invite field {field} exceeds cap ({size} bytes/entries)"
+            ));
+        }
+        let view = InviteSignedViewV4::from_invite(self).map_err(|r| r.reason().to_string())?;
+        let canonical = view
+            .canonical_bytes()
+            .map_err(|e| format!("invite canonical bytes: {e}"))?;
+        let mut inviter_input = INVITE_V4_INVITER_DOMAIN.to_vec();
+        inviter_input.extend_from_slice(&canonical);
+        let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            inviter_kp.secret_key(),
+            &inviter_input,
+        )
+        .map_err(|e| format!("inviter sign: {e:?}"))?;
+        self.inviter_signature_b64 = B64_STD.encode(sig.as_bytes());
+        if let Some(owner) = owner_kp {
+            let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+            owner_input.extend_from_slice(&canonical);
+            let sig =
+                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(owner.secret_key(), &owner_input)
+                    .map_err(|e| format!("owner countersign: {e:?}"))?;
+            self.owner_countersignature_b64 =
+                Some(B64_STD.encode(sig.as_bytes()));
+        }
+        Ok(())
+    }
+
+    /// Verify the v4 signatures and inline key bindings (#469, v6 E4).
+    ///
+    /// Order: view construction (version/projection/id invariants/meta
+    /// equality — `invite_unsigned` / `invite_malformed`) → legacy
+    /// `signature` must be empty → inline inviter key id binding →
+    /// inviter signature → owner axis: inline owner key present + id
+    /// binding + countersignature. Revocation-set checks are the
+    /// caller's (the server owns the set; map to
+    /// [`InviteRefusal::InviterKeyRevoked`] / [`InviteRefusal::OwnerKeyRevoked`]).
+    #[must_use]
+    pub fn verify_v4_signatures(&self) -> Result<(), InviteRefusal> {
+        if !self.signature.is_empty() {
+            return Err(InviteRefusal::SignatureInvalid);
+        }
+        let view = InviteSignedViewV4::from_invite(self)?;
+        let canonical = view.canonical_bytes().map_err(|_| InviteRefusal::Malformed)?;
+
+        // Inline inviter key: self-authenticating id binding (E4).
+        let inviter_key_bytes = B64_STD
+            .decode(view.inviter_public_key_b64.as_bytes())
+            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
+        let inviter_key = ant_quic::MlDsaPublicKey::from_bytes(&inviter_key_bytes)
+            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
+        let derived_inviter = crate::identity::AgentId::from_public_key(&inviter_key);
+        if hex::encode(derived_inviter.as_bytes()) != view.inviter {
+            return Err(InviteRefusal::InviterKeyMismatch);
+        }
+        let sig_bytes = B64_STD
+            .decode(self.inviter_signature_b64.as_bytes())
+            .map_err(|_| InviteRefusal::InviterSignatureInvalid)?;
+        let sig = ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&sig_bytes)
+            .map_err(|_| InviteRefusal::InviterSignatureInvalid)?;
+        let mut inviter_input = INVITE_V4_INVITER_DOMAIN.to_vec();
+        inviter_input.extend_from_slice(&canonical);
+        if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+            &inviter_key,
+            &inviter_input,
+            &sig,
+        )
+        .is_err()
+        {
+            return Err(InviteRefusal::InviterSignatureInvalid);
+        }
+
+        // Owner axis: countersignature required and verified under the
+        // inline owner user key, itself bound to the policy's owner id.
+        if let Some(owner_id) = view.policy.admission.owner_certified_user_id() {
+            let Some(owner_key_b64) = view.owner_public_key_b64.as_deref() else {
+                return Err(InviteRefusal::OwnerCountersignatureMissing);
+            };
+            let owner_key_bytes = B64_STD
+                .decode(owner_key_b64)
+                .map_err(|_| InviteRefusal::OwnerCountersignatureInvalid)?;
+            let owner_key = ant_quic::MlDsaPublicKey::from_bytes(&owner_key_bytes)
+                .map_err(|_| InviteRefusal::OwnerCountersignatureInvalid)?;
+            let derived_owner = crate::identity::UserId::from_public_key(&owner_key);
+            if derived_owner != *owner_id {
+                return Err(InviteRefusal::OwnerCountersignatureInvalid);
+            }
+            let Some(countersig_b64) = self.owner_countersignature_b64.as_deref() else {
+                return Err(InviteRefusal::OwnerCountersignatureMissing);
+            };
+            let countersig = B64_STD
+                .decode(countersig_b64)
+                .and_then(|bytes| {
+                    ant_quic::crypto::raw_public_keys::pqc::MlDsaSignature::from_bytes(&bytes)
+                        .map_err(|_| {
+                            base64::DecodeError::InvalidByte(0, 0) // never observed: mapped below
+                        })
+                })
+                .map_err(|_| InviteRefusal::OwnerCountersignatureInvalid)?;
+            let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
+            owner_input.extend_from_slice(&canonical);
+            if ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(
+                &owner_key,
+                &owner_input,
+                &countersig,
+            )
+            .is_err()
+            {
+                return Err(InviteRefusal::OwnerCountersignatureInvalid);
+            }
+        }
+        Ok(())
     }
 
     /// Encode this invite as a shareable link.
