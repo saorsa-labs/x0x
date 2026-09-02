@@ -19626,10 +19626,6 @@ enum PairedReplayDecision {
     /// The journal's record chains forward from the live state (or the
     /// group is absent live) — apply all three live files.
     Apply,
-    /// The live merged record is NEWER — the journal pair is stale: apply
-    /// NOTHING (record, sidecar, and snapshot included) and consume the
-    /// journals.
-    StaleLiveNewer,
     /// Equal revision with a DIFFERENT state hash — an equal-revision
     /// fork: quarantine both journals, apply neither half.
     Fork,
@@ -20426,6 +20422,7 @@ pub(in crate::server) async fn recover_treekem_named_journals(
         // live state is consumed as stale REGARDLESS of any classification
         // — decided from the ALREADY-PARSED journal image (no re-parse,
         // 14.4) and the single snapshot.
+        let mut stale_live_newer = false;
         let mut decision = match named_groups.get(&journal.group_id_hex) {
             None => PairedReplayDecision::Apply,
             Some(record) => {
@@ -20436,7 +20433,11 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                 {
                     None => PairedReplayDecision::Apply,
                     Some(existing) if existing.state_revision > record.state_revision => {
-                        PairedReplayDecision::StaleLiveNewer
+                        // Staleness is a separate BOOL (its consume path
+                        // `continue`s below); the decision enum carries
+                        // only post-staleness outcomes.
+                        stale_live_newer = true;
+                        PairedReplayDecision::Apply
                     }
                     Some(existing)
                         if existing.state_revision == record.state_revision
@@ -20448,7 +20449,7 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                 }
             }
         };
-        if decision == PairedReplayDecision::StaleLiveNewer {
+        if stale_live_newer {
             tracing::warn!(
                 group_id = %journal.group_id_hex,
                 "#457 r14: journal pair is stale against the newer live merged view — no live file written, journals consumed"
@@ -20532,10 +20533,12 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                     // groups: a decoded body with NO record for this group
                     // is a VALID "no sidecar change" half for a PLAIN
                     // group ⇒ replay the legacy half as legacy-only.
-                    // #457 r13 item 13.1 + r14 item 14.3 — v1 has no tag:
-                    // Home-Suite-ness comes from the SAME live snapshot the
-                    // verdict used; a lookup that cannot answer is
-                    // UNCERTAIN (retain the pair), never "plain".
+                    // #457 r13 item 13.1 + r14 item 14.3 + r15 — v1 has
+                    // no tag: Home-Suite-ness comes from the SAME live
+                    // snapshot the verdict used. A readable store with no
+                    // record for the group classifies as PLAIN (the r15
+                    // recoverability rule); only a read/parse failure is
+                    // uncertain, and that is the global fail-closed abort.
                     match live_classification(&live_merged, &named_groups, &journal.group_id_hex) {
                         LiveClassification::HomeSuite => {
                             match sidecar_half_identity(
@@ -20624,11 +20627,6 @@ pub(in crate::server) async fn recover_treekem_named_journals(
             }
         }
         match decision {
-            // Unreachable-by-construction: the stale consume above already
-            // `continue`d for this decision. Defensive retain.
-            PairedReplayDecision::StaleLiveNewer => {
-                continue;
-            }
             PairedReplayDecision::BodyMismatch => {
                 // #457 r14 item 14.8 — same checked quarantine machinery,
                 // distinct reason; operator resolution is DELETE (never
@@ -20877,8 +20875,7 @@ enum SidecarIdentity {
 
 /// Does the legacy journal's own record describe a Home-Suite
 /// #457 r14 item 14.3 — the v1 Home-Suite classification, taken from the
-/// SAME live snapshot the staleness verdict used. `Uncertain` (no live
-/// record to consult) RETAINS the pair — never a guess.
+/// SAME live snapshot the staleness verdict used.
 enum LiveClassification {
     HomeSuite,
     Plain,
@@ -38124,11 +38121,8 @@ mod hs451_downgrade_safety {
     ///   (c) stale-journal removal failure (unwritable dir) ⇒ retained.
     #[tokio::test]
     async fn r13_per_group_failures_never_abort_startup() {
-        if is_root() {
-            tracing::warn!("skipped under root (chmod is not a barrier there)");
-            return;
-        }
-        // (a) malformed inner legacy JSON.
+        // (a) malformed inner legacy JSON — permission-independent, runs
+        // under root too (#457 r16 item 16.2).
         {
             let _fault_test_lock = fault_test_lock().await;
             let dir = tempfile::tempdir().expect("tempdir");
@@ -38164,7 +38158,12 @@ mod hs451_downgrade_safety {
                 "(a) quarantined aside"
             );
         }
-        // (b)+(c): removal failures under an unwritable treekem dir.
+        // (b)+(c): removal failures under an unwritable treekem dir —
+        // permission-dependent, skipped under root (#457 r16 item 16.2).
+        if is_root() {
+            tracing::warn!("skipping the chmod-dependent cases under root");
+            return;
+        }
         {
             let _fault_test_lock = fault_test_lock().await;
             let dir = tempfile::tempdir().expect("tempdir");
@@ -38943,8 +38942,9 @@ mod hs451_downgrade_safety {
         j.state_hash = "h2".to_string();
         journal_groups.insert(home_id.clone(), j);
         let (legacy_json, _) = encode_named_groups_store(&journal_groups).expect("encode");
-        // v1, record absent from the body, live store EMPTY ⇒ no record to
-        // consult ⇒ Uncertain.
+        // v1, record absent from the body, live store EMPTY ⇒ no record
+        // to consult ⇒ PLAIN (the r15 recoverability rule: the new plain
+        // group's first-persist crash shape replays, never retains).
         x0x::storage::write_private_bytes(
             &treekem_home_suite_journal_path(&treekem, &home_id),
             vec![0x01, 0x02, 0x7B, 0x7D],
