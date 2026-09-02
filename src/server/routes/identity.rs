@@ -375,13 +375,6 @@ fn prioritize_local_card_addresses(addresses: &mut [String]) {
     });
 }
 
-pub(in crate::server) fn populate_invite_base_state_from_group_info(
-    invite: &mut x0x::groups::invite::SignedInvite,
-    info: &x0x::groups::GroupInfo,
-) {
-    populate_invite_base_state_v4(invite, info, None);
-}
-
 /// #469 A1b: v4 mint population — the SAME base-state fields plus the v4
 /// additions (public-meta snapshot, roster projection, explicit signed
 /// creator, intended joiner) and NO legacy fat roster. Signing and the
@@ -492,45 +485,131 @@ pub(in crate::server) async fn get_agent_card(
         }
     }
 
-    // Optionally include group invite links
+    // Optionally include group invite links (#469 E3 transaction):
+    // reuse-or-mint under the group's membership lock, durably persisted
+    // before the link is returned; a group that cannot be served is
+    // OMITTED with a diagnostic — never fails the whole card.
     if query.include_groups.unwrap_or(false) {
-        let groups = state.named_groups.read().await;
-        for info in groups.values() {
-            if info.withdrawn
-                || has_withdrawn_same_stable_group_record(
-                    &groups,
-                    &info.mls_group_id,
-                    Some(info.stable_group_id()),
-                )
-            {
-                continue;
-            }
-            let mut invite = x0x::groups::invite::SignedInvite::new(
-                info.mls_group_id.clone(),
-                info.name.clone(),
-                &agent_id,
-                x0x::groups::invite::DEFAULT_EXPIRY_SECS,
-            );
-            populate_invite_base_state_from_group_info(&mut invite, info);
-            // Enforce the DM-safe budget at mint; an oversized link would 400
-            // later when the card consumer DMs the join. Skip rather than poison
-            // the whole agent card (issue #205).
-            let invite_link = match invite.encode_link() {
-                Ok(link) => link,
-                Err(e) => {
-                    tracing::warn!(
-                        group_id = %info.mls_group_id,
-                        actual = e.actual,
-                        limit = e.limit,
-                        "skipping oversized group invite in agent card: {e}"
-                    );
+        // Phase 1 (read-only): pick candidate groups and REUSE links that
+        // need no mutation. `GET /agent/card` carries no ActorContext, so
+        // owner-axis groups cannot establish durable-owner authority on
+        // this surface — they are omitted unless a Card-origin record is
+        // already reusable (design v5 D3 fail-safe reading).
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let mut mint_candidates: Vec<String> = Vec::new();
+        {
+            let groups = state.named_groups.read().await;
+            for (map_key, info) in groups.iter() {
+                if info.withdrawn
+                    || has_withdrawn_same_stable_group_record(
+                        &groups,
+                        &info.mls_group_id,
+                        Some(info.stable_group_id()),
+                    )
+                {
                     continue;
                 }
+                let inviter_hex = hex::encode(agent_id.as_bytes());
+                // Only active admins may mint; others are skipped silently.
+                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex).is_err() {
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(map_key, "card_invite_omitted_non_admin");
+                    continue;
+                }
+                if let Some(reusable) = info.reusable_card_invite(now_secs) {
+                    if let Some(link) = reusable.signed_link.clone() {
+                        card.groups.push(x0x::groups::card::CardGroup {
+                            name: info.name.clone(),
+                            invite_link: link,
+                        });
+                        continue;
+                    }
+                }
+                if info.policy.admission.owner_certified_user_id().is_some() {
+                    // No durable-owner actor on a GET surface — omit.
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(map_key, "card_invite_omitted_owner_axis");
+                    continue;
+                }
+                mint_candidates.push(map_key.clone());
+            }
+        }
+        // Phase 2 (mutating): mint each candidate through the single v4
+        // authority under its membership lock, then persist durably before
+        // the link is returned.
+        for map_key in mint_candidates {
+            let membership_lock = crate::server::routes::named_groups::group_membership_lock(&state, &map_key).await;
+            let _guard = membership_lock.lock().await;
+            let Some(info) = state.named_groups.read().await.get(&map_key).cloned() else {
+                continue;
             };
-            card.groups.push(x0x::groups::card::CardGroup {
-                name: info.name.clone(),
-                invite_link,
-            });
+            let mut next = info.clone();
+            let now_secs = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or_default();
+            next.prune_issued_invites(now_secs);
+            if next.live_issued_invite_count(now_secs)
+                >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
+            {
+                state
+                    .groups_diagnostics
+                    .record_invite_refusal(&map_key, "card_invite_omitted_cap_reached");
+                continue;
+            }
+            match crate::server::routes::named_groups::assemble_signed_v4_invite(
+                &state,
+                &next,
+                x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+                None,
+            ) {
+                Ok((invite, link)) => {
+                    next.record_issued_invite_v2(
+                        invite.invite_secret.clone(),
+                        invite.created_at,
+                        invite.expires_at,
+                        x0x::groups::GroupRole::Member,
+                        None,
+                        x0x::groups::InviteOrigin::Card,
+                        Some(link.clone()),
+                    );
+                    if !matches!(
+                        crate::server::routes::named_groups::persist_named_groups_mutation(
+                            &state,
+                            |groups| {
+                                groups.insert(map_key.clone(), next.clone());
+                                true
+                            },
+                        )
+                        .await,
+                        Ok(crate::server::routes::named_groups::AtomicWriteOutcome::Durable)
+                    ) {
+                        // Not durable — do not hand out the link.
+                        state
+                            .groups_diagnostics
+                            .record_invite_refusal(&map_key, "card_invite_omitted_not_durable");
+                        continue;
+                    }
+                    card.groups.push(x0x::groups::card::CardGroup {
+                        name: invite.group_name.clone(),
+                        invite_link: link,
+                    });
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        group_id = %map_key,
+                        "card invite mint failed; omitting group from card: {e:?}"
+                    );
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(&map_key, "card_invite_omitted_mint_failed");
+                }
+            }
         }
     }
 

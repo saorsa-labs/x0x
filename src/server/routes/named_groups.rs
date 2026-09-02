@@ -16287,7 +16287,7 @@ pub(in crate::server) async fn retry_pending_owner_cert_joins(
 }
 
 /// Require the caller to be an active Admin or higher.
-fn require_admin_or_above(
+pub(in crate::server) fn require_admin_or_above(
     info: &x0x::groups::GroupInfo,
     caller_hex: &str,
 ) -> Result<(), (StatusCode, Json<serde_json::Value>)> {
