@@ -40832,30 +40832,23 @@ mod cas_rollback_470 {
         );
         // Everything else is exactly the pre-transaction value.
         assert_eq!(current(&case.state, X_ID).await, case.x_before);
-        let mut map_after: HashMap<String, x0x::groups::GroupInfo> =
+        // Review r3: the OBSERVED map is compared UNTOUCHED against a
+        // separately constructed expected map — overwriting the observed Y
+        // with the expectation first (round 2's shape) would mask any
+        // other unintended Y change.
+        let map_after: HashMap<String, x0x::groups::GroupInfo> =
             case.state.named_groups.read().await.clone();
+        let mut expected: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
+        expected.insert(X_ID.to_string(), case.x_before.expect("X seeded"));
         let mut y_expected = case.y_before.clone();
         y_expected
             .members_v2
             .get_mut(Y_MEMBER)
             .expect("Y member")
             .certificate_missing_since_ms = Some(1_234_567);
-        map_after.insert(Y_ID.to_string(), y_expected);
+        expected.insert(Y_ID.to_string(), y_expected);
         assert_eq!(
-            map_after,
-            {
-                let mut expected: HashMap<String, x0x::groups::GroupInfo> = HashMap::new();
-                expected.insert(X_ID.to_string(), case.x_before.expect("X seeded"));
-                expected.insert(Y_ID.to_string(), {
-                    let mut y = case.y_before.clone();
-                    y.members_v2
-                        .get_mut(Y_MEMBER)
-                        .expect("Y member")
-                        .certificate_missing_since_ms = Some(1_234_567);
-                    y
-                });
-                expected
-            },
+            map_after, expected,
             "no-op mutation rewrites nothing — the map equals the seed plus \
              exactly the concurrent Y change"
         );
