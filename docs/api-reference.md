@@ -956,8 +956,8 @@ helper API.
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
-| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate an invite link |
-| POST | `/groups/join` | `x0x group join <invite>` | Join via invite |
+| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 32) and 429 `invite_cap_reached` (64 live unconsumed records/group) |
+| POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
 | PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |

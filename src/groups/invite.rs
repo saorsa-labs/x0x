@@ -784,7 +784,9 @@ impl SignedInvite {
     /// inviter signature → owner axis: inline owner key present + id
     /// binding + countersignature. Revocation-set checks are the
     /// caller's (the server owns the set; map to
-    /// [`InviteRefusal::InviterKeyRevoked`] / [`InviteRefusal::OwnerKeyRevoked`]).
+    /// [`InviteRefusal::InviterKeyRevoked`] — the AGENT subject only; there
+    /// is no user revocation subject, see v7 F3 and the ADR-0016
+    /// amendment).
     pub fn verify_v4_signatures(&self) -> Result<(), InviteRefusal> {
         if !self.signature.is_empty() {
             return Err(InviteRefusal::SignatureInvalid);

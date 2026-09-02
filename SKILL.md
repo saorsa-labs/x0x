@@ -328,6 +328,13 @@ curl -X POST "http://$API/groups" -H "Authorization: Bearer $TOKEN" -H "Content-
 curl -X POST "http://$API/groups/<gid>/members" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"agent_id":"<64-hex>"}'
 # Invite links (share out-of-band), then join on the other agent:
+**v0.41.0 ROLLOUT NOTE (#468/#469)**: invites are now SIGNED (v4). Unsigned
+legacy invites are refused with `invite_unsigned` — re-mint after upgrading.
+Upgrade INVITERS/AUTHORITIES before joiners. Home joins pin the owner:
+`x0x group join --home --owner <owner_user_id_hex>` (both flags required
+together; `x0x home` prints `owner_user_id`). Rosters over 32 entries or
+links over 40,960 B fail typed at mint — slim the roster.
+
 curl -X POST "http://$API/groups/<gid>/invite" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'   # -> x0x://invite/... (Content-Type required for any non-empty body, else 415)
 curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"invite":"x0x://invite/<...>"}'
