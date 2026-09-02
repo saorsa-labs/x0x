@@ -145,6 +145,11 @@ sees a shape it cannot parse:
      valid envelope with a malformed sidecar body) — this binary can
      never replay these bytes: DELETE the quarantined files to accept
      the live state (renaming them back re-enters the same branch).
+  3b. **Body/tag mismatch** (log: "BODY/TAG MISMATCH") — the `.hsjournal`
+     body's target record disagrees with its envelope tag (revision,
+     hash, or the Home-Suite/plain classification; a retry race or a
+     spoofed tag). Renaming back re-enters the same branch: DELETE the
+     quarantined files to accept the live state.
   4. **Legacy-only** — no `.hsjournal` exists (the shape every released
      v0.40.x leaves); only the legacy journal is quarantined. SINGLE-HALF
      procedure: to accept the live state, delete the one quarantined
@@ -153,8 +158,10 @@ sees a shape it cannot parse:
      entry + `<group>.snap`) and rename that one file back to
      `<group>.journal` — there is NO second half to restore.
   5. **Split pair** (log: "SPLIT pair"; files: `<group>.journal.
-     quarantined-…` plus `<group>.hsjournal.split-<ms>-<seq>`) — a
-     quarantine partially completed. To ACCEPT THE LIVE STATE: delete
+     quarantined-…` plus `<group>.hsjournal.split-<ms>-<seq>`, or — when
+     the marker rename itself failed — an UNMARKED live `.hsjournal`
+     beside the quarantined legacy, which the daemon PRESERVES as
+     split-uncertain) — a quarantine partially completed. To ACCEPT THE LIVE STATE: delete
      both aside files. To RETRY the transaction: delete the group's live
      state files, rename the quarantined `.journal.quarantined-*` file
      back to `<group>.journal`, rename the `.hsjournal.split-*` file back
