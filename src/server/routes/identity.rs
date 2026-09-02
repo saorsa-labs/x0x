@@ -428,8 +428,16 @@ pub(in crate::server) fn populate_invite_base_state_v4(
 }
 
 /// GET /agent/card — generate a shareable identity card.
+///
+/// r3 (Fable 1): owner-axis groups (Home metadata or an OwnerCertified
+/// admission axis) mint/reuse a countersigned invite link ONLY under a
+/// DURABLE-owner actor — the countersigned link is a device-admission
+/// credential, exactly like `POST /groups/:id/invite` (its #446 durable
+/// fence). A session bearer (or a rider, or a direct handler call with
+/// no actor context) gets the group OMITTED with a recorded reason.
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
+    actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
     axum::extract::Query(query): axum::extract::Query<CardQuery>,
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
@@ -489,11 +497,13 @@ pub(in crate::server) async fn get_agent_card(
     // before the link is returned; a group that cannot be served is
     // OMITTED with a diagnostic — never fails the whole card.
     if query.include_groups.unwrap_or(false) {
+        // r3 (Fable 1): owner-axis mint/reuse authority. The card surface
+        // is reachable by browser SESSION bearers; the countersigned
+        // owner-axis link is a device-admission credential and demands
+        // the same durable-owner proof as the explicit mint route.
+        let durable_owner = actor.as_ref().is_some_and(|a| a.is_durable_owner());
         // Phase 1 (read-only): pick candidate groups and REUSE links that
-        // need no mutation. `GET /agent/card` carries no ActorContext, so
-        // owner-axis groups cannot establish durable-owner authority on
-        // this surface — they are omitted unless a Card-origin record is
-        // already reusable (design v5 D3 fail-safe reading).
+        // need no mutation.
         let now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_secs())
@@ -521,6 +531,21 @@ pub(in crate::server) async fn get_agent_card(
                         .record_invite_refusal(map_key, "card_invite_omitted_non_admin");
                     continue;
                 }
+                // r3 (Fable 1): owner-axis fence keyed on the SAME policy
+                // axis as `home_mutation_requires_durable` — Home metadata
+                // OR an OwnerCertified admission. Without a durable owner
+                // the group is omitted entirely (no mint, no REUSE — an
+                // already-recorded Card link is equally a device-admission
+                // credential).
+                let owner_axis = info.home.is_some()
+                    || info.policy.admission.owner_certified_user_id().is_some();
+                if owner_axis && !durable_owner {
+                    state.groups_diagnostics.record_invite_refusal(
+                        map_key,
+                        "card_invite_omitted_owner_axis_no_durable_owner",
+                    );
+                    continue;
+                }
                 if let Some(reusable) = info.reusable_card_invite(now_secs) {
                     if let Some(link) = reusable.signed_link.clone() {
                         card.groups.push(x0x::groups::card::CardGroup {
@@ -530,10 +555,6 @@ pub(in crate::server) async fn get_agent_card(
                         continue;
                     }
                 }
-                // r1 (Fable 7): owner-axis groups DO mint on an owner
-                // install — the mint's own user-key equality fence is the
-                // owner proof (the countersignature authenticates the
-                // link). Non-owner installs omit at mint time below.
                 mint_candidates.push(map_key.clone());
             }
         }
@@ -548,9 +569,11 @@ pub(in crate::server) async fn get_agent_card(
                 continue;
             };
             let mut next = info.clone();
-            // r1 (Codex 9): re-check admin authority UNDER the membership
-            // lock — the phase-1 preselection ran under a read lock and a
-            // demotion could have landed in between (TOCTOU).
+            // r1 (Codex 9) + r3 (Fable 1): re-check admin authority AND
+            // the owner-axis durable fence UNDER the membership lock —
+            // the phase-1 preselection ran under a read lock and a
+            // demotion or policy change could have landed in between
+            // (TOCTOU).
             {
                 let inviter_hex = hex::encode(agent_id.as_bytes());
                 if crate::server::routes::named_groups::require_admin_or_above(&next, &inviter_hex)
@@ -559,6 +582,15 @@ pub(in crate::server) async fn get_agent_card(
                     state
                         .groups_diagnostics
                         .record_invite_refusal(&map_key, "card_invite_omitted_non_admin");
+                    continue;
+                }
+                let owner_axis = next.home.is_some()
+                    || next.policy.admission.owner_certified_user_id().is_some();
+                if owner_axis && !durable_owner {
+                    state.groups_diagnostics.record_invite_refusal(
+                        &map_key,
+                        "card_invite_omitted_owner_axis_no_durable_owner",
+                    );
                     continue;
                 }
             }

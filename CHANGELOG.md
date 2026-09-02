@@ -27,6 +27,24 @@ All notable changes to this project will be documented in this file.
 - **Roster projection.** v4 invites carry the roster projection (no
   certificate bytes); digest-only members hash identically to their
   byte-bearing form and certificates hydrate from the announce cache.
+- **Gap adoption is now digest-only (D2 behaviour change).** A certified
+  member added inside a reconstructed roster gap used to be
+  unreconstructable — the projection carries only the cert digest and the
+  reconstruction dropped it, so the terminal roster root could not be
+  re-derived; the joiner refused
+  (`member_added_events_rejected_state_chain_gap`) and stayed pending.
+  D2 makes the digest the signed commitment (digest-only and byte-bearing
+  members hash identically), so the same shape is now intentionally
+  ADOPTED: the filler seats digest-only and the cert bytes hydrate later
+  via the announce bridge, pinned by re-pointing the #458 r5 gap test
+  (`issue458r5_certified_member_in_gap_adopts_digest_only`) at adoption.
+- **MemberJoined authority seat records the published TreeKEM KeyPackage
+  again.** Dropping the setter made every later KeyPackage-consuming path
+  fail `member_key_package_pending` (CI regression caught by the
+  `member_banned_lost_initial_volley_recovers_via_bounded_resend`
+  integration run; fixed at 2698ce8). The seat's roster-hash/binding
+  stays the authority — the joiner's published KeyPackage bytes are
+  recorded on the seat, nothing more.
 - **Mint cap.** 64 live unconsumed invites per group (429
   `invite_cap_reached`); per-field caps; the final encoded size is
   authoritative (40,960 link budget).

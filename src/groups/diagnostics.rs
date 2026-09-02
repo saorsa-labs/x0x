@@ -22,6 +22,12 @@ use crate::groups::GroupInfo;
 use serde::Serialize;
 use std::collections::{HashMap, HashSet};
 use std::sync::Mutex;
+/// #468 A5 (r3): the per-group rate-limit window for
+/// [`GroupsDiagnostics::record_conflict_unauthenticated`] — one
+/// increment per group per second. Unauthenticated conflict packets are
+/// freely replayable; the counter observes conflict PRESSURE, not the
+/// attacker's packet rate.
+const CONFLICT_UNAUTHENTICATED_WINDOW_MS: u64 = 1_000;
 
 /// Per-group counters captured by the public-message and metadata ingest
 /// pipelines. Plain `u64`s — atomic ordering is not required because the
@@ -80,11 +86,16 @@ pub struct GroupCounters {
     /// `invite_lineage` (deduplicated by `(revision, state_hash,
     /// committed_by)`; replays do not increment).
     pub adoption_fork_evidence: u64,
-    /// #468 A5: unauthenticated fork CONFLICT attempts (per-packet,
-    /// rate-limited by the caller; explicitly NOT unique evidence).
+    /// #468 A5: unauthenticated fork CONFLICT attempts (per-packet;
+    /// rate-limited to one increment per group per second by
+    /// `GroupsDiagnostics::record_conflict_unauthenticated` — an attacker can
+    /// replay unauthenticated conflict packets, so the raw count is not
+    /// observable; explicitly NOT unique evidence).
     pub conflict_unauthenticated: u64,
     /// #469 D2: members whose certificate bytes have not yet hydrated
-    /// from the announce/discovery cache (gauge at snapshot time).
+    /// from the announce/discovery cache (gauge at snapshot time —
+    /// active seats with a committed `certificate_digest` but no
+    /// certificate bytes).
     #[serde(default, skip_serializing_if = "is_zero")]
     pub members_awaiting_certificate: u64,
     /// Number of `MemberJoined` events rejected because the joiner's
@@ -175,6 +186,20 @@ pub struct GroupDiagnostic {
 #[derive(Debug, Default)]
 pub struct GroupsDiagnostics {
     inner: Mutex<HashMap<String, GroupCounters>>,
+    /// #468 A5 (r3): identities of fork-evidence records whose
+    /// first-observation diagnostics (warn + `adoption_fork_evidence`)
+    /// have already fired — post-first observations of the SAME
+    /// `(group, revision, state_hash, committed_by)` are silent, even
+    /// when the lineage record itself could not be (re)installed (e.g.
+    /// a failed persist rolled it back). In-memory only: after a
+    /// restart the durable lineage record's own identity dedupe takes
+    /// over (see `evaluate_fork_evidence_candidate`).
+    seen_fork_evidence: Mutex<HashSet<(String, u64, String, String)>>,
+    /// #468 A5 (r3): per-group wall-clock (ms) of the last
+    /// `conflict_unauthenticated` increment — unauthenticated conflict
+    /// packets are attacker-replayable, so the counter is rate-limited
+    /// to one increment per group per second.
+    conflict_unauthenticated_last_ms: Mutex<HashMap<String, u64>>,
 }
 
 impl GroupsDiagnostics {
@@ -205,6 +230,71 @@ impl GroupsDiagnostics {
         });
     }
 
+    /// #468 A5 (r3): record an unauthenticated conflict attempt.
+    /// RATE-LIMITED to one increment per group per
+    /// the per-group one-second window (CONFLICT_UNAUTHENTICATED_WINDOW_MS) — the counter observes
+    /// that a group is under conflict pressure, not the attacker's
+    /// packet rate; unauthenticated conflicts are freely replayable, so
+    /// an unbounded count is both useless and a cheap write-amplifier.
+    /// `now_ms` is the wall-clock millis the caller already holds
+    /// (same contract as [`Self::record_message_received`]).
+    pub fn record_conflict_unauthenticated(&self, group_id: &str, now_ms: u64) {
+        {
+            let mut last = match self.conflict_unauthenticated_last_ms.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let window_start = last
+                .get(group_id)
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(CONFLICT_UNAUTHENTICATED_WINDOW_MS);
+            if now_ms < window_start {
+                return;
+            }
+            last.insert(group_id.to_string(), now_ms);
+        }
+        self.with_counters(group_id, |c| {
+            c.conflict_unauthenticated = c.conflict_unauthenticated.saturating_add(1);
+        });
+    }
+
+    /// #468 A5 (r3): fire the first-observation diagnostics for one
+    /// fork-evidence identity — `(group, revision, state_hash,
+    /// committed_by)` — exactly ONCE per process. Returns `true` only
+    /// the first time this identity is observed (incrementing
+    /// `adoption_fork_evidence`); every later observation of the same
+    /// identity is silent: no counter, no warn (the caller owns the
+    /// warn), no re-persist. A DIFFERENT identity for the same group
+    /// still fires. The set is in-memory: after a restart, the durable
+    /// lineage record's own identity check provides the same silence.
+    pub fn record_fork_evidence_once(
+        &self,
+        group_id: &str,
+        revision: u64,
+        state_hash: &str,
+        committed_by: &str,
+    ) -> bool {
+        let identity = (
+            group_id.to_string(),
+            revision,
+            state_hash.to_string(),
+            committed_by.to_ascii_lowercase(),
+        );
+        {
+            let mut seen = match self.seen_fork_evidence.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            if !seen.insert(identity) {
+                return false;
+            }
+        }
+        self.with_counters(group_id, |c| {
+            c.adoption_fork_evidence = c.adoption_fork_evidence.saturating_add(1);
+        });
+        true
+    }
     /// #469 A2: record a typed invite refusal reason.
     pub fn record_invite_refusal(&self, group_id: &str, reason: &str) {
         self.with_counters(group_id, |c| {
@@ -213,21 +303,6 @@ impl GroupsDiagnostics {
                 .entry(reason.to_string())
                 .or_insert(0);
             *entry = entry.saturating_add(1);
-        });
-    }
-
-    /// #468 A5: record ONE new unique authenticated fork-evidence record.
-    pub fn record_adoption_fork_evidence(&self, group_id: &str) {
-        self.with_counters(group_id, |c| {
-            c.adoption_fork_evidence = c.adoption_fork_evidence.saturating_add(1);
-        });
-    }
-
-    /// #468 A5: record an unauthenticated conflict attempt (per-packet,
-    /// rate-limited by the caller).
-    pub fn record_conflict_unauthenticated(&self, group_id: &str) {
-        self.with_counters(group_id, |c| {
-            c.conflict_unauthenticated = c.conflict_unauthenticated.saturating_add(1);
         });
     }
 
@@ -450,6 +525,19 @@ impl GroupsDiagnostics {
             dst.messages_dropped_decode_failed = dst
                 .messages_dropped_decode_failed
                 .saturating_add(src.messages_dropped_decode_failed);
+            for (reason, count) in &src.invites_refused_reasons {
+                let entry = dst
+                    .invites_refused_reasons
+                    .entry(reason.clone())
+                    .or_insert(0);
+                *entry = entry.saturating_add(*count);
+            }
+            dst.adoption_fork_evidence = dst
+                .adoption_fork_evidence
+                .saturating_add(src.adoption_fork_evidence);
+            dst.conflict_unauthenticated = dst
+                .conflict_unauthenticated
+                .saturating_add(src.conflict_unauthenticated);
             dst.messages_dropped_author_banned = dst
                 .messages_dropped_author_banned
                 .saturating_add(src.messages_dropped_author_banned);
@@ -526,6 +614,17 @@ impl GroupsDiagnostics {
             std::collections::BTreeMap::new();
         for (key, info) in groups {
             let stable_id = info.stable_group_id().to_string();
+            // r3 (Codex 8): the #469 D2 gauge — active seats whose
+            // certificate is digest-only (committed
+            // `certificate_digest`, no bytes) are exactly the seats the
+            // F1 bridge / seat-time hydrate still owes bytes to.
+            let awaiting_certificate = info
+                .members_v2
+                .values()
+                .filter(|m| {
+                    m.is_active() && m.certificate.is_none() && m.certificate_digest.is_some()
+                })
+                .count() as u64;
             rows.entry(stable_id.clone())
                 .or_insert_with(|| GroupDiagnostic {
                     group_id: stable_id.clone(),
@@ -534,7 +633,10 @@ impl GroupsDiagnostics {
                         || metadata_subscribed.contains(&stable_id),
                     subscribed_public: public_subscribed.contains(&stable_id)
                         || public_subscribed.contains(key),
-                    counters: GroupCounters::default(),
+                    counters: GroupCounters {
+                        members_awaiting_certificate: awaiting_certificate,
+                        ..GroupCounters::default()
+                    },
                     causal_queue_entries: causal_gauges
                         .get(key)
                         .or_else(|| causal_gauges.get(&stable_id))
@@ -705,5 +807,120 @@ mod tests {
         assert_eq!(snap.groups[0].group_id, "ghost");
         assert_eq!(snap.groups[0].members_v2_size, 0);
         assert_eq!(snap.groups[0].counters.messages_dropped_other, 1);
+    }
+
+    /// r3 (#468 A5): `conflict_unauthenticated` is rate-limited to one
+    /// increment per group per second — unauthenticated conflict packets
+    /// are freely replayable, and the counter must observe pressure, not
+    /// the attacker's packet rate. The window is per-GROUP: another
+    /// group's conflicts still count.
+    #[test]
+    fn conflict_unauthenticated_is_rate_limited_per_group() {
+        let diag = GroupsDiagnostics::new();
+        diag.record_conflict_unauthenticated("grp", 1_000);
+        // Same group, inside the 1 s window: suppressed.
+        diag.record_conflict_unauthenticated("grp", 1_500);
+        diag.record_conflict_unauthenticated("grp", 1_999);
+        // Window boundary (1_000 + 1_000): counts again.
+        diag.record_conflict_unauthenticated("grp", 2_000);
+        // A different group is independently rate-limited.
+        diag.record_conflict_unauthenticated("other", 1_500);
+
+        let mut groups: HashMap<String, GroupInfo> = HashMap::new();
+        groups.insert("grp".into(), group("Grp", "grp"));
+        groups.insert("other".into(), group("Other", "other"));
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
+        assert_eq!(
+            g.counters.conflict_unauthenticated, 2,
+            "only window-crossing attempts may increment"
+        );
+        let other = snap.groups.iter().find(|g| g.group_id == "other").unwrap();
+        assert_eq!(other.counters.conflict_unauthenticated, 1);
+    }
+
+    /// r3 (#468 A5): fork-evidence diagnostics fire exactly ONCE per
+    /// identity — a second identical conflict must not re-warn or
+    /// re-increment `adoption_fork_evidence`, while a DIFFERENT identity
+    /// for the same group still fires. `committed_by` is
+    /// case-insensitive, mirroring the lineage record's identity check.
+    #[test]
+    fn fork_evidence_once_fires_only_for_new_identities() {
+        let diag = GroupsDiagnostics::new();
+        assert!(diag.record_fork_evidence_once("grp", 7, "hash-a", &"AB".repeat(32)));
+        // Same identity, differently-cased committer: silent.
+        assert!(!diag.record_fork_evidence_once("grp", 7, "hash-a", &"ab".repeat(32)));
+        // Same identity again: silent.
+        assert!(!diag.record_fork_evidence_once("grp", 7, "hash-a", &"AB".repeat(32)));
+        // Different state hash at the same revision: a NEW conflict — fires.
+        assert!(diag.record_fork_evidence_once("grp", 7, "hash-b", &"AB".repeat(32)));
+
+        let mut groups: HashMap<String, GroupInfo> = HashMap::new();
+        groups.insert("grp".into(), group("Grp", "grp"));
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
+        assert_eq!(
+            g.counters.adoption_fork_evidence, 2,
+            "two distinct identities fired; the replay did not"
+        );
+    }
+
+    /// r3 (#469 D2 / Codex 8): the snapshot's `members_awaiting_certificate`
+    /// gauge counts ACTIVE digest-only seats — a committed
+    /// `certificate_digest` without certificate bytes. Inactive seats and
+    /// fully-certified seats do not count.
+    #[test]
+    fn snapshot_counts_active_digest_only_members_as_awaiting_certificate() {
+        let mut info = group("Grp", "grp");
+        info.add_member(
+            "aa".repeat(32),
+            crate::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.add_member(
+            "bb".repeat(32),
+            crate::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        info.add_member(
+            "cc".repeat(32),
+            crate::groups::GroupRole::Member,
+            None,
+            None,
+        );
+        // Digest-only ACTIVE seat — awaiting hydration.
+        info.members_v2
+            .get_mut(&"aa".repeat(32))
+            .unwrap()
+            .certificate_digest = Some("00".repeat(32));
+        // Fully-certified ACTIVE seat — not awaiting.
+        {
+            let seat = info.members_v2.get_mut(&"bb".repeat(32)).unwrap();
+            seat.certificate_digest = Some("11".repeat(32));
+            seat.certificate = Some(certified_stub_certificate());
+        }
+        // Digest-only but NOT active — not awaiting.
+        {
+            let seat = info.members_v2.get_mut(&"cc".repeat(32)).unwrap();
+            seat.state = crate::groups::GroupMemberState::Removed;
+            seat.certificate_digest = Some("22".repeat(32));
+        }
+
+        let mut groups: HashMap<String, GroupInfo> = HashMap::new();
+        groups.insert("grp".into(), info);
+        let diag = GroupsDiagnostics::new();
+        let snap = diag.snapshot(&groups, &HashSet::new(), &HashSet::new(), &HashMap::new());
+        let g = snap.groups.iter().find(|g| g.group_id == "grp").unwrap();
+        assert_eq!(g.counters.members_awaiting_certificate, 1);
+    }
+
+    /// Minimal certificate value for the gauge test — the gauge only
+    /// inspects `certificate.is_some()`, never verifies the bytes.
+    fn certified_stub_certificate() -> crate::identity::AgentCertificate {
+        let owner = crate::identity::UserKeypair::generate().expect("user keypair");
+        let agent = crate::identity::AgentKeypair::generate().expect("agent keypair");
+        crate::identity::AgentCertificate::issue(&owner, &agent).expect("stub cert issue")
     }
 }

@@ -193,14 +193,21 @@ pub const INVITE_MAX_TAGS: usize = 16;
 pub const INVITE_MAX_TAG_LEN: usize = 32;
 /// Maximum `avatar_url` / `banner_url` length (#469 D5).
 pub const INVITE_MAX_URL_LEN: usize = 512;
-/// Maximum roster entries in a v4 invite (#469 D5 / v7 F4). DERIVED from
-/// the final-encoder worst-case fixture (all string caps simultaneous,
-/// two inline keys + two signatures, N certificate-bearing projection
-/// entries with max-length ids/hashes) against BOTH the 40,960 link
-/// safety budget and the 49,152 DM ceiling — the pinned test fails if
-/// this constant is raised above the derived maximum. The final
+/// Maximum roster entries in a v4 invite (#469 D5 / v7 F4 / r3 Codex 11).
+/// DERIVED, not chosen: the final-encoder worst-case fixture (all string
+/// caps simultaneous, two inline keys + two signatures, N
+/// certificate-bearing projection entries with max-length ids/hashes) is
+/// measured BOTH as a bare link against the 40,960-byte
+/// [`INVITE_LINK_MAX_BYTES`] budget AND through the EXACT e2e
+/// `group_join` command-DM wrapper (`x0xtest|cmd|` ‖ base64(JSON
+/// envelope), tests/e2e_vps_groups.py:498-508) against the 49,152-byte
+/// gossip DM ceiling ([`crate::dm::MAX_PAYLOAD_BYTES`]). The link-only
+/// budget alone would admit 38 entries; the wrapped cmd-DM is the
+/// BINDING constraint, and the largest N whose worst case fits BOTH
+/// bounds is 26 — that is the constant. The pinned test fails if the
+/// constant is raised OR lowered off the derived maximum. The final
 /// encoded-size check remains authoritative regardless.
-pub const MAX_INVITE_ROSTER_ENTRIES: usize = 32;
+pub const MAX_INVITE_ROSTER_ENTRIES: usize = 26;
 
 /// Typed refusal reasons for v4 invite verification (#469 A2). These are
 /// the `reason` strings counted by `invites_refused{reason}` and surfaced
@@ -285,9 +292,19 @@ pub struct InviteSignedViewV4 {
     /// equal `public_meta.home_digest` when the latter is present (D1).
     pub base_home: Option<crate::groups::HomeMetadata>,
     /// Secure-group crypto plane at the base revision.
-    pub secure_plane: crate::mls::SecureGroupPlane,
-    /// Full policy snapshot.
-    pub policy: crate::groups::policy::GroupPolicy,
+    /// Option-preserving (r3 Codex 6): `None` and `Some(Gss)` are
+    /// DISTINCT signed states — postcard encodes the Option tag, so a
+    /// defaulted plane can no longer impersonate a legacy-missing one.
+    /// A v4 invite MUST carry the plane; `from_invite` refuses `None`
+    /// with [`InviteRefusal::Unsigned`].
+    pub secure_plane: Option<crate::mls::SecureGroupPlane>,
+    /// Full policy snapshot. Option-preserving (r3 Codex 6): `None` and
+    /// `Some(default)` are DISTINCT signed states — the owner-axis
+    /// countersignature pin below consumes this field, so a collapsed
+    /// discriminant would let a minted-default policy ride in place of
+    /// an unsigned-missing one. A v4 invite MUST carry its policy;
+    /// `from_invite` refuses `None` with [`InviteRefusal::Unsigned`].
+    pub policy: Option<crate::groups::policy::GroupPolicy>,
     /// Base state revision.
     pub base_state_revision: u64,
     /// Base state hash (hex).
@@ -332,8 +349,11 @@ impl InviteSignedViewV4 {
     ///
     /// Returns [`InviteRefusal::Unsigned`] when a legacy fat roster is
     /// present (v4 carries the projection) or any v4-required field is
-    /// missing, and [`InviteRefusal::Malformed`] when a duplicated-meta
-    /// equality rule fails.
+    /// missing — including `policy` and `secure_plane`, which MUST be
+    /// carried verbatim (r3 Codex 6: None ≢ Some(default) in the signed
+    /// bytes, so a missing field is refused rather than defaulted) — and
+    /// [`InviteRefusal::Malformed`] when a duplicated-meta equality rule
+    /// fails.
     pub fn from_invite(invite: &SignedInvite) -> Result<Self, InviteRefusal> {
         // E1: exhaustive destructure — no `..`. The three signature
         // outputs and the legacy fat roster are consumed by name into
@@ -388,6 +408,18 @@ impl InviteSignedViewV4 {
         let base_state_hash = base_state_hash.clone().ok_or(InviteRefusal::Unsigned)?;
         let base_roster = base_roster.clone().ok_or(InviteRefusal::Unsigned)?;
         let base_secret_epoch = (*base_secret_epoch).ok_or(InviteRefusal::Unsigned)?;
+        // r3 (Codex 6): the policy and crypto plane ride the view
+        // VERBATIM — a v4 invite MUST carry both, so a missing field is
+        // a typed Unsigned refusal, never a silent `Some(default)`
+        // substitution (None ≢ Some(default) in the canonical bytes).
+        let secure_plane = *secure_plane;
+        if secure_plane.is_none() {
+            return Err(InviteRefusal::Unsigned);
+        }
+        let policy = policy.clone();
+        if policy.is_none() {
+            return Err(InviteRefusal::Unsigned);
+        }
         let public_meta = public_meta.clone().ok_or(InviteRefusal::Unsigned)?;
         let creator = creator.clone().ok_or(InviteRefusal::Unsigned)?;
         if inviter_public_key_b64.is_empty() {
@@ -433,8 +465,8 @@ impl InviteSignedViewV4 {
             creator,
             public_meta,
             base_home: base_home.clone(),
-            secure_plane: secure_plane.unwrap_or(crate::mls::SecureGroupPlane::Gss),
-            policy: policy.clone().unwrap_or_default(),
+            secure_plane,
+            policy,
             base_state_revision,
             base_state_hash,
             base_prev_state_hash: base_prev_state_hash.clone(),
@@ -834,7 +866,11 @@ impl SignedInvite {
 
         // Owner axis: countersignature required and verified under the
         // inline owner user key, itself bound to the policy's owner id.
-        if let Some(owner_id) = view.policy.admission.owner_certified_user_id() {
+        if let Some(owner_id) = view
+            .policy
+            .as_ref()
+            .and_then(|policy| policy.admission.owner_certified_user_id())
+        {
             let Some(owner_key_b64) = view.owner_public_key_b64.as_deref() else {
                 return Err(InviteRefusal::OwnerCountersignatureMissing);
             };
@@ -1218,7 +1254,7 @@ mod tests {
     /// in `InviteSignedViewV4` (or one of its member types) moves this
     /// digest and fails the pin.
     const PINNED_VIEW_CANONICAL_BLAKE3: &str =
-        "d19b8c48198a63aac9d7263f867cf9a325f2aa8d7adc5970b33c5b20c72ae4ea";
+        "9baf3a5b7076107bb86627579596e676e95aeb6ea9d12608a2f5854f9d80ad59";
 
     /// The fixed-field view pinned by `canonical_bytes_pinned_vector`:
     /// deterministic key bytes, secret, timestamps, roster, and metadata —
@@ -1242,8 +1278,8 @@ mod tests {
                 home_digest: None,
             },
             base_home: None,
-            secure_plane: SecureGroupPlane::TreeKem,
-            policy: GroupPolicy::default(),
+            secure_plane: Some(SecureGroupPlane::TreeKem),
+            policy: Some(GroupPolicy::default()),
             base_state_revision: 7,
             base_state_hash: "aa".repeat(32),
             base_prev_state_hash: Some("bb".repeat(32)),
@@ -1277,12 +1313,12 @@ mod tests {
         invite.invite_secret = "ab".repeat(32);
         invite.created_at = view.created_at;
         invite.expires_at = view.expires_at;
-        invite.policy = Some(view.policy.clone());
+        invite.policy = view.policy.clone();
         invite.genesis_creation_nonce = view.genesis_creation_nonce.clone();
         invite.base_state_revision = Some(view.base_state_revision);
         invite.base_state_hash = Some(view.base_state_hash.clone());
         invite.base_prev_state_hash = view.base_prev_state_hash.clone();
-        invite.secure_plane = Some(view.secure_plane);
+        invite.secure_plane = view.secure_plane;
         invite.base_secret_epoch = Some(view.base_secret_epoch);
         invite.base_security_binding = view.base_security_binding.clone();
         invite.public_meta = Some(view.public_meta.clone());
@@ -1383,6 +1419,22 @@ mod tests {
         let mut t = invite.clone();
         t.creator = None;
         assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        // r3 (Codex 6): the policy and crypto plane are REQUIRED — a
+        // missing field is a typed Unsigned refusal, never defaulted.
+        let mut t = invite.clone();
+        t.policy = None;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::Unsigned),
+            "a v4 invite must carry its policy"
+        );
+        let mut t = invite.clone();
+        t.secure_plane = None;
+        assert_eq!(
+            t.verify_v4_signatures(),
+            Err(InviteRefusal::Unsigned),
+            "a v4 invite must carry its crypto plane"
+        );
         // invite_secret: non-hex text, and valid hex of the wrong length.
         let mut t = invite.clone();
         t.invite_secret = "zz".repeat(32);
@@ -1390,6 +1442,103 @@ mod tests {
         let mut t = invite.clone();
         t.invite_secret = "ab".repeat(31);
         assert_eq!(t.verify_v4_signatures(), Err(InviteRefusal::Malformed));
+    }
+
+    /// r3 (Codex 6): `policy` and `secure_plane` keep their Option
+    /// discriminants in the signed view — `None` and `Some(default)`
+    /// are DISTINCT signed states on the wire (the old
+    /// `unwrap_or(default)` constructor collapsed them) — and a v4
+    /// invite MUST carry both, so every invite-level flip of the
+    /// discriminant maps to a typed refusal instead of a silent default.
+    #[test]
+    fn v4_policy_and_secure_plane_option_discriminants_are_signed() {
+        // View level: flipping ONLY the Option tag moves the canonical
+        // bytes — None ≢ Some(default), both directions, both fields.
+        let none_policy = InviteSignedViewV4 {
+            policy: None,
+            ..pinned_view()
+        };
+        let some_policy = InviteSignedViewV4 {
+            policy: Some(GroupPolicy::default()),
+            ..pinned_view()
+        };
+        assert_ne!(
+            none_policy.canonical_bytes(),
+            some_policy.canonical_bytes(),
+            "policy: None vs Some(default) must be distinct signed states"
+        );
+        let none_plane = InviteSignedViewV4 {
+            secure_plane: None,
+            ..pinned_view()
+        };
+        let some_gss_plane = InviteSignedViewV4 {
+            secure_plane: Some(SecureGroupPlane::Gss),
+            ..pinned_view()
+        };
+        assert_ne!(
+            none_plane.canonical_bytes(),
+            some_gss_plane.canonical_bytes(),
+            "secure_plane: None vs Some(Gss) must be distinct signed states"
+        );
+
+        // Invite level: a signed invite stripped of either field
+        // (Some(default) → None) is a typed Unsigned refusal at BOTH the
+        // view constructor and full verification.
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let mut invite = v4_fixture(&inviter_kp, None);
+        invite.policy = Some(GroupPolicy::default());
+        invite.secure_plane = Some(SecureGroupPlane::Gss);
+        invite
+            .sign_v4(&inviter_kp, None)
+            .expect("sign default-policy Gss invite");
+        assert_eq!(invite.verify_v4_signatures(), Ok(()));
+        type FlipMutator<'a> = (&'a str, &'a dyn Fn(&mut SignedInvite));
+        let flips: [FlipMutator; 2] = [
+            ("policy", &|t: &mut SignedInvite| {
+                t.policy = None;
+            }),
+            ("secure_plane", &|t: &mut SignedInvite| {
+                t.secure_plane = None;
+            }),
+        ];
+        for (label, mutate) in flips {
+            let mut t = invite.clone();
+            mutate(&mut t);
+            assert_eq!(
+                InviteSignedViewV4::from_invite(&t),
+                Err(InviteRefusal::Unsigned),
+                "{label}: Some(default) → None is a typed Unsigned refusal"
+            );
+            assert_eq!(
+                t.verify_v4_signatures(),
+                Err(InviteRefusal::Unsigned),
+                "{label}: verification surfaces the same refusal"
+            );
+        }
+
+        // Mint level: the None → Some(default) direction is unMINTABLE —
+        // `sign_v4` funnels through `from_invite`, so a field-less
+        // candidate surfaces the typed `invite_unsigned` reason string
+        // instead of signing a defaulted view.
+        let flips: [FlipMutator; 2] = [
+            ("policy", &|t: &mut SignedInvite| {
+                t.policy = None;
+            }),
+            ("secure_plane", &|t: &mut SignedInvite| {
+                t.secure_plane = None;
+            }),
+        ];
+        for (label, mutate) in flips {
+            let mut t = invite.clone();
+            mutate(&mut t);
+            let err = t
+                .sign_v4(&inviter_kp, None)
+                .expect_err("a field-less candidate must not sign");
+            assert!(
+                err.contains("invite_unsigned"),
+                "{label}: sign_v4 error must carry the typed refusal, got {err}"
+            );
+        }
     }
 
     #[test]
@@ -1687,6 +1836,9 @@ mod tests {
         boundary.group_created_at = Some(1);
         boundary.group_description = Some("d".repeat(INVITE_MAX_GROUP_DESCRIPTION));
         boundary.invite_secret = "ab".repeat(32);
+        // r3 (Codex 6): the plane is now REQUIRED, not defaulted —
+        // pin it explicitly to the value the old collapse produced.
+        boundary.secure_plane = Some(SecureGroupPlane::Gss);
         boundary.policy = Some(GroupPolicy::default());
         boundary.base_state_revision = Some(1);
         boundary.base_state_hash = Some("aa".repeat(32));
@@ -1800,14 +1952,19 @@ mod tests {
         );
     }
 
-    /// v7 F4: `MAX_INVITE_ROSTER_ENTRIES` is DERIVED, not chosen. The
-    /// worst-case mintable fixture below puts every capped string at its
-    /// cap, carries both inline ML-DSA-65 keys (1 952 B → 2 604 base64
-    /// chars) and both signatures (3 309 B → 4 412 base64 chars), and N
-    /// projection entries with max-length ids/hashes and the longest role
-    /// and state wire strings — measured through the FINAL encoder
-    /// (`to_link`). The largest N fitting the 40 960-byte link budget is
-    /// the derived maximum; raising the constant above it fails here.
+    /// v7 F4 / r3 (Codex 11 + Fable 5): `MAX_INVITE_ROSTER_ENTRIES` is
+    /// DERIVED, not chosen. The worst-case mintable fixture below puts
+    /// every capped string at its cap, carries both inline ML-DSA-65
+    /// keys (1 952 B → 2 604 base64 chars) and both signatures
+    /// (3 309 B → 4 412 base64 chars), and N projection entries with
+    /// max-length ids/hashes and the longest role and state wire
+    /// strings — measured BOTH through the FINAL encoder (`to_link`)
+    /// against the 40 960-byte link budget AND through the EXACT e2e
+    /// command-DM wrapper that carries a `group_join` link
+    /// (tests/e2e_vps_groups.py:498-508) against the 49 152-byte
+    /// gossip DM ceiling. The largest N satisfying BOTH bounds is the
+    /// derived maximum; the constant must equal it exactly — raised OR
+    /// lowered off the maximum, this test fails.
     #[test]
     fn f4_worst_case_link_budget_pins_roster_cap() {
         fn worst_case(n: usize) -> SignedInvite {
@@ -1874,38 +2031,306 @@ mod tests {
             invite
         }
 
+        /// Exact byte-replica of the e2e `group_join` command-DM
+        /// (tests/e2e_vps_groups.py:498-508): `b"x0xtest|cmd|"` ‖
+        /// standard-base64(JSON envelope) — json.dumps DEFAULT
+        /// separators (", " and ": "), dict order command_id,
+        /// target_node, action, anchor_aid, params{invite, request_id,
+        /// anchor_aid} — with the fixed shapes the fleet script uses:
+        /// uuid4 command/request ids, a 64-hex anchor agent id, and the
+        /// longest default node name ("nuremberg").
+        fn group_join_cmd_dm(invite_link: &str) -> Vec<u8> {
+            let uuid = "01234567-89ab-cdef-0123-456789abcdef";
+            let anchor_aid = "5a".repeat(32);
+            let params = format!(
+                "{{\"invite\": \"{link}\", \"request_id\": \"{uuid}\", \
+                 \"anchor_aid\": \"{aid}\"}}",
+                link = invite_link,
+                uuid = uuid,
+                aid = anchor_aid
+            );
+            let envelope = format!(
+                "{{\"command_id\": \"{uuid}\", \"target_node\": \"nuremberg\", \
+                 \"action\": \"group_join\", \"anchor_aid\": \"{aid}\", \
+                 \"params\": {params}}}",
+                uuid = uuid,
+                aid = anchor_aid,
+                params = params
+            );
+            let mut wire = b"x0xtest|cmd|".to_vec();
+            wire.extend_from_slice(B64_STD.encode(envelope.as_bytes()).as_bytes());
+            wire
+        }
+
         // The fixture is a MINTABLE worst case at the constant: structural
-        // rules hold, no D5 cap fires, and the final encoder accepts it.
+        // rules hold, no D5 cap fires, and BOTH the final encoder and
+        // the exact cmd-DM wrapper accept it.
         let at_cap = worst_case(MAX_INVITE_ROSTER_ENTRIES);
         assert!(InviteSignedViewV4::from_invite(&at_cap).is_ok());
         assert_eq!(at_cap.v4_field_caps_violation(), None);
         let cap_link = at_cap
             .encode_link()
-            .expect("worst case at the roster cap fits the budget");
+            .expect("worst case at the roster cap fits the link budget");
         assert!(cap_link.len() <= INVITE_LINK_MAX_BYTES);
+        assert!(
+            group_join_cmd_dm(&cap_link).len() <= crate::dm::MAX_PAYLOAD_BYTES,
+            "worst case at the roster cap must fit the {}-byte gossip DM ceiling",
+            crate::dm::MAX_PAYLOAD_BYTES
+        );
 
-        // Derive the largest N whose worst-case link fits (link length is
-        // monotonic in N, so stop at the first overflow).
+        // Derive the largest N whose worst case fits BOTH bounds (link
+        // length is monotonic in N, so stop at the first overflow).
         let mut derived_max = 0usize;
         for n in 1..=1024usize {
-            if worst_case(n).to_link().len() <= INVITE_LINK_MAX_BYTES {
+            let link = worst_case(n).to_link();
+            if link.len() <= INVITE_LINK_MAX_BYTES
+                && group_join_cmd_dm(&link).len() <= crate::dm::MAX_PAYLOAD_BYTES
+            {
                 derived_max = n;
             } else {
                 break;
             }
         }
-        assert!(
-            MAX_INVITE_ROSTER_ENTRIES <= derived_max,
-            "MAX_INVITE_ROSTER_ENTRIES ({MAX_INVITE_ROSTER_ENTRIES}) exceeds the \
-             worst-case derived maximum ({derived_max})"
+        // The constant IS the derived maximum — raising it above, or
+        // lowering it off, the maximum fails here.
+        assert_eq!(
+            MAX_INVITE_ROSTER_ENTRIES,
+            derived_max,
+            "MAX_INVITE_ROSTER_ENTRIES must equal the largest worst-case N \
+             fitting BOTH the {INVITE_LINK_MAX_BYTES}-byte link budget and the \
+             {}-byte cmd-DM ceiling",
+            crate::dm::MAX_PAYLOAD_BYTES
         );
-        // The final encoder refuses the first over-budget N.
-        let over_budget = worst_case(derived_max + 1);
+        // The wrapper is the BINDING bound at the maximum: the first N
+        // past it still fits the bare link budget but overflows the DM
+        // ceiling once wrapped.
+        let first_over = worst_case(derived_max + 1);
+        let first_over_link = first_over.to_link();
+        assert!(
+            first_over_link.len() <= INVITE_LINK_MAX_BYTES,
+            "the link budget alone must still admit derived_max + 1 \
+             (the wrapper is the binding constraint)"
+        );
+        assert!(
+            group_join_cmd_dm(&first_over_link).len() > crate::dm::MAX_PAYLOAD_BYTES,
+            "the first N past the derived max must overflow the wrapped \
+             cmd-DM ceiling"
+        );
+        // The final encoder remains authoritative for link-only growth:
+        // it refuses the first N whose bare link overflows the budget.
+        let mut link_only_max = derived_max;
+        for n in derived_max + 1..=1024usize {
+            if worst_case(n).to_link().len() <= INVITE_LINK_MAX_BYTES {
+                link_only_max = n;
+            } else {
+                break;
+            }
+        }
+        let over_budget = worst_case(link_only_max + 1);
         let err = over_budget
             .encode_link()
-            .expect_err("first over-budget N must be refused");
+            .expect_err("first link-over-budget N must be refused");
         assert_eq!(err.limit, INVITE_LINK_MAX_BYTES);
         assert_eq!(err.actual, over_budget.to_link().len());
         assert!(err.actual > INVITE_LINK_MAX_BYTES);
+    }
+
+    // ─── r3 (Fable 5): v0.40.4 cross-version fixtures ────────────────────
+
+    /// Byte-faithful replica of the v0.40.4 wire types a v0.40.4 node
+    /// parses invites with — tag-copied from `git show
+    /// v0.40.4:src/groups/invite.rs` (the pre-#469 field set: no
+    /// `base_home`, no version/public-meta/projection/inline-key/
+    /// signature fields) and `git show v0.40.4:src/groups/policy.rs`
+    /// (the policy mirror WITHOUT the ADR-0038 `owner_certified`
+    /// admission variant). Deserializing into these types behaves
+    /// exactly like a v0.40.4 node reading invite JSON.
+    mod replica_v0_40_4 {
+        use serde::{Deserialize, Serialize};
+        use std::collections::BTreeMap;
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupDiscoverability {
+            #[default]
+            Hidden,
+            ListedToContacts,
+            PublicDirectory,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupAdmission {
+            #[default]
+            InviteOnly,
+            RequestAccess,
+            OpenJoin,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupConfidentiality {
+            #[default]
+            MlsEncrypted,
+            SignedPublic,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupReadAccess {
+            #[default]
+            MembersOnly,
+            Public,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupWriteAccess {
+            #[default]
+            MembersOnly,
+            ModeratedPublic,
+        }
+
+        #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct GroupPolicy {
+            pub discoverability: GroupDiscoverability,
+            pub admission: GroupAdmission,
+            pub confidentiality: GroupConfidentiality,
+            pub read_access: GroupReadAccess,
+            pub write_access: GroupWriteAccess,
+        }
+
+        /// Tag-copied v0.40.4 `SignedInvite` — the pre-#469 field set.
+        #[derive(Debug, Clone, Serialize, Deserialize)]
+        pub struct SignedInvite {
+            pub group_id: String,
+            #[serde(default)]
+            pub stable_group_id: Option<String>,
+            #[serde(default)]
+            pub group_created_at: Option<u64>,
+            pub group_name: String,
+            #[serde(default)]
+            pub group_description: Option<String>,
+            #[serde(default)]
+            pub policy: Option<GroupPolicy>,
+            #[serde(default)]
+            pub genesis_creation_nonce: Option<String>,
+            #[serde(default)]
+            pub base_state_revision: Option<u64>,
+            #[serde(default)]
+            pub base_state_hash: Option<String>,
+            #[serde(default)]
+            pub base_members_v2: Option<BTreeMap<String, crate::groups::GroupMember>>,
+            #[serde(default)]
+            pub base_prev_state_hash: Option<String>,
+            #[serde(default)]
+            pub secure_plane: Option<crate::mls::SecureGroupPlane>,
+            #[serde(default)]
+            pub base_secret_epoch: Option<u64>,
+            #[serde(default)]
+            pub base_security_binding: Option<String>,
+            pub inviter: String,
+            pub invite_secret: String,
+            pub created_at: u64,
+            pub expires_at: u64,
+            #[serde(default)]
+            pub signature: String,
+        }
+    }
+
+    /// A v0.40.4-minted invite, populated the way an old authority
+    /// minted them (fat base roster, TreeKEM plane, vestigial-empty
+    /// `signature`).
+    fn replica_v0_40_4_invite() -> replica_v0_40_4::SignedInvite {
+        let hex64 = || "ab".repeat(32);
+        let mut base_members_v2 = BTreeMap::new();
+        base_members_v2.insert(
+            "11".repeat(32),
+            GroupMember::new_admin("11".repeat(32), None, 1_699_000_000),
+        );
+        replica_v0_40_4::SignedInvite {
+            group_id: "cd".repeat(32),
+            stable_group_id: Some("cd".repeat(32)),
+            group_created_at: Some(1_699_000_000),
+            group_name: "legacy group".to_string(),
+            group_description: Some("legacy description".to_string()),
+            policy: Some(replica_v0_40_4::GroupPolicy::default()),
+            genesis_creation_nonce: Some(hex64()),
+            base_state_revision: Some(7),
+            base_state_hash: Some(hex64()),
+            base_members_v2: Some(base_members_v2),
+            base_prev_state_hash: Some(hex64()),
+            secure_plane: Some(SecureGroupPlane::TreeKem),
+            base_secret_epoch: Some(3),
+            base_security_binding: Some(hex64()),
+            inviter: "12".repeat(32),
+            invite_secret: hex64(),
+            created_at: 1_700_000_000,
+            expires_at: 1_700_086_400,
+            signature: String::new(),
+        }
+    }
+
+    /// (a) old → new: a v0.40.4-minted invite PARSES as the current
+    /// `SignedInvite` (every post-v0.40.4 field defaults), and the v4
+    /// authentication then refuses it with the typed `invite_unsigned`
+    /// (the version sentinel 0) — legacy links fail closed at the auth
+    /// gate, never as a parse error.
+    #[test]
+    fn v0_40_4_replica_invite_parses_then_refuses_unsigned() {
+        let json = serde_json::to_string(&replica_v0_40_4_invite()).expect("serialize replica");
+        let parsed: SignedInvite =
+            serde_json::from_str(&json).expect("v0.40.4 invite JSON parses into the current type");
+        assert_eq!(
+            parsed.version, 0,
+            "absent version deserializes as the legacy sentinel"
+        );
+        assert!(parsed.public_meta.is_none());
+        assert!(parsed.base_roster.is_none());
+        assert_eq!(
+            InviteSignedViewV4::from_invite(&parsed),
+            Err(InviteRefusal::Unsigned)
+        );
+        assert_eq!(parsed.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+    }
+
+    /// (b) new ordinary → old: a current v4 invite on the DEFAULT
+    /// admission axis serializes into field shapes a v0.40.4 node still
+    /// parses (unknown post-v0.40.4 fields are ignored there; the
+    /// legacy fields it consumed are intact).
+    #[test]
+    fn v4_ordinary_invite_json_parses_as_v0_40_4_replica() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let mut invite = v4_fixture(&inviter_kp, None);
+        invite
+            .sign_v4(&inviter_kp, None)
+            .expect("sign ordinary v4 invite");
+        let json = serde_json::to_string(&invite).expect("serialize v4 invite");
+        let old: replica_v0_40_4::SignedInvite = serde_json::from_str(&json)
+            .expect("ordinary v4 invite JSON parses on the v0.40.4 replica");
+        assert_eq!(old.group_name, "fixture group");
+        assert_eq!(old.policy, Some(replica_v0_40_4::GroupPolicy::default()));
+        assert_eq!(old.secure_plane, Some(SecureGroupPlane::TreeKem));
+    }
+
+    /// (c) new Home(owner-axis) → old: the owner-axis policy serializes
+    /// `"admission":{"owner_certified":…}` — the v0.40.4 replica (like a
+    /// real v0.40.4 node) fails on the unknown admission variant and
+    /// drops the invite. Pre-existing fail-closed compat, pinned here.
+    #[test]
+    fn v4_owner_axis_invite_fails_on_v0_40_4_replica_unknown_admission() {
+        let inviter_kp = AgentKeypair::generate().expect("agent keypair");
+        let owner_kp = UserKeypair::generate().expect("user keypair");
+        let mut invite = v4_fixture(&inviter_kp, Some(&owner_kp));
+        invite
+            .sign_v4(&inviter_kp, Some(&owner_kp))
+            .expect("sign owner-axis invite");
+        let json = serde_json::to_string(&invite).expect("serialize owner-axis invite");
+        let err = serde_json::from_str::<replica_v0_40_4::SignedInvite>(&json)
+            .expect_err("the unknown `owner_certified` admission variant must fail closed");
+        assert!(
+            err.to_string().contains("owner_certified"),
+            "error must name the unknown variant, got: {err}"
+        );
     }
 }

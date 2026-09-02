@@ -412,6 +412,7 @@ mod tests {
         use axum::response::IntoResponse as _;
         let response = get_agent_card(
             State(Arc::clone(&state)),
+            None,
             axum::extract::Query(CardQuery {
                 display_name: Some("query-param-name".to_string()),
                 include_groups: None,
