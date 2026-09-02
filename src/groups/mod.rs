@@ -1115,6 +1115,7 @@ impl GroupInfo {
         self.commit_log.push(state_commit::RetainedCommit::capture(
             commit.clone(),
             &self.members_v2,
+            self.public_meta(),
         ));
         if self.commit_log.len() > COMMIT_LOG_CAP {
             let overflow = self.commit_log.len() - COMMIT_LOG_CAP;
@@ -1262,6 +1263,186 @@ impl GroupInfo {
         commit: &state_commit::GroupStateCommit,
     ) -> Result<(), state_commit::ApplyError> {
         self.finalize_applied_commit_with_terminal_mode(commit, false)
+    }
+
+    /// #458 (review r2): finalize a commit a joiner stub ADOPTED across a
+    /// `prev_state_hash` gap, WITHOUT ever blind-copying the commit's
+    /// chain fields onto content they do not cover.
+    ///
+    /// Verified before anything mutates:
+    /// - the reconstructed roster's root equals the commit's SIGNED
+    ///   `roster_root` — the joiner's seat, role, state and committed
+    ///   certificate are exactly what the authority signed;
+    /// - the last-admin invariant holds on that roster.
+    ///
+    /// Then the joiner FORKS its local chain at its own frontier, keeping
+    /// internal consistency: `state_revision` advances to the commit's
+    /// revision and `security_binding` follows the commit (an epoch
+    /// input), but `prev_state_hash` chains from the LOCAL hash and
+    /// `state_hash` is RECOMPUTED from local content — never copied.
+    /// Copying the commit's hash would bind the joiner's stored hash to
+    /// intermediate metadata (e.g. a rename) the stub never saw, leaving
+    /// hash ≠ content; the next normal apply/seal would then recompute
+    /// and reject, wedging the very joiner this path exists to free.
+    /// A forked joiner converges on later authority commits through this
+    /// same roster-root-verified path until a full resync (restart,
+    /// catch-up) rebuilds the chain link.
+    /// #458 r4: fold a VERIFIED roster projection (its root already
+    /// re-derived the signed `roster_root`) into the live roster: entries
+    /// adopt the projection's role/state, members absent from the
+    /// projection are removed (the projection is authoritative), and
+    /// projection-only members are added minimally. Certificates already
+    /// embedded in the local roster are preserved when their digest still
+    /// matches the projection's.
+    pub fn apply_reconstructed_roster(
+        &mut self,
+        projection: &BTreeMap<String, state_commit::RosterMemberSnapshot>,
+    ) {
+        // Remove entries the projection dropped (or made non-root-visible).
+        let dropped: Vec<String> = self
+            .members_v2
+            .keys()
+            .filter(|id| !projection.contains_key(*id))
+            .cloned()
+            .collect();
+        for id in dropped {
+            self.members_v2.remove(&id);
+        }
+        for (id, snap) in projection {
+            match self.members_v2.get_mut(id) {
+                Some(member) => {
+                    member.role = snap.role;
+                    member.state = snap.state;
+                    let local_digest = member
+                        .certificate
+                        .as_ref()
+                        .map(owner_cert::certificate_digest_hex);
+                    if local_digest.as_deref() != snap.certificate_digest.as_deref() {
+                        // The projection is authoritative for cert presence;
+                        // a matching local cert keeps its full bytes.
+                        member.certificate = None;
+                    }
+                }
+                None => {
+                    let mut member =
+                        GroupMember::new_member(id.clone(), None, None, self.updated_at);
+                    member.role = snap.role;
+                    member.state = snap.state;
+                    self.members_v2.insert(id.clone(), member);
+                }
+            }
+        }
+    }
+
+    /// #458 r4: finalize the RECONSTRUCTED adoption. Unlike the r3 fork
+    /// variant, the reconstruction must re-derive the terminal commit's
+    /// FULL state hash — hash == content by construction; a differing
+    /// hash is a failure. The metadata fields fold from the verified
+    /// reconstruction, the chain fields from the terminal commit, and the
+    /// entire verified chain is retained for audit.
+    pub fn finalize_adopted_commit_reconstructed(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+        meta: &state_commit::GroupPublicMeta,
+        chain: &[state_commit::RetainedCommit],
+    ) -> Result<(), state_commit::ApplyError> {
+        if self.withdrawn && !commit.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+        // Fold the verified metadata so content matches the hash we adopt.
+        self.name = meta.name.clone();
+        self.description = meta.description.clone();
+        self.tags = meta.tags.clone();
+        self.avatar_url = meta.avatar_url.clone();
+        self.banner_url = meta.banner_url.clone();
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        if roster_root != commit.roster_root {
+            return Err(state_commit::ApplyError::RosterRootMismatch {
+                expected: commit.roster_root.clone(),
+                got: roster_root,
+            });
+        }
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        let recomputed = state_commit::compute_state_hash(
+            self.stable_group_id(),
+            commit.revision,
+            commit.prev_state_hash.as_deref(),
+            &roster_root,
+            &commit.policy_hash,
+            &state_commit::compute_public_meta_hash(&self.public_meta()),
+            commit.security_binding.as_deref(),
+            commit.withdrawn,
+        );
+        if recomputed != commit.state_hash {
+            return Err(state_commit::ApplyError::StateHashMismatch {
+                expected: commit.state_hash.clone(),
+                got: recomputed,
+            });
+        }
+        // #458 r5d — GSS/Legacy `security_binding`: for non-TreeKEM
+        // planes the binding string ("gss:epoch=N") is NOT tied to any
+        // key material a joiner can independently verify; adopting it from
+        // the verified terminal commit makes it HASH-CONSISTENT-ONLY (the
+        // full-hash equality above proves the authority committed to this
+        // exact string). TreeKEM planes bind epochs to the snapshot the
+        // rebind path verifies separately. Adoption itself is restricted
+        // to OwnerCertified groups anchored by the owner-signed head
+        // attestation, which is the real integrity bound here.
+        self.security_binding = commit.security_binding.clone();
+        self.state_revision = commit.revision;
+        self.prev_state_hash = commit.prev_state_hash.clone();
+        self.state_hash = commit.state_hash.clone();
+        for link in chain {
+            self.commit_log.push(link.clone());
+        }
+        if self.commit_log.len() > COMMIT_LOG_CAP {
+            let overflow = self.commit_log.len() - COMMIT_LOG_CAP;
+            self.commit_log.drain(0..overflow);
+        }
+        self.retain_commit(commit);
+        Ok(())
+    }
+
+    /// #458 r3: the chain-verified variant — retains the ENTIRE verified
+    /// intervening chain (each link already signature- and linkage-checked
+    /// by the caller) ahead of the terminal commit, so the adopted view's
+    /// audit history matches what was actually verified.
+    pub fn finalize_adopted_commit_roster_checked_with_chain(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+        chain: &[state_commit::GroupStateCommit],
+    ) -> Result<(), state_commit::ApplyError> {
+        let result = self.finalize_adopted_commit_roster_checked(commit);
+        if result.is_ok() {
+            for link in chain {
+                self.retain_commit(link);
+            }
+        }
+        result
+    }
+
+    pub fn finalize_adopted_commit_roster_checked(
+        &mut self,
+        commit: &state_commit::GroupStateCommit,
+    ) -> Result<(), state_commit::ApplyError> {
+        if self.withdrawn && !commit.withdrawn {
+            return Err(state_commit::ApplyError::Withdrawn);
+        }
+        let roster_root = state_commit::compute_roster_root(&self.members_v2);
+        if roster_root != commit.roster_root {
+            return Err(state_commit::ApplyError::RosterRootMismatch {
+                expected: commit.roster_root.clone(),
+                got: roster_root,
+            });
+        }
+        state_commit::enforce_last_admin_invariant(&self.members_v2, self.withdrawn)?;
+        let prev = self.state_hash.clone();
+        self.security_binding = commit.security_binding.clone();
+        self.state_revision = commit.revision;
+        self.prev_state_hash = Some(prev);
+        self.recompute_state_hash();
+        self.retain_commit(commit);
+        Ok(())
     }
 
     /// Finalize an explicitly terminal, already-authorized withdrawal commit.

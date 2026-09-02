@@ -386,6 +386,9 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     invite.genesis_creation_nonce = info.genesis.as_ref().map(|g| g.creation_nonce.clone());
     invite.base_state_revision = Some(info.state_revision);
     invite.base_state_hash = Some(info.state_hash.clone());
+    // #458 r3: the base hash commits to the Home metadata digest — carry
+    // the metadata so the joiner's stub can actually recompute it.
+    invite.base_home = info.home.clone();
     // Issue #205: strip per-member crypto material that contributes nothing to
     // invite validation. `roster_root` commits only to `(id, role, state)`
     // triples (state_commit.rs), the link is unsigned, and admission is the

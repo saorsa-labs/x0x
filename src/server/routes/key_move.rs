@@ -825,6 +825,101 @@ mod tests {
         Ok(())
     }
 
+    /// #459 (E1 P2): after the owner issues an ADDITIONAL certificate, the
+    /// lazy re-mint batch is Pinned-only (the local agent is already
+    /// minted Roaming and is skipped as idempotent). The ≥1-Roaming
+    /// refusal must evaluate the RESULTING ledger — existing Roaming
+    /// placements count — instead of failing the whole batch with
+    /// 409 "no Roaming agent" and making GET /owner/placement unreadable.
+    #[tokio::test]
+    async fn issue459_placement_stays_readable_after_additional_certificate() -> anyhow::Result<()>
+    {
+        let dir = tempfile::tempdir()?;
+        let data_dir = dir.path();
+        let owner_seed = [0x59u8; 32];
+        let user =
+            crate::identity::UserKeypair::from_seed(&owner_seed).map_err(anyhow::Error::from)?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_user_key(
+                    crate::identity::UserKeypair::from_seed(&owner_seed)
+                        .map_err(anyhow::Error::from)?,
+                )
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_identity_dir(data_dir)
+                .with_move_ceremony(true)
+                .build()
+                .await?,
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            data_dir, agent,
+        )
+        .await?;
+
+        // First read: lazy mint — local agent Roaming.
+        let response = owner_placement(State(Arc::clone(&state)), owner_ext())
+            .await
+            .into_response();
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(
+            body.get("home_invariant_ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "first mint must yield >=1 Roaming: {body:?}"
+        );
+
+        // Issue an additional certificate for a NEW roster agent (the E1
+        // step-7 recipe: `owner agents issue <PUB> --mode acp`) — appends
+        // to the issuance journal the roster derives from.
+        let remote = crate::identity::AgentKeypair::generate().map_err(anyhow::Error::from)?;
+        let cert = crate::identity::AgentCertificate::issue_for_public_key(
+            &user,
+            remote.public_key().as_bytes(),
+            None,
+        )
+        .map_err(anyhow::Error::from)?;
+        let record = crate::profile::IssuedCertRecord::from_cert_with_mode(
+            &user.user_id(),
+            &cert,
+            crate::profile::CertMode::Acp,
+            Some("issue459-remote".to_string()),
+        )
+        .expect("journal record");
+        let journal_path = state
+            .agent
+            .cert_journal_path()
+            .map(std::path::Path::to_path_buf)
+            .expect("cert journal configured (identity_dir set)");
+        crate::profile::IssuedCertRecord::append(&journal_path, &record).await?;
+
+        // The regression: the second mint batch is Pinned-only, but the
+        // ledger ALREADY holds a Roaming placement — must succeed.
+        let response = owner_placement(State(Arc::clone(&state)), owner_ext())
+            .await
+            .into_response();
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "#459: GET /owner/placement must stay readable after issuing an additional cert"
+        );
+        let body: serde_json::Value =
+            serde_json::from_slice(&axum::body::to_bytes(response.into_body(), 1 << 20).await?)?;
+        assert_eq!(
+            body.get("home_invariant_ok").and_then(|v| v.as_bool()),
+            Some(true),
+            "the grown roster must still satisfy >=1 Roaming: {body:?}"
+        );
+        assert_eq!(
+            body.get("roaming_count").and_then(|v| v.as_u64()),
+            Some(1),
+            "local agent stays the one Roaming placement: {body:?}"
+        );
+        Ok(())
+    }
+
     fn response_status(_body: &serde_json::Value) {}
 }
 

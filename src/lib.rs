@@ -2212,6 +2212,70 @@ async fn upsert_discovered_agent(
     }
 }
 
+/// #447: merge an announce-blob pair into the discovery entry the moment a
+/// background `ensure_blob` fetch completes, instead of waiting for the
+/// agent's next announce (600 s heartbeat). Mirrors the ingest-time merge
+/// semantics of [`upsert_discovered_agent`]: promote the cert + user_id,
+/// never demote existing evidence, and re-check the certificate binds THIS
+/// agent (the digest is attacker-choosable; the blob cache verifies against
+/// the agent that triggered the fetch, which is the same agent here).
+/// Bounded: polls for at most ~2× the fetch timeout, then gives up (the
+/// next heartbeat's cache hit takes over).
+async fn patch_discovery_entry_when_blob_lands(
+    cache: &std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    >,
+    blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    digest: &[u8; 32],
+    agent_id: &identity::AgentId,
+) {
+    let attempts = (announce_blob::BLOB_FETCH_TIMEOUT_SECS * 2).max(1);
+    for _ in 0..attempts {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let Some(blob) = blob_cache.get(digest).await else {
+            continue;
+        };
+        let Some(cert) = blob.agent_certificate.as_ref() else {
+            return; // anonymous pair fetched — nothing to attach
+        };
+        if !cert.agent_id().is_ok_and(|id| id == *agent_id) || cert.user_id().ok() != blob.user_id {
+            tracing::debug!(
+                agent = %hex::encode(agent_id.0),
+                "announce blob landed but binds a different agent; not patching discovery entry (#447)"
+            );
+            return;
+        }
+        let mut cache = cache.write().await;
+        if let Some(entry) = cache.get_mut(agent_id) {
+            // FRESHNESS GATE (review r2, #447): the entry's LATEST announce
+            // must still commit to the digest this fetch resolved. Between
+            // the fetch being triggered and landing, a newer announce can
+            // have moved the entry to digest D2 — the normal upsert would
+            // DROP the old cert there (see `upsert_discovered_agent`'s
+            // digest-change branch); this async path must not re-attach
+            // the superseded D1 evidence on top of it.
+            if entry.cert_digest != Some(*digest) {
+                tracing::debug!(
+                    agent = %hex::encode(&agent_id.0[..8]),
+                    current_digest = ?entry.cert_digest.map(hex::encode),
+                    "announce blob landed for a superseded digest; not patching (#447 r2)"
+                );
+                return;
+            }
+            if entry.agent_certificate.is_none() {
+                entry.user_id = blob.user_id;
+                entry.cert_not_after = cert.not_after();
+                entry.agent_certificate = Some(cert.clone());
+                tracing::debug!(
+                    agent = %hex::encode(&agent_id.0[..8]),
+                    "patched discovery entry from completed announce-blob fetch (#447)"
+                );
+            }
+        }
+        return;
+    }
+}
+
 fn sort_discovered_machine(machine: &mut DiscoveredMachine) {
     // Addresses stay in observation order (LRU at front, MRU at back).
     // Sorting them would make eviction drop "first after sort" instead of
@@ -8584,6 +8648,28 @@ impl Agent {
                                         &converted.machine_id,
                                     )
                                     .await;
+                                // #447: the fetch is async — nothing used to
+                                // re-attach the pair to the discovery entry
+                                // when it completed, so `user_id`/cert stayed
+                                // invisible until the agent's NEXT announce
+                                // (600 s heartbeat). Watch briefly for the
+                                // fetch result and merge it the moment it
+                                // lands (bounded: the fetch itself gives up
+                                // after BLOB_FETCH_TIMEOUT_SECS).
+                                let watch_cache = std::sync::Arc::clone(&cache);
+                                let watch_blob_cache =
+                                    std::sync::Arc::clone(&announce_blob_cache);
+                                let watch_digest = cert_digest;
+                                let watch_agent = converted.agent_id;
+                                tokio::spawn(async move {
+                                    patch_discovery_entry_when_blob_lands(
+                                        &watch_cache,
+                                        &watch_blob_cache,
+                                        &watch_digest,
+                                        &watch_agent,
+                                    )
+                                    .await;
+                                });
                             }
                         }
                     }
@@ -10307,9 +10393,21 @@ impl Agent {
         if mints.is_empty() {
             return Ok(0);
         }
-        // Refuse an all-Pinned mint (the local-agent exception above makes
-        // this reachable only when the local agent is not on the roster).
-        let any_roaming = mints.iter().any(|m| {
+        // Refuse a mint that would leave the RESULTING ledger with no
+        // Roaming agent (#459). The invariant is over the owner's
+        // placements — existing records count: after the first lazy mint
+        // (local agent Roaming), issuing an additional certificate makes
+        // every LATER batch Pinned-only, and checking the batch alone
+        // turned a healthy ledger into a 409 "no Roaming agent" on
+        // GET /owner/placement.
+        let existing_roaming = {
+            let state = self.move_state.read().await;
+            state
+                .placement_view()
+                .values()
+                .any(|record| record.placement == key_move::Placement::Roaming)
+        };
+        let batch_roaming = mints.iter().any(|m| {
             matches!(
                 m.record,
                 key_move::MoveRecord::PlacementMint {
@@ -10318,7 +10416,7 @@ impl Agent {
                 }
             )
         });
-        if !any_roaming {
+        if !existing_roaming && !batch_roaming {
             return Err(error::IdentityError::CertificateVerification(
                 "mint refused: no Roaming agent among the owner's placements (ADR-0038 ≥1-Roaming)"
                     .to_string(),
@@ -22519,6 +22617,165 @@ async fn upsert_self_name_sets_renames_clears_and_preserves() {
             .and_then(|a| a.self_name.clone()),
         None,
         "an explicit X0A4 clear must erase the cached name"
+    );
+}
+
+/// #447: the async announce-blob fetch lands only in the blob cache — the
+/// discovery entry stayed digest-only (no user_id, no cert) until the
+/// agent's NEXT announce (600 s heartbeat), so admission checks answered
+/// `no agent certificate resolved` even though verified evidence was
+/// already cached. The watcher must merge the pair the moment it lands,
+/// and must NOT import a cert bound to a different agent.
+#[tokio::test]
+async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x47; 32]).expect("owner kp");
+    let joiner = identity::AgentKeypair::generate().expect("joiner kp");
+    let cert = identity::AgentCertificate::issue_for_public_key(
+        &user_kp,
+        joiner.public_key().as_bytes(),
+        None,
+    )
+    .expect("joiner cert");
+    let digest = announce_v3::cert_digest(&cert.user_id().ok(), &Some(cert.clone()));
+
+    let cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut entry = discovered_agent_fixture(0x47, 100, &[], None);
+    entry.agent_id = joiner.agent_id();
+    entry.cert_digest = Some(digest);
+    entry.agent_certificate = None;
+    entry.user_id = None;
+    upsert_discovered_agent(&cache, entry).await;
+
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest,
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert.clone()),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+
+    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &digest, &joiner.agent_id()).await;
+    let patched = cache
+        .read()
+        .await
+        .get(&joiner.agent_id())
+        .cloned()
+        .expect("entry");
+    assert_eq!(
+        patched.agent_certificate.as_ref(),
+        Some(&cert),
+        "#447: cert attached"
+    );
+    assert_eq!(
+        patched.user_id,
+        cert.user_id().ok(),
+        "#447: user_id attached"
+    );
+
+    // Negative: a blob whose cert binds ANOTHER agent never patches.
+    let other = identity::AgentKeypair::generate().expect("other kp");
+    let other_cert = identity::AgentCertificate::issue_for_public_key(
+        &user_kp,
+        other.public_key().as_bytes(),
+        None,
+    )
+    .expect("other cert");
+    let other_digest =
+        announce_v3::cert_digest(&other_cert.user_id().ok(), &Some(other_cert.clone()));
+    let mut other_entry = discovered_agent_fixture(0x48, 100, &[], None);
+    other_entry.agent_id = other.agent_id();
+    other_entry.cert_digest = Some(other_digest);
+    other_entry.agent_certificate = None;
+    upsert_discovered_agent(&cache, other_entry).await;
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest: other_digest,
+            // A copied digest: the cached pair binds the JOINER, not the
+            // announcing agent.
+            user_id: cert.user_id().ok(),
+            agent_certificate: Some(cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &other_digest, &other.agent_id())
+        .await;
+    let not_patched = cache
+        .read()
+        .await
+        .get(&other.agent_id())
+        .cloned()
+        .expect("entry");
+    assert!(
+        not_patched.agent_certificate.is_none(),
+        "#447: a copied digest must not import another agent's cert"
+    );
+}
+
+/// #447 r2: a DELAYED fetch for superseded digest D1 must not attach its
+/// evidence after a newer announce moved the entry to D2 — the normal
+/// upsert clears the cert on a digest change, and the async watcher must
+/// not resurrect it. Only evidence matching the CURRENT announce digest
+/// may attach.
+#[tokio::test]
+async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
+    let user_kp = identity::UserKeypair::from_seed(&[0x48; 32]).expect("owner kp");
+    let agent = identity::AgentKeypair::generate().expect("agent kp");
+    let old_cert = identity::AgentCertificate::issue_for_public_key(
+        &user_kp,
+        agent.public_key().as_bytes(),
+        None,
+    )
+    .expect("old cert");
+    let d1 = announce_v3::cert_digest(&old_cert.user_id().ok(), &Some(old_cert.clone()));
+
+    let cache: std::sync::Arc<
+        tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
+    > = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let mut entry = discovered_agent_fixture(0x48, 100, &[], None);
+    entry.agent_id = agent.agent_id();
+    entry.cert_digest = Some(d1);
+    upsert_discovered_agent(&cache, entry).await;
+
+    // The D1 fetch completes and lands in the blob cache…
+    let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
+    blob_cache
+        .insert_verified(announce_blob::CachedBlob {
+            digest: d1,
+            user_id: old_cert.user_id().ok(),
+            agent_certificate: Some(old_cert),
+            payload_version: 1,
+            fetched_at_unix: 1,
+        })
+        .await;
+
+    // …but a NEWER announce already moved the entry to D2 (re-key/re-issue).
+    let d2 = [0xD2u8; 32];
+    let mut newer = discovered_agent_fixture(0x48, 200, &[], None);
+    newer.agent_id = agent.agent_id();
+    newer.cert_digest = Some(d2);
+    upsert_discovered_agent(&cache, newer).await;
+
+    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &d1, &agent.agent_id()).await;
+    let entry = cache
+        .read()
+        .await
+        .get(&agent.agent_id())
+        .cloned()
+        .expect("entry");
+    assert!(
+        entry.agent_certificate.is_none(),
+        "#447 r2: a superseded digest's evidence must not attach"
+    );
+    assert_eq!(
+        entry.cert_digest,
+        Some(d2),
+        "#447 r2: the entry keeps its CURRENT announce digest"
     );
 }
 

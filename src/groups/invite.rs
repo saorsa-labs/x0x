@@ -72,6 +72,15 @@ pub struct SignedInvite {
     /// Authority previous state hash at invite creation time.
     #[serde(default)]
     pub base_prev_state_hash: Option<String>,
+    /// #458 r3: the authority's Home metadata at the base revision. The
+    /// base `state_hash` commits to its digest (`home_digest` rides the
+    /// public-meta hash), and the joiner's stub cannot reconstruct what it
+    /// never received — without this field a Home-group stub can NEVER
+    /// recompute the base hash, so its `MemberAdded` apply fails
+    /// `StateHashMismatch` even when the chain links perfectly. None on
+    /// legacy invites (and non-Home groups) hashes exactly as before.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_home: Option<crate::groups::HomeMetadata>,
     /// Secure-group crypto plane at invite creation time. Missing means legacy
     /// pre-ADR-0012 invite; treat as GSS-compatible for backwards compatibility.
     #[serde(default)]
@@ -162,6 +171,7 @@ impl SignedInvite {
             base_state_hash: None,
             base_members_v2: None,
             base_prev_state_hash: None,
+            base_home: None,
             secure_plane: None,
             base_secret_epoch: None,
             base_security_binding: None,
@@ -202,6 +212,11 @@ impl SignedInvite {
                 .unwrap_or("")
                 .as_bytes(),
         );
+        // #458 r3: base_home is integrity-covered — a stripped/ swapped
+        // Home-metadata claim breaks the invite signature. `None` hashes
+        // as empty, byte-identical to every legacy invite.
+        let home_json = serde_json::to_vec(&self.base_home).unwrap_or_default();
+        data.extend_from_slice(&home_json);
         if let Some(secure_plane) = self.secure_plane {
             let secure_plane_json = serde_json::to_vec(&secure_plane).unwrap_or_default();
             data.extend_from_slice(&secure_plane_json);

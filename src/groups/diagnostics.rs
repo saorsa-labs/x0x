@@ -69,6 +69,19 @@ pub struct GroupCounters {
     /// Number of `MemberJoined` events rejected because the invite secret was
     /// not issued by this local inviter.
     pub member_joined_events_rejected_invite_secret_unknown: u64,
+    /// Number of `MemberJoined` events rejected because the joiner's
+    /// OwnerCertified certificate evidence had not resolved yet (#447). The
+    /// event is retained pending evidence, so this counts retries too.
+    pub member_joined_events_rejected_owner_cert_pending: u64,
+    /// Number of `MemberJoined` events rejected because the group's TreeKEM
+    /// group was unavailable (missing/restored-mismatch) at apply time (#457).
+    pub member_joined_events_rejected_treekem_unavailable: u64,
+    /// Number of authority `MemberAdded` commits adopted by a joiner stub
+    /// whose local chain could not validate the prev hash directly (#458).
+    pub member_added_events_adopted: u64,
+    /// Number of `MemberAdded` commits rejected on a state-chain gap the
+    /// joiner could neither validate nor adopt (#458).
+    pub member_added_events_rejected_state_chain_gap: u64,
     // ── ADR 0028 causal predecessor delivery counters ──
     /// Predecessor envelopes relayed to active witnesses.
     pub causal_relayed: u64,
@@ -263,6 +276,43 @@ impl GroupsDiagnostics {
                 .saturating_add(1);
         });
     }
+    /// Record a `MemberJoined` rejection pending OwnerCertified certificate
+    /// evidence (#447) — the event is retained and retried once evidence
+    /// resolves.
+    pub fn record_member_joined_rejected_owner_cert_pending(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_joined_events_rejected_owner_cert_pending = c
+                .member_joined_events_rejected_owner_cert_pending
+                .saturating_add(1);
+        });
+    }
+
+    /// Record a `MemberJoined` rejection because the TreeKEM group was
+    /// unavailable at apply time (#457).
+    pub fn record_member_joined_rejected_treekem_unavailable(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_joined_events_rejected_treekem_unavailable = c
+                .member_joined_events_rejected_treekem_unavailable
+                .saturating_add(1);
+        });
+    }
+
+    /// Record a joiner adopting an authority `MemberAdded` commit across a
+    /// local state-chain gap (#458).
+    pub fn record_member_added_adopted(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_added_events_adopted = c.member_added_events_adopted.saturating_add(1);
+        });
+    }
+
+    /// Record a `MemberAdded` rejection on an unadoptable state-chain gap (#458).
+    pub fn record_member_added_rejected_state_chain_gap(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.member_added_events_rejected_state_chain_gap = c
+                .member_added_events_rejected_state_chain_gap
+                .saturating_add(1);
+        });
+    }
 
     // ── ADR 0028 causal predecessor delivery counter methods ──
 
@@ -378,6 +428,18 @@ impl GroupsDiagnostics {
             dst.member_joined_events_rejected_invite_secret_unknown = dst
                 .member_joined_events_rejected_invite_secret_unknown
                 .saturating_add(src.member_joined_events_rejected_invite_secret_unknown);
+            dst.member_joined_events_rejected_owner_cert_pending = dst
+                .member_joined_events_rejected_owner_cert_pending
+                .saturating_add(src.member_joined_events_rejected_owner_cert_pending);
+            dst.member_joined_events_rejected_treekem_unavailable = dst
+                .member_joined_events_rejected_treekem_unavailable
+                .saturating_add(src.member_joined_events_rejected_treekem_unavailable);
+            dst.member_added_events_adopted = dst
+                .member_added_events_adopted
+                .saturating_add(src.member_added_events_adopted);
+            dst.member_added_events_rejected_state_chain_gap = dst
+                .member_added_events_rejected_state_chain_gap
+                .saturating_add(src.member_added_events_rejected_state_chain_gap);
             dst.causal_relayed = dst.causal_relayed.saturating_add(src.causal_relayed);
             dst.causal_retried = dst.causal_retried.saturating_add(src.causal_retried);
             dst.causal_queued = dst.causal_queued.saturating_add(src.causal_queued);

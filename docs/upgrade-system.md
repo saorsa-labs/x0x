@@ -121,6 +121,62 @@ sees a shape it cannot parse:
   extension is invisible to v0.40.x, whose recovery scan only reads
   `*.journal`; the postcard shape of the legacy journal itself is unchanged
   because old binaries decode the FULL struct before checking its version.
+- **Quarantined journals (`<group>.journal.quarantined-<ms>-<seq>` /
+  `<group>.hsjournal.quarantined-<ms>-<seq>`)** — the daemon quarantines a
+  group's journals aside (never aborts startup, applies nothing, live
+  state stands) in these cases, each with its OWN operator procedure:
+  1. **Equal-revision fork** — the live merged state and the retained
+     journal pair disagree at the same `state_revision` with different
+     `state_hash`. To RESOLVE you must pick a side: to keep the LIVE
+     state, delete both quarantined files. To keep the JOURNAL state
+     instead, stop the daemon, delete the group's live files
+     (`named_groups.json` entry, the Home-Suite sidecar entry, the
+     `<group>.snap`), rename BOTH quarantined files back to their live
+     names (`<group>.journal` / `<group>.hsjournal`), and start — the pair
+     then replays (the live state it forked against is gone).
+  2. **Mismatched transaction tag** — the `.hsjournal`'s v2 tag
+     (group, revision, hash) disagrees with the retained legacy journal's
+     record (a retry race). The halves belong to DIFFERENT transactions:
+     pick the LEGACY half (it is the commit point) by deleting the
+     quarantined `.hsjournal.*` file and renaming only the
+     `.journal.quarantined-*` file back to `<group>.journal`; or accept
+     the live state by deleting both.
+  3. **Undecodable** (`.hsjournal` or legacy `.journal` garbage, or a
+     valid envelope with a malformed sidecar body) — this binary can
+     never replay these bytes: DELETE the quarantined files to accept
+     the live state (renaming them back re-enters the same branch).
+  3b. **Body/tag mismatch** (log: "BODY/TAG MISMATCH") — the `.hsjournal`
+     body's target record disagrees with its envelope tag (revision,
+     hash, or the Home-Suite/plain classification; a retry race or a
+     spoofed tag). Renaming back re-enters the same branch: DELETE the
+     quarantined files to accept the live state.
+  4. **Legacy-only** — no `.hsjournal` exists (the shape every released
+     v0.40.x leaves); only the legacy journal is quarantined. SINGLE-HALF
+     procedure: to accept the live state, delete the one quarantined
+     `.journal.quarantined-*` file. To replay the legacy journal instead,
+     delete the group's live state (`named_groups.json` entry + sidecar
+     entry + `<group>.snap`) and rename that one file back to
+     `<group>.journal` — there is NO second half to restore.
+  5. **Split pair** (log: "SPLIT pair"; files: `<group>.journal.
+     quarantined-…` plus `<group>.hsjournal.split-<ms>-<seq>`, or — when
+     the marker rename itself failed — an UNMARKED live `.hsjournal`
+     beside the quarantined legacy, which the daemon PRESERVES as
+     split-uncertain) — a quarantine partially completed. To ACCEPT THE LIVE STATE: delete
+     both aside files. To RETRY the transaction: delete the group's live
+     state files, rename the quarantined `.journal.quarantined-*` file
+     back to `<group>.journal`, rename the `.hsjournal.split-*` file back
+     to `<group>.hsjournal`, and restart — the paired pass re-runs the
+     verdict on the restored pair. (Deleting the aside legacy and leaving
+     the `.split-*` file is NOT a retry: the next boot sees no live
+     journals and simply keeps the live state.)
+  6. **Durability-uncertain** (log: "durability uncertain") — both halves
+     are renamed aside but the directory fsync failed; they may revert on
+     power loss. Treat as (1)/(2) per the triggering cause.
+  A quarantine never REPLACES an existing quarantine file (destinations
+  are reserved exclusively). Stale journals (older revision than live)
+  are consumed automatically. A v1 (pre-tag) `.hsjournal` with a
+  consistent pair — or whose sidecar body simply has no record for a
+  plain (non-Home-Suite) group — is REPLAYED, never quarantined.
 - **Migration**: a store written by a pre-#451 Home-Suite binary (real
   owner-certified entries directly in `named_groups.json`) is migrated to
   the split layout automatically on the first post-#451 start — no
