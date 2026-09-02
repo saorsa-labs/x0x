@@ -9539,6 +9539,15 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if let Some(ref dn) = display_name {
                 next.set_display_name(&member_agent_id, dn.clone());
             }
+            // r2 (Fable 4 / CI regression): record the joiner's published
+            // TreeKEM KeyPackage when the MemberJoined seat applies — the
+            // roster-hash/binding stays the authority, but the bytes must
+            // be on the seat or a later ban/KeyPackage-consuming path
+            // fails `member_key_package_pending`
+            // (named_group_integration::member_banned_lost_initial_volley_…).
+            if let Some(kp_b64) = treekem_key_package_b64.clone() {
+                next.set_member_treekem_key_package(&member_agent_id, kp_b64);
+            }
             if let Some(cert) = owner_certified_admission.clone() {
                 // Constraint 2: the certificate the joiner was admitted
                 // under becomes COMMITTED evidence — sealed into the roster
