@@ -1080,10 +1080,7 @@ impl GroupInfo {
                     .is_some();
             if digest_only {
                 clear_ts(&mut self.members_v2);
-                per_member.insert(
-                    agent_hex,
-                    owner_cert::MemberCertStatus::DigestPending,
-                );
+                per_member.insert(agent_hex, owner_cert::MemberCertStatus::DigestPending);
                 continue;
             }
             let embedded_is_stale = embedded.as_ref().is_some_and(|cert| {
@@ -1242,7 +1239,10 @@ impl GroupInfo {
         let Some(m) = self.members_v2.get_mut(agent_id_hex) else {
             return Ok(());
         };
-        if m.certificate_digest.as_deref().is_some_and(|committed| committed != digest) {
+        if m.certificate_digest
+            .as_deref()
+            .is_some_and(|committed| committed != digest)
+        {
             return Err(SetMemberCertificateError::CertificateDigestMismatch);
         }
         m.certificate = Some(certificate);
@@ -1298,10 +1298,7 @@ impl GroupInfo {
                 );
                 continue;
             }
-            if self
-                .set_member_certificate(agent_hex, cert.clone())
-                .is_ok()
-            {
+            if self.set_member_certificate(agent_hex, cert.clone()).is_ok() {
                 hydrated += 1;
             }
         }
@@ -1843,6 +1840,7 @@ impl GroupInfo {
 
     /// #469 A4/E3: full-arity mint recorder — intended joiner, origin and
     /// (for Card origin) the exact signed link to reuse.
+    #[allow(clippy::too_many_arguments)]
     pub fn record_issued_invite_v2(
         &mut self,
         secret: String,
@@ -2818,8 +2816,7 @@ mod tests {
     // ── #468/#469 (design v5 D2 / v6 E2): digest-only roster seats ──────
 
     /// Owner + freshly certified agent — the minimal admission fixture.
-    fn certified_fixture()
-    -> (
+    fn certified_fixture() -> (
         crate::identity::UserKeypair,
         crate::identity::AgentKeypair,
         crate::identity::AgentCertificate,
@@ -2838,17 +2835,20 @@ mod tests {
         // install must be refused without touching the entry; a matching
         // install records BOTH the bytes and their digest so a later strip
         // keeps the commitment (#468/#469 design v5 D2).
-        let (user, agent, cert) = certified_fixture();
+        let (user, agent_kp, cert) = certified_fixture();
         let other_agent = crate::identity::AgentKeypair::generate().unwrap();
         let other_cert =
             crate::identity::AgentCertificate::issue(&user, &other_agent).expect("other cert");
-        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
 
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
         info.add_member(agent_hex.clone(), GroupRole::Member, None, None);
         // Digest-only seat keyed to `cert`.
-        info.members_v2.get_mut(&agent_hex).unwrap().certificate_digest = Some(committed.clone());
+        info.members_v2
+            .get_mut(&agent_hex)
+            .unwrap()
+            .certificate_digest = Some(committed.clone());
 
         // Mismatching bytes: refused, entry untouched.
         let err = info
@@ -2856,7 +2856,10 @@ mod tests {
             .expect_err("mismatching digest must be refused");
         assert_eq!(err, SetMemberCertificateError::CertificateDigestMismatch);
         let m = info.members_v2.get(&agent_hex).unwrap();
-        assert!(m.certificate.is_none(), "refused install must not touch the entry");
+        assert!(
+            m.certificate.is_none(),
+            "refused install must not touch the entry"
+        );
         assert_eq!(m.certificate_digest.as_deref(), Some(committed.as_str()));
 
         // Matching bytes: accepted, BOTH fields set.
@@ -2886,11 +2889,16 @@ mod tests {
         // window; instead it must be reported DigestPending (fail closed
         // for clean-required operations) and never evictable (#468/#469
         // design v5 D2 / v6 E2).
-        let (user, _agent, cert) = certified_fixture();
+        let (user, _agent_kp, cert) = certified_fixture();
         let mut policy = GroupPolicyPreset::PublicRequestSecure.to_policy();
         policy.admission = GroupAdmission::OwnerCertified(user.user_id());
-        let mut info =
-            GroupInfo::with_policy("T".into(), String::new(), agent(1), "aabb".repeat(8), policy);
+        let mut info = GroupInfo::with_policy(
+            "T".into(),
+            String::new(),
+            agent(1),
+            "aabb".repeat(8),
+            policy,
+        );
         let creator_hex = hex::encode([1u8; 32]);
         {
             let m = info.members_v2.get_mut(&creator_hex).unwrap();
@@ -2943,8 +2951,8 @@ mod tests {
         // `finalize_adopted_commit_reconstructed` (recomputed roster root ==
         // signed roster_root) holds — the digest IS the commitment the
         // authority signed.
-        let (_user, agent, cert) = certified_fixture();
-        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let (_user, agent_kp, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
 
         let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
@@ -2990,8 +2998,8 @@ mod tests {
         // stale and must be dropped — but the committed digest is KEPT, so
         // the member stays digest-seated (pending hydration) instead of
         // losing its committed evidence entirely (#468/#469 design v5 D2).
-        let (_user, agent, cert) = certified_fixture();
-        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let (_user, agent_kp, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
 
         let mut source = GroupInfo::new("S".into(), String::new(), agent(1), "aabb".repeat(8));
@@ -3005,7 +3013,7 @@ mod tests {
         let signed_root = state_commit::roster_root_of_projection(&projection);
 
         // Local roster holds DIFFERENT bytes for the same seat.
-        let (_user2, _agent2, other_cert) = certified_fixture();
+        let (_user2, _agent2_kp, other_cert) = certified_fixture();
         let mut adopted = GroupInfo::new("S".into(), String::new(), agent(9), "aabb".repeat(8));
         adopted.add_member(agent_hex.clone(), GroupRole::Member, None, None);
         adopted
@@ -3016,7 +3024,10 @@ mod tests {
         adopted.apply_reconstructed_roster(&projection);
 
         let m = adopted.members_v2.get(&agent_hex).unwrap();
-        assert!(m.certificate.is_none(), "mismatching local bytes must be dropped");
+        assert!(
+            m.certificate.is_none(),
+            "mismatching local bytes must be dropped"
+        );
         assert_eq!(
             m.certificate_digest.as_deref(),
             Some(committed.as_str()),
@@ -3034,10 +3045,10 @@ mod tests {
         // seat's COMMITTED digest may install. Evidence for a different
         // admission (owner re-keyed) must be ignored, never allowed to
         // rewrite the commitment (#468/#469 design v5 D2).
-        let (_user, agent, cert) = certified_fixture();
-        let (_user2, agent2, other_cert) = certified_fixture();
-        let agent_hex = hex::encode(agent.agent_id().as_bytes());
-        let other_hex = hex::encode(agent2.agent_id().as_bytes());
+        let (_user, agent_kp, cert) = certified_fixture();
+        let (_user2, agent2_kp, other_cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
+        let other_hex = hex::encode(agent2_kp.agent_id().as_bytes());
         let committed = owner_cert::certificate_digest_hex(&cert);
         let other_committed = owner_cert::certificate_digest_hex(&other_cert);
 
@@ -3065,7 +3076,10 @@ mod tests {
             Some(committed.as_str())
         );
         let seated = info.members_v2.get(&other_hex).unwrap();
-        assert!(seated.certificate.as_ref().is_some_and(|c| *c == other_cert));
+        assert!(seated
+            .certificate
+            .as_ref()
+            .is_some_and(|c| *c == other_cert));
         assert_eq!(
             seated.certificate_digest.as_deref(),
             Some(other_committed.as_str())
@@ -3095,8 +3109,8 @@ mod tests {
         // the authority when present; digest-less legacy entries and
         // digest-only entries are left exactly as persisted (#468/#469
         // design v5 D2).
-        let (_user, agent, cert) = certified_fixture();
-        let agent_hex = hex::encode(agent.agent_id().as_bytes());
+        let (_user, agent_kp, cert) = certified_fixture();
+        let agent_hex = hex::encode(agent_kp.agent_id().as_bytes());
         let real = owner_cert::certificate_digest_hex(&cert);
 
         let mut info = GroupInfo::new("T".into(), String::new(), agent(1), "aabb".repeat(8));
@@ -3128,13 +3142,13 @@ mod tests {
         );
         assert_eq!(m.certificate_digest.as_deref(), Some(real.as_str()));
         assert!(
-            info.members_v2[&legacy_hex]
-                .certificate_digest
-                .is_none(),
+            info.members_v2[&legacy_hex].certificate_digest.is_none(),
             "legacy no-digest entry must not be backfilled"
         );
         assert_eq!(
-            info.members_v2[&digest_only_hex].certificate_digest.as_deref(),
+            info.members_v2[&digest_only_hex]
+                .certificate_digest
+                .as_deref(),
             Some(orphan_digest.as_str()),
             "digest-only entry is left alone"
         );

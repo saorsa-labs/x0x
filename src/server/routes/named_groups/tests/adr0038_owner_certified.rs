@@ -488,7 +488,7 @@ fn blind_seal_of_owner_certified_group_is_refused() {
     // a DIFFERENT owner — pruned, and the last-admin invariant vetoes the
     // commit (fail-closed "Home locks itself out", ADR-0038).
     let foreign = UserKeypair::generate().expect("foreign owner");
-    info.set_member_certificate(
+    let _ = info.set_member_certificate(
         &hex::encode(creator.agent_id().as_bytes()),
         x0x::identity::AgentCertificate::issue(&foreign, &creator).expect("foreign cert"),
     );
@@ -665,7 +665,7 @@ async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Resu
             None,
             None,
         );
-        live.set_member_certificate(&stranger_hex, foreign_cert);
+        let _ = live.set_member_certificate(&stranger_hex, foreign_cert);
     }
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
@@ -1200,7 +1200,7 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
             None,
             None,
         );
-        live.set_member_certificate(&member_hex, cert.clone());
+        let _ = live.set_member_certificate(&member_hex, cert.clone());
     }
     // The owner re-keys: the member's next announce commits to a NEW
     // digest; the replacement cert has not resolved here yet.
@@ -1369,7 +1369,7 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
         let mut groups = state.named_groups.write().await;
         let live = groups.get_mut(&group_id).expect("group");
         live.add_member(bad_hex.clone(), x0x::groups::GroupRole::Member, None, None);
-        live.set_member_certificate(&bad_hex, foreign_cert);
+        let _ = live.set_member_certificate(&bad_hex, foreign_cert);
         live.shared_secret = Some(vec![4u8; 32]);
         live.owner_cert_reverify_required = true;
     }

@@ -2842,12 +2842,13 @@ fn record_fork_evidence_candidate(
             .record_conflict_unauthenticated(group_key);
         return;
     };
-    let signer_is_base_admin = predecessor.roster.get(&commit.committed_by).is_some_and(
-        |snap| {
+    let signer_is_base_admin = predecessor
+        .roster
+        .get(&commit.committed_by)
+        .is_some_and(|snap| {
             snap.state == x0x::groups::GroupMemberState::Active
                 && snap.role.at_least(x0x::groups::GroupRole::Admin)
-        },
-    );
+        });
     if !signer_is_base_admin {
         state
             .groups_diagnostics
@@ -2860,7 +2861,9 @@ fn record_fork_evidence_candidate(
         if let Some(existing) = lineage.fork_evidence.as_ref() {
             if existing.revision == candidate_revision
                 && existing.state_hash == commit.state_hash
-                && existing.committed_by.eq_ignore_ascii_case(&commit.committed_by)
+                && existing
+                    .committed_by
+                    .eq_ignore_ascii_case(&commit.committed_by)
             {
                 return;
             }
@@ -2873,7 +2876,9 @@ fn record_fork_evidence_candidate(
         committed_by = %LogHexId::agent(&commit.committed_by),
         "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
     );
-    state.groups_diagnostics.record_adoption_fork_evidence(group_key);
+    state
+        .groups_diagnostics
+        .record_adoption_fork_evidence(group_key);
 
     // Install the evidence on the live lineage record (first complete
     // evidence wins). Best-effort `try_write`: the apply path may hold a
@@ -2892,7 +2897,9 @@ fn record_fork_evidence_candidate(
                 let is_duplicate = lineage.fork_evidence.as_ref().is_some_and(|existing| {
                     existing.revision == evidence.revision
                         && existing.state_hash == evidence.state_hash
-                        && existing.committed_by.eq_ignore_ascii_case(&evidence.committed_by)
+                        && existing
+                            .committed_by
+                            .eq_ignore_ascii_case(&evidence.committed_by)
                 });
                 if !is_duplicate && lineage.fork_evidence.is_none() {
                     lineage.fork_evidence = Some(evidence);
@@ -3176,7 +3183,9 @@ async fn try_adopt_member_added_across_gap(
         // digest is authoritative — cert bytes hashing to a different
         // digest cannot be seated on the adopted roster.
         if adopted.set_member_certificate(agent_id, cert).is_err() {
-            return refuse("joiner certificate digest contradicts the reconstructed roster commitment");
+            return refuse(
+                "joiner certificate digest contradicts the reconstructed roster commitment",
+            );
         }
     }
     match adopted.finalize_adopted_commit_reconstructed(commit, &meta, &chain) {
@@ -7716,7 +7725,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let current = info.clone();
             let mut next = match apply_stateful_event_with_evidence(
-                &state,
+                state,
                 &resolved_group_key,
                 &current,
                 &commit,
@@ -8093,21 +8102,28 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key, &current, &commit, action_kind, |next| {
-                next.roster_revision = revision.max(next.roster_revision);
-                next.remove_member(&agent_id, Some(actor.clone()));
-                if let Some((_, epoch)) = treekem_payload.as_ref() {
-                    next.secret_epoch = *epoch;
-                    next.security_binding = Some(format!("treekem:epoch={epoch}"));
-                } else if let Some(secret_epoch) = secret_epoch {
-                    let old_epoch = next.secret_epoch;
-                    next.secret_epoch = secret_epoch;
-                    next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
-                    if old_epoch < secret_epoch {
-                        next.shared_secret = None;
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
+                &current,
+                &commit,
+                action_kind,
+                |next| {
+                    next.roster_revision = revision.max(next.roster_revision);
+                    next.remove_member(&agent_id, Some(actor.clone()));
+                    if let Some((_, epoch)) = treekem_payload.as_ref() {
+                        next.secret_epoch = *epoch;
+                        next.security_binding = Some(format!("treekem:epoch={epoch}"));
+                    } else if let Some(secret_epoch) = secret_epoch {
+                        let old_epoch = next.secret_epoch;
+                        next.secret_epoch = secret_epoch;
+                        next.security_binding = Some(format!("gss:epoch={secret_epoch}"));
+                        if old_epoch < secret_epoch {
+                            next.shared_secret = None;
+                        }
                     }
-                }
-            }) else {
+                },
+            ) else {
                 return ApplyMetadataResult::REJECTED;
             };
             let cache_aliases = treekem_cache_group_aliases(state, &resolved_group_key).await;
@@ -8281,7 +8297,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8343,7 +8361,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8395,7 +8415,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 None
             };
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8499,7 +8521,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8564,7 +8588,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::NonMemberRequest,
@@ -8730,7 +8756,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             };
             let request_key_package_b64 = req_snapshot.treekem_key_package_b64.clone();
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8926,7 +8954,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -8977,7 +9007,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::NonMemberRequest,
@@ -9044,7 +9076,9 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let Ok(next) = apply_stateful_event_with_evidence(&state, &resolved_group_key,
+            let Ok(next) = apply_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
                 x0x::groups::ActionKind::AdminOrHigher,
@@ -9420,9 +9454,10 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         member = %member_agent_id,
                         "MemberJoined: invite is addressed to another agent; not consumed"
                     );
-                    state
-                        .groups_diagnostics
-                        .record_invite_refusal(&resolved_group_key, "invite_not_addressed_to_joiner");
+                    state.groups_diagnostics.record_invite_refusal(
+                        &resolved_group_key,
+                        "invite_not_addressed_to_joiner",
+                    );
                     return ApplyMetadataResult::REJECTED;
                 }
             }
@@ -12098,7 +12133,6 @@ async fn spawn_public_message_listener(state: Arc<AppState>, group_id: String) {
 }
 
 /// POST /groups/:id/invite — generate an invite link (admin+; body optional).
-
 /// #469 A1b: the SINGLE v4 invite assembly authority. Builds the invite
 /// (projection, public-meta snapshot, explicit creator, inline keys),
 /// adds the owner countersignature when the policy admission carries an
@@ -12146,20 +12180,19 @@ pub(in crate::server) fn assemble_signed_v4_invite(
         }
     }
     invite
-        .sign_v4(
-            state.agent.identity().agent_keypair(),
-            user_kp,
-        )
-        .map_err(|e| MintInviteError::Signing(e))?;
+        .sign_v4(state.agent.identity().agent_keypair(), user_kp)
+        .map_err(MintInviteError::Signing)?;
     // D5 caps + the authoritative final encoded-size gate (v7 F4),
     // before the caller records anything.
     if let Some((field, size)) = invite.v4_field_caps_violation() {
         return Err(MintInviteError::TooLarge { field, size });
     }
-    let link = invite.encode_link().map_err(|e| MintInviteError::TooLargeBytes {
-        actual: e.actual,
-        limit: e.limit,
-    })?;
+    let link = invite
+        .encode_link()
+        .map_err(|e| MintInviteError::TooLargeBytes {
+            actual: e.actual,
+            limit: e.limit,
+        })?;
     Ok((invite, link))
 }
 
@@ -12273,8 +12306,7 @@ pub(in crate::server) async fn create_group_invite(
         // grow `issued_invites` forever on card-heavy installs.
         let now_secs = now_millis_u64() / 1_000;
         next.prune_issued_invites(now_secs);
-        if next.live_issued_invite_count(now_secs)
-            >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
+        if next.live_issued_invite_count(now_secs) >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
         {
             return (
                 StatusCode::TOO_MANY_REQUESTS,
@@ -12299,15 +12331,11 @@ pub(in crate::server) async fn create_group_invite(
                 }
             },
         };
-        let (invite, link) = match assemble_signed_v4_invite(
-            &state,
-            &next,
-            req.expiry_secs,
-            intended_joiner,
-        ) {
-            Ok(minted) => minted,
-            Err(e) => return mint_error_response(&id, e).into_response(),
-        };
+        let (invite, link) =
+            match assemble_signed_v4_invite(&state, &next, req.expiry_secs, intended_joiner) {
+                Ok(minted) => minted,
+                Err(e) => return mint_error_response(&id, e).into_response(),
+            };
 
         // Track this one-time secret on the inviter so a future
         // MemberJoined request carrying it can be authenticated, role-capped,
@@ -12587,8 +12615,7 @@ pub(in crate::server) async fn join_group_via_invite(
     {
         let roster_root = x0x::groups::state_commit::roster_root_of_projection(&view.base_roster);
         let policy_hash = x0x::groups::state_commit::compute_policy_hash(&view.policy);
-        let meta_hash =
-            x0x::groups::state_commit::compute_public_meta_hash(&view.public_meta);
+        let meta_hash = x0x::groups::state_commit::compute_public_meta_hash(&view.public_meta);
         let recomputed = x0x::groups::state_commit::compute_state_hash(
             &view.stable_group_id,
             view.base_state_revision,
@@ -12615,19 +12642,21 @@ pub(in crate::server) async fn join_group_via_invite(
     }
 
     // ── #469 A3: Home-join mode matrix (fail closed on every misuse) ──
-    let invite_owner_id = view
-        .policy
-        .admission
-        .owner_certified_user_id()
-        .copied();
+    let invite_owner_id = view.policy.admission.owner_certified_user_id().copied();
     let join_mode = match req.mode.as_deref() {
         None | Some("group") => None,
         Some("home") => Some(()),
         Some(other) => {
-            return bad_request(format!("unknown join mode {other:?}: expected \"group\" or \"home\""));
+            return bad_request(format!(
+                "unknown join mode {other:?}: expected \"group\" or \"home\""
+            ));
         }
     };
-    match (join_mode, req.expected_owner_user_id.as_deref(), invite_owner_id) {
+    match (
+        join_mode,
+        req.expected_owner_user_id.as_deref(),
+        invite_owner_id,
+    ) {
         (None, None, None) => { /* ordinary group join — proceed */ }
         (None, None, Some(_owner)) => {
             return refuse_invite(&state, &invite, "use_home_mode");
@@ -27151,6 +27180,8 @@ pub(in crate::server) mod tests {
             Json(JoinGroupRequest {
                 invite: card_group.invite_link.clone(),
                 display_name: Some("joiner".to_string()),
+                mode: None,
+                expected_owner_user_id: None,
             }),
         )
         .await
@@ -33775,7 +33806,11 @@ pub(in crate::server) mod tests {
             let full_root = compute_roster_root(&info.members_v2);
             let mut invite =
                 SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
-            crate::server::routes::identity::populate_invite_base_state_v4(&mut invite, &info, None);
+            crate::server::routes::identity::populate_invite_base_state_v4(
+                &mut invite,
+                &info,
+                None,
+            );
 
             let roster = invite
                 .base_members_v2
@@ -33831,7 +33866,11 @@ pub(in crate::server) mod tests {
         // gracefully on an old daemon (kp reads as None).
         let mut slim_invite =
             SignedInvite::new(group_id.clone(), "growth".to_string(), &agent_id, 3600);
-        crate::server::routes::identity::populate_invite_base_state_v4(&mut slim_invite, &info3, None);
+        crate::server::routes::identity::populate_invite_base_state_v4(
+            &mut slim_invite,
+            &info3,
+            None,
+        );
         let slim_link = slim_invite.encode_link().expect("slim under budget");
         let parsed_slim = SignedInvite::from_link(&slim_link).expect("slim link round-trips");
         assert!(parsed_slim
@@ -35427,6 +35466,8 @@ pub(in crate::server) mod tests {
             Json(JoinGroupRequest {
                 invite: invite_link,
                 display_name: None,
+                mode: None,
+                expected_owner_user_id: None,
             }),
         )
         .await
@@ -41057,6 +41098,9 @@ mod cas_rollback_470 {
                             max_role: x0x::groups::GroupRole::Member,
                             consumed_by: None,
                             consumed_at_ms: None,
+                            intended_joiner: None,
+                            origin: x0x::groups::InviteOrigin::Explicit,
+                            signed_link: None,
                         },
                     );
                 }
@@ -41135,6 +41179,9 @@ mod cas_rollback_470 {
                     max_role: x0x::groups::GroupRole::Member,
                     consumed_by: None,
                     consumed_at_ms: None,
+                    intended_joiner: None,
+                    origin: x0x::groups::InviteOrigin::Explicit,
+                    signed_link: None,
                 },
             );
             y.home = Some(x0x::groups::HomeMetadata {

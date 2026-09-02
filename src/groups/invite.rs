@@ -11,10 +11,10 @@ use crate::groups::policy::GroupPolicy;
 use crate::groups::GroupMember;
 use crate::identity::AgentId;
 use crate::mls::SecureGroupPlane;
-use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
 use base64::engine::general_purpose::STANDARD as B64_STD;
 use base64::Engine as _;
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 /// Default invite expiry: 7 days in seconds.
@@ -410,9 +410,7 @@ impl InviteSignedViewV4 {
         // Raw-secret normalization: strictly 32 bytes after hex decode.
         let secret_bytes = hex::decode(invite_secret.trim())
             .map_err(|_| InviteRefusal::Malformed)
-            .and_then(|bytes| {
-                <[u8; 32]>::try_from(bytes).map_err(|_| InviteRefusal::Malformed)
-            })?;
+            .and_then(|bytes| <[u8; 32]>::try_from(bytes).map_err(|_| InviteRefusal::Malformed))?;
         let secret_hash = *blake3::hash(&secret_bytes).as_bytes();
 
         Ok(Self {
@@ -449,7 +447,7 @@ impl InviteSignedViewV4 {
     ///
     /// # Errors
     ///
-/// Returns the postcard error on serialization failure.
+    /// Returns the postcard error on serialization failure.
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, postcard::Error> {
         let mut out = Vec::with_capacity(INVITE_V4_CANONICAL_DOMAIN.len() + 1024);
         out.extend_from_slice(INVITE_V4_CANONICAL_DOMAIN);
@@ -768,11 +766,12 @@ impl SignedInvite {
         if let Some(owner) = owner_kp {
             let mut owner_input = INVITE_V4_OWNER_DOMAIN.to_vec();
             owner_input.extend_from_slice(&canonical);
-            let sig =
-                ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(owner.secret_key(), &owner_input)
-                    .map_err(|e| format!("owner countersign: {e:?}"))?;
-            self.owner_countersignature_b64 =
-                Some(B64_STD.encode(sig.as_bytes()));
+            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                owner.secret_key(),
+                &owner_input,
+            )
+            .map_err(|e| format!("owner countersign: {e:?}"))?;
+            self.owner_countersignature_b64 = Some(B64_STD.encode(sig.as_bytes()));
         }
         Ok(())
     }
@@ -786,13 +785,14 @@ impl SignedInvite {
     /// binding + countersignature. Revocation-set checks are the
     /// caller's (the server owns the set; map to
     /// [`InviteRefusal::InviterKeyRevoked`] / [`InviteRefusal::OwnerKeyRevoked`]).
-    #[must_use]
     pub fn verify_v4_signatures(&self) -> Result<(), InviteRefusal> {
         if !self.signature.is_empty() {
             return Err(InviteRefusal::SignatureInvalid);
         }
         let view = InviteSignedViewV4::from_invite(self)?;
-        let canonical = view.canonical_bytes().map_err(|_| InviteRefusal::Malformed)?;
+        let canonical = view
+            .canonical_bytes()
+            .map_err(|_| InviteRefusal::Malformed)?;
 
         // Inline inviter key: self-authenticating id binding (E4).
         let inviter_key_bytes = B64_STD

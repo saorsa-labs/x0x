@@ -2051,9 +2051,8 @@ mod tests {
         let mut digest_only = byte_bearing.clone();
         let stripped = digest_only.get_mut(&agent_hex).unwrap();
         stripped.certificate = None;
-        stripped.certificate_digest = Some(crate::groups::owner_cert::certificate_digest_hex(
-            &cert,
-        ));
+        stripped.certificate_digest =
+            Some(crate::groups::owner_cert::certificate_digest_hex(&cert));
         assert_eq!(
             compute_roster_root(&digest_only),
             root_with_bytes,

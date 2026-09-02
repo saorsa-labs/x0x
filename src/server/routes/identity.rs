@@ -420,8 +420,7 @@ pub(in crate::server) fn populate_invite_base_state_v4(
             .unwrap_or_else(|| hex::encode(info.creator.as_bytes())),
     );
     // #469 A4: addressed invites carry the intended joiner.
-    invite.intended_joiner =
-        intended_joiner.map(|agent| hex::encode(agent.as_bytes()));
+    invite.intended_joiner = intended_joiner.map(|agent| hex::encode(agent.as_bytes()));
     invite.base_prev_state_hash = info.prev_state_hash.clone();
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);
@@ -514,7 +513,9 @@ pub(in crate::server) async fn get_agent_card(
                 }
                 let inviter_hex = hex::encode(agent_id.as_bytes());
                 // Only active admins may mint; others are skipped silently.
-                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex).is_err() {
+                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
+                    .is_err()
+                {
                     state
                         .groups_diagnostics
                         .record_invite_refusal(map_key, "card_invite_omitted_non_admin");
@@ -543,7 +544,8 @@ pub(in crate::server) async fn get_agent_card(
         // authority under its membership lock, then persist durably before
         // the link is returned.
         for map_key in mint_candidates {
-            let membership_lock = crate::server::routes::named_groups::group_membership_lock(&state, &map_key).await;
+            let membership_lock =
+                crate::server::routes::named_groups::group_membership_lock(&state, &map_key).await;
             let _guard = membership_lock.lock().await;
             let Some(info) = state.named_groups.read().await.get(&map_key).cloned() else {
                 continue;

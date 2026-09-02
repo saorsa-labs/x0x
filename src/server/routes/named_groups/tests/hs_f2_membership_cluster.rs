@@ -1154,6 +1154,8 @@ async fn issue458r2_join_stub_not_durable_and_typed_until_member_added() -> Resu
         Json(JoinGroupRequest {
             invite: invite_link.clone(),
             display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
         }),
     )
     .await
@@ -1191,6 +1193,8 @@ async fn issue458r2_join_stub_not_durable_and_typed_until_member_added() -> Resu
         Json(JoinGroupRequest {
             invite: invite_link,
             display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
         }),
     )
     .await
@@ -1749,6 +1753,8 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         Json(JoinGroupRequest {
             invite: invite_link,
             display_name: Some("second-device".to_string()),
+            mode: None,
+            expected_owner_user_id: None,
         }),
     )
     .await
@@ -2384,6 +2390,8 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         Json(JoinGroupRequest {
             invite: invite_link,
             display_name: Some("second-device".to_string()),
+            mode: None,
+            expected_owner_user_id: None,
         }),
     )
     .await

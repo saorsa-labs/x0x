@@ -208,7 +208,10 @@ impl GroupsDiagnostics {
     /// #469 A2: record a typed invite refusal reason.
     pub fn record_invite_refusal(&self, group_id: &str, reason: &str) {
         self.with_counters(group_id, |c| {
-            let entry = c.invites_refused_reasons.entry(reason.to_string()).or_insert(0);
+            let entry = c
+                .invites_refused_reasons
+                .entry(reason.to_string())
+                .or_insert(0);
             *entry = entry.saturating_add(1);
         });
     }
