@@ -90,7 +90,10 @@ candidate becomes ONE recorded `ForkEvidence` only when its signature verifies
 and its committer was an active admin in the retained predecessor roster;
 evidence is identity-deduplicated `(revision, state_hash, committed_by)`, first
 complete evidence wins, and it is durably persisted. Unauthenticated candidates
-increment a per-packet `conflict_unauthenticated` counter. **No state change,
+increment a WINDOWED `conflict_unauthenticated` rate-limit counter — one
+increment per group per second, because unauthenticated conflict packets are
+freely replayable and the counter must observe conflict PRESSURE, not the
+attacker's packet rate. **No state change,
 eviction, or quarantine follows from evidence** — observability only.
 
 ### 5. The stale-base residual and the old-admin-key caveat (#468)
@@ -116,22 +119,31 @@ key, or rejecting an admin promoted after the base) is called out there.
   members hash identically to their byte-bearing form, and certificates
   hydrate from the authenticated announce/discovery cache (digest-matched;
   mismatches are never silently installed).
-- Minting is bounded: per-field caps, a derived roster cap (pinned by a
+- Minting is bounded: per-field caps (including the Home-metadata caps
+  the join side enforces — 64-hex primary agent, placements bounded by
+  the roster cap), a derived roster cap (pinned by a
   worst-case final-encoder fixture against the 40,960-byte link budget and the
   49,152-byte DM ceiling), 64 live unconsumed records per group, and the final
   encoded size as the authoritative gate — all before any secret is recorded.
 
 ## Validation
-
-- `src/groups/invite.rs` unit suite (19 tests): canonical-bytes vector
+- `src/groups/invite.rs` unit suite (23 tests): canonical-bytes vector
   (blake3-pinned), missing-field → typed-refusal matrix, sign/verify
   tamper matrix incl. None↔Some("") signed-state flips, D1 equality
-  rules + non-default meta round-trip, D5 caps matrix, and the F4
-  worst-case final-encoder fixture (derived max N=38 ≥ cap 32; the test
-  fails if the constant is raised).
-- Joiner validation/mode matrix, card reuse-or-mint, evidence dedup, and
-  the F1 hydration bridge are pinned by the server-route suites and
-  `member_certificate_bridge_tests` (pre-populated-cache reconcile,
-  deterministic lag recovery, idempotent re-run).
-- Full workspace at head: `X0X_HOME=… cargo nextest run --all-features
-  --workspace --no-fail-fast` → 3228 run, 3228 passed, 0 failed.
+  rules + non-default meta round-trip, the D5 caps matrix (incl. the
+  round-4 Home-metadata caps, enforced at mint exactly as at join), and
+  the F4 worst-case final-encoder fixture — an EQUALITY pin: the roster
+  cap IS the derived maximum (20 entries, worst-case Home included,
+  against BOTH the 40,960-byte link budget and the 49,152-byte cmd-DM
+  envelope; the link-only budget would admit 30), so the test fails if
+  the constant is raised OR lowered — plus the v0.40.4 tag-copied
+  cross-version replica fixtures (old→new parse-then-refuse, new→old
+  ordinary parse, owner-axis fail-closed).
+- Joiner validation/mode matrix, card reuse-or-mint, evidence dedup,
+  and the F1 hydration surfaces are pinned by the server-route suites
+  and `member_certificate_bridge_tests` (3 tests: pre-populated-cache
+  startup reconcile, deterministic event-ring-overflow lag recovery via
+  full reconcile, idempotent re-run hydrating nothing).
+- Full workspace: 3 228 tests green at the pre-round-4 PR head; the
+  round-4 additions are verified per-suite above, and the parent re-runs
+  the full workspace before merge (the number only grows).

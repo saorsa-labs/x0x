@@ -3597,3 +3597,159 @@ async fn issue458r6b_tier2_removed_admin_fork_rejected() -> Result<()> {
     }
     Ok(())
 }
+
+/// r4 (hs-FU-A round 4, original item 1a / addendum item 9): the
+/// across-gap ADOPTION success path materializes the reconstructed
+/// roster's seats DIGEST-ONLY — same construction as the r5 digest-only
+/// adoption test, but with the filler's certificate ALREADY in the
+/// joiner's discovered-certificate cache. The seat-time hydrate on the
+/// adoption success arm must install the bytes BEFORE the caller
+/// persists `next`, with NO bridge event (raw cache write; no bridge
+/// worker runs in the test state).
+#[tokio::test]
+async fn issue458r4_adoption_hydrates_reconstructed_digest_only_seats() -> Result<()> {
+    let stage = r3_stage(0x94).await?;
+    let real = stage.chain.first().cloned().expect("one link");
+    let signer =
+        AgentKeypair::from_bytes(&stage.authority_key_bytes.0, &stage.authority_key_bytes.1)?;
+
+    // ONE filler certificate everything agrees on (link projection
+    // digest, link signed root, terminal roster bytes).
+    let filler_owner = UserKeypair::generate()?;
+    let filler_agent = AgentKeypair::generate()?;
+    let filler_cert = x0x::identity::AgentCertificate::issue_for_public_key(
+        &filler_owner,
+        filler_agent.public_key().as_bytes(),
+        None,
+    )?;
+    let filler_digest = x0x::groups::owner_cert::certificate_digest_hex(&filler_cert);
+
+    // The mutated link: base roster + the certified member (digest-only
+    // in the projection, exactly what a retained snapshot carries).
+    let mut churned = real.roster.clone();
+    churned.insert(
+        "cd".repeat(32),
+        x0x::groups::state_commit::RosterMemberSnapshot {
+            role: x0x::groups::GroupRole::Member,
+            state: x0x::groups::GroupMemberState::Active,
+            treekem_key_package_hash: None,
+            certificate_digest: Some(filler_digest.clone()),
+        },
+    );
+    let churned_commit = x0x::groups::GroupStateCommit::sign(
+        real.commit.group_id.clone(),
+        real.commit.revision,
+        real.commit.prev_state_hash.clone(),
+        x0x::groups::state_commit::roster_root_of_projection(&churned),
+        real.commit.policy_hash.clone(),
+        real.commit.public_meta_hash.clone(),
+        real.commit.security_binding.clone(),
+        false,
+        real.commit.committed_at,
+        &signer,
+    )?;
+    let churned_link = x0x::groups::state_commit::RetainedCommit {
+        commit: churned_commit,
+        roster: churned.clone(),
+        meta: real.meta.clone(),
+    };
+
+    // Terminal roster: the churned roster WITH the filler cert BYTES +
+    // the joiner with its committed cert (the honest authority's signed
+    // root covers the digest either way — D2).
+    let mut terminal_roster = r6c_materialize(&churned);
+    let mut certified_member = x0x::groups::GroupMember::new_member("cd".repeat(32), None, None, 0);
+    certified_member.role = x0x::groups::GroupRole::Member;
+    certified_member.state = x0x::groups::GroupMemberState::Active;
+    certified_member.certificate = Some(filler_cert.clone());
+    terminal_roster.insert("cd".repeat(32), certified_member);
+    let mut added = x0x::groups::GroupMember::new_member(stage.joiner_hex.clone(), None, None, 0);
+    added.role = x0x::groups::GroupRole::Member;
+    added.state = x0x::groups::GroupMemberState::Active;
+    if let NamedGroupMetadataEvent::MemberAdded {
+        certificate_b64: Some(b64),
+        ..
+    } = &stage.member_added
+    {
+        use base64::Engine as _;
+        if let Ok(bytes) = BASE64.decode(b64) {
+            if let Ok(cert) = bincode::deserialize::<x0x::identity::AgentCertificate>(&bytes) {
+                added.certificate = Some(cert);
+            }
+        }
+    }
+    terminal_roster.insert(stage.joiner_hex.clone(), added);
+
+    // r4: PRE-POPULATE the joiner's discovered-certificate cache for the
+    // filler's ROSTER seat — a raw map write that fires NO
+    // verified-certificate event (the bridge can never see it).
+    stage
+        .joiner_state
+        .agent
+        .identity_discovery_cache()
+        .write()
+        .await
+        .insert(
+            x0x::identity::AgentId([0xCD; 32]),
+            x0x::DiscoveredAgent {
+                agent_id: x0x::identity::AgentId([0xCD; 32]),
+                machine_id: x0x::identity::MachineId([0u8; 32]),
+                user_id: None,
+                self_name: None,
+                addresses: Vec::new(),
+                announced_at: 1,
+                last_seen: 1,
+                machine_public_key: Vec::new(),
+                nat_type: None,
+                can_receive_direct: None,
+                is_relay: None,
+                is_coordinator: None,
+                reachable_via: vec![],
+                relay_candidates: vec![],
+                cert_not_after: filler_cert.not_after(),
+                agent_certificate: Some(filler_cert.clone()),
+                agent_public_key: Vec::new(),
+                cert_digest: None,
+            },
+        );
+
+    let result = r6c_targeted_refusal(&stage, churned_link, &terminal_roster).await?;
+    assert!(
+        result.accepted,
+        "the digest-committed gap adoption succeeds (r5 shape)"
+    );
+    {
+        let groups = stage.joiner_state.named_groups.read().await;
+        let info = groups.get(&stage.group_id).expect("group");
+        let filler = info
+            .members_v2
+            .get(&"cd".repeat(32))
+            .expect("filler member adopted");
+        assert_eq!(
+            filler.certificate.as_ref(),
+            Some(&filler_cert),
+            "the adopted digest-only seat hydrated from the cache at adoption time — no bridge event"
+        );
+        assert_eq!(
+            filler.certificate_digest.as_deref(),
+            Some(filler_digest.as_str()),
+            "hydration keeps the committed digest"
+        );
+    }
+    // The hydrated bytes also reached the DURABLE record (the caller
+    // persists `next` after the seat-time hydrate).
+    let on_disk = load_named_groups_merged(
+        &stage.joiner_state.named_groups_path,
+        &stage.joiner_state.home_suite_groups_path,
+    )
+    .await?;
+    assert_eq!(
+        on_disk[&stage.group_id]
+            .members_v2
+            .get(&"cd".repeat(32))
+            .and_then(|seat| seat.certificate.clone()),
+        Some(filler_cert),
+        "the hydrated certificate persisted with the adopted roster"
+    );
+    Ok(())
+}

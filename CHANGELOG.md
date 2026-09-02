@@ -26,7 +26,12 @@ All notable changes to this project will be documented in this file.
   protocol response is deferred to #472.
 - **Roster projection.** v4 invites carry the roster projection (no
   certificate bytes); digest-only members hash identically to their
-  byte-bearing form and certificates hydrate from the announce cache.
+  byte-bearing form. Certificate bytes hydrate on exactly three
+  digest-anchored surfaces: the `MemberJoined` seat-time targeted
+  hydrate from the discovered-certificate cache, the member-certificate
+  bridge over announce-cache `VerifiedCertificate` events, and the
+  startup reconcile from the authenticated cache — bytes that do not
+  hash to a seat's committed digest are never installed.
 - **Gap adoption is now digest-only (D2 behaviour change).** A certified
   member added inside a reconstructed roster gap used to be
   unreconstructable — the projection carries only the cert digest and the
@@ -36,7 +41,9 @@ All notable changes to this project will be documented in this file.
   D2 makes the digest the signed commitment (digest-only and byte-bearing
   members hash identically), so the same shape is now intentionally
   ADOPTED: the filler seats digest-only and the cert bytes hydrate later
-  via the announce bridge, pinned by re-pointing the #458 r5 gap test
+  on the three digest-anchored surfaces above (seat-time targeted
+  hydrate, bridge events, startup reconcile), pinned by re-pointing the
+  #458 r5 gap test
   (`issue458r5_certified_member_in_gap_adopts_digest_only`) at adoption.
 - **MemberJoined authority seat records the published TreeKEM KeyPackage
   again.** Dropping the setter made every later KeyPackage-consuming path

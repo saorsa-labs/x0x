@@ -565,18 +565,17 @@ pub(in crate::server) async fn get_agent_card(
             let membership_lock =
                 crate::server::routes::named_groups::group_membership_lock(&state, &map_key).await;
             let _guard = membership_lock.lock().await;
-            let Some(info) = state.named_groups.read().await.get(&map_key).cloned() else {
-                continue;
-            };
-            let mut next = info.clone();
-            // r1 (Codex 9) + r3 (Fable 1): re-check admin authority AND
-            // the owner-axis durable fence UNDER the membership lock —
-            // the phase-1 preselection ran under a read lock and a
-            // demotion or policy change could have landed in between
+            let inviter_hex = hex::encode(agent_id.as_bytes());
+            // r1 (Codex 9): re-check admin authority UNDER the
+            // membership lock — the phase-1 preselection ran under a
+            // read lock and a demotion could have landed in between
             // (TOCTOU).
             {
-                let inviter_hex = hex::encode(agent_id.as_bytes());
-                if crate::server::routes::named_groups::require_admin_or_above(&next, &inviter_hex)
+                let groups = state.named_groups.read().await;
+                let Some(info) = groups.get(&map_key) else {
+                    continue;
+                };
+                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
                     .is_err()
                 {
                     state
@@ -584,77 +583,60 @@ pub(in crate::server) async fn get_agent_card(
                         .record_invite_refusal(&map_key, "card_invite_omitted_non_admin");
                     continue;
                 }
-                let owner_axis = next.home.is_some()
-                    || next.policy.admission.owner_certified_user_id().is_some();
-                if owner_axis && !durable_owner {
-                    state.groups_diagnostics.record_invite_refusal(
-                        &map_key,
-                        "card_invite_omitted_owner_axis_no_durable_owner",
-                    );
-                    continue;
-                }
             }
-            let now_secs = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_secs())
-                .unwrap_or_default();
-            next.prune_issued_invites(now_secs);
-            if next.live_issued_invite_count(now_secs)
-                >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
-            {
-                state
-                    .groups_diagnostics
-                    .record_invite_refusal(&map_key, "card_invite_omitted_cap_reached");
-                continue;
-            }
-            match crate::server::routes::named_groups::assemble_signed_v4_invite(
+            // r4 (addendum item 6): the card mint runs through the SAME
+            // single actor-aware mint transaction as the explicit route
+            // — owner-axis durable fence, live cap, signed v4 assembly,
+            // secret recording and the durable persist are one unit
+            // (with the Card origin so the link is reusable).
+            match crate::server::routes::named_groups::mint_invite_transaction(
                 &state,
-                &next,
+                &map_key,
                 x0x::groups::invite::DEFAULT_EXPIRY_SECS,
                 None,
-            ) {
-                Ok((invite, link)) => {
-                    next.record_issued_invite_v2(
-                        invite.invite_secret.clone(),
-                        invite.created_at,
-                        invite.expires_at,
-                        x0x::groups::GroupRole::Member,
-                        None,
-                        x0x::groups::InviteOrigin::Card,
-                        Some(link.clone()),
-                    );
-                    if !matches!(
-                        crate::server::routes::named_groups::persist_named_groups_mutation(
-                            &state,
-                            |groups| {
-                                groups.insert(map_key.clone(), next.clone());
-                                true
-                            },
-                        )
-                        .await,
-                        Ok(crate::server::routes::named_groups::AtomicWriteOutcome::Durable)
-                    ) {
-                        // Not durable — do not hand out the link.
-                        state
-                            .groups_diagnostics
-                            .record_invite_refusal(&map_key, "card_invite_omitted_not_durable");
-                        continue;
-                    }
+                x0x::groups::InviteOrigin::Card,
+                durable_owner,
+            )
+            .await
+            {
+                Ok((_invite, link)) => {
+                    let name = {
+                        let groups = state.named_groups.read().await;
+                        groups
+                            .get(&map_key)
+                            .map(|info| info.name.clone())
+                            .unwrap_or_default()
+                    };
                     card.groups.push(x0x::groups::card::CardGroup {
-                        name: invite.group_name.clone(),
+                        name,
                         invite_link: link,
                     });
                 }
-                Err(e) => {
-                    let reason = match e {
-                        crate::server::routes::named_groups::MintInviteError::OwnerKeyUnavailable => {
+                Err(refusal) => {
+                    let reason = match refusal {
+                        crate::server::routes::named_groups::MintInviteRefusal::CapReached {
+                            ..
+                        } => "card_invite_omitted_cap_reached",
+                        crate::server::routes::named_groups::MintInviteRefusal::OwnerAxisNoDurableOwner => {
+                            "card_invite_omitted_owner_axis_no_durable_owner"
+                        }
+                        crate::server::routes::named_groups::MintInviteRefusal::OwnerKeyUnavailable => {
                             "card_invite_omitted_owner_axis"
                         }
-                        _ => "card_invite_omitted_mint_failed",
+                        crate::server::routes::named_groups::MintInviteRefusal::NotDurable => {
+                            "card_invite_omitted_not_durable"
+                        }
+                        crate::server::routes::named_groups::MintInviteRefusal::TooLarge { .. }
+                        | crate::server::routes::named_groups::MintInviteRefusal::TooLargeBytes {
+                            ..
+                        }
+                        | crate::server::routes::named_groups::MintInviteRefusal::Signing(_) => {
+                            "card_invite_omitted_mint_failed"
+                        }
                     };
                     tracing::warn!(
                         group_id = %map_key,
-                        "card invite mint failed; omitting group from card: {e:?}"
+                        "card invite mint refused; omitting group from card: {refusal:?}"
                     );
                     state
                         .groups_diagnostics

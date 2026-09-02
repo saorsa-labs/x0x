@@ -2789,16 +2789,14 @@ fn previous_hash_initial(
 ///   retained history = unclassifiable).
 /// - A candidate becomes ONE recorded `ForkEvidence` only when its
 ///   signature verifies (`verify_structure`) AND its committer was an
-///   ACTIVE ADMIN in the retained predecessor roster (the retained commit
-/// - Evidence is deduplicated by `(revision, state_hash, committed_by)`:
-///   first COMPLETE evidence wins; repeats change nothing (no repeated
-///   persistence, warn, or counter) — checked against BOTH the durable
-///   lineage record and the process's once-only diagnostics set (r3
-///   Fable 2), so a second identical conflict is fully silent even when
-///   the record could not be installed.
-/// - Candidates failing either check increment `conflict_unauthenticated`
-///   (rate-limited to one increment per group per second — r3).
-/// - NO state change, eviction, or quarantine (#472 owns those).
+///   ACTIVE ADMIN in the retained predecessor roster.
+/// - Evidence is deduplicated by the STORED record: once the group's
+///   lineage carries ANY evidence, EVERY later conflict — identical or
+///   different — is fully silent (no classification, no warn, no
+///   counter; r4 Codex addendum item 7). Before the first DURABLE
+///   install nothing is marked seen, so a failed/rolled-back persist
+///   leaves the identical conflict RETRYABLE (the r3 pre-install
+///   once-only set suppressed retries — reversed by design).
 fn evaluate_fork_evidence_candidate(
     state: &Arc<AppState>,
     group_key: &str,
@@ -2806,6 +2804,16 @@ fn evaluate_fork_evidence_candidate(
     commit: &x0x::groups::state_commit::GroupStateCommit,
     error: &x0x::groups::state_commit::ApplyError,
 ) -> Option<x0x::groups::ForkEvidence> {
+    // r4 (addendum item 7): after the first STORED evidence, silence ALL
+    // diagnostics for this group's conflicts — a different post-first
+    // conflict must not warn either (first COMPLETE evidence wins).
+    if current
+        .invite_lineage
+        .as_ref()
+        .is_some_and(|lineage| lineage.fork_evidence.is_some())
+    {
+        return None;
+    }
     let candidate_revision = match error {
         x0x::groups::state_commit::ApplyError::PrevHashMismatch { .. } => commit.revision,
         x0x::groups::state_commit::ApplyError::StaleRevision { got, .. } => {
@@ -2830,78 +2838,45 @@ fn evaluate_fork_evidence_candidate(
 
     // Authenticate the candidate: structure + signature + signer binding.
     let now_ms = now_millis_u64();
-    if commit.verify_structure().is_err() {
-        state
-            .groups_diagnostics
-            .record_conflict_unauthenticated(group_key, now_ms);
-        return None;
-    }
-    // The retained predecessor roster is the signed base the alternate
-    // commit claims to chain from.
-    let Some(predecessor) = current
-        .commit_log
-        .iter()
-        .rev()
-        .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
-    else {
-        state
-            .groups_diagnostics
-            .record_conflict_unauthenticated(group_key, now_ms);
-        return None;
-    };
-    let signer_is_base_admin = predecessor
-        .roster
-        .get(&commit.committed_by)
-        .is_some_and(|snap| {
-            snap.state == x0x::groups::GroupMemberState::Active
-                && snap.role.at_least(x0x::groups::GroupRole::Admin)
-        });
-    if !signer_is_base_admin {
+    if !fork_candidate_authenticated(current, commit) {
         state
             .groups_diagnostics
             .record_conflict_unauthenticated(group_key, now_ms);
         return None;
     }
 
-    // Deduplicate by identity. The DURABLE lineage record first — that
-    // is what keeps a RELOADED daemon silent about evidence it already
-    // carries — then the process's once-only diagnostics set (r3 Fable
-    // 2): the SECOND identical conflict fires no warn and no counter
-    // even when the record itself could not be (re)installed (e.g. a
-    // failed persist rolled it back).
-    if let Some(lineage) = current.invite_lineage.as_ref() {
-        if let Some(existing) = lineage.fork_evidence.as_ref() {
-            if existing.revision == candidate_revision
-                && existing.state_hash == commit.state_hash
-                && existing
-                    .committed_by
-                    .eq_ignore_ascii_case(&commit.committed_by)
-            {
-                return None;
-            }
-        }
-    }
-    if !state.groups_diagnostics.record_fork_evidence_once(
-        group_key,
-        candidate_revision,
-        &commit.state_hash,
-        &commit.committed_by,
-    ) {
-        return None;
-    }
-    tracing::warn!(
-        group_id = %LogHexId::group(group_key),
-        revision = candidate_revision,
-        state_hash = %commit.state_hash,
-        committed_by = %LogHexId::agent(&commit.committed_by),
-        "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
-    );
     Some(x0x::groups::ForkEvidence {
         revision: candidate_revision,
         state_hash: commit.state_hash.clone(),
         committed_by: commit.committed_by.clone(),
         observed_at_ms: now_millis_u64(),
     })
+}
+
+/// #468 A5 (r4): the pure candidate-authentication step shared by the
+/// live apply wrapper and journal recovery — structure/signature
+/// verification plus committer-was-active-admin in the retained
+/// PREDECESSOR roster (the signed base the alternate commit claims to
+/// chain from). No diagnostics inside: recovery runs before an
+/// `AppState` exists, so the (rate-limited) unauthenticated counter is
+/// the live caller's to fire.
+fn fork_candidate_authenticated(
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+) -> bool {
+    if commit.verify_structure().is_err() {
+        return false;
+    }
+    current
+        .commit_log
+        .iter()
+        .rev()
+        .find(|rc| rc.commit.revision == commit.revision.saturating_sub(1))
+        .and_then(|predecessor| predecessor.roster.get(&commit.committed_by))
+        .is_some_and(|snap| {
+            snap.state == x0x::groups::GroupMemberState::Active
+                && snap.role.at_least(x0x::groups::GroupRole::Admin)
+        })
 }
 
 /// #468 A5 (r3 Fable 2 + Codex 9): install one evaluated fork-evidence
@@ -2914,35 +2889,22 @@ fn evaluate_fork_evidence_candidate(
 /// selects the UNLOCKED helper for callers that already hold
 /// `named_groups_persistence_lock` (the causal-replay apply path) — the
 /// locking wrapper would self-deadlock there.
+/// Returns `true` only when the record reached directory durability —
+/// the caller gates the once-only diagnostics on it (r4 addendum
+/// item 7: a non-durable install must leave the conflict retryable,
+/// not seen-marked).
 async fn install_fork_evidence(
     state: &Arc<AppState>,
     group_key: &str,
     evidence: x0x::groups::ForkEvidence,
     persistence_lock_already_held: bool,
-) {
+) -> bool {
     let install_key = group_key.to_string();
     let install = |groups: &mut HashMap<String, x0x::groups::GroupInfo>| -> bool {
-        // First COMPLETE evidence wins: install only into a live
-        // lineage record that carries no evidence (or this exact one —
-        // impossible here, the evaluator already refused duplicates).
         groups
             .get_mut(&install_key)
             .and_then(|info| info.invite_lineage.as_mut())
-            .is_some_and(|lineage| {
-                let duplicate = lineage.fork_evidence.as_ref().is_some_and(|existing| {
-                    existing.revision == evidence.revision
-                        && existing.state_hash == evidence.state_hash
-                        && existing
-                            .committed_by
-                            .eq_ignore_ascii_case(&evidence.committed_by)
-                });
-                if !duplicate && lineage.fork_evidence.is_none() {
-                    lineage.fork_evidence = Some(evidence.clone());
-                    true
-                } else {
-                    false
-                }
-            })
+            .is_some_and(|lineage| fork_evidence_first_complete_wins(lineage, &evidence))
     };
     let outcome = if persistence_lock_already_held {
         persist_named_groups_mutation_unlocked(state, install).await
@@ -2950,26 +2912,45 @@ async fn install_fork_evidence(
         persist_named_groups_mutation(state, install).await
     };
     match outcome {
-        Ok(AtomicWriteOutcome::Durable) => {}
+        Ok(AtomicWriteOutcome::Durable) => true,
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             tracing::warn!(
                 group_id = %LogHexId::group(group_key),
-                "#468: fork evidence visible but not directory-durable (the durability flag retries on the next save)"
+                "#468: fork evidence visible but not directory-durable — NOT marked seen; the durability flag retries on the next save and the identical conflict retries the install"
             );
+            false
         }
         Ok(AtomicWriteOutcome::NotReplaced) => {
             tracing::debug!(
                 group_id = %LogHexId::group(group_key),
                 "#468: fork evidence install was a no-op (lineage gone or already carries evidence)"
             );
+            false
         }
         Err(e) => {
             tracing::warn!(
                 group_id = %LogHexId::group(group_key),
                 error = %e,
-                "#468: fork evidence persist FAILED — once-only diagnostics already fired; the next DIFFERENT conflict still records"
+                "#468: fork evidence persist FAILED — not marked seen, the identical conflict retries the install"
             );
+            false
         }
+    }
+}
+
+/// #468 A5 (r4): the FIRST-COMPLETE-WINS install rule shared by the
+/// live install path and journal recovery — evidence lands only on a
+/// lineage record that carries none; a lineage already holding evidence
+/// (identical or different) keeps it.
+fn fork_evidence_first_complete_wins(
+    lineage: &mut x0x::groups::InviteLineage,
+    evidence: &x0x::groups::ForkEvidence,
+) -> bool {
+    if lineage.fork_evidence.is_none() {
+        lineage.fork_evidence = Some(evidence.clone());
+        true
+    } else {
+        false
     }
 }
 
@@ -2996,13 +2977,36 @@ async fn apply_stateful_event_with_evidence(
                 if let Some(evidence) =
                     evaluate_fork_evidence_candidate(state, group_key, current, commit, &e)
                 {
-                    install_fork_evidence(
+                    let durable_install = install_fork_evidence(
                         state,
                         group_key,
-                        evidence,
+                        evidence.clone(),
                         persistence_lock_already_held,
                     )
                     .await;
+                    // r4 (addendum item 7): the once-only diagnostics
+                    // (warn + `adoption_fork_evidence`) fire ONLY after
+                    // the record reached directory durability — a
+                    // ReplacedNotDurable/Err/NotReplaced install is NOT
+                    // marked seen, so the identical conflict stays
+                    // retryable instead of being silenced by a record
+                    // that never landed (the r3 pre-install marking).
+                    if durable_install
+                        && state.groups_diagnostics.record_fork_evidence_once(
+                            group_key,
+                            evidence.revision,
+                            &evidence.state_hash,
+                            &evidence.committed_by,
+                        )
+                    {
+                        tracing::warn!(
+                            group_id = %LogHexId::group(group_key),
+                            revision = evidence.revision,
+                            state_hash = %evidence.state_hash,
+                            committed_by = %LogHexId::agent(&evidence.committed_by),
+                            "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
+                        );
+                    }
                 }
             }
             Err(e)
@@ -7902,6 +7906,31 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                                     lineage.corroborated = true;
                                 }
                             }
+                            // r4 (addendum item 9): the adoption just
+                            // materialized the reconstructed roster's
+                            // members DIGEST-ONLY (certificates are not
+                            // recoverable from the projection). Hydrate
+                            // every adopted digest-only seat from the
+                            // discovered-certificate cache NOW, before the
+                            // caller installs/persists `next` — the F1
+                            // bridge never re-fires for a cert that was
+                            // already cached when the seat materialized.
+                            let adopted_digest_only: Vec<String> = next
+                                .members_v2
+                                .iter()
+                                .filter(|(_, seat)| {
+                                    seat.certificate.is_none()
+                                        && seat.certificate_digest.is_some()
+                                })
+                                .map(|(id, _)| id.clone())
+                                .collect();
+                            hydrate_digest_only_seats_at_seat_time(
+                                state,
+                                &resolved_group_key,
+                                &mut next,
+                                &adopted_digest_only,
+                            )
+                            .await;
                             next
                         }
                         None => {
@@ -9648,6 +9677,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             if let Some(kp_b64) = treekem_key_package_b64.clone() {
                 next.set_member_treekem_key_package(&member_agent_id, kp_b64);
             }
+            // r3 (Codex 8) → r4 (addendum item 9): seat-time hydrate for a
+            // DIGEST-ONLY joiner seat, BEFORE the event's own certificate
+            // install below (running it after meant a seat the event does
+            // not carry bytes for — a re-join over a projection-era seat —
+            // never hydrated: the install path leaves it digest-only and
+            // the F1 bridge event never re-fires for an identical cached
+            // cert). Digest-anchored: only bytes hashing to the seat's
+            // committed digest install; the event's own certificate (when
+            // present) overwrites with the identical bytes.
+            hydrate_digest_only_seats_at_seat_time(
+                state,
+                &resolved_group_key,
+                &mut next,
+                std::slice::from_ref(&member_agent_id),
+            )
+            .await;
             if let Some(cert) = owner_certified_admission.clone() {
                 // Constraint 2: the certificate the joiner was admitted
                 // under becomes COMMITTED evidence — sealed into the roster
@@ -9666,36 +9711,6 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 }
             }
 
-            // r3 (Codex 8): targeted hydrate for a DIGEST-ONLY joiner
-            // seat. The F1 certificate-landing event fires only on
-            // CHANGE/cold-insert — a certificate already sitting in the
-            // discovery cache when this seat materializes digest-only
-            // (e.g. a re-join over a projection-era seat, or a restored
-            // key-stripped roster) will NEVER re-fire, so the bridge
-            // cannot be waited for. Pull the joiner's cached certificate
-            // NOW; `hydrate_member_certificates` is digest-anchored and
-            // installs only bytes hashing to the seat's committed digest.
-            if info.policy.admission.owner_certified_user_id().is_some() {
-                let seat_digest_only = next
-                    .members_v2
-                    .get(&member_agent_id)
-                    .is_some_and(|m| m.certificate.is_none() && m.certificate_digest.is_some());
-                if seat_digest_only {
-                    let evidence = owner_cert_evidence_for(state, &[&member_agent_id]).await;
-                    if let Some(cert) = evidence.cert_for(&member_agent_id).cloned() {
-                        let hydrated =
-                            next.hydrate_member_certificates(&[(member_agent_id.clone(), cert)]);
-                        if hydrated > 0 {
-                            tracing::info!(
-                                group_id = %LogHexId::group(&resolved_group_key),
-                                member = %LogHexId::agent(&member_agent_id),
-                                hydrated,
-                                "MemberJoined: hydrated digest-only joiner seat from the discovered-certificate cache"
-                            );
-                        }
-                    }
-                }
-            }
             let revision = next.roster_revision;
             let commit = if let Some(kp_bytes) = treekem_key_package_bytes.as_ref() {
                 let member_id = match parse_agent_id_hex(&member_agent_id) {
@@ -12360,17 +12375,162 @@ pub(in crate::server) enum MintInviteError {
     Signing(String),
 }
 
-/// Map a mint failure to its typed response (#469 A1b/D5/E3).
-fn mint_error_response(
+/// Typed refusals for the SINGLE mint transaction (r4 Codex addendum
+/// item 6): everything the mint route maps to a 4xx/429/503 response
+/// and the card surface maps to a typed omission counter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::server) enum MintInviteRefusal {
+    /// #469 E3: `MAX_LIVE_ISSUED_INVITES_PER_GROUP` live records already
+    /// outstanding.
+    CapReached { limit: usize },
+    /// r3 Fable 1 → r4: an owner-axis group (Home metadata or
+    /// OwnerCertified admission) demands a DURABLE-owner actor; a
+    /// session bearer never mints.
+    OwnerAxisNoDurableOwner,
+    /// #469 A1b: no usable local owner user key for an owner-axis group.
+    OwnerKeyUnavailable,
+    /// A D5 field cap was exceeded (`field`, measured size/count).
+    TooLarge { field: &'static str, size: usize },
+    /// The final encoded link exceeded the safety budget.
+    TooLargeBytes { actual: usize, limit: usize },
+    /// Signing failed (crypto error detail).
+    Signing(String),
+    /// The durable roster persist did not confirm directory durability —
+    /// the secret was NOT handed out (rolled back, or visible-but-not-
+    /// durable with the durability-retry flag set).
+    NotDurable,
+}
+
+/// r4 (Codex r3 addendum item 6): the SINGLE actor-aware MINT
+/// TRANSACTION shared by BOTH mint surfaces — `POST /groups/:id/invite`
+/// and the agent-card link mint. Under the CALLER-HELD group membership
+/// lock it performs, as ONE transaction: the live-invite prune + cap
+/// check, the owner-axis durable-owner fence, signed v4 assembly (owner
+/// countersignature fence, D5 caps, authoritative encoded-size gate),
+/// one-time-secret recording, and the durable roster persist.
+///
+/// Atomicity: nothing is recorded or persisted when any step refuses —
+/// the persist runs through `persist_named_group_info`, whose #457
+/// pre-durable rollback (journal discard + in-memory map restore + pending
+/// stub marker restore) rolls a failed save back, so a refused mint never
+/// leaves a live secret behind, and a `NotDurable` outcome never hands the
+/// link out (the ReplacedNotDurable record stays visible-but-unconfirmed
+/// and the durability flag retries on the next save, per the r2 Watson
+/// ruling). For TreeKEM-plane groups that persist is also the #457
+/// snapshot-rebind transaction — it keeps the on-disk envelope bound to
+/// the (invite-recording) named state and restores the secure plane into
+/// the live map when a restart left it unloaded.
+///
+/// `durable_owner` carries the ACTOR's authority (rider-auth
+/// `ActorContext::is_durable_owner`); the route's head fence
+/// (`home_mutation_requires_durable`) already answers 403 for session
+/// bearers, and this fence makes the card surface's phase-2 re-check
+/// the SAME rule instead of a second implementation.
+pub(in crate::server) async fn mint_invite_transaction(
+    state: &AppState,
+    group_key: &str,
+    expiry_secs: u64,
+    intended_joiner: Option<AgentId>,
+    origin: x0x::groups::InviteOrigin,
+    durable_owner: bool,
+) -> Result<(x0x::groups::invite::SignedInvite, String), MintInviteRefusal> {
+    let info = state
+        .named_groups
+        .read()
+        .await
+        .get(group_key)
+        .cloned()
+        .ok_or(MintInviteRefusal::NotDurable)?;
+    let mut next = info;
+    // r3 Fable 1 fence (same axis as `home_mutation_requires_durable`):
+    // a countersigned owner-axis link is a device-admission credential.
+    let owner_axis =
+        next.home.is_some() || next.policy.admission.owner_certified_user_id().is_some();
+    if owner_axis && !durable_owner {
+        return Err(MintInviteRefusal::OwnerAxisNoDurableOwner);
+    }
+    // #469 E3: the live-invite cap. Prune consumed/expired records
+    // first, then refuse at the cap.
+    let now_secs = now_millis_u64() / 1_000;
+    next.prune_issued_invites(now_secs);
+    if next.live_issued_invite_count(now_secs) >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP {
+        return Err(MintInviteRefusal::CapReached {
+            limit: x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP,
+        });
+    }
+    // #469 A1b: signed v4 assembly — owner countersignature fence, D5
+    // caps and the authoritative final encoded-size check all happen
+    // BEFORE the secret is recorded.
+    let (invite, link) = assemble_signed_v4_invite(state, &next, expiry_secs, intended_joiner)
+        .map_err(|e| match e {
+            MintInviteError::OwnerKeyUnavailable => MintInviteRefusal::OwnerKeyUnavailable,
+            MintInviteError::TooLarge { field, size } => {
+                MintInviteRefusal::TooLarge { field, size }
+            }
+            MintInviteError::TooLargeBytes { actual, limit } => {
+                MintInviteRefusal::TooLargeBytes { actual, limit }
+            }
+            MintInviteError::Signing(detail) => MintInviteRefusal::Signing(detail),
+        })?;
+    // Track this one-time secret on the inviter so a future MemberJoined
+    // request carrying it can be authenticated, role-capped,
+    // expiry-checked, and consumed locally before the inviter publishes
+    // an authority-signed MemberAdded commit. #469 A4: the intended
+    // joiner rides the record and is compared at consumption.
+    let signed_link = match origin {
+        x0x::groups::InviteOrigin::Card => Some(link.clone()),
+        x0x::groups::InviteOrigin::Explicit => None,
+    };
+    next.record_issued_invite_v2(
+        invite.invite_secret.clone(),
+        invite.created_at,
+        invite.expires_at,
+        x0x::groups::GroupRole::Member,
+        intended_joiner.map(|agent| hex::encode(agent.as_bytes())),
+        origin,
+        signed_link,
+    );
+    // r4 regression fix: persist through `persist_named_group_info`, NOT a
+    // plain `persist_named_groups_mutation` insert. The single-record
+    // helper is the #457 transaction — for a TreeKEM-plane group it also
+    // journals + applies the snapshot REBIND, and `rebind_restore_live_group`
+    // restores the group into the live `treekem_groups` map (arm-2 repair)
+    // when a restart left the map without it. The plain mutation persist
+    // dropped that side effect, so the first certified MemberJoined after a
+    // restart died at the #457 TreeKEM-availability gate. It also keeps the
+    // withdrawn-terminal-record and missing-slot guards
+    // (`store_named_group_info_locked`) the blind insert bypassed.
+    let outcome = persist_named_group_info(state, group_key, next).await;
+    match outcome {
+        Ok(AtomicWriteOutcome::Durable) => Ok((invite, link)),
+        _ => Err(MintInviteRefusal::NotDurable),
+    }
+}
+
+/// Map a mint-transaction refusal to its typed response (#469
+/// A1b/D5/E3 + r4 addendum item 6: cap, actor fence, durability).
+fn mint_refusal_response(
     group_id: &str,
-    error: MintInviteError,
+    refusal: MintInviteRefusal,
 ) -> (StatusCode, Json<serde_json::Value>) {
-    match error {
-        MintInviteError::OwnerKeyUnavailable => api_error(
+    match refusal {
+        MintInviteRefusal::CapReached { limit } => (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "invite_cap_reached",
+                "limit": limit,
+            })),
+        ),
+        MintInviteRefusal::OwnerAxisNoDurableOwner => api_error(
+            StatusCode::FORBIDDEN,
+            "mutating the Home requires the durable API token (not a session token)",
+        ),
+        MintInviteRefusal::OwnerKeyUnavailable => api_error(
             StatusCode::CONFLICT,
             "owner_key_unavailable: minting an owner-axis (Home-capable) invite requires the durable owner's loaded user key",
         ),
-        MintInviteError::TooLarge { field, size } => (
+        MintInviteRefusal::TooLarge { field, size } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "ok": false,
@@ -12379,7 +12539,7 @@ fn mint_error_response(
                 "size": size,
             })),
         ),
-        MintInviteError::TooLargeBytes { actual, limit } => (
+        MintInviteRefusal::TooLargeBytes { actual, limit } => (
             StatusCode::PAYLOAD_TOO_LARGE,
             Json(serde_json::json!({
                 "ok": false,
@@ -12391,10 +12551,17 @@ fn mint_error_response(
                 "limit_bytes": limit,
             })),
         ),
-        MintInviteError::Signing(detail) => {
+        MintInviteRefusal::Signing(detail) => {
             tracing::warn!(group_id = %LogHexId::group(group_id), %detail, "invite signing failed");
             api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("invite signing failed: {detail}"))
         }
+        MintInviteRefusal::NotDurable => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "named-group state is not directory-durable"
+            })),
+        ),
     }
 }
 
@@ -12432,7 +12599,7 @@ pub(in crate::server) async fn create_group_invite(
     // stale-clone apply storing afterward overwrites the invite we record here.
     let membership_lock = group_membership_lock(&state, &id).await;
     let _membership_guard = membership_lock.lock().await;
-    let (link, mls_group_id, group_name, expires_at, next) = {
+    {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(&id) else {
             return (
@@ -12441,7 +12608,6 @@ pub(in crate::server) async fn create_group_invite(
             )
                 .into_response();
         };
-
         let agent_id = state.agent.agent_id();
         let inviter_hex = hex::encode(agent_id.as_bytes());
         if let Err(e) = require_admin_or_above(info, &inviter_hex) {
@@ -12450,77 +12616,44 @@ pub(in crate::server) async fn create_group_invite(
         if let Some(resp) = reject_withdrawn_group(info) {
             return resp.into_response();
         }
-        let mut next = info.clone();
-
-        // #469 E3: the live-invite cap. Prune consumed/expired records
-        // first, then refuse at the cap — an unbounded mint surface would
-        // grow `issued_invites` forever on card-heavy installs.
-        let now_secs = now_millis_u64() / 1_000;
-        next.prune_issued_invites(now_secs);
-        if next.live_issued_invite_count(now_secs) >= x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP
-        {
-            return (
-                StatusCode::TOO_MANY_REQUESTS,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "invite_cap_reached",
-                    "limit": x0x::groups::MAX_LIVE_ISSUED_INVITES_PER_GROUP,
-                })),
-            )
-                .into_response();
-        }
-
-        // #469 A1b: the SINGLE mint authority — signed v4 assembly, owner
-        // countersignature fence, D5 caps and the authoritative final
-        // encoded-size check all happen BEFORE the secret is recorded.
-        let intended_joiner = match req.intended_joiner.as_deref() {
-            None => None,
-            Some(hex_id) => match parse_agent_id_hex(hex_id) {
-                Ok(agent) => Some(agent),
-                Err(e) => {
-                    return bad_request(format!("invalid intended_joiner: {e}")).into_response();
-                }
-            },
-        };
-        let (invite, link) =
-            match assemble_signed_v4_invite(&state, &next, req.expiry_secs, intended_joiner) {
-                Ok(minted) => minted,
-                Err(e) => return mint_error_response(&id, e).into_response(),
-            };
-
-        // Track this one-time secret on the inviter so a future
-        // MemberJoined request carrying it can be authenticated, role-capped,
-        // expiry-checked, and consumed locally before the inviter publishes an
-        // authority-signed MemberAdded commit. #469 A4: the intended joiner
-        // rides the record and is compared at consumption.
-        next.record_issued_invite_v2(
-            invite.invite_secret.clone(),
-            invite.created_at,
-            invite.expires_at,
-            x0x::groups::GroupRole::Member,
-            req.intended_joiner.clone(),
-            x0x::groups::InviteOrigin::Explicit,
-            None,
-        );
-
-        let mls_group_id = next.mls_group_id.clone();
-        let group_name = next.name.clone();
-        let expires_at = invite.expires_at;
-        (link, mls_group_id, group_name, expires_at, next)
-    };
-    if !matches!(
-        persist_named_group_info(&state, &id, next).await,
-        Ok(AtomicWriteOutcome::Durable)
-    ) {
-        return (
-            StatusCode::SERVICE_UNAVAILABLE,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "named-group state is not directory-durable"
-            })),
-        )
-            .into_response();
     }
+    // #469 A4: mint the invite for ONE specific agent (64-char hex) or
+    // leave it unaddressed (first-joiner-wins).
+    let intended_joiner = match req.intended_joiner.as_deref() {
+        None => None,
+        Some(hex_id) => match parse_agent_id_hex(hex_id) {
+            Ok(agent) => Some(agent),
+            Err(e) => {
+                return bad_request(format!("invalid intended_joiner: {e}")).into_response();
+            }
+        },
+    };
+    // r4 (addendum item 6): the SINGLE actor-aware mint transaction —
+    // live-cap, owner-axis durable fence, signed v4 assembly, secret
+    // recording and the durable persist as ONE unit, shared with the
+    // card surface. A refusal leaves no recorded secret (the #470
+    // compare-and-restore rolls the map back on a failed save).
+    let (invite, link) = match mint_invite_transaction(
+        &state,
+        &id,
+        req.expiry_secs,
+        intended_joiner,
+        x0x::groups::InviteOrigin::Explicit,
+        actor.is_durable_owner(),
+    )
+    .await
+    {
+        Ok(minted) => minted,
+        Err(refusal) => return mint_refusal_response(&id, refusal).into_response(),
+    };
+    let (mls_group_id, group_name) = {
+        let groups = state.named_groups.read().await;
+        match groups.get(&id) {
+            Some(info) => (info.mls_group_id.clone(), info.name.clone()),
+            None => (id.clone(), String::new()),
+        }
+    };
+    let expires_at = invite.expires_at;
 
     (
         StatusCode::OK,
@@ -12792,6 +12925,14 @@ pub(in crate::server) async fn join_group_via_invite(
         Ok(id) => id,
         Err(_) => return refuse_invite(&state, &invite, "inviter_key_mismatch"),
     };
+    // sigs, inviter half (A2 step 7a — r4 addendum item 8, LITERAL A2
+    // precedence): the INLINE INVITER KEY BINDING and the inviter
+    // signature run BEFORE the revocation-set check (a key that never
+    // bound to its claimed id is a mismatch, not a revocation), and the
+    // owner countersignature runs later — AFTER base consistency.
+    if let Err(refusal) = invite.verify_v4_inviter_axis() {
+        return refuse_invite(&state, &invite, refusal.reason());
+    }
     // Revocation of the inline inviter key (v7 F3: agent subject only —
     // there is no user revocation subject; see the ADR-0016 amendment).
     {
@@ -12801,13 +12942,6 @@ pub(in crate::server) async fn join_group_via_invite(
             drop(revoked);
             return refuse_invite(&state, &invite, "inviter_key_revoked");
         }
-    }
-    // sigs (A2 step 7): inline keys must bind to their claimed ids (F2:
-    // domain-separated from_public_key — re-checked here as part of the
-    // canonical verify), the inviter signature and, on the owner axis,
-    // the owner countersignature must verify.
-    if let Err(refusal) = invite.verify_v4_signatures() {
-        return refuse_invite(&state, &invite, refusal.reason());
     }
     // caps (r1 Codex 10): caps are enforced at JOIN too — every trusted
     // field, not just at mint. r3 (Codex 10) adds the Home-metadata
@@ -12833,6 +12967,12 @@ pub(in crate::server) async fn join_group_via_invite(
             );
             return refuse_invite(&state, &invite, "invite_malformed");
         }
+    }
+    // sigs, owner half (A2 step 7b — r4 addendum item 8): base
+    // consistency runs BEFORE the owner countersignature — a base that
+    // does not re-derive is refused before any owner-key work.
+    if let Err(refusal) = invite.verify_v4_owner_countersignature() {
+        return refuse_invite(&state, &invite, refusal.reason());
     }
     // base (A2 step 8): recompute the authority's base state hash from
     // the projection + snapshot exactly as the stub will materialize
@@ -13119,6 +13259,28 @@ pub(in crate::server) async fn join_group_via_invite(
                 corroborated: false,
                 fork_evidence: None,
             });
+
+            // r4 (addendum item 9): the base-roster materialization above
+            // seated every projection member DIGEST-ONLY (certificate
+            // bytes never ride the projection). Hydrate the digest-only
+            // seats from the local discovered-certificate cache NOW —
+            // before the durable write below — because the F1 bridge
+            // event only fires on CHANGE/cold-insert and never re-fires
+            // for a cert that was already cached when the seat
+            // materialized. Digest-anchored and roster-root-neutral.
+            let materialized_digest_only: Vec<String> = info
+                .members_v2
+                .iter()
+                .filter(|(_, seat)| seat.certificate.is_none() && seat.certificate_digest.is_some())
+                .map(|(id, _)| id.clone())
+                .collect();
+            hydrate_digest_only_seats_at_seat_time(
+                &state,
+                &group_id_hex,
+                &mut info,
+                &materialized_digest_only,
+            )
+            .await;
 
             let chat_topic = info.general_chat_topic();
 
@@ -16457,6 +16619,71 @@ pub(in crate::server) async fn owner_cert_evidence_for(
         }
     }
     evidence
+}
+
+/// r3 (Codex 8) → r4 (hs-FU-A round 4, Codex r3 addendum item 9): the
+/// SEAT-TIME targeted certificate hydrate, shared by every site where a
+/// digest-only seat materializes — the MemberJoined authority seat (run
+/// BEFORE the event's own certificate install, or a re-activated
+/// projection-era seat never hydrates), the across-gap adoption success
+/// path (`try_adopt_member_added_across_gap` materializes the
+/// reconstructed roster digest-only), and the join route's invite
+/// base-roster materialization (`invite_join_group_info` seats every
+/// projection member digest-only). The F1 certificate-landing event
+/// fires only on CHANGE/cold-insert (the discovery-cache upsert), so a
+/// certificate already sitting in the cache when the seat materializes
+/// will NEVER re-fire and the bridge cannot be waited for — pull it NOW.
+/// `hydrate_member_certificates` is digest-anchored and installs only
+/// bytes hashing to each seat's committed digest (a mismatched cached
+/// cert is ignored, never installed; settled seats are untouched, and
+/// the roster root is unchanged because a digest-only member hashes
+/// identically to its byte-bearing form — #468/#469 design v5 D2).
+/// Returns how many seats hydrated.
+pub(in crate::server) async fn hydrate_digest_only_seats_at_seat_time(
+    state: &AppState,
+    group_key: &str,
+    info: &mut x0x::groups::GroupInfo,
+    members: &[String],
+) -> usize {
+    if info.policy.admission.owner_certified_user_id().is_none() {
+        // No owner axis: seats never carry certificate digests.
+        return 0;
+    }
+    let digest_only: Vec<String> = members
+        .iter()
+        .filter(|member| {
+            info.members_v2
+                .get(*member)
+                .is_some_and(|seat| seat.certificate.is_none() && seat.certificate_digest.is_some())
+        })
+        .cloned()
+        .collect();
+    if digest_only.is_empty() {
+        return 0;
+    }
+    let refs: Vec<&str> = digest_only.iter().map(String::as_str).collect();
+    let evidence = owner_cert_evidence_for(state, &refs).await;
+    let pairs: Vec<(String, x0x::identity::AgentCertificate)> = digest_only
+        .iter()
+        .filter_map(|member| {
+            evidence
+                .cert_for(member)
+                .cloned()
+                .map(|cert| (member.clone(), cert))
+        })
+        .collect();
+    if pairs.is_empty() {
+        return 0;
+    }
+    let hydrated = info.hydrate_member_certificates(&pairs);
+    if hydrated > 0 {
+        tracing::info!(
+            group_id = %LogHexId::group(group_key),
+            hydrated,
+            "seat-time hydrate: installed cached certificates onto digest-only seats"
+        );
+    }
+    hydrated
 }
 
 /// ADR-0038 seal-time evidence: snapshot certificates for every ACTIVE
@@ -20623,6 +20850,114 @@ fn journal_record_state_hash(journal: &TreeKemNamedPersistJournal) -> String {
         .unwrap_or_default()
 }
 
+/// r4 (Codex r3 addendum item 7): fork evidence for the JOURNAL-RECOVERY
+/// conflict path. Recovery runs before an `AppState` exists, so this
+/// cannot call the AppState-backed install — instead it applies the SAME
+/// central rules the live wrapper uses, via the shared pure helpers
+/// (`fork_candidate_authenticated` for the
+/// signature/committer-authority gate, `fork_evidence_first_complete_wins`
+/// for the install): the journal record's own terminal commit
+/// authenticates the conflict against the LIVE record's retained
+/// predecessor roster, and the evidence lands on the live record's
+/// lineage in whichever durable store actually holds that record
+/// (Home-Suite records live in the sidecar; the legacy store holds
+/// sentinels for them, which carry no lineage and are skipped).
+///
+/// Best-effort by design: the quarantine the caller performs next is
+/// the fail-closed act, and a failed evidence write must never block
+/// it. Pre-first-evidence conflicts stay retryable exactly like the
+/// live path (nothing is marked seen before a durable write).
+async fn record_recovery_fork_evidence(
+    named_groups_path: &FsPath,
+    home_suite_groups_path: &FsPath,
+    journal: &TreeKemNamedPersistJournal,
+    live: Option<&x0x::groups::GroupInfo>,
+    journal_revision: u64,
+    journal_state_hash: &str,
+) {
+    let Some(live) = live else {
+        return;
+    };
+    if live.invite_lineage.is_none() {
+        // No lineage to carry evidence — nothing to install.
+        return;
+    }
+    let journal_commit =
+        serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&journal.named_groups_json)
+            .ok()
+            .and_then(|view| {
+                view.get(&journal.group_id_hex)
+                    .and_then(|record| record.commit_log.last())
+                    .map(|retained| retained.commit.clone())
+            });
+    let Some(journal_commit) = journal_commit else {
+        tracing::debug!(
+            group_id = %journal.group_id_hex,
+            "#468 recovery: journal record carries no terminal commit — no evidence"
+        );
+        return;
+    };
+    if !fork_candidate_authenticated(live, &journal_commit) {
+        tracing::debug!(
+            group_id = %journal.group_id_hex,
+            "#468 recovery: journal conflict commit fails the shared authentication gate — no evidence"
+        );
+        return;
+    }
+    let evidence = x0x::groups::ForkEvidence {
+        revision: journal_revision,
+        state_hash: journal_state_hash.to_string(),
+        committed_by: journal_commit.committed_by.clone(),
+        observed_at_ms: now_millis_u64(),
+    };
+    for store_path in [named_groups_path, home_suite_groups_path] {
+        let Ok(json) = tokio::fs::read_to_string(store_path).await else {
+            continue;
+        };
+        let Ok(mut store) = serde_json::from_str::<HashMap<String, x0x::groups::GroupInfo>>(&json)
+        else {
+            continue;
+        };
+        let Some(record) = store.get_mut(&journal.group_id_hex) else {
+            continue;
+        };
+        let Some(lineage) = record.invite_lineage.as_mut() else {
+            // Legacy-store sentinel for a sidecar record — skip.
+            continue;
+        };
+        if !fork_evidence_first_complete_wins(lineage, &evidence) {
+            continue;
+        }
+        let Ok(merged) = serde_json::to_string(&store) else {
+            tracing::warn!(
+                group_id = %journal.group_id_hex,
+                "#468 recovery: fork-evidence store re-encode failed"
+            );
+            return;
+        };
+        match write_named_groups_json_atomic(store_path, &merged).await {
+            Ok(_) => {
+                tracing::warn!(
+                    group_id = %journal.group_id_hex,
+                    revision = evidence.revision,
+                    state_hash = %evidence.state_hash,
+                    committed_by = %LogHexId::agent(&evidence.committed_by),
+                    "#468 recovery: journal-recovery fork evidence recorded on the live lineage (no eviction; #472 owns the protocol response)"
+                );
+                return;
+            }
+            Err(e) => {
+                tracing::warn!(
+                    group_id = %journal.group_id_hex,
+                    error = %e,
+                    "#468 recovery: fork-evidence write failed — not recorded; quarantine below remains the fail-closed act"
+                );
+                return;
+            }
+        }
+    }
+}
+
 /// #457 r10 item 10.2/10.3 — test-only rename fault injection for the
 /// quarantine path (first/second rename failure).
 /// #457 r11 item 11.6 — the quarantine outcome describes the ACTUAL
@@ -21634,6 +21969,19 @@ pub(in crate::server) async fn recover_treekem_named_journals(
                         });
                 let journal_revision = journal_record_revision(&journal);
                 let journal_state_hash = journal_record_state_hash(&journal);
+                // r4 (addendum item 7): the recovery-detected conflict is
+                // fork evidence too — recorded on the live lineage through
+                // the SAME shared rules as the central apply wrapper
+                // (best-effort; the quarantine below stays fail-closed).
+                record_recovery_fork_evidence(
+                    named_groups_path,
+                    home_suite_groups_path,
+                    &journal,
+                    live_probe.as_ref(),
+                    journal_revision,
+                    &journal_state_hash,
+                )
+                .await;
                 tracing::error!(
                     group_id = %journal.group_id_hex,
                     legacy_source = %path.display(),

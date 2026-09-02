@@ -3708,7 +3708,8 @@ mod member_certificate_bridge_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     use super::{
-        reconcile_member_certificates_from_cache, run_member_certificate_bridge, AppState,
+        reconcile_member_certificates_from_cache, run_member_certificate_bridge,
+        supervise_member_certificate_bridge, AppState,
     };
     use crate as x0x;
     use crate::server::routes::named_groups::tests::secure_endpoint_test_state;
@@ -3977,5 +3978,120 @@ mod member_certificate_bridge_tests {
             "an idempotent sweep must not re-stamp the member"
         );
         assert_eq!(second.certificate, first.certificate);
+    }
+
+    /// WHY (r4 / addendum item 5): the supervisor must RESPAWN a bridge
+    /// worker that dies mid-stream, and every (re)start re-runs the FULL
+    /// cache reconcile — a digest-only seat created while the worker was
+    /// down hydrates after the restart with NO new event. The initial
+    /// worker is killed deterministically by feeding it a receiver whose
+    /// channel then CLOSES (`RecvError::Closed` → clean worker exit —
+    /// exactly the "worker died, shutdown was NOT requested" arm the
+    /// supervisor restarts on); the sentinel member A proves worker 1
+    /// was alive and past its initial reconcile (its certificate lives
+    /// ONLY in the synthetic event, never in the cache), and member B's
+    /// cache entry lands only after the death — only worker 2's
+    /// startup reconcile can hydrate it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supervisor_respawns_worker_and_reconciles_after_death() {
+        let user = x0x::identity::UserKeypair::generate().unwrap();
+        let a_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let b_kp = x0x::identity::AgentKeypair::generate().unwrap();
+        let cert_a = x0x::identity::AgentCertificate::issue(&user, &a_kp).unwrap();
+        let cert_b = x0x::identity::AgentCertificate::issue(&user, &b_kp).unwrap();
+        let hex_a = hex::encode(a_kp.agent_id().as_bytes());
+        let hex_b = hex::encode(b_kp.agent_id().as_bytes());
+
+        let (state, _dir) = secure_endpoint_test_state().await.unwrap();
+        // Both members seat digest-only; A's cert rides ONLY the
+        // synthetic event channel, B's ONLY the discovery cache.
+        let (group_id, info) = group_with_digest_only_members(&[
+            (a_kp.agent_id(), cert_a.clone()),
+            (b_kp.agent_id(), cert_b.clone()),
+        ]);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_id.clone(), info);
+
+        // The synthetic channel whose closure kills worker 1.
+        let (event_tx, event_rx) = tokio::sync::broadcast::channel::<x0x::VerifiedCertificate>(8);
+        let supervisor = tokio::spawn(supervise_member_certificate_bridge(
+            std::sync::Arc::clone(&state),
+            event_rx,
+        ));
+
+        // Sentinel: A hydrates ONLY through the synthetic event, proving
+        // worker 1 subscribed to OUR channel and finished its initial
+        // reconcile (the cache holds no entry for A).
+        let digest_a = *blake3::hash(bincode::serialize(&cert_a).unwrap().as_slice()).as_bytes();
+        let _ = event_tx.send(x0x::VerifiedCertificate {
+            agent_id: a_kp.agent_id(),
+            certificate: cert_a.clone(),
+            digest: digest_a,
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            if member_of(&state, &group_id, &hex_a)
+                .await
+                .certificate
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker 1 must apply the synthetic event (proof of life past its initial reconcile)"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+
+        // Kill worker 1 mid-stream: closing the channel exits its loop
+        // (Closed), which the supervisor treats as an early exit and
+        // respawns after backoff — subscription switches to the AGENT
+        // channel, whose startup reconcile is cache-driven.
+        drop(event_tx);
+        // While the worker is down/upcoming, B's certificate lands ONLY
+        // in the discovery cache (a raw write that fires an event on the
+        // AGENT channel — missed if worker 2 has not subscribed yet; the
+        // reconcile covers it either way).
+        state.agent.identity_discovery_cache().write().await.insert(
+            b_kp.agent_id(),
+            cached_cert_entry(b_kp.agent_id(), cert_b.clone()),
+        );
+
+        // The fresh worker's full reconcile hydrates B — impossible
+        // without a respawn (worker 1 is dead and its only reconcile ran
+        // before B's entry existed).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+        loop {
+            if member_of(&state, &group_id, &hex_b)
+                .await
+                .certificate
+                .is_some()
+            {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the respawned worker's reconcile must hydrate the digest-only seat created while it was down"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        let b = member_of(&state, &group_id, &hex_b).await;
+        assert!(b.certificate.as_ref().is_some_and(|c| *c == cert_b));
+        assert_eq!(
+            b.certificate_digest.as_deref(),
+            Some(x0x::groups::owner_cert::certificate_digest_hex(&cert_b).as_str())
+        );
+
+        // Clean shutdown: the supervisor (still alive after the respawn)
+        // exits on the daemon's shutdown watch.
+        let _ = state.shutdown_notify.send(true);
+        tokio::time::timeout(std::time::Duration::from_secs(10), supervisor)
+            .await
+            .expect("supervisor exits on shutdown")
+            .expect("supervisor task completed cleanly");
     }
 }

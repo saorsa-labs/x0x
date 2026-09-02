@@ -193,21 +193,28 @@ pub const INVITE_MAX_TAGS: usize = 16;
 pub const INVITE_MAX_TAG_LEN: usize = 32;
 /// Maximum `avatar_url` / `banner_url` length (#469 D5).
 pub const INVITE_MAX_URL_LEN: usize = 512;
-/// Maximum roster entries in a v4 invite (#469 D5 / v7 F4 / r3 Codex 11).
-/// DERIVED, not chosen: the final-encoder worst-case fixture (all string
-/// caps simultaneous, two inline keys + two signatures, N
-/// certificate-bearing projection entries with max-length ids/hashes) is
-/// measured BOTH as a bare link against the 40,960-byte
-/// [`INVITE_LINK_MAX_BYTES`] budget AND through the EXACT e2e
-/// `group_join` command-DM wrapper (`x0xtest|cmd|` ‖ base64(JSON
+/// Maximum `base_home.primary_agent` length (round 4 / hs-FU-A item 10).
+/// A primary agent id is 32 bytes of hex (64 chars) — the same bound the
+/// join side enforces (`JOIN_HOME_PRIMARY_AGENT_MAX_BYTES`); mint refuses
+/// what join would reject.
+pub const INVITE_MAX_HOME_PRIMARY_AGENT_BYTES: usize = 64;
+/// Maximum roster entries in a v4 invite (#469 D5 / v7 F4 / r3 Codex 11 /
+/// round 4 item 11). DERIVED, not chosen: the final-encoder worst-case
+/// fixture (all string caps simultaneous, a worst-case Home — 64-hex
+/// primary agent + one max-length Roaming placement per roster member,
+/// i.e. the placements map AT its cap at the constant, two inline keys +
+/// two signatures, N certificate-bearing projection entries with
+/// max-length ids/hashes) is measured BOTH as a bare link against the
+/// 40,960-byte [`INVITE_LINK_MAX_BYTES`] budget AND through the EXACT
+/// e2e `group_join` command-DM wrapper (`x0xtest|cmd|` ‖ base64(JSON
 /// envelope), tests/e2e_vps_groups.py:498-508) against the 49,152-byte
 /// gossip DM ceiling ([`crate::dm::MAX_PAYLOAD_BYTES`]). The link-only
-/// budget alone would admit 38 entries; the wrapped cmd-DM is the
+/// budget alone would admit 30 entries; the wrapped cmd-DM is the
 /// BINDING constraint, and the largest N whose worst case fits BOTH
-/// bounds is 26 — that is the constant. The pinned test fails if the
+/// bounds is 20 — that is the constant. The pinned test fails if the
 /// constant is raised OR lowered off the derived maximum. The final
 /// encoded-size check remains authoritative regardless.
-pub const MAX_INVITE_ROSTER_ENTRIES: usize = 26;
+pub const MAX_INVITE_ROSTER_ENTRIES: usize = 20;
 
 /// Typed refusal reasons for v4 invite verification (#469 A2). These are
 /// the `reason` strings counted by `invites_refused{reason}` and surfaced
@@ -757,6 +764,19 @@ impl SignedInvite {
                 }
             }
         }
+        // Round 4 (hs-FU-A item 10): the Home caps the join side enforces
+        // (`JOIN_HOME_PRIMARY_AGENT_MAX_BYTES` / `JOIN_HOME_PLACEMENTS_MAX`)
+        // are checked at MINT too — an over-cap Home must never be signed.
+        // Placements key roster members, so the roster cap is their natural
+        // bound (mirrored by the join side).
+        if let Some(home) = self.base_home.as_ref() {
+            if home.primary_agent.len() > INVITE_MAX_HOME_PRIMARY_AGENT_BYTES {
+                return Some(("base_home.primary_agent", home.primary_agent.len()));
+            }
+            if home.placements.len() > MAX_INVITE_ROSTER_ENTRIES {
+                return Some(("base_home.placements", home.placements.len()));
+            }
+        }
         if let Some(roster) = self.base_roster.as_ref() {
             if roster.len() > MAX_INVITE_ROSTER_ENTRIES {
                 return Some(("base_roster", roster.len()));
@@ -828,7 +848,22 @@ impl SignedInvite {
     /// [`InviteRefusal::InviterKeyRevoked`] — the AGENT subject only; there
     /// is no user revocation subject, see v7 F3 and the ADR-0016
     /// amendment).
+    ///
+    /// r4 (Codex addendum item 8): composed of the two granular halves
+    /// so the join route can interleave its A2 steps literally —
+    /// [`Self::verify_v4_inviter_axis`] (binding + inviter signature)
+    /// runs before the revocation-set check, and base consistency runs
+    /// before [`Self::verify_v4_owner_countersignature`].
     pub fn verify_v4_signatures(&self) -> Result<(), InviteRefusal> {
+        self.verify_v4_inviter_axis()?;
+        self.verify_v4_owner_countersignature()
+    }
+
+    /// The inviter half of [`Self::verify_v4_signatures`]: legacy
+    /// `signature` must be empty, the inline inviter key must bind to
+    /// its claimed id (E4 — the id IS the hash of the key), and the
+    /// inviter signature must verify over the canonical view.
+    pub fn verify_v4_inviter_axis(&self) -> Result<(), InviteRefusal> {
         if !self.signature.is_empty() {
             return Err(InviteRefusal::SignatureInvalid);
         }
@@ -863,7 +898,19 @@ impl SignedInvite {
         {
             return Err(InviteRefusal::InviterSignatureInvalid);
         }
+        Ok(())
+    }
 
+    /// The owner half of [`Self::verify_v4_signatures`]: for policies
+    /// carrying an OwnerCertified axis, the inline owner user key must
+    /// be present, bind to the policy's owner id, and countersign the
+    /// canonical view. A no-op `Ok(())` for ordinary (no-owner-axis)
+    /// invites.
+    pub fn verify_v4_owner_countersignature(&self) -> Result<(), InviteRefusal> {
+        let view = InviteSignedViewV4::from_invite(self)?;
+        let canonical = view
+            .canonical_bytes()
+            .map_err(|_| InviteRefusal::Malformed)?;
         // Owner axis: countersignature required and verified under the
         // inline owner user key, itself bound to the policy's owner id.
         if let Some(owner_id) = view
@@ -967,7 +1014,7 @@ mod tests {
     use super::*;
     use crate::groups::policy::{GroupAdmission, GroupConfidentiality};
     use crate::groups::state_commit::{compute_home_digest, GroupPublicMeta, RosterMemberSnapshot};
-    use crate::groups::{GroupMemberState, GroupRole, HomeMetadata};
+    use crate::groups::{GroupMemberState, GroupRole, HomeMetadata, MemberPlacement};
     use crate::identity::{AgentKeypair, UserId, UserKeypair};
 
     fn agent(n: u8) -> AgentId {
@@ -1843,13 +1890,24 @@ mod tests {
         boundary.base_state_revision = Some(1);
         boundary.base_state_hash = Some("aa".repeat(32));
         boundary.base_secret_epoch = Some(1);
+        // Round 4 (item 10): the Home caps sit AT their bounds too — a
+        // 64-hex primary agent and a placements map at the roster cap
+        // (the join-side `JOIN_HOME_PLACEMENTS_MAX` bound).
+        let boundary_home = HomeMetadata {
+            primary_agent: "12".repeat(32),
+            placements: (0..MAX_INVITE_ROSTER_ENTRIES)
+                .map(|i| (format!("{i:064x}"), MemberPlacement::Roaming))
+                .collect(),
+            provisioned_at_ms: u64::MAX,
+        };
+        boundary.base_home = Some(boundary_home.clone());
         boundary.public_meta = Some(GroupPublicMeta {
             name: "n".repeat(INVITE_MAX_GROUP_NAME),
             description: "d".repeat(INVITE_MAX_GROUP_DESCRIPTION),
             tags: vec!["t".repeat(INVITE_MAX_TAG_LEN); INVITE_MAX_TAGS],
             avatar_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
             banner_url: Some("u".repeat(INVITE_MAX_URL_LEN)),
-            home_digest: None,
+            home_digest: Some(compute_home_digest(&boundary_home)),
         });
         boundary.base_roster = Some(
             (0..MAX_INVITE_ROSTER_ENTRIES)
@@ -1950,11 +2008,35 @@ mod tests {
             }),
             ("base_roster", MAX_INVITE_ROSTER_ENTRIES + 1)
         );
+        // Round 4 (item 10): each Home cap exceeded at MINT reports a
+        // typed violation — the same bounds the join side enforces.
+        assert_eq!(
+            over(&|t| {
+                let mut home = t.base_home.clone().expect("home");
+                home.primary_agent = "p".repeat(INVITE_MAX_HOME_PRIMARY_AGENT_BYTES + 1);
+                t.base_home = Some(home);
+            }),
+            (
+                "base_home.primary_agent",
+                INVITE_MAX_HOME_PRIMARY_AGENT_BYTES + 1
+            )
+        );
+        assert_eq!(
+            over(&|t| {
+                let mut home = t.base_home.clone().expect("home");
+                home.placements
+                    .insert("ff".repeat(32), MemberPlacement::Pinned);
+                t.base_home = Some(home);
+            }),
+            ("base_home.placements", MAX_INVITE_ROSTER_ENTRIES + 1)
+        );
     }
 
     /// v7 F4 / r3 (Codex 11 + Fable 5): `MAX_INVITE_ROSTER_ENTRIES` is
     /// DERIVED, not chosen. The worst-case mintable fixture below puts
-    /// every capped string at its cap, carries both inline ML-DSA-65
+    /// every capped string at its cap, a worst-case Home (64-hex primary
+    /// agent, one max-length Roaming placement per roster member — AT the
+    /// placements cap when N is the constant), both inline ML-DSA-65
     /// keys (1 952 B → 2 604 base64 chars) and both signatures
     /// (3 309 B → 4 412 base64 chars), and N projection entries with
     /// max-length ids/hashes and the longest role and state wire
@@ -1989,9 +2071,21 @@ mod tests {
             invite.base_state_revision = Some(u64::MAX);
             invite.base_state_hash = Some(hex64());
             invite.base_prev_state_hash = Some(hex64());
+            // Round 4 (item 11) — fixture TRUTH: the worst-case Home for
+            // a roster of n keys EVERY member — n max-length (64-hex)
+            // Roaming placements (the longest wire value). Placements key
+            // roster members (join-side `JOIN_HOME_PLACEMENTS_MAX` doc:
+            // "a larger map can never be consistent with the signed
+            // roster"), so this is the largest Home an n-member roster
+            // can carry; at the derived cap it sits exactly AT the
+            // placements cap. The empty map the fixture used to carry
+            // under-stated the worst case (`skip_serializing_if =
+            // "is_empty"` hid it entirely).
             let home = HomeMetadata {
                 primary_agent: hex64(),
-                placements: BTreeMap::new(),
+                placements: (0..n)
+                    .map(|i| (format!("{i:064x}"), MemberPlacement::Roaming))
+                    .collect(),
                 provisioned_at_ms: u64::MAX,
             };
             invite.base_home = Some(home.clone());
@@ -2066,7 +2160,11 @@ mod tests {
         // rules hold, no D5 cap fires, and BOTH the final encoder and
         // the exact cmd-DM wrapper accept it.
         let at_cap = worst_case(MAX_INVITE_ROSTER_ENTRIES);
-        assert!(InviteSignedViewV4::from_invite(&at_cap).is_ok());
+        assert!(
+            InviteSignedViewV4::from_invite(&at_cap).is_ok(),
+            "worst case at the cap must be structurally mintable: {:?}",
+            InviteSignedViewV4::from_invite(&at_cap)
+        );
         assert_eq!(at_cap.v4_field_caps_violation(), None);
         let cap_link = at_cap
             .encode_link()
@@ -2141,10 +2239,14 @@ mod tests {
     /// parses invites with — tag-copied from `git show
     /// v0.40.4:src/groups/invite.rs` (the pre-#469 field set: no
     /// `base_home`, no version/public-meta/projection/inline-key/
-    /// signature fields) and `git show v0.40.4:src/groups/policy.rs`
-    /// (the policy mirror WITHOUT the ADR-0038 `owner_certified`
-    /// admission variant). Deserializing into these types behaves
-    /// exactly like a v0.40.4 node reading invite JSON.
+    /// signature fields; the `signature` field carries NO serde
+    /// default at the tag shape, so absent-signature JSON fails there),
+    /// `git show v0.40.4:src/groups/policy.rs` (the policy mirror
+    /// WITHOUT the ADR-0038 `owner_certified` admission variant but
+    /// WITH the `AdminOnly` write-access variant), and `git show
+    /// v0.40.4:src/groups/member.rs` (the pre-ADR-0038 `GroupMember`
+    /// shape — no certificate fields). Deserializing into these types
+    /// behaves exactly like a v0.40.4 node reading invite JSON.
     mod replica_v0_40_4 {
         use serde::{Deserialize, Serialize};
         use std::collections::BTreeMap;
@@ -2189,6 +2291,7 @@ mod tests {
             #[default]
             MembersOnly,
             ModeratedPublic,
+            AdminOnly,
         }
 
         #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -2198,6 +2301,68 @@ mod tests {
             pub confidentiality: GroupConfidentiality,
             pub read_access: GroupReadAccess,
             pub write_access: GroupWriteAccess,
+        }
+
+        /// Tag-copied v0.40.4 `GroupRole` (member.rs) — the flat
+        /// ADR-0016 vocabulary, unchanged since.
+        #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupRole {
+            Owner,
+            Admin,
+            Moderator,
+            Member,
+            Guest,
+        }
+
+        /// Tag-copied v0.40.4 `GroupMemberState` (member.rs).
+        #[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+        #[serde(rename_all = "snake_case")]
+        pub enum GroupMemberState {
+            #[default]
+            Active,
+            Pending,
+            Removed,
+            Banned,
+        }
+
+        /// Tag-copied v0.40.4 `GroupMember` (member.rs) — the PRE-ADR-0038
+        /// shape: no `certificate_missing_since_ms`, `certificate`, or
+        /// `certificate_digest` fields (those default on the current type
+        /// when absent, but a replica reading with the CURRENT type would
+        /// also silently accept certificate-bearing rosters the tag
+        /// shape never round-trips).
+        #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+        pub struct GroupMember {
+            /// Agent ID as lowercase hex.
+            pub agent_id: String,
+            /// Optional linked user ID (hex).
+            #[serde(default)]
+            pub user_id: Option<String>,
+            pub role: GroupRole,
+            pub state: GroupMemberState,
+            #[serde(default)]
+            pub display_name: Option<String>,
+            /// Unix milliseconds when this member was first added.
+            pub joined_at: u64,
+            /// Unix milliseconds of the last state/role change.
+            pub updated_at: u64,
+            /// Agent hex that added this member (None for the initial admin seed).
+            #[serde(default)]
+            pub added_by: Option<String>,
+            /// Agent hex that removed/banned this member.
+            #[serde(default)]
+            pub removed_by: Option<String>,
+            /// Base64 of the member's ML-KEM-768 public key.
+            #[serde(default)]
+            pub kem_public_key_b64: Option<String>,
+            /// Base64 TreeKEM KeyPackage binding this entry to its ratchet
+            /// tree leaf.
+            #[serde(default)]
+            pub treekem_key_package_b64: Option<String>,
+            /// BLAKE3 hash of the admitted TreeKEM KeyPackage.
+            #[serde(default, skip_serializing_if = "Option::is_none")]
+            pub treekem_key_package_hash: Option<String>,
         }
 
         /// Tag-copied v0.40.4 `SignedInvite` — the pre-#469 field set.
@@ -2220,7 +2385,7 @@ mod tests {
             #[serde(default)]
             pub base_state_hash: Option<String>,
             #[serde(default)]
-            pub base_members_v2: Option<BTreeMap<String, crate::groups::GroupMember>>,
+            pub base_members_v2: Option<BTreeMap<String, GroupMember>>,
             #[serde(default)]
             pub base_prev_state_hash: Option<String>,
             #[serde(default)]
@@ -2233,7 +2398,9 @@ mod tests {
             pub invite_secret: String,
             pub created_at: u64,
             pub expires_at: u64,
-            #[serde(default)]
+            /// NO serde default at the tag shape (v0.40.4
+            /// invite.rs:85-97): a v0.40.4 node REFUSES invite JSON
+            /// without an explicit (possibly empty) `signature`.
             pub signature: String,
         }
     }
@@ -2246,7 +2413,22 @@ mod tests {
         let mut base_members_v2 = BTreeMap::new();
         base_members_v2.insert(
             "11".repeat(32),
-            GroupMember::new_admin("11".repeat(32), None, 1_699_000_000),
+            // The tag-copied member shape (new_admin at the tag): no
+            // certificate-bearing fields exist on v0.40.4 rosters.
+            replica_v0_40_4::GroupMember {
+                agent_id: "11".repeat(32),
+                user_id: None,
+                role: replica_v0_40_4::GroupRole::Admin,
+                state: replica_v0_40_4::GroupMemberState::Active,
+                display_name: None,
+                joined_at: 1_699_000_000,
+                updated_at: 1_699_000_000,
+                added_by: None,
+                removed_by: None,
+                kem_public_key_b64: None,
+                treekem_key_package_b64: None,
+                treekem_key_package_hash: None,
+            },
         );
         replica_v0_40_4::SignedInvite {
             group_id: "cd".repeat(32),
@@ -2292,6 +2474,44 @@ mod tests {
             Err(InviteRefusal::Unsigned)
         );
         assert_eq!(parsed.verify_v4_signatures(), Err(InviteRefusal::Unsigned));
+        // Round 4 (item 12) — replica EXACTNESS pins, verified against
+        // `git show v0.40.4:…`:
+        // (i) the tag's `signature` field has NO serde default: invite
+        // JSON without an explicit `signature` FAILS on a v0.40.4 node,
+        // while the current type defaults it (tag invite.rs:85-97).
+        let mut value: serde_json::Value = serde_json::from_str(&json).expect("replica JSON");
+        assert!(value
+            .as_object_mut()
+            .expect("object")
+            .remove("signature")
+            .is_some());
+        let stripped = value.to_string();
+        assert!(
+            serde_json::from_str::<replica_v0_40_4::SignedInvite>(&stripped).is_err(),
+            "v0.40.4 refuses invite JSON without an explicit signature"
+        );
+        assert!(
+            serde_json::from_str::<SignedInvite>(&stripped).is_ok(),
+            "the current type defaults the absent signature (legacy sentinel)"
+        );
+        // (ii) the tag's `GroupWriteAccess` carries `AdminOnly`
+        // (tag policy.rs:61-68): it round-trips on the replica AND parses
+        // into the current policy — the replica is not a narrowed copy.
+        let announce_policy = replica_v0_40_4::GroupPolicy {
+            write_access: replica_v0_40_4::GroupWriteAccess::AdminOnly,
+            ..replica_v0_40_4::GroupPolicy::default()
+        };
+        assert_eq!(
+            serde_json::to_value(announce_policy).expect("policy JSON")["write_access"],
+            serde_json::json!("admin_only")
+        );
+        let current: GroupPolicy =
+            serde_json::from_value(serde_json::to_value(announce_policy).expect("policy JSON"))
+                .expect("admin_only parses on the current policy too");
+        assert_eq!(
+            current.write_access,
+            crate::groups::policy::GroupWriteAccess::AdminOnly
+        );
     }
 
     /// (b) new ordinary → old: a current v4 invite on the DEFAULT
