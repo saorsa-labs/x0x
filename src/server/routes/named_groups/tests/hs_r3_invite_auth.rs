@@ -573,6 +573,36 @@ async fn join_refusals_are_typed_in_a2_order() -> Result<()> {
         "revocation must precede the owner countersignature check"
     );
 
+    // ── r6 (Codex 1c) combined: REVOKED inviter + CORRUPT INVITER
+    // SIGNATURE ⇒ still `inviter_key_revoked`. The id BINDING proves
+    // the inviter identity (E4), the revocation set answers against
+    // that PROVEN identity, and only then does the inviter signature
+    // verify — r6 Codex 1a's split pins binding → revocation →
+    // signature, so the corrupt signature (which would refuse with
+    // invite_signature_invalid) never gets to answer first.
+    let mut revoked_and_misigned = owner_invite.clone();
+    revoked_and_misigned.inviter_signature_b64 = {
+        use base64::Engine as _;
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(&revoked_and_misigned.inviter_signature_b64)
+            .context("decode inviter signature")?;
+        bytes[0] ^= 0xFF;
+        base64::engine::general_purpose::STANDARD.encode(bytes)
+    };
+    let (status, body) = join(
+        Arc::clone(&joiner),
+        revoked_and_misigned.to_link(),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("inviter_key_revoked")),
+        "binding → revocation must precede the inviter signature verify"
+    );
+
     // ── r5 (Codex 7b) combined: INCONSISTENT base + MISSING owner
     // countersignature ⇒ invite_base_inconsistent — the base recompute
     // precedes the owner half (r5 Fable 1's reorder, pinned here at the
@@ -2537,13 +2567,100 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
     Ok(())
 }
 
-/// r4 (addendum item 7) → r5 (Fable 3 + Codex 5): EVERY stateful event
-/// variant routes its conflicting commits through the CENTRAL wrapper —
-/// all TWELVE commit-carrying variants (MemberAdded, MemberRemoved,
-/// GroupDeleted via the terminal twin, PolicyUpdated, MemberRoleUpdated,
-/// MemberBanned, MemberUnbanned, JoinRequestCreated,
-/// JoinRequestApproved, JoinRequestRejected, JoinRequestCancelled,
-/// GroupMetadataUpdated) record evidence on a conflicting commit.
+/// r6 (Codex 2): the ORDINARY live-ingress path (`persistence_lock_
+/// already_held == false`) hits the same `ReplacedNotDurable` shape as
+/// the causal-replay path — the install goes LIVE in the map but the
+/// save never confirms directory durability. The arm must roll the
+/// live record back (otherwise the stored-evidence gate silences the
+/// identical conflict's retry FOREVER while the log claims
+/// "retryable"), fire NO once-only diagnostics, and the identical
+/// conflict must install DURABLY once the fault clears — the
+/// flag-confirmation save clears the durability flag first, then the
+/// install's own save confirms.
+#[tokio::test]
+async fn fork_evidence_replaced_not_durable_ordinary_path_rolls_back_and_retries() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let group_id = "3e".repeat(32);
+    let base = r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
+    fn variant(
+        state: &AppState,
+        base: &x0x::groups::GroupInfo,
+        description: &str,
+    ) -> Result<x0x::groups::state_commit::GroupStateCommit> {
+        let mut v = base.clone();
+        v.description = description.to_string();
+        v.seal_commit(state.agent.identity().agent_keypair(), now_millis_u64())?;
+        Ok(v.commit_log.last().context("sealed commit")?.commit.clone())
+    }
+    let fork_a = variant(&state, &base, "ord-rnd-a")?;
+    let fork_b = variant(&state, &base, "ord-rnd-b")?;
+
+    // Apply A and persist it so B conflicts at the live head.
+    let applied = r4_apply_through_wrapper(&state, &group_id, fork_a, "ord-rnd-a", false).await?;
+    assert!(applied.is_ok());
+    persist_named_groups_mutation(&state, |groups| {
+        let info = groups.get_mut(&group_id).unwrap();
+        *info = applied.clone().expect("applied");
+        true
+    })
+    .await?;
+
+    // The fault leg: NO persistence lock held — the ordinary
+    // live-ingress path — while the save returns ReplacedNotDurable.
+    {
+        let _fault = set_save_fault(SaveFault::ReplacedNotDurable);
+        let refused =
+            r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "ord-rnd-b", false).await?;
+        assert!(refused.is_err(), "the conflicting twin is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_none(),
+            "the live-but-not-durable record was ROLLED BACK on the \
+             ordinary path — nothing remains in the map to silence the \
+             identical retry"
+        );
+        assert_eq!(
+            r4_diag_row(&state, &group_id)
+                .await
+                .counters
+                .adoption_fork_evidence,
+            0,
+            "the rolled-back install fired no once-only diagnostics"
+        );
+    }
+    // Retry after the fault clears: the identical conflict installs
+    // DURABLY and fires the once-only diagnostics exactly once.
+    let retried =
+        r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "ord-rnd-b", false).await?;
+    assert!(retried.is_err(), "still a conflict, still refused");
+    let evidence = r4_evidence(&state, &group_id)
+        .await
+        .expect("the identical conflict installs DURABLY once the fault clears");
+    assert_eq!(evidence.state_hash, fork_b.state_hash);
+    assert_eq!(
+        r4_diag_row(&state, &group_id)
+            .await
+            .counters
+            .adoption_fork_evidence,
+        1,
+        "exactly one once-only firing after the durable retry"
+    );
+    Ok(())
+}
+
+/// r4 (addendum item 7) → r5 (Fable 3 + Codex 5) → r6 (Fable 4): the
+/// commit-routing coverage, counted accurately. THIRTEEN event
+/// variants carry a `GroupStateCommit`; TWELVE of them apply their
+/// commit through the CENTRAL wrapper (or its terminal twin) and are
+/// covered below — MemberAdded, MemberRemoved, GroupDeleted via the
+/// terminal twin, PolicyUpdated, MemberRoleUpdated, MemberBanned,
+/// MemberUnbanned, JoinRequestCreated, JoinRequestApproved,
+/// JoinRequestRejected, JoinRequestCancelled, GroupMetadataUpdated —
+/// each records evidence on a conflicting commit. The thirteenth,
+/// MemberJoined, is DELIBERATELY excluded: its `recovery_authority_commit`
+/// is the authority-sealed MemberAdded commit carried as recovery
+/// provenance — it is verified as sealed evidence, never APPLIED
+/// through this wrapper, so it has no conflict-evaluation path to
+/// cover here.
 #[tokio::test]
 async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;

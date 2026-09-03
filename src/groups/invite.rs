@@ -849,39 +849,49 @@ impl SignedInvite {
     /// is no user revocation subject, see v7 F3 and the ADR-0016
     /// amendment).
     ///
-    /// r4 (Codex addendum item 8): composed of the two granular halves
-    /// so the join route can interleave its A2 steps literally —
-    /// [`Self::verify_v4_inviter_axis`] (binding + inviter signature)
-    /// runs before the revocation-set check, and base consistency runs
-    /// before [`Self::verify_v4_owner_countersignature`].
+    /// r4 (Codex addendum item 8) → r6 (Codex 1a): composed of the
+    /// granular halves so the join route can interleave its A2 steps
+    /// literally — [`Self::verify_v4_inviter_binding`] runs before the
+    /// revocation-set check (which answers against the PROVEN
+    /// identity), [`Self::verify_v4_inviter_signature`] runs after it,
+    /// and base consistency runs before
+    /// [`Self::verify_v4_owner_countersignature`].
     pub fn verify_v4_signatures(&self) -> Result<(), InviteRefusal> {
-        self.verify_v4_inviter_axis()?;
+        self.verify_v4_inviter_binding()?;
+        self.verify_v4_inviter_signature()?;
         self.verify_v4_owner_countersignature()
     }
 
-    /// The inviter half of [`Self::verify_v4_signatures`]: legacy
-    /// `signature` must be empty, the inline inviter key must bind to
-    /// its claimed id (E4 — the id IS the hash of the key), and the
-    /// inviter signature must verify over the canonical view.
-    pub fn verify_v4_inviter_axis(&self) -> Result<(), InviteRefusal> {
+    /// The BINDING half of the inviter axis (r6 Codex 1a): legacy
+    /// `signature` must be empty, the view must construct, and the
+    /// inline inviter key must bind to its claimed id (E4 — the id IS
+    /// the hash of the key). Deliberately split from the signature
+    /// verify so a caller can interleave its revocation-set check
+    /// BETWEEN the two halves: revocation then answers against the
+    /// PROVEN identity — the id the inline key actually hashes to —
+    /// before any signature work runs.
+    pub fn verify_v4_inviter_binding(&self) -> Result<(), InviteRefusal> {
         if !self.signature.is_empty() {
             return Err(InviteRefusal::SignatureInvalid);
         }
         let view = InviteSignedViewV4::from_invite(self)?;
+        Self::bound_inviter_key(&view).map(|_| ())
+    }
+
+    /// The SIGNATURE half of the inviter axis (r6 Codex 1a): the
+    /// inviter signature must verify over the canonical view under the
+    /// BOUND inline key. Sound standalone (it re-derives the E4 id
+    /// binding exactly like [`Self::verify_v4_inviter_binding`]) but
+    /// meant to run AFTER the binding — and, in the join route, after
+    /// the revocation-set check against the proven identity.
+    pub fn verify_v4_inviter_signature(&self) -> Result<(), InviteRefusal> {
+        let view = InviteSignedViewV4::from_invite(self)?;
         let canonical = view
             .canonical_bytes()
             .map_err(|_| InviteRefusal::Malformed)?;
-
-        // Inline inviter key: self-authenticating id binding (E4).
-        let inviter_key_bytes = B64_STD
-            .decode(view.inviter_public_key_b64.as_bytes())
-            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
-        let inviter_key = ant_quic::MlDsaPublicKey::from_bytes(&inviter_key_bytes)
-            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
-        let derived_inviter = crate::identity::AgentId::from_public_key(&inviter_key);
-        if hex::encode(derived_inviter.as_bytes()) != view.inviter {
-            return Err(InviteRefusal::InviterKeyMismatch);
-        }
+        // The signature verifies under the BOUND key: re-derive the E4
+        // binding so this half is sound even when called alone.
+        let inviter_key = Self::bound_inviter_key(&view)?;
         let sig_bytes = B64_STD
             .decode(self.inviter_signature_b64.as_bytes())
             .map_err(|_| InviteRefusal::InviterSignatureInvalid)?;
@@ -899,6 +909,24 @@ impl SignedInvite {
             return Err(InviteRefusal::InviterSignatureInvalid);
         }
         Ok(())
+    }
+
+    /// E4 self-authenticating inviter-id binding, shared by the two
+    /// inviter halves: decode the inline key and require that its hash
+    /// IS the claimed inviter id.
+    fn bound_inviter_key(
+        view: &InviteSignedViewV4,
+    ) -> Result<ant_quic::MlDsaPublicKey, InviteRefusal> {
+        let inviter_key_bytes = B64_STD
+            .decode(view.inviter_public_key_b64.as_bytes())
+            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
+        let inviter_key = ant_quic::MlDsaPublicKey::from_bytes(&inviter_key_bytes)
+            .map_err(|_| InviteRefusal::InviterKeyMismatch)?;
+        let derived_inviter = crate::identity::AgentId::from_public_key(&inviter_key);
+        if hex::encode(derived_inviter.as_bytes()) != view.inviter {
+            return Err(InviteRefusal::InviterKeyMismatch);
+        }
+        Ok(inviter_key)
     }
 
     /// The owner half of [`Self::verify_v4_signatures`]: for policies

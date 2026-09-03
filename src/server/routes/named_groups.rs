@@ -2893,8 +2893,10 @@ fn fork_candidate_authenticated(
 /// the caller gates the once-only diagnostics on it (r4 addendum
 /// item 7: a non-durable install must leave the conflict retryable,
 /// not seen-marked).
-/// r5 (Fable 2): remove a live-but-not-durable evidence record so the
-/// identical conflict stays retryable (identity-matched removal only).
+/// r5 (Fable 2) → r6 (Codex 2): remove a live-but-not-durable evidence
+/// record so the identical conflict stays retryable (identity-matched
+/// removal only) — on BOTH the held-lock (causal-replay) path AND the
+/// ordinary live-ingress path.
 ///
 /// IN-MEMORY by design — a nested persist cannot work here: the caller
 /// sits inside a save that returned `ReplacedNotDurable`, so the store's
@@ -2903,7 +2905,13 @@ fn fork_candidate_authenticated(
 /// causal-replay caller reaches this arm precisely because it HOLDS the
 /// persistence lock, which a locking persist would self-deadlock on.
 /// The still-set flag re-persists this rollback on the next successful
-/// save.
+/// save. r6 (Fable 5): that gap is the DELIBERATE memory-vs-disk
+/// divergence window — the in-memory removal is immediate, but the
+/// on-disk copy still carries the evidence until the next successful
+/// save clears the durability flag. The window is bounded by the next
+/// persist, exactly like every other durability-flagged write; a
+/// crash inside it can only resurrect a record the retry semantics
+/// already tolerate (the conflict stays retryable either way).
 async fn rollback_live_fork_evidence(
     state: &AppState,
     group_key: &str,
@@ -2949,25 +2957,26 @@ async fn install_fork_evidence(
     };
     match outcome {
         Ok(AtomicWriteOutcome::Durable) => true,
-        Ok(AtomicWriteOutcome::ReplacedNotDurable) if persistence_lock_already_held => {
-            // r5 (Fable 2): the record IS live in the map, but the save
-            // never confirmed directory durability — later identical
-            // conflicts would be silenced by the lineage gate while the
-            // warn/counter never fired. Roll the in-memory record back
-            // (identity-matched, no nested persist — see the helper) so
-            // "retryable" is literally true; the still-set durability
-            // flag re-persists the rollback on the next successful save.
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+            // r5 (Fable 2, held-lock path) → r6 (Codex 2, ORDINARY
+            // live-ingress path too): the record IS live in the map,
+            // but the save never confirmed directory durability — on
+            // BOTH paths. Leaving it installed would silence every
+            // later identical conflict through the lineage gate while
+            // the once-only warn/counter never fired (the stored
+            // evidence gate would suppress the retry forever, while
+            // the log claimed "retryable"). Roll the in-memory record
+            // back (identity-matched, no nested persist — see the
+            // helper) so "retryable" is literally true; the still-set
+            // durability flag re-persists the rollback on the next
+            // successful save. The on-disk copy still carries the
+            // evidence until then — the deliberate memory-vs-disk
+            // divergence window, bounded by the next persist like
+            // every other durability-flagged write.
             rollback_live_fork_evidence(state, group_key, &evidence).await;
             tracing::warn!(
                 group_id = %LogHexId::group(group_key),
                 "#468: fork evidence install was live but NOT directory-durable — rolled back; the identical conflict retries the install"
-            );
-            false
-        }
-        Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
-            tracing::warn!(
-                group_id = %LogHexId::group(group_key),
-                "#468: fork evidence visible but not directory-durable — NOT marked seen; the durability flag retries on the next save and the identical conflict retries the install"
             );
             false
         }
@@ -3544,6 +3553,19 @@ where
 /// the concurrent value, and keys the mutation never touched are never
 /// rewritten. `ReplacedNotDurable` does NOT roll back: the replacement is
 /// visible on disk, so memory stays aligned with it (r2 Watson ruling).
+///
+/// ONE deliberate divergence from that ruling (r6 Codex 2 + Fable 5):
+/// the #468 fork-evidence install's own `ReplacedNotDurable` arm rolls
+/// its record back IN-MEMORY (`rollback_live_fork_evidence`) instead of
+/// staying aligned with disk. The evidence record's contract is to gate
+/// the once-only diagnostics on a DURABLE install, so a live-only
+/// record would silence every identical conflict's retry (the lineage
+/// gate keeps it) while the warn/counter never fired. The resulting
+/// memory-vs-disk window is deliberate and bounded exactly like every
+/// other durability-flagged write: memory drops the evidence
+/// immediately, the on-disk copy still carries it until the next
+/// successful save clears the durability flag and re-persists the
+/// rollback.
 pub(in crate::server) async fn persist_named_groups_mutation_unlocked<F>(
     state: &AppState,
     mutate: F,
@@ -9939,11 +9961,30 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // discovery-card side effects. Tests and operators poll
             // /groups/:id/members and /diagnostics/groups as the acceptance
             // signal for this path.
-            if !matches!(
-                persist_named_group_info(state, &resolved_group_key, next.clone()).await,
-                Ok(AtomicWriteOutcome::Durable)
-            ) {
-                return ApplyMetadataResult::REJECTED;
+            // r6 (coverage-gate root cause): `ReplacedNotDurable` means the
+            // rename LANDED — the seat is live in the map and the on-disk
+            // file holds it; only the parent-dir fsync is unconfirmed and
+            // the #470 durability flag retries it on the next save. The
+            // seat IS applied (the counter's contract counts applied
+            // MemberJoined events regardless of which delivery got there),
+            // so we proceed exactly like Durable; only a pre-rename
+            // NotReplaced/Err leaves nothing applied and rejects. The old
+            // any-non-Durable rejection produced a phantom state under
+            // slow (coverage-instrumented) builds: member seated live,
+            // event reported failed, counter 0, retries burning on the
+            // already-consumed secret.
+            match persist_named_group_info(state, &resolved_group_key, next.clone()).await {
+                Ok(AtomicWriteOutcome::Durable) => {}
+                Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
+                    tracing::warn!(
+                        group_id = %LogHexId::group(&resolved_group_key),
+                        member = %LogHexId::agent(&member_agent_id),
+                        "MemberJoined: seat applied but parent-dir fsync unconfirmed — the durability flag re-persists on the next save"
+                    );
+                }
+                Ok(AtomicWriteOutcome::NotReplaced) | Err(_) => {
+                    return ApplyMetadataResult::REJECTED;
+                }
             }
             *replay_group_id = Some(resolved_group_key.clone());
             state
@@ -12982,11 +13023,11 @@ pub(in crate::server) async fn join_group_via_invite(
     //    can no longer create local state (#469: previously the inviter
     //    supplied policy + base roster seeded the joiner's admission
     //    tier and trust root unauthenticated).
-    //    r3 (Codex 7): the checks run in the SPEC A2 order —
-    //    decode → version → legacy-sig → expiry → id → keys → sigs →
-    //    base → owner → intended. Expiry now sits AFTER version/view
-    //    construction and the legacy-signature gate, and BEFORE the
-    //    cryptographic key/signature work.
+    //    r6 (Codex 1b) — the A2 order, LITERALLY: the three CHEAP gates
+    //    (version → legacy signature empty → expiry) are hoisted ABOVE
+    //    the full view construction, which then precedes id → binding →
+    //    revocation (against the PROVEN identity) → inviter signature →
+    //    caps → base → owner → intended.
     let refuse_invite = |state: &AppState,
                          invite: &x0x::groups::invite::SignedInvite,
                          reason: &str|
@@ -13003,30 +13044,42 @@ pub(in crate::server) async fn join_group_via_invite(
         api_error(StatusCode::CONFLICT, reason)
     };
 
-    // version (A2 step 2): view construction refuses version < 4 and
-    // the structural rules. `invite_unsigned` covers version < 4
-    // (including the legacy sentinel 0), a missing projection, or a
-    // legacy fat roster (plus, since r3, an absent `policy`/`
-    // secure_plane` discriminant); `invite_malformed` covers the E1 id
-    // invariant and the D1 duplicated-meta/home-digest equality rules.
+    // version (A2 step 2, hoisted r6 Codex 1b): a non-v4 blob refuses
+    // before ANY structural work — `invite_unsigned` covers version < 4
+    // (including the legacy sentinel 0). The structural rules that used
+    // to share this gate (projection presence, fat-roster refusal,
+    // absent `policy`/`secure_plane`) stay in the view construction
+    // below.
+    if invite.version != x0x::groups::invite::INVITE_VERSION_V4 {
+        return refuse_invite(&state, &invite, "invite_unsigned");
+    }
+    // legacy-sig (A2 step 3, hoisted r6 Codex 1b): the vestigial legacy
+    // `signature` must be empty on a v4 invite — before expiry so a
+    // legacy-signed blob cannot be timing-probed past the typed gate,
+    // and before the structural checks so a broken v4 blob carrying a
+    // legacy signature reports the SIGNATURE refusal, not a structural
+    // one.
+    if !invite.signature.is_empty() {
+        return refuse_invite(&state, &invite, "invite_signature_invalid");
+    }
+    // expiry (A2 step 4, hoisted r6 Codex 1b): a cheap clock check
+    // before the view construction and all cryptographic work. Still a
+    // plain 400 — expiry is not an authentication failure.
+    if invite.is_expired() {
+        return bad_request("invite has expired");
+    }
+    // view (A2 step 2b): the full signed-view construction — the
+    // structural, meta and secret rules. `invite_unsigned` covers a
+    // missing projection, a legacy fat roster or an absent
+    // `policy`/`secure_plane` discriminant; `invite_malformed` covers
+    // the E1 id invariant and the D1 duplicated-meta/home-digest
+    // equality rules.
     let view = match x0x::groups::invite::InviteSignedViewV4::from_invite(&invite) {
         Ok(view) => view,
         Err(refusal) => {
             return refuse_invite(&state, &invite, refusal.reason());
         }
     };
-    // legacy-sig (A2 step 3): the vestigial legacy `signature` must be
-    // empty on a v4 invite — checked before expiry so a legacy-signed
-    // blob cannot be timing-probed past the typed gate.
-    if !invite.signature.is_empty() {
-        return refuse_invite(&state, &invite, "invite_signature_invalid");
-    }
-    // expiry (A2 step 4): a cheap clock check between the structural
-    // gates and the cryptographic ones. Still a plain 400 — expiry is
-    // not an authentication failure.
-    if invite.is_expired() {
-        return bad_request("invite has expired");
-    }
     let invite_is_treekem = invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
 
     // id + keys (A2 steps 5-6): the inviter id must parse. r3 (Codex 7):
@@ -13037,12 +13090,29 @@ pub(in crate::server) async fn join_group_via_invite(
         Ok(id) => id,
         Err(_) => return refuse_invite(&state, &invite, "inviter_key_mismatch"),
     };
-    // sigs, inviter half (A2 step 7a — r4 addendum item 8, LITERAL A2
-    // precedence): the INLINE INVITER KEY BINDING and the inviter
-    // signature run BEFORE the revocation-set check (a key that never
-    // bound to its claimed id is a mismatch, not a revocation), and the
-    // owner countersignature runs later — AFTER base consistency.
-    if let Err(refusal) = invite.verify_v4_inviter_axis() {
+    // binding (A2 step 6a — r6 Codex 1a): ONLY the inline-key id
+    // binding runs here, so the revocation check that follows answers
+    // against the PROVEN identity — the id the inline key actually
+    // hashes to (E4) — and a bound-but-revoked key refuses before any
+    // signature work.
+    if let Err(refusal) = invite.verify_v4_inviter_binding() {
+        return refuse_invite(&state, &invite, refusal.reason());
+    }
+    // Revocation of the inline inviter key (v7 F3: agent subject only —
+    // there is no user revocation subject; see the ADR-0016 amendment).
+    {
+        let revocation_set = state.agent.revocation_set();
+        let revoked = revocation_set.read().await;
+        if revoked.is_agent_revoked(&inviter_agent) {
+            drop(revoked);
+            return refuse_invite(&state, &invite, "inviter_key_revoked");
+        }
+    }
+    // inviter signature (A2 step 7a — r6 Codex 1a): the inviter
+    // signature verifies under the just-proven BOUND key, AFTER the
+    // revocation check — a revoked inviter refuses with
+    // `inviter_key_revoked` even when its signature is also corrupt.
+    if let Err(refusal) = invite.verify_v4_inviter_signature() {
         return refuse_invite(&state, &invite, refusal.reason());
     }
     // Revocation of the inline inviter key (v7 F3: agent subject only —

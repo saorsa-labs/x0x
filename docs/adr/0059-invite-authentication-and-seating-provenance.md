@@ -129,7 +129,7 @@ key, or rejecting an admin promoted after the base) is called out there.
   encoded size as the authoritative gate — all before any secret is recorded.
 
 ## Validation
-- `src/groups/invite.rs` unit suite (28 tests at round-5): canonical-bytes vector
+- `src/groups/invite.rs` unit suite (23 tests at round-6): canonical-bytes vector
   (blake3-pinned), missing-field → typed-refusal matrix, sign/verify
   tamper matrix incl. None↔Some("") signed-state flips, D1 equality
   rules + non-default meta round-trip, the D5 caps matrix (incl. the
@@ -146,6 +146,6 @@ key, or rejecting an admin promoted after the base) is called out there.
   and `member_certificate_bridge_tests` (3 tests: pre-populated-cache
   startup reconcile, deterministic event-ring-overflow lag recovery via
   full reconcile, idempotent re-run hydrating nothing).
-- Full workspace: 3 228 tests green at the pre-round-4 PR head; the
+- Full workspace: 3 256 tests green at the round-5 head; the
   round-4 additions are verified per-suite above, and the parent re-runs
   the full workspace before merge (the number only grows).
