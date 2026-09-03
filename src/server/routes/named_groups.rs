@@ -3833,6 +3833,11 @@ pub(in crate::server) enum SaveFault {
     /// `Ok(AtomicWriteOutcome::ReplacedNotDurable)` — replacement visible,
     /// parent-dir fsync failed (rollback must NOT run).
     ReplacedNotDurable = 3,
+    /// #477 (r8 item 1): the REAL write happens (the destination holds the
+    /// new content) and only the parent-dir fsync is reported failed —
+    /// `ReplacedNotDurable` AFTER the rename. One-shot: the cell clears
+    /// when it fires, so a caller's corrective re-save runs unfaulted.
+    ReplacedNotDurableAfterWrite = 4,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3852,6 +3857,20 @@ fn save_fault_short_circuit() -> Option<AtomicWriteOutcome> {
 #[cfg_attr(not(test), allow(dead_code))]
 fn save_fault_legacy_write_fails() -> bool {
     cfg!(test) && SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) == 2
+}
+
+/// #477 (r8 item 1): one-shot post-rename fault — fires once, then clears.
+#[cfg_attr(not(test), allow(dead_code))]
+fn save_fault_after_write_not_durable() -> bool {
+    cfg!(test)
+        && SAVE_FAULT_INJECT
+            .compare_exchange(
+                4,
+                0,
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            )
+            .is_ok()
 }
 
 /// #470 — RAII fault guard (see [`DeleteFaultGuard`]).
@@ -14075,22 +14094,34 @@ pub(in crate::server) async fn join_group_via_invite(
                     })
                     .await;
                     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
-                        // ROLLBACK (r7 item 1): `NotReplaced`/`Err` were
-                        // already compare-and-restored by the persist
-                        // helper; `ReplacedNotDurable` deliberately leaves
-                        // the record visible in the live map (the file
-                        // replacement happened, its directory fsync did
-                        // not) — remove exactly the record this join
-                        // inserted (CAS on full record equality) so nothing
-                        // of the failed join survives. The durability flag
-                        // the helper raised makes the next save re-persist
-                        // the (now rolled-back) map before any other
-                        // mutation.
+                        // ROLLBACK (r7 item 1 → r8 item 1): `NotReplaced`/
+                        // `Err` were already compare-and-restored by the
+                        // persist helper and never reached the destination;
+                        // `ReplacedNotDurable` means the DESTINATION HOLDS
+                        // the failed join (rename done, directory fsync
+                        // not) and the helper deliberately keeps the live
+                        // map matching it. Roll back BOTH: remove exactly
+                        // the record this join inserted (CAS on full record
+                        // equality), then re-save the rolled-back roster so
+                        // the on-disk view excludes the failed join too (a
+                        // restart must not reload it). The corrective save
+                        // is `confirm_named_groups_durability_unlocked` —
+                        // it clears the raised durability flag on success;
+                        // if it fails as well the flag stays raised and the
+                        // next roster mutation re-persists first.
                         {
                             let mut groups = state.named_groups.write().await;
                             if groups.get(&group_id_hex) == Some(&info) {
                                 groups.remove(&group_id_hex);
                             }
+                        }
+                        if matches!(outcome, Ok(AtomicWriteOutcome::ReplacedNotDurable))
+                            && !confirm_named_groups_durability_unlocked(&state).await
+                        {
+                            tracing::error!(
+                                group_id = %group_id_hex,
+                                "join install rollback: the corrective roster re-save did not confirm durability; the failed join may remain on disk until the next successful save"
+                            );
                         }
                         return api_error(
                             StatusCode::SERVICE_UNAVAILABLE,
@@ -26450,6 +26481,15 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
         .map_err(|e| {
             tracing::error!("Failed to save named groups: {e}");
             e
+        })
+        // #477 (r8 item 1) test fault: the rename happened; report the
+        // parent-dir fsync as failed (constant-false outside test builds).
+        .map(|written| {
+            if written == AtomicWriteOutcome::Durable && save_fault_after_write_not_durable() {
+                AtomicWriteOutcome::ReplacedNotDurable
+            } else {
+                written
+            }
         });
     match &outcome {
         Ok(AtomicWriteOutcome::Durable) => state
@@ -33233,7 +33273,11 @@ pub(in crate::server) mod tests {
         /// object, no marker, no attempt, no inviter pin, no outcome.
         #[tokio::test]
         async fn wp_b_t1_persist_failure_installs_nothing() {
-            for fault in [SaveFault::ReplacedNotDurable, SaveFault::NotReplaced] {
+            for fault in [
+                SaveFault::ReplacedNotDurableAfterWrite,
+                SaveFault::ReplacedNotDurable,
+                SaveFault::NotReplaced,
+            ] {
                 let (authority_state, _a) = fresh_state().await;
                 let (joiner_state, _j) = fresh_state().await;
                 let group = "ef".repeat(16);
@@ -33268,6 +33312,25 @@ pub(in crate::server) mod tests {
                     !joiner_state.named_groups.read().await.contains_key(&group),
                     "({fault:?}) the group record was rolled back"
                 );
+                // #477 (r8 item 1): the PERSISTED view excludes the failed
+                // join too — a restart reloads exactly what the live map
+                // shows. For the post-rename fault the destination DID hold
+                // the failed join until the corrective re-save ran.
+                let reloaded = load_named_groups(&joiner_state.named_groups_path)
+                    .await
+                    .expect("reload named_groups.json");
+                assert!(
+                    !reloaded.contains_key(&group),
+                    "({fault:?}) the on-disk roster excludes the failed join"
+                );
+                if fault == SaveFault::ReplacedNotDurableAfterWrite {
+                    assert!(
+                        !joiner_state
+                            .named_groups_requires_durability_confirmation
+                            .load(Ordering::Acquire),
+                        "({fault:?}) the corrective re-save confirmed durability"
+                    );
+                }
                 assert!(
                     !joiner_state.mls_groups.read().await.contains_key(&group),
                     "({fault:?}) no legacy MLS object survives the failed transaction"
