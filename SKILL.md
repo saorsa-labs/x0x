@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.40.4
+version: 0.41.0
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -186,7 +186,7 @@ curl -X PUT "http://$API/profile" -H "Authorization: Bearer $TOKEN" -H "Content-
 curl "http://$API/profile" -H "Authorization: Bearer $TOKEN"     # -> {human_name, display_name, machine_name}
 ```
 
-Names surface in `/agent`, `x0x agent`, and on agent cards. The **display_name rides identity announcements** (X0A4 self-name, V3.1 announce): peers render your name without importing a card. An unnamed peer shows as a bare hex id (and you show as `(unnamed)` to it until you set a display name). `GET /agents/discovered` lists each peer's `self_name`. Agent cards (`GET /agent/card`, A2A card) carry a capability snapshot inside the signed bytes — in a mixed fleet, cards minted by newer daemons fail signature verification on v0.40.4 peers (#450) until the verifying peer upgrades.
+Names surface in `/agent`, `x0x agent`, and on agent cards. The **display_name rides identity announcements** (X0A4 self-name, V3.1 announce): peers render your name without importing a card. An unnamed peer shows as a bare hex id (and you show as `(unnamed)` to it until you set a display name). `GET /agents/discovered` lists each peer's `self_name`. Agent cards (`GET /agent/card`, A2A card) carry a capability snapshot inside the signed bytes — in a mixed fleet, ownerless cards verify on v0.40.x peers (#450 fixed in v0.41.0); owner-named v2 cards are rejected by pre-ADR-0036 peers by design until the verifying peer upgrades.
 
 ### 2.2 Owner roster
 
@@ -212,7 +212,7 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off (§5.2).
 
-**Second owner device joining the Home — current limitation (#447).** A certified second device's join currently succeeds only after the cert becomes visible in the Home owner's discovery cache, which happens on the *next announce ingest* (heartbeats every 600 s). Workaround: on the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` **twice, ~10 s apart, BEFORE attempting the join** — a bodyless announce publishes the ANONYMOUS cert digest, so the owner can never resolve the joiner's certificate and the join cannot succeed. A premature join wedges the joiner (it reports `already_joined: true` forever; recovery = remove the joiner's LOCAL group state — the `named_groups.json` entry itself, not just a `local_only` leave — and rejoin). Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` once before joining — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
 
 **Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
 
@@ -268,7 +268,7 @@ Rider sends are signed by the daemon's key but carry a provenance envelope **ins
 - **Durable API token** (`<data_dir>/api-token`) — full control plane including owner acts. Keep it secret; never in a URL.
 - **Session token** — mint via `POST /auth/session` (`{"session_token":"...","expires_in":600}`); accepted as a bearer everywhere and in `?token=` on browser endpoints. Intended as a read-mostly browser credential.
 
-> ⚠️ **Known open issue #446:** session tokens currently reach MORE than they should — `/agent/sign`, `/exec/*`, `/shutdown`, `/sync/devices/enroll`, `POST /groups/:id/delegate`, `/home/rename`, and `/announce` all accept a session bearer today (verified live; fix pending). **Guidance:** perform owner acts only with the durable token, treat session tokens as secrets (leak = same power for 10 minutes; exposure is loopback-CORS-bound), and never paste a session token into pages or logs.
+> ℹ️ **Owner-act fence (#446, fixed in v0.41.0):** session tokens are refused on the owner-act surfaces — `/agent/sign`, `POST /exec/run` and `/exec/cancel`, `/shutdown`, `/upgrade/apply`, `/sync/devices/enroll` and `DELETE /sync/devices/:id`, `POST /groups/:id/delegate`, `/home/rename`, `/announce` with `include_user_identity=true`, exec-prefixed payloads on `POST /direct/send` and WebSocket `send_direct`, and the administrative control-plane mutators of the Home or any OwnerCertified group (invites, roles, removals, policy, rename, delegation — not per-member display names). Perform owner acts with the durable token; still treat session tokens as secrets and never paste one into pages or logs.
 
 ---
 
@@ -310,7 +310,7 @@ curl -N -H "Authorization: Bearer $TOKEN" "http://$API/direct/events?backfill=50
 
 DMs default to **durable application-ACK semantics** (ADR-0030): `ok: true` means the recipient's daemon durably committed the message; a typed refusal is never a black hole. Opt OUT explicitly with `"require_durable_app_ack": false` (v1 "accepted for delivery" semantics — for peers that have not upgraded). Do not confuse it with `"require_ack_ms"` — that only asks for a post-send peer-liveness probe. The response reports the path (`loopback`/`gossip_inbox`/`raw_quic`/`raw_quic_acked`/`relayed`), request_id, and retry counters. Caveat: `path` names the send *strategy*, not the physical transport of the receipt — a durable send reports `gossip_inbox` even when the ACK was hedged home over the direct/raw-QUIC path, and the same label feeds `/diagnostics/dm` (per-peer `preferred_path` and the aggregate `outgoing_path_*` counters). Aggregate hedge-ACTIVITY counters exist (`ack_direct_hedge_*`), but no surface reports which transport actually carried an individual durable ACK (#461).
 
-> **Mixed-fleet caveat #448:** a v0.40.4 (old) peer cannot verify a new peer's capability advert (`digest_support`), so a strict (durable-ack) DM to such a peer returns **409 `recipient_ack_semantics_unavailable`** — there is **no automatic fallback**. Your options: retry later, upgrade the peer, or explicitly resend with `"require_durable_app_ack": false` (v1 best-effort; delivery then works). See also #450 (agent cards, §2.1). Both self-heal when the fleet upgrades.
+> **Mixed-fleet note (#448, fixed in v0.41.0):** v0.41.0 emits frozen v1 capability adverts, so durable-ack DMs interoperate with v0.40.x peers in both directions. A strict (durable-ack) DM still returns **409 `recipient_ack_semantics_unavailable`** when, after one bounded refresh, the known recipient has no current usable signed, machine-bound v2 advert (missing or not yet converged, expired, v1-only, gossip-unready, or invalid machine binding); an entirely unknown recipient gets **404 `recipient_key_unavailable`** — there is **no automatic fallback**. Your options: retry later, upgrade the peer, or explicitly resend with `"require_durable_app_ack": false` (v1 best-effort; delivery then works). See also #450 (agent cards, §2.1). Both self-heal when the fleet upgrades.
 
 ### 4.3 Named groups — spaces
 
@@ -513,7 +513,7 @@ curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # d
 
 Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk; the daemon REST surface updates the daemon and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` disables MORE than the check for that one daemon process — it also turns off the process's self-update install/restart paths, including `POST /upgrade/apply` (which then returns `"self-update disabled for this process"`); it composes with `[update] enabled` (both must allow an apply). Neither flag governs the standalone CLI updater. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
-> ⚠️ **#451 rollback trap:** v0.40.4 cannot START on a data dir that holds Home state (`unknown variant owner_certified` → exit 1), and a failed upgrade auto-respawns the previous binary — so a failed upgrade on an **owned** install currently crash-loops. **Never downgrade an owned install to v0.40.x**, and back up the data dir before upgrading one.
+> ℹ️ **Downgrade safety (#451, fixed in v0.41.0):** Home state now lives in a sidecar; a v0.40.x binary reads the legacy store and starts cleanly, so a failed upgrade that respawns the previous binary no longer crash-loops. Still back up the data dir before upgrading an owned install, and expect Home features to be absent while downgraded.
 
 ### 7.3 Diagnostics
 
@@ -529,11 +529,11 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Second device can't join owner's Home (`no agent certificate resolved`) | #447: cert blob merges into discovery only on next announce ingest; a BODYLESS announce publishes the anonymous digest, which the owner can never resolve | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` twice ~10 s apart BEFORE joining; a wedged joiner must remove its local `named_groups.json` entry (not just a `local_only` leave) and rejoin |
+| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` once, then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears once the joiner's owner-issued certificate reaches the Home authority and the committed add reaches the joiner |
 | Two Homes for one owner | #449: per-device provisioning, no reconciliation yet | expected until #449; use either Home, don't fight it |
-| Strict (durable-ack) DM to v0.40.4 peer → 409 `recipient_ack_semantics_unavailable` | #448 mixed-fleet: peer can't verify new advert; no auto-fallback | upgrade the peer, retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
-| Peer rejects your agent card | #450 mixed-fleet card signature mismatch | upgrade the verifying peer |
-| Daemon crash-loops after downgrade/failed upgrade | #451: v0.40.4 can't parse Home state | never downgrade an owned install; restore data-dir backup or remove Home state |
+| Strict (durable-ack) DM → 409 `recipient_ack_semantics_unavailable` | no current usable signed, machine-bound v2 advert for the recipient after one refresh (missing/unconverged, expired, v1-only, gossip-unready, bad machine binding); v0.40.x peers interoperate via frozen v1 adverts (#448 fixed); no auto-fallback | retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
+| Peer rejects your agent card | #450: ownerless cards interoperate with v0.40.x; owner-named v2 cards are rejected by pre-ADR-0036 peers by design | upgrade the verifying peer |
+| Daemon downgraded to v0.40.x on an owned install | #451 fixed in v0.41.0: the legacy store is readable, Home state waits in the sidecar | expected; Home features return on re-upgrade — keep a data-dir backup before upgrading |
 | `403 rider tokens are denied on this route` | deny-by-default rider scope (ADR-0039) | use a granted surface (`groups/:id/send`, `secure/encrypt`, `GET /history`) or act as the owner |
 | `403 ... Home must be delegated explicitly` | rider token's `groups` list lacks the Home gid (no implicit grant) | re-mint the token with the Home group id in `groups` (and in the signed capability) |
 | `409` on `/owner/*` or `/sync/*` | install has no owner key | `x0x user-id create`, restart daemon |
@@ -607,13 +607,13 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Capability | REST | CLI | Status |
 |---|---|---|---|
 | Gossip pub/sub + SSE | `/publish` `/subscribe` `/events` | `x0x publish/subscribe/events` | GA |
-| Direct messages (durable ACK) | `/direct/send` `/direct/events` | `x0x direct send/events` | GA · mixed-fleet #448 |
+| Direct messages (durable ACK) | `/direct/send` `/direct/events` | `x0x direct send/events` | GA |
 | Identity + names | `/profile` `/agent` `/announce` | `x0x profile set` `agent` | GA |
 | Owner key + roster | `/owner/agents(+/issue,/:id)` | `x0x user-id create` `owner agents` | GA |
 | Home space | `/home` `/home/rename` | `x0x home` `home rename` | GA · joins #447, per-device #449 |
 | Sub-agents (ACP + rider) | `/owner/agents/issue` `/owner/riders*` | `x0x owner agents issue/revoke` · `owner riders issue --delegation-payload-b64/--delegation-signature` (mint) / list / revoke | GA |
 | Rider deny-by-default scopes | middleware (403 matrix) | — | GA |
-| Session tokens read-mostly | `/auth/session` | — | **caveat #446** |
+| Session tokens read-mostly | `/auth/session` | — | GA (owner-act routes refuse session tokens since v0.41.0) |
 | Named groups + policy + discovery | `/groups*` | `x0x group ...` | GA |
 | Public messages + threads | `/groups/:id/send` `/messages` (`thread_root`/`thread_parent`) | `x0x group send --thread-root/--reply-to` | GA |
 | Structured mentions | `/groups/:id/send` `mentions:[...]` | `x0x group send --mentions <hex>... [--delegation-digest <hex>]` | GA |
@@ -635,7 +635,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
 | Durable history | `/history*` | — | GA (local-only; Tier-2 Home backfill designed, not shipped — §5.1) |
-| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA · #451 on owned installs |
+| Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
 
 ---
 

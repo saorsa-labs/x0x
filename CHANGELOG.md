@@ -4,6 +4,51 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.41.0] - 2026-09-03
+
+Home Suite hardening release. Summarises the notable user-facing changes since v0.39.9 (the v0.39.10–v0.40.4 tags carried no changelog entries).
+
+### Rollout notes (read first)
+
+- **Invite links must be re-minted.** Invites are now signed (InviteV4). Invites minted by v0.40.x daemons are refused with the typed error `invite_unsigned`. Upgrade inviters/authorities before joiners, then re-mint.
+- **Home joins need the owner id.** Joining a Home group requires `x0x group join --home --owner <owner-user-id> <invite>`; the owner id is shown by `x0x home`. A Home invite presented without `--home` is refused (`use_home_mode`); a stripped invite in Home mode is refused (`invite_downgraded`).
+- **Quarantine files.** Startup recovery may leave `<group>.journal.quarantined-<ms>-<seq>` / `.hsjournal.quarantined-…` / `.hsjournal.split-…` files under `<data-dir>/treekem/` instead of failing startup. See `docs/upgrade-system.md` for the per-state operator procedures.
+
+### Security
+
+- Owner-act surfaces require a durable owner token and refuse session tokens (#446, #464): `/agent/sign`, `POST /exec/run` and `/exec/cancel`, `/shutdown`, `/upgrade/apply`, `/sync/devices/enroll` and `DELETE /sync/devices/:id`, `/groups/:id/delegate`, `/home/rename`, `/announce` when `include_user_identity=true`, exec-prefixed payloads on `POST /direct/send` and WebSocket `send_direct`, and the administrative control-plane mutators of the Home group or any OwnerCertified group (invites, roles, removals, policy, rename, delegation).
+- Certified-membership cluster (#447 #457 #458 #459, #467): across-gap join adoption now reconstructs and verifies the full commit chain (signatures, linkage, re-derived roster roots and metadata hashes, committer authority in the reconstructed roster, withdrawal terminality, binding-change refusal, full terminal hash equality); Home groups additionally require an owner-user-key head attestation; ordinary groups fall back to reconstruction alone.
+- InviteV4 (#469): invites are signed by the inviter's agent key over the whole invite; Home invites carry an owner countersignature; both public keys travel inline and are bound by identity derivation; the joiner recomputes the base state before creating any local stub; optional intended-joiner binding closes invite replay across agents.
+- Invite-derived seatings carry local lineage provenance and deduplicated, authenticated fork-evidence counters (#468, ADR-0059 proposed); no eviction is performed in this release (see #472).
+- Invite base rosters travel as a certificate-digest projection (roster cap 20 entries, derived from the exact link and DM-envelope budgets); `GroupMember` gains an authoritative `certificate_digest` used until certificate bytes hydrate from the announce cache.
+- Peer-relay `RelayHeader` is bound to the inner payload (#437, #445); announce storm control (announce replay drop, per-author forward limits, broadcast-topic dedupe) (#421 #423 #425).
+
+### Fixed
+
+- Home rename no longer desynchronises the TreeKEM snapshot (#457); join-commit loss no longer strands a joiner in `already_joined` limbo (#458); placement 409 after a second certificate (#459); certified second-device Home join no longer needs a second announce (#447).
+- Home state is downgrade-safe: v0.40.x binaries read the legacy store while new state lives in a sidecar (#451); `X0X_HOME` is resolved consistently in production, override directories are purged exactly, `--name` applies to `user-id create/inspect`, and tests no longer pollute the real `~/.x0x` (#456, #465).
+- Identity, capability and card cadences moved from 300 s to 600 s with on-change revocation publishing, a periodic fallback, and a 90-day TTL (#413).
+- Mixed-fleet compatibility with v0.40.x peers for frozen v1 DM capability adverts and ownerless AgentCards, plus a ten-second per-recipient cooldown on targeted capability refreshes (#448 #450, #466). Owner-named v2 cards are still rejected by pre-ADR-0036 peers by design.
+- TreeKEM/named-group persistence is crash-atomic end to end: journal-first writes on seal and rebind, fsynced snapshots, paired replay with a single merged-live verdict, per-group quarantine instead of daemon-wide startup failure, v1 sidecar-journal upgrade path, resurrection-proof deletion (#467). Group responses now expose `membership_state` and `join_state`, and a pending join re-fires its volley.
+- `persist_named_groups_mutation` rolls back per key with compare-and-restore instead of restoring the whole map (#470, #473).
+- A `MemberJoined` whose named-group rename landed but whose directory fsync was unconfirmed (`ReplacedNotDurable`) is no longer treated as a failed apply, which left a phantom seat and burned retries on the consumed invite secret.
+- Agent-card embedded invites are minted through the same fenced transaction as explicit invites, reuse only the newest unconsumed, unexpired, unaddressed card-origin token, never republish explicit invites, and require a durable-owner caller for owner-axis groups (the group's link is omitted from the card otherwise).
+- `addr_is_free` probes the exact bind address during upgrades (#433).
+
+### Added
+
+- Owner singleton and naming registry (ADR-0036, #430); Home auto-provisioning and primary agent (ADR-0038, #432 #435); agent harness boundary with rider tokens and actor context (ADR-0039, #439); signed delegation envelope, structured mentions, task claim/complete (ADR-0040, #441); cross-machine owner-state sync Tier 1 (ADR-0041, #440); loss-tolerant datagram voice lane (ADR-0042, #431); agent key-move protocol (ADR-0037/0043, #444, roaming ceremony gated off); relay metering phase (ADR-0035, #427); V3 self-verifying announces with cert-blob fetch (#380, #416 #419); `fan_out` on public send (#296, #353).
+- CLI argument-level parity with the Home Suite API and dispatch-to-wire parity tests (#455); complete API reference (#454); SKILL.md Home Suite coverage (#453); `x0x group join --home --owner`, `x0x home` shows `owner_user_id`.
+
+### Known limitations
+
+- A joiner whose local view is still at the invite base can adopt a removed admin's fork (ADR-0016 equal-revision limitation, #468); a malicious admin can hand out a policy-stripped invite that joins an ordinary-looking fork (#469 residual). Both are tracked by #472 (owner mandate on `MemberAdded`, alternate-chain validation, route-complete quarantine, content-addressed base snapshots).
+- The ordinary save path writes the Home sidecar before `named_groups.json` (#471).
+- Record-level compare-and-restore: a concurrent mutation of the SAME record skips the rollback for that record, so fields from a failed mutation can remain and may be persisted by a later save (#470).
+- Owner user keys have no revocation subject yet (agent and machine keys do).
+- A GSS/legacy epoch rotation inside an adoption gap leaves the joiner pending until it re-joins on a fresh invite.
+- Old peers reject owner-named v2 AgentCards (ADR-0036).
+
 ### Security / groups (#468, #469 — v0.41.0 hardening subset)
 
 - **Authenticated invites (InviteV4).** Invites are signed by the inviter
@@ -11,7 +56,7 @@ All notable changes to this project will be documented in this file.
   user key; both keys travel inline (id-bound). Joiners verify signatures,
   re-derive the base state hash from the carried roster projection +
   public-meta snapshot, and check the intended joiner BEFORE seating any
-  stub. Typed refusals surface as `invites_refused{reason}` diagnostics.
+  stub. Typed refusals surface as `invites_refused_reasons: { "<reason>": <count> }` diagnostics.
 - **Home-join mode.** `POST /groups/join` gains `mode: "home"` +
   `expected_owner_user_id` (fail-closed matrix incl. `use_home_mode`,
   `pin_requires_home_mode`, `home_mode_requires_pin`,
