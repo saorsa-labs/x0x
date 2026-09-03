@@ -134,7 +134,7 @@ pub struct GroupCounters {
     /// catch-up/replay (the wedge class where a verified event — e.g. a
     /// second device's self-leave — could previously sit queued forever
     /// with no other signal).
-    pub membership_events_queued_gap: u64,
+    pub membership_events_queued_revision_gap: u64,
 }
 
 /// Per-group gauges for ADR 0028 causal predecessor delivery. Populated by the
@@ -237,9 +237,10 @@ impl GroupsDiagnostics {
 
     /// #482: record a TreeKEM membership event queued for state-chain
     /// catch-up/replay.
-    pub fn record_membership_event_queued_gap(&self, group_id: &str) {
+    pub fn record_membership_event_queued_revision_gap(&self, group_id: &str) {
         self.with_counters(group_id, |c| {
-            c.membership_events_queued_gap = c.membership_events_queued_gap.saturating_add(1);
+            c.membership_events_queued_revision_gap =
+                c.membership_events_queued_revision_gap.saturating_add(1);
         });
     }
 
@@ -603,9 +604,9 @@ impl GroupsDiagnostics {
             dst.causal_capacity_rejected = dst
                 .causal_capacity_rejected
                 .saturating_add(src.causal_capacity_rejected);
-            dst.membership_events_queued_gap = dst
-                .membership_events_queued_gap
-                .saturating_add(src.membership_events_queued_gap);
+            dst.membership_events_queued_revision_gap = dst
+                .membership_events_queued_revision_gap
+                .saturating_add(src.membership_events_queued_revision_gap);
             dst.last_message_at_ms = match (dst.last_message_at_ms, src.last_message_at_ms) {
                 (Some(a), Some(b)) => Some(a.max(b)),
                 (None, Some(b)) => Some(b),

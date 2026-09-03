@@ -8173,6 +8173,7 @@ impl Agent {
             .await;
         let move_state_for_listener = std::sync::Arc::clone(&self.move_state);
 
+        let own_peer_id_for_cache_exclude = ant_quic::PeerId(self.machine_id().0);
         self.spawn_tracked(async move {
             enum DiscoveryMessage {
                 Identity(crate::gossip::PubSubMessage),
@@ -8287,6 +8288,20 @@ impl Agent {
                         if !bootstrap_addresses.is_empty() {
                             if let Some(ref bc) = &bootstrap_cache {
                                 let peer_id = ant_quic::PeerId(announcement.machine_id.0);
+
+                                // uses own_peer_id_for_cache_exclude (moved in before the spawn)
+
+                                // #484 (design r3 item 2): never insert SELF into the
+
+                                // bootstrap cache — the cache has no own-peer predicate
+
+                                // (durable fix ant-quic#269).
+
+                                if peer_id == own_peer_id_for_cache_exclude {
+
+                                    continue;
+
+                                }
                                 bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
                                     .await;
                             }
@@ -8972,6 +8987,20 @@ impl Agent {
                     if !bootstrap_addresses.is_empty() {
                         if let Some(ref bc) = &bootstrap_cache {
                             let peer_id = ant_quic::PeerId(announcement.machine_id.0);
+
+                            // uses own_peer_id_for_cache_exclude (moved in before the spawn)
+
+                            // #484 (design r3 item 2): never insert SELF into the
+
+                            // bootstrap cache — the cache has no own-peer predicate
+
+                            // (durable fix ant-quic#269).
+
+                            if peer_id == own_peer_id_for_cache_exclude {
+
+                                continue;
+
+                            }
                             bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
                                 .await;
                             tracing::debug!(

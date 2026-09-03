@@ -6138,9 +6138,13 @@ async fn queue_treekem_membership_event(
             queue.pop_front();
         }
     }
-    state
-        .groups_diagnostics
-        .record_membership_event_queued_gap(group_id);
+    if reason == "revision_gap" {
+        // #482 (design r3 item 4): the counter measures the NAMED failure
+        // mode (revision-gap wedges), not every queued reason.
+        state
+            .groups_diagnostics
+            .record_membership_event_queued_revision_gap(group_id);
+    }
     tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
     request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
 }
@@ -16816,6 +16820,10 @@ pub(in crate::server) async fn owner_cert_evidence_for_with_digests(
         let Some(agent_id) = parse_agent_id_hex(&key).ok() else {
             continue;
         };
+        // #483 (design r3 item 1): the roster digest is blake3(CERT) while
+        // the blob cache keys on blake3((user_id, cert)) — scan for the
+        // blob whose CERTIFICATE hashes to the roster digest instead of a
+        // keyed lookup.
         let digest_bytes: [u8; 32] = match hex::decode(digest) {
             Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
                 Ok(arr) => arr,
@@ -16823,7 +16831,12 @@ pub(in crate::server) async fn owner_cert_evidence_for_with_digests(
             },
             Err(_) => continue,
         };
-        if let Some(blob) = state.agent.announce_blob_cache.get(&digest_bytes).await {
+        if let Some(blob) = state
+            .agent
+            .announce_blob_cache
+            .find_by_cert_digest(&digest_bytes)
+            .await
+        {
             if let Some(cert) = blob.agent_certificate.as_ref() {
                 if cert.agent_id().is_ok_and(|id| id == agent_id)
                     && cert.user_id().ok() == blob.user_id

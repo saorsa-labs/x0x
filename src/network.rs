@@ -395,6 +395,21 @@ fn default_peer_relay_max_forward_bytes() -> u64 {
     crate::peer_relay::DEFAULT_MAX_FORWARD_BYTES_PER_WINDOW
 }
 
+/// #484: normalize a v4-mapped IPv6 socket address (`::ffff:a.b.c.d`) to
+/// its plain IPv4 form — cached/announced addresses observed as mapped-v6
+/// wedge sends with "No route to host" on hosts whose mapped-v6 egress is
+/// refused. Non-mapped addresses pass through unchanged (durable fix
+/// ant-quic#269).
+#[must_use]
+pub fn normalize_v4_mapped_addr(addr: SocketAddr) -> SocketAddr {
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+            None => SocketAddr::V6(v6),
+        },
+        v4 => v4,
+    }
+}
 impl Default for PeerRelayConfig {
     fn default() -> Self {
         Self {
@@ -2618,13 +2633,7 @@ impl NetworkNode {
         let candidate_addrs: Vec<SocketAddr> = cached_peer
             .preferred_addresses()
             .into_iter()
-            .map(|addr| match addr {
-                SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-                    Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
-                    None => SocketAddr::V6(v6),
-                },
-                v4 => v4,
-            })
+            .map(normalize_v4_mapped_addr)
             .collect();
         for addr in &candidate_addrs {
             match self.connect_peer_with_addrs(peer_id, vec![*addr]).await {
@@ -2668,7 +2677,9 @@ impl NetworkNode {
     ///
     /// Returns `NetworkError` if connection fails or node is not initialized.
     pub async fn connect_addr(&self, addr: SocketAddr) -> NetworkResult<AntPeerId> {
-        self.connect_addr_with_origin(addr, "manual").await
+        // #484: normalize v4-mapped addresses at the explicit dial boundary.
+        self.connect_addr_with_origin(normalize_v4_mapped_addr(addr), "manual")
+            .await
     }
 
     /// Address-only dial carrying the #292 refusal-log origin (eager-set,

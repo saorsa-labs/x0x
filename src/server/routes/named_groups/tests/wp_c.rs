@@ -114,8 +114,8 @@ async fn wp_c_482_hash_gap_still_queues() {
 #[tokio::test]
 async fn wp_c_482_counter_increments_on_queue() {
     let diag = crate::groups::GroupsDiagnostics::new();
-    diag.record_membership_event_queued_gap("g1");
-    diag.record_membership_event_queued_gap("g1");
+    diag.record_membership_event_queued_revision_gap("g1");
+    diag.record_membership_event_queued_revision_gap("g1");
     let snapshot = diag.snapshot(
         &std::collections::HashMap::new(),
         &std::collections::HashSet::new(),
@@ -127,7 +127,7 @@ async fn wp_c_482_counter_increments_on_queue() {
         .iter()
         .find(|r| r.group_id == "g1")
         .expect("row");
-    assert_eq!(row.counters.membership_events_queued_gap, 2);
+    assert_eq!(row.counters.membership_events_queued_revision_gap, 2);
 }
 
 fn sample_commit() -> crate::groups::state_commit::GroupStateCommit {
@@ -151,24 +151,11 @@ fn sample_commit() -> crate::groups::state_commit::GroupStateCommit {
 #[test]
 fn wp_c_484_v4_mapped_normalizes() {
     let mapped: std::net::SocketAddr = "[::ffff:192.168.1.4]:51820".parse().unwrap();
-    let normalized = match mapped {
-        std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(v4) => std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
-            None => std::net::SocketAddr::V6(v6),
-        },
-        v4 => v4,
-    };
+    let normalized = crate::network::normalize_v4_mapped_addr(mapped);
     assert_eq!(normalized.to_string(), "192.168.1.4:51820");
     // Non-mapped IPv6 stays untouched.
     let native: std::net::SocketAddr = "[fe80::1]:51820".parse().unwrap();
-    let kept = match native {
-        std::net::SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
-            Some(v4) => std::net::SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
-            None => std::net::SocketAddr::V6(v6),
-        },
-        v4 => v4,
-    };
-    assert_eq!(kept, native);
+    assert_eq!(crate::network::normalize_v4_mapped_addr(native), native);
 }
 
 #[tokio::test]
