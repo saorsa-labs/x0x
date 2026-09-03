@@ -212,7 +212,7 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off (§5.2).
 
-**Second owner device joining the Home — current limitation (#447).** A certified second device's join currently succeeds only after the cert becomes visible in the Home owner's discovery cache, which happens on the *next announce ingest* (heartbeats every 600 s). Workaround: on the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` **twice, ~10 s apart, BEFORE attempting the join** — a bodyless announce publishes the ANONYMOUS cert digest, so the owner can never resolve the joiner's certificate and the join cannot succeed. A premature join wedges the joiner (it reports `already_joined: true` forever; recovery = remove the joiner's LOCAL group state — the `named_groups.json` entry itself, not just a `local_only` leave — and rejoin). Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+**Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` once before joining — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
 
 **Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
 
@@ -513,7 +513,7 @@ curl -X POST "http://$API/upgrade/apply" -H "Authorization: Bearer $TOKEN"   # d
 
 Two separate updaters: the `x0x upgrade` CLI is dispatched before any daemon client exists and updates the CLI/binary on disk; the daemon REST surface updates the daemon and is governed by the daemon config. `[update] enabled = false` disables the daemon side (`GET /upgrade` → `{"update_available":false,"reason":"updates disabled"}`). `--skip-update-check` disables MORE than the check for that one daemon process — it also turns off the process's self-update install/restart paths, including `POST /upgrade/apply` (which then returns `"self-update disabled for this process"`); it composes with `[update] enabled` (both must allow an apply). Neither flag governs the standalone CLI updater. Verified-release manifests only. See [docs/upgrade-system.md](https://github.com/saorsa-labs/x0x/blob/main/docs/upgrade-system.md).
 
-> ⚠️ **#451 rollback trap:** v0.40.4 cannot START on a data dir that holds Home state (`unknown variant owner_certified` → exit 1), and a failed upgrade auto-respawns the previous binary — so a failed upgrade on an **owned** install currently crash-loops. **Never downgrade an owned install to v0.40.x**, and back up the data dir before upgrading one.
+> ℹ️ **Downgrade safety (#451, fixed in v0.41.0):** Home state now lives in a sidecar; a v0.40.x binary reads the legacy store and starts cleanly, so a failed upgrade that respawns the previous binary no longer crash-loops. Still back up the data dir before upgrading an owned install, and expect Home features to be absent while downgraded.
 
 ### 7.3 Diagnostics
 
@@ -529,11 +529,11 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 
 | Symptom | Cause | Fix |
 |---|---|---|
-| Second device can't join owner's Home (`no agent certificate resolved`) | #447: cert blob merges into discovery only on next announce ingest; a BODYLESS announce publishes the anonymous digest, which the owner can never resolve | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` twice ~10 s apart BEFORE joining; a wedged joiner must remove its local `named_groups.json` entry (not just a `local_only` leave) and rejoin |
+| Second device can't join owner's Home (`no agent certificate resolved` / `pending`) | a BODYLESS announce publishes the anonymous digest, which the owner can never resolve (#447 single-announce admission is fixed in v0.41.0) | `POST /announce` with `{"include_user_identity":true,"human_consent":true}` once, then `x0x group join --home --owner <owner-user-id> <invite>`; a `pending` join clears when the owner's certificate arrives |
 | Two Homes for one owner | #449: per-device provisioning, no reconciliation yet | expected until #449; use either Home, don't fight it |
-| Strict (durable-ack) DM to v0.40.4 peer → 409 `recipient_ack_semantics_unavailable` | #448 mixed-fleet: peer can't verify new advert; no auto-fallback | upgrade the peer, retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
-| Peer rejects your agent card | #450 mixed-fleet card signature mismatch | upgrade the verifying peer |
-| Daemon crash-loops after downgrade/failed upgrade | #451: v0.40.4 can't parse Home state | never downgrade an owned install; restore data-dir backup or remove Home state |
+| Strict (durable-ack) DM to v0.40.4 peer → 409 `recipient_ack_semantics_unavailable` | #448 mixed-fleet: frozen v1 adverts interoperate, but an old peer cannot verify a new-format advert; no auto-fallback | upgrade the peer, retry later, or resend with `require_durable_app_ack:false` (v1 best-effort) |
+| Peer rejects your agent card | #450: ownerless cards interoperate with v0.40.x; owner-named v2 cards are rejected by pre-ADR-0036 peers by design | upgrade the verifying peer |
+| Daemon downgraded to v0.40.x on an owned install | #451 fixed in v0.41.0: the legacy store is readable, Home state waits in the sidecar | expected; Home features return on re-upgrade — keep a data-dir backup before upgrading |
 | `403 rider tokens are denied on this route` | deny-by-default rider scope (ADR-0039) | use a granted surface (`groups/:id/send`, `secure/encrypt`, `GET /history`) or act as the owner |
 | `403 ... Home must be delegated explicitly` | rider token's `groups` list lacks the Home gid (no implicit grant) | re-mint the token with the Home group id in `groups` (and in the signed capability) |
 | `409` on `/owner/*` or `/sync/*` | install has no owner key | `x0x user-id create`, restart daemon |
