@@ -594,13 +594,13 @@ except the local agent itself, which the lazy mint deliberately records as
 {
   "agent_id": "<64-hex agent id>",
   "to_machine": "<64-hex machine id>",
-  "placement": "roaming",
-  "pin": "<64-hex machine id, optional>"
+  "placement": "roaming"
 }
 ```
 
-`placement` is `"roaming"` or `"pinned"`; when `"pinned"`, `pin` must equal
-`to_machine`. The JSON extractor runs *before* the ceremony gate, so a body
+For `"pinned"` the body instead carries `"pin": "<64-hex machine id>"`
+(required — and it must equal `to_machine`). `pin` must be ABSENT for
+`"roaming"`. The JSON extractor runs *before* the ceremony gate, so a body
 with missing or mistyped fields answers a plain-text **422** (invalid JSON
 syntax 400, missing `Content-Type: application/json` 415) — only a
 well-formed body reaches the **501**. With the ceremony enabled the handler
@@ -609,8 +609,8 @@ no mint / a move is already in flight / **or a well-formed pinned placement
 has `pin != to_machine`** (the equality is enforced inside
 `move_authorize`, whose errors map to `409` with
 `move authorization rejected: …`); and `400` on malformed ids or an
-unparseable placement (unknown `placement` kind, or `"pinned"` without a
-`pin`).
+unparseable placement (unknown `placement` kind, `"pinned"` without a
+`pin`, or `"roaming"` sent WITH a `pin`).
 
 Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
 placement ledger. **Binding revocation** is the permanent tombstone form of
