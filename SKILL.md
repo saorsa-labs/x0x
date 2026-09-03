@@ -613,7 +613,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Home space | `/home` `/home/rename` | `x0x home` `home rename` | GA · joins #447, per-device #449 |
 | Sub-agents (ACP + rider) | `/owner/agents/issue` `/owner/riders*` | `x0x owner agents issue/revoke` · `owner riders issue --delegation-payload-b64/--delegation-signature` (mint) / list / revoke | GA |
 | Rider deny-by-default scopes | middleware (403 matrix) | — | GA |
-| Session tokens read-mostly | `/auth/session` | — | **caveat #446** |
+| Session tokens read-mostly | `/auth/session` | — | GA (owner-act routes refuse session tokens since v0.41.0) |
 | Named groups + policy + discovery | `/groups*` | `x0x group ...` | GA |
 | Public messages + threads | `/groups/:id/send` `/messages` (`thread_root`/`thread_parent`) | `x0x group send --thread-root/--reply-to` | GA |
 | Structured mentions | `/groups/:id/send` `mentions:[...]` | `x0x group send --mentions <hex>... [--delegation-digest <hex>]` | GA |
