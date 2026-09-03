@@ -173,6 +173,27 @@ impl AnnounceBlobCache {
         cache
     }
 
+    /// #483: scan for a cached blob whose CERTIFICATE hashes to
+    /// `cert_digest` (blake3(cert) — the roster-seat digest), regardless
+    /// of the cache's own `(user_id, cert)` blob key. Returns the first
+    /// binding whose certificate matches; the caller still applies the
+    /// agent/user binding rule.
+    pub async fn find_by_cert_digest(&self, cert_digest: &[u8; 32]) -> Option<Arc<CachedBlob>> {
+        let blobs = self.blobs.read().await;
+        blobs
+            .values()
+            .find(|blob| {
+                blob.agent_certificate.as_ref().is_some_and(|cert| {
+                    // Match owner_cert::certificate_digest_hex: bincode(cert)
+                    // with a public-key fallback on serialize failure.
+                    let bytes = bincode::serialize(cert)
+                        .unwrap_or_else(|_| cert.agent_public_key().to_vec());
+                    blake3::hash(&bytes).as_bytes() == cert_digest
+                })
+            })
+            .cloned()
+    }
+
     /// Look up a cached blob by digest. Returns `None` on miss.
     /// Updates LRU access order on hit.
     pub async fn get(&self, digest: &[u8; 32]) -> Option<Arc<CachedBlob>> {
