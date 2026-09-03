@@ -2893,6 +2893,42 @@ fn fork_candidate_authenticated(
 /// the caller gates the once-only diagnostics on it (r4 addendum
 /// item 7: a non-durable install must leave the conflict retryable,
 /// not seen-marked).
+/// r5 (Fable 2): remove a live-but-not-durable evidence record so the
+/// identical conflict stays retryable (identity-matched removal only).
+///
+/// IN-MEMORY by design — a nested persist cannot work here: the caller
+/// sits inside a save that returned `ReplacedNotDurable`, so the store's
+/// durability-confirmation flag is set and a nested mutation persist
+/// short-circuits on the flag before ever running the removal; and the
+/// causal-replay caller reaches this arm precisely because it HOLDS the
+/// persistence lock, which a locking persist would self-deadlock on.
+/// The still-set flag re-persists this rollback on the next successful
+/// save.
+async fn rollback_live_fork_evidence(
+    state: &AppState,
+    group_key: &str,
+    evidence: &x0x::groups::ForkEvidence,
+) {
+    let rev = evidence.revision;
+    let hash = evidence.state_hash.clone();
+    let by = evidence.committed_by.clone();
+    let mut groups = state.named_groups.write().await;
+    let Some(info) = groups.get_mut(group_key) else {
+        return;
+    };
+    let Some(lineage) = info.invite_lineage.as_mut() else {
+        return;
+    };
+    let matches = lineage.fork_evidence.as_ref().is_some_and(|existing| {
+        existing.revision == rev
+            && existing.state_hash == hash
+            && existing.committed_by.eq_ignore_ascii_case(&by)
+    });
+    if matches {
+        lineage.fork_evidence = None;
+    }
+}
+
 async fn install_fork_evidence(
     state: &Arc<AppState>,
     group_key: &str,
@@ -2913,6 +2949,21 @@ async fn install_fork_evidence(
     };
     match outcome {
         Ok(AtomicWriteOutcome::Durable) => true,
+        Ok(AtomicWriteOutcome::ReplacedNotDurable) if persistence_lock_already_held => {
+            // r5 (Fable 2): the record IS live in the map, but the save
+            // never confirmed directory durability — later identical
+            // conflicts would be silenced by the lineage gate while the
+            // warn/counter never fired. Roll the in-memory record back
+            // (identity-matched, no nested persist — see the helper) so
+            // "retryable" is literally true; the still-set durability
+            // flag re-persists the rollback on the next successful save.
+            rollback_live_fork_evidence(state, group_key, &evidence).await;
+            tracing::warn!(
+                group_id = %LogHexId::group(group_key),
+                "#468: fork evidence install was live but NOT directory-durable — rolled back; the identical conflict retries the install"
+            );
+            false
+        }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => {
             tracing::warn!(
                 group_id = %LogHexId::group(group_key),
@@ -2955,12 +3006,13 @@ fn fork_evidence_first_complete_wins(
 }
 
 /// #468 A5: the CENTRAL apply hook — every state-commit event variant
-/// passes through here, so every PrevHashMismatch/StaleRevision rejection
-/// is evaluated as fork evidence exactly once. Evaluation runs against
-/// the caller's snapshot (`current`); the INSTALL + durable persist are
-/// awaited INLINE (r3 Fable 2 — the r1/r2 detached spawn + `try_write`
-/// shape could never run under a live reader and discarded the persist
-/// error).
+/// passes through here (or its terminal twin
+/// [`apply_terminal_stateful_event_with_evidence`]), so every
+/// PrevHashMismatch/StaleRevision rejection is evaluated as fork
+/// evidence exactly once. Evaluation runs against the caller's snapshot
+/// (`current`); the INSTALL + durable persist are awaited INLINE
+/// (r3 Fable 2 — the r1/r2 detached spawn + `try_write` shape could
+/// never run under a live reader and discarded the persist error).
 async fn apply_stateful_event_with_evidence(
     state: &Arc<AppState>,
     group_key: &str,
@@ -2973,43 +3025,98 @@ async fn apply_stateful_event_with_evidence(
     match apply_stateful_event_to_group(current, commit, action, mutate) {
         Ok(next) => Ok(next),
         Err(e) => {
-            if current.invite_lineage.is_some() {
-                if let Some(evidence) =
-                    evaluate_fork_evidence_candidate(state, group_key, current, commit, &e)
-                {
-                    let durable_install = install_fork_evidence(
-                        state,
-                        group_key,
-                        evidence.clone(),
-                        persistence_lock_already_held,
-                    )
-                    .await;
-                    // r4 (addendum item 7): the once-only diagnostics
-                    // (warn + `adoption_fork_evidence`) fire ONLY after
-                    // the record reached directory durability — a
-                    // ReplacedNotDurable/Err/NotReplaced install is NOT
-                    // marked seen, so the identical conflict stays
-                    // retryable instead of being silenced by a record
-                    // that never landed (the r3 pre-install marking).
-                    if durable_install
-                        && state.groups_diagnostics.record_fork_evidence_once(
-                            group_key,
-                            evidence.revision,
-                            &evidence.state_hash,
-                            &evidence.committed_by,
-                        )
-                    {
-                        tracing::warn!(
-                            group_id = %LogHexId::group(group_key),
-                            revision = evidence.revision,
-                            state_hash = %evidence.state_hash,
-                            committed_by = %LogHexId::agent(&evidence.committed_by),
-                            "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
-                        );
-                    }
-                }
-            }
+            record_fork_evidence_on_apply_error(
+                state,
+                group_key,
+                current,
+                commit,
+                persistence_lock_already_held,
+                &e,
+            )
+            .await;
             Err(e)
+        }
+    }
+}
+
+/// r5 (Codex 5): the TERMINAL twin of the central apply hook
+/// ([`apply_stateful_event_with_evidence`]) for `GroupDeleted`'s
+/// withdrawal commit — the terminal validator still routes its
+/// PrevHashMismatch/StaleRevision rejections through the SAME
+/// fork-evidence evaluation instead of bypassing the central wrapper.
+async fn apply_terminal_stateful_event_with_evidence(
+    state: &Arc<AppState>,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    persistence_lock_already_held: bool,
+    action: x0x::groups::ActionKind,
+    mutate: impl FnOnce(&mut x0x::groups::GroupInfo),
+) -> Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError> {
+    match apply_terminal_stateful_event_to_group(current, commit, action, mutate) {
+        Ok(next) => Ok(next),
+        Err(e) => {
+            record_fork_evidence_on_apply_error(
+                state,
+                group_key,
+                current,
+                commit,
+                persistence_lock_already_held,
+                &e,
+            )
+            .await;
+            Err(e)
+        }
+    }
+}
+
+/// The shared error arm of the two central apply hooks: evaluate the
+/// rejection as a fork-evidence candidate and, when one is
+/// authenticated, install it durably and fire the once-only
+/// diagnostics. Extracted so the terminal twin cannot drift from the
+/// ordinary hook's rules.
+async fn record_fork_evidence_on_apply_error(
+    state: &Arc<AppState>,
+    group_key: &str,
+    current: &x0x::groups::GroupInfo,
+    commit: &x0x::groups::state_commit::GroupStateCommit,
+    persistence_lock_already_held: bool,
+    error: &x0x::groups::state_commit::ApplyError,
+) {
+    if current.invite_lineage.is_some() {
+        if let Some(evidence) =
+            evaluate_fork_evidence_candidate(state, group_key, current, commit, error)
+        {
+            let durable_install = install_fork_evidence(
+                state,
+                group_key,
+                evidence.clone(),
+                persistence_lock_already_held,
+            )
+            .await;
+            // r4 (addendum item 7): the once-only diagnostics
+            // (warn + `adoption_fork_evidence`) fire ONLY after
+            // the record reached directory durability — a
+            // ReplacedNotDurable/Err/NotReplaced install is NOT
+            // marked seen, so the identical conflict stays
+            // retryable instead of being silenced by a record
+            // that never landed (the r3 pre-install marking).
+            if durable_install
+                && state.groups_diagnostics.record_fork_evidence_once(
+                    group_key,
+                    evidence.revision,
+                    &evidence.state_hash,
+                    &evidence.committed_by,
+                )
+            {
+                tracing::warn!(
+                    group_id = %LogHexId::group(group_key),
+                    revision = evidence.revision,
+                    state_hash = %evidence.state_hash,
+                    committed_by = %LogHexId::agent(&evidence.committed_by),
+                    "#468: authenticated fork evidence recorded (no eviction; #472 owns the protocol response)"
+                );
+            }
         }
     }
 }
@@ -8350,15 +8457,20 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 return ApplyMetadataResult::REJECTED;
             }
             let current = info.clone();
-            let next = match apply_terminal_stateful_event_to_group(
+            let next = match apply_terminal_stateful_event_with_evidence(
+                state,
+                &resolved_group_key,
                 &current,
                 &commit,
+                roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
                     next.roster_revision = revision.max(next.roster_revision);
                     next.updated_at = commit.committed_at;
                 },
-            ) {
+            )
+            .await
+            {
                 Ok(next) => next,
                 Err(e) => {
                     tracing::debug!(
@@ -12968,15 +13080,10 @@ pub(in crate::server) async fn join_group_via_invite(
             return refuse_invite(&state, &invite, "invite_malformed");
         }
     }
-    // sigs, owner half (A2 step 7b — r4 addendum item 8): base
-    // consistency runs BEFORE the owner countersignature — a base that
-    // does not re-derive is refused before any owner-key work.
-    if let Err(refusal) = invite.verify_v4_owner_countersignature() {
-        return refuse_invite(&state, &invite, refusal.reason());
-    }
-    // base (A2 step 8): recompute the authority's base state hash from
-    // the projection + snapshot exactly as the stub will materialize
-    // them (A2; a tampered roster/policy/meta cannot seed the joiner).
+    // base (A2 step 7b — r5 Fable 1, fixes the r4 inversion): the base
+    // consistency recompute runs BEFORE the owner countersignature — a
+    // base that does not re-derive is refused before any owner-key
+    // work, per the spec's literal order.
     {
         // r3: the view preserves the policy discriminant — `None` was
         // already refused as `invite_unsigned` by view construction;
@@ -13003,6 +13110,11 @@ pub(in crate::server) async fn join_group_via_invite(
         if recomputed != view.base_state_hash {
             return refuse_invite(&state, &invite, "invite_base_inconsistent");
         }
+    }
+    // sigs, owner half (A2 step 8): the owner countersignature verifies
+    // only after the base it commits to has re-derived.
+    if let Err(refusal) = invite.verify_v4_owner_countersignature() {
+        return refuse_invite(&state, &invite, refusal.reason());
     }
 
     // ── owner (A2 step 9): #469 A3 Home-join mode matrix (fail closed

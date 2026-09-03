@@ -536,6 +536,204 @@ async fn join_refusals_are_typed_in_a2_order() -> Result<()> {
     let (status, body) = join(Arc::clone(&joiner), owner_link.clone(), None, None, None).await?;
     assert_eq!(status, StatusCode::CONFLICT);
     assert_eq!(body["error"], "inviter_key_revoked");
+
+    // ── r5 (Codex 7a) combined: REVOKED inviter + INVALID owner
+    // countersignature ⇒ the REVOCATION result fires. The inviter axis
+    // (key binding + signature) passes — the bound-but-revoked key is
+    // exactly the binding-then-revocation order — so the revocation
+    // check, which sits between the inviter half and the owner half,
+    // answers before any owner-key work. (The countersignature is not
+    // signed-view input, so tampering it leaves the inviter signature
+    // valid.)
+    let mut revoked_and_broken = owner_invite.clone();
+    revoked_and_broken.owner_countersignature_b64 = {
+        use base64::Engine as _;
+        let mut bytes = base64::engine::general_purpose::STANDARD
+            .decode(
+                revoked_and_broken
+                    .owner_countersignature_b64
+                    .as_deref()
+                    .context("countersignature present")?,
+            )
+            .context("decode countersignature")?;
+        bytes[0] ^= 0xFF;
+        Some(base64::engine::general_purpose::STANDARD.encode(bytes))
+    };
+    let (status, body) = join(
+        Arc::clone(&joiner),
+        revoked_and_broken.to_link(),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("inviter_key_revoked")),
+        "revocation must precede the owner countersignature check"
+    );
+
+    // ── r5 (Codex 7b) combined: INCONSISTENT base + MISSING owner
+    // countersignature ⇒ invite_base_inconsistent — the base recompute
+    // precedes the owner half (r5 Fable 1's reorder, pinned here at the
+    // precedence level too). The roster entry is tampered and the view
+    // re-signed by the inviter so the failure reaches the base check
+    // instead of dying at the inviter signature.
+    let mut based_and_unsigned = owner_invite.clone();
+    {
+        let authority_hex = hex::encode(authority.agent.agent_id().as_bytes());
+        let roster = based_and_unsigned
+            .base_roster
+            .as_mut()
+            .context("v4 projection present")?;
+        let seat = roster
+            .get_mut(&authority_hex)
+            .context("authority seated in the projection")?;
+        seat.role = x0x::groups::GroupRole::Member;
+    }
+
+    based_and_unsigned.owner_countersignature_b64 = None;
+    based_and_unsigned
+        .sign_v4(authority.agent.identity().agent_keypair(), None)
+        .map_err(|e| anyhow::anyhow!("re-sign failed: {e:?}"))?;
+    // A FRESH joiner: the first joiner's revocation set now names this
+    // inviter, and revocation precedes the base check — the 7b pin
+    // needs the base-vs-countersignature pair in isolation.
+    let dir_b = tempfile::tempdir()?;
+    let joiner_b_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(dir_b.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir_b.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let joiner_b = secure_endpoint_test_state_at(dir_b.path(), joiner_b_agent).await?;
+    let (status, body) = join(
+        Arc::clone(&joiner_b),
+        based_and_unsigned.to_link(),
+        None,
+        None,
+        None,
+    )
+    .await?;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("invite_base_inconsistent")),
+        "base consistency must precede the owner countersignature check"
+    );
+    Ok(())
+}
+
+/// r5 (Fable 1): the A2 base-consistency recompute runs BEFORE the
+/// owner countersignature — an owner-axis invite whose ROSTER ENTRY was
+/// tampered (the projection no longer re-derives the signed base hash)
+/// AND whose owner countersignature is MISSING refuses with
+/// `invite_base_inconsistent`, never the countersignature reason. The
+/// control leg (strip only, roster intact) proves the
+/// missing-countersignature refusal is live in the same fixture, so the
+/// ordering — not reachability — is what the first leg pins.
+#[tokio::test]
+async fn join_tampered_base_refuses_before_missing_owner_countersignature() -> Result<()> {
+    let (authority, _dir, owner_kp) = r3_owner_authority_state().await?;
+    let group_id = "9f".repeat(32);
+    r3_insert_group(&authority, &group_id, r3_owner_certified_policy(&owner_kp)).await;
+    let info = authority
+        .named_groups
+        .read()
+        .await
+        .get(&group_id)
+        .cloned()
+        .context("seeded group")?;
+    let (owner_invite, _) = assemble_signed_v4_invite(
+        &authority,
+        &info,
+        x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+        None,
+    )
+    .map_err(|e| anyhow::anyhow!("v4 mint failed: {e:?}"))?;
+
+    let dir = tempfile::tempdir()?;
+    let joiner_agent = Arc::new(
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key(AgentKeypair::generate()?)
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .build()
+            .await?,
+    );
+    let joiner = secure_endpoint_test_state_at(dir.path(), joiner_agent).await?;
+
+    // COMBINED failure: tamper the authority's own roster entry (Admin →
+    // Member — the projection no longer re-derives `base_state_hash`),
+    // strip the owner countersignature, and re-sign ONLY the inviter
+    // half over the tampered view so the invite survives the inviter
+    // axis and reaches the base recompute.
+    let mut tampered = owner_invite.clone();
+    {
+        let authority_hex = hex::encode(authority.agent.agent_id().as_bytes());
+        let roster = tampered
+            .base_roster
+            .as_mut()
+            .context("v4 projection present")?;
+        let seat = roster
+            .get_mut(&authority_hex)
+            .context("authority seated in the projection")?;
+        seat.role = x0x::groups::GroupRole::Member;
+    }
+    tampered.owner_countersignature_b64 = None;
+    tampered
+        .sign_v4(authority.agent.identity().agent_keypair(), None)
+        .map_err(|e| anyhow::anyhow!("re-sign failed: {e:?}"))?;
+
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: tampered.to_link(),
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (StatusCode::CONFLICT, json!("invite_base_inconsistent")),
+        "a tampered base must refuse with invite_base_inconsistent EVEN \
+         when the owner countersignature is also missing"
+    );
+
+    // CONTROL (same fixture, roster intact): the stripped countersignature
+    // alone refuses with the countersignature reason — proving that leg
+    // is reachable and the first leg genuinely pinned the ORDER.
+    let mut stripped = owner_invite;
+    stripped.owner_countersignature_b64 = None;
+    let response = join_group_via_invite(
+        State(Arc::clone(&joiner)),
+        Json(JoinGroupRequest {
+            invite: stripped.to_link(),
+            display_name: None,
+            mode: None,
+            expected_owner_user_id: None,
+        }),
+    )
+    .await
+    .into_response();
+    let status = response.status();
+    let body = response_json(response).await?.1;
+    assert_eq!(
+        (status, body["error"].clone()),
+        (
+            StatusCode::CONFLICT,
+            json!("invite_owner_countersignature_missing")
+        ),
+        "control: with the base intact the missing countersignature fires its own reason"
+    );
     Ok(())
 }
 
@@ -767,6 +965,44 @@ async fn fork_evidence_records_once_and_survives_in_the_durable_record() -> Resu
         assert_eq!(evidence.revision, 2);
         assert_eq!(evidence.state_hash, fork_b.state_hash);
         assert_eq!(evidence.committed_by, authority_hex);
+    }
+
+    // r5 (Codex 8): the REPLAY leg — install the disk-rebuilt store as
+    // the live map and replay the IDENTICAL conflict: the reloaded
+    // lineage's evidence gate must silence it — no re-warn, no counter
+    // increment, no record replacement.
+    {
+        let reloaded =
+            load_named_groups_merged(&state.named_groups_path, &state.home_suite_groups_path)
+                .await?;
+        *state.named_groups.write().await = reloaded;
+        let replayed = apply(&state, &group_id, fork_b.clone(), "fork-b").await;
+        assert!(
+            replayed.is_err(),
+            "the identical conflict is still refused after the disk rebuild"
+        );
+        assert_eq!(
+            r4_diag_row(&state, &group_id)
+                .await
+                .counters
+                .adoption_fork_evidence,
+            1,
+            "the disk-rebuilt state does NOT re-fire the once-only diagnostics \
+             on the identical replay"
+        );
+        let groups = state.named_groups.read().await;
+        assert_eq!(
+            groups[&group_id]
+                .invite_lineage
+                .as_ref()
+                .unwrap()
+                .fork_evidence
+                .as_ref()
+                .unwrap()
+                .state_hash,
+            fork_b.state_hash,
+            "the replay replaces nothing — the first stored record wins"
+        );
     }
     Ok(())
 }
@@ -1176,12 +1412,15 @@ async fn mint_route_refusals_cap_size_owner_key_and_rollback() -> Result<()> {
         .into_response();
         let (status, body) = response_json(response).await?;
         assert_eq!(status, StatusCode::CONFLICT);
-        assert!(
-            body["error"]
-                .as_str()
-                .unwrap_or_default()
-                .starts_with("owner_key_unavailable"),
-            "owner-axis mint without a local owner key is the typed 409: {body}"
+        // r5 (Codex 9): the EXACT typed error value — a starts_with
+        // prefix would tolerate a truncated or edited message silently.
+        assert_eq!(
+            body["error"],
+            json!(
+                "owner_key_unavailable: minting an owner-axis (Home-capable) \
+                 invite requires the durable owner's loaded user key"
+            ),
+            "owner-axis mint without a local owner key is the typed 409"
         );
     }
 
@@ -1468,6 +1707,77 @@ async fn card_mint_refusals_share_the_transaction() -> Result<()> {
     Ok(())
 }
 
+/// r5 (Codex 4): two CONCURRENT card GETs for one group — phase 1's
+/// reuse scan runs UNLOCKED, so both getters can miss reuse and each
+/// mint. The re-check inside the serialized (membership-locked) section
+/// must serve the first getter's link to the second: exactly ONE new
+/// issuance record and BOTH responses carry the SAME link.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_card_gets_share_one_minted_invite() -> Result<()> {
+    let (state, _dir, owner_kp) = r3_owner_authority_state().await?;
+    let group_id = "bf".repeat(32);
+    r3_insert_group(&state, &group_id, r3_owner_certified_policy(&owner_kp)).await;
+    let name = format!("group-{group_id}");
+
+    let get_card_groups = |state: Arc<AppState>| async move {
+        let response = get_agent_card(
+            State(state),
+            Some(axum::extract::Extension(
+                crate::server::rider_auth::ActorContext::Owner { durable: true },
+            )),
+            axum::extract::Query(CardQuery {
+                display_name: Some("authority".to_string()),
+                include_groups: Some(true),
+                include_local_addresses: false,
+            }),
+        )
+        .await
+        .into_response();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = response_json(response).await?.1;
+        let card: x0x::groups::card::AgentCard =
+            serde_json::from_value(body["card"].clone()).context("decode agent card")?;
+        Ok::<_, anyhow::Error>(card.groups)
+    };
+    let (first, second) = tokio::join!(
+        get_card_groups(Arc::clone(&state)),
+        get_card_groups(Arc::clone(&state))
+    );
+    let first = first?;
+    let second = second?;
+
+    let link_of = |groups: &[x0x::groups::card::CardGroup]| -> String {
+        groups
+            .iter()
+            .find(|g| g.name == name)
+            .unwrap_or_else(|| panic!("group {name} served on the card"))
+            .invite_link
+            .clone()
+    };
+    let first_link = link_of(&first);
+    let second_link = link_of(&second);
+    assert_eq!(
+        first_link, second_link,
+        "both concurrent card GETs serve the SAME link"
+    );
+    let card_origin_records = state.named_groups.read().await[&group_id]
+        .issued_invites
+        .values()
+        .filter(|record| matches!(record.origin, x0x::groups::InviteOrigin::Card))
+        .count();
+    assert_eq!(
+        card_origin_records, 1,
+        "exactly ONE new Card-origin issuance record across both GETs"
+    );
+    assert_eq!(
+        state.named_groups.read().await[&group_id]
+            .live_issued_invite_count(now_millis_u64() / 1_000),
+        1,
+        "the group carries exactly one live invite after the race"
+    );
+    Ok(())
+}
+
 /// r4 (original item 4a): an ADDRESSED invite under CONCURRENT
 /// MemberJoined volleys — the wrong agent's volley is refused with the
 /// not-addressed refusal (the one-time secret SURVIVES for the rightful
@@ -1581,6 +1891,117 @@ async fn addressed_invite_consumed_exactly_once_under_concurrent_volleys() -> Re
         Some(&1),
         "the wrong agent's refusal is the not-addressed reason"
     );
+    Ok(())
+}
+
+/// r5 (Codex 6): an UNADDRESSED invite under CONCURRENT MemberJoined
+/// volleys from TWO DIFFERENT agents — first-joiner-wins: exactly ONE
+/// consumption happens, the winner is seated, and the loser's volley is
+/// refused (the one-time secret does not admit two members no matter
+/// how the serialized applies interleave).
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unaddressed_invite_first_joiner_wins_under_concurrent_volleys() -> Result<()> {
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let group_id = "af".repeat(32);
+    let invite_secret = "unaddressed-concurrency-secret".to_string();
+
+    let mut info = x0x::groups::GroupInfo::with_policy(
+        "unaddressed".to_string(),
+        String::new(),
+        state.agent.agent_id(),
+        group_id.clone(),
+        x0x::groups::GroupPolicyPreset::PublicOpen.to_policy(),
+    );
+    info.add_member(
+        authority_hex.clone(),
+        x0x::groups::GroupRole::Admin,
+        None,
+        None,
+    );
+    // The UNADDRESSED record: no intended joiner — either agent may
+    // consume it, but only ONE may.
+    info.record_issued_invite_v2(
+        invite_secret.clone(),
+        now_millis_u64() / 1_000,
+        0,
+        x0x::groups::GroupRole::Member,
+        None,
+        x0x::groups::InviteOrigin::Explicit,
+        None,
+    );
+    state
+        .named_groups
+        .write()
+        .await
+        .insert(group_id.clone(), info);
+
+    // Two CONCURRENT volleys from two DIFFERENT agents on the same
+    // unaddressed secret.
+    let first_kp = AgentKeypair::generate()?;
+    let second_kp = AgentKeypair::generate()?;
+    let (first_id, first_hex, _pk, first_event) = signed_member_joined_event_for_test(
+        &first_kp,
+        &group_id,
+        &authority_hex,
+        &invite_secret,
+        x0x::groups::GroupRole::Member,
+    )?;
+    let (second_id, second_hex, _pk, second_event) = signed_member_joined_event_for_test(
+        &second_kp,
+        &group_id,
+        &authority_hex,
+        &invite_secret,
+        x0x::groups::GroupRole::Member,
+    )?;
+    let first_state = Arc::clone(&state);
+    let first = tokio::spawn(async move {
+        apply_named_group_metadata_event(&first_state, first_event, first_id, true, None).await
+    });
+    let second_state = Arc::clone(&state);
+    let second = tokio::spawn(async move {
+        apply_named_group_metadata_event(&second_state, second_event, second_id, true, None).await
+    });
+    let first = first.await?;
+    let second = second.await?;
+
+    // Whichever volley serialized first, EXACTLY ONE consumption: one
+    // apply accepted, the other refused — never both, never neither.
+    assert_ne!(
+        first.accepted, second.accepted,
+        "exactly ONE of the two concurrent volleys is accepted"
+    );
+    let winner_hex = if first.accepted {
+        &first_hex
+    } else {
+        &second_hex
+    };
+    let loser_hex = if first.accepted {
+        &second_hex
+    } else {
+        &first_hex
+    };
+    {
+        let groups = state.named_groups.read().await;
+        let info = &groups[&group_id];
+        assert!(
+            info.has_active_member(winner_hex),
+            "the first joiner to serialize is seated"
+        );
+        assert!(
+            !info.has_active_member(loser_hex),
+            "the second volley's agent is never seated"
+        );
+        let record = info
+            .issued_invites
+            .get(&invite_secret)
+            .expect("the consumed record persists for audit");
+        assert_eq!(
+            record.consumed_by.as_deref(),
+            Some(winner_hex.as_str()),
+            "EXACTLY ONE consumption — by whichever joiner serialized first"
+        );
+    }
     Ok(())
 }
 
@@ -1750,11 +2171,15 @@ async fn r4_seed_lineage_group(
 }
 
 /// Drive one commit through the CENTRAL wrapper against the live map.
+/// `lock_held` mirrors the causal-replay caller's
+/// `persistence_lock_already_held` flag (the caller itself must hold
+/// `named_groups_persistence_lock` when passing `true`).
 async fn r4_apply_through_wrapper(
     state: &Arc<AppState>,
     group_id: &str,
     commit: x0x::groups::state_commit::GroupStateCommit,
     description: &str,
+    lock_held: bool,
 ) -> Result<Result<x0x::groups::GroupInfo, x0x::groups::state_commit::ApplyError>> {
     let current = state
         .named_groups
@@ -1769,7 +2194,7 @@ async fn r4_apply_through_wrapper(
         group_id,
         &current,
         &commit,
-        false,
+        lock_held,
         x0x::groups::ActionKind::AdminOrHigher,
         |next| {
             next.description = mutation;
@@ -1824,7 +2249,8 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
             r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
         // Advance to rev 1 so the predecessor roster is retained.
         let a = variant(&state, base.clone(), "prevhash-a")?;
-        let applied = r4_apply_through_wrapper(&state, &group_id, a.clone(), "prevhash-a").await?;
+        let applied =
+            r4_apply_through_wrapper(&state, &group_id, a.clone(), "prevhash-a", false).await?;
         assert!(applied.is_ok(), "variant A applies: {applied:?}");
         persist_named_groups_mutation(&state, |groups| {
             let info = groups.get_mut(&group_id).unwrap();
@@ -1847,7 +2273,7 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
             signer,
         )?;
         let refused =
-            r4_apply_through_wrapper(&state, &group_id, conflicting, "prevhash-b").await?;
+            r4_apply_through_wrapper(&state, &group_id, conflicting, "prevhash-b", false).await?;
         assert!(refused.is_err(), "the prev-hash conflict must be refused");
         let evidence = r4_evidence(&state, &group_id)
             .await
@@ -1865,7 +2291,8 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
             r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
         let a = variant(&state, base, "stale-identical")?;
         let applied =
-            r4_apply_through_wrapper(&state, &group_id, a.clone(), "stale-identical").await?;
+            r4_apply_through_wrapper(&state, &group_id, a.clone(), "stale-identical", false)
+                .await?;
         assert!(applied.is_ok());
         persist_named_groups_mutation(&state, |groups| {
             let info = groups.get_mut(&group_id).unwrap();
@@ -1875,7 +2302,8 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
         .await?;
         // Replay the IDENTICAL retained commit: StaleRevision with the
         // same hash — an ordinary duplicate, not evidence.
-        let replay = r4_apply_through_wrapper(&state, &group_id, a, "stale-identical").await?;
+        let replay =
+            r4_apply_through_wrapper(&state, &group_id, a, "stale-identical", false).await?;
         assert!(replay.is_err(), "the duplicate is refused");
         assert!(
             r4_evidence(&state, &group_id).await.is_none(),
@@ -1919,7 +2347,8 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
             now_millis_u64(),
             signer,
         )?;
-        let refused = r4_apply_through_wrapper(&state, &group_id, stale, "outside-history").await?;
+        let refused =
+            r4_apply_through_wrapper(&state, &group_id, stale, "outside-history", false).await?;
         assert!(refused.is_err(), "the pruned-span stale commit is refused");
         assert!(
             r4_evidence(&state, &group_id).await.is_none(),
@@ -1957,7 +2386,8 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
             now_millis_u64(),
             &stranger,
         )?;
-        let refused = r4_apply_through_wrapper(&state, &group_id, conflicting, "unauth").await?;
+        let refused =
+            r4_apply_through_wrapper(&state, &group_id, conflicting, "unauth", false).await?;
         assert!(refused.is_err());
         assert!(
             r4_evidence(&state, &group_id).await.is_none(),
@@ -1975,10 +2405,15 @@ async fn fork_evidence_classification_matrix() -> Result<()> {
     Ok(())
 }
 
-/// r4 (addendum item 7): a FAILED evidence install is RETRYABLE — the
-/// identical conflict is not marked seen before durable success, so once
-/// the persist fault clears the very same conflict installs the record
-/// and fires the once-only diagnostics exactly once.
+/// r4 (addendum item 7) → r5 (Fable 2): a FAILED evidence install is
+/// RETRYABLE — the identical conflict is not marked seen before durable
+/// success, so once the persist fault clears the very same conflict
+/// installs the record and fires the once-only diagnostics exactly once.
+/// The r5 leg covers the ReplacedNotDurable shape on the held-lock
+/// (causal-replay) path: the install went LIVE in the map but never
+/// reached directory durability — the arm rolls the live record back,
+/// fires no once-only diagnostics, and the identical conflict still
+/// retries to a durable install once the fault clears.
 #[tokio::test]
 async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -1998,8 +2433,7 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
     let fork_b = variant(&state, &base, "retry-b")?;
 
     // Apply A, persist; then B conflicts — under an injected save fault
-    // the evidence install FAILS and must leave NOTHING seen-marked.
-    let applied = r4_apply_through_wrapper(&state, &group_id, fork_a, "retry-a").await?;
+    let applied = r4_apply_through_wrapper(&state, &group_id, fork_a, "retry-a", false).await?;
     assert!(applied.is_ok());
     persist_named_groups_mutation(&state, |groups| {
         let info = groups.get_mut(&group_id).unwrap();
@@ -2010,7 +2444,7 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
     {
         let _fault = set_save_fault(SaveFault::Error);
         let refused =
-            r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "retry-b").await?;
+            r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "retry-b", false).await?;
         assert!(refused.is_err(), "the conflicting twin is refused");
         assert!(
             r4_evidence(&state, &group_id).await.is_none(),
@@ -2025,8 +2459,8 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
             "the failed install fired no once-only diagnostics — the conflict stays retryable"
         );
     }
-    // The fault cleared: the IDENTICAL conflict retries and installs.
-    let retried = r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "retry-b").await?;
+    let retried =
+        r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "retry-b", false).await?;
     assert!(retried.is_err(), "still a conflict, still refused");
     let evidence = r4_evidence(&state, &group_id)
         .await
@@ -2040,14 +2474,76 @@ async fn fork_evidence_failed_install_is_retryable_not_seen_marked() -> Result<(
         1,
         "exactly one once-only firing after the durable retry"
     );
+
+    // ── r5 (Fable 2): the ReplacedNotDurable arm on the HELD-lock
+    // (causal-replay) path. The install goes LIVE in the map but the
+    // save never confirms durability; the arm must roll the live record
+    // back (identity-matched, no nested persist), fire NO once-only
+    // diagnostics, and leave the identical conflict retryable — the
+    // retry after the fault clears installs DURABLY. Driven under the
+    // ACTUAL persistence lock, exactly like the replay caller that
+    // passes the flag (this also proves the rollback cannot
+    // self-deadlock on that lock).
+    {
+        let group_id = "5f".repeat(32);
+        let base =
+            r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
+        let fork_a = variant(&state, &base, "rnd-a")?;
+        let fork_b = variant(&state, &base, "rnd-b")?;
+        let applied = r4_apply_through_wrapper(&state, &group_id, fork_a, "rnd-a", false).await?;
+        assert!(applied.is_ok());
+        persist_named_groups_mutation(&state, |groups| {
+            let info = groups.get_mut(&group_id).unwrap();
+            *info = applied.clone().expect("applied");
+            true
+        })
+        .await?;
+        {
+            let _fault = set_save_fault(SaveFault::ReplacedNotDurable);
+            let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+            let refused =
+                r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "rnd-b", true).await?;
+            assert!(refused.is_err(), "the conflicting twin is refused");
+            assert!(
+                r4_evidence(&state, &group_id).await.is_none(),
+                "the live-but-not-durable record was ROLLED BACK — nothing \
+                 remains in the map to silence the identical retry"
+            );
+            assert_eq!(
+                r4_diag_row(&state, &group_id)
+                    .await
+                    .counters
+                    .adoption_fork_evidence,
+                0,
+                "the rolled-back install fired no once-only diagnostics"
+            );
+        }
+        let retried =
+            r4_apply_through_wrapper(&state, &group_id, fork_b.clone(), "rnd-b", false).await?;
+        assert!(retried.is_err(), "still a conflict, still refused");
+        let evidence = r4_evidence(&state, &group_id)
+            .await
+            .expect("the identical conflict installs DURABLY once the fault clears");
+        assert_eq!(evidence.state_hash, fork_b.state_hash);
+        assert_eq!(
+            r4_diag_row(&state, &group_id)
+                .await
+                .counters
+                .adoption_fork_evidence,
+            1,
+            "exactly one once-only firing after the durable retry"
+        );
+    }
     Ok(())
 }
 
-/// r4 (addendum item 7): EVERY stateful event variant routes its
-/// conflicting commits through the CENTRAL wrapper — a conflicting
-/// commit carried by a MemberRemoved, MemberRoleUpdated, PolicyUpdated,
-/// or JoinRequestCreated event records evidence exactly like the
-/// description-change and MemberAdded arms already pinned.
+/// r4 (addendum item 7) → r5 (Fable 3 + Codex 5): EVERY stateful event
+/// variant routes its conflicting commits through the CENTRAL wrapper —
+/// all TWELVE commit-carrying variants (MemberAdded, MemberRemoved,
+/// GroupDeleted via the terminal twin, PolicyUpdated, MemberRoleUpdated,
+/// MemberBanned, MemberUnbanned, JoinRequestCreated,
+/// JoinRequestApproved, JoinRequestRejected, JoinRequestCancelled,
+/// GroupMetadataUpdated) record evidence on a conflicting commit.
 #[tokio::test]
 async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> Result<()> {
     let (state, _dir) = secure_endpoint_test_state().await?;
@@ -2058,11 +2554,13 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
     let requester_hex = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
 
     // A conflicting rev-1 commit for the freshly seeded group (prev does
-    // not chain from the sealed base head).
+    // not chain from the sealed base head). `withdrawn` selects the
+    // terminal shape GroupDeleted carries.
     async fn conflicting_commit(
         state: &AppState,
         group_id: &str,
         signer: &x0x::identity::AgentKeypair,
+        withdrawn: bool,
     ) -> Result<x0x::groups::GroupStateCommit> {
         let current = state.named_groups.read().await[group_id].clone();
         Ok(x0x::groups::GroupStateCommit::sign(
@@ -2075,10 +2573,41 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             x0x::groups::compute_policy_hash(&current.policy),
             x0x::groups::compute_public_meta_hash(&current.public_meta()),
             current.security_binding.clone(),
-            false,
+            withdrawn,
             now_millis_u64(),
             signer,
         )?)
+    }
+
+    // Seed a PENDING join request on a seeded group — the approval,
+    // rejection and cancellation arms gate on its presence before they
+    // reach the commit apply.
+    async fn seed_pending_join_request(state: &AppState, group_id: &str, requester_hex: &str) {
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(group_id)
+            .expect("seeded group")
+            .join_requests
+            .insert(
+                "req-1".to_string(),
+                x0x::groups::JoinRequest {
+                    request_id: "req-1".to_string(),
+                    group_id: group_id.to_string(),
+                    requester_agent_id: requester_hex.to_string(),
+                    requester_user_id: None,
+                    requested_role: x0x::groups::GroupRole::Member,
+                    message: None,
+                    treekem_key_package_b64: None,
+                    created_at: now_millis_u64(),
+                    reviewed_at: None,
+                    reviewed_by: None,
+                    status: x0x::groups::JoinRequestStatus::Pending,
+                    predecessor_envelope_digest: None,
+                    predecessor_first_seen_ms: None,
+                },
+            );
     }
 
     // MemberRemoved: admin remove of the extra member.
@@ -2099,7 +2628,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             treekem_commit_b64: None,
             treekem_epoch: None,
             secret_epoch: None,
-            commit: Some(conflicting_commit(&state, &group_id, signer).await?),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
@@ -2126,7 +2655,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             actor: authority_hex.clone(),
             agent_id: member_hex.clone(),
             role: x0x::groups::GroupRole::Admin,
-            commit: Some(conflicting_commit(&state, &group_id, signer).await?),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
@@ -2149,7 +2678,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             revision: 1,
             actor: authority_hex.clone(),
             policy,
-            commit: Some(conflicting_commit(&state, &group_id, signer).await?),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
         };
         let result =
             apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
@@ -2172,7 +2701,7 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
             ts: now_millis_u64(),
             requester_kem_public_key_b64: Some(String::new()),
             treekem_key_package_b64: None,
-            commit: Some(conflicting_commit(&state, &group_id, signer).await?),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
         };
         let sender = crate::server::parse_agent_id_hex(&requester_hex)
             .map_err(|e| anyhow::anyhow!("requester id: {e}"))?;
@@ -2181,6 +2710,215 @@ async fn every_stateful_event_variant_routes_conflicts_through_the_wrapper() -> 
         assert!(
             r4_evidence(&state, &group_id).await.is_some(),
             "JoinRequestCreated conflicts record evidence through the wrapper"
+        );
+    }
+
+    // ── r5 (Fable 3): the seven variants the r4 test left uncovered,
+    // plus the terminal twin below ─────────────────────────────────────
+
+    // MemberAdded: authority adds a third agent (the conflicting commit
+    // fails in the wrapper BEFORE the across-gap adoption body runs).
+    {
+        let group_id = "0a".repeat(32);
+        r4_seed_lineage_group(
+            &state,
+            &group_id,
+            GroupAdmission::InviteOnly,
+            Some(&member_hex),
+        )
+        .await?;
+        let added_hex = hex::encode(AgentKeypair::generate()?.agent_id().as_bytes());
+        let event = NamedGroupMetadataEvent::MemberAdded {
+            group_id: group_id.clone(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            agent_id: added_hex,
+            display_name: None,
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            member_joined_recovery: None,
+            member_recovery_history: Vec::new(),
+            certificate_b64: None,
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting add is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "MemberAdded conflicts record evidence through the wrapper"
+        );
+    }
+
+    // GroupDeleted (r5 Codex 5): the TERMINAL withdrawal commit routes
+    // through the terminal twin of the central wrapper — a conflicting
+    // delete records evidence instead of bypassing it.
+    {
+        let group_id = "0b".repeat(32);
+        r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
+        let event = NamedGroupMetadataEvent::GroupDeleted {
+            group_id: group_id.clone(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            commit: Some(conflicting_commit(&state, &group_id, signer, true).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting delete is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "GroupDeleted conflicts record evidence through the TERMINAL twin of the wrapper"
+        );
+    }
+
+    // MemberBanned: admin ban of the extra member.
+    {
+        let group_id = "0c".repeat(32);
+        r4_seed_lineage_group(
+            &state,
+            &group_id,
+            GroupAdmission::InviteOnly,
+            Some(&member_hex),
+        )
+        .await?;
+        let event = NamedGroupMetadataEvent::MemberBanned {
+            group_id: group_id.clone(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            agent_id: member_hex.clone(),
+            secret_epoch: None,
+            treekem_commit_b64: None,
+            treekem_epoch: None,
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting ban is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "MemberBanned conflicts record evidence through the wrapper"
+        );
+    }
+
+    // MemberUnbanned: admin unban.
+    {
+        let group_id = "0d".repeat(32);
+        r4_seed_lineage_group(
+            &state,
+            &group_id,
+            GroupAdmission::InviteOnly,
+            Some(&member_hex),
+        )
+        .await?;
+        let event = NamedGroupMetadataEvent::MemberUnbanned {
+            group_id: group_id.clone(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            agent_id: member_hex.clone(),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting unban is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "MemberUnbanned conflicts record evidence through the wrapper"
+        );
+    }
+
+    // JoinRequestApproved: authority approves the seeded pending request.
+    {
+        let group_id = "0e".repeat(32);
+        r4_seed_lineage_group(&state, &group_id, GroupAdmission::RequestAccess, None).await?;
+        seed_pending_join_request(&state, &group_id, &requester_hex).await;
+        let event = NamedGroupMetadataEvent::JoinRequestApproved {
+            group_id: group_id.clone(),
+            request_id: "req-1".to_string(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            requester_agent_id: requester_hex.clone(),
+            treekem_commit_b64: None,
+            treekem_welcome_b64: None,
+            welcome_ref: None,
+            treekem_epoch: None,
+            treekem_key_package_hash: None,
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting approval is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "JoinRequestApproved conflicts record evidence through the wrapper"
+        );
+    }
+
+    // JoinRequestRejected: authority rejects the seeded pending request.
+    {
+        let group_id = "0f".repeat(32);
+        r4_seed_lineage_group(&state, &group_id, GroupAdmission::RequestAccess, None).await?;
+        seed_pending_join_request(&state, &group_id, &requester_hex).await;
+        let event = NamedGroupMetadataEvent::JoinRequestRejected {
+            group_id: group_id.clone(),
+            request_id: "req-1".to_string(),
+            actor: authority_hex.clone(),
+            requester_agent_id: requester_hex.clone(),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(!result.accepted, "the conflicting rejection is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "JoinRequestRejected conflicts record evidence through the wrapper"
+        );
+    }
+
+    // JoinRequestCancelled: the requester cancels (sender == requester).
+    {
+        let group_id = "1a".repeat(32);
+        r4_seed_lineage_group(&state, &group_id, GroupAdmission::RequestAccess, None).await?;
+        seed_pending_join_request(&state, &group_id, &requester_hex).await;
+        let event = NamedGroupMetadataEvent::JoinRequestCancelled {
+            group_id: group_id.clone(),
+            request_id: "req-1".to_string(),
+            requester_agent_id: requester_hex.clone(),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let sender = crate::server::parse_agent_id_hex(&requester_hex)
+            .map_err(|e| anyhow::anyhow!("requester id: {e}"))?;
+        let result = apply_named_group_metadata_event(&state, event, sender, true, None).await;
+        assert!(!result.accepted, "the conflicting cancellation is refused");
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "JoinRequestCancelled conflicts record evidence through the wrapper"
+        );
+    }
+
+    // GroupMetadataUpdated: admin description change.
+    {
+        let group_id = "2a".repeat(32);
+        r4_seed_lineage_group(&state, &group_id, GroupAdmission::InviteOnly, None).await?;
+        let event = NamedGroupMetadataEvent::GroupMetadataUpdated {
+            group_id: group_id.clone(),
+            revision: 1,
+            actor: authority_hex.clone(),
+            name: None,
+            description: Some("conflicting description".to_string()),
+            commit: Some(conflicting_commit(&state, &group_id, signer, false).await?),
+        };
+        let result =
+            apply_named_group_metadata_event(&state, event, authority_id, true, None).await;
+        assert!(
+            !result.accepted,
+            "the conflicting metadata update is refused"
+        );
+        assert!(
+            r4_evidence(&state, &group_id).await.is_some(),
+            "GroupMetadataUpdated conflicts record evidence through the wrapper"
         );
     }
     Ok(())

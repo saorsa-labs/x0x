@@ -82,7 +82,9 @@ base-already-seated self-rejoin paths.
 
 ### 4. Fork evidence (#468)
 
-A central hook evaluates every rejected state commit (all event variants):
+A central hook evaluates every rejected state commit routed through the
+shared apply wrapper (see the Validation section for the covered variant
+matrix):
 `PrevHashMismatch` is a candidate; `StaleRevision` only when a retained local
 commit exists at that exact revision with a DIFFERENT state hash (identical
 hash = duplicate replay; outside retained history = unclassifiable). A
@@ -127,7 +129,7 @@ key, or rejecting an admin promoted after the base) is called out there.
   encoded size as the authoritative gate — all before any secret is recorded.
 
 ## Validation
-- `src/groups/invite.rs` unit suite (23 tests): canonical-bytes vector
+- `src/groups/invite.rs` unit suite (28 tests at round-5): canonical-bytes vector
   (blake3-pinned), missing-field → typed-refusal matrix, sign/verify
   tamper matrix incl. None↔Some("") signed-state flips, D1 equality
   rules + non-default meta round-trip, the D5 caps matrix (incl. the

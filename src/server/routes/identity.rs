@@ -584,6 +584,29 @@ pub(in crate::server) async fn get_agent_card(
                     continue;
                 }
             }
+            // r5 (Codex 4): re-run the REUSE check inside the serialized
+            // section too — phase 1's scan ran unlocked, so two
+            // concurrent card GETs can both miss reuse and each mint.
+            // The second getter under the lock must serve the link the
+            // first one minted, not a second issuance record.
+            {
+                let groups = state.named_groups.read().await;
+                if let Some(reused) = groups
+                    .get(&map_key)
+                    .and_then(|info| info.reusable_card_invite(now_secs))
+                    .and_then(|record| record.signed_link.clone())
+                {
+                    let name = groups
+                        .get(&map_key)
+                        .map(|info| info.name.clone())
+                        .unwrap_or_default();
+                    card.groups.push(x0x::groups::card::CardGroup {
+                        name,
+                        invite_link: reused,
+                    });
+                    continue;
+                }
+            }
             // r4 (addendum item 6): the card mint runs through the SAME
             // single actor-aware mint transaction as the explicit route
             // — owner-axis durable fence, live cap, signed v4 assembly,

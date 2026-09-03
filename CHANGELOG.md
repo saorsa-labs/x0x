@@ -26,12 +26,13 @@ All notable changes to this project will be documented in this file.
   protocol response is deferred to #472.
 - **Roster projection.** v4 invites carry the roster projection (no
   certificate bytes); digest-only members hash identically to their
-  byte-bearing form. Certificate bytes hydrate on exactly three
-  digest-anchored surfaces: the `MemberJoined` seat-time targeted
-  hydrate from the discovered-certificate cache, the member-certificate
-  bridge over announce-cache `VerifiedCertificate` events, and the
-  startup reconcile from the authenticated cache — bytes that do not
-  hash to a seat's committed digest are never installed.
+  byte-bearing form. Certificate bytes hydrate on
+  digest-anchored surfaces — the seat-time targeted hydrate (at the
+  `MemberJoined` authority seat, across-gap adoption, and join-route
+  projection materialization), the member-certificate bridge over
+  announce-cache `VerifiedCertificate` events, and the startup
+  reconcile from the authenticated cache — bytes that do not hash to a
+  seat's committed digest are never installed.
 - **Gap adoption is now digest-only (D2 behaviour change).** A certified
   member added inside a reconstructed roster gap used to be
   unreconstructable — the projection carries only the cert digest and the
