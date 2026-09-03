@@ -1202,6 +1202,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         ]),
     },
     EndpointDef {
+        method: Method::Get,
+        path: "/groups/:id/join-status",
+        cli_name: "group join-status",
+        description: "Pending-join status with the typed terminal outcome (#477)",
+        category: "named-groups",
+        request: RequestSpec::Fields(&[]),
+    },
+    EndpointDef {
         method: Method::Put,
         path: "/groups/:id/display-name",
         cli_name: "group set-name",

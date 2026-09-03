@@ -213,7 +213,7 @@ pub async fn join_wait(client: &DaemonClient, group_id: &str, seconds: u64) -> R
     };
     loop {
         let resp = client
-            .get(&format!("/groups/{group_id}/join-status"))
+            .get_with_error_body(&format!("/groups/{group_id}/join-status"))
             .await?;
         if resp.get("last_join_outcome").is_some_and(|v| !v.is_null()) {
             print_value(client.format(), &resp);

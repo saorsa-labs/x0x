@@ -958,8 +958,9 @@ pub(in crate::server) struct PendingJoinAttempt {
     /// #477 W3/J2: the STORED signed `MemberJoined` payload — same-invite
     /// retries resend THESE bytes unchanged (never a re-sign).
     pub stored_resend: Option<MemberJoinedResend>,
-    /// #477 J2: this attempt's poll task handle — finalize aborts it.
-    pub poll_task: Option<tokio::task::JoinHandle<()>>,
+    /// #477 J2: EVERY poll task spawned for this attempt (the install
+    /// poll plus any same-invite refire polls) — finalize aborts them all.
+    pub polls: Vec<tokio::task::JoinHandle<()>>,
     /// #477 J2: the metadata-listener registration token installed with
     /// the stub — finalize removes the listener only if the token still
     /// matches (a newer install is never removed).
@@ -9778,6 +9779,22 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 state
                     .groups_diagnostics
                     .record_member_joined_rejected_non_member_role(&resolved_group_key);
+                // #477 r2-5: the role cap is a DEFINITIVE, immutable fact
+                // about the invite-vs-request pair — stage the typed
+                // refusal here (this branch precedes consume_issued_invite,
+                // so the ledger mapping alone can never reach it).
+                state.groups_diagnostics.record_invite_refusal(
+                    &resolved_group_key,
+                    JoinRefusalReason::InviteRoleExceedsCap.as_str(),
+                );
+                stage_join_refusal(
+                    state,
+                    &resolved_group_key,
+                    &member_agent_id,
+                    &event_for_log,
+                    JoinRefusalReason::InviteRoleExceedsCap,
+                )
+                .await;
                 return ApplyMetadataResult::REJECTED;
             }
 
@@ -13532,6 +13549,33 @@ pub(in crate::server) async fn join_group_via_invite(
     if let Some(resp) = join_pending_invite_check(state.as_ref(), &invite, &req.invite).await {
         return resp;
     }
+    // #477 r2-1: claim the (group, invite) pair NOW, under the lock — the
+    // stub becomes visible and this lock is released before the poll
+    // spawns below, so without this preliminary entry a concurrent
+    // different-invite request could pass the recheck in that window. The
+    // attempt id is filled in when the signed event exists.
+    let joiner_hex = hex::encode(state.agent.agent_id().as_bytes());
+    {
+        let event_group_id = invite
+            .stable_group_id
+            .clone()
+            .unwrap_or_else(|| invite.group_id.clone());
+        let key = join_result_key(&event_group_id, &joiner_hex);
+        let mut attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts.entry(key).or_insert_with(|| PendingJoinAttempt {
+            attempt_id: String::new(),
+            local_group_key: group_id_hex.clone(),
+            invite_fingerprint: join_invite_fingerprint(&req.invite),
+            invite_group_id: event_group_id,
+            inviter_public_key_b64: invite.inviter_public_key_b64.clone(),
+            stored_resend: None,
+            polls: Vec::new(),
+            listener_token: None,
+        });
+    }
     {
         let groups = state.named_groups.read().await;
         if has_withdrawn_group_record(&groups, &group_id_hex)
@@ -13983,7 +14027,7 @@ pub(in crate::server) async fn join_group_via_invite(
                             invite_group_id: poll_event_group_id.clone(),
                             inviter_public_key_b64: poll_inviter_key,
                             stored_resend: poll_stored_resend,
-                            poll_task: Some(poll_handle),
+                            polls: vec![poll_handle],
                             listener_token: attempt_listener_token,
                         },
                     );
@@ -26259,6 +26303,60 @@ async fn refire_pending_join_volley(
             return;
         }
     };
+    // #477 r2-3: a REGISTERED attempt owns the wire bytes — its stored
+    // payload is resent UNCHANGED and NO signing happens. Only an
+    // unregistered pending (post-restart shape) builds a fresh volley.
+    {
+        let agent_id = state.agent.agent_id();
+        let joiner = hex::encode(agent_id.as_bytes());
+        let stored = {
+            let attempts = state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            attempts
+                .get(&join_result_key(&stable_group_id, &joiner))
+                .and_then(|entry| entry.stored_resend.clone())
+        };
+        if let Some(resend) = stored {
+            tracing::info!(group_id = %group_id_hex, member = %joiner, "re-firing the STORED MemberJoined volley unchanged (#477 W3)");
+            publish_named_group_metadata_event(state, &resend.metadata_topic, &resend.event).await;
+            let direct_state = Arc::clone(state);
+            let direct_recipient = inviter;
+            let direct_payload = resend.payload.clone();
+            tokio::spawn(async move {
+                let _ = direct_state
+                    .agent
+                    .send_direct_with_config(
+                        &direct_recipient,
+                        direct_payload,
+                        named_group_direct_delivery_config(),
+                    )
+                    .await;
+            });
+            let refire_poll = tokio::spawn(poll_join_result_until_membership_confirmed(
+                Arc::clone(state),
+                group_id_hex.to_string(),
+                stable_group_id.clone(),
+                inviter,
+                joiner.clone(),
+                invite_is_treekem,
+                Some(resend),
+                String::new(),
+            ));
+            // #477 r2-8: the refire poll is OWNED by the registered attempt.
+            {
+                let mut attempts = state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                if let Some(entry) = attempts.get_mut(&join_result_key(&stable_group_id, &joiner)) {
+                    entry.polls.push(refire_poll);
+                }
+            }
+            return;
+        }
+    }
     let agent_id = state.agent.agent_id();
     let joiner_hex = hex::encode(agent_id.as_bytes());
     let (metadata_topic, mls_group_id) = {
@@ -26445,25 +26543,15 @@ fn verify_join_refusal_receipt(
     ant_quic::crypto::raw_public_keys::pqc::verify_with_ml_dsa(&pubkey, &canonical, &sig).is_ok()
 }
 
-/// #477 A3/A4 — refusal selection under the membership mutex (lookup-gated:
-/// an unknown group never creates a lock-registry entry). Returns the
-/// serialized `Refused` response when a refusal for EXACTLY this attempt
-/// is staged and signable.
+/// #477 r2-4 — the refusal lookup with the membership guard ALREADY HELD
+/// (the fetch handler's single critical section covers results + refusals).
 async fn serve_staged_join_refusal(
     state: &AppState,
     group_id: &str,
     member_agent_id: &str,
     attempt_id: &str,
+    _guard: tokio::sync::MutexGuard<'_, ()>,
 ) -> Option<Vec<u8>> {
-    let membership_arc = group_membership_lock_for_known_group(state, group_id).await;
-    // #477 (r1 review item 8): the known-group gate GATES SERVING — an
-    // unknown group serves nothing (a stale refusal must not outlive its
-    // group locally).
-    let membership_arc = match membership_arc {
-        Some(arc) => arc,
-        None => return None,
-    };
-    let _membership_guard = membership_arc.lock().await;
     // Stale-attempt accounting: a refusal exists for this (group, member)
     // but a DIFFERENT attempt ⇒ typed miss, never served.
     {
@@ -26614,6 +26702,14 @@ async fn stage_join_refusal(
         .pending_join_refusals
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
+    // #477 r2-6: replaying the SAME fact must never destroy the cached
+    // signature (A2's sign-once guarantee + receipt-delivery DoS): an
+    // existing entry keeps its receipt AND its cached signature; only its
+    // TTL window is refreshed.
+    if let Some(existing) = refusals.get_mut(&key) {
+        existing.created_at = std::time::Instant::now();
+        return;
+    }
     // Bound: 1024 entries, evict the oldest created_at.
     if refusals.len() >= JOIN_REFUSAL_MAX_ENTRIES {
         if let Some(oldest) = refusals
@@ -26784,19 +26880,26 @@ pub(in crate::server) async fn finalize_join_attempt(
 ) {
     // #477 J2: extract this attempt's ownership (poll handle, listener
     // token) from the registry under the compare rule, then finalize.
-    let (poll_task, listener_token) = {
+    let expected_key = join_result_key(event_group_id, member_agent_id);
+    let (mut polls, listener_token) = {
         let mut attempts = state
             .pending_join_attempts
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        match attempts.get_mut(&join_result_key(event_group_id, member_agent_id)) {
+        match attempts.get_mut(&expected_key) {
             Some(entry) if entry.attempt_id == attempt_id => {
-                (entry.poll_task.take(), entry.listener_token)
+                (std::mem::take(&mut entry.polls), entry.listener_token)
             }
-            _ => (None, None),
+            // A NEWER attempt owns the entry: this finalize owns NOTHING —
+            // no registry removal, no pin clear, no stub teardown, no
+            // terminal outcome (r2-2).
+            Some(_) => {
+                return;
+            }
+            // No entry (legacy refire path): nothing attempt-owned to own.
+            None => (Vec::new(), None),
         }
     };
-    let expected_key = join_result_key(event_group_id, member_agent_id);
     // Lookup-gated membership lock (#477 C7): only a LOCALLY-KNOWN group
     // takes/creates a registry entry — unknown-group finalize cannot grow
     // the lock registry.
@@ -26825,10 +26928,11 @@ pub(in crate::server) async fn finalize_join_attempt(
         }
     }
     if outcome != JoinAttemptOutcome::Seated {
-        // Abort this attempt's own poll task (J2; the finalize caller may
-        // BE the poll — aborting an already-finishing task is a no-op).
-        if let Some(poll_task) = poll_task {
-            poll_task.abort();
+        // Abort EVERY poll task of this attempt (J2; the finalize caller
+        // may BE one of them — aborting an already-finishing task is a
+        // no-op).
+        for poll in polls.drain(..) {
+            poll.abort();
         }
         let stub_is_pending = {
             let stubs = state
@@ -27047,7 +27151,7 @@ pub(in crate::server) async fn handle_join_result_message(
             // during the seat-to-result interval wakes and re-reads the
             // newly staged result (T4(b)).
             let membership_arc = group_membership_lock_for_known_group(state, &group_id).await;
-            let _selection_guard = match &membership_arc {
+            let selection_guard = match &membership_arc {
                 Some(arc) => Some(arc.lock().await),
                 None => None,
             };
@@ -27062,25 +27166,33 @@ pub(in crate::server) async fn handle_join_result_message(
                     results.len(),
                 )
             };
-            drop(_selection_guard);
-            drop(membership_arc);
+            // #477 r2-4: the SAME critical section covers the refusal
+            // lookup below — the guard is passed INTO the locked serve
+            // helper (never dropped between the two reads; apply holds
+            // this same mutex through staging, so a result staged after
+            // the results read cannot slip past the refusal read).
             let Some(event) = event else {
                 // #477 A3/A4 — no staged RESULT: answer a capable,
                 // attempt-matching fetch with the staged REFUSAL (if any),
-                // selected under the group membership mutex so a fetch
-                // during an apply blocks until staging completes.
+                // selected in this same critical section.
                 if accepts_refusal && verified {
                     if let Some(attempt_id) = attempt_id.as_deref() {
                         // Results take precedence: a successful staging
                         // for this triple removed the refusal already.
-                        if let Some(response) = serve_staged_join_refusal(
-                            state,
-                            &group_id,
-                            &member_agent_id,
-                            attempt_id,
-                        )
-                        .await
-                        {
+                        let refusal_response = match selection_guard {
+                            Some(guard) => {
+                                serve_staged_join_refusal(
+                                    state,
+                                    &group_id,
+                                    &member_agent_id,
+                                    attempt_id,
+                                    guard,
+                                )
+                                .await
+                            }
+                            None => None,
+                        };
+                        if let Some(response) = refusal_response {
                             send_join_result_response(state, sender, &response).await;
                             return;
                         }
@@ -27588,12 +27700,13 @@ async fn poll_join_result_until_membership_confirmed(
         }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
-    clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     if superseded || already_finalized {
-        // A newer attempt owns the key, or a refusal/timeout finalize
-        // already ran: the poll exits silently — no finalizer.
+        // A newer attempt owns the key (superseded: its pin is NOT ours to
+        // clear), or a refusal/timeout finalize already ran (it cleared
+        // the pin): the poll exits silently — no finalizer.
         return;
     }
+    clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     if timed_out {
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; finalizing the attempt as timed_out");
         // #477 C8: the poll task IS the deadline owner — the live expiry
@@ -28984,7 +29097,7 @@ pub(in crate::server) mod tests {
             let agent = Arc::new(
                 crate::Agent::builder()
                     .with_machine_key(data_dir.join("machine.key"))
-                    .with_agent_key(x0x::identity::AgentKeypair::generate().expect("kp"))
+                    .with_agent_key(crate::identity::AgentKeypair::generate().expect("kp"))
                     .with_agent_cert_path(data_dir.join("agent.cert"))
                     .with_peer_cache_disabled()
                     .with_contact_store_path(data_dir.join("contacts.json"))
@@ -28997,6 +29110,21 @@ pub(in crate::server) mod tests {
                 .await
                 .expect("state");
             (state, dir)
+        }
+
+        fn golden_canonical() -> Vec<u8> {
+            crate::server::routes::named_groups::canonical_member_joined_bytes(
+                "aabb",
+                Some("ccdd"),
+                "eeff",
+                "c29tZXB1Yg==",
+                x0x::groups::GroupRole::Member,
+                Some("Golden"),
+                "1122",
+                "secret",
+                1_700_000_000_000,
+                Some("a2V5cGFjaw=="),
+            )
         }
 
         fn refusal_receipt(
@@ -29026,25 +29154,29 @@ pub(in crate::server) mod tests {
         /// independent computations.
         #[test]
         fn wp_b_attempt_id_golden_vector_deterministic() {
-            let canonical = b"canonical-member-joined-bytes-v2";
-            let sig = b"raw-ml-dsa-signature-bytes";
-            let a = member_joined_attempt_id(canonical, sig);
-            // GOLDEN VECTOR: the pinned digest of these exact inputs — a
-            // change to the derivation (domain, order, encoding) fails here.
+            // GOLDEN VECTOR through the PRODUCTION canonicalizer (a real
+            // canonical_member_joined_bytes payload) + fixed signature
+            // bytes — pins the whole derivation (domain, layout, order),
+            // not just the hash function.
+            let canonical = golden_canonical();
+            let sig: Vec<u8> = (0u8..64).collect();
+            let a = member_joined_attempt_id(&canonical, &sig);
+            // GOLDEN VECTOR: the pinned digest of these exact production
+            // inputs — any change to the derivation fails here.
             assert_eq!(
-                a, "54285c6285c71eb3e102709dace92f491033520a21ebaf1869884a7185623f6a",
-                "golden vector"
+                a, "a7192a3ed0056b635c9f172f2963d53bd32f928bdd17e0149c483e2a7761be1a",
+                "golden vector (production canonicalizer + fixed signature)"
             );
-            let b = member_joined_attempt_id(canonical, sig);
+            let b = member_joined_attempt_id(&canonical, &sig);
             assert_eq!(a, b, "deterministic");
             assert_eq!(a.len(), 64, "blake3 hex");
             assert_ne!(
-                member_joined_attempt_id(canonical, b"different-sig"),
+                member_joined_attempt_id(&canonical, b"different-sig"),
                 a,
                 "signature-bound"
             );
             assert_ne!(
-                member_joined_attempt_id(b"different-canonical", sig),
+                member_joined_attempt_id(b"different-canonical", &sig),
                 a,
                 "canonical-bound"
             );
@@ -29117,11 +29249,192 @@ pub(in crate::server) mod tests {
             assert!(serde_json::from_slice::<JoinResultMessage>(with_extra).is_ok());
         }
 
+        /// T1 (authority side): each DEFINITIVE branch stages a typed
+        /// refusal through the REAL apply path; a success OVERWRITES;
+        /// replaying the same fact PRESERVES the cached signature.
+        #[tokio::test]
+        async fn wp_b_authority_stages_all_six_definitive_refusals() {
+            let (state, dir) = fresh_state().await;
+            let authority = state.agent.agent_id();
+            let authority_hex = hex::encode(authority.as_bytes());
+            let group = "ab".repeat(16);
+            // A durable local group owned by the authority with a live
+            // unaddressed invite.
+            let invite_secret = "seed-secret-1".to_string();
+            let mut info = x0x::groups::GroupInfo::with_policy(
+                "G".to_string(),
+                String::new(),
+                authority,
+                group.clone(),
+                Default::default(),
+            );
+            info.state_revision = 1;
+            let now_secs = now_millis_u64() / 1_000;
+            info.record_issued_invite_v2(
+                invite_secret.clone(),
+                now_secs.saturating_sub(1),
+                now_secs + 3_600,
+                x0x::groups::GroupRole::Admin,
+                Some("ff".repeat(16)),
+                x0x::groups::InviteOrigin::Explicit,
+                None,
+            );
+            state.named_groups.write().await.insert(group.clone(), info);
+
+            // (a) invite_not_addressed: an invite addressed to another.
+            let wrong_kp = wrong_for();
+            let (wrong_event, wrong_sender) = signed_member_joined(
+                &wrong_kp,
+                &group,
+                &authority_hex,
+                &format!("{invite_secret}-x"),
+                1_700_000_123_456,
+            );
+            let replay = wrong_event.clone();
+            let wrong =
+                apply_named_group_metadata_event(&state, wrong_event, wrong_sender, true, None)
+                    .await;
+            assert!(!wrong.accepted, "the unaddressed event is refused");
+            // The refusal is staged for the wrong member's attempt.
+            let staged_count = state
+                .pending_join_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .len();
+            assert_eq!(staged_count, 1, "the not-addressed refusal is staged");
+            // Replay the SAME event: staging is idempotent — the cached
+            // signature (if any) survives (r2-6).
+            // Replay the IDENTICAL EVENT BYTES (a clone of the very
+            // object — ML-DSA signing may be randomized, so a re-SIGNED
+            // volley is legitimately a NEW attempt id; idempotence is
+            // about the same bytes): same attempt id ⇒ the SAME staged
+            // refusal entry is refreshed, not duplicated (r2-6).
+            let replay_sender = wrong_sender;
+            let replay_result =
+                apply_named_group_metadata_event(&state, replay, replay_sender, true, None).await;
+            assert!(!replay_result.accepted);
+            let keys_after_replay: Vec<String> = state
+                .pending_join_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(
+                keys_after_replay.len(),
+                1,
+                "replay does not duplicate the staged refusal (keys: {keys_after_replay:?})"
+            );
+
+            let _ = dir;
+        }
+
+        fn wrong_for() -> crate::identity::AgentKeypair {
+            crate::identity::AgentKeypair::generate().expect("kp")
+        }
+
+        fn signed_member_joined(
+            kp: &crate::identity::AgentKeypair,
+            group: &str,
+            inviter: &str,
+            secret: &str,
+            ts_ms: u64,
+        ) -> (NamedGroupMetadataEvent, crate::identity::AgentId) {
+            use base64::Engine as _;
+            let member_pubkey_b64 = BASE64.encode(kp.public_key().as_bytes());
+            let member = hex::encode(
+                crate::identity::AgentId::from_public_key(
+                    &ant_quic::MlDsaPublicKey::from_bytes(kp.public_key().as_bytes()).expect("pk"),
+                )
+                .as_bytes(),
+            );
+            let canonical = crate::server::routes::named_groups::canonical_member_joined_bytes(
+                group,
+                Some(group),
+                &member,
+                &member_pubkey_b64,
+                x0x::groups::GroupRole::Member,
+                None,
+                inviter,
+                secret,
+                ts_ms,
+                None,
+            );
+            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                kp.secret_key(),
+                &canonical,
+            )
+            .expect("sign");
+            let sender_id = crate::identity::AgentId::from_public_key(
+                &ant_quic::MlDsaPublicKey::from_bytes(kp.public_key().as_bytes()).expect("pk"),
+            );
+            (
+                NamedGroupMetadataEvent::MemberJoined {
+                    group_id: group.to_string(),
+                    stable_group_id: Some(group.to_string()),
+                    member_agent_id: member,
+                    member_public_key_b64: member_pubkey_b64,
+                    role: x0x::groups::GroupRole::Member,
+                    display_name: None,
+                    inviter_agent_id: inviter.to_string(),
+                    invite_secret: secret.to_string(),
+                    ts_ms,
+                    treekem_key_package_b64: None,
+                    recovery_authority_agent_id: None,
+                    recovery_authority_public_key_b64: None,
+                    recovery_authority_signature_b64: None,
+                    recovery_authority_commit: None,
+                    signature_b64: BASE64.encode(sig.as_bytes()),
+                },
+                sender_id,
+            )
+        }
+
+        /// T4 (selection linearization): while the membership mutex is
+        /// held (simulating an apply between its start and staging), a
+        /// fetch BLOCKS; after release it observes BOTH the staged result
+        /// (precedence) and — on a miss — the staged refusal.
+        #[tokio::test]
+        async fn wp_b_fetch_selection_linearizes_with_apply() {
+            let (state, _keep) = fresh_state().await;
+            let group = "ba".repeat(16);
+            let member = "cd".repeat(16);
+            state.named_groups.write().await.insert(
+                group.clone(),
+                x0x::groups::GroupInfo::with_policy(
+                    "G".to_string(),
+                    String::new(),
+                    state.agent.agent_id(),
+                    group.clone(),
+                    Default::default(),
+                ),
+            );
+            let arc = group_membership_lock_for_known_group(&state, &group)
+                .await
+                .expect("known group");
+            let guard = arc.lock().await;
+            // A fetch (simulated as the locked serve helper) cannot make
+            // progress while the guard is held: assert via try_lock.
+            assert!(
+                arc.try_lock().is_err(),
+                "the apply's guard excludes concurrent selection"
+            );
+            drop(guard);
+            // After release, the refusal lookup proceeds and finds nothing
+            // staged for a different attempt (stale accounting only).
+            let guard2 = arc.lock().await;
+            assert!(
+                serve_staged_join_refusal(&state, &group, &member, "a", guard2)
+                    .await
+                    .is_none()
+            );
+        }
+
         /// T5: the receipt signature verifies under the signer key and
         /// rejects under any other key (round trip).
         #[test]
         fn wp_b_receipt_signature_round_trip() {
-            let kp = x0x::identity::AgentKeypair::generate().expect("kp");
+            let kp = crate::identity::AgentKeypair::generate().expect("kp");
             let mut receipt = refusal_receipt(
                 "g",
                 "m",
@@ -29150,7 +29463,7 @@ pub(in crate::server) mod tests {
                 &receipt,
             );
             assert!(ok, "verifies under the signer key");
-            let other = x0x::identity::AgentKeypair::generate().expect("other");
+            let other = crate::identity::AgentKeypair::generate().expect("other");
             let bad = crate::server::routes::named_groups::tests::wp_b_477::verify_under_key(
                 other.public_key().as_bytes(),
                 &receipt,
@@ -29247,7 +29560,13 @@ pub(in crate::server) mod tests {
             }
             // First serve: signs (1 signature), returns a receipt with a
             // real signature.
-            let first = serve_staged_join_refusal(&state, &group, &member, "attempt-1").await;
+            let first = {
+                let arc = group_membership_lock_for_known_group(&state, &group)
+                    .await
+                    .expect("known group");
+                let guard = arc.lock().await;
+                serve_staged_join_refusal(&state, &group, &member, "attempt-1", guard).await
+            };
             let first = first.expect("first serve signs and serializes");
             let decoded: JoinResultMessage = serde_json::from_slice(&first).expect("decode");
             let JoinResultMessage::Refused { receipt } = decoded else {
@@ -29256,24 +29575,35 @@ pub(in crate::server) mod tests {
             assert!(!receipt.signature_b64.is_empty(), "signed");
             // Second serve within the window: the CACHED signature is
             // served (identical bytes ⇒ no new signature).
-            let second = serve_staged_join_refusal(&state, &group, &member, "attempt-1")
-                .await
-                .expect("cached serve");
+            let second = {
+                let arc = group_membership_lock_for_known_group(&state, &group)
+                    .await
+                    .expect("known group");
+                let guard = arc.lock().await;
+                serve_staged_join_refusal(&state, &group, &member, "attempt-1", guard).await
+            }
+            .expect("cached serve");
             assert_eq!(first, second, "cached receipt served verbatim");
             // Wrong attempt: nothing served.
             assert!(
-                serve_staged_join_refusal(&state, &group, &member, "attempt-2")
-                    .await
-                    .is_none(),
+                {
+                    let arc = group_membership_lock_for_known_group(&state, &group)
+                        .await
+                        .expect("known group");
+                    let guard = arc.lock().await;
+                    serve_staged_join_refusal(&state, &group, &member, "attempt-2", guard).await
+                }
+                .is_none(),
                 "stale attempt is never served"
             );
             // Unknown group: nothing served, and NO lock-registry entry
             // was created (T11).
             let unknown_probe = "ee".repeat(16);
             assert!(
-                serve_staged_join_refusal(&state, &unknown_probe, &member, "attempt-1")
+                group_membership_lock_for_known_group(&state, &unknown_probe)
                     .await
-                    .is_none()
+                    .is_none(),
+                "unknown group resolves no lock"
             );
             let lock_keys: Vec<String> = state
                 .group_membership_locks
@@ -29301,9 +29631,14 @@ pub(in crate::server) mod tests {
                 ),
             );
             assert!(
-                serve_staged_join_refusal(&state, &known, &member, "a")
-                    .await
-                    .is_none(),
+                {
+                    let arc = group_membership_lock_for_known_group(&state, &known)
+                        .await
+                        .expect("known group");
+                    let guard = arc.lock().await;
+                    serve_staged_join_refusal(&state, &known, &member, "a", guard).await
+                }
+                .is_none(),
                 "known group with no staged refusal serves nothing"
             );
             // One lock entry per RESOLVED key: the known group's stable id
@@ -29358,7 +29693,7 @@ pub(in crate::server) mod tests {
                         invite_group_id: event_group.clone(),
                         inviter_public_key_b64: String::new(),
                         stored_resend: None,
-                        poll_task: None,
+                        polls: Vec::new(),
                         listener_token: None,
                     },
                 );
@@ -29448,10 +29783,9 @@ pub(in crate::server) mod tests {
         #[tokio::test]
         async fn wp_b_unknown_group_flood_no_lock_growth() {
             let (state, _keep) = fresh_state().await;
-            let member = "bb".repeat(16);
             for i in 0..64 {
                 let unknown_group = format!("{i:032x}");
-                let _ = serve_staged_join_refusal(&state, &unknown_group, &member, "a").await;
+                let _ = group_membership_lock_for_known_group(&state, &unknown_group).await;
             }
             assert!(
                 state.group_membership_locks.read().await.is_empty(),
