@@ -31,6 +31,15 @@ const GUI_HTML: &str = include_str!("../src/gui/x0x-gui.html");
 /// Adding an entry here is a downgrade that must show up in
 /// `docs/proof/NAMED_GROUPS_PARITY_SIGNOFF.md`.
 const DEFERRED: &[(Method, &str, &str)] = &[
+    // #477: the pending-join status (with the typed terminal refusal
+    // outcome) is a CLI/REST-first surface — `x0x group join-status` and
+    // `x0x group join --wait`. GUI wiring (a join-progress panel) is
+    // deferred with the other #477 follow-ups (issue #481).
+    (
+        Method::Get,
+        "/groups/:id/join-status",
+        "CLI/REST-first join-status surface; GUI join-progress panel deferred (#481)",
+    ),
     // issue #111: retained state-commit history is a verification / governance
     // read surface (audit, dispute evidence), not a routine browser action.
     // Exposed via the CLI (`x0x group state-commits`) and the REST API; a GUI

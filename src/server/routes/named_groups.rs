@@ -13854,52 +13854,6 @@ pub(in crate::server) async fn join_group_via_invite(
             // unconfirmed join. The stub is inserted in MEMORY so the
             // listeners/poll/volley machinery works, but named_groups.json
             // only becomes durable when the member's own `MemberAdded` is
-            // observed in the chain (the apply path persists at that
-            // point). Exception: when the invite's committed base state
-            // already seats the local joiner (single-daemon self-rejoin
-            // via an invite minted before leaving), the signed base IS the
-            // confirmation — keep the durable write for that shape.
-            let base_seats_joiner = info.has_active_member(&joiner_hex);
-            if base_seats_joiner {
-                // #468 A5: the signed base already seats the local joiner
-                // (self-rejoin shape) — the base IS the confirmation.
-                if let Some(lineage) = info.invite_lineage.as_mut() {
-                    lineage.seated_at_revision = Some(info.state_revision);
-                }
-                if !matches!(
-                    persist_named_groups_mutation(&state, |groups| {
-                        groups.insert(group_id_hex.clone(), info.clone());
-                        true
-                    })
-                    .await,
-                    Ok(AtomicWriteOutcome::Durable)
-                ) {
-                    return api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "named-group state is not directory-durable",
-                    );
-                }
-            } else {
-                // #458 r4: the stub insert AND its exclusion marker are
-                // ONE atomic step under the persistence lock — the stub is
-                // never visible to a serializer without its marker.
-                // #487 (design r2 item 5): the pending-set insertion runs
-                // FIRST — find_home/adoption readers do NOT take the
-                // persistence lock, so publishing the map entry before
-                // its marker opens a window where a non-durable stub is
-                // "found" as the Home.
-                let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-                state
-                    .pending_join_stubs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .insert(group_id_hex.clone());
-                state
-                    .named_groups
-                    .write()
-                    .await
-                    .insert(group_id_hex.clone(), info.clone());
-            }
             // #477 (r4 item 3): the MemberJoined is built + SIGNED here —
             // BEFORE any state insert. A sign failure at this point has
             // touched NOTHING (no stub, no marker, no outcome clear, no
@@ -13980,6 +13934,63 @@ pub(in crate::server) async fn join_group_via_invite(
                     "failed to sign the join announcement",
                 );
             };
+            // #477 (r5 item 3): record the expected join-result inviter AT
+            // INSTALL — without the pin the first Result response (new OR
+            // v0.41.0 authority) is rejected as missing_expected_inviter.
+            // Both planes record it (TreeKEM polls for the Welcome-bearing
+            // commit, non-TreeKEM for the roster commit, #297).
+            record_expected_join_result_inviter(
+                state.as_ref(),
+                join_result_key(&stable_id_for_event, &joiner_hex),
+                invite.inviter.clone(),
+            );
+
+            // observed in the chain (the apply path persists at that
+            // point). Exception: when the invite's committed base state
+            // already seats the local joiner (single-daemon self-rejoin
+            // via an invite minted before leaving), the signed base IS the
+            // confirmation — keep the durable write for that shape.
+            let base_seats_joiner = info.has_active_member(&joiner_hex);
+            if base_seats_joiner {
+                // #468 A5: the signed base already seats the local joiner
+                // (self-rejoin shape) — the base IS the confirmation.
+                if let Some(lineage) = info.invite_lineage.as_mut() {
+                    lineage.seated_at_revision = Some(info.state_revision);
+                }
+                if !matches!(
+                    persist_named_groups_mutation(&state, |groups| {
+                        groups.insert(group_id_hex.clone(), info.clone());
+                        true
+                    })
+                    .await,
+                    Ok(AtomicWriteOutcome::Durable)
+                ) {
+                    return api_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "named-group state is not directory-durable",
+                    );
+                }
+            } else {
+                // #458 r4: the stub insert AND its exclusion marker are
+                // ONE atomic step under the persistence lock — the stub is
+                // never visible to a serializer without its marker.
+                // #487 (design r2 item 5): the pending-set insertion runs
+                // FIRST — find_home/adoption readers do NOT take the
+                // persistence lock, so publishing the map entry before
+                // its marker opens a window where a non-durable stub is
+                // "found" as the Home.
+                let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+                state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(group_id_hex.clone());
+                state
+                    .named_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), info.clone());
+            }
             // #477 (r4 item 3): the COMPLETE attempt installs in the
             // SAME persistence-locked step as the stub + marker — the old
             // terminal outcome is cleared and the attempt (id, stored
@@ -14138,11 +14149,7 @@ pub(in crate::server) async fn join_group_via_invite(
             // authority recomputes the same value from what it verified).
             let attempt_id_for_poll = join_attempt_id_from_resend(&member_joined_resend);
             if !attempt_id_for_poll.is_empty() {
-                state
-                    .last_join_outcomes
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(&group_id_for_poll);
+
             }
             let poll_attempt_id = attempt_id_for_poll.clone();
             let poll_event_group_id = event_group_id_for_poll.clone();
