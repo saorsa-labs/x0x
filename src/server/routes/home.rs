@@ -642,6 +642,13 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         StatusCode::OK,
         Json(serde_json::json!({
             "ok": true,
+            // #469 (A3): the Home-join pin (`x0x group join --home
+            // --owner <hex>`) needs the owner's user id visible where the
+            // operator actually looks — `x0x home` prints this payload
+            // verbatim. `find_home` only matches a group whose admission
+            // axis is OwnerCertified(owner), so this IS the Home policy
+            // admission owner id (additive, backwards-compatible field).
+            "owner_user_id": hex::encode(owner.as_bytes()),
             "group_id": group_id,
             "name": info.name,
             "description": info.description,
@@ -1069,6 +1076,16 @@ pub(in crate::server::routes) mod tests {
         let (status, body) = response_json(response).await?;
         assert_eq!(status, StatusCode::OK, "{body}");
         assert_eq!(body["name"], "Home");
+        // #469 (A3): the payload carries the Home admission owner's user
+        // id so `x0x group join --home --owner <hex>` has a place to read
+        // the pin from (`x0x home` prints this payload verbatim).
+        let expected_owner = hex::encode(
+            crate::identity::UserKeypair::from_seed(&[0x41; 32])?
+                .user_id()
+                .as_bytes(),
+        );
+        assert_eq!(body["owner_user_id"], expected_owner.as_str());
+        assert_eq!(body["owner_user_id"].as_str().map(str::len), Some(64));
         // Founding agent is provisioned Roaming (round-2 fix 3): the
         // warning must NOT fire on a fresh Home.
         assert_eq!(

@@ -4,6 +4,61 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Security / groups (#468, #469 — v0.41.0 hardening subset)
+
+- **Authenticated invites (InviteV4).** Invites are signed by the inviter
+  agent key and, for OwnerCertified policies, countersigned by the owner
+  user key; both keys travel inline (id-bound). Joiners verify signatures,
+  re-derive the base state hash from the carried roster projection +
+  public-meta snapshot, and check the intended joiner BEFORE seating any
+  stub. Typed refusals surface as `invites_refused{reason}` diagnostics.
+- **Home-join mode.** `POST /groups/join` gains `mode: "home"` +
+  `expected_owner_user_id` (fail-closed matrix incl. `use_home_mode`,
+  `pin_requires_home_mode`, `home_mode_requires_pin`,
+  `invite_downgraded`, `owner_mismatch`); CLI `x0x group join --home
+  --owner <hex>`; `x0x home` reports `owner_user_id`.
+- **Addressed invites.** Mint accepts `intended_joiner`; the authority
+  compares it with `MemberJoined.member_agent_id` before consuming the
+  one-time secret.
+- **Invite lineage + fork evidence (#468).** Local, deduplicated,
+  authenticated fork-evidence records in `invite_lineage` (stripped from
+  outbound bootstrap snapshots, rejected inbound); no eviction — the
+  protocol response is deferred to #472.
+- **Roster projection.** v4 invites carry the roster projection (no
+  certificate bytes); digest-only members hash identically to their
+  byte-bearing form. Certificate bytes hydrate on
+  digest-anchored surfaces — the seat-time targeted hydrate (at the
+  `MemberJoined` authority seat, across-gap adoption, and join-route
+  projection materialization), the member-certificate bridge over
+  announce-cache `VerifiedCertificate` events, and the startup
+  reconcile from the authenticated cache — bytes that do not hash to a
+  seat's committed digest are never installed.
+- **Gap adoption is now digest-only (D2 behaviour change).** A certified
+  member added inside a reconstructed roster gap used to be
+  unreconstructable — the projection carries only the cert digest and the
+  reconstruction dropped it, so the terminal roster root could not be
+  re-derived; the joiner refused
+  (`member_added_events_rejected_state_chain_gap`) and stayed pending.
+  D2 makes the digest the signed commitment (digest-only and byte-bearing
+  members hash identically), so the same shape is now intentionally
+  ADOPTED: the filler seats digest-only and the cert bytes hydrate later
+  on the three digest-anchored surfaces above (seat-time targeted
+  hydrate, bridge events, startup reconcile), pinned by re-pointing the
+  #458 r5 gap test
+  (`issue458r5_certified_member_in_gap_adopts_digest_only`) at adoption.
+- **MemberJoined authority seat records the published TreeKEM KeyPackage
+  again.** Dropping the setter made every later KeyPackage-consuming path
+  fail `member_key_package_pending` (CI regression caught by the
+  `member_banned_lost_initial_volley_recovers_via_bounded_resend`
+  integration run; fixed at 2698ce8). The seat's roster-hash/binding
+  stays the authority — the joiner's published KeyPackage bytes are
+  recorded on the seat, nothing more.
+- **Mint cap.** 64 live unconsumed invites per group (429
+  `invite_cap_reached`); per-field caps; the final encoded size is
+  authoritative (40,960 link budget).
+- **Rollout:** upgrade inviters/authorities before joiners; re-mint
+  invites (unsigned legacy invites are refused with `invite_unsigned`).
+
 ## [v0.39.9] - 2026-08-26
 
 ### Fixed

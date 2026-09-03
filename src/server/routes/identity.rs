@@ -375,9 +375,15 @@ fn prioritize_local_card_addresses(addresses: &mut [String]) {
     });
 }
 
-pub(in crate::server) fn populate_invite_base_state_from_group_info(
+/// #469 A1b: v4 mint population — the SAME base-state fields plus the v4
+/// additions (public-meta snapshot, roster projection, explicit signed
+/// creator, intended joiner) and NO legacy fat roster. Signing and the
+/// size/secret bookkeeping happen in `mint_signed_invite`
+/// (named_groups.rs) — the single mint authority; this only assembles.
+pub(in crate::server) fn populate_invite_base_state_v4(
     invite: &mut x0x::groups::invite::SignedInvite,
     info: &x0x::groups::GroupInfo,
+    intended_joiner: Option<x0x::identity::AgentId>,
 ) {
     invite.stable_group_id = Some(info.stable_group_id().to_string());
     invite.group_created_at = Some(info.created_at);
@@ -389,25 +395,32 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
     // #458 r3: the base hash commits to the Home metadata digest — carry
     // the metadata so the joiner's stub can actually recompute it.
     invite.base_home = info.home.clone();
-    // Issue #205: strip per-member crypto material that contributes nothing to
-    // invite validation. `roster_root` commits only to `(id, role, state)`
-    // triples (state_commit.rs), the link is unsigned, and admission is the
-    // `invite_secret` handshake + authority-signed `MemberAdded`. Each member's
-    // ~15.7 KiB TreeKEM KeyPackage + ~1.2 KiB ML-KEM pubkey would otherwise be
-    // copy-pasted into the join cmd-DM, crossing the 49 152-byte gossip cap at
-    // the 3rd roster member (issue #188). Joiners learn both keys out-of-band
-    // (MemberAdded / Welcome / GET /agent), so the slim roster is sufficient.
-    let slim_roster = info
-        .members_v2
-        .iter()
-        .map(|(agent_id, member)| {
-            let mut slim = member.clone();
-            slim.treekem_key_package_b64 = None;
-            slim.kem_public_key_b64 = None;
-            (agent_id.clone(), slim)
-        })
-        .collect();
-    invite.base_members_v2 = Some(slim_roster);
+    // #469 A1: the v4 roster carrier is the PROJECTION — exactly what
+    // `roster_root_of_projection` hashes (role, state, TreeKEM key-package
+    // hash, certificate digest). No certificate BYTES, no KEM/TreeKEM
+    // material: the base-consistency recompute works from the projection
+    // alone (D2 makes digest-only members hash identically on the joiner),
+    // and the size budget holds at a roster cap instead of the 3rd member
+    // (issue #188/#205). The legacy fat `base_members_v2` is never set on
+    // v4 invites — the E1 view constructor refuses it.
+    invite.base_roster = Some(x0x::groups::state_commit::roster_projection(
+        &info.members_v2,
+    ));
+    invite.base_members_v2 = None;
+    // #469 D1: exact public-meta snapshot — the precise input of
+    // `compute_public_meta_hash`, so the joiner recomputes the base state
+    // hash bit-for-bit even for non-default tags/avatar/banner.
+    invite.public_meta = Some(info.public_meta());
+    // #469 D1: explicit signed creator — genesis creator when known (the
+    // genesis record is the stable identity), else the local creator field.
+    invite.creator = Some(
+        info.genesis
+            .as_ref()
+            .map(|g| g.creator_agent_id.clone())
+            .unwrap_or_else(|| hex::encode(info.creator.as_bytes())),
+    );
+    // #469 A4: addressed invites carry the intended joiner.
+    invite.intended_joiner = intended_joiner.map(|agent| hex::encode(agent.as_bytes()));
     invite.base_prev_state_hash = info.prev_state_hash.clone();
     invite.secure_plane = Some(info.secure_plane);
     invite.base_secret_epoch = Some(info.secret_epoch);
@@ -415,8 +428,16 @@ pub(in crate::server) fn populate_invite_base_state_from_group_info(
 }
 
 /// GET /agent/card — generate a shareable identity card.
+///
+/// r3 (Fable 1): owner-axis groups (Home metadata or an OwnerCertified
+/// admission axis) mint/reuse a countersigned invite link ONLY under a
+/// DURABLE-owner actor — the countersigned link is a device-admission
+/// credential, exactly like `POST /groups/:id/invite` (its #446 durable
+/// fence). A session bearer (or a rider, or a direct handler call with
+/// no actor context) gets the group OMITTED with a recorded reason.
 pub(in crate::server) async fn get_agent_card(
     State(state): State<Arc<AppState>>,
+    actor: Option<axum::extract::Extension<crate::server::rider_auth::ActorContext>>,
     axum::extract::Query(query): axum::extract::Query<CardQuery>,
 ) -> impl IntoResponse {
     let agent_id = state.agent.agent_id();
@@ -471,45 +492,180 @@ pub(in crate::server) async fn get_agent_card(
         }
     }
 
-    // Optionally include group invite links
+    // Optionally include group invite links (#469 E3 transaction):
+    // reuse-or-mint under the group's membership lock, durably persisted
+    // before the link is returned; a group that cannot be served is
+    // OMITTED with a diagnostic — never fails the whole card.
     if query.include_groups.unwrap_or(false) {
-        let groups = state.named_groups.read().await;
-        for info in groups.values() {
-            if info.withdrawn
-                || has_withdrawn_same_stable_group_record(
-                    &groups,
-                    &info.mls_group_id,
-                    Some(info.stable_group_id()),
-                )
-            {
-                continue;
-            }
-            let mut invite = x0x::groups::invite::SignedInvite::new(
-                info.mls_group_id.clone(),
-                info.name.clone(),
-                &agent_id,
-                x0x::groups::invite::DEFAULT_EXPIRY_SECS,
-            );
-            populate_invite_base_state_from_group_info(&mut invite, info);
-            // Enforce the DM-safe budget at mint; an oversized link would 400
-            // later when the card consumer DMs the join. Skip rather than poison
-            // the whole agent card (issue #205).
-            let invite_link = match invite.encode_link() {
-                Ok(link) => link,
-                Err(e) => {
-                    tracing::warn!(
-                        group_id = %info.mls_group_id,
-                        actual = e.actual,
-                        limit = e.limit,
-                        "skipping oversized group invite in agent card: {e}"
+        // r3 (Fable 1): owner-axis mint/reuse authority. The card surface
+        // is reachable by browser SESSION bearers; the countersigned
+        // owner-axis link is a device-admission credential and demands
+        // the same durable-owner proof as the explicit mint route.
+        let durable_owner = actor.as_ref().is_some_and(|a| a.is_durable_owner());
+        // Phase 1 (read-only): pick candidate groups and REUSE links that
+        // need no mutation.
+        let now_secs = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or_default();
+        let mut mint_candidates: Vec<String> = Vec::new();
+        {
+            let groups = state.named_groups.read().await;
+            for (map_key, info) in groups.iter() {
+                if info.withdrawn
+                    || has_withdrawn_same_stable_group_record(
+                        &groups,
+                        &info.mls_group_id,
+                        Some(info.stable_group_id()),
+                    )
+                {
+                    continue;
+                }
+                let inviter_hex = hex::encode(agent_id.as_bytes());
+                // Only active admins may mint; others are skipped silently.
+                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
+                    .is_err()
+                {
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(map_key, "card_invite_omitted_non_admin");
+                    continue;
+                }
+                // r3 (Fable 1): owner-axis fence keyed on the SAME policy
+                // axis as `home_mutation_requires_durable` — Home metadata
+                // OR an OwnerCertified admission. Without a durable owner
+                // the group is omitted entirely (no mint, no REUSE — an
+                // already-recorded Card link is equally a device-admission
+                // credential).
+                let owner_axis = info.home.is_some()
+                    || info.policy.admission.owner_certified_user_id().is_some();
+                if owner_axis && !durable_owner {
+                    state.groups_diagnostics.record_invite_refusal(
+                        map_key,
+                        "card_invite_omitted_owner_axis_no_durable_owner",
                     );
                     continue;
                 }
-            };
-            card.groups.push(x0x::groups::card::CardGroup {
-                name: info.name.clone(),
-                invite_link,
-            });
+                if let Some(reusable) = info.reusable_card_invite(now_secs) {
+                    if let Some(link) = reusable.signed_link.clone() {
+                        card.groups.push(x0x::groups::card::CardGroup {
+                            name: info.name.clone(),
+                            invite_link: link,
+                        });
+                        continue;
+                    }
+                }
+                mint_candidates.push(map_key.clone());
+            }
+        }
+        // Phase 2 (mutating): mint each candidate through the single v4
+        // authority under its membership lock, then persist durably before
+        // the link is returned.
+        for map_key in mint_candidates {
+            let membership_lock =
+                crate::server::routes::named_groups::group_membership_lock(&state, &map_key).await;
+            let _guard = membership_lock.lock().await;
+            let inviter_hex = hex::encode(agent_id.as_bytes());
+            // r1 (Codex 9): re-check admin authority UNDER the
+            // membership lock — the phase-1 preselection ran under a
+            // read lock and a demotion could have landed in between
+            // (TOCTOU).
+            {
+                let groups = state.named_groups.read().await;
+                let Some(info) = groups.get(&map_key) else {
+                    continue;
+                };
+                if crate::server::routes::named_groups::require_admin_or_above(info, &inviter_hex)
+                    .is_err()
+                {
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(&map_key, "card_invite_omitted_non_admin");
+                    continue;
+                }
+            }
+            // r5 (Codex 4): re-run the REUSE check inside the serialized
+            // section too — phase 1's scan ran unlocked, so two
+            // concurrent card GETs can both miss reuse and each mint.
+            // The second getter under the lock must serve the link the
+            // first one minted, not a second issuance record.
+            {
+                let groups = state.named_groups.read().await;
+                if let Some(reused) = groups
+                    .get(&map_key)
+                    .and_then(|info| info.reusable_card_invite(now_secs))
+                    .and_then(|record| record.signed_link.clone())
+                {
+                    let name = groups
+                        .get(&map_key)
+                        .map(|info| info.name.clone())
+                        .unwrap_or_default();
+                    card.groups.push(x0x::groups::card::CardGroup {
+                        name,
+                        invite_link: reused,
+                    });
+                    continue;
+                }
+            }
+            // r4 (addendum item 6): the card mint runs through the SAME
+            // single actor-aware mint transaction as the explicit route
+            // — owner-axis durable fence, live cap, signed v4 assembly,
+            // secret recording and the durable persist are one unit
+            // (with the Card origin so the link is reusable).
+            match crate::server::routes::named_groups::mint_invite_transaction(
+                &state,
+                &map_key,
+                x0x::groups::invite::DEFAULT_EXPIRY_SECS,
+                None,
+                x0x::groups::InviteOrigin::Card,
+                durable_owner,
+            )
+            .await
+            {
+                Ok((_invite, link)) => {
+                    let name = {
+                        let groups = state.named_groups.read().await;
+                        groups
+                            .get(&map_key)
+                            .map(|info| info.name.clone())
+                            .unwrap_or_default()
+                    };
+                    card.groups.push(x0x::groups::card::CardGroup {
+                        name,
+                        invite_link: link,
+                    });
+                }
+                Err(refusal) => {
+                    let reason = match refusal {
+                        crate::server::routes::named_groups::MintInviteRefusal::CapReached {
+                            ..
+                        } => "card_invite_omitted_cap_reached",
+                        crate::server::routes::named_groups::MintInviteRefusal::OwnerAxisNoDurableOwner => {
+                            "card_invite_omitted_owner_axis_no_durable_owner"
+                        }
+                        crate::server::routes::named_groups::MintInviteRefusal::OwnerKeyUnavailable => {
+                            "card_invite_omitted_owner_axis"
+                        }
+                        crate::server::routes::named_groups::MintInviteRefusal::NotDurable => {
+                            "card_invite_omitted_not_durable"
+                        }
+                        crate::server::routes::named_groups::MintInviteRefusal::TooLarge { .. }
+                        | crate::server::routes::named_groups::MintInviteRefusal::TooLargeBytes {
+                            ..
+                        }
+                        | crate::server::routes::named_groups::MintInviteRefusal::Signing(_) => {
+                            "card_invite_omitted_mint_failed"
+                        }
+                    };
+                    tracing::warn!(
+                        group_id = %map_key,
+                        "card invite mint refused; omitting group from card: {refusal:?}"
+                    );
+                    state
+                        .groups_diagnostics
+                        .record_invite_refusal(&map_key, reason);
+                }
+            }
         }
     }
 

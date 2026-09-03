@@ -416,18 +416,37 @@ async fn joiner_without_certificate_fails_fast_on_owner_certified_invite() -> Re
     // cannot use the invite (403) instead of creating a local stub that
     // the authority silently rejects — the authority-side gate in the
     // test above remains the enforcement; this is fail-fast UX.
-    let (state, _dir) = secure_endpoint_test_state().await?;
-    let owner_kp = UserKeypair::generate()?;
-    let mut invite = x0x::groups::invite::SignedInvite::new(
-        "75".repeat(32),
-        "home".to_string(),
-        &state.agent.agent_id(),
-        3_600,
-    );
-    invite.policy = Some(owner_certified_policy(&owner_kp));
-    let link = invite.to_link();
+    //
+    // #469: the invite is minted through the single mint authority
+    // (signed v4 + owner countersignature) and joined in home mode with
+    // the owner pinned — those typed gates all sit BEFORE the cert
+    // fail-fast, so a 403 here isolates the certificate check exactly
+    // like the original unsigned-invite test did.
+    let (authority, _adir, owner_kp) = owner_authority_state().await?;
+    let group_id = "75".repeat(32);
+    insert_owner_group(
+        authority.as_ref(),
+        &group_id,
+        owner_certified_policy(&owner_kp),
+        "unused",
+    )
+    .await;
+    let base_info = {
+        let groups = authority.named_groups.read().await;
+        groups.get(&group_id).cloned().expect("group")
+    };
+    let (_invite, link) =
+        assemble_signed_v4_invite(&authority, &base_info, 3_600, None).expect("mint v4 invite");
 
-    let req = serde_json::from_value(serde_json::json!({ "invite": link }))?;
+    // The uncertified JOINER: a fresh state with no user key and no
+    // agent certificate chaining to the admission owner.
+    let (state, _dir) = secure_endpoint_test_state().await?;
+    let owner_pin = hex::encode(owner_kp.user_id().as_bytes());
+    let req = serde_json::from_value(serde_json::json!({
+        "invite": link,
+        "mode": "home",
+        "expected_owner_user_id": owner_pin,
+    }))?;
     let response = join_group_via_invite(State(Arc::clone(&state)), Json(req))
         .await
         .into_response();
@@ -491,7 +510,8 @@ fn blind_seal_of_owner_certified_group_is_refused() {
     info.set_member_certificate(
         &hex::encode(creator.agent_id().as_bytes()),
         x0x::identity::AgentCertificate::issue(&foreign, &creator).expect("foreign cert"),
-    );
+    )
+    .expect("fresh seat: foreign cert must install (seeds the definitive failure)");
     let failed_verdict = info.owner_cert_verdict(&OwnerCertEvidence::new(2_000));
     let err = info
         .seal_commit_with_owner_certs(&creator, 2_000, &failed_verdict)
@@ -665,7 +685,8 @@ async fn ordinary_seal_refuses_with_typed_error_when_eviction_required() -> Resu
             None,
             None,
         );
-        live.set_member_certificate(&stranger_hex, foreign_cert);
+        live.set_member_certificate(&stranger_hex, foreign_cert)
+            .expect("fresh seat: foreign cert must install (seeds the definitive failure)");
     }
     let req: UpdateGroupPolicyRequest =
         serde_json::from_value(serde_json::json!({ "write_access": "admin_only" }))?;
@@ -1200,7 +1221,8 @@ async fn stale_embedded_cert_does_not_seat_while_replacement_in_flight() -> Resu
             None,
             None,
         );
-        live.set_member_certificate(&member_hex, cert.clone());
+        live.set_member_certificate(&member_hex, cert.clone())
+            .expect("fresh seat: owner-issued cert must install");
     }
     // The owner re-keys: the member's next announce commits to a NEW
     // digest; the replacement cert has not resolved here yet.
@@ -1369,7 +1391,8 @@ async fn explicit_eviction_of_failed_member_clears_restore_quarantine() -> Resul
         let mut groups = state.named_groups.write().await;
         let live = groups.get_mut(&group_id).expect("group");
         live.add_member(bad_hex.clone(), x0x::groups::GroupRole::Member, None, None);
-        live.set_member_certificate(&bad_hex, foreign_cert);
+        live.set_member_certificate(&bad_hex, foreign_cert)
+            .expect("fresh seat: foreign cert must install (seeds the definitive failure)");
         live.shared_secret = Some(vec![4u8; 32]);
         live.owner_cert_reverify_required = true;
     }

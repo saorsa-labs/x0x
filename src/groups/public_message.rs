@@ -1119,6 +1119,7 @@ mod tests {
             treekem_key_package_hash: None,
             certificate: None,
             certificate_missing_since_ms: None,
+            certificate_digest: None,
         }
     }
 

@@ -364,6 +364,16 @@ pub struct Agent {
         tokio::sync::Mutex<Option<dm_capability_service::CapabilityAdvertService>>,
     /// L3 fetch-on-miss cache for announce cert blobs (see `announce_blob`).
     pub(crate) announce_blob_cache: std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    /// Invite-auth #468/#469 (design v6 E2d / v7 F1): broadcast fan-out for
+    /// [`VerifiedCertificate`] events, fired by the discovery-cache write
+    /// paths the instant an authenticated certificate lands (announce
+    /// ingest and completed announce-blob fetches). The server's
+    /// member-certificate bridge subscribes before its group state exists
+    /// and never relies on channel history; subscribers that fall
+    /// `VERIFIED_CERT_EVENT_CAPACITY` events behind see `Lagged` and
+    /// reconcile from the cache instead.
+    pub(crate) verified_cert_tx:
+        std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
     /// ADR-0035 metering: relay/coordinator selection-skew counters.
     pub(crate) selection_skew: std::sync::Arc<SelectionSkew>,
     /// This daemon's live `(user_id, agent_certificate)` pair, served to
@@ -1858,6 +1868,68 @@ pub struct DiscoveredAgent {
     pub self_name: Option<String>,
 }
 
+/// Invite-auth #468/#469 (design v6 E2d / v7 F1): an authenticated
+/// `(agent, certificate)` pair at the moment it lands in the
+/// identity-discovery cache — from announce ingest or a completed
+/// announce-blob fetch. The server's member-certificate bridge subscribes
+/// via [`Agent::subscribe_verified_certificates`] and hydrates digest-only
+/// roster seats (`GroupInfo::hydrate_member_certificates`) with the bytes.
+#[derive(Debug, Clone)]
+pub struct VerifiedCertificate {
+    /// Subject of the certificate.
+    pub agent_id: identity::AgentId,
+    /// The authenticated certificate bytes.
+    pub certificate: identity::AgentCertificate,
+    /// BLAKE3-256 of the certificate's canonical storage bytes — the RAW
+    /// form of what [`crate::groups::owner_cert::certificate_digest_hex`]
+    /// hex-encodes — so [`Self::digest_hex`] compares equal to a member
+    /// seat's committed `certificate_digest`.
+    pub digest: [u8; 32],
+}
+
+impl VerifiedCertificate {
+    /// Build the event for `agent_id` / `certificate`. The digest follows
+    /// the `owner_cert::certificate_digest_hex` rule exactly (bincode of
+    /// the certificate, falling back to the agent public key bytes —
+    /// serialization of this struct cannot realistically fail).
+    fn new(agent_id: identity::AgentId, certificate: &identity::AgentCertificate) -> Self {
+        let bytes = bincode::serialize(&certificate)
+            .unwrap_or_else(|_| certificate.agent_public_key().to_vec());
+        Self {
+            agent_id,
+            certificate: certificate.clone(),
+            digest: *blake3::hash(&bytes).as_bytes(),
+        }
+    }
+
+    /// Hex form of [`Self::digest`] — byte-identical to
+    /// `owner_cert::certificate_digest_hex(&self.certificate)`.
+    #[must_use]
+    pub fn digest_hex(&self) -> String {
+        hex::encode(self.digest)
+    }
+}
+
+/// Invite-auth #468/#469 (design v7 F1): slack in the verified-certificate
+/// event ring. A subscriber that falls this far behind sees
+/// `RecvError::Lagged` and must re-run a full reconcile (the server bridge
+/// does); 256 covers a full announce wave from the ~50-agent fleet with
+/// room to spare.
+const VERIFIED_CERT_EVENT_CAPACITY: usize = 256;
+
+/// Fire the verified-certificate event for a certificate that just landed
+/// in the identity-discovery cache. `send` fails only while zero receivers
+/// exist (e.g. the library embedded without the server bridge) — dropping
+/// the event then is correct; an active-but-slow receiver sees `Lagged`,
+/// not a lost send.
+fn publish_verified_certificate(
+    events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
+    agent_id: identity::AgentId,
+    certificate: &identity::AgentCertificate,
+) {
+    let _ = events.send(VerifiedCertificate::new(agent_id, certificate));
+}
+
 /// One entry of the owner's certificate roster (journal-backed; see
 /// [`Agent::owner_issued_certificates`]).
 #[derive(Debug, Clone)]
@@ -2102,6 +2174,7 @@ async fn upsert_discovered_agent(
     cache: &std::sync::Arc<
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
+    cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     mut incoming: DiscoveredAgent,
 ) {
     prioritize_discovery_addresses(&mut incoming.addresses);
@@ -2162,8 +2235,12 @@ async fn upsert_discovered_agent(
                 //  - same digest, or a legacy digest-less record → keep
                 //    (monotone; never demote on missing information).
                 if let Some(cert) = incoming.agent_certificate.take() {
+                    // E2d: only a CHANGE lands — every announce re-carries
+                    // the same certificate, and replaying an identical one
+                    // must not re-fire the hydration bridge.
+                    let landed = existing.agent_certificate.as_ref() != Some(&cert);
                     existing.cert_not_after = cert.not_after();
-                    existing.agent_certificate = Some(cert);
+                    existing.agent_certificate = Some(cert.clone());
                     existing.cert_digest = incoming
                         .cert_digest
                         .or(Some(announce_v3::cert_digest(
@@ -2171,6 +2248,9 @@ async fn upsert_discovered_agent(
                             &existing.agent_certificate,
                         )))
                         .or(existing.cert_digest);
+                    if landed {
+                        publish_verified_certificate(cert_events, incoming.agent_id, &cert);
+                    }
                 } else if let Some(digest) = incoming.cert_digest {
                     if existing.cert_digest != Some(digest) {
                         if existing.agent_certificate.is_some() {
@@ -2207,7 +2287,14 @@ async fn upsert_discovered_agent(
                     cache.remove(&stalest);
                 }
             }
+            // E2d: a certificate arriving with a COLD entry lands too —
+            // capture it before the record is moved into the map.
+            let landed_cert = incoming.agent_certificate.clone();
+            let landed_agent = incoming.agent_id;
             cache.insert(incoming.agent_id, incoming);
+            if let Some(cert) = landed_cert {
+                publish_verified_certificate(cert_events, landed_agent, &cert);
+            }
         }
     }
 }
@@ -2226,6 +2313,7 @@ async fn patch_discovery_entry_when_blob_lands(
         tokio::sync::RwLock<std::collections::HashMap<identity::AgentId, DiscoveredAgent>>,
     >,
     blob_cache: &std::sync::Arc<announce_blob::AnnounceBlobCache>,
+    cert_events: &tokio::sync::broadcast::Sender<VerifiedCertificate>,
     digest: &[u8; 32],
     agent_id: &identity::AgentId,
 ) {
@@ -2270,6 +2358,9 @@ async fn patch_discovery_entry_when_blob_lands(
                     agent = %hex::encode(&agent_id.0[..8]),
                     "patched discovery entry from completed announce-blob fetch (#447)"
                 );
+                // E2d: the fetched certificate has now LANDED in the
+                // discovery cache — notify the hydration bridge.
+                publish_verified_certificate(cert_events, *agent_id, cert);
             }
         }
         return;
@@ -2798,6 +2889,9 @@ struct HeartbeatContext {
     self_name: std::sync::Arc<std::sync::RwLock<Option<String>>>,
     /// Shared ever-named latch (see `Agent::self_name_ever_set`).
     self_name_ever_set: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// E2d: shared verified-certificate event ring (the self-announce
+    /// record carries no certificate, but the upsert signature is shared).
+    verified_cert_tx: std::sync::Arc<tokio::sync::broadcast::Sender<VerifiedCertificate>>,
 }
 
 impl HeartbeatContext {
@@ -3169,7 +3263,7 @@ impl HeartbeatContext {
             cert_digest: None,
         };
         upsert_discovered_machine_from_agent(&self.machine_cache, &discovered_agent).await;
-        upsert_discovered_agent(&self.cache, discovered_agent).await;
+        upsert_discovered_agent(&self.cache, &self.verified_cert_tx, discovered_agent).await;
 
         // ADR-0043 §2.1: publish the V3 machine announcement (enrollment
         // KEM key + placement digests + capability advert) on its own
@@ -4013,6 +4107,41 @@ impl Agent {
     #[must_use]
     pub fn contacts(&self) -> &std::sync::Arc<tokio::sync::RwLock<contacts::ContactStore>> {
         &self.contact_store
+    }
+
+    /// Invite-auth #468/#469 (design v6 E2d / v7 F1): subscribe to the
+    /// stream of [`VerifiedCertificate`] events, fired the instant an
+    /// authenticated certificate lands in the identity-discovery cache
+    /// (announce ingest or a completed announce-blob fetch). The ring holds
+    /// 256 buffered events (VERIFIED_CERT_EVENT_CAPACITY); a subscriber that falls
+    /// behind sees `RecvError::Lagged` and must recover with a full
+    /// reconcile (see [`Self::cached_verified_certificates`]) — channel
+    /// history is best-effort, never authoritative.
+    pub fn subscribe_verified_certificates(
+        &self,
+    ) -> tokio::sync::broadcast::Receiver<VerifiedCertificate> {
+        self.verified_cert_tx.subscribe()
+    }
+
+    /// Snapshot of every authenticated `(agent_id, certificate)` pair
+    /// currently held in the identity-discovery cache — the authoritative
+    /// hydration source for digest-only member seats. A full reconcile
+    /// built on this snapshot subsumes any events a consumer missed
+    /// (startup before subscription, `Lagged`, task restart).
+    pub async fn cached_verified_certificates(
+        &self,
+    ) -> Vec<(identity::AgentId, identity::AgentCertificate)> {
+        self.identity_discovery_cache
+            .read()
+            .await
+            .values()
+            .filter_map(|entry| {
+                entry
+                    .agent_certificate
+                    .as_ref()
+                    .map(|cert| (entry.agent_id, cert.clone()))
+            })
+            .collect()
     }
 
     /// Get the reachability information for a discovered agent.
@@ -7591,7 +7720,12 @@ impl Agent {
         };
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &discovered_agent)
             .await;
-        upsert_discovered_agent(&self.identity_discovery_cache, discovered_agent).await;
+        upsert_discovered_agent(
+            &self.identity_discovery_cache,
+            &self.verified_cert_tx,
+            discovered_agent,
+        )
+        .await;
 
         // Record consent AFTER successful publish so heartbeats don't start
         // including user identity if this announcement never actually propagated.
@@ -7991,6 +8125,8 @@ impl Agent {
             None => None,
         };
         let cache = std::sync::Arc::clone(&self.identity_discovery_cache);
+        // E2d: the listener's upserts fire verified-certificate events.
+        let cert_events = std::sync::Arc::clone(&self.verified_cert_tx);
         let authenticated_machine_bindings =
             std::sync::Arc::clone(&self.authenticated_machine_bindings);
         let machine_cache = std::sync::Arc::clone(&self.machine_discovery_cache);
@@ -8659,12 +8795,14 @@ impl Agent {
                                 let watch_cache = std::sync::Arc::clone(&cache);
                                 let watch_blob_cache =
                                     std::sync::Arc::clone(&announce_blob_cache);
+                                let watch_cert_events = std::sync::Arc::clone(&cert_events);
                                 let watch_digest = cert_digest;
                                 let watch_agent = converted.agent_id;
                                 tokio::spawn(async move {
                                     patch_discovery_entry_when_blob_lands(
                                         &watch_cache,
                                         &watch_blob_cache,
+                                        &watch_cert_events,
                                         &watch_digest,
                                         &watch_agent,
                                     )
@@ -8898,7 +9036,7 @@ impl Agent {
                     cache_freshness_ttl_secs,
                 ) {
                     upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent).await;
-                    upsert_discovered_agent(&cache, discovered_agent).await;
+                    upsert_discovered_agent(&cache, &cert_events, discovered_agent).await;
                 } else {
                     tracing::debug!(
                         target: "x0x::discovery",
@@ -9495,6 +9633,7 @@ impl Agent {
                 revocation_set: std::sync::Arc::clone(&self.revocation_set),
                 last_revocation_generation: std::sync::atomic::AtomicU64::new(0),
                 heartbeat_tick: std::sync::atomic::AtomicU64::new(0),
+                verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
                 machine_kem_public: self.machine_kem_public_key(),
                 move_state: std::sync::Arc::clone(&self.move_state),
                 legacy_announce: self.legacy_announce,
@@ -11662,7 +11801,7 @@ impl Agent {
                             };
                             upsert_discovered_machine_from_agent(&machine_cache, &discovered_agent)
                                 .await;
-                            upsert_discovered_agent(&cache, discovered_agent).await;
+                            upsert_discovered_agent(&cache, &self.verified_cert_tx, discovered_agent).await;
                             return Ok(Some(addrs));
                         }
                     }
@@ -11679,6 +11818,7 @@ impl Agent {
                 .map_or(0, |d| d.as_secs());
             upsert_discovered_agent(
                 &cache,
+                &self.verified_cert_tx,
                 DiscoveredAgent {
                     self_name: None,
                     agent_id,
@@ -13120,6 +13260,7 @@ impl Agent {
             move_state: std::sync::Arc::clone(&self.move_state),
             self_name: std::sync::Arc::clone(&self.self_name),
             self_name_ever_set: std::sync::Arc::clone(&self.self_name_ever_set),
+            verified_cert_tx: std::sync::Arc::clone(&self.verified_cert_tx),
         };
         let handle = tokio::task::spawn(async move {
             let mut ticker =
@@ -13346,7 +13487,12 @@ impl Agent {
         let agent_id = agent.agent_id;
         let machine_id = agent.machine_id;
         upsert_discovered_machine_from_agent(&self.machine_discovery_cache, &agent).await;
-        upsert_discovered_agent(&self.identity_discovery_cache, agent).await;
+        upsert_discovered_agent(
+            &self.identity_discovery_cache,
+            &self.verified_cert_tx,
+            agent,
+        )
+        .await;
 
         if machine_id.0 != [0u8; 32] {
             self.direct_messaging
@@ -14781,6 +14927,9 @@ impl AgentBuilder {
                 let (tx, _rx) = tokio::sync::watch::channel(dm::DmCapabilities::pending());
                 tx
             }),
+            verified_cert_tx: std::sync::Arc::new(tokio::sync::broadcast::Sender::new(
+                VERIFIED_CERT_EVENT_CAPACITY,
+            )),
             dm_inflight_acks: std::sync::Arc::new(dm::InFlightAcks::new()),
             recent_delivery_cache: std::sync::Arc::new(dm::RecentDeliveryCache::with_defaults()),
             capability_advert_service: tokio::sync::Mutex::new(None),
@@ -21082,21 +21231,25 @@ mod tests {
         // community coordinator, and a STALE community relay.
         upsert_discovered_agent(
             &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
             mk(1, "142.93.199.50:443", true, true, now),
         )
         .await;
         upsert_discovered_agent(
             &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
             mk(2, "203.0.113.9:5483", true, false, now),
         )
         .await;
         upsert_discovered_agent(
             &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
             mk(3, "203.0.113.10:5483", false, true, now),
         )
         .await;
         upsert_discovered_agent(
             &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
             mk(
                 4,
                 "203.0.113.11:5483",
@@ -21155,10 +21308,16 @@ mod tests {
             cert_digest: None,
         };
         // Cold miss: cert-less entry lands first.
-        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now, None)).await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            mk(now, None),
+        )
+        .await;
         // Later heartbeat, same agent, now with the fetched certificate.
         upsert_discovered_agent(
             &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
             mk(now + 5, Some(cert.clone())),
         )
         .await;
@@ -21170,7 +21329,12 @@ mod tests {
         );
         // And a cert-less later announce must NOT demote it.
         drop(cache);
-        upsert_discovered_agent(&agent.identity_discovery_cache, mk(now + 10, None)).await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            mk(now + 10, None),
+        )
+        .await;
         let cache = agent.identity_discovery_cache.read().await;
         let entry = cache.get(&member.agent_id()).expect("entry retained");
         assert!(
@@ -21184,7 +21348,12 @@ mod tests {
         drop(cache);
         let mut rekeyed = mk(now + 15, None);
         rekeyed.cert_digest = Some([0xAA; 32]);
-        upsert_discovered_agent(&agent.identity_discovery_cache, rekeyed).await;
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            rekeyed,
+        )
+        .await;
         let cache = agent.identity_discovery_cache.read().await;
         let entry = cache.get(&member.agent_id()).expect("entry retained");
         assert!(
@@ -21192,6 +21361,97 @@ mod tests {
             "a new announced digest must invalidate the stale cached certificate"
         );
         assert_eq!(entry.cert_digest, Some([0xAA; 32]));
+    }
+
+    /// E2d (design v6/v7): a certificate LANDING in the identity-discovery
+    /// cache must fire exactly one [`VerifiedCertificate`] event per CHANGE
+    /// — the server bridge's hydration trigger. An identical re-announce
+    /// (the 600 s heartbeat re-carries the same cert) must NOT re-fire, and
+    /// the digest must equal `owner_cert::certificate_digest_hex`.
+    #[tokio::test]
+    async fn verified_certificate_events_fire_on_landing_not_on_replay() {
+        let agent = Agent::builder()
+            .with_network_config(network::NetworkConfig::default())
+            .build()
+            .await
+            .unwrap();
+        let mut events = agent.subscribe_verified_certificates();
+        let user = identity::UserKeypair::generate().unwrap();
+        let member = identity::AgentKeypair::generate().unwrap();
+        let cert = identity::AgentCertificate::issue(&user, &member).unwrap();
+        let now = Agent::unix_timestamp_secs();
+        let mk = |last_seen: u64, cert: Option<identity::AgentCertificate>| DiscoveredAgent {
+            agent_id: member.agent_id(),
+            machine_id: identity::MachineId([9; 32]),
+            user_id: None,
+            self_name: None,
+            addresses: vec![],
+            announced_at: last_seen,
+            last_seen,
+            machine_public_key: vec![1],
+            nat_type: None,
+            can_receive_direct: None,
+            is_relay: None,
+            is_coordinator: None,
+            reachable_via: vec![],
+            relay_candidates: vec![],
+            cert_not_after: cert.as_ref().and_then(|c| c.not_after()),
+            agent_certificate: cert,
+            agent_public_key: vec![],
+            cert_digest: None,
+        };
+
+        // Cold insert carrying the certificate → one event.
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            mk(now, Some(cert.clone())),
+        )
+        .await;
+        let event = events.recv().await.expect("cold landing fires an event");
+        assert_eq!(event.agent_id, member.agent_id());
+        assert_eq!(event.certificate, cert);
+        assert_eq!(
+            event.digest_hex(),
+            groups::owner_cert::certificate_digest_hex(&cert),
+            "event digest must match the seat-digest rule byte-for-byte"
+        );
+
+        // Identical re-announce (same bytes, fresher timestamp) → NO event.
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            mk(now + 5, Some(cert.clone())),
+        )
+        .await;
+        assert!(
+            events.try_recv().is_err(),
+            "an identical re-announce must not re-fire the hydration bridge"
+        );
+
+        // Promote into an existing cert-less entry → one event (blob-landing
+        // shape: entry first lands digest-only, the fetch completes later).
+        let other = identity::AgentKeypair::generate().unwrap();
+        let other_cert = identity::AgentCertificate::issue(&user, &other).unwrap();
+        let mut cold = mk(now, None);
+        cold.agent_id = other.agent_id();
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            cold,
+        )
+        .await;
+        let mut warmed = mk(now + 1, Some(other_cert.clone()));
+        warmed.agent_id = other.agent_id();
+        upsert_discovered_agent(
+            &agent.identity_discovery_cache,
+            &agent.verified_cert_tx,
+            warmed,
+        )
+        .await;
+        let promoted = events.recv().await.expect("promotion fires an event");
+        assert_eq!(promoted.agent_id, other.agent_id());
+        assert_eq!(promoted.certificate, other_cert);
     }
 
     #[tokio::test]
@@ -21233,7 +21493,12 @@ mod tests {
             let mut entry = mk(0, now + u64::from(i));
             entry.agent_id = identity::AgentId(id);
             entry.machine_id = identity::MachineId(id);
-            upsert_discovered_agent(&agent.identity_discovery_cache, entry).await;
+            upsert_discovered_agent(
+                &agent.identity_discovery_cache,
+                &agent.verified_cert_tx,
+                entry,
+            )
+            .await;
         }
         let cache = agent.identity_discovery_cache.read().await;
         assert!(
@@ -22266,6 +22531,12 @@ fn discovered_agent_fixture(
 }
 
 #[cfg(test)]
+fn test_cert_events() -> tokio::sync::broadcast::Sender<VerifiedCertificate> {
+    // E2d: standalone event ring for cache-only tests (no Agent needed).
+    tokio::sync::broadcast::channel(VERIFIED_CERT_EVENT_CAPACITY).0
+}
+
+#[cfg(test)]
 fn signed_identity_announcement_fixture(
     agent_id: identity::AgentId,
     machine: &identity::MachineKeypair,
@@ -22561,12 +22832,13 @@ async fn upsert_self_name_sets_renames_clears_and_preserves() {
     // from an X0A4 no-name beat, and None (legacy X0A3) carries no name
     // information and must preserve whatever is cached.
     let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
     let id = identity::AgentId([9; 32]);
 
     // Set via a fresh (first-seen) record.
     let mut first = discovered_agent_fixture(9, 100, &["10.0.0.1:5483"], None);
     first.self_name = Some("fae".to_string());
-    upsert_discovered_agent(&cache, first).await;
+    upsert_discovered_agent(&cache, &cert_events, first).await;
     assert_eq!(
         cache
             .read()
@@ -22579,7 +22851,7 @@ async fn upsert_self_name_sets_renames_clears_and_preserves() {
     // Rename via a fresher beat.
     let mut rename = discovered_agent_fixture(9, 200, &["10.0.0.1:5483"], None);
     rename.self_name = Some("fae2".to_string());
-    upsert_discovered_agent(&cache, rename).await;
+    upsert_discovered_agent(&cache, &cert_events, rename).await;
     assert_eq!(
         cache
             .read()
@@ -22592,6 +22864,7 @@ async fn upsert_self_name_sets_renames_clears_and_preserves() {
     // Legacy X0A3 beat (None): preserves the cached name.
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(9, 300, &["10.0.0.1:5483"], None),
     )
     .await;
@@ -22608,7 +22881,7 @@ async fn upsert_self_name_sets_renames_clears_and_preserves() {
     // X0A4 explicit clear (Some("")): erases it.
     let mut cleared = discovered_agent_fixture(9, 400, &["10.0.0.1:5483"], None);
     cleared.self_name = Some(String::new());
-    upsert_discovered_agent(&cache, cleared).await;
+    upsert_discovered_agent(&cache, &cert_events, cleared).await;
     assert_eq!(
         cache
             .read()
@@ -22646,7 +22919,8 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
     entry.cert_digest = Some(digest);
     entry.agent_certificate = None;
     entry.user_id = None;
-    upsert_discovered_agent(&cache, entry).await;
+    let cert_events = test_cert_events();
+    upsert_discovered_agent(&cache, &cert_events, entry).await;
 
     let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
     blob_cache
@@ -22659,7 +22933,14 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
         })
         .await;
 
-    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &digest, &joiner.agent_id()).await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &blob_cache,
+        &cert_events,
+        &digest,
+        &joiner.agent_id(),
+    )
+    .await;
     let patched = cache
         .read()
         .await
@@ -22689,9 +22970,7 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
         announce_v3::cert_digest(&other_cert.user_id().ok(), &Some(other_cert.clone()));
     let mut other_entry = discovered_agent_fixture(0x48, 100, &[], None);
     other_entry.agent_id = other.agent_id();
-    other_entry.cert_digest = Some(other_digest);
-    other_entry.agent_certificate = None;
-    upsert_discovered_agent(&cache, other_entry).await;
+    upsert_discovered_agent(&cache, &cert_events, other_entry).await;
     blob_cache
         .insert_verified(announce_blob::CachedBlob {
             digest: other_digest,
@@ -22703,8 +22982,14 @@ async fn patch_discovery_entry_when_blob_lands_merges_verified_pair() {
             fetched_at_unix: 1,
         })
         .await;
-    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &other_digest, &other.agent_id())
-        .await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &blob_cache,
+        &cert_events,
+        &other_digest,
+        &other.agent_id(),
+    )
+    .await;
     let not_patched = cache
         .read()
         .await
@@ -22740,7 +23025,8 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
     let mut entry = discovered_agent_fixture(0x48, 100, &[], None);
     entry.agent_id = agent.agent_id();
     entry.cert_digest = Some(d1);
-    upsert_discovered_agent(&cache, entry).await;
+    let cert_events = test_cert_events();
+    upsert_discovered_agent(&cache, &cert_events, entry).await;
 
     // The D1 fetch completes and lands in the blob cache…
     let blob_cache = std::sync::Arc::new(announce_blob::AnnounceBlobCache::new(None));
@@ -22759,9 +23045,16 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
     let mut newer = discovered_agent_fixture(0x48, 200, &[], None);
     newer.agent_id = agent.agent_id();
     newer.cert_digest = Some(d2);
-    upsert_discovered_agent(&cache, newer).await;
+    upsert_discovered_agent(&cache, &cert_events, newer).await;
 
-    patch_discovery_entry_when_blob_lands(&cache, &blob_cache, &d1, &agent.agent_id()).await;
+    patch_discovery_entry_when_blob_lands(
+        &cache,
+        &blob_cache,
+        &cert_events,
+        &d1,
+        &agent.agent_id(),
+    )
+    .await;
     let entry = cache
         .read()
         .await
@@ -22782,10 +23075,12 @@ async fn patch_discovery_entry_rejects_superseded_digest_fetch() {
 #[tokio::test]
 async fn upsert_discovered_agent_replaces_addresses_on_fresher_announcement() {
     let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
     let id = identity::AgentId([7; 32]);
 
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(7, 100, &["10.0.0.1:5483", "8.8.8.8:5483"], None),
     )
     .await;
@@ -22794,6 +23089,7 @@ async fn upsert_discovered_agent_replaces_addresses_on_fresher_announcement() {
     // endpoints that each cost a dial timeout.
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(7, 200, &["1.2.3.4:5483"], None),
     )
     .await;
@@ -22810,10 +23106,12 @@ async fn upsert_discovered_agent_replaces_addresses_on_fresher_announcement() {
 #[tokio::test]
 async fn upsert_discovered_agent_ignores_stale_announcement_addresses() {
     let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
+    let cert_events = test_cert_events();
     let id = identity::AgentId([8; 32]);
 
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(8, 200, &["1.2.3.4:5483"], None),
     )
     .await;
@@ -22821,6 +23119,7 @@ async fn upsert_discovered_agent_ignores_stale_announcement_addresses() {
     // addresses into the fresher cached record.
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(8, 100, &["10.0.0.9:5483"], None),
     )
     .await;
@@ -22842,16 +23141,19 @@ async fn upsert_discovered_agent_ignores_stale_announcement_addresses() {
 async fn upsert_discovered_agent_preserves_known_user_id() {
     let cache = std::sync::Arc::new(tokio::sync::RwLock::new(std::collections::HashMap::new()));
     let id = identity::AgentId([9; 32]);
+    let cert_events = test_cert_events();
     let user = identity::UserId([9; 32]);
 
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(9, 100, &["1.2.3.4:5483"], Some(user)),
     )
     .await;
     // A fresher but anonymous announcement must not erase a known user_id.
     upsert_discovered_agent(
         &cache,
+        &cert_events,
         discovered_agent_fixture(9, 200, &["1.2.3.4:5483"], None),
     )
     .await;

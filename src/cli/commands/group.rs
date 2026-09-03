@@ -152,15 +152,30 @@ pub async fn invite(client: &DaemonClient, group_id: &str, expiry_secs: u64) -> 
 }
 
 /// `x0x group join` — POST /groups/join.
+///
+/// `--home` (with its required `--owner` pin) selects Home-join mode
+/// (#468/#469): the body carries `"mode": "home"` plus the expected
+/// owner's 64-hex user id so the daemon can reject a downgraded or
+/// foreign-owner invite (`invite_downgraded` / `owner_mismatch`).
+/// Without `--home` both fields are omitted — the daemon's default is
+/// plain group mode.
 pub async fn join(
     client: &DaemonClient,
     invite_link: &str,
     display_name: Option<&str>,
+    home: bool,
+    expected_owner_user_id: Option<&str>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "invite": invite_link });
     if let Some(dn) = display_name {
         body["display_name"] = Value::String(dn.to_string());
+    }
+    if home {
+        body["mode"] = Value::String("home".to_string());
+        if let Some(owner) = expected_owner_user_id {
+            body["expected_owner_user_id"] = Value::String(owner.to_string());
+        }
     }
     let resp = client.post("/groups/join", &body).await?;
     print_value(client.format(), &resp);
@@ -940,7 +955,7 @@ mod tests {
         let mock_resp = serde_json::json!({"id": "joined-group"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = join(&client, "invite-code-123", None).await;
+        let result = join(&client, "invite-code-123", None, false, None).await;
         assert!(result.is_ok(), "join should succeed: {:?}", result);
     }
 

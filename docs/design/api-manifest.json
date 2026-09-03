@@ -2078,7 +2078,7 @@
     {
       "category": "named-groups",
       "cli_name": "group join",
-      "description": "Join group via invite",
+      "description": "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",
       "method": "POST",
       "path": "/groups/join",
       "request": {
@@ -2093,6 +2093,18 @@
             "cli": "default",
             "in": "body",
             "name": "display_name",
+            "required": false
+          },
+          {
+            "cli": "derived",
+            "in": "body",
+            "name": "mode",
+            "required": false
+          },
+          {
+            "cli": "derived",
+            "in": "body",
+            "name": "expected_owner_user_id",
             "required": false
           }
         ],

@@ -88,6 +88,18 @@ pub struct RequestField {
 }
 
 impl RequestField {
+    /// Body field whose CLI surface is DERIVED (synthesized from flag
+    /// pairs, not a 1:1 name/value mapping) — the generic parity shape
+    /// check skips it; a targeted exact-wire test owns the contract.
+    pub const fn derived_body(name: &'static str) -> Self {
+        Self {
+            name,
+            location: FieldLocation::Body,
+            required: false,
+            cli: CliExpose::Derived,
+        }
+    }
+
     /// Body field using the default CLI naming convention.
     pub const fn body(name: &'static str, required: bool) -> Self {
         Self {
@@ -1173,9 +1185,21 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         method: Method::Post,
         path: "/groups/join",
         cli_name: "group join",
-        description: "Join group via invite",
+        description: "Join group via invite (mode=home with --home --owner pins the expected Home owner, #468/#469)",
         category: "named-groups",
-        request: RequestSpec::Fields(&[RequestField::body_as("invite", true, "INVITE"), RequestField::body("display_name", false)]),
+        request: RequestSpec::Fields(&[
+            RequestField::body_as("invite", true, "INVITE"),
+            RequestField::body("display_name", false),
+            // #468/#469: `--home` serializes as the literal "home" mode
+            // value; `--owner <HEX>` is the expected owner user id pin.
+            // Both are only sent together (clap `requires` both ways).
+            // #469 A3: mode/owner pin are Derived — `--home` is a bool
+            // flag pair whose VALUES the CLI synthesizes ("home" mode +
+            // the --owner token), so the generic shape check skips them;
+            // tests/cli_group_join_wire.rs pins the exact wire instead.
+            RequestField::derived_body("mode"),
+            RequestField::derived_body("expected_owner_user_id"),
+        ]),
     },
     EndpointDef {
         method: Method::Put,

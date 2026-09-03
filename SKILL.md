@@ -335,6 +335,13 @@ curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
 # (typically <1 s while the inviter is online); posting earlier returns 403 members-only.
 ```
 
+> **v0.41.0 ROLLOUT NOTE (#468/#469)**: invites are now SIGNED (v4). Unsigned
+> legacy invites are refused with `invite_unsigned` — re-mint after upgrading.
+> Upgrade INVITERS/AUTHORITIES before joiners. Home joins pin the owner:
+> `x0x group join --home --owner <owner_user_id_hex>` (both flags required
+> together; `x0x home` prints `owner_user_id`). Rosters over 20 entries or
+> links over 40,960 B fail typed at mint — slim the roster.
+
 **Public messages, threads, mentions:**
 
 ```bash
