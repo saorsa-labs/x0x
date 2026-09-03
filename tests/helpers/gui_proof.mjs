@@ -1,5 +1,18 @@
-import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
+
+// #480 H3: playwright-core is a devDependency pinned in the root
+// package.json. Resolve it explicitly so a fresh worktree gets a one-line
+// reason and a distinct exit code (3) instead of a raw ERR_MODULE_NOT_FOUND.
+let chromium;
+try {
+  ({ chromium } = await import('playwright-core'));
+} catch (err) {
+  if (err && err.code === 'ERR_MODULE_NOT_FOUND') {
+    console.error('gui_proof.mjs: playwright-core is not installed — run `npm ci` in the repo root (package.json pins it)');
+    process.exit(3);
+  }
+  throw err;
+}
 
 const [, , mode, ...args] = process.argv;
 
@@ -122,8 +135,12 @@ async function runSendDm(baseUrl, cardLink, targetAgentId, message) {
 
 if (mode === 'send-dm') {
   if (args.length !== 4) usage();
+  // Playwright navigation errors serialize the full URL — including the
+  // ?token= session token from guiUrl(). Redact query tokens so a failure
+  // path can never print the credential (harness also redacts at echo time).
+  const redactTokens = (s) => String(s).replace(/([?&]token=)[^&\s'"]+/g, '$1<redacted>');
   runSendDm(args[0], args[1], args[2], args[3]).catch((err) => {
-    console.error(JSON.stringify({ ok: false, mode, error: String(err?.message || err) }));
+    console.error(JSON.stringify({ ok: false, mode, error: redactTokens(err?.message || err) }));
     process.exit(1);
   });
 } else {
