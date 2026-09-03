@@ -44,7 +44,7 @@ Home Suite hardening release. Summarises the notable user-facing changes since v
 
 - A joiner whose local view is still at the invite base can adopt a removed admin's fork (ADR-0016 equal-revision limitation, #468); a malicious admin can hand out a policy-stripped invite that joins an ordinary-looking fork (#469 residual). Both are tracked by #472 (owner mandate on `MemberAdded`, alternate-chain validation, route-complete quarantine, content-addressed base snapshots).
 - The ordinary save path writes the Home sidecar before `named_groups.json` (#471).
-- Record-level compare-and-restore: a concurrent mutation of the SAME record skips the rollback for that record, so fields from a failed mutation can remain until the next save (#470).
+- Record-level compare-and-restore: a concurrent mutation of the SAME record skips the rollback for that record, so fields from a failed mutation can remain and may be persisted by a later save (#470).
 - Owner user keys have no revocation subject yet (agent and machine keys do).
 - A GSS/legacy epoch rotation inside an adoption gap leaves the joiner pending until it re-joins on a fresh invite.
 - Old peers reject owner-named v2 AgentCards (ADR-0036).
