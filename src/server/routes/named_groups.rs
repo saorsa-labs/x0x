@@ -27453,9 +27453,6 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         }
     };
     clear_expected_join_result_inviter(state, &expected_key);
-    for poll in polls.drain(..).chain(tasks.drain(..)) {
-        poll.abort();
-    }
     if outcome != JoinAttemptOutcome::Seated {
         let stub_is_pending = {
             let stubs = state
@@ -27464,9 +27461,31 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             stubs.contains(local_group_key)
         };
+        let outcome_str = match outcome {
+            JoinAttemptOutcome::Refused => "refused",
+            _ => "timed_out",
+        };
         if stub_is_pending {
+            // #477 (r7 item 5): the terminal outcome write and the
+            // stub/marker removal are ONE persistence-guarded step —
+            // join-status can never observe the group gone without its
+            // terminal outcome (a bare 404 mid-finalize). The outcome is
+            // written FIRST so the 404-with-outcome shape is always
+            // complete.
             {
                 let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+                state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .insert(
+                        local_group_key.to_string(),
+                        LastJoinOutcome {
+                            outcome: outcome_str,
+                            reason,
+                            finished_at_ms: now_millis_u64(),
+                        },
+                    );
                 state.named_groups.write().await.remove(local_group_key);
                 state
                     .pending_join_stubs
@@ -27487,23 +27506,29 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             }
             state.mls_groups.write().await.remove(local_group_key);
             state.treekem_groups.write().await.remove(local_group_key);
+        } else {
+            state
+                .last_join_outcomes
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(
+                    local_group_key.to_string(),
+                    LastJoinOutcome {
+                        outcome: outcome_str,
+                        reason,
+                        finished_at_ms: now_millis_u64(),
+                    },
+                );
         }
-        let outcome_str = match outcome {
-            JoinAttemptOutcome::Refused => "refused",
-            _ => "timed_out",
-        };
-        state
-            .last_join_outcomes
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(
-                local_group_key.to_string(),
-                LastJoinOutcome {
-                    outcome: outcome_str,
-                    reason,
-                    finished_at_ms: now_millis_u64(),
-                },
-            );
+    }
+    // #477 (r7 item 3): abort every owned task LAST — no await follows
+    // this loop. The poll task IS the finalizer (its own handle sits in
+    // entry.polls); aborting it mid-finalize would cancel the awaited
+    // cleanup above at an await point, so the aborts run only after all
+    // state changes are complete (self-abort is then harmless: the task
+    // is already returning).
+    for poll in polls.drain(..).chain(tasks.drain(..)) {
+        poll.abort();
     }
 }
 
