@@ -14649,6 +14649,23 @@ impl AgentBuilder {
         // do not start it again here.
         let bootstrap_cache = network.as_ref().and_then(|n| n.bootstrap_cache());
 
+        // #484 (HS-E1 D2, x0x-side mitigation; durable fix ant-quic#269):
+        // a daemon must never dial ITSELF. Our own signed announcement
+        // can land in the persistent cache (self-observation at bind or a
+        // loopback mDNS reflection), and after a restart ant-quic's
+        // relay/candidate selection has no local-peer predicate — the
+        // observed failure mode was this node selecting ITSELF as the
+        // "optimized relay". Remove any self entry now, post-load.
+        if let (Some(cache), Some(node)) = (bootstrap_cache.as_ref(), network.as_ref()) {
+            let own_peer_id = ant_quic::PeerId(node.peer_id().0);
+            if let Some(removed) = cache.remove(&own_peer_id).await {
+                tracing::info!(
+                    peer = %hex::encode(removed.peer_id.0),
+                    "#484: pruned self entry from the bootstrap cache (never self-dial)"
+                );
+            }
+        }
+
         // Load the local revocation set now (shared Arc) so the relay-DM
         // listener can enforce revocation on inbound relayed envelopes. The
         // same Arc is moved into the Agent below, so the listener and the

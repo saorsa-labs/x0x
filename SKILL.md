@@ -339,8 +339,17 @@ curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
 > legacy invites are refused with `invite_unsigned` — re-mint after upgrading.
 > Upgrade INVITERS/AUTHORITIES before joiners. Home joins pin the owner:
 > `x0x group join --home --owner <owner_user_id_hex>` (both flags required
-> together; `x0x home` prints `owner_user_id`). Rosters over 20 entries or
-> links over 40,960 B fail typed at mint — slim the roster.
+> together; `x0x home` prints `owner_user_id`). The REST form of the same
+> join is `POST /groups/join` with `{"invite":"x0x://invite/<...>","mode":"home","expected_owner_user_id":"<owner_user_id_hex>"}`
+> (#486). `invite_owner_countersignature_invalid` is a property of the
+> SIGNED INVITE (the countersignature must come from the owner install
+> that minted it — an invite minted by a non-owner authority for a Home
+> is refused) — re-mint the invite on the owner, it is not a body error.
+> The OWNER's primary agent must ALSO have announced with
+> `{"include_user_identity":true,"human_consent":true}` (#483) before a
+> seated second device can seal/leave Home state; a pending-join state
+> after a restart must be re-issued with a fresh invite. Rosters over 20
+> entries or links over 40,960 B fail typed at mint — slim the roster.
 
 **Public messages, threads, mentions:**
 

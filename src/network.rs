@@ -2571,6 +2571,20 @@ impl NetworkNode {
         // tombstone doing so.
         self.dial_gated(&peer_id, "cached_peer")?;
 
+        // #484: never dial SELF from the cache — the observed failure had
+        // this node redial its own cached entry (and select itself as an
+        // "optimized relay") after a restart.
+        {
+            let node_guard = self.node.read().await;
+            if let Some(node) = node_guard.as_ref() {
+                if node.peer_id() == peer_id {
+                    return Err(NetworkError::ConnectionFailed(
+                        "#484: refusing to dial self from the bootstrap cache".to_string(),
+                    ));
+                }
+            }
+        }
+
         if self.is_connected(&peer_id).await {
             let node_guard = self.node.read().await;
             if let Some(node) = node_guard.as_ref() {
@@ -2598,8 +2612,20 @@ impl NetworkNode {
                 peer_id
             ))
         })?;
-
-        let candidate_addrs = cached_peer.preferred_addresses();
+        // cached addresses observed as mapped-v6 wedge sends with
+        // "No route to host" on hosts whose mapped-v6 egress is refused
+        // (durable fix ant-quic#269).
+        let candidate_addrs: Vec<SocketAddr> = cached_peer
+            .preferred_addresses()
+            .into_iter()
+            .map(|addr| match addr {
+                SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+                    Some(v4) => SocketAddr::new(std::net::IpAddr::V4(v4), v6.port()),
+                    None => SocketAddr::V6(v6),
+                },
+                v4 => v4,
+            })
+            .collect();
         for addr in &candidate_addrs {
             match self.connect_peer_with_addrs(peer_id, vec![*addr]).await {
                 Ok((selected_addr, connected_peer)) if connected_peer == peer_id => {

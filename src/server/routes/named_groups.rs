@@ -4628,9 +4628,18 @@ fn treekem_state_frontier_gap_reason(
     {
         return None;
     }
-    if frontier.commit.revision > info.state_revision.saturating_add(1)
-        || frontier.revision > info.roster_revision.saturating_add(1)
-    {
+    // #482: queue ONLY on a STATE-chain gap. The signed GroupStateCommit
+    // is the authoritative chain; the event's roster `revision` is minted
+    // from the AUTHOR's local roster clock, which can legitimately run
+    // ahead of ours (an InviteV4 stub seeds both clocks from
+    // base_state_revision, and authority-side join-request bookkeeping
+    // advances state without roster — so a joiner's roster clock stays
+    // inflated; membership application reconciles it with `max`). A
+    // state-adjacent, hash-linked event is applyable regardless of the
+    // roster clock; queueing on roster-ahead alone wedged verified
+    // self-leaves forever (the catch-up went only to the departed
+    // leaver). The hash-link check below still gates chain integrity.
+    if frontier.commit.revision > info.state_revision.saturating_add(1) {
         return Some("revision_gap".to_string());
     }
     if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
@@ -6114,6 +6123,9 @@ async fn queue_treekem_membership_event(
             queue.pop_front();
         }
     }
+    state
+        .groups_diagnostics
+        .record_membership_event_queued_gap(group_id);
     tracing::warn!(group_id = %LogHexId::group(&group_id), reason, "queued TreeKEM membership event pending catch-up/replay");
     request_treekem_catchup_for_gap(state, group_id, &event, sender).await;
 }
@@ -6128,7 +6140,7 @@ async fn request_treekem_catchup_for_gap(
     let Some(frontier) = treekem_membership_event_frontier(event) else {
         return;
     };
-    let (from_revision, from_epoch, current_state_hash) = {
+    let (from_revision, from_epoch, current_state_hash, other_members) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id) else {
             return;
@@ -6136,10 +6148,26 @@ async fn request_treekem_catchup_for_gap(
         if info.withdrawn {
             return;
         }
+        // #482: also fan the catch-up out to OTHER active members (up to
+        // 2, deterministic order) — the event's author/sender may be the
+        // departed leaver itself, which previously left the gap
+        // unfillable.
+        let mut others: Vec<AgentId> = info
+            .active_members()
+            .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
+            .filter(|peer| {
+                let hex = hex::encode(peer.as_bytes());
+                hex != local_agent_hex && !frontier.actor.eq_ignore_ascii_case(hex.as_str())
+            })
+            .collect();
+        others.sort_by_key(|peer| hex::encode(peer.as_bytes()));
+        others.dedup();
+        others.truncate(2);
         (
             info.state_revision,
             info.secret_epoch,
             info.state_hash.clone(),
+            others,
         )
     };
     let mut peers = Vec::new();
@@ -6151,6 +6179,11 @@ async fn request_treekem_catchup_for_gap(
     let sender_hex = hex::encode(sender.as_bytes());
     if sender_hex != local_agent_hex && !peers.contains(&sender) {
         peers.push(sender);
+    }
+    for peer in other_members {
+        if !peers.contains(&peer) {
+            peers.push(peer);
+        }
     }
     for peer in peers {
         let peer_hex = hex::encode(peer.as_bytes());
@@ -16539,6 +16572,21 @@ pub(in crate::server) async fn leave_group(
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
+            // #483: the pending-certificate family is a typed, retryable
+            // refusal — the same shape the dedicated seal endpoint
+            // returns — not a server error.
+            if matches!(
+                e,
+                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. }
+            ) {
+                return api_error(
+                    StatusCode::CONFLICT,
+                    format!(
+                        "owner-certified group has members pending certificate resolution; \
+                         retry the leave once evidence converges: {e}"
+                    ),
+                );
+            }
             return api_error(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 format!("seal failed: {e}"),
@@ -16691,6 +16739,56 @@ pub(in crate::server) fn now_millis_u64() -> u64 {
 /// grow-only set. Agents whose hex does not parse produce no entry and so
 /// fail closed downstream (`NoCertificate`/not-revoked evidence still fails
 /// the chain check).
+/// #483 restart-safe evidence: like [`owner_cert_evidence_for`], but each
+/// wanted agent may carry its committed certificate DIGEST. When the
+/// session-only discovery map has no entry for the agent, the DURABLE
+/// announce-blob cache is consulted by that digest under the SAME binding
+/// rule as the #447 nested path (the certificate must bind this agent and
+/// the blob's user) — so a restarted daemon can still resolve roster
+/// members without waiting for a fresh announce.
+pub(in crate::server) async fn owner_cert_evidence_for_with_digests(
+    state: &AppState,
+    agents_with_digests: &[(String, Option<String>)],
+) -> x0x::groups::owner_cert::OwnerCertEvidence {
+    let plain: Vec<&str> = agents_with_digests
+        .iter()
+        .map(|(agent, _)| agent.as_str())
+        .collect();
+    let mut evidence = owner_cert_evidence_for(state, &plain).await;
+    for (agent_hex, digest) in agents_with_digests {
+        let Some(digest) = digest else { continue };
+        let key = agent_hex.to_ascii_lowercase();
+        if evidence.cert_for(&key).is_some() {
+            continue;
+        }
+        let Some(agent_id) = parse_agent_id_hex(&key).ok() else {
+            continue;
+        };
+        let digest_bytes: [u8; 32] = match hex::decode(digest) {
+            Ok(bytes) => match <[u8; 32]>::try_from(bytes) {
+                Ok(arr) => arr,
+                Err(_) => continue,
+            },
+            Err(_) => continue,
+        };
+        if let Some(blob) = state.agent.announce_blob_cache.get(&digest_bytes).await {
+            if let Some(cert) = blob.agent_certificate.as_ref() {
+                if cert.agent_id().is_ok_and(|id| id == agent_id)
+                    && cert.user_id().ok() == blob.user_id
+                {
+                    evidence.insert_cert(key.clone(), cert.clone());
+                } else {
+                    tracing::debug!(
+                        agent = %key,
+                        "roster-digest blob fallback: cert bound to a different agent; ignoring"
+                    );
+                }
+            }
+        }
+    }
+    evidence
+}
+
 pub(in crate::server) async fn owner_cert_evidence_for(
     state: &AppState,
     agents: &[&str],
@@ -16859,9 +16957,6 @@ pub(in crate::server) async fn hydrate_digest_only_seats_at_seat_time(
 }
 
 /// ADR-0038 seal-time evidence: snapshot certificates for every ACTIVE
-/// roster member (plus the local agent) so `seal_commit_with_owner_certs`
-/// can re-verify the whole roster. Cheap no-op snapshot for groups on any
-/// other admission axis — the seal never consults it.
 async fn owner_cert_seal_evidence(
     state: &AppState,
     info: &x0x::groups::GroupInfo,
@@ -16874,8 +16969,22 @@ async fn owner_cert_seal_evidence(
     if !agents.iter().any(|a| a.eq_ignore_ascii_case(&local_hex)) {
         agents.push(local_hex);
     }
-    let refs: Vec<&str> = agents.iter().map(String::as_str).collect();
-    owner_cert_evidence_for(state, &refs).await
+    // #483: carry each active member's committed certificate DIGEST so
+    // the builder can fall back to the DURABLE announce-blob cache when
+    // the session-only discovery map has no entry for the agent (after a
+    // restart the map is empty; without this, a seated second device
+    // cannot seal until the owner's primary announces again).
+    let with_digests: Vec<(String, Option<String>)> = agents
+        .into_iter()
+        .map(|agent| {
+            let digest = info
+                .members_v2
+                .get(&agent)
+                .and_then(|seat| seat.certificate_digest.clone());
+            (agent, digest)
+        })
+        .collect();
+    owner_cert_evidence_for_with_digests(state, &with_digests).await
 }
 
 /// ADR-0038 seal wrapper for the authority's ORDINARY commit sites: this
@@ -27027,6 +27136,8 @@ pub(in crate::server) mod tests {
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
     mod pr291_restart_marker_matrix;
+    mod wp_c;
+
     fn fake_group_state_commit(
         group_id: &str,
         revision: u64,

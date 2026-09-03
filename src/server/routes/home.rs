@@ -81,11 +81,23 @@ pub(in crate::server) async fn find_home(
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    // #487: a pending join stub lives in MEMORY only — the join is not
+    // durable, so it must not become "the Home" (the marker would dangle
+    // after the stub is dropped on restart). Snapshot the set and drop
+    // the std Mutex guard BEFORE awaiting (Send futures).
+    let pending: Vec<String> = {
+        let pending = state
+            .pending_join_stubs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        pending.iter().cloned().collect()
+    };
     let groups = state.named_groups.read().await;
     groups
         .iter()
-        .find(|(_, info)| {
-            info.home.is_some()
+        .find(|(id, info)| {
+            !pending.iter().any(|p| p == id.as_str())
+                && info.home.is_some()
                 && is_home_policy(&info.policy, owner)
                 && info.has_active_member(&local_hex)
         })
@@ -432,14 +444,28 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
     //    complete its metadata + seal instead of minting a duplicate.
     let candidate: Option<String> = {
+        // #487: same durability rule as find_home — a pending join stub
+        // must not be adopted/stamped as this machine's Home. Guard is
+        // scoped before the await (Send futures).
+        let pending: Vec<String> = {
+            let pending = state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
         let groups = state.named_groups.read().await;
-        let mut matches: Vec<(&String, u64)> = groups
+        let mut matches: Vec<(String, u64)> = groups
             .iter()
-            .filter(|(_, info)| info.home.is_none() && is_home_candidate(info, &owner))
-            .map(|(id, info)| (id, info.created_at))
+            .filter(|(id, info)| {
+                !pending.iter().any(|p| p == id.as_str())
+                    && info.home.is_none()
+                    && is_home_candidate(info, &owner)
+            })
+            .map(|(id, info)| (id.clone(), info.created_at))
             .collect();
         matches.sort_by_key(|(_, created)| *created);
-        matches.first().map(|(id, _)| (*id).clone())
+        matches.into_iter().next().map(|(id, _)| id)
     };
     if let Some(id) = candidate {
         tracing::info!(
