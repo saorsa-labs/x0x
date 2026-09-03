@@ -17084,6 +17084,33 @@ pub(in crate::server) async fn seal_commit_owner_certified(
     // explicit eviction+rekey path; InGrace members are pending evidence
     // (fetch lag / mid-rotation) and get the retryable typed refusal.
     // Never prune here.
+    //
+    // #483 (code review r1 item 1): hydrate digest-only seats BEFORE the
+    // verdict — the verdict ladder classifies a byte-less digest seat as
+    // DigestPending before considering resolved evidence, so without this
+    // the seal still refuses even when the durable blob cache holds the
+    // certificate.
+    let digest_only_members: Vec<String> = info
+        .active_members()
+        .filter(|m| m.certificate.is_none() && m.certificate_digest.is_some())
+        .map(|m| m.agent_id.clone())
+        .collect();
+    if !digest_only_members.is_empty() {
+        let stable_group_id = info.stable_group_id().to_string();
+        let hydrated = hydrate_digest_only_seats_at_seat_time(
+            state,
+            &stable_group_id,
+            info,
+            &digest_only_members,
+        )
+        .await;
+        if hydrated > 0 {
+            tracing::info!(
+                hydrated,
+                "#483: seal-time hydrate installed certificates onto digest-only seats"
+            );
+        }
+    }
     let evidence = owner_cert_seal_evidence(state, info).await;
     let verdict = info.owner_cert_verdict(&evidence);
     if !verdict.is_all_clean() {

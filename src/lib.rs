@@ -8297,13 +8297,13 @@ impl Agent {
 
                                 // (durable fix ant-quic#269).
 
-                                if peer_id == own_peer_id_for_cache_exclude {
-
-                                    continue;
-
+                                // #484 (code review r1 item 6): skip ONLY the bootstrap insert —
+                                // the rest of the handler (agent/certificate
+                                // discovery for co-hosted agents) must run.
+                                if peer_id != own_peer_id_for_cache_exclude {
+                                    bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
+                                        .await;
                                 }
-                                bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
-                                    .await;
                             }
                         }
 
@@ -8996,13 +8996,13 @@ impl Agent {
 
                             // (durable fix ant-quic#269).
 
-                            if peer_id == own_peer_id_for_cache_exclude {
-
-                                continue;
-
+                            // #484 (code review r1 item 6): skip ONLY the bootstrap insert —
+                            // the rest of the handler (agent/certificate
+                            // discovery for co-hosted agents) must run.
+                            if peer_id != own_peer_id_for_cache_exclude {
+                                bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
+                                    .await;
                             }
-                            bc.add_from_connection(peer_id, bootstrap_addresses.clone(), None)
-                                .await;
                             tracing::debug!(
                                 "Added {} public addresses to bootstrap cache for agent {:?} (machine {:?})",
                                 bootstrap_addresses.len(),

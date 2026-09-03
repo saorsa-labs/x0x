@@ -81,27 +81,41 @@ pub(in crate::server) async fn find_home(
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    // #487: a pending join stub lives in MEMORY only — the join is not
-    // durable, so it must not become "the Home" (the marker would dangle
-    // after the stub is dropped on restart). Snapshot the set and drop
-    // the std Mutex guard BEFORE awaiting (Send futures).
-    let pending: Vec<String> = {
-        let pending = state
-            .pending_join_stubs
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        pending.iter().cloned().collect()
-    };
-    let groups = state.named_groups.read().await;
-    groups
-        .iter()
-        .find(|(id, info)| {
-            !pending.iter().any(|p| p == id.as_str())
-                && info.home.is_some()
-                && is_home_policy(&info.policy, owner)
-                && info.has_active_member(&local_hex)
-        })
-        .map(|(id, info)| (id.clone(), info.clone()))
+    // #487 (code review r1 item 2): re-check the pending set AFTER the
+    // groups read — a join can insert the marker and publish the stub
+    // between a pre-read snapshot and the map acquisition (TOCTOU). The
+    // re-check closes the window: any stub published before the map read
+    // has its marker by then (pending-set-first ordering).
+    loop {
+        let pending_before: Vec<String> = {
+            let pending = state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
+        let groups = state.named_groups.read().await;
+        let found = groups
+            .iter()
+            .find(|(id, info)| {
+                !pending_before.iter().any(|p| p == id.as_str())
+                    && info.home.is_some()
+                    && is_home_policy(&info.policy, owner)
+                    && info.has_active_member(&local_hex)
+            })
+            .map(|(id, info)| (id.clone(), info.clone()));
+        let pending_after: Vec<String> = {
+            let pending = state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
+        if pending_after.len() <= pending_before.len() {
+            return found;
+        }
+        // New stubs appeared during the read: the snapshot may be stale.
+    }
 }
 
 /// A group that matches the full Home policy for `owner` whether or not the

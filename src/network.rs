@@ -2863,7 +2863,10 @@ impl NetworkNode {
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
         self.dial_gated(&peer_id, "peer_with_addrs")?;
-        let node = self.require_node().await?;
+        // #484 (code review r1 item 4): normalize v4-mapped addresses at
+        // this shared boundary — verified-announcement auto-connect and
+        // every other addrs caller route through here.
+        let addrs: Vec<SocketAddr> = addrs.into_iter().map(normalize_v4_mapped_addr).collect();
         let v4_count = addrs.iter().filter(|a| a.is_ipv4()).count();
         let v6_count = addrs.len() - v4_count;
         tracing::debug!(
@@ -2873,8 +2876,8 @@ impl NetworkNode {
             addr_count = addrs.len(),
             v4_count,
             v6_count,
-            "starting peer-authenticated dial with hints"
         );
+        let node = self.require_node().await?;
         // Snapshot which peers are already connected BEFORE the dial. ant-quic
         // may return a pre-existing reused connection (connect_orchestrated scans
         // connected_peers by remote address). If the returned peer_id mismatches,
@@ -3196,6 +3199,24 @@ impl NetworkNode {
     }
 
     fn dial_gated(&self, peer_id: &AntPeerId, origin: &'static str) -> NetworkResult<()> {
+        // #484 (code review r1 item 5): the SELF-refusal lives in the
+        // shared pre-dial choke point — every known-ID dial seam passes
+        // through here, so no boundary can bypass it.
+        {
+            let node_guard = self.node.blocking_read();
+            if let Some(node) = node_guard.as_ref() {
+                if node.peer_id() == *peer_id {
+                    tracing::warn!(
+                        target: "x0x::connect",
+                        origin,
+                        "#484: dial of SELF refused (never self-dial)"
+                    );
+                    return Err(NetworkError::ConnectionFailed(format!(
+                        "#484: dial of self refused ({origin})"
+                    )));
+                }
+            }
+        }
         if reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), peer_id.0) {
             tracing::warn!(
                 target: "x0x::connect",
