@@ -127,7 +127,20 @@ x0x start --name alice      # named instance: separate identity (~/.x0x-alice/) 
 x0xd --config /path.toml    # custom config
 ```
 
-If a daemon is already running, just attach — the CLI finds it automatically.
+If a daemon is already running, just attach — the CLI finds it automatically:
+it reads `api.port` and `api-token` from the default data dir (§7.5). To target
+a non-default daemon:
+
+```bash
+x0x --name alice health                                  # named instance: reads api.port + api-token from the "-alice" data dir
+x0x --api 127.0.0.1:12701 health                         # explicit address (host:port or full URL; alias --api-url)
+X0X_API_TOKEN=<token> x0x --api 10.0.0.5:12700 health    # token for a daemon whose api-token file is not local
+```
+
+`X0X_API_TOKEN` always wins over the data-dir token file; `--api` only
+replaces the address, so pair it with `X0X_API_TOKEN` when the target's
+token is not in your local data dir. Both flags are global (accepted before
+or after the subcommand).
 
 ### 1.3 Find your token and verify
 
@@ -213,6 +226,20 @@ x0x home rename "David's Home"                 # renamable (sealed state update)
 Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the user across machines — nominal in v1 while the move ceremony is gated off (§5.2).
 
 **Second owner device joining the Home (#447, fixed in v0.41.0).** On the new device, run `POST /announce` **with body** `{"include_user_identity":true,"human_consent":true}` once before joining — a bodyless announce publishes the ANONYMOUS cert digest, which the owner can never resolve. Then join with `x0x group join --home --owner <owner-user-id> <invite>` (the owner id is shown by `x0x home`); the certified join is admitted from that single announce, and a join that arrives before the certificate is visible stays in a typed `pending` state instead of wedging. Uncertified joiners holding a stolen invite are always rejected — the gate fails closed.
+
+**A pending join lives in memory only.** Until the joiner observes its own
+`MemberAdded` commit from the Home authority, the join is a stub that is
+*not* written to `named_groups.json` (an unconfirmed join must never be
+recorded as durable). If the joining daemon restarts before that commit
+arrives, the pending join is gone. Do not replay the same link: the invite's
+one-time secret is consumed when the **authority validates the first
+`MemberJoined`** — after that, a replay fails `invite_secret_consumed`; if
+the authority has NOT validated it yet (event still in flight, or the
+authority itself restarted first) the secret is not yet burned, and a replay
+by an already-active member is refused earlier as an idempotent no-op
+rather than with a consumed-secret error. In every case the replay proves
+nothing about YOUR join — mint a **fresh** invite on the owner
+(`POST /groups/<home-gid>/invite`) and join again.
 
 **Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
 
@@ -339,8 +366,17 @@ curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
 > legacy invites are refused with `invite_unsigned` — re-mint after upgrading.
 > Upgrade INVITERS/AUTHORITIES before joiners. Home joins pin the owner:
 > `x0x group join --home --owner <owner_user_id_hex>` (both flags required
-> together; `x0x home` prints `owner_user_id`). Rosters over 20 entries or
-> links over 40,960 B fail typed at mint — slim the roster.
+> together; `x0x home` prints `owner_user_id`). The REST form of the same
+> join is `POST /groups/join` with `{"invite":"x0x://invite/<...>","mode":"home","expected_owner_user_id":"<owner_user_id_hex>"}`
+> (#486). `invite_owner_countersignature_invalid` is a property of the
+> SIGNED INVITE (the countersignature must come from the owner install
+> that minted it — an invite minted by a non-owner authority for a Home
+> is refused) — re-mint the invite on the owner, it is not a body error.
+> The OWNER's primary agent must ALSO have announced with
+> `{"include_user_identity":true,"human_consent":true}` (#483) before a
+> seated second device can seal/leave Home state; a pending-join state
+> after a restart must be re-issued with a fresh invite. Rosters over 20
+> entries or links over 40,960 B fail typed at mint — slim the roster.
 
 **Public messages, threads, mentions:**
 
@@ -537,6 +573,7 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 | `403 rider tokens are denied on this route` | deny-by-default rider scope (ADR-0039) | use a granted surface (`groups/:id/send`, `secure/encrypt`, `GET /history`) or act as the owner |
 | `403 ... Home must be delegated explicitly` | rider token's `groups` list lacks the Home gid (no implicit grant) | re-mint the token with the Home group id in `groups` (and in the signed capability) |
 | `409` on `/owner/*` or `/sync/*` | install has no owner key | `x0x user-id create`, restart daemon |
+| `404 no placement record cached` on `GET /owner/agents/:id/placement` (even ownerless) | the route is durable-owner gated (`403` for a session token), but after auth it performs no owner-key/mint-presence check — it only reads the cached placement record, which exists after the lazy mint / a seen bundle, on owned and ownerless installs alike | create the owner key where THIS daemon loads it, restart, then run the lazy mint before retrying: default install `x0x user-id create` (`~/.x0x/user.key`); named instance `x0x --name <name> user-id create` (`~/.x0x-<name>/user.key`) and keep `--name <name>` on every later command; daemon configured with `user_key_path`/`identity_dir` needs the explicit path (`x0x user-id create <user_key_path>` or `<identity_dir>/user.key` — it never falls back to `~/.x0x`). Then `x0x owner placement` (the lazy mint happens only on that route's first read — creating the key alone records nothing), then retry |
 | `501` on `/agent/move*` | ceremony gated off in v1 | leave it off; placements don't move (founding Home agent is nominally Roaming, inert) |
 | Join then immediate post → `403 members-only` | membership commits asynchronously | poll `GET /groups/<gid>/members` until your id is `active` |
 | `sub-agent lacks the required roster role` | rider scope granted but sub-agent not a member | add the sub-agent to the group (TreeKEM adds need its key package) |
@@ -556,6 +593,11 @@ rendezvous_enabled = true             # global findability
 network_id = "x0x.prod"               # gossip plane isolation ("" = open)
 port_mapping_enabled = true           # UPnP IGD mapping
 observed_prefix_enabled = false       # masked origin prefix on DM surfaces
+# identity_dir = "/srv/x0x/identity"  # keep ALL identity material (machine.key, agent.key, agent.cert,
+#                                     # and the opt-in user.key lookup) out of ~/.x0x — with this set the
+#                                     # daemon never falls back to ~/.x0x (the embedding storage boundary)
+# user_key_path = "/srv/x0x/user.key" # explicit owner key file (opt-in; never auto-generated).
+#                                     # Overrides <identity_dir>/user.key when both are set
 # zero_peer_restart_secs = 600        # TOP-LEVEL KEY (keep it ABOVE the first [section] or it
 #                                     # lands in the wrong table!). SUPERVISOR-ONLY (systemd
 #                                     # Restart=always): exit at zero peers so the supervisor
@@ -580,6 +622,7 @@ ceremony_enabled = false
 
 ```
 ~/.x0x/machine.key machine · agent.key agent · user.key owner (opt) · owner.json owner singleton
+            (all relocated by `identity_dir`; `user_key_path` relocates the owner key + its sibling owner.json)
 ~/.x0x-skilltest/... named instances: ~/.x0x-<name>/
 <data_dir>/ api.port · api-token · contacts.json · history.db · mls_groups.bin · named_groups.json
             home.json (Home marker) · owner-cert-journal.jsonl · rider-tokens.json (hashed) · peers/bootstrap_cache.json

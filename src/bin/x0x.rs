@@ -26,7 +26,7 @@ use x0x::cli::{DaemonClient, OutputFormat};
 #[derive(Parser)]
 #[command(name = "x0x", version = x0x::VERSION, about = "x0x agent network — control a running x0xd daemon")]
 struct Cli {
-    /// Named instance to target (reads port from data dir). [dev]
+    /// Named instance to target (reads port + token from that instance's data dir).
     //
     // The clap field id MUST stay distinct from any subcommand's `name`
     // argument: a shared id collides under `global = true` and the
@@ -34,11 +34,12 @@ struct Cli {
     // would otherwise bleed into this instance selector and route the
     // command at a non-existent daemon instance. Keep the `--name` long flag
     // (established dev/multi-instance API) but bind it to `instance`.
-    #[arg(long = "name", global = true, hide = true)]
+    #[arg(long = "name", global = true)]
     instance: Option<String>,
 
-    /// Daemon API address override (default: auto-detect). [dev]
-    #[arg(long, global = true, hide = true, alias = "api-url")]
+    /// Daemon API address override, `host:port` or a full URL (default: auto-detect).
+    /// Pair with `X0X_API_TOKEN` when the target daemon's token is not in the local data dir.
+    #[arg(long, global = true, alias = "api-url")]
     api: Option<String>,
 
     /// Backward-compatible output format selector (`json` or `text`). [dev]
@@ -1716,8 +1717,28 @@ enum WsSub {
 
 // ── Main ────────────────────────────────────────────────────────────────
 
+/// #478: the Rust runtime starts with SIGPIPE ignored, so once an early-
+/// closing consumer (`x0x routes | head`) drops the read end every later
+/// `println!` fails with EPIPE and std aborts with "failed printing to
+/// stdout: Broken pipe" — a panic that hides the real output. Restore the
+/// conventional Unix disposition so the CLI exits silently instead. Network
+/// sockets are unaffected: std sends with `MSG_NOSIGNAL` (Linux) and sets
+/// `SO_NOSIGPIPE` (macOS/BSD) on every socket.
+#[cfg(unix)]
+fn reset_sigpipe_to_default() {
+    // SAFETY: `signal(2)` only swaps the process-wide SIGPIPE disposition to
+    // the kernel default; it touches no Rust-owned memory and runs once at
+    // startup before any output is written.
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
+    #[cfg(unix)]
+    reset_sigpipe_to_default();
+
     let cli = Cli::parse();
 
     let format = if cli.json || cli.format.as_deref() == Some("json") {

@@ -81,15 +81,50 @@ pub(in crate::server) async fn find_home(
     owner: &crate::identity::UserId,
 ) -> Option<(String, crate::groups::GroupInfo)> {
     let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-    let groups = state.named_groups.read().await;
-    groups
-        .iter()
-        .find(|(_, info)| {
-            info.home.is_some()
-                && is_home_policy(&info.policy, owner)
-                && info.has_active_member(&local_hex)
-        })
-        .map(|(id, info)| (id.clone(), info.clone()))
+    // #487 (code review r1 item 2): re-check the pending set AFTER the
+    // groups read — a join can insert the marker and publish the stub
+    // between a pre-read snapshot and the map acquisition (TOCTOU). The
+    // re-check closes the window: any stub published before the map read
+    // has its marker by then (pending-set-first ordering).
+    loop {
+        let pending_before: Vec<String> = {
+            let pending = state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
+        let groups = state.named_groups.read().await;
+        let found = groups
+            .iter()
+            .find(|(id, info)| {
+                !pending_before.iter().any(|p| p == id.as_str())
+                    && info.home.is_some()
+                    && is_home_policy(&info.policy, owner)
+                    && info.has_active_member(&local_hex)
+            })
+            .map(|(id, info)| (id.clone(), info.clone()));
+        let pending_after: Vec<String> = {
+            let pending = state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
+        // #487 (code review r2 item 4): compare set CONTENTS, not length —
+        // a concurrent removal+insertion can swap an id without growing
+        // the count. Sort for deterministic comparison (HashSet iteration
+        // is unordered).
+        let mut before_sorted = pending_before.clone();
+        before_sorted.sort();
+        let mut after_sorted = pending_after.clone();
+        after_sorted.sort();
+        if after_sorted == before_sorted {
+            return found;
+        }
+        // The pending set changed during the read: retry with a fresh
+        // snapshot.
+    }
 }
 
 /// A group that matches the full Home policy for `owner` whether or not the
@@ -432,14 +467,46 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
     //    complete its metadata + seal instead of minting a duplicate.
     let candidate: Option<String> = {
-        let groups = state.named_groups.read().await;
-        let mut matches: Vec<(&String, u64)> = groups
-            .iter()
-            .filter(|(_, info)| info.home.is_none() && is_home_candidate(info, &owner))
-            .map(|(id, info)| (id, info.created_at))
-            .collect();
-        matches.sort_by_key(|(_, created)| *created);
-        matches.first().map(|(id, _)| (*id).clone())
+        // #487: same durability rule + TOCTOU recheck as find_home — the
+        // pending-set snapshot is re-verified after the groups read
+        // (code review r2 item 4: the adoption path previously had no
+        // recheck and could stamp a newly published pending stub).
+        loop {
+            let pending_before: Vec<String> = {
+                let pending = state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.iter().cloned().collect()
+            };
+            let groups = state.named_groups.read().await;
+            let mut matches: Vec<(String, u64)> = groups
+                .iter()
+                .filter(|(id, info)| {
+                    !pending_before.iter().any(|p| p == id.as_str())
+                        && info.home.is_none()
+                        && is_home_candidate(info, &owner)
+                })
+                .map(|(id, info)| (id.clone(), info.created_at))
+                .collect();
+            matches.sort_by_key(|(_, created)| *created);
+            let candidate = matches.into_iter().next().map(|(id, _)| id);
+            let pending_after: Vec<String> = {
+                let pending = state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.iter().cloned().collect()
+            };
+            let mut before_sorted = pending_before.clone();
+            before_sorted.sort();
+            let mut after_sorted = pending_after.clone();
+            after_sorted.sort();
+            if after_sorted == before_sorted {
+                break candidate;
+            }
+            // Pending set changed during the read: retry.
+        }
     };
     if let Some(id) = candidate {
         tracing::info!(
