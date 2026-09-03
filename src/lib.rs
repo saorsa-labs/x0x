@@ -14532,6 +14532,7 @@ impl AgentBuilder {
         // endpoint's instance after node creation. `disable_peer_cache`
         // yields a session-only in-memory cache: nothing is loaded from
         // previous runs and nothing is written to disk.
+        let mut cache_dir_for_prune: Option<std::path::PathBuf> = None;
         let bootstrap_cache_config = if self.network_config.is_some() {
             let cache_dir = self.peer_cache_dir.unwrap_or_else(|| {
                 // Issue #456: honor X0X_HOME for the default cache dir.
@@ -14539,6 +14540,7 @@ impl AgentBuilder {
                     .unwrap_or_else(|| std::path::PathBuf::from("."))
                     .join("peers")
             });
+            cache_dir_for_prune = Some(cache_dir.clone());
             Some(
                 ant_quic::BootstrapCacheConfig::builder()
                     .cache_dir(cache_dir)
@@ -14648,7 +14650,6 @@ impl AgentBuilder {
         // reads and writes one instance. The endpoint runs maintenance —
         // do not start it again here.
         let bootstrap_cache = network.as_ref().and_then(|n| n.bootstrap_cache());
-
         // #484 (HS-E1 D2, x0x-side mitigation; durable fix ant-quic#269):
         // a daemon must never dial ITSELF. Our own signed announcement
         // can land in the persistent cache (self-observation at bind or a
@@ -14656,16 +14657,36 @@ impl AgentBuilder {
         // relay/candidate selection has no local-peer predicate — the
         // observed failure mode was this node selecting ITSELF as the
         // "optimized relay". Remove any self entry now, post-load.
+        // Design r2 item 7: ant-quic's remove() is memory-only and its
+        // save() refuses to write below min_peers_to_save (we configure
+        // 1), so a self-only cache would REAPPEAR from disk after the
+        // next restart — when the prune empties the cache, also unlink
+        // the persisted file directly (x0x owns the cache dir).
         if let (Some(cache), Some(node)) = (bootstrap_cache.as_ref(), network.as_ref()) {
             let own_peer_id = ant_quic::PeerId(node.peer_id().0);
-            if let Some(removed) = cache.remove(&own_peer_id).await {
+            let pruned = cache.remove(&own_peer_id).await;
+            if pruned.is_some() {
+                let remaining = cache.peer_count().await;
                 tracing::info!(
-                    peer = %hex::encode(removed.peer_id.0),
+                    peer = %hex::encode(own_peer_id.0),
+                    remaining,
                     "#484: pruned self entry from the bootstrap cache (never self-dial)"
                 );
+                if remaining == 0 {
+                    if let Some(dir) = cache_dir_for_prune.as_deref() {
+                        let file = dir.join("bootstrap_cache.json");
+                        if let Err(e) = tokio::fs::remove_file(&file).await {
+                            if e.kind() != std::io::ErrorKind::NotFound {
+                                tracing::warn!(
+                                    path = %file.display(),
+                                    "#484: failed to remove the emptied bootstrap cache file: {e}"
+                                );
+                            }
+                        }
+                    }
+                }
             }
         }
-
         // Load the local revocation set now (shared Arc) so the relay-DM
         // listener can enforce revocation on inbound relayed envelopes. The
         // same Arc is moved into the Agent below, so the listener and the

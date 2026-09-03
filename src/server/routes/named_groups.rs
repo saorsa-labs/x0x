@@ -3367,7 +3367,7 @@ async fn try_adopt_member_added_across_gap(
     // terminal roster root, then the FULL state hash, to re-derive.
     let mut adopted = current.clone();
     adopted.apply_reconstructed_roster(&roster);
-    adopted.roster_revision = revision.max(adopted.roster_revision);
+    adopted.roster_revision = adopt_roster_revision(adopted.roster_revision, revision);
     adopted.add_member(
         agent_id.to_string(),
         x0x::groups::GroupRole::Member,
@@ -4193,9 +4193,9 @@ async fn rebind_envelope_for(
     Ok(Some(rebound_bytes))
 }
 
-/// #457 r4: after a journaled rebind applies, restore the repaired group
-/// into the live map (arm-2 repair) so the secure plane is available
-/// immediately, not only after the next restart.
+// #457 r4: after a journaled rebind applies, restore the repaired group
+// into the live map (arm-2 repair) so the secure plane is available
+// immediately, not only after the next restart.
 async fn rebind_restore_live_group(state: &AppState, group_id: &str) {
     if state.treekem_groups.read().await.contains_key(group_id) {
         return;
@@ -4610,6 +4610,15 @@ fn authorized_treekem_membership_event_for_queue(
     }
 }
 
+/// #482 (design r2 item 1): adopt an incoming membership-event roster
+/// revision with a +1 CLAMP — `roster_revision` is not committed by the
+/// state hash, so an unclamped `max` would let a malicious event revision
+/// (e.g. u64::MAX on a self-leave) saturate the local clock. Legitimate
+/// catch-up replay is unaffected: replayed events arrive in order, each at
+/// most one step ahead of the previous.
+fn adopt_roster_revision(current: u64, event_revision: u64) -> u64 {
+    event_revision.min(current.saturating_add(1)).max(current)
+}
 fn treekem_state_frontier_gap_reason(
     info: &x0x::groups::GroupInfo,
     event: &NamedGroupMetadataEvent,
@@ -4628,18 +4637,24 @@ fn treekem_state_frontier_gap_reason(
     {
         return None;
     }
-    // #482: queue ONLY on a STATE-chain gap. The signed GroupStateCommit
-    // is the authoritative chain; the event's roster `revision` is minted
-    // from the AUTHOR's local roster clock, which can legitimately run
-    // ahead of ours (an InviteV4 stub seeds both clocks from
-    // base_state_revision, and authority-side join-request bookkeeping
-    // advances state without roster — so a joiner's roster clock stays
-    // inflated; membership application reconciles it with `max`). A
-    // state-adjacent, hash-linked event is applyable regardless of the
-    // roster clock; queueing on roster-ahead alone wedged verified
-    // self-leaves forever (the catch-up went only to the departed
-    // leaver). The hash-link check below still gates chain integrity.
-    if frontier.commit.revision > info.state_revision.saturating_add(1) {
+    // #482 (design r2 item 1): waive the ROSTER-clock gap ONLY for an
+    // authenticated SELF-leave (actor == target) on MemberRemoved — the
+    // exact wedge shape from HS-E1, where the leaver's roster clock ran
+    // ahead of ours because InviteV4 stubs seed both clocks from
+    // base_state_revision. A global waiver would let any member poison
+    // the roster clock (roster_revision is NOT committed by the state
+    // hash, so a u64::MAX event revision would saturate ours via max).
+    // The apply path clamps the adopted roster revision to local+1, so
+    // even a self-leave cannot inflate our clock arbitrarily.
+    let is_authenticated_self_leave = matches!(
+        event,
+        NamedGroupMetadataEvent::MemberRemoved { actor, agent_id, .. }
+            if actor.eq_ignore_ascii_case(agent_id)
+    );
+    if frontier.commit.revision > info.state_revision.saturating_add(1)
+        || (!is_authenticated_self_leave
+            && frontier.revision > info.roster_revision.saturating_add(1))
+    {
         return Some("revision_gap".to_string());
     }
     if frontier.commit.prev_state_hash.as_deref() != Some(info.state_hash.as_str()) {
@@ -6152,12 +6167,26 @@ async fn request_treekem_catchup_for_gap(
         // 2, deterministic order) — the event's author/sender may be the
         // departed leaver itself, which previously left the gap
         // unfillable.
+        // #482 (design r2 item 2): exclude local, the actor, the SENDER,
+        // and the removal/ban TARGET (for MemberRemoved/MemberBanned the
+        // target is departing/unreachable — a wasted redundancy slot).
+        let event_target_hex = match event {
+            NamedGroupMetadataEvent::MemberRemoved { agent_id, .. }
+            | NamedGroupMetadataEvent::MemberBanned { agent_id, .. } => {
+                Some(agent_id.to_ascii_lowercase())
+            }
+            _ => None,
+        };
+        let sender_hex_pre = hex::encode(sender.as_bytes());
         let mut others: Vec<AgentId> = info
             .active_members()
             .filter_map(|member| parse_agent_id_hex(&member.agent_id).ok())
             .filter(|peer| {
                 let hex = hex::encode(peer.as_bytes());
-                hex != local_agent_hex && !frontier.actor.eq_ignore_ascii_case(hex.as_str())
+                hex != local_agent_hex
+                    && hex != sender_hex_pre
+                    && !frontier.actor.eq_ignore_ascii_case(hex.as_str())
+                    && event_target_hex.as_deref() != Some(hex.as_str())
             })
             .collect();
         others.sort_by_key(|peer| hex::encode(peer.as_bytes()));
@@ -7977,7 +8006,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.add_member(
                         agent_id.clone(),
                         x0x::groups::GroupRole::Member,
@@ -8381,7 +8410,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 action_kind,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.remove_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -8520,7 +8549,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.updated_at = commit.committed_at;
                 },
             )
@@ -8651,7 +8680,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.set_member_role(&agent_id, role);
                 },
             )
@@ -8708,7 +8737,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.ban_member(&agent_id, Some(actor.clone()));
                     if let Some((_, epoch)) = treekem_payload.as_ref() {
                         next.secret_epoch = *epoch;
@@ -8817,7 +8846,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     if next.secure_plane == x0x::mls::SecureGroupPlane::TreeKem {
                         if let Some(member) = next.members_v2.get_mut(&agent_id) {
                             member.state = x0x::groups::GroupMemberState::Removed;
@@ -9064,7 +9093,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                         req.reviewed_by = Some(actor.clone());
                         req.reviewed_at = Some(now_ms);
                     }
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.add_member(
                         requester_agent_id.clone(),
                         x0x::groups::GroupRole::Member,
@@ -9387,7 +9416,7 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
                 roster_lock_already_held,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     if let Some(n) = name.clone() {
                         next.name = n;
                     }
@@ -13522,17 +13551,22 @@ pub(in crate::server) async fn join_group_via_invite(
                 // #458 r4: the stub insert AND its exclusion marker are
                 // ONE atomic step under the persistence lock — the stub is
                 // never visible to a serializer without its marker.
+                // #487 (design r2 item 5): the pending-set insertion runs
+                // FIRST — find_home/adoption readers do NOT take the
+                // persistence lock, so publishing the map entry before
+                // its marker opens a window where a non-durable stub is
+                // "found" as the Home.
                 let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-                state
-                    .named_groups
-                    .write()
-                    .await
-                    .insert(group_id_hex.clone(), info.clone());
                 state
                     .pending_join_stubs
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .insert(group_id_hex.clone());
+                state
+                    .named_groups
+                    .write()
+                    .await
+                    .insert(group_id_hex.clone(), info.clone());
             }
             drop(membership_guard);
             ensure_named_group_listeners(Arc::clone(&state), &group_id_hex).await;
@@ -15422,6 +15456,24 @@ async fn leave_treekem_group(
     let commit = match seal_commit_owner_certified(&state, &mut next, signing_kp, now_ms).await {
         Ok(c) => c,
         Err(e) => {
+            // #483 (design r2 item 3): the SAME typed mapping as the
+            // non-TreeKEM arm — pending-certificate is a retryable 409,
+            // not a server error.
+            if matches!(
+                e,
+                x0x::groups::state_commit::ApplyError::OwnerCertMemberPending { .. }
+            ) {
+                return (
+                    StatusCode::CONFLICT,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "error": format!(
+                            "owner-certified group has members pending certificate resolution; \
+                             retry the leave once evidence converges: {e}"
+                        ),
+                    })),
+                );
+            }
             return (
                 StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({ "ok": false, "error": format!("seal failed: {e}") })),
@@ -16931,8 +16983,20 @@ pub(in crate::server) async fn hydrate_digest_only_seats_at_seat_time(
     if digest_only.is_empty() {
         return 0;
     }
-    let refs: Vec<&str> = digest_only.iter().map(String::as_str).collect();
-    let evidence = owner_cert_evidence_for(state, &refs).await;
+    // #483 (design r2 item 4): use the DIGEST-AWARE builder so the
+    // durable announce-blob cache can resolve seats even when the
+    // session-only discovery map has no entry (post-restart shape).
+    let with_digests: Vec<(String, Option<String>)> = digest_only
+        .iter()
+        .map(|member| {
+            let digest = info
+                .members_v2
+                .get(member.as_str())
+                .and_then(|seat| seat.certificate_digest.clone());
+            (member.clone(), digest)
+        })
+        .collect();
+    let evidence = owner_cert_evidence_for_with_digests(state, &with_digests).await;
     let pairs: Vec<(String, x0x::identity::AgentCertificate)> = digest_only
         .iter()
         .filter_map(|member| {
@@ -33579,7 +33643,7 @@ pub(in crate::server) mod tests {
                 &member_added,
                 x0x::groups::ActionKind::AdminOrHigher,
                 |next| {
-                    next.roster_revision = revision.max(next.roster_revision);
+                    next.roster_revision = adopt_roster_revision(next.roster_revision, revision);
                     next.add_member(
                         joiner_hex.clone(),
                         x0x::groups::GroupRole::Member,
