@@ -13115,16 +13115,6 @@ pub(in crate::server) async fn join_group_via_invite(
     if let Err(refusal) = invite.verify_v4_inviter_signature() {
         return refuse_invite(&state, &invite, refusal.reason());
     }
-    // Revocation of the inline inviter key (v7 F3: agent subject only —
-    // there is no user revocation subject; see the ADR-0016 amendment).
-    {
-        let revocation_set = state.agent.revocation_set();
-        let revoked = revocation_set.read().await;
-        if revoked.is_agent_revoked(&inviter_agent) {
-            drop(revoked);
-            return refuse_invite(&state, &invite, "inviter_key_revoked");
-        }
-    }
     // caps (r1 Codex 10): caps are enforced at JOIN too — every trusted
     // field, not just at mint. r3 (Codex 10) adds the Home-metadata
     // bounds: `base_home` is attacker-sized invite-carried data that
