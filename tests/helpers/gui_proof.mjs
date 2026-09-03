@@ -1,5 +1,18 @@
-import { chromium } from 'playwright-core';
 import { existsSync } from 'node:fs';
+
+// #480 H3: playwright-core is a devDependency pinned in the root
+// package.json. Resolve it explicitly so a fresh worktree gets a one-line
+// reason and a distinct exit code (3) instead of a raw ERR_MODULE_NOT_FOUND.
+let chromium;
+try {
+  ({ chromium } = await import('playwright-core'));
+} catch (err) {
+  if (err && err.code === 'ERR_MODULE_NOT_FOUND') {
+    console.error('gui_proof.mjs: playwright-core is not installed — run `npm ci` in the repo root (package.json pins it)');
+    process.exit(3);
+  }
+  throw err;
+}
 
 const [, , mode, ...args] = process.argv;
 

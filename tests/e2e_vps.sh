@@ -105,28 +105,30 @@ a_is_live() {
 }
 
 # ── Load tokens ──────────────────────────────────────────────────────────
-if [ -f "$SCRIPT_DIR/.vps-tokens.env" ]; then
-    echo "Loading tokens from .vps-tokens.env..."
-    # [migrated 2026-05-16] tokens loaded by x0x-network.sh preamble
-    [ -n "${NYC_TK:-}" ] && NODE_TOKENS[nyc]="$NYC_TK"
-    [ -n "${SFO_TK:-}" ] && NODE_TOKENS[sfo]="$SFO_TK"
-    [ -n "${HELSINKI_TK:-}" ] && NODE_TOKENS[helsinki]="$HELSINKI_TK"
-    [ -n "${NUREMBERG_TK:-}" ] && NODE_TOKENS[nuremberg]="$NUREMBERG_TK"
-    [ -n "${SINGAPORE_TK:-}" ] && NODE_TOKENS[singapore]="$SINGAPORE_TK"
-    [ -n "${SYDNEY_TK:-}" ] && NODE_TOKENS[sydney]="$SYDNEY_TK"
+# #480 H1: tokens come ONLY from the network-scoped file picked by
+# x0x-network.sh ($X0X_TOKEN_FILE = tests/.vps-tokens-<network>.env, written
+# by tests/e2e_deploy.sh) and re-exported as NYC_TK/SFO_TK/... by the
+# x0x_export_legacy_token_vars preamble above. There is deliberately NO SSH
+# fallback: the on-host token paths belong to the PROD daemon, and reading
+# them while targeting the testnet API port turned every call into a
+# curl_failed FAIL. A node without a token is skipped loudly instead.
+if [ ! -f "$X0X_TOKEN_FILE" ]; then
+    echo -e "${RED}Token file $X0X_TOKEN_FILE not found for network '$X0X_NETWORK'.${NC}"
+    echo -e "${RED}Run: bash tests/e2e_deploy.sh --network $X0X_NETWORK   (writes the tokens), then retry.${NC}"
+    exit 1
 fi
+echo "Loading tokens from $(basename "$X0X_TOKEN_FILE") (network: $X0X_NETWORK)..."
+[ -n "${NYC_TK:-}" ] && NODE_TOKENS[nyc]="$NYC_TK"
+[ -n "${SFO_TK:-}" ] && NODE_TOKENS[sfo]="$SFO_TK"
+[ -n "${HELSINKI_TK:-}" ] && NODE_TOKENS[helsinki]="$HELSINKI_TK"
+[ -n "${NUREMBERG_TK:-}" ] && NODE_TOKENS[nuremberg]="$NUREMBERG_TK"
+[ -n "${SINGAPORE_TK:-}" ] && NODE_TOKENS[singapore]="$SINGAPORE_TK"
+[ -n "${SYDNEY_TK:-}" ] && NODE_TOKENS[sydney]="$SYDNEY_TK"
 
-# Fallback: read tokens via SSH
 for node in "${NODES[@]}"; do
     if [ -z "${NODE_TOKENS[$node]:-}" ]; then
-        ip="${NODE_IPS[$node]}"
-        tk=$(ssh -o ConnectTimeout=10 -o ControlMaster=no -o ControlPath=none -o BatchMode=yes \
-            root@"$ip" 'cat /root/.local/share/x0x/api-token 2>/dev/null || cat /var/lib/x0x/data/api-token 2>/dev/null' 2>/dev/null || echo "")
-        if [ -n "$tk" ]; then
-            NODE_TOKENS[$node]="$tk"
-        else
-            echo -e "${RED}Cannot get token for $node ($ip)${NC}"
-        fi
+        node_upper="$(echo "$node" | tr '[:lower:]' '[:upper:]')"
+        echo -e "${RED}No ${X0X_TOKEN_VAR_PREFIX}_${node_upper}_TK in $X0X_TOKEN_FILE — $node will be skipped (not reading on-host prod tokens).${NC}"
     fi
 done
 
@@ -525,7 +527,19 @@ ${CYAN}[10/20] GUI Interface Proof${NC}"
 NYC_IP="${NODE_IPS[nyc]}"; NYC_TK="${NODE_TOKENS[nyc]:-}"
 HEL_IP="${NODE_IPS[helsinki]}"; HEL_TK="${NODE_TOKENS[helsinki]:-}"
 HEL_AID="${NODE_AIDS[helsinki]:-}"
-if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
+# #480 H3: the browser proof needs node + playwright-core (pinned in the
+# root package.json; `npm ci` there installs it). Preflight so a missing
+# module is an explicit SKIP with the reason, not two FAILs whose
+# ERR_MODULE_NOT_FOUND stderr was thrown away.
+GUI_PROOF_SKIP_REASON=""
+if ! command -v node >/dev/null 2>&1; then
+    GUI_PROOF_SKIP_REASON="node not on PATH"
+elif ! (cd "$(dirname "$GUI_PROOF")" && node -e "require.resolve('playwright-core')" >/dev/null 2>&1); then
+    GUI_PROOF_SKIP_REASON="playwright-core not installed (run: npm ci in $ROOT_DIR)"
+fi
+if [ -n "$GUI_PROOF_SKIP_REASON" ]; then
+    skip "GUI proof" "$GUI_PROOF_SKIP_REASON"
+elif [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]:-}" ]; then
     # Clawpatch 7fc6183 (critical security): /gui no longer injects the API
     # token into the served HTML. The GUI contract is now: unauthenticated
     # /gui answers 401; /gui?token=<SESSION> serves the chat UI with no token
@@ -556,7 +570,11 @@ if [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsinki]
     GUI_RECV_OUT="/tmp/x0x-vps-${PROOF_TOKEN}-gui-helsinki.sse"
     GUI_RECV_PID=$(start_remote_direct_listener "$HEL_IP" "$HEL_TK" "$GUI_RECV_OUT")
     GUI_MSG="GUI-${PROOF_TOKEN}-nyc-to-helsinki"
-    GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>/dev/null || echo '{"ok":false}')
+    GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>"$TMPDIR/gui_proof.stderr" || echo '{"ok":false}')
+    if [ -s "$TMPDIR/gui_proof.stderr" ]; then
+        echo -e "        ${YELLOW}gui_proof.mjs stderr:${NC}"
+        sed 's/^/        | /' "$TMPDIR/gui_proof.stderr" | head -20
+    fi
     check_contains "real GUI browser send visible locally" "$GUI_JSON" '"messageVisible":true'
     GUI_PAYLOAD_B64=$(jq_field "$GUI_JSON" "payloadB64")
     sleep 8
@@ -747,11 +765,23 @@ if [ -n "$NYC_TK" ]; then
                 check_json "Sydney group info" "$R" "members"
                 check_contains "Sydney space member list includes self" "$R" "$SYD_AID"
                 check_contains "Sydney space member display name persisted" "$R" "Sydney Space Tester"
-                R=$(vps_post "$NYC_IP" "$NYC_TK" "/groups/$NG/members" "{\"agent_id\":\"$SYD_AID\",\"display_name\":\"Sydney Space Tester\"}")
-                check_not_error "NYC adds Sydney to named-space roster" "$R"
-                R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")
+                # #480 H2: the invite join is committed by the authority (NYC)
+                # itself — MemberJoined is validated there and answered with
+                # an authority-signed MemberAdded — so Sydney is ALREADY on
+                # NYC's roster. A second POST /groups/:id/members answers
+                # 409 `member already present` (correct product behaviour);
+                # wait for the commit to land instead of re-adding.
+                SYD_ON_NYC_ROSTER=false
+                for _ in $(seq 1 20); do
+                    R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")
+                    if echo "$R" | grep -q "$SYD_AID"; then
+                        SYD_ON_NYC_ROSTER=true
+                        break
+                    fi
+                    sleep 1
+                done
                 check_json "NYC named-space members" "$R" "members"
-                check_contains "NYC named-space members include Sydney" "$R" "$SYD_AID"
+                check_true "NYC named-space members include Sydney (invite join committed, no re-add)" "$SYD_ON_NYC_ROSTER"
                 R=$(vps_del "$NYC_IP" "$NYC_TK" "/groups/$NG/members/$SYD_AID")
                 check_not_error "NYC removes Sydney from named-space roster" "$R"
                 R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")

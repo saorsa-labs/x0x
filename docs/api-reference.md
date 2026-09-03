@@ -588,6 +588,26 @@ except the local agent itself, which the lazy mint deliberately records as
 ≥-1-Roaming Home invariant. Placement *records* and their enforcement gates
 (identity ingest, DM inbox, forward, connect-send) are live.
 
+**`POST /agent/move` body** (`MoveAuthorizeRequest`):
+
+```json
+{
+  "agent_id": "<64-hex agent id>",
+  "to_machine": "<64-hex machine id>",
+  "placement": "roaming",
+  "pin": "<64-hex machine id, optional>"
+}
+```
+
+`placement` is `"roaming"` or `"pinned"`; when `"pinned"`, `pin` must equal
+`to_machine`. The JSON extractor runs *before* the ceremony gate, so a body
+with missing or mistyped fields answers a plain-text **422** (invalid JSON
+syntax 400, missing `Content-Type: application/json` 415) — only a
+well-formed body reaches the **501**. With the ceremony enabled the handler
+then answers `403` for a session token, `409` when there is no owner key /
+no mint / a move already in flight, and `400` on malformed ids or an
+illegal placement.
+
 Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
 placement ledger. **Binding revocation** is the permanent tombstone form of
 `POST /identity/revoke`: send **both** `agent_id` and `machine_id` (32-byte
@@ -956,9 +976,9 @@ helper API.
 | GET | `/groups/:id/members` | `x0x group members <group_id>` | List named-group members |
 | POST | `/groups/:id/members` | `x0x group add-member <group_id> <agent_id> [--display-name <n>] [--key-package <b64>]` | Admin-authored member add (propagates to subscribed peers). `--key-package` carries the base64 TreeKEM key package required for direct adds to encrypted groups |
 | DELETE | `/groups/:id/members/:agent_id` | `x0x group remove-member <group_id> <agent_id>` | Admin-authored member removal (propagates to subscribed peers) |
-| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group) |
+| POST | `/groups/:id/invite` | `x0x group invite <group_id>` | Generate a SIGNED v4 invite link. Body `{"expiry_secs":u64,"intended_joiner":"<64-hex agent id, optional>"}`. Owner-axis (Home-capable) groups additionally require the durable owner's loaded user key (else 409 `owner_key_unavailable`). Typed 413 `invite_too_large` (per-field caps + final encoded size; roster cap 20) and 429 `invite_cap_reached` (64 live unconsumed records/group). **Invites are single-use**: the link carries a one-time secret that the issuing daemon consumes on the first validated `MemberJoined` (before it publishes the authority-signed `MemberAdded`); a replayed link still passes the joiner-side signature checks, but the authority rejects its `MemberJoined` (`invite_secret_consumed`) and never seats it, so that join stays pending forever — mint a fresh invite instead. `expiry_secs` only bounds how long an *unconsumed* invite stays valid |
 | POST | `/groups/join` | `x0x group join <invite> [--display-name <n>] [--home --owner <hex>]` | Join via signed v4 invite. Body `{"invite":..., "display_name":..., "mode":"group"|"home", "expected_owner_user_id":"<64-hex>"}`. Typed 409 refusals: `invite_unsigned` (pre-v4), `invite_signature_invalid`, `inviter_key_mismatch|revoked`, `invite_base_inconsistent`, `invite_owner_countersignature_missing|invalid`, `invite_not_addressed_to_me`, and the mode matrix `use_home_mode` / `pin_requires_home_mode` / `home_mode_requires_pin` / `invite_downgraded` / `owner_mismatch`; unknown mode 400 |
-| PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name |
+| PUT | `/groups/:id/display-name` | `x0x group set-name <group_id> <name>` | Set your display name. Body `{"name":"<display name>"}` |
 | PATCH | `/groups/:id` | `x0x group update <group_id>` | Update name/description (admin-authored) |
 | PATCH | `/groups/:id/policy` | `x0x group policy <group_id>` | Update group policy (admin-authored) |
 | PATCH | `/groups/:id/members/:agent_id/role` | `x0x group set-role <group_id> <agent_id> <role>` | Assign `admin` or `member` (admin-authored) |
@@ -989,6 +1009,40 @@ helper API.
 | POST | `/groups/:id/secure/reseal` | `x0x group secure-reseal <group_id>` | Re-seal the current group shared secret to a named recipient (`SecureShareDelivered`-format envelope) |
 | POST | `/groups/secure/open-envelope` | `x0x group secure-open-envelope` | Attempt to open a `SecureShareDelivered` envelope with this daemon's KEM key (adversarial test) |
 | DELETE | `/groups/:id` | `x0x group leave <group_id>` | Leave the group by self-removing, for any rank. A sole-member leave deletes the group (`{"ok":true,"deleted":...}`); otherwise the last admin is blocked — promote another admin first or use `x0x group delete` |
+
+### `GET /groups/:id` — `invite_lineage`
+
+Alongside `name`, `policy`, `roster_revision`, `members`, `withdrawn` and
+`home`, the group-info response carries `invite_lineage`: the local
+invite-seat provenance for a group this daemon joined via a signed invite
+(#468 A5). It is `null` for groups this daemon created or was added to
+directly.
+
+```json
+"invite_lineage": {
+  "base_revision": 3,
+  "base_hash": "<hex state hash the invite committed to>",
+  "base_roster_root": "<hex roster root over the invite's projection at base_revision>",
+  "seated_at_revision": 4,
+  "corroborated": false,
+  "fork_evidence": {
+    "revision": 3,
+    "state_hash": "<hex of the alternate commit>",
+    "committed_by": "<64-hex admin agent id>",
+    "observed_at_ms": 1788091312000
+  }
+}
+```
+
+- `seated_at_revision` is **absent while the join is pending** — the stub
+  exists locally but this daemon's own `MemberAdded` seat has not been
+  observed in the chain yet.
+- `corroborated` — the seat was confirmed by a verified owner head
+  attestation (across-gap adoption under an `OwnerCertified` policy).
+- `fork_evidence` — absent until the first COMPLETE authenticated fork
+  (an alternate commit at a retained revision, signature-verified, committed
+  by an active admin in the retained base roster); first evidence wins and
+  replays do not overwrite it.
 
 ### Roles
 
@@ -1801,6 +1855,7 @@ Key counter fields (flattened into each group row):
 |---|---|---|
 | `messages_dropped_write_policy_violation` | Receiver | Inbound public messages rejected by the ingest pipeline for write-policy reasons (e.g. `MembersOnly` author not in `members_v2`). The canary for the join-roster-propagation regression: a spike here on the owner side after a joiner posts means `members_v2` is stale. |
 | `sends_rejected_write_policy` | Sender | Outgoing sends from this daemon rejected locally by a members-only write-access policy. A non-zero value means this daemon is absent from its own roster copy. Tracked separately so operators can distinguish "I cannot see joiners" from "I am missing from my own roster". |
+| `invites_refused_reasons` | Joiner / inviter | `{"<reason>": count}` map of signed-invite refusals for this group, keyed by the typed reason. Joiner-side (`POST /groups/join`): `invite_unsigned`, `invite_signature_invalid`, `inviter_key_mismatch`, `inviter_key_revoked`, `invite_owner_countersignature_missing`, `invite_owner_countersignature_invalid`, `invite_malformed`, plus the base/addressing/mode-matrix refusals the join route answers with 409. Inviter-side: `invite_not_addressed_to_joiner` when an addressed invite's `MemberJoined` arrives from a different agent (the secret is not consumed). **Omitted from the row while empty.** |
 
 ### `GET /diagnostics/connect`
 
