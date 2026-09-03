@@ -111,10 +111,19 @@ pub(in crate::server) async fn find_home(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             pending.iter().cloned().collect()
         };
-        if pending_after.len() <= pending_before.len() {
+        // #487 (code review r2 item 4): compare set CONTENTS, not length —
+        // a concurrent removal+insertion can swap an id without growing
+        // the count. Sort for deterministic comparison (HashSet iteration
+        // is unordered).
+        let mut before_sorted = pending_before.clone();
+        before_sorted.sort();
+        let mut after_sorted = pending_after.clone();
+        after_sorted.sort();
+        if after_sorted == before_sorted {
             return found;
         }
-        // New stubs appeared during the read: the snapshot may be stale.
+        // The pending set changed during the read: retry with a fresh
+        // snapshot.
     }
 }
 
@@ -458,28 +467,46 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
     //    stamp, or a failed stamp/persist). Adopt the OLDEST such group —
     //    complete its metadata + seal instead of minting a duplicate.
     let candidate: Option<String> = {
-        // #487: same durability rule as find_home — a pending join stub
-        // must not be adopted/stamped as this machine's Home. Guard is
-        // scoped before the await (Send futures).
-        let pending: Vec<String> = {
-            let pending = state
-                .pending_join_stubs
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            pending.iter().cloned().collect()
-        };
-        let groups = state.named_groups.read().await;
-        let mut matches: Vec<(String, u64)> = groups
-            .iter()
-            .filter(|(id, info)| {
-                !pending.iter().any(|p| p == id.as_str())
-                    && info.home.is_none()
-                    && is_home_candidate(info, &owner)
-            })
-            .map(|(id, info)| (id.clone(), info.created_at))
-            .collect();
-        matches.sort_by_key(|(_, created)| *created);
-        matches.into_iter().next().map(|(id, _)| id)
+        // #487: same durability rule + TOCTOU recheck as find_home — the
+        // pending-set snapshot is re-verified after the groups read
+        // (code review r2 item 4: the adoption path previously had no
+        // recheck and could stamp a newly published pending stub).
+        loop {
+            let pending_before: Vec<String> = {
+                let pending = state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.iter().cloned().collect()
+            };
+            let groups = state.named_groups.read().await;
+            let mut matches: Vec<(String, u64)> = groups
+                .iter()
+                .filter(|(id, info)| {
+                    !pending_before.iter().any(|p| p == id.as_str())
+                        && info.home.is_none()
+                        && is_home_candidate(info, &owner)
+                })
+                .map(|(id, info)| (id.clone(), info.created_at))
+                .collect();
+            matches.sort_by_key(|(_, created)| *created);
+            let candidate = matches.into_iter().next().map(|(id, _)| id);
+            let pending_after: Vec<String> = {
+                let pending = state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                pending.iter().cloned().collect()
+            };
+            let mut before_sorted = pending_before.clone();
+            before_sorted.sort();
+            let mut after_sorted = pending_after.clone();
+            after_sorted.sort();
+            if after_sorted == before_sorted {
+                break candidate;
+            }
+            // Pending set changed during the read: retry.
+        }
     };
     if let Some(id) = candidate {
         tracing::info!(

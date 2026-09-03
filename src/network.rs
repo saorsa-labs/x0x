@@ -2584,7 +2584,7 @@ impl NetworkNode {
         // fast-path below — a suppressed peer refuses even while a
         // transient transport winner exists, and never refreshes the
         // tombstone doing so.
-        self.dial_gated(&peer_id, "cached_peer")?;
+        self.dial_gated(&peer_id, "cached_peer").await?;
 
         // #484: never dial SELF from the cache — the observed failure had
         // this node redial its own cached entry (and select itself as an
@@ -2692,6 +2692,12 @@ impl NetworkNode {
         addr: SocketAddr,
         origin: &'static str,
     ) -> NetworkResult<AntPeerId> {
+        // #484 (code review r2 item 3): normalize v4-mapped addresses at
+        // the SHARED address-dial boundary — every caller (manual
+        // connect_addr, bootstrap dial_bootstrap, auto-connect) routes
+        // through here, before cache comparison, logging, dialing, and
+        // cache insertion.
+        let addr = normalize_v4_mapped_addr(addr);
         // Optional invariant-C skip: if this address already maps to a
         // suppressed cache entry, refuse pre-socket so the handshake
         // cannot write cache success (shared ant-quic BootstrapCache).
@@ -2787,7 +2793,7 @@ impl NetworkNode {
     /// Returns `NetworkError` if connection fails.
     pub async fn connect_peer(&self, peer_id: AntPeerId) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
-        self.dial_gated(&peer_id, "peer")?;
+        self.dial_gated(&peer_id, "peer").await?;
         let node = self.require_node().await?;
         let start = std::time::Instant::now();
         let peer_conn = node
@@ -2862,7 +2868,7 @@ impl NetworkNode {
         addrs: Vec<SocketAddr>,
     ) -> NetworkResult<(SocketAddr, AntPeerId)> {
         // Issue #292 invariant C: refuse pre-socket when the id is known.
-        self.dial_gated(&peer_id, "peer_with_addrs")?;
+        self.dial_gated(&peer_id, "peer_with_addrs").await?;
         // #484 (code review r1 item 4): normalize v4-mapped addresses at
         // this shared boundary — verified-announcement auto-connect and
         // every other addrs caller route through here.
@@ -3198,12 +3204,12 @@ impl NetworkNode {
         Ok(())
     }
 
-    fn dial_gated(&self, peer_id: &AntPeerId, origin: &'static str) -> NetworkResult<()> {
-        // #484 (code review r1 item 5): the SELF-refusal lives in the
-        // shared pre-dial choke point — every known-ID dial seam passes
-        // through here, so no boundary can bypass it.
+    async fn dial_gated(&self, peer_id: &AntPeerId, origin: &'static str) -> NetworkResult<()> {
+        // #484 (code review r2 item 1): async read — the previous
+        // blocking_read() panics inside the async runtime. The self-check
+        // is the shared pre-dial invariant (r1 item 5).
         {
-            let node_guard = self.node.blocking_read();
+            let node_guard = self.node.read().await;
             if let Some(node) = node_guard.as_ref() {
                 if node.peer_id() == *peer_id {
                     tracing::warn!(
@@ -3249,6 +3255,27 @@ impl NetworkNode {
         answered: &AntPeerId,
         origin: &'static str,
     ) -> NetworkResult<()> {
+        // #484 (code review r2 item 2): an address-only dial that ANSWERS
+        // as self must be rejected before bookkeeping — the pre-socket
+        // gate cannot know the id for address-only dials.
+        if node.peer_id() == *answered {
+            tracing::warn!(
+                target: "x0x::connect",
+                origin,
+                "#484: address-only dial answered as SELF; closing and refusing"
+            );
+            if let Err(e) = node.disconnect(answered).await {
+                tracing::debug!(
+                    target: "x0x::connect",
+                    origin,
+                    error = %e,
+                    "close of self-answered dial failed"
+                );
+            }
+            return Err(NetworkError::ConnectionFailed(format!(
+                "#484: dial answered as self; closed ({origin})"
+            )));
+        }
         if reconnect_suppression_is_live(self.reconnect_suppressions.as_ref(), answered.0) {
             tracing::warn!(
                 target: "x0x::connect",
@@ -4665,6 +4692,7 @@ impl saorsa_gossip_transport::GossipTransport for NetworkNode {
         // fast-path — a suppressed peer must not read as a successful
         // gossip dial even while a transient transport connection exists.
         self.dial_gated(&ant_peer, "eager_set")
+            .await
             .map_err(|e| anyhow::anyhow!("dial refused: {}", e))?;
 
         // Check if already connected
