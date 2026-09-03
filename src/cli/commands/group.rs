@@ -205,7 +205,12 @@ pub async fn join_status(client: &DaemonClient, group_id: &str) -> Result<()> {
 /// window closes; prints the typed refusal when one is recorded (#477).
 pub async fn join_wait(client: &DaemonClient, group_id: &str, seconds: u64) -> Result<()> {
     client.ensure_running().await?;
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    // #477 (r1 review item 11): checked — `Instant + Duration` panics on
+    // overflow; cap the wait at one day instead.
+    let wait = std::time::Duration::from_secs(seconds.min(86_400));
+    let Some(deadline) = std::time::Instant::now().checked_add(wait) else {
+        return Ok(());
+    };
     loop {
         let resp = client
             .get(&format!("/groups/{group_id}/join-status"))
