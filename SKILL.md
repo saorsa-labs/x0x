@@ -231,9 +231,14 @@ Home always keeps ≥1 agent placed `Roaming` so it is *designed* to follow the 
 `MemberAdded` commit from the Home authority, the join is a stub that is
 *not* written to `named_groups.json` (an unconfirmed join must never be
 recorded as durable). If the joining daemon restarts before that commit
-arrives, the pending join is gone — and the invite link cannot simply be
-replayed, because the authority consumes the invite's one-time secret on the
-first validated `MemberJoined`. Mint a **fresh** invite on the owner
+arrives, the pending join is gone. Do not replay the same link: the invite's
+one-time secret is consumed when the **authority validates the first
+`MemberJoined`** — after that, a replay fails `invite_secret_consumed`; if
+the authority has NOT validated it yet (event still in flight, or the
+authority itself restarted first) the secret is not yet burned, and a replay
+by an already-active member is refused earlier as an idempotent no-op
+rather than with a consumed-secret error. In every case the replay proves
+nothing about YOUR join — mint a **fresh** invite on the owner
 (`POST /groups/<home-gid>/invite`) and join again.
 
 **Each device makes its own Home (#449).** Two machines sharing one `user.key` currently provision two separate Homes; SyncV1 (§5.1) does not yet reconcile them. Treat Home as per-device until #449 lands.
@@ -559,7 +564,7 @@ Read-only snapshots: `/diagnostics/connectivity` (NodeStatus — UPnP, NAT, rela
 | `403 rider tokens are denied on this route` | deny-by-default rider scope (ADR-0039) | use a granted surface (`groups/:id/send`, `secure/encrypt`, `GET /history`) or act as the owner |
 | `403 ... Home must be delegated explicitly` | rider token's `groups` list lacks the Home gid (no implicit grant) | re-mint the token with the Home group id in `groups` (and in the signed capability) |
 | `409` on `/owner/*` or `/sync/*` | install has no owner key | `x0x user-id create`, restart daemon |
-| `404 no placement record cached` on `GET /owner/agents/:id/placement` (even ownerless) | that route has no owner gate — it only looks up the cached placement record, which exists after the lazy mint / a seen bundle | same fix as the 409 row on an ownerless install; on an owned install run `x0x owner placement` first (lazy mint), then retry |
+| `404 no placement record cached` on `GET /owner/agents/:id/placement` (even ownerless) | the route IS durable-owner gated (`403` for a session token) like every `/owner/*` surface, but after auth it performs no owner-key/mint-presence check — it only reads the cached placement record, which exists after the lazy mint / a seen bundle, on owned and ownerless installs alike | same fix as the 409 row on an ownerless install; on an owned install run `x0x owner placement` first (lazy mint), then retry |
 | `501` on `/agent/move*` | ceremony gated off in v1 | leave it off; placements don't move (founding Home agent is nominally Roaming, inert) |
 | Join then immediate post → `403 members-only` | membership commits asynchronously | poll `GET /groups/<gid>/members` until your id is `active` |
 | `sub-agent lacks the required roster role` | rider scope granted but sub-agent not a member | add the sub-agent to the group (TreeKEM adds need its key package) |

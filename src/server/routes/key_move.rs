@@ -91,9 +91,10 @@ pub(in crate::server) struct MoveAuthorizeRequest {
 /// enrolled KEM key is known, seal the export envelope + chain the
 /// `ExportReceipt` in the same call. The returned transfer bundle is the
 /// operator carriage to the target (`/agent/move/import`).
-///
-/// Returns `409` when no owner key, no mint exists, or a move is already
-/// in flight; `400` on malformed ids or an illegal placement.
+/// Returns `409` when no owner key, no mint exists, a move is already in
+/// flight, or a well-formed pinned placement has `pin != to_machine`
+/// (enforced inside `move_authorize`); `400` on malformed ids or an
+/// unparseable placement (unknown kind / `"pinned"` without a `pin`).
 pub(in crate::server) async fn agent_move_authorize(
     State(state): State<Arc<AppState>>,
     axum::extract::Extension(actor): axum::extract::Extension<

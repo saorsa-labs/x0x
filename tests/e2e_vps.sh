@@ -494,8 +494,11 @@ ${CYAN}[9/20] CLI Interface Proof (x0x direct send)${NC}"
 CLI_PAIRS=("nyc:helsinki" "sydney:sfo")
 for pair in "${CLI_PAIRS[@]}"; do
     src="${pair%%:*}"; dst="${pair##*:}"
-    src_ip="${NODE_IPS[$src]}"; src_tk="${NODE_TOKENS[$src]}"
+    src_ip="${NODE_IPS[$src]}"; src_tk="${NODE_TOKENS[$src]:-}"
     dst_ip="${NODE_IPS[$dst]}"; dst_tk="${NODE_TOKENS[$dst]:-}"; dst_aid="${NODE_AIDS[$dst]:-}"
+    # #480: under `set -u` an unset source token would abort the whole suite
+    # before its footer — guard it and count an explicit SKIP instead.
+    [ -z "$src_tk" ] && { skip "CLI ${NODE_LABELS[$src]}→${NODE_LABELS[$dst]}" "no token for source node ${NODE_LABELS[$src]}"; continue; }
     [ -z "$dst_aid" ] && { skip "CLI ${NODE_LABELS[$src]}→${NODE_LABELS[$dst]}" "no agent_id"; continue; }
     [ -z "${PAIR_CONNECTED[${src}_${dst}]:-}" ] && { skip "CLI ${NODE_LABELS[$src]}→${NODE_LABELS[$dst]}" "not connected"; continue; }
 
@@ -573,7 +576,10 @@ elif [ -n "$NYC_TK" ] && [ -n "$HEL_AID" ] && [ -n "${PAIR_CONNECTED[nyc_helsink
     GUI_JSON=$(GUI_SESSION_TOKEN="$GUI_SESSION" node "$GUI_PROOF" send-dm "http://127.0.0.1:22600" "$HEL_LINK" "$HEL_AID" "$GUI_MSG" 2>"$TMPDIR/gui_proof.stderr" || echo '{"ok":false}')
     if [ -s "$TMPDIR/gui_proof.stderr" ]; then
         echo -e "        ${YELLOW}gui_proof.mjs stderr:${NC}"
-        sed 's/^/        | /' "$TMPDIR/gui_proof.stderr" | head -20
+        # Review r1: Playwright navigation errors serialize the full URL,
+        # which carries the session token in ?token= — redact query tokens
+        # before echoing (SKILL.md: session tokens never reach logs).
+        sed -E "s/(token=)[^&\"' ]+/\\1<redacted>/g; s/^/        | /" "$TMPDIR/gui_proof.stderr" | head -20
     fi
     check_contains "real GUI browser send visible locally" "$GUI_JSON" '"messageVisible":true'
     GUI_PAYLOAD_B64=$(jq_field "$GUI_JSON" "payloadB64")
@@ -815,11 +821,34 @@ if [ -n "$NYC_TK" ]; then
                 fi
             fi
 
-            # Singapore joins to prove a second remote invite path still works.
-            SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"
-            if a_is_live singapore && [ -n "$SGP_TK" ]; then
-                R=$(vps_post "$SGP_IP" "$SGP_TK" /groups/join "{\"invite\":\"$INVITE\"}")
-                check_not_error "Singapore joins via invite" "$R"
+            # Review r1: the earlier invite's one-time secret was consumed by
+            # Sydney's validated MemberJoined, so a second remote join needs a
+            # FRESH invite (a replayed secret answers ok:true with
+            # pending_authority_commit locally and is then rejected
+            # invite_secret_consumed at the authority). And the joiner's
+            # ok:true alone proves nothing — poll the AUTHORITY's committed
+            # roster for Singapore's seat instead.
+            SGP_IP="${NODE_IPS[singapore]}"; SGP_TK="${NODE_TOKENS[singapore]:-}"; SGP_AID="${NODE_AIDS[singapore]:-}"
+            if a_is_live singapore && [ -n "$SGP_TK" ] && [ -n "$SGP_AID" ]; then
+                R=$(vps_post "$NYC_IP" "$NYC_TK" "/groups/$NG/invite")
+                check_not_error "generate fresh Singapore invite" "$R"
+                SGP_INVITE=$(jq_field "$R" "invite_link")
+                if [ -n "$SGP_INVITE" ]; then
+                    R=$(vps_post "$SGP_IP" "$SGP_TK" /groups/join "{\"invite\":\"$SGP_INVITE\"}")
+                    check_not_error "Singapore joins via fresh invite" "$R"
+                    SGP_ON_NYC_ROSTER=false
+                    for _ in $(seq 1 20); do
+                        R=$(vps_get "$NYC_IP" "$NYC_TK" "/groups/$NG/members")
+                        if echo "$R" | grep -q "$SGP_AID"; then
+                            SGP_ON_NYC_ROSTER=true
+                            break
+                        fi
+                        sleep 1
+                    done
+                    check_true "NYC named-space members include Singapore (authority-side committed seat)" "$SGP_ON_NYC_ROSTER"
+                else
+                    skip "Singapore fresh-invite join" "invite mint returned no link"
+                fi
             fi
         fi
 

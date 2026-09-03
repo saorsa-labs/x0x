@@ -135,8 +135,12 @@ async function runSendDm(baseUrl, cardLink, targetAgentId, message) {
 
 if (mode === 'send-dm') {
   if (args.length !== 4) usage();
+  // Playwright navigation errors serialize the full URL — including the
+  // ?token= session token from guiUrl(). Redact query tokens so a failure
+  // path can never print the credential (harness also redacts at echo time).
+  const redactTokens = (s) => String(s).replace(/([?&]token=)[^&\s'"]+/g, '$1<redacted>');
   runSendDm(args[0], args[1], args[2], args[3]).catch((err) => {
-    console.error(JSON.stringify({ ok: false, mode, error: String(err?.message || err) }));
+    console.error(JSON.stringify({ ok: false, mode, error: redactTokens(err?.message || err) }));
     process.exit(1);
   });
 } else {

@@ -604,9 +604,13 @@ except the local agent itself, which the lazy mint deliberately records as
 with missing or mistyped fields answers a plain-text **422** (invalid JSON
 syntax 400, missing `Content-Type: application/json` 415) — only a
 well-formed body reaches the **501**. With the ceremony enabled the handler
-then answers `403` for a session token, `409` when there is no owner key /
-no mint / a move already in flight, and `400` on malformed ids or an
-illegal placement.
+then answers `403` for a session token; `409` when there is no owner key /
+no mint / a move is already in flight / **or a well-formed pinned placement
+has `pin != to_machine`** (the equality is enforced inside
+`move_authorize`, whose errors map to `409` with
+`move authorization rejected: …`); and `400` on malformed ids or an
+unparseable placement (unknown `placement` kind, or `"pinned"` without a
+`pin`).
 
 Owned agents are `Pinned(MachineId)` or `Roaming` in an owner-signed
 placement ledger. **Binding revocation** is the permanent tombstone form of
