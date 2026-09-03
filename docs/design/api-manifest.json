@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 174,
+  "endpoint_count": 175,
   "endpoints": [
     {
       "category": "status",
@@ -2108,6 +2108,17 @@
             "required": false
           }
         ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "named-groups",
+      "cli_name": "group join-status",
+      "description": "Pending-join status with the typed terminal outcome (#477)",
+      "method": "GET",
+      "path": "/groups/:id/join-status",
+      "request": {
+        "fields": [],
         "kind": "fields"
       }
     },

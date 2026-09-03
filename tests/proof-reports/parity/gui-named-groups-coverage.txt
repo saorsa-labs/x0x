@@ -1,4 +1,4 @@
-# GUI named-groups parity report — 39 endpoints total
+# GUI named-groups parity report — 40 endpoints total
   WIRED     POST /groups
   WIRED     GET /groups
   WIRED     GET /groups/:id
@@ -11,6 +11,7 @@
   DEFERRED  GET /groups/:id/delegations  // agent-to-agent authority surface; exposed via CLI + REST, GUI manager deferred
   WIRED     POST /groups/:id/invite
   WIRED     POST /groups/join
+  DEFERRED  GET /groups/:id/join-status  // CLI/REST-first join-status surface; GUI join-progress panel deferred (#481)
   WIRED     PUT /groups/:id/display-name
   WIRED     DELETE /groups/:id
   WIRED     GET /groups/:id/state
@@ -39,4 +40,4 @@
   DEFERRED  POST /groups/:id/secure/reseal  // secure-plane primitive; server-side rekey on approve/ban
   DEFERRED  POST /groups/secure/open-envelope  // adversarial test endpoint, not a user-facing action
 
-Coverage: 25/39 wired; 14 deferred; 0 missing
+Coverage: 25/40 wired; 15 deferred; 0 missing
