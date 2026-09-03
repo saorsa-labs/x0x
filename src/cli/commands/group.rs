@@ -195,7 +195,7 @@ pub async fn join(
 pub async fn join_status(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.ensure_running().await?;
     let resp = client
-        .get(&format!("/groups/{group_id}/join-status"))
+        .get_with_error_body(&format!("/groups/{group_id}/join-status"))
         .await?;
     print_value(client.format(), &resp);
     Ok(())

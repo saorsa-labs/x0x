@@ -359,12 +359,18 @@ impl DaemonClient {
         } else {
             serde_json::from_str(&text).context("failed to parse response")?
         };
-        let mut body = body;
-        if let serde_json::Value::Object(map) = &mut body {
-            map.entry("status".to_string())
-                .or_insert(serde_json::Value::from(status.as_u16()));
+        // #477 (r3 item 5): ONLY 404 passes through with its body (the
+        // join-status terminal shape); every other non-2xx is an error so
+        // auth/server failures never print as terminal outcomes.
+        if status.is_success() || status.as_u16() == 404 {
+            let mut body = body;
+            if let serde_json::Value::Object(map) = &mut body {
+                map.entry("status".to_string())
+                    .or_insert(serde_json::Value::from(status.as_u16()));
+            }
+            return Ok(body);
         }
-        Ok(body)
+        Err(error_from_body(status, &body))
     }
 
     async fn handle_response(&self, resp: reqwest::Response) -> Result<serde_json::Value> {
