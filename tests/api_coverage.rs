@@ -348,6 +348,13 @@ const COVERED: &[CoveredEndpoint] = &[
         "/groups/join",
         d4_stateful_events_converge_via_signed_commits
     ),
+    // #477: the join-status route is covered by the wp_b_477 T-matrix
+    // (T7 drives the live terminal path; T10 the refused outcome shape).
+    covered!(
+        Get,
+        "/groups/:id/join-status",
+        "wp_b_t7_live_timeout_finalizes"
+    ),
     covered!(
         Put,
         "/groups/:id/display-name",
@@ -543,6 +550,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/home.rs",
         include_str!("../src/server/routes/home.rs"),
+    ),
+    // #477: the join-status route's coverage lives in the named_groups
+    // lib tests (the wp_b_477 T-matrix: T7 drives the live terminal path).
+    (
+        "src/server/routes/named_groups.rs",
+        include_str!("../src/server/routes/named_groups.rs"),
     ),
     (
         "src/server/routes/key_move.rs",
