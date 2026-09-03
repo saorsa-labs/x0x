@@ -2491,19 +2491,26 @@ async fn publish_named_group_metadata_event_with_envelope(
 /// Direct delivery is intentionally spawned in the background: failures are
 /// logged by the task and must not block metadata application, follow-up
 /// side-effects, or HTTP responses.
-pub(in crate::server) fn spawn_named_group_event_delivery(
+/// The direct-delivery future for one named-group event (no spawn): the
+/// recipient is validated and the payload serialized up front; `delay`
+/// sleeps before the send. Returns `None` when the event cannot be
+/// delivered at all (invalid recipient / unserializable event). #477 (r7
+/// item 2): attempt-owned callers wrap this future in their own
+/// currency-checked task instead of letting it spawn detached.
+fn named_group_event_delivery_future(
     state: &AppState,
     recipient_hex: &str,
     event: &NamedGroupMetadataEvent,
-) -> tokio::task::JoinHandle<()> {
+    label: &'static str,
+) -> Option<impl std::future::Future<Output = ()> + Send + 'static> {
     let recipient = match parse_agent_id_hex(recipient_hex) {
         Ok(id) => id,
         Err(e) => {
             tracing::warn!(
                 requester = %LogHexId::agent(&recipient_hex),
-                "cannot direct-deliver named-group event: invalid requester id: {e}"
+                "cannot {label}-direct-deliver named-group event: invalid requester id: {e}"
             );
-            return tokio::spawn(async {});
+            return None;
         }
     };
     #[cfg(test)]
@@ -2512,29 +2519,42 @@ pub(in crate::server) fn spawn_named_group_event_delivery(
             recipient_hex.to_string(),
             named_group_metadata_event_group_id(event).to_string(),
             named_group_metadata_event_kind(event),
-            "direct",
+            label,
         ));
     }
     let payload = match serde_json::to_vec(event) {
         Ok(bytes) => bytes,
         Err(e) => {
-            tracing::warn!("failed to serialize named-group event for direct delivery: {e}");
-            return tokio::spawn(async {});
+            tracing::warn!(
+                "failed to serialize named-group event for {label} direct delivery: {e}"
+            );
+            return None;
         }
     };
     let agent = Arc::clone(&state.agent);
     let requester = recipient_hex.to_string();
-    tokio::spawn(async move {
+    Some(async move {
         if let Err(e) = agent
             .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
             .await
         {
             tracing::warn!(
                 requester = %LogHexId::agent(&requester),
-                "failed to direct-deliver named-group review event: {e}"
+                "failed to {label}-direct-deliver named-group event: {e}"
             );
         }
     })
+}
+
+pub(in crate::server) fn spawn_named_group_event_delivery(
+    state: &AppState,
+    recipient_hex: &str,
+    event: &NamedGroupMetadataEvent,
+) -> tokio::task::JoinHandle<()> {
+    match named_group_event_delivery_future(state, recipient_hex, event, "direct") {
+        Some(delivery) => tokio::spawn(delivery),
+        None => tokio::spawn(async {}),
+    }
 }
 
 fn spawn_named_group_event_delivery_after(
@@ -2543,48 +2563,13 @@ fn spawn_named_group_event_delivery_after(
     event: &NamedGroupMetadataEvent,
     delay: Duration,
 ) -> tokio::task::JoinHandle<()> {
-    let recipient = match parse_agent_id_hex(recipient_hex) {
-        Ok(id) => id,
-        Err(e) => {
-            tracing::warn!(
-                requester = %LogHexId::agent(&recipient_hex),
-                "cannot delayed-direct-deliver named-group event: invalid requester id: {e}"
-            );
-            return tokio::spawn(async {});
-        }
-    };
-    #[cfg(test)]
-    if let Ok(mut rec) = NAMED_GROUP_DIRECT_DELIVERIES_FOR_TEST.lock() {
-        rec.push((
-            recipient_hex.to_string(),
-            named_group_metadata_event_group_id(event).to_string(),
-            named_group_metadata_event_kind(event),
-            "delayed",
-        ));
+    match named_group_event_delivery_future(state, recipient_hex, event, "delayed") {
+        Some(delivery) => tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            delivery.await;
+        }),
+        None => tokio::spawn(async {}),
     }
-    let payload = match serde_json::to_vec(event) {
-        Ok(bytes) => bytes,
-        Err(e) => {
-            tracing::warn!(
-                "failed to serialize named-group event for delayed direct delivery: {e}"
-            );
-            return tokio::spawn(async {});
-        }
-    };
-    let agent = Arc::clone(&state.agent);
-    let requester = recipient_hex.to_string();
-    tokio::spawn(async move {
-        tokio::time::sleep(delay).await;
-        if let Err(e) = agent
-            .send_direct_with_config(&recipient, payload, named_group_direct_delivery_config())
-            .await
-        {
-            tracing::warn!(
-                requester = %LogHexId::agent(&requester),
-                "failed to delayed-direct-deliver named-group event: {e}"
-            );
-        }
-    })
 }
 
 /// Active members plus `extra_recipients`, minus this node — the recipient set
@@ -8523,6 +8508,16 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             ) {
                 return ApplyMetadataResult::REJECTED;
             }
+            // #477 C5 (r6 item 2 → r7): this commit SEATED the local agent
+            // durably — finalize its pending join attempt HERE, while this
+            // apply's membership guard is still held (the point S of the
+            // design), so no delayed refusal/timeout can find a live
+            // attempt after the seat persisted. Bookkeeping only: the
+            // durable group and the authority caches are untouched.
+            if agent_id.eq_ignore_ascii_case(&local_agent_hex) {
+                finalize_seated_join_attempt_locked(state, &event_group_id_for_chain, &agent_id)
+                    .await;
+            }
             for (key, cached) in recovery_cache_entries {
                 cache_treekem_member_key_package(state, key, cached, true).await;
             }
@@ -10391,7 +10386,18 @@ pub(in crate::server) async fn apply_named_group_metadata_event_inner_serialized
             // view, never a refusal for a seated member).
             #[cfg(test)]
             join_apply_test_barrier::park(2).await;
-            stage_join_result(state, &event_group_id, &member_agent_id, event.clone()).await;
+            // #477 C4 (r7 item 6): the result supersedes ONLY the refusal
+            // staged for THIS attempt (the same signed bytes the authority
+            // just seated).
+            let seated_attempt_id = member_joined_event_attempt_id(&event_for_log);
+            stage_join_result(
+                state,
+                &event_group_id,
+                &member_agent_id,
+                event.clone(),
+                seated_attempt_id.as_deref(),
+            )
+            .await;
             publish_named_group_metadata_event(state, &metadata_topic, &event).await;
             remember_treekem_membership_event(state, &event).await;
             spawn_named_group_event_delivery_to_active_members(
@@ -10920,10 +10926,17 @@ pub(in crate::server) async fn get_group_join_status(
 /// terminal outcome), 404 WITH the outcome after a terminal finalize
 /// removed the stub.
 async fn join_status_body(state: &AppState, id: &str) -> (StatusCode, serde_json::Value) {
-    // #477 (r6 item 1): the read side takes the persistence lock so the
-    // status can never observe an intermediate install state (the
-    // install's single guarded step writes stub+marker+outcome+attempt
-    // under this same lock).
+    // #477 (r6 item 1 → r7 item 5): the read side takes the SAME locks in
+    // the SAME order as the install and the finalizers — the lookup-gated
+    // membership mutex (none for an unknown group, C7) then the
+    // persistence lock — so the status can never observe an intermediate
+    // install state, nor a finalize's group removal without its terminal
+    // outcome (both are written in one persistence-guarded step).
+    let membership_arc = group_membership_lock_for_known_group(state, id).await;
+    let _membership_guard = match &membership_arc {
+        Some(arc) => Some(arc.lock().await),
+        None => None,
+    };
     let _persistence_guard = state.named_groups_persistence_lock.lock().await;
     let (pending, outcome) = {
         let groups = state.named_groups.read().await;
@@ -13818,44 +13831,44 @@ pub(in crate::server) async fn join_group_via_invite(
                     let refire_secret = invite.invite_secret.clone();
                     let refire_treekem =
                         invite.secure_plane == Some(x0x::mls::SecureGroupPlane::TreeKem);
-                    // #477 (r5 item 4): when a REGISTERED attempt owns the
-                    // pending join, the refire wrapper is attempt-owned — a
-                    // terminal finalize aborts it (no post-finalize
-                    // transmission). A post-restart pending has no registry
-                    // entry; its legacy repair wrapper stays independent
-                    // (C8's deadline owner).
-                    let wrapper_owned = {
+                    // #477 (r5 item 4 → r7 item 2): when a REGISTERED
+                    // attempt owns the pending join, the refire wrapper is
+                    // attempt-owned — its registry slot is claimed and the
+                    // task spawned in ONE step while the membership guard
+                    // is STILL held (a finalizer cannot interleave), so it
+                    // can never transmit unowned. A post-restart pending
+                    // has no registry entry (empty attempt id): its legacy
+                    // repair wrapper spawns detached (C8's deadline owner).
+                    let owning_attempt_id = {
                         let attempts = state
                             .pending_join_attempts
                             .lock()
                             .unwrap_or_else(|poisoned| poisoned.into_inner());
-                        attempts.contains_key(&join_result_key(&refire_stable, &joiner_hex))
+                        attempts
+                            .get(&join_result_key(&refire_stable, &joiner_hex))
+                            .map(|entry| entry.attempt_id.clone())
+                            .unwrap_or_default()
                     };
                     drop(groups);
-                    // #477 (r6 item 4): spawn AND register the wrapper
-                    // while STILL holding the membership guard — a
-                    // finalizer cannot remove the attempt between the
-                    // ownership check and the registration, so the
-                    // wrapper can never transmit unowned.
-                    let refire_wrapper = tokio::spawn(async move {
-                        refire_pending_join_volley(
-                            &refire_state,
-                            &refire_group_id,
-                            refire_stable,
-                            &refire_inviter,
-                            refire_secret,
-                            refire_treekem,
-                        )
-                        .await;
-                    });
-                    if wrapper_owned {
-                        register_attempt_task(
-                            state.as_ref(),
-                            invite_stable_group_id,
-                            &joiner_hex,
-                            refire_wrapper,
-                        );
-                    }
+                    spawn_attempt_task_under_guard(
+                        state.as_ref(),
+                        invite_stable_group_id,
+                        &joiner_hex,
+                        &owning_attempt_id,
+                        AttemptTaskKind::Task,
+                        Some(&membership_guard),
+                        async move {
+                            refire_pending_join_volley(
+                                &refire_state,
+                                &refire_group_id,
+                                refire_stable,
+                                &refire_inviter,
+                                refire_secret,
+                                refire_treekem,
+                            )
+                            .await;
+                        },
+                    );
                     drop(membership_guard);
                 }
                 let confirmed = membership_state == "active";
@@ -14024,19 +14037,6 @@ pub(in crate::server) async fn join_group_via_invite(
                     "failed to sign the join announcement",
                 );
             };
-            // #477 (r6 item 1): the deferred legacy MLS group installs
-            // NOW — after the sign succeeded, still nothing else is
-            // visible — then the single persistence-locked install step
-            // below covers stub+marker+pin+outcome-clear+attempt.
-            if let Some(group) = deferred_mls_group.take() {
-                state
-                    .mls_groups
-                    .write()
-                    .await
-                    .insert(group_id_hex.clone(), group);
-                save_mls_groups(&state).await;
-            }
-
             // named_groups.json only becomes durable when the member's
             // own `MemberAdded` is observed in the chain (the apply path
             // persists at that point). Exception: when the invite's
@@ -14045,35 +14045,58 @@ pub(in crate::server) async fn join_group_via_invite(
             // leaving), the signed base IS the confirmation — keep the
             // durable write for that shape.
             //
-            // #477 (r5 item 1): the ENTIRE install is ONE
-            // persistence-locked critical section — stub + exclusion
-            // marker, the old terminal outcome clear, and the COMPLETE
-            // attempt (id, stored bytes, inviter key, fingerprint)
-            // become visible ATOMICALLY. The sign already succeeded
-            // above, and nothing below is fallible except the durable
-            // persist, so a failure leaves NOTHING installed (no stub,
-            // no marker, no attempt, no outcome clear): join-status can
-            // never observe the old terminal outcome after the stub is
-            // visible, and no separate second critical section exists
-            // for a concurrent refusal to race against.
+            // #477 (r5 item 1 → r7 item 1): the ENTIRE install is ONE
+            // membership→persistence critical section — stub + exclusion
+            // marker (or the durable base-seated record), the legacy MLS
+            // entry, the inviter pin, the old terminal outcome clear and
+            // the COMPLETE attempt (id, stored bytes, inviter key,
+            // fingerprint) become visible ATOMICALLY. The sign already
+            // succeeded above; the ONLY fallible step is the durable
+            // base-seated persist, and it runs FIRST: a non-durable
+            // outcome rolls back the record it inserted and returns 503
+            // with NOTHING installed (no group entry, no MLS entry, no
+            // marker, no pin, no attempt, no outcome clear). join-status
+            // reads under the same locks, so no intermediate install
+            // state is ever observable.
             let base_seats_joiner = info.has_active_member(&joiner_hex);
+            let installed_attempt_id = join_attempt_id_from_resend(&member_joined_resend);
             {
                 let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-                let shape_ok = if base_seats_joiner {
+                if base_seats_joiner {
                     // #468 A5: the signed base already seats the local
                     // joiner (self-rejoin shape) — the base IS the
                     // confirmation.
                     if let Some(lineage) = info.invite_lineage.as_mut() {
                         lineage.seated_at_revision = Some(info.state_revision);
                     }
-                    matches!(
-                        persist_named_groups_mutation_unlocked(&state, |groups| {
-                            groups.insert(group_id_hex.clone(), info.clone());
-                            true
-                        })
-                        .await,
-                        Ok(AtomicWriteOutcome::Durable)
-                    )
+                    let outcome = persist_named_groups_mutation_unlocked(&state, |groups| {
+                        groups.insert(group_id_hex.clone(), info.clone());
+                        true
+                    })
+                    .await;
+                    if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
+                        // ROLLBACK (r7 item 1): `NotReplaced`/`Err` were
+                        // already compare-and-restored by the persist
+                        // helper; `ReplacedNotDurable` deliberately leaves
+                        // the record visible in the live map (the file
+                        // replacement happened, its directory fsync did
+                        // not) — remove exactly the record this join
+                        // inserted (CAS on full record equality) so nothing
+                        // of the failed join survives. The durability flag
+                        // the helper raised makes the next save re-persist
+                        // the (now rolled-back) map before any other
+                        // mutation.
+                        {
+                            let mut groups = state.named_groups.write().await;
+                            if groups.get(&group_id_hex) == Some(&info) {
+                                groups.remove(&group_id_hex);
+                            }
+                        }
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "named-group state is not directory-durable",
+                        );
+                    }
                 } else {
                     // #458 r4: the stub insert AND its exclusion marker are
                     // ONE atomic step under the persistence lock — the stub is
@@ -14093,13 +14116,18 @@ pub(in crate::server) async fn join_group_via_invite(
                         .write()
                         .await
                         .insert(group_id_hex.clone(), info.clone());
-                    true
-                };
-                if !shape_ok {
-                    return api_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "named-group state is not directory-durable",
-                    );
+                }
+                // #477 (r6 item 1 → r7 item 1): the deferred legacy MLS
+                // entry installs INSIDE the transaction, AFTER the only
+                // fallible step — a persistence failure above never
+                // leaves an MLS object behind.
+                if let Some(group) = deferred_mls_group.take() {
+                    state
+                        .mls_groups
+                        .write()
+                        .await
+                        .insert(group_id_hex.clone(), group);
+                    save_mls_groups(&state).await;
                 }
                 // #477 (r5 item 3 + r6 item 1): the expected-inviter pin
                 // records INSIDE the same guarded step — a persistence
@@ -14116,7 +14144,6 @@ pub(in crate::server) async fn join_group_via_invite(
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner())
                     .remove(&group_id_hex);
-                let installed_attempt_id = join_attempt_id_from_resend(&member_joined_resend);
                 state
                     .pending_join_attempts
                     .lock()
@@ -14124,7 +14151,7 @@ pub(in crate::server) async fn join_group_via_invite(
                     .insert(
                         join_result_key(&stable_id_for_event, &joiner_hex),
                         PendingJoinAttempt {
-                            attempt_id: installed_attempt_id,
+                            attempt_id: installed_attempt_id.clone(),
                             local_group_key: group_id_hex.clone(),
                             invite_fingerprint: join_invite_fingerprint(&req.invite),
                             invite_group_id: stable_id_for_event.clone(),
@@ -14157,66 +14184,218 @@ pub(in crate::server) async fn join_group_via_invite(
                     entry.listener_token = Some(token);
                 }
             }
-            // #477 (r6 item 4): every attempt-spawned send is spawned AND
-            // registered while the membership guard is STILL held — a
-            // finalizer cannot remove the attempt between install and
-            // registration, so no delivery can start transmitting
-            // unowned. The network publishes themselves run AFTER the
-            // guard is released (they await up to the publish timeout).
+            // #477 (r6 item 4 → r7 item 2): EVERY attempt-owned task — the
+            // initial and delayed direct deliveries, the delayed replay,
+            // the join-result poll and the chat announcement — is spawned
+            // through the reserve-then-spawn helper while the membership
+            // guard is STILL held (the registry slot is claimed before
+            // the spawn; a finalizer cannot interleave), and each task
+            // re-checks attempt currency UNDER the membership lock before
+            // its first send. Only the handler's own initial publish runs
+            // after the guard is released (it awaits up to the publish
+            // timeout).
             let event = member_joined_resend.event.clone();
             // TreeKEM membership is order-sensitive: gossip remains the
             // broadcast path, but the join trigger must reach the inviter
             // reliably so they can produce the authoritative add commit.
-            // #477 (r4 item 4): every attempt-spawned send registers its
-            // handle in the attempt task set.
-            let initial_delivery =
-                spawn_named_group_event_delivery(&state, &invite.inviter, &event);
-            register_attempt_task(&state, &stable_id_for_event, &joiner_hex, initial_delivery);
-            let delayed_delivery = spawn_named_group_event_delivery_after(
-                &state,
-                &invite.inviter,
-                &event,
-                GROUP_BACKGROUND_PUBLISH_DELAY,
-            );
-            register_attempt_task(&state, &stable_id_for_event, &joiner_hex, delayed_delivery);
-            let state_for_replay = Arc::clone(&state);
-            let topic_for_replay = info.metadata_topic.clone();
-            let inviter_for_replay = invite.inviter.clone();
-            let event_for_replay = event.clone();
-            let replay_event_group_for_task = stable_id_for_event.clone();
-            let replay_member_for_task = joiner_hex.clone();
-            let replay_state_for_reg = Arc::clone(&state);
-            let replay_inner_event_group = replay_event_group_for_task.clone();
-            let replay_inner_member = replay_member_for_task.clone();
-            let replay_handle = tokio::spawn(async move {
-                tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
-                publish_named_group_metadata_event(
-                    &state_for_replay,
-                    &topic_for_replay,
-                    &event_for_replay,
-                )
-                .await;
-                // #477 (r4 item 4): the child delivery registers
-                // itself (the parent is aborted on finalize;
-                // the child outlives only when already spawned).
-                let child = spawn_named_group_event_delivery(
-                    &state_for_replay,
-                    &inviter_for_replay,
-                    &event_for_replay,
+            if let Some(delivery) =
+                named_group_event_delivery_future(&state, &invite.inviter, &event, "direct")
+            {
+                let owner_state = Arc::clone(&state);
+                let owner_group = group_id_hex.clone();
+                let owner_event_group = stable_id_for_event.clone();
+                let owner_member = joiner_hex.clone();
+                let owner_attempt = installed_attempt_id.clone();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &stable_id_for_event,
+                    &joiner_hex,
+                    &installed_attempt_id,
+                    AttemptTaskKind::Task,
+                    Some(&membership_guard),
+                    async move {
+                        if !join_attempt_is_current(
+                            &owner_state,
+                            &owner_group,
+                            &owner_event_group,
+                            &owner_member,
+                            &owner_attempt,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        delivery.await;
+                    },
                 );
-                register_attempt_task(
-                    &state_for_replay,
-                    &replay_inner_event_group,
-                    &replay_inner_member,
-                    child,
+            }
+            if let Some(delivery) =
+                named_group_event_delivery_future(&state, &invite.inviter, &event, "delayed")
+            {
+                let owner_state = Arc::clone(&state);
+                let owner_group = group_id_hex.clone();
+                let owner_event_group = stable_id_for_event.clone();
+                let owner_member = joiner_hex.clone();
+                let owner_attempt = installed_attempt_id.clone();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &stable_id_for_event,
+                    &joiner_hex,
+                    &installed_attempt_id,
+                    AttemptTaskKind::Task,
+                    Some(&membership_guard),
+                    async move {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                        if !join_attempt_is_current(
+                            &owner_state,
+                            &owner_group,
+                            &owner_event_group,
+                            &owner_member,
+                            &owner_attempt,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        delivery.await;
+                    },
                 );
+            }
+            // The delayed replay: re-publish on the metadata topic, then
+            // re-deliver directly (one owned task; no detached child).
+            if let Some(replay_delivery) =
+                named_group_event_delivery_future(&state, &invite.inviter, &event, "direct")
+            {
+                let owner_state = Arc::clone(&state);
+                let owner_group = group_id_hex.clone();
+                let owner_event_group = stable_id_for_event.clone();
+                let owner_member = joiner_hex.clone();
+                let owner_attempt = installed_attempt_id.clone();
+                let topic_for_replay = info.metadata_topic.clone();
+                let event_for_replay = event.clone();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &stable_id_for_event,
+                    &joiner_hex,
+                    &installed_attempt_id,
+                    AttemptTaskKind::Task,
+                    Some(&membership_guard),
+                    async move {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                        if !join_attempt_is_current(
+                            &owner_state,
+                            &owner_group,
+                            &owner_event_group,
+                            &owner_member,
+                            &owner_attempt,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        publish_named_group_metadata_event(
+                            &owner_state,
+                            &topic_for_replay,
+                            &event_for_replay,
+                        )
+                        .await;
+                        replay_delivery.await;
+                    },
+                );
+            }
+            // Poll the join authority for the authoritative join result.
+            // TreeKEM joins converge when the TreeKEM group is installed;
+            // non-TreeKEM joins converge once the local roster lists the
+            // joiner as an active member, repairing a MemberAdded commit
+            // missed during the join window (#297). The poll's FIRST
+            // iteration takes the membership lock itself, so it cannot
+            // fetch before this install releases the guard.
+            {
+                let poll_state = Arc::clone(&state);
+                let poll_group = group_id_hex.clone();
+                let poll_event_group = stable_id_for_event.clone();
+                let poll_member = joiner_hex.clone();
+                let poll_resend = member_joined_resend;
+                let poll_attempt = installed_attempt_id.clone();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &stable_id_for_event,
+                    &joiner_hex,
+                    &installed_attempt_id,
+                    AttemptTaskKind::Poll,
+                    Some(&membership_guard),
+                    async move {
+                        poll_join_result_until_membership_confirmed(
+                            poll_state,
+                            poll_group,
+                            poll_event_group,
+                            inviter,
+                            poll_member,
+                            invite_is_treekem,
+                            Some(poll_resend),
+                            poll_attempt,
+                        )
+                        .await;
+                    },
+                );
+            }
+            // Announce join on the chat topic so the inviter sees us —
+            // attempt-owned and delayed like every other background send.
+            let agent_hex = joiner_hex.clone();
+            let display = req
+                .display_name
+                .clone()
+                .unwrap_or_else(|| agent_hex[..8].to_string());
+            let announcement = serde_json::json!({
+                "type": "group_event",
+                "event": "joined",
+                "agent_id": agent_hex,
+                "display_name": display,
+                "group_id": group_id_hex,
+                "group_name": invite.group_name,
+                "ts": std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_secs(),
             });
-            register_attempt_task(
-                &replay_state_for_reg,
-                &replay_event_group_for_task,
-                &replay_member_for_task,
-                replay_handle,
-            );
+            {
+                let owner_state = Arc::clone(&state);
+                let owner_group = group_id_hex.clone();
+                let owner_event_group = stable_id_for_event.clone();
+                let owner_member = joiner_hex.clone();
+                let owner_attempt = installed_attempt_id.clone();
+                let chat_topic_for_join = chat_topic.clone();
+                let announcement_bytes = announcement.to_string().into_bytes();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &stable_id_for_event,
+                    &joiner_hex,
+                    &installed_attempt_id,
+                    AttemptTaskKind::Task,
+                    Some(&membership_guard),
+                    async move {
+                        tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
+                        if !join_attempt_is_current(
+                            &owner_state,
+                            &owner_group,
+                            &owner_event_group,
+                            &owner_member,
+                            &owner_attempt,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        if let Err(e) = owner_state
+                            .agent
+                            .publish(&chat_topic_for_join, announcement_bytes)
+                            .await
+                        {
+                            tracing::debug!(topic = %chat_topic_for_join, "join announcement publish failed: {e}");
+                        }
+                    },
+                );
+            }
             // The attempt is fully installed and every task is owned —
             // release the membership guard BEFORE the network work (the
             // publish below awaits up to the publish timeout).
@@ -14238,108 +14417,13 @@ pub(in crate::server) async fn join_group_via_invite(
                 );
                 // Publish twice: once immediately so the inviter gets it
                 // as soon as the metadata mesh covers them, then again
-                // after `GROUP_BACKGROUND_PUBLISH_DELAY` so members
-                // whose Plumtree links formed late still pick it up.
-                // The applier is idempotent (re-applying the same
-                // event for an already-active member is a no-op), so
-                // double-publish is safe.
+                // after `GROUP_BACKGROUND_PUBLISH_DELAY` (the owned replay
+                // task above) so members whose Plumtree links formed late
+                // still pick it up. The applier is idempotent
+                // (re-applying the same event for an already-active
+                // member is a no-op), so double-publish is safe.
                 publish_named_group_metadata_event(&state, &info.metadata_topic, &event).await;
             }
-            // Poll the join authority for the authoritative join result.
-            // TreeKEM joins converge when the TreeKEM group is installed;
-            // non-TreeKEM joins converge once the local roster lists the
-            // joiner as an active member, repairing a MemberAdded commit
-            // missed during the join window (#297).
-            let state_for_poll = Arc::clone(&state);
-            let group_id_for_poll = group_id_hex.clone();
-            let event_group_id_for_poll = info.stable_group_id().to_string();
-            let member_for_poll = joiner_hex.clone();
-            // #477: the attempt id binds this pending join — blake3 over
-            // the canonical MemberJoined bytes || raw signature (the
-            // authority recomputes the same value from what it verified).
-            let attempt_id_for_poll = join_attempt_id_from_resend(&member_joined_resend);
-            let poll_attempt_id = attempt_id_for_poll.clone();
-            let poll_event_group_id = event_group_id_for_poll.clone();
-            let poll_member = member_for_poll.clone();
-            let poll_state_inner = state_for_poll;
-            let poll_group_inner = group_id_for_poll;
-            let poll_event_inner = event_group_id_for_poll;
-            let poll_member_inner = member_for_poll;
-            let poll_resend_inner = member_joined_resend;
-            let poll_attempt_inner = attempt_id_for_poll;
-            let poll_handle = tokio::spawn(async move {
-                poll_join_result_until_membership_confirmed(
-                    poll_state_inner,
-                    poll_group_inner,
-                    poll_event_inner,
-                    inviter,
-                    poll_member_inner,
-                    invite_is_treekem,
-                    Some(poll_resend_inner),
-                    poll_attempt_inner,
-                )
-                .await;
-            });
-            if !poll_attempt_id.is_empty() {
-                // #477 (steer 1): the entry was installed COMPLETE under
-                // the guard above; this only attaches the poll handle.
-                // #477 (r5 item 4): if a finalizer removed the entry
-                // between install and attach, the orphan poll is ABORTED
-                // — never detached (no post-finalize fetching).
-                let mut attempts = state
-                    .pending_join_attempts
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match attempts.get_mut(&join_result_key(&poll_event_group_id, &poll_member)) {
-                    Some(entry) => entry.polls.push(poll_handle),
-                    None => poll_handle.abort(),
-                }
-            }
-
-            // Announce join on the chat topic so the inviter sees us —
-            // fire-and-forget. The result was already discarded pre-fix,
-            // and spawning keeps the handler responsive when the gossip
-            // publish path is slow under back-pressure.
-            let agent_hex = joiner_hex;
-            let display = req
-                .display_name
-                .clone()
-                .unwrap_or_else(|| agent_hex[..8].to_string());
-            let announcement = serde_json::json!({
-                "type": "group_event",
-                "event": "joined",
-                "agent_id": agent_hex,
-                "display_name": display,
-                "group_id": group_id_hex,
-                "group_name": invite.group_name,
-                "ts": std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default()
-                    .as_secs(),
-            });
-            let state_for_join = Arc::clone(&state);
-            let chat_topic_for_join = chat_topic.clone();
-            let announcement_bytes = announcement.to_string().into_bytes();
-            let announce_member = agent_hex.clone();
-            let announcement_task = tokio::spawn(async move {
-                tokio::time::sleep(GROUP_BACKGROUND_PUBLISH_DELAY).await;
-                if let Err(e) = state_for_join
-                    .agent
-                    .publish(&chat_topic_for_join, announcement_bytes)
-                    .await
-                {
-                    tracing::debug!(topic = %chat_topic_for_join, "join announcement publish failed: {e}");
-                }
-            });
-            // #477 (r5 item 4): the delayed announcement is
-            // attempt-owned — a terminal finalize aborts it (no
-            // post-finalize transmission).
-            register_attempt_task(
-                state.as_ref(),
-                &stable_id_for_event,
-                &announce_member,
-                announcement_task,
-            );
 
             (
                 StatusCode::OK,
@@ -26594,22 +26678,28 @@ fn clear_expected_join_result_inviter(state: &AppState, key: &str) {
     }
 }
 
+/// `attempt_id` (#477 C4, r7 item 6) is the attempt the seated
+/// `MemberJoined` belongs to: a successful staging removes ONLY the refusal
+/// staged for that exact `(group, member, attempt_id)` triple. A refusal
+/// staged for a DIFFERENT (newer) attempt is never erased by a late result
+/// from an older one.
 async fn stage_join_result(
     state: &AppState,
     group_id: &str,
     member_agent_id: &str,
     event: NamedGroupMetadataEvent,
+    attempt_id: Option<&str>,
 ) {
-    // #477: a successful staging SUPERSEDES any refusal staged for this
-    // member — results take precedence per attempt triple (any attempt id:
-    // a later success wins for the member).
-    {
+    if let Some(attempt_id) = attempt_id {
         let mut refusals = state
             .pending_join_refusals
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let prefix = format!("{group_id}:{member_agent_id}:");
-        refusals.retain(|k, _| !k.starts_with(&prefix));
+        refusals.remove(&join_refusal_refusal_key(
+            group_id,
+            member_agent_id,
+            attempt_id,
+        ));
     }
     let key = join_result_key(group_id, member_agent_id);
     let event_kind = named_group_metadata_event_kind(&event);
@@ -26698,11 +26788,14 @@ async fn stage_join_result(
 }
 
 /// #447/#458: re-fire a `MemberJoined` volley for a join whose local stub
-/// exists but whose authority commit never landed. Rebuilds the signed event
-/// from the still-unconsumed invite (a rejection never consumes the one-time
-/// secret), publishes both volley channels, and restarts the join-result
-/// poll. Called from the duplicate-join path in a spawned task — never under
-/// the membership lock (the poll's confirmation reads take it).
+/// exists but whose authority commit never landed. A REGISTERED attempt
+/// resends its STORED signed bytes unchanged (#477 W3); only an
+/// unregistered (post-restart) pending join rebuilds the signed event from
+/// the still-unconsumed invite. Publishes both volley channels and restarts
+/// the join-result poll. Called from the duplicate-join path in a spawned
+/// task — never under the membership lock (the poll's confirmation reads
+/// take it; this function takes it only briefly to reserve-then-spawn its
+/// children, r7 item 2).
 async fn refire_pending_join_volley(
     state: &Arc<AppState>,
     group_id_hex: &str,
@@ -26718,73 +26811,123 @@ async fn refire_pending_join_volley(
             return;
         }
     };
+    let agent_id = state.agent.agent_id();
+    let joiner_hex = hex::encode(agent_id.as_bytes());
     // #477 r2-3: a REGISTERED attempt owns the wire bytes — its stored
     // payload is resent UNCHANGED and NO signing happens. Only an
     // unregistered pending (post-restart shape) builds a fresh volley.
-    {
-        let agent_id = state.agent.agent_id();
-        let joiner = hex::encode(agent_id.as_bytes());
-        let stored = {
-            let attempts = state
-                .pending_join_attempts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            attempts
-                .get(&join_result_key(&stable_group_id, &joiner))
-                .and_then(|entry| entry.stored_resend.clone())
-        };
-        if let Some(resend) = stored {
-            tracing::info!(group_id = %group_id_hex, member = %joiner, "re-firing the STORED MemberJoined volley unchanged (#477 W3)");
-            publish_named_group_metadata_event(state, &resend.metadata_topic, &resend.event).await;
-            let direct_state = Arc::clone(state);
-            let direct_recipient = inviter;
-            let direct_payload = resend.payload.clone();
-            let direct_send = tokio::spawn(async move {
-                let _ = direct_state
-                    .agent
-                    .send_direct_with_config(
-                        &direct_recipient,
-                        direct_payload,
-                        named_group_direct_delivery_config(),
-                    )
-                    .await;
-            });
-            // #477 (r5 item 4): the stored-bytes refire's direct send is
-            // attempt-owned (aborted on finalize / when the entry is
-            // gone) — never detached.
-            register_attempt_task(state, &stable_group_id, &joiner, direct_send);
-            // #477 (r4 item 4): the refire poll runs under the STORED
-            // attempt's id (an empty id would read as an immediate
-            // supersession).
-            let refire_attempt_id = join_attempt_id_from_resend(&resend);
-            let refire_poll = tokio::spawn(poll_join_result_until_membership_confirmed(
-                Arc::clone(state),
-                group_id_hex.to_string(),
-                stable_group_id.clone(),
-                inviter,
-                joiner.clone(),
-                invite_is_treekem,
-                Some(resend),
-                refire_attempt_id,
-            ));
-            // #477 r2-8: the refire poll is OWNED by the registered
-            // attempt; if a finalizer won between spawn and attach the
-            // orphan poll is ABORTED, not detached (r5 item 4).
-            {
-                let mut attempts = state
-                    .pending_join_attempts
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
-                match attempts.get_mut(&join_result_key(&stable_group_id, &joiner)) {
-                    Some(entry) => entry.polls.push(refire_poll),
-                    None => refire_poll.abort(),
-                }
-            }
+    let stored = {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts
+            .get(&join_result_key(&stable_group_id, &joiner_hex))
+            .and_then(|entry| {
+                entry
+                    .stored_resend
+                    .clone()
+                    .map(|resend| (entry.attempt_id.clone(), resend))
+            })
+    };
+    if let Some((refire_attempt_id, resend)) = stored {
+        // #477 (r7 item 2): this wrapper is attempt-owned — currency is
+        // re-checked UNDER the membership lock before its first send.
+        if !join_attempt_is_current(
+            state,
+            group_id_hex,
+            &stable_group_id,
+            &joiner_hex,
+            &refire_attempt_id,
+        )
+        .await
+        {
             return;
         }
+        tracing::info!(group_id = %group_id_hex, member = %joiner_hex, "re-firing the STORED MemberJoined volley unchanged (#477 W3)");
+        publish_named_group_metadata_event(state, &resend.metadata_topic, &resend.event).await;
+        // Children (the direct resend + the refire poll): reserve-then-
+        // spawn under the membership guard so neither can outlive a
+        // finalize unregistered; both run under the STORED attempt's id
+        // (the same signed bytes ⇒ the same attempt).
+        let membership_arc = group_membership_lock_for_known_group(state, group_id_hex).await;
+        let membership_guard = match &membership_arc {
+            Some(arc) => Some(arc.lock().await),
+            None => None,
+        };
+        {
+            let direct_state = Arc::clone(state);
+            let direct_group = group_id_hex.to_string();
+            let direct_event_group = stable_group_id.clone();
+            let direct_member = joiner_hex.clone();
+            let direct_attempt = refire_attempt_id.clone();
+            let direct_recipient = inviter;
+            let direct_payload = resend.payload.clone();
+            spawn_attempt_task_under_guard(
+                state,
+                &stable_group_id,
+                &joiner_hex,
+                &refire_attempt_id,
+                AttemptTaskKind::Task,
+                membership_guard.as_ref(),
+                async move {
+                    if !join_attempt_is_current(
+                        &direct_state,
+                        &direct_group,
+                        &direct_event_group,
+                        &direct_member,
+                        &direct_attempt,
+                    )
+                    .await
+                    {
+                        return;
+                    }
+                    let _ = direct_state
+                        .agent
+                        .send_direct_with_config(
+                            &direct_recipient,
+                            direct_payload,
+                            named_group_direct_delivery_config(),
+                        )
+                        .await;
+                },
+            );
+        }
+        {
+            let poll_state = Arc::clone(state);
+            let poll_group = group_id_hex.to_string();
+            let poll_event_group = stable_group_id.clone();
+            let poll_member = joiner_hex.clone();
+            let poll_attempt = refire_attempt_id.clone();
+            spawn_attempt_task_under_guard(
+                state,
+                &stable_group_id,
+                &joiner_hex,
+                &refire_attempt_id,
+                AttemptTaskKind::Poll,
+                membership_guard.as_ref(),
+                async move {
+                    poll_join_result_until_membership_confirmed(
+                        poll_state,
+                        poll_group,
+                        poll_event_group,
+                        inviter,
+                        poll_member,
+                        invite_is_treekem,
+                        Some(resend),
+                        poll_attempt,
+                    )
+                    .await;
+                },
+            );
+        }
+        drop(membership_guard);
+        return;
     }
-    let agent_id = state.agent.agent_id();
-    let joiner_hex = hex::encode(agent_id.as_bytes());
+    // LEGACY (post-restart) shape: no registered attempt — rebuild the
+    // signed volley. Its children are unowned (empty attempt id) and spawn
+    // detached exactly as before #477 (C8's legacy deadline owner) unless
+    // a registered attempt has meanwhile claimed the key.
     let (metadata_topic, mls_group_id) = {
         let groups = state.named_groups.read().await;
         let Some(info) = groups.get(group_id_hex).or_else(|| {
@@ -26872,23 +27015,10 @@ async fn refire_pending_join_volley(
         join_result_key(&stable_group_id, &joiner_hex),
         inviter_hex.to_string(),
     );
-    // #477 W3: an EXISTING registered attempt owns the wire bytes — its
-    // STORED payload is resent unchanged; only an unregistered (e.g.
-    // post-restart) pending join falls back to a freshly built volley.
-    let rebuilt = MemberJoinedResend {
+    let resend = MemberJoinedResend {
         metadata_topic,
         event,
         payload,
-    };
-    let resend = {
-        let attempts = state
-            .pending_join_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        attempts
-            .get(&join_result_key(&stable_group_id, &joiner_hex))
-            .and_then(|entry| entry.stored_resend.clone())
-            .unwrap_or(rebuilt)
     };
     tracing::info!(
         group_id = %group_id_hex,
@@ -26896,70 +27026,55 @@ async fn refire_pending_join_volley(
         "re-firing MemberJoined volley for unconfirmed join (#447/#458)"
     );
     publish_named_group_metadata_event(state, &resend.metadata_topic, &resend.event).await;
-    let direct_state = Arc::clone(state);
-    let direct_recipient = inviter;
-    let direct_payload = resend.payload.clone();
-    let direct_send = tokio::spawn(async move {
-        let _ = direct_state
-            .agent
-            .send_direct_with_config(
-                &direct_recipient,
-                direct_payload,
-                named_group_direct_delivery_config(),
-            )
-            .await;
-    });
-    // #477 (r5 item 4): the rebuilt-volley direct send registers under
-    // the attempt when one exists (aborted on finalize); a post-restart
-    // pending has NO registry entry — its legacy repair send runs
-    // independent (C8's legacy deadline owner).
-    let direct_owned = {
-        let attempts = state
-            .pending_join_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        attempts.contains_key(&join_result_key(&stable_group_id, &joiner_hex))
-    };
-    if direct_owned {
-        register_attempt_task(state, &stable_group_id, &joiner_hex, direct_send);
-    }
-    // #477: the refire reuses the SAME signed bytes ⇒ the same attempt id
-    // (the stored-bytes resend contract).
-    let refire_attempt_id = join_attempt_id_from_resend(&resend);
-    if !refire_attempt_id.is_empty() {
-        let mut attempts = state
-            .pending_join_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        let key = join_result_key(&stable_group_id, &joiner_hex);
-        if let Some(existing) = attempts.get_mut(&key) {
-            // Same signed bytes ⇒ same attempt: preserve the pinned
-            // inviter key from the original install.
-            existing.attempt_id = refire_attempt_id.clone();
-        }
-    }
-    let refire_key = join_result_key(&stable_group_id, &joiner_hex);
-    let refire_poll = tokio::spawn(poll_join_result_until_membership_confirmed(
-        Arc::clone(state),
-        group_id_hex.to_string(),
-        stable_group_id,
-        inviter,
-        joiner_hex,
-        invite_is_treekem,
-        Some(resend),
-        refire_attempt_id,
-    ));
-    // #477 (r5 item 4): attach the poll when a registered attempt owns
-    // it; with NO entry (the post-restart legacy shape) the poll IS the
-    // deadline owner and must stay live (C8).
     {
-        let mut attempts = state
-            .pending_join_attempts
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if let Some(entry) = attempts.get_mut(&refire_key) {
-            entry.polls.push(refire_poll);
-        }
+        let direct_state = Arc::clone(state);
+        let direct_recipient = inviter;
+        let direct_payload = resend.payload.clone();
+        spawn_attempt_task_under_guard(
+            state,
+            &stable_group_id,
+            &joiner_hex,
+            "",
+            AttemptTaskKind::Task,
+            None,
+            async move {
+                let _ = direct_state
+                    .agent
+                    .send_direct_with_config(
+                        &direct_recipient,
+                        direct_payload,
+                        named_group_direct_delivery_config(),
+                    )
+                    .await;
+            },
+        );
+    }
+    {
+        let poll_state = Arc::clone(state);
+        let poll_group = group_id_hex.to_string();
+        let poll_event_group = stable_group_id.clone();
+        let poll_member = joiner_hex.clone();
+        spawn_attempt_task_under_guard(
+            state,
+            &stable_group_id,
+            &joiner_hex,
+            "",
+            AttemptTaskKind::Poll,
+            None,
+            async move {
+                poll_join_result_until_membership_confirmed(
+                    poll_state,
+                    poll_group,
+                    poll_event_group,
+                    inviter,
+                    poll_member,
+                    invite_is_treekem,
+                    Some(resend),
+                    String::new(),
+                )
+                .await;
+            },
+        );
     }
 }
 
@@ -27100,40 +27215,9 @@ async fn stage_join_refusal(
     event: &NamedGroupMetadataEvent,
     reason: JoinRefusalReason,
 ) {
-    let NamedGroupMetadataEvent::MemberJoined {
-        group_id: mls_group_id,
-        stable_group_id,
-        member_agent_id: joined_member,
-        member_public_key_b64,
-        role,
-        display_name,
-        inviter_agent_id,
-        invite_secret,
-        ts_ms,
-        treekem_key_package_b64,
-        signature_b64,
-        ..
-    } = event
-    else {
+    let Some(attempt_id) = member_joined_event_attempt_id(event) else {
         return;
     };
-    use base64::Engine as _;
-    let Ok(raw_sig) = BASE64.decode(signature_b64) else {
-        return;
-    };
-    let canonical = canonical_member_joined_bytes(
-        mls_group_id,
-        stable_id_of(stable_group_id.as_deref(), mls_group_id),
-        joined_member,
-        member_public_key_b64,
-        *role,
-        display_name.as_deref(),
-        inviter_agent_id,
-        invite_secret,
-        *ts_ms,
-        treekem_key_package_b64.as_deref(),
-    );
-    let attempt_id = member_joined_attempt_id(&canonical, &raw_sig);
     let signer_agent_id = hex::encode(state.agent.identity().agent_id().as_bytes());
     let digest =
         blake3::hash(format!("{signer_agent_id}:{attempt_id}:{}", reason.as_str()).as_bytes());
@@ -27315,20 +27399,86 @@ pub(in crate::server) enum JoinAttemptOutcome {
     TimedOut,
 }
 
+/// #477 C5 — the SEAT finalizer at the `MemberAdded` apply site (the
+/// caller holds the group's membership guard): whatever attempt is pending
+/// for `(event_group_id, member)` is finalized as `Seated` — its polls and
+/// tasks aborted, its pin cleared, its registry entry removed. Nothing
+/// else is touched (no terminal outcome, no group mutation).
+async fn finalize_seated_join_attempt_locked(
+    state: &AppState,
+    event_group_id: &str,
+    member_agent_id: &str,
+) {
+    let pending = {
+        let attempts = state
+            .pending_join_attempts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        attempts
+            .get(&join_result_key(event_group_id, member_agent_id))
+            .map(|entry| (entry.local_group_key.clone(), entry.attempt_id.clone()))
+    };
+    let Some((attempt_group_key, attempt_id)) = pending else {
+        return;
+    };
+    finalize_join_attempt(
+        state,
+        &attempt_group_key,
+        event_group_id,
+        member_agent_id,
+        &attempt_id,
+        JoinAttemptOutcome::Seated,
+        JoinFinalizeGuard::HeldByCaller,
+    )
+    .await;
+}
+
+/// #477 (r7 item 4) — what a finalizer call actually did. Callers count
+/// (refusal reasons, timeouts) ONLY on `Finalized`: a finalizer that lost
+/// to a durable seat, a newer attempt, or an earlier terminal outcome
+/// owned nothing and must not be observable in the counters.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(in crate::server) enum JoinFinalizeDisposition {
+    /// This call owned the attempt and performed the finalization.
+    Finalized,
+    /// Nothing owned, nothing mutated (seat won / duplicate / superseded).
+    NotApplicable,
+}
+
+/// #477 — how the finalizer obtains the group membership mutex.
+pub(in crate::server) enum JoinFinalizeGuard<'a> {
+    /// The caller acquired the (lookup-gated) guard and hands it over for
+    /// the whole critical section.
+    Owned(tokio::sync::MutexGuard<'a, ()>),
+    /// The caller ALREADY holds the group's membership mutex for the
+    /// duration of this call (the `MemberAdded` apply site — the guard is
+    /// the apply's own and cannot be moved).
+    HeldByCaller,
+    /// No local group resolves to this key (C7: unknown groups take no
+    /// lock) — the registry check alone decides ownership.
+    Unlocked,
+}
+
 /// #477 C5/C8 — COMPARE-AND-FINALIZE one pending-join attempt on the
 /// JOINER, under the membership mutex THE CALLER ALREADY HOLDS (r5 item
 /// 2: validation and finalization are ONE critical section — the
 /// Refused arm passes its guard straight through, so a seat finalizer
-/// can never interleave between acceptance and finalize). Under the
-/// guard, the live registry entry is compared by attempt id and the
-/// terminal outcome map acts as the finalizer idempotency key — a
-/// second finalizer (loser of the race) observes either a different
-/// attempt's entry or an existing terminal outcome and returns WITHOUT
-/// mutating anything. An ABSENT entry never authorizes a Refused
-/// (a seat that won the guard race removed it); only the TimedOut
-/// legacy deadline owner may finalize on absence, and only while the
-/// non-durable stub is still pending. Refused/TimedOut remove ONLY
-/// joiner-owned attempt state (the non-durable stub + marker, the
+/// can never interleave between acceptance and finalize).
+///
+/// r7 items 3/4/5 lock discipline: a Refused/TimedOut finalizer takes
+/// membership → persistence FIRST, then re-checks (a) that no durable
+/// seat exists for the member, (b) that no terminal outcome was already
+/// recorded and (c) that the registry entry is THIS attempt's, and only
+/// then mutates: the stub + marker removal AND the terminal-outcome write
+/// happen inside the SAME persistence-guarded step (join-status reads
+/// under the same locks, so it can never observe the group gone without
+/// its outcome). The finalizer's OWN task handle (the timeout owner is a
+/// registered poll) is deregistered, never aborted — aborting itself
+/// would cancel the cleanup at the next await. An ABSENT entry never
+/// authorizes a Refused (a seat that won the guard race removed it); only
+/// the TimedOut legacy deadline owner may finalize on absence, and only
+/// while the non-durable stub is still pending. Refused/TimedOut remove
+/// ONLY joiner-owned attempt state (the non-durable stub + marker, the
 /// inviter pin, every attempt-owned poll/task, the token-matching
 /// listener); authority caches are NEVER touched. Seated finalizes the
 /// bookkeeping only.
@@ -27339,8 +27489,8 @@ pub(in crate::server) async fn finalize_join_attempt(
     member_agent_id: &str,
     attempt_id: &str,
     outcome: JoinAttemptOutcome,
-    membership_guard: Option<tokio::sync::MutexGuard<'_, ()>>,
-) {
+    membership_guard: JoinFinalizeGuard<'_>,
+) -> JoinFinalizeDisposition {
     finalize_join_attempt_with_reason(
         state,
         local_group_key,
@@ -27362,17 +27512,30 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
     attempt_id: &str,
     outcome: JoinAttemptOutcome,
     reason: Option<&'static str>,
-    membership_guard: Option<tokio::sync::MutexGuard<'_, ()>>,
-) {
+    membership_guard: JoinFinalizeGuard<'_>,
+) -> JoinFinalizeDisposition {
     let expected_key = join_result_key(event_group_id, member_agent_id);
     // The caller holds the (lookup-gated) membership mutex — held for
     // this WHOLE critical section (#477 C7: unknown groups take no lock
-    // and pass None).
-    let _membership_guard = membership_guard;
-    // #477 (r6 item 2): a DURABLE SEAT always wins — if the local roster
-    // already seats the member actively, a delayed Refused or a TimedOut
-    // whose deadline expired before the seat landed must never record a
-    // terminal refusal outcome or tear the (now durable) group down.
+    // and pass `Unlocked`).
+    let _membership_guard = match membership_guard {
+        JoinFinalizeGuard::Owned(guard) => Some(guard),
+        JoinFinalizeGuard::HeldByCaller | JoinFinalizeGuard::Unlocked => None,
+    };
+    // #477 (r7 items 3/5): membership → persistence, acquired BEFORE any
+    // check or mutation for the terminal outcomes. Seated touches no
+    // group state (the apply site persisted the seat under its own
+    // persistence critical section) and takes no persistence lock.
+    let persistence_guard = if outcome == JoinAttemptOutcome::Seated {
+        None
+    } else {
+        Some(state.named_groups_persistence_lock.lock().await)
+    };
+    // #477 (r6 item 2, re-checked AFTER both locks per r7): a DURABLE
+    // SEAT always wins — if the local roster already seats the member
+    // actively, a delayed Refused or a TimedOut whose deadline expired
+    // before the seat landed must never record a terminal refusal
+    // outcome or tear the (now durable) group down.
     if outcome != JoinAttemptOutcome::Seated {
         let seated = {
             let groups = state.named_groups.read().await;
@@ -27387,11 +27550,11 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 "#477: a durable seat exists — {:?} finalize owns nothing (the seat wins)",
                 outcome
             );
-            return;
+            return JoinFinalizeDisposition::NotApplicable;
         }
     }
-    // Idempotency + ownership, ALL under the guard: a concurrent finalizer
-    // for this group cannot pass here until this one finishes.
+    // Idempotency + ownership, ALL under the guards: a concurrent
+    // finalizer for this group cannot pass here until this one finishes.
     {
         let outcomes = state
             .last_join_outcomes
@@ -27400,7 +27563,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         if outcomes.contains_key(local_group_key) && outcome != JoinAttemptOutcome::Seated {
             // A terminal outcome already exists: this finalize is a
             // duplicate (loser of the race) — own nothing, do nothing.
-            return;
+            return JoinFinalizeDisposition::NotApplicable;
         }
     }
     let (mut polls, mut tasks, listener_token) = {
@@ -27413,7 +27576,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
             .is_some_and(|entry| entry.attempt_id == attempt_id);
         if owned {
             let Some(mut entry) = attempts.remove(&expected_key) else {
-                return;
+                return JoinFinalizeDisposition::NotApplicable;
             };
             (
                 std::mem::take(&mut entry.polls),
@@ -27423,14 +27586,14 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         } else {
             match attempts.get(&expected_key) {
                 // A NEWER attempt owns the entry: this finalize owns NOTHING.
-                Some(_) => return,
+                Some(_) => return JoinFinalizeDisposition::NotApplicable,
                 None => match outcome {
                     // #477 (r5 item 2): an absent entry NEVER authorizes a
                     // refusal — the winning seat finalizer removed it; a
                     // delayed refusal must not overwrite the seat's result.
-                    JoinAttemptOutcome::Refused => return,
+                    JoinAttemptOutcome::Refused => return JoinFinalizeDisposition::NotApplicable,
                     // Seated bookkeeping with no entry: nothing to own.
-                    JoinAttemptOutcome::Seated => return,
+                    JoinAttemptOutcome::Seated => return JoinFinalizeDisposition::NotApplicable,
                     // TimedOut: the LEGACY (post-restart) deadline owner may
                     // still finalize — but ONLY while the non-durable stub is
                     // pending (a seat or a newer attempt otherwise owns the
@@ -27444,7 +27607,7 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                             stubs.contains(local_group_key)
                         };
                         if !stub_pending {
-                            return;
+                            return JoinFinalizeDisposition::NotApplicable;
                         }
                         (Vec::new(), Vec::new(), None)
                     }
@@ -27453,10 +27616,22 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
         }
     };
     clear_expected_join_result_inviter(state, &expected_key);
-    for poll in polls.drain(..).chain(tasks.drain(..)) {
-        poll.abort();
+    // #477 (r7 item 3): abort every owned poll/task EXCEPT the finalizer's
+    // own task — the timeout owner IS a registered poll whose handle sits
+    // in `polls`; aborting itself here would cancel the cleanup below at
+    // its next await. The own handle is simply dropped (deregistered).
+    let self_task_id = tokio::task::try_id();
+    for handle in polls.drain(..).chain(tasks.drain(..)) {
+        if self_task_id.is_some_and(|own| own == handle.id()) {
+            continue;
+        }
+        handle.abort();
     }
     if outcome != JoinAttemptOutcome::Seated {
+        let outcome_str = match outcome {
+            JoinAttemptOutcome::Refused => "refused",
+            _ => "timed_out",
+        };
         let stub_is_pending = {
             let stubs = state
                 .pending_join_stubs
@@ -27464,34 +27639,19 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
             stubs.contains(local_group_key)
         };
+        // #477 (r7 item 5): the stub/marker removal and the terminal
+        // outcome write are ONE persistence-guarded step (the guard was
+        // taken at the top of this function). A reader under the same
+        // lock observes either the pending stub (no outcome) or the
+        // 404-with-outcome shape — never a bare 404.
         if stub_is_pending {
-            {
-                let _persistence_guard = state.named_groups_persistence_lock.lock().await;
-                state.named_groups.write().await.remove(local_group_key);
-                state
-                    .pending_join_stubs
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner())
-                    .remove(local_group_key);
-            }
-            // J2: remove the listener ONLY when its registration token is
-            // still this attempt's (compare-AND-abort under the registry
-            // write lock — no TOCTOU).
-            if listener_token.is_some() {
-                stop_named_group_metadata_listener_if_token(
-                    state,
-                    local_group_key,
-                    listener_token.unwrap_or(0),
-                )
-                .await;
-            }
-            state.mls_groups.write().await.remove(local_group_key);
-            state.treekem_groups.write().await.remove(local_group_key);
+            state.named_groups.write().await.remove(local_group_key);
+            state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(local_group_key);
         }
-        let outcome_str = match outcome {
-            JoinAttemptOutcome::Refused => "refused",
-            _ => "timed_out",
-        };
         state
             .last_join_outcomes
             .lock()
@@ -27504,7 +27664,24 @@ pub(in crate::server) async fn finalize_join_attempt_with_reason(
                     finished_at_ms: now_millis_u64(),
                 },
             );
+        // #477 T8 (r7 item 5): park INSIDE the persistence-guarded
+        // terminal step so a concurrent join-status read is proven to
+        // block on the same lock instead of observing a torn state.
+        #[cfg(test)]
+        join_apply_test_barrier::park(3).await;
+        drop(persistence_guard);
+        if stub_is_pending {
+            // J2: remove the listener ONLY when its registration token is
+            // still this attempt's (compare-AND-abort under the registry
+            // write lock — no TOCTOU).
+            if let Some(token) = listener_token {
+                stop_named_group_metadata_listener_if_token(state, local_group_key, token).await;
+            }
+            state.mls_groups.write().await.remove(local_group_key);
+            state.treekem_groups.write().await.remove(local_group_key);
+        }
     }
+    JoinFinalizeDisposition::Finalized
 }
 
 #[cfg(test)]
@@ -27532,13 +27709,24 @@ mod join_apply_test_barrier {
     // Per-stage state: T4(a) and T4(b) arm DIFFERENT stages and may run
     // concurrently in one test binary — arming one must never disturb
     // the other (index 0 unused).
-    static ARMED: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
-    static RELEASED: [AtomicBool; 3] = [
+    static ARMED: [AtomicU8; 4] = [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ];
+    static RELEASED: [AtomicBool; 4] = [
+        AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
         AtomicBool::new(false),
     ];
-    static REACHED: [AtomicU8; 3] = [AtomicU8::new(0), AtomicU8::new(0), AtomicU8::new(0)];
+    static REACHED: [AtomicU8; 4] = [
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+        AtomicU8::new(0),
+    ];
 
     pub(super) fn arm(stage: u8) {
         let i = stage as usize;
@@ -27570,25 +27758,129 @@ mod join_apply_test_barrier {
     }
 }
 
-/// #477 (steer 4): register an attempt-owned task; no-op when the entry
-/// is gone (already finalized) — the task then runs to its natural end but
-/// nothing references it.
-fn register_attempt_task(
+/// #477 (r7 item 2) — which attempt-owned handle set a spawned task joins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AttemptTaskKind {
+    /// A join-result poll (the attempt's `polls` set).
+    Poll,
+    /// Any other attempt-owned send (the attempt's `tasks` set).
+    Task,
+}
+
+/// #477 (r7 item 2): test-only ledger of every attempt-owned handle the
+/// production spawn helper registered, keyed by attempt id — the abort
+/// proof for route-spawned tasks (`AbortHandle::is_finished`).
+#[cfg(test)]
+static ATTEMPT_TASK_HANDLES_FOR_TEST: StdMutex<Vec<(String, tokio::task::AbortHandle)>> =
+    StdMutex::new(Vec::new());
+
+/// #477 (r7 item 2): test-only count of join-result fetches actually
+/// handed to the transport by the poll loop.
+#[cfg(test)]
+static JOIN_FETCHES_SENT_FOR_TEST: StdMutex<Vec<(String, u64)>> = StdMutex::new(Vec::new());
+
+/// #477 (r7 item 2) — reserve-then-spawn: claim the attempt's registry
+/// slot and spawn in ONE step while the caller HOLDS the group's
+/// membership guard (`membership_guard` is the proof — `None` only when
+/// the lookup found no local group, in which case the registry check
+/// alone decides). A finalizer needs the same guard to remove the
+/// attempt, so between the currency check and the handle registration
+/// nothing can interleave: the task is either registered (and therefore
+/// aborted by any later finalize) or never spawned at all. Every task
+/// spawned this way re-checks `join_attempt_is_current` under the lock
+/// before its FIRST send.
+///
+/// Legacy (post-restart) work carries an EMPTY attempt id and is unowned:
+/// it spawns detached exactly as before #477 (C8's legacy deadline
+/// owner) unless a registered attempt now owns the key.
+fn spawn_attempt_task_under_guard<F>(
     state: &AppState,
     event_group_id: &str,
     member_agent_id: &str,
-    handle: tokio::task::JoinHandle<()>,
-) {
+    attempt_id: &str,
+    kind: AttemptTaskKind,
+    membership_guard: Option<&tokio::sync::MutexGuard<'_, ()>>,
+    task: F,
+) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let _proof_of_lock = membership_guard;
+    let key = join_result_key(event_group_id, member_agent_id);
     let mut attempts = state
         .pending_join_attempts
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match attempts.get_mut(&join_result_key(event_group_id, member_agent_id)) {
-        Some(entry) => entry.tasks.push(handle),
-        // Already finalized: no attempt owns this send — abort it so no
-        // post-finalize transmission can occur (r4 item 4).
-        None => handle.abort(),
+    if attempt_id.is_empty() {
+        if attempts.contains_key(&key) {
+            // A registered attempt owns this key: legacy work must not
+            // transmit on its behalf.
+            return false;
+        }
+        drop(attempts);
+        let _detached = tokio::spawn(task);
+        return true;
     }
+    let Some(entry) = attempts.get_mut(&key) else {
+        // Already finalized: nothing owns this send — never spawned.
+        return false;
+    };
+    if entry.attempt_id != attempt_id {
+        // A NEWER attempt owns the key.
+        return false;
+    }
+    // The slot is claimed (registry lock held): spawn and register.
+    let handle = tokio::spawn(task);
+    #[cfg(test)]
+    if let Ok(mut ledger) = ATTEMPT_TASK_HANDLES_FOR_TEST.lock() {
+        ledger.push((attempt_id.to_string(), handle.abort_handle()));
+    }
+    match kind {
+        AttemptTaskKind::Poll => entry.polls.push(handle),
+        AttemptTaskKind::Task => entry.tasks.push(handle),
+    }
+    true
+}
+
+/// #477 (r7 item 2) — the currency predicate under an ALREADY-HELD
+/// membership guard: a registered attempt is current iff the registry
+/// entry is still ITS OWN; legacy (empty-id) work is current iff no
+/// registered attempt owns the key.
+fn join_attempt_is_current_locked(state: &AppState, expected_key: &str, attempt_id: &str) -> bool {
+    let attempts = state
+        .pending_join_attempts
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match attempts.get(expected_key) {
+        None => attempt_id.is_empty(),
+        Some(entry) => !attempt_id.is_empty() && entry.attempt_id == attempt_id,
+    }
+}
+
+/// #477 (r7 item 2) — the per-task currency check every attempt-owned
+/// task runs UNDER the group's membership lock before its FIRST send. A
+/// registered attempt whose group is no longer locally known was
+/// finalized (its stub is gone): not current.
+async fn join_attempt_is_current(
+    state: &AppState,
+    local_group_key: &str,
+    event_group_id: &str,
+    member_agent_id: &str,
+    attempt_id: &str,
+) -> bool {
+    let membership_arc = group_membership_lock_for_known_group(state, local_group_key).await;
+    let _guard = match &membership_arc {
+        Some(arc) => Some(arc.lock().await),
+        None => None,
+    };
+    if membership_arc.is_none() && !attempt_id.is_empty() {
+        return false;
+    }
+    join_attempt_is_current_locked(
+        state,
+        &join_result_key(event_group_id, member_agent_id),
+        attempt_id,
+    )
 }
 
 /// #477 J2 — compare-AND-abort a listener registration under the registry
@@ -27615,15 +27907,15 @@ fn stable_id_of<'a>(stable_group_id: Option<&'a str>, group_id: &'a str) -> Opti
     stable_group_id.or(Some(group_id))
 }
 
-/// The embedded signature field of a stored MemberJoined event.
-fn resend_event_signature(event: &NamedGroupMetadataEvent) -> &str {
-    match event {
-        NamedGroupMetadataEvent::MemberJoined { signature_b64, .. } => signature_b64,
-        _ => "",
-    }
+fn join_attempt_id_from_resend(resend: &MemberJoinedResend) -> String {
+    member_joined_event_attempt_id(&resend.event).unwrap_or_default()
 }
 
-fn join_attempt_id_from_resend(resend: &MemberJoinedResend) -> String {
+/// #477 W3 — the attempt id of a signed `MemberJoined` event (`None` for
+/// any other event kind or an undecodable signature). The SAME derivation
+/// on both sides: the joiner at install/resend, the authority at refusal
+/// staging and at result staging (C4).
+fn member_joined_event_attempt_id(event: &NamedGroupMetadataEvent) -> Option<String> {
     let NamedGroupMetadataEvent::MemberJoined {
         group_id,
         stable_group_id,
@@ -27635,10 +27927,11 @@ fn join_attempt_id_from_resend(resend: &MemberJoinedResend) -> String {
         invite_secret,
         ts_ms,
         treekem_key_package_b64,
+        signature_b64,
         ..
-    } = &resend.event
+    } = event
     else {
-        return String::new();
+        return None;
     };
     let canonical = canonical_member_joined_bytes(
         group_id,
@@ -27653,10 +27946,8 @@ fn join_attempt_id_from_resend(resend: &MemberJoinedResend) -> String {
         treekem_key_package_b64.as_deref(),
     );
     use base64::Engine as _;
-    let Ok(raw_sig) = BASE64.decode(resend_event_signature(&resend.event)) else {
-        return String::new();
-    };
-    member_joined_attempt_id(&canonical, &raw_sig)
+    let raw_sig = BASE64.decode(signature_b64).ok()?;
+    Some(member_joined_attempt_id(&canonical, &raw_sig))
 }
 
 /// #477: the 409 check — same invite while pending is idempotent; a
@@ -28018,40 +28309,11 @@ pub(in crate::server) async fn handle_join_result_message(
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .remove(&expected_key);
             if applied {
+                // #477 (r6 item 2 → r7): the seat finalize ran INSIDE the
+                // MemberAdded apply while its membership guard was held
+                // (`finalize_seated_join_attempt_locked`), so no delayed
+                // refusal can find a live attempt after the seat persisted.
                 clear_expected_join_result_inviter(state.as_ref(), &expected_key);
-                // #477 (r6 item 2): the seat is DURABLE — finalize the
-                // pending attempt NOW (under the membership lock the
-                // apply just released) so a delayed refusal arriving
-                // before the poll notices cannot find a live attempt to
-                // refuse.
-                let owned = {
-                    let attempts = state
-                        .pending_join_attempts
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
-                    attempts
-                        .get(&expected_key)
-                        .map(|entry| (entry.local_group_key.clone(), entry.attempt_id.clone()))
-                };
-                if let Some((local_group_key, attempt_id)) = owned {
-                    let seat_arc =
-                        group_membership_lock_for_known_group(state.as_ref(), &local_group_key)
-                            .await;
-                    let seat_guard = match &seat_arc {
-                        Some(arc) => Some(arc.lock().await),
-                        None => None,
-                    };
-                    finalize_join_attempt(
-                        state.as_ref(),
-                        &local_group_key,
-                        &group_id,
-                        &member_agent_id,
-                        &attempt_id,
-                        JoinAttemptOutcome::Seated,
-                        seat_guard,
-                    )
-                    .await;
-                }
             }
         }
         JoinResultMessage::Refused { receipt } => {
@@ -28144,10 +28406,7 @@ pub(in crate::server) async fn handle_join_result_message(
             // re-acquiring it, so no seat finalizer can interleave
             // between acceptance and the terminal write.
             let reason = receipt.reason.as_str();
-            state
-                .groups_diagnostics
-                .record_invite_refusal(&receipt.group_id, reason);
-            finalize_join_attempt_with_reason(
+            let disposition = finalize_join_attempt_with_reason(
                 state,
                 &local_group_key,
                 &receipt.group_id,
@@ -28155,9 +28414,22 @@ pub(in crate::server) async fn handle_join_result_message(
                 &receipt.attempt_id,
                 JoinAttemptOutcome::Refused,
                 Some(reason),
-                _refusal_guard,
+                match _refusal_guard {
+                    Some(guard) => JoinFinalizeGuard::Owned(guard),
+                    None => JoinFinalizeGuard::Unlocked,
+                },
             )
             .await;
+            // #477 (r7 item 4): the refusal is COUNTED only when this
+            // finalize owned the attempt — a receipt that lost to a
+            // durable seat (or a duplicate) is not an accepted refusal.
+            if disposition != JoinFinalizeDisposition::Finalized {
+                tracing::debug!(group_id = %LogHexId::group(&receipt.group_id), reason, "#477: refusal receipt valid but the attempt was already finalized/seated — not counted");
+                return;
+            }
+            state
+                .groups_diagnostics
+                .record_invite_refusal(&receipt.group_id, reason);
             tracing::warn!(group_id = %LogHexId::group(&receipt.group_id), member = %LogHexId::agent(&receipt.member_agent_id), reason, "#477: join REFUSED by the authority — attempt finalized, stub removed");
         }
     }
@@ -28218,22 +28490,24 @@ async fn poll_join_result_until_membership_confirmed(
     let mut superseded = false;
     let mut unconfirmed_polls: u32 = 0;
     while tokio::time::Instant::now() < deadline {
-        // #477: a terminal finalize (Refused accepted, or a superseding
-        // outcome) removes the attempt registry entry — this poll then
-        // exits instead of fetching against a finalized attempt.
-        let attempt_live = {
-            let attempts = state
-                .pending_join_attempts
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
-            // Live unless a registry entry exists for a DIFFERENT attempt
-            // (superseded); a refusal/timeout finalize REMOVES the entry,
-            // distinguished from a legacy no-entry poll by the terminal
-            // outcome check below.
-            attempts
-                .get(&expected_key)
-                .is_none_or(|attempt| attempt.attempt_id == attempt_id)
+        // #477 (r7 item 2): EVERY iteration re-checks attempt currency
+        // UNDER the group's membership lock before the fetch is sent — a
+        // finalizer (refusal / seat / timeout) that won the lock has
+        // already removed this attempt's entry, so the poll exits here
+        // instead of transmitting for a finalized attempt. The lock is
+        // released before the network send.
+        let membership_arc = group_membership_lock_for_known_group(&state, &group_id).await;
+        let membership_guard = match &membership_arc {
+            Some(arc) => Some(arc.lock().await),
+            None => None,
         };
+        // A registered attempt's stub is always locally known while the
+        // attempt is live: an unknown group means it was finalized.
+        if membership_arc.is_none() && !attempt_id.is_empty() {
+            superseded = true;
+            break;
+        }
+        let attempt_live = join_attempt_is_current_locked(&state, &expected_key, &attempt_id);
         let finalized = {
             let outcomes = state
                 .last_join_outcomes
@@ -28272,6 +28546,88 @@ async fn poll_join_result_until_membership_confirmed(
                 .map(|info| (Some(info.state_revision), Some(info.state_hash.clone())))
                 .unwrap_or((None, None))
         };
+        // Outbound-leg repair (#333): the authority can only stage a result
+        // for a `MemberJoined` it actually received, so a lost join volley
+        // makes every fetch above answer "nothing staged" until the deadline.
+        //
+        // Both volley channels are retried, because either one alone leaves a
+        // hole: the direct message is unusable until the joiner has resolved
+        // the authority's DM key material (routinely still pending here, and
+        // the reason a DM-only retry cannot repair the very window it
+        // targets), while the metadata publish needs no key material but only
+        // reaches an authority the mesh already covers.
+        //
+        // Spawned, not awaited, for the same reason every other named-group
+        // delivery is spawned: a send can block for the full ack timeout, and
+        // blocking here would stretch the fetch cadence this loop exists to
+        // maintain. Individual attempts are expected to fail; the repair is
+        // the repetition, not any single send.
+        //
+        // #477 (r7 item 2): the resend is spawned AND registered while this
+        // iteration still holds the membership guard (slot claimed before
+        // the spawn), and re-checks currency under the lock before its own
+        // first send.
+        if let Some(member_joined) = member_joined.as_ref() {
+            if unconfirmed_polls.is_multiple_of(MEMBER_JOINED_RESEND_POLL_INTERVALS) {
+                let resend_state = Arc::clone(&state);
+                let recipient = inviter;
+                let topic = member_joined.metadata_topic.clone();
+                let event = member_joined.event.clone();
+                let payload = member_joined.payload.clone();
+                let resend_len = payload.len();
+                let resend_hash = hex::encode(blake3::hash(&payload).as_bytes());
+                let attempt = unconfirmed_polls / MEMBER_JOINED_RESEND_POLL_INTERVALS;
+                let resend_group_id = group_id.clone();
+                let resend_event_group_id = event_group_id.clone();
+                let resend_member = member_agent_id.clone();
+                let resend_attempt_id = attempt_id.clone();
+                spawn_attempt_task_under_guard(
+                    &state,
+                    &event_group_id,
+                    &member_agent_id,
+                    &attempt_id,
+                    AttemptTaskKind::Task,
+                    membership_guard.as_ref(),
+                    async move {
+                        if !join_attempt_is_current(
+                            &resend_state,
+                            &resend_group_id,
+                            &resend_event_group_id,
+                            &resend_member,
+                            &resend_attempt_id,
+                        )
+                        .await
+                        {
+                            return;
+                        }
+                        publish_named_group_metadata_event(&resend_state, &topic, &event).await;
+                        let error = resend_state
+                            .agent
+                            .send_direct_with_config(
+                                &recipient,
+                                payload,
+                                named_group_direct_delivery_config(),
+                            )
+                            .await
+                            .err();
+                        tracing::debug!(
+                            target: "treekem.trace",
+                            stage = "member_joined_resend",
+                            group_id = %resend_group_id,
+                            event_group_id = %resend_event_group_id,
+                            member = %resend_member,
+                            attempt,
+                            payload_len = resend_len,
+                            payload_hash = %resend_hash,
+                            direct_error = error.as_ref().map(|e| e.to_string()),
+                        );
+                    },
+                );
+            }
+        }
+        // Currency verified under the lock: release it BEFORE the network
+        // send (the fetch can block for the full ack timeout).
+        drop(membership_guard);
         let request = JoinResultMessage::FetchRequest {
             group_id: event_group_id.clone(),
             member_agent_id: member_agent_id.clone(),
@@ -28301,6 +28657,13 @@ async fn poll_join_result_until_membership_confirmed(
             payload_len,
             payload_hash = %payload_hash,
         );
+        #[cfg(test)]
+        if let Ok(mut sent) = JOIN_FETCHES_SENT_FOR_TEST.lock() {
+            match sent.iter_mut().find(|(g, _)| g == &group_id) {
+                Some((_, n)) => *n += 1,
+                None => sent.push((group_id.clone(), 1)),
+            }
+        }
         if let Err(e) = state
             .agent
             .send_direct_with_config(&inviter, payload, direct_message_send_config())
@@ -28328,64 +28691,6 @@ async fn poll_join_result_until_membership_confirmed(
                 payload_hash = %payload_hash,
             );
         }
-        // Outbound-leg repair (#333): the authority can only stage a result
-        // for a `MemberJoined` it actually received, so a lost join volley
-        // makes every fetch above answer "nothing staged" until the deadline.
-        //
-        // Both volley channels are retried, because either one alone leaves a
-        // hole: the direct message is unusable until the joiner has resolved
-        // the authority's DM key material (routinely still pending here, and
-        // the reason a DM-only retry cannot repair the very window it
-        // targets), while the metadata publish needs no key material but only
-        // reaches an authority the mesh already covers.
-        //
-        // Spawned, not awaited, for the same reason every other named-group
-        // delivery is spawned: a send can block for the full ack timeout, and
-        // blocking here would stretch the fetch cadence this loop exists to
-        // maintain. Individual attempts are expected to fail; the repair is
-        // the repetition, not any single send.
-        if let Some(member_joined) = member_joined.as_ref() {
-            if unconfirmed_polls.is_multiple_of(MEMBER_JOINED_RESEND_POLL_INTERVALS) {
-                let resend_state = Arc::clone(&state);
-                let recipient = inviter;
-                let topic = member_joined.metadata_topic.clone();
-                let event = member_joined.event.clone();
-                let payload = member_joined.payload.clone();
-                let resend_len = payload.len();
-                let resend_hash = hex::encode(blake3::hash(&payload).as_bytes());
-                let attempt = unconfirmed_polls / MEMBER_JOINED_RESEND_POLL_INTERVALS;
-                let resend_group_id = group_id.clone();
-                let resend_event_group_id = event_group_id.clone();
-                let resend_member = member_agent_id.clone();
-                let reg_state = Arc::clone(&resend_state);
-                let reg_event_group = resend_event_group_id.clone();
-                let reg_member = resend_member.clone();
-                let resend_task = tokio::spawn(async move {
-                    publish_named_group_metadata_event(&resend_state, &topic, &event).await;
-                    let error = resend_state
-                        .agent
-                        .send_direct_with_config(
-                            &recipient,
-                            payload,
-                            named_group_direct_delivery_config(),
-                        )
-                        .await
-                        .err();
-                    tracing::debug!(
-                        target: "treekem.trace",
-                        stage = "member_joined_resend",
-                        group_id = %resend_group_id,
-                        event_group_id = %resend_event_group_id,
-                        member = %resend_member,
-                        attempt,
-                        payload_len = resend_len,
-                        payload_hash = %resend_hash,
-                        direct_error = error.as_ref().map(|e| e.to_string()),
-                    );
-                });
-                register_attempt_task(&reg_state, &reg_event_group, &reg_member, resend_task);
-            }
-        }
         tokio::time::sleep(JOIN_RESULT_POLL_INTERVAL).await;
     }
     if superseded || already_finalized {
@@ -28394,24 +28699,31 @@ async fn poll_join_result_until_membership_confirmed(
         // the pin): the poll exits silently — no finalizer.
         return;
     }
-    clear_expected_join_result_inviter(state.as_ref(), &expected_key);
     // #477 (r5 item 2): finalize takes the membership guard from its
     // caller — the poll acquires the (lookup-gated) lock here so the
-    // finalization critical section is intact.
+    // finalization critical section is intact. The finalizer itself
+    // re-checks the seat / attempt identity AFTER membership →
+    // persistence are held (r7 items 3/4) and reports whether it owned
+    // anything; the pin is cleared by the finalizer (never before the
+    // ownership decision).
     let finalize_arc = group_membership_lock_for_known_group(state.as_ref(), &group_id).await;
-    let finalize_guard = match &finalize_arc {
-        Some(arc) => Some(arc.lock().await),
-        None => None,
+    let finalize_guard = match finalize_arc.as_ref() {
+        Some(arc) => JoinFinalizeGuard::Owned(arc.lock().await),
+        None => JoinFinalizeGuard::Unlocked,
     };
     if timed_out {
         tracing::warn!(group_id = %LogHexId::group(&group_id), member = %LogHexId::agent(&member_agent_id), await_treekem, "timed out polling authority for join result; finalizing the attempt as timed_out");
         // #477 C8: the poll task IS the deadline owner — the live expiry
         // path finalizes the joiner-side attempt state (stub cleanup) with
-        // the typed `timed_out` outcome.
-        state
-            .groups_diagnostics
-            .record_join_attempt_timed_out(&group_id);
-        finalize_join_attempt(
+        // the typed `timed_out` outcome. Its OWN handle is registered in
+        // the attempt's poll set: the finalizer deregisters (never aborts)
+        // it, so this cleanup runs to completion. A LEGACY (unregistered,
+        // post-restart) poll owns its pin outright and clears it exactly
+        // as before #477.
+        if attempt_id.is_empty() {
+            clear_expected_join_result_inviter(state.as_ref(), &expected_key);
+        }
+        let disposition = finalize_join_attempt(
             state.as_ref(),
             &group_id,
             &event_group_id,
@@ -28421,10 +28733,19 @@ async fn poll_join_result_until_membership_confirmed(
             finalize_guard,
         )
         .await;
+        // #477 (r7 item 4): counted ONLY by the finalizer that owned the
+        // attempt — a second poll for the same attempt (or one that lost
+        // to a seat) returns NotApplicable and counts nothing.
+        if disposition == JoinFinalizeDisposition::Finalized {
+            state
+                .groups_diagnostics
+                .record_join_attempt_timed_out(&group_id);
+        }
     } else {
         // #477 C5: a confirmed seat finalizes the attempt bookkeeping
         // WITHOUT touching the now-durable group and WITHOUT recording a
         // terminal outcome (seated is not a terminal refusal state).
+        clear_expected_join_result_inviter(state.as_ref(), &expected_key);
         finalize_join_attempt(
             state.as_ref(),
             &group_id,
@@ -29784,12 +30105,15 @@ pub(in crate::server) mod tests {
         use super::super::{
             canonical_join_refusal_bytes, ensure_named_group_metadata_listener,
             finalize_join_attempt, join_refusal_refusal_key, join_result_key,
-            member_joined_attempt_id, serve_staged_join_refusal, JoinAttemptOutcome,
-            JoinRefusalReason, JoinRefusalReceipt, JoinResultMessage, NamedGroupMetadataEvent,
-            PendingJoinAttempt, PendingJoinRefusal, PendingJoinResult,
+            member_joined_attempt_id, serve_staged_join_refusal, AttemptTaskKind,
+            JoinAttemptOutcome, JoinFinalizeDisposition, JoinFinalizeGuard, JoinRefusalReason,
+            JoinRefusalReceipt, JoinResultMessage, NamedGroupMetadataEvent, PendingJoinAttempt,
+            PendingJoinRefusal, PendingJoinResult, PendingWelcome, SaveFault,
+            ATTEMPT_TASK_HANDLES_FOR_TEST, JOIN_FETCHES_SENT_FOR_TEST,
         };
         use super::*;
         use super::{isolated_loopback_config, secure_endpoint_test_state_at};
+        use x0x::groups::diagnostics::GroupCounters;
 
         async fn fresh_state() -> (Arc<AppState>, tempfile::TempDir) {
             let dir = tempfile::tempdir().expect("tempdir");
@@ -30454,49 +30778,63 @@ pub(in crate::server) mod tests {
                     .is_empty(),
                 "the OwnerCertified failure (NoCertificate: evidence-in-flight) stages NOTHING"
             );
-            // Seed a refusal directly, then stage a SUCCESS for the same
-            // member: the refusal is removed (later success wins).
-            let receipt = JoinRefusalReceipt {
-                group_id: group.clone(),
-                member_agent_id: "ee".repeat(16),
-                signer_agent_id: authority_hex.clone(),
-                attempt_id: "a".into(),
-                reason: JoinRefusalReason::InviteSecretConsumed,
-                issued_at_ms: now_millis_u64(),
-                nonce: "x".repeat(16),
-                signature_b64: String::new(),
-            };
-            state
-                .pending_join_refusals
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(
-                    join_refusal_refusal_key(&group, &"ee".repeat(16), "a"),
-                    PendingJoinRefusal {
-                        receipt,
-                        created_at: std::time::Instant::now(),
-                        cached_signature_b64: None,
-                    },
-                );
-            stage_join_result(
-                &state,
-                &group,
-                &"ee".repeat(16),
-                NamedGroupMetadataEvent::GroupDeleted {
+            // #477 C4 (r7 item 6): seed refusals for TWO attempts of the
+            // same member, then stage a SUCCESS for attempt "a" only: the
+            // exact triple is removed, the OTHER attempt's refusal (a newer
+            // attempt a late result must never erase) survives.
+            for attempt in ["a", "b"] {
+                let receipt = JoinRefusalReceipt {
                     group_id: group.clone(),
-                    actor: authority_hex,
-                    revision: 2,
-                    commit: None,
-                },
-            )
-            .await;
-            assert!(
+                    member_agent_id: "ee".repeat(16),
+                    signer_agent_id: authority_hex.clone(),
+                    attempt_id: attempt.into(),
+                    reason: JoinRefusalReason::InviteSecretConsumed,
+                    issued_at_ms: now_millis_u64(),
+                    nonce: "x".repeat(16),
+                    signature_b64: String::new(),
+                };
                 state
                     .pending_join_refusals
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
-                    .is_empty(),
-                "a successful staging removes the member's refusal (later success wins)"
+                    .insert(
+                        join_refusal_refusal_key(&group, &"ee".repeat(16), attempt),
+                        PendingJoinRefusal {
+                            receipt,
+                            created_at: std::time::Instant::now(),
+                            cached_signature_b64: None,
+                        },
+                    );
+            }
+            let success = NamedGroupMetadataEvent::GroupDeleted {
+                group_id: group.clone(),
+                actor: authority_hex,
+                revision: 2,
+                commit: None,
+            };
+            stage_join_result(&state, &group, &"ee".repeat(16), success.clone(), Some("a")).await;
+            let remaining: Vec<String> = state
+                .pending_join_refusals
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .keys()
+                .cloned()
+                .collect();
+            assert_eq!(
+                remaining,
+                vec![join_refusal_refusal_key(&group, &"ee".repeat(16), "b")],
+                "the success removed ONLY its own (group, member, attempt) triple"
+            );
+            // A result with NO attempt binding removes nothing.
+            stage_join_result(&state, &group, &"ee".repeat(16), success, None).await;
+            assert_eq!(
+                state
+                    .pending_join_refusals
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .len(),
+                1,
+                "an unbound result never erases another attempt's refusal"
             );
         }
 
@@ -30577,18 +30915,68 @@ pub(in crate::server) mod tests {
                     },
                 );
             set_join_poll_window_override(120);
-            poll_join_result_until_membership_confirmed(
-                Arc::clone(&state),
-                group.clone(),
-                event_group.clone(),
-                crate::identity::AgentId([7; 32]),
-                member.clone(),
-                false,
-                None,
-                "a7".into(),
-            )
-            .await;
+            // #477 (r7 item 3): the poll's OWN handle sits in the attempt's
+            // poll set (exactly as the route registers it) — the timeout
+            // finalizer must deregister, never abort, its own task, or the
+            // cleanup is cancelled at its next CONTENDED await. The test
+            // holds the MLS map's write lock (an await the finalizer's
+            // tail takes AFTER the poll-abort loop) until the terminal
+            // outcome is recorded, so a self-aborted finalizer is dropped
+            // right there and never completes.
+            let mls_hold = state.mls_groups.write().await;
+            let completed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let completed_inner = std::sync::Arc::clone(&completed);
+            let poll_state = Arc::clone(&state);
+            let poll_group = group.clone();
+            let poll_event_group = event_group.clone();
+            let poll_member = member.clone();
+            let poll = tokio::spawn(async move {
+                poll_join_result_until_membership_confirmed(
+                    poll_state,
+                    poll_group,
+                    poll_event_group,
+                    crate::identity::AgentId([7; 32]),
+                    poll_member,
+                    false,
+                    None,
+                    "a7".into(),
+                )
+                .await;
+                completed_inner.store(true, std::sync::atomic::Ordering::SeqCst);
+            });
+            state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get_mut(&join_result_key(&event_group, &member))
+                .expect("attempt")
+                .polls
+                .push(poll);
+            for _ in 0..300 {
+                let recorded = state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains_key(&group);
+                if recorded {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // The outcome is recorded; the finalizer is now parked on the
+            // contended MLS write lock — release it.
+            drop(mls_hold);
+            for _ in 0..300 {
+                if completed.load(std::sync::atomic::Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             set_join_poll_window_override(0);
+            assert!(
+                completed.load(std::sync::atomic::Ordering::SeqCst),
+                "the timeout owner ran to completion — it was NOT aborted by its own finalize"
+            );
             // The LIVE path finalized: stub gone, outcome timed_out, counter.
             assert!(
                 !state.named_groups.read().await.contains_key(&group),
@@ -30693,15 +31081,21 @@ pub(in crate::server) mod tests {
                 .unwrap_or(true));
         }
 
-        /// T10 (r5 item 6) — the #477 e2e: TWO JOINERS share ONE invite.
-        /// Joiner A applies FIRST through the REAL apply path and WINS the
-        /// seat (the one-time secret is consumed by A's acceptance — NOT
-        /// test-seeded). Joiner B reuses the same invite: the real apply
-        /// stages the typed `invite_secret_consumed` refusal for B's
-        /// attempt; the authority-served receipt reaches B through the
-        /// REAL Refused arm (verified sender) and B finalizes: typed
-        /// outcome, counter, stub removed — while A stays seated and the
-        /// authority's staged result for A survives.
+        /// T10 (r5 item 6 → r7 item 7) — the #477 e2e: TWO JOINERS, ONE
+        /// signed invite, BOTH driven through the PRODUCTION join route.
+        /// Joiner A's route-installed `MemberJoined` (its stored bytes)
+        /// applies FIRST on the authority through the REAL apply path and
+        /// WINS the seat (the one-time secret is consumed by A's
+        /// acceptance — NOT test-seeded). Joiner B's route-installed
+        /// attempt reuses the same invite: the real apply stages the typed
+        /// `invite_secret_consumed` refusal for EXACTLY B's route-installed
+        /// attempt id (joiner and authority derive the same id through
+        /// production code); the authority-served receipt (lazy-signed in
+        /// the PRODUCTION fetch arm) reaches B through the REAL Refused arm
+        /// and B finalizes: typed outcome, counter, stub removed, every
+        /// route-spawned task aborted — while A's staged result survives
+        /// and, delivered through A's REAL Result arm, seats A locally and
+        /// finalizes A's attempt at the apply site (seat wins, no outcome).
         #[tokio::test]
         async fn wp_b_t10_consumed_invite_e2e_refusal() {
             let (authority_state, _a) = fresh_state().await;
@@ -30709,71 +31103,100 @@ pub(in crate::server) mod tests {
             let (joiner_b_state, _jb) = fresh_state().await;
             let group = "ee".repeat(16);
             let authority_hex = hex::encode(authority_state.agent.agent_id().as_bytes());
-            let secret = "seed-e2e-shared".to_string();
-            // 1. ONE live, unconsumed invite on the authority.
-            seed_authority_group(&authority_state, &group, &secret, None, false, false).await;
-            // 2. JOINER A (its own state agent) applies FIRST — the real
-            //    apply ACCEPTS: A is seated and the secret is consumed BY
-            //    THE ACCEPTANCE (not by test seeding).
-            let kp_a = joiner_a_state.agent.identity().agent_keypair();
-            let member_a = hex::encode(kp_a.agent_id().as_bytes());
-            let (event_a, sender_a) = signed_member_joined(
-                kp_a,
+            let member_a = hex::encode(joiner_a_state.agent.agent_id().as_bytes());
+            let member_b = hex::encode(joiner_b_state.agent.agent_id().as_bytes());
+            // 1. ONE live, unconsumed, SIGNED invite minted by the authority
+            //    (its secret recorded in the authority ledger).
+            seed_authority_group(
+                &authority_state,
                 &group,
-                &authority_hex,
-                &secret,
-                now_millis_u64(),
-                x0x::groups::GroupRole::Member,
+                "sec-e2e-unused",
+                None,
+                false,
+                false,
+            )
+            .await;
+            let (inviter_hex, link) = mint_real_invite(&authority_state, &group).await;
+            assert_eq!(inviter_hex, authority_hex);
+            // 2. JOINER A joins through the PRODUCTION route.
+            let (code_a, body_a) = route_join(&joiner_a_state, link.clone()).await;
+            assert_eq!(code_a, StatusCode::OK, "{body_a:?}");
+            assert_eq!(
+                body_a.get("join_state").and_then(serde_json::Value::as_str),
+                Some("pending_authority_commit")
             );
-            let applied_a =
-                apply_named_group_metadata_event(&authority_state, event_a, sender_a, true, None)
-                    .await;
+            let (attempt_a, event_a) = installed_attempt(&joiner_a_state, &group, &member_a);
+            // 3. A's stored bytes reach the authority: the REAL apply
+            //    ACCEPTS — A is seated and the secret is consumed BY THE
+            //    ACCEPTANCE.
+            let applied_a = apply_named_group_metadata_event(
+                &authority_state,
+                event_a,
+                joiner_a_state.agent.agent_id(),
+                true,
+                None,
+            )
+            .await;
             assert!(
                 applied_a.accepted,
                 "joiner A's real join consumed the invite"
             );
-            // 3. JOINER B reuses the SAME invite: the real apply stages
-            //    the typed consumed refusal for B's attempt.
-            let kp_b = joiner_b_state.agent.identity().agent_keypair();
-            let member_b = hex::encode(kp_b.agent_id().as_bytes());
-            let (event_b, sender_b) = signed_member_joined(
-                kp_b,
-                &group,
-                &authority_hex,
-                &secret,
-                now_millis_u64(),
-                x0x::groups::GroupRole::Member,
+            assert!(
+                authority_state
+                    .pending_join_results
+                    .read()
+                    .await
+                    .contains_key(&join_result_key(&group, &member_a)),
+                "A's result staged"
             );
-            let applied_b =
-                apply_named_group_metadata_event(&authority_state, event_b, sender_b, true, None)
-                    .await;
+            // 4. JOINER B joins through the PRODUCTION route with the SAME
+            //    invite — pending, its own attempt installed.
+            let (code_b, body_b) = route_join(&joiner_b_state, link).await;
+            assert_eq!(code_b, StatusCode::OK, "{body_b:?}");
+            let (attempt_b, event_b) = installed_attempt(&joiner_b_state, &group, &member_b);
+            assert_ne!(
+                attempt_a, attempt_b,
+                "distinct signed bytes ⇒ distinct attempts"
+            );
+            let b_task_handles = abort_handles_for(&attempt_b);
+            assert_eq!(
+                b_task_handles.len(),
+                5,
+                "B's route spawned five owned tasks"
+            );
+            // 5. B's stored bytes reach the authority: the real apply
+            //    stages the typed consumed refusal for EXACTLY B's attempt.
+            let applied_b = apply_named_group_metadata_event(
+                &authority_state,
+                event_b,
+                joiner_b_state.agent.agent_id(),
+                true,
+                None,
+            )
+            .await;
             assert!(!applied_b.accepted, "joiner B's reuse is refused");
-            let (b_attempt_id, b_reason) = {
+            let staged_reason = {
                 let refusals = authority_state
                     .pending_join_refusals
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 refusals
-                    .values()
-                    .find(|pending| pending.receipt.member_agent_id == member_b)
-                    .map(|pending| (pending.receipt.attempt_id.clone(), pending.receipt.reason))
-            }
-            .expect("B's refusal staged");
+                    .get(&join_refusal_refusal_key(&group, &member_b, &attempt_b))
+                    .map(|pending| pending.receipt.reason)
+            };
             assert_eq!(
-                b_reason,
-                JoinRefusalReason::InviteSecretConsumed,
-                "the second joiner's typed reason is invite_secret_consumed"
+                staged_reason,
+                Some(JoinRefusalReason::InviteSecretConsumed),
+                "the refusal is staged under B's ROUTE-installed attempt id with the typed reason"
             );
-            // 4. B POLLS the authority through the PRODUCTION FetchRequest
-            //    arm (r6 item 6): capable, verified, matching attempt —
-            //    the arm's serve path lazy-signs under the authority key
-            //    (the DM response itself fails on the isolated transport;
-            //    the served receipt with its signature is then read from
-            //    the authority's refusal cache and delivered to B below).
-            let b_agent_id = kp_b.agent_id();
+            // 6. B POLLS the authority through the PRODUCTION FetchRequest
+            //    arm: capable, verified, matching attempt — the arm's serve
+            //    path lazy-signs under the authority key (the DM response
+            //    itself fails on the isolated transport; the served receipt
+            //    is read back from the authority's cache and delivered to B).
             handle_join_result_message(
                 &authority_state,
-                &b_agent_id,
+                &joiner_b_state.agent.agent_id(),
                 true,
                 JoinResultMessage::FetchRequest {
                     group_id: group.clone(),
@@ -30781,7 +31204,7 @@ pub(in crate::server) mod tests {
                     from_revision: None,
                     base_state_hash: None,
                     accepts_refusal: true,
-                    attempt_id: Some(b_attempt_id.clone()),
+                    attempt_id: Some(attempt_b.clone()),
                 },
             )
             .await;
@@ -30791,7 +31214,7 @@ pub(in crate::server) mod tests {
                     .lock()
                     .unwrap_or_else(|p| p.into_inner());
                 refusals
-                    .get(&join_refusal_refusal_key(&group, &member_b, &b_attempt_id))
+                    .get(&join_refusal_refusal_key(&group, &member_b, &attempt_b))
                     .map(|pending| {
                         let mut receipt = pending.receipt.clone();
                         receipt.signature_b64 =
@@ -30804,59 +31227,20 @@ pub(in crate::server) mod tests {
                 !receipt.signature_b64.is_empty(),
                 "the production fetch arm lazy-signed the receipt"
             );
-            // 5. B's joiner side: the stub + the registered attempt with
-            //    the authority's inviter key pinned.
-            {
-                let _persistence_guard = joiner_b_state.named_groups_persistence_lock.lock().await;
-                joiner_b_state
-                    .pending_join_stubs
-                    .lock()
-                    .unwrap_or_else(|p| p.into_inner())
-                    .insert(group.clone());
-                joiner_b_state.named_groups.write().await.insert(
-                    group.clone(),
-                    home_suite_stub_for(&group, crate::identity::AgentId([5; 32])),
-                );
-            }
-            use base64::Engine as _;
-            joiner_b_state
-                .pending_join_attempts
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
-                .insert(
-                    join_result_key(&group, &member_b),
-                    PendingJoinAttempt {
-                        attempt_id: b_attempt_id.clone(),
-                        local_group_key: group.clone(),
-                        invite_fingerprint: "fp".into(),
-                        invite_group_id: group.clone(),
-                        inviter_public_key_b64: BASE64.encode(
-                            authority_state
-                                .agent
-                                .identity()
-                                .agent_keypair()
-                                .public_key()
-                                .as_bytes(),
-                        ),
-                        stored_resend: None,
-                        polls: Vec::new(),
-                        tasks: Vec::new(),
-                        listener_token: None,
-                    },
-                );
-            // 6. Deliver through B's REAL Refused arm (verified sender =
-            //    the authority).
-            let authority_id = authority_state.agent.agent_id();
+            // 7. Deliver through B's REAL Refused arm (verified sender =
+            //    the authority; the pinned inviter key is the one the
+            //    ROUTE installed from the verified invite).
             handle_join_result_message(
                 &joiner_b_state,
-                &authority_id,
+                &authority_state.agent.agent_id(),
                 true,
                 JoinResultMessage::Refused {
                     receipt: Box::new(receipt),
                 },
             )
             .await;
-            // 7. B finalized: typed outcome, stub removed, registry empty.
+            // 8. B finalized: typed outcome, stub removed, registry empty,
+            //    counter, every route-spawned task aborted.
             let outcome = joiner_b_state
                 .last_join_outcomes
                 .lock()
@@ -30879,27 +31263,115 @@ pub(in crate::server) mod tests {
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .is_empty());
-            // 8. The authority's roster: A IS seated (the winner), B is
+            assert_eq!(
+                refused_reason_count(&joiner_b_state, &group, "invite_secret_consumed"),
+                1,
+                "B counted the typed refusal once"
+            );
+            for _ in 0..40 {
+                if b_task_handles.iter().all(|h| h.is_finished()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                b_task_handles.iter().all(|h| h.is_finished()),
+                "B's route-spawned poll/deliveries were aborted by the finalize"
+            );
+            let (status_code, status_body) = join_status_body(&joiner_b_state, &group).await;
+            assert_eq!(status_code, StatusCode::NOT_FOUND);
+            assert_eq!(
+                status_body
+                    .get("last_join_outcome")
+                    .and_then(|o| o.get("reason"))
+                    .and_then(serde_json::Value::as_str),
+                Some("invite_secret_consumed")
+            );
+            // 9. The authority's roster: A IS seated (the winner), B is
             //    not — and A's staged result survives (authority caches
             //    preserved by B's refusal flow).
-            let roster = authority_state.named_groups.read().await;
-            let info = roster.get(&group).expect("authority group");
-            assert!(
-                info.has_active_member(&member_a),
-                "joiner A (the first, winning joiner) is seated"
-            );
-            assert!(
-                !info.has_active_member(&member_b),
-                "joiner B (the invite reuser) never gained a seat"
-            );
-            drop(roster);
-            assert!(
+            let staged_a = {
+                let roster = authority_state.named_groups.read().await;
+                let info = roster.get(&group).expect("authority group");
+                assert!(
+                    info.has_active_member(&member_a),
+                    "joiner A (the first, winning joiner) is seated"
+                );
+                assert!(
+                    !info.has_active_member(&member_b),
+                    "joiner B (the invite reuser) never gained a seat"
+                );
+                drop(roster);
                 authority_state
                     .pending_join_results
                     .read()
                     .await
-                    .contains_key(&join_result_key(&group, &member_a)),
-                "A's staged result survives B's refusal (authority caches preserved)"
+                    .get(&join_result_key(&group, &member_a))
+                    .map(|pending| (pending.event.clone(), pending.head_attestation.clone()))
+                    .expect("A's staged result survives B's refusal (authority caches preserved)")
+            };
+            // 10. A's staged result reaches A through A's REAL Result arm:
+            //     the seat applies and persists on A, and A's attempt is
+            //     finalized AT THE APPLY SITE (seat wins: no outcome, no
+            //     stub teardown, registry entry gone, tasks aborted).
+            let a_task_handles = abort_handles_for(&attempt_a);
+            assert_eq!(a_task_handles.len(), 5);
+            let (event, attestation) = staged_a;
+            handle_join_result_message(
+                &joiner_a_state,
+                &authority_state.agent.agent_id(),
+                true,
+                JoinResultMessage::Result {
+                    event: Box::new(event),
+                    chain: Vec::new(),
+                    head_attestation: attestation.map(Box::new),
+                },
+            )
+            .await;
+            let seated_a = joiner_a_state
+                .named_groups
+                .read()
+                .await
+                .get(&group)
+                .is_some_and(|info| info.has_active_member(&member_a));
+            assert!(
+                seated_a,
+                "A's durable seat applied through the real Result arm"
+            );
+            assert!(
+                joiner_a_state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty(),
+                "A's attempt finalized (Seated) at the apply site"
+            );
+            assert!(
+                joiner_a_state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&group)
+                    .is_none(),
+                "a seat is not a terminal refusal outcome"
+            );
+            assert!(
+                !joiner_a_state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .contains(&group),
+                "A's marker cleared by the durable seat"
+            );
+            for _ in 0..40 {
+                if a_task_handles.iter().all(|h| h.is_finished()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                a_task_handles.iter().all(|h| h.is_finished()),
+                "A's route-spawned poll/deliveries were aborted by the seat finalize"
             );
         }
 
@@ -31790,6 +32262,17 @@ pub(in crate::server) mod tests {
                     created_at: std::time::Instant::now(),
                 },
             );
+            // #477 (r7 item 7): the pending_welcomes sentinel — the
+            // authority's Welcome staging must survive a joiner finalize.
+            state.pending_welcomes.write().await.insert(
+                "welcome-sentinel".to_string(),
+                PendingWelcome {
+                    group_id: event_group.clone(),
+                    joiner_agent: member.clone(),
+                    bytes: vec![1, 2, 3],
+                    created_at: std::time::Instant::now(),
+                },
+            );
             // A listener registered with a NEWER token than the finalize's
             // bookkeeping would know (the compare-remove keeps it).
             ensure_named_group_metadata_listener(Arc::clone(&state), &group).await;
@@ -31812,7 +32295,7 @@ pub(in crate::server) mod tests {
                 &member,
                 "a1",
                 JoinAttemptOutcome::Refused,
-                Some(t6_guard),
+                JoinFinalizeGuard::Owned(t6_guard),
             )
             .await;
 
@@ -31836,6 +32319,14 @@ pub(in crate::server) mod tests {
                     .await
                     .contains_key("authority-key"),
                 "finalize never touches authority results"
+            );
+            assert!(
+                state
+                    .pending_welcomes
+                    .read()
+                    .await
+                    .contains_key("welcome-sentinel"),
+                "finalize never touches the authority's pending_welcomes (T6 sentinel)"
             );
             // Terminal outcome recorded.
             let outcome = state
@@ -31944,7 +32435,7 @@ pub(in crate::server) mod tests {
                 &member,
                 "a6",
                 JoinAttemptOutcome::Refused,
-                Some(finalize_guard),
+                JoinFinalizeGuard::Owned(finalize_guard),
             )
             .await;
             assert!(
@@ -31989,7 +32480,7 @@ pub(in crate::server) mod tests {
                 "a6",
                 JoinAttemptOutcome::Refused,
                 Some("invite_secret_consumed"),
-                None,
+                JoinFinalizeGuard::Unlocked,
             )
             .await;
             let outcome = state
@@ -32158,6 +32649,24 @@ pub(in crate::server) mod tests {
                 None,
             )
             .expect("mint invite");
+            // The production mint route records the minted secret in the
+            // authority ledger; do the same so a joiner's stored bytes can
+            // be applied on the authority (T10).
+            {
+                let now_secs = now_millis_u64() / 1_000;
+                let mut groups = authority_state.named_groups.write().await;
+                if let Some(info) = groups.get_mut(group) {
+                    info.record_issued_invite_v2(
+                        invite.invite_secret.clone(),
+                        now_secs.saturating_sub(60),
+                        now_secs + 3_600,
+                        x0x::groups::GroupRole::Member,
+                        None,
+                        x0x::groups::InviteOrigin::Explicit,
+                        Some(link.clone()),
+                    );
+                }
+            }
             (invite.inviter.clone(), link)
         }
 
@@ -32389,6 +32898,13 @@ pub(in crate::server) mod tests {
                 joiner_state.named_groups.read().await.contains_key(&group),
                 "the durable group is intact"
             );
+            // #477 (r7 item 4): a refusal that lost to the seat is NOT
+            // observable in the counters.
+            assert_eq!(
+                refused_reason_count(&joiner_state, &group, "invite_secret_consumed"),
+                0,
+                "seat-wins: the losing refusal is never counted as accepted"
+            );
         }
 
         /// #477 (r6 item 6): T5 — the FIVE (+future) rejection dimensions
@@ -32583,6 +33099,738 @@ pub(in crate::server) mod tests {
                 assert!(
                     !joiner_state.named_groups.read().await.contains_key(&group),
                     "stub removed on the valid path"
+                );
+            }
+        }
+
+        /// Diagnostics counter helper: one named counter for `group`.
+        fn counter_for(state: &AppState, group: &str, pick: impl Fn(&GroupCounters) -> u64) -> u64 {
+            state
+                .groups_diagnostics
+                .snapshot(
+                    &HashMap::new(),
+                    &std::collections::HashSet::new(),
+                    &std::collections::HashSet::new(),
+                    &HashMap::new(),
+                )
+                .groups
+                .into_iter()
+                .find(|row| row.group_id == group)
+                .map(|row| pick(&row.counters))
+                .unwrap_or(0)
+        }
+
+        fn refused_reason_count(state: &AppState, group: &str, reason: &str) -> u64 {
+            counter_for(state, group, |c| {
+                c.invites_refused_reasons.get(reason).copied().unwrap_or(0)
+            })
+        }
+
+        fn fetches_sent_for(group: &str) -> u64 {
+            JOIN_FETCHES_SENT_FOR_TEST
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .find(|(g, _)| g == group)
+                .map(|(_, n)| *n)
+                .unwrap_or(0)
+        }
+
+        fn abort_handles_for(attempt_id: &str) -> Vec<tokio::task::AbortHandle> {
+            ATTEMPT_TASK_HANDLES_FOR_TEST
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .iter()
+                .filter(|(id, _)| id == attempt_id)
+                .map(|(_, handle)| handle.clone())
+                .collect()
+        }
+
+        /// A pending stub + registered attempt (the joiner-side shape every
+        /// finalizer test starts from).
+        async fn seed_pending_attempt(
+            state: &AppState,
+            group: &str,
+            event_group: &str,
+            member: &str,
+            attempt_id: &str,
+            inviter_public_key_b64: String,
+        ) {
+            {
+                let _persistence_guard = state.named_groups_persistence_lock.lock().await;
+                state
+                    .pending_join_stubs
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(group.to_string());
+                state.named_groups.write().await.insert(
+                    group.to_string(),
+                    home_suite_stub_for(group, crate::identity::AgentId([5; 32])),
+                );
+            }
+            state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .insert(
+                    join_result_key(event_group, member),
+                    PendingJoinAttempt {
+                        attempt_id: attempt_id.to_string(),
+                        local_group_key: group.to_string(),
+                        invite_fingerprint: "fp".into(),
+                        invite_group_id: event_group.to_string(),
+                        inviter_public_key_b64,
+                        stored_resend: None,
+                        polls: Vec::new(),
+                        tasks: Vec::new(),
+                        listener_token: None,
+                    },
+                );
+        }
+
+        /// A route join through the PRODUCTION handler; returns the
+        /// (status, body).
+        async fn route_join(
+            joiner_state: &Arc<AppState>,
+            link: String,
+        ) -> (StatusCode, serde_json::Value) {
+            let response = join_group_via_invite(
+                State(Arc::clone(joiner_state)),
+                Json(JoinGroupRequest {
+                    invite: link,
+                    display_name: None,
+                    mode: None,
+                    expected_owner_user_id: None,
+                }),
+            )
+            .await
+            .into_response();
+            response_json(response).await.expect("route response")
+        }
+
+        /// The registered attempt's (attempt_id, stored MemberJoined event)
+        /// as the ROUTE installed them.
+        fn installed_attempt(
+            state: &AppState,
+            group: &str,
+            joiner: &str,
+        ) -> (String, NamedGroupMetadataEvent) {
+            let attempts = state
+                .pending_join_attempts
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            let entry = attempts
+                .get(&join_result_key(group, joiner))
+                .expect("route installed the attempt");
+            let resend = entry.stored_resend.as_ref().expect("stored bytes");
+            (entry.attempt_id.clone(), resend.event.clone())
+        }
+
+        /// #477 (r7 item 1): a REAL route join whose durable base-seated
+        /// persist FAILS (the #470 save fault cell, through the PRODUCTION
+        /// persist path) returns 503 and installs NOTHING — the group record
+        /// is rolled back (`ReplacedNotDurable` included), no legacy MLS
+        /// object, no marker, no attempt, no inviter pin, no outcome.
+        #[tokio::test]
+        async fn wp_b_t1_persist_failure_installs_nothing() {
+            for fault in [SaveFault::ReplacedNotDurable, SaveFault::NotReplaced] {
+                let (authority_state, _a) = fresh_state().await;
+                let (joiner_state, _j) = fresh_state().await;
+                let group = "ef".repeat(16);
+                let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
+                let authority_hex = hex::encode(authority_state.agent.agent_id().as_bytes());
+                seed_authority_group(&authority_state, &group, "sec-persist", None, false, false)
+                    .await;
+                // The invite's committed base ALREADY seats the joiner
+                // (self-rejoin shape) ⇒ the route takes the DURABLE
+                // persist branch — the only fallible install step.
+                {
+                    let mut groups = authority_state.named_groups.write().await;
+                    let info = groups.get_mut(&group).expect("authority group");
+                    info.add_member(
+                        joiner.clone(),
+                        x0x::groups::GroupRole::Member,
+                        Some(authority_hex.clone()),
+                        None,
+                    );
+                }
+                let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
+                let (code, body) = {
+                    let _fault = set_save_fault(fault);
+                    route_join(&joiner_state, link).await
+                };
+                assert_eq!(
+                    code,
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "({fault:?}) persist failure ⇒ 503: {body:?}"
+                );
+                assert!(
+                    !joiner_state.named_groups.read().await.contains_key(&group),
+                    "({fault:?}) the group record was rolled back"
+                );
+                assert!(
+                    !joiner_state.mls_groups.read().await.contains_key(&group),
+                    "({fault:?}) no legacy MLS object survives the failed transaction"
+                );
+                assert!(
+                    joiner_state
+                        .pending_join_stubs
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_empty(),
+                    "({fault:?}) no marker"
+                );
+                assert!(
+                    joiner_state
+                        .pending_join_attempts
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_empty(),
+                    "({fault:?}) no attempt"
+                );
+                assert!(
+                    expected_join_result_inviter(&joiner_state, &join_result_key(&group, &joiner))
+                        .is_none(),
+                    "({fault:?}) no inviter pin"
+                );
+                let (status_code, status_body) = join_status_body(&joiner_state, &group).await;
+                assert_eq!(status_code, StatusCode::NOT_FOUND);
+                assert!(
+                    status_body
+                        .get("last_join_outcome")
+                        .map(serde_json::Value::is_null)
+                        .unwrap_or(true),
+                    "({fault:?}) nothing of the failed join is observable"
+                );
+            }
+        }
+
+        /// #477 (r7 item 2): the poll checks attempt currency UNDER the
+        /// membership lock before its first fetch. While the test holds
+        /// the group's membership guard the poll cannot fetch; a finalize
+        /// performed under that same guard removes the attempt, and the
+        /// poll then exits WITHOUT ever handing a fetch to the transport.
+        #[tokio::test]
+        async fn wp_b_t6c_finalized_attempt_poll_never_fetches() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fa".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            seed_pending_attempt(&state, &group, &event_group, &member, "a6c", String::new()).await;
+            let lock_arc = group_membership_lock_for_known_group(&state, &group)
+                .await
+                .expect("known group");
+            let held = lock_arc.lock().await;
+            set_join_poll_window_override(2_000);
+            let poll = tokio::spawn(poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                event_group.clone(),
+                crate::identity::AgentId([7; 32]),
+                member.clone(),
+                false,
+                None,
+                "a6c".into(),
+            ));
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+            assert_eq!(
+                fetches_sent_for(&group),
+                0,
+                "the poll is parked on the membership lock — no fetch before the currency check"
+            );
+            assert!(!poll.is_finished(), "the poll is blocked, not exited");
+            // Finalize the attempt UNDER the held guard (a refusal arm does
+            // exactly this), then release.
+            let disposition = finalize_join_attempt_with_reason(
+                &state,
+                &group,
+                &event_group,
+                &member,
+                "a6c",
+                JoinAttemptOutcome::Refused,
+                Some("invite_secret_consumed"),
+                JoinFinalizeGuard::Owned(held),
+            )
+            .await;
+            assert_eq!(disposition, JoinFinalizeDisposition::Finalized);
+            let joined = tokio::time::timeout(std::time::Duration::from_secs(5), poll).await;
+            assert!(
+                matches!(joined, Ok(Ok(()))),
+                "the poll exits on its own (not aborted, not timed out): {joined:?}"
+            );
+            set_join_poll_window_override(0);
+            assert_eq!(
+                fetches_sent_for(&group),
+                0,
+                "a finalized attempt never transmits a fetch"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                0,
+                "the exiting poll owns nothing — no timeout counted"
+            );
+            let outcome = state
+                .last_join_outcomes
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .get(&group)
+                .map(|o| o.outcome);
+            assert_eq!(outcome, Some("refused"), "the refusal outcome stands");
+        }
+
+        /// #477 (r7 item 2): EVERY task the REAL route spawns for the
+        /// attempt is registered by the reserve-then-spawn helper (five:
+        /// initial + delayed deliveries, replay, announcement, poll) and is
+        /// ABORTED when a valid refusal through the REAL arm finalizes the
+        /// attempt.
+        #[tokio::test]
+        async fn wp_b_t6d_route_spawned_tasks_owned_and_aborted() {
+            let (authority_state, _a) = fresh_state().await;
+            let (joiner_state, _j) = fresh_state().await;
+            let group = "fb".repeat(16);
+            let authority_hex = hex::encode(authority_state.agent.agent_id().as_bytes());
+            let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
+            seed_authority_group(&authority_state, &group, "sec-owned", None, false, false).await;
+            let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
+            let (code, body) = route_join(&joiner_state, link).await;
+            assert_eq!(code, StatusCode::OK, "{body:?}");
+            let (attempt_id, _event) = installed_attempt(&joiner_state, &group, &joiner);
+            let (polls, tasks) = {
+                let attempts = joiner_state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner());
+                let entry = attempts
+                    .get(&join_result_key(&group, &joiner))
+                    .expect("attempt");
+                (entry.polls.len(), entry.tasks.len())
+            };
+            assert_eq!(polls, 1, "the join-result poll is registered at return");
+            assert_eq!(
+                tasks, 4,
+                "initial delivery, delayed delivery, delayed replay, announcement — all registered"
+            );
+            let handles = abort_handles_for(&attempt_id);
+            assert_eq!(
+                handles.len(),
+                5,
+                "every route-spawned task went through the reserve-then-spawn helper"
+            );
+            assert!(
+                handles.iter().any(|h| !h.is_finished()),
+                "the delayed tasks are still parked (nothing finished them yet)"
+            );
+            // A VALID refusal through the REAL arm.
+            let mut receipt = refusal_receipt(
+                &group,
+                &joiner,
+                &authority_hex,
+                &attempt_id,
+                JoinRefusalReason::InviteSecretConsumed,
+            );
+            receipt.issued_at_ms = now_millis_u64();
+            let authority_kp = authority_state.agent.identity().agent_keypair();
+            let sig = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+                authority_kp.secret_key(),
+                &canonical_join_refusal_bytes(&receipt),
+            )
+            .expect("sign");
+            use base64::Engine as _;
+            receipt.signature_b64 = BASE64.encode(sig.as_bytes());
+            handle_join_result_message(
+                &joiner_state,
+                &authority_state.agent.agent_id(),
+                true,
+                JoinResultMessage::Refused {
+                    receipt: Box::new(receipt),
+                },
+            )
+            .await;
+            assert!(
+                joiner_state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty(),
+                "finalized"
+            );
+            for _ in 0..40 {
+                if handles.iter().all(|h| h.is_finished()) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            assert!(
+                handles.iter().all(|h| h.is_finished()),
+                "every route-spawned task was aborted by the finalize"
+            );
+            assert_eq!(
+                refused_reason_count(&joiner_state, &group, "invite_secret_consumed"),
+                1,
+                "the owning finalize counted the refusal exactly once"
+            );
+        }
+
+        /// #477 (r7 item 4): two live polls for the SAME attempt (install
+        /// poll + refire poll) both expire — exactly ONE timeout is
+        /// counted (the owning finalizer's), and the finalizer never aborts
+        /// its own task mid-cleanup (r7 item 3): the owner completes.
+        #[tokio::test]
+        async fn wp_b_t7b_two_polls_one_timeout_count() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fc".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            seed_pending_attempt(&state, &group, &event_group, &member, "a7b", String::new()).await;
+            set_join_poll_window_override(150);
+            let done = std::sync::Arc::new(std::sync::atomic::AtomicU8::new(0));
+            let lock_arc = group_membership_lock_for_known_group(&state, &group)
+                .await
+                .expect("known group");
+            let guard = lock_arc.lock().await;
+            for _ in 0..2 {
+                let poll_state = Arc::clone(&state);
+                let poll_group = group.clone();
+                let poll_event_group = event_group.clone();
+                let poll_member = member.clone();
+                let done = std::sync::Arc::clone(&done);
+                let spawned = spawn_attempt_task_under_guard(
+                    &state,
+                    &event_group,
+                    &member,
+                    "a7b",
+                    AttemptTaskKind::Poll,
+                    Some(&guard),
+                    async move {
+                        poll_join_result_until_membership_confirmed(
+                            poll_state,
+                            poll_group,
+                            poll_event_group,
+                            crate::identity::AgentId([7; 32]),
+                            poll_member,
+                            false,
+                            None,
+                            "a7b".into(),
+                        )
+                        .await;
+                        done.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    },
+                );
+                assert!(spawned, "the slot was reserved under the guard");
+            }
+            drop(guard);
+            for _ in 0..200 {
+                if state
+                    .pending_join_attempts
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .is_empty()
+                    && done.load(std::sync::atomic::Ordering::SeqCst) >= 1
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            set_join_poll_window_override(0);
+            assert!(
+                done.load(std::sync::atomic::Ordering::SeqCst) >= 1,
+                "the OWNING poll ran to completion (it was never aborted by its own finalize)"
+            );
+            assert!(
+                !state.named_groups.read().await.contains_key(&group),
+                "stub removed"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                1,
+                "exactly one timeout counted for two expiring polls"
+            );
+        }
+
+        /// #477 (r7 item 4): a timeout finalizer that owns NOTHING (here the
+        /// legacy no-entry shape over a DURABLE group without a pending
+        /// stub — the design's only absent-entry TimedOut authorization is
+        /// "stub still pending") returns NotApplicable and is NOT counted.
+        #[tokio::test]
+        async fn wp_b_t7c_unowned_timeout_not_counted() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fa".repeat(15) + "01";
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            // A durable group (no marker), the local member NOT seated, no
+            // registry entry (legacy poll shape).
+            state.named_groups.write().await.insert(
+                group.clone(),
+                home_suite_stub_for(&group, crate::identity::AgentId([5; 32])),
+            );
+            set_join_poll_window_override(120);
+            poll_join_result_until_membership_confirmed(
+                Arc::clone(&state),
+                group.clone(),
+                group.clone(),
+                crate::identity::AgentId([7; 32]),
+                member.clone(),
+                false,
+                None,
+                String::new(),
+            )
+            .await;
+            set_join_poll_window_override(0);
+            assert!(
+                state.named_groups.read().await.contains_key(&group),
+                "a durable group is never torn down by an unowned timeout"
+            );
+            assert!(
+                state
+                    .last_join_outcomes
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .get(&group)
+                    .is_none(),
+                "no terminal outcome recorded by a finalizer that owned nothing"
+            );
+            assert_eq!(
+                counter_for(&state, &group, |c| c.join_attempts_timed_out),
+                0,
+                "join_attempts_timed_out is counted ONLY by an owning finalizer"
+            );
+        }
+
+        /// #477 (r7 item 5): join-status can NEVER observe the finalize's
+        /// group removal without its terminal outcome. A finalize parked
+        /// INSIDE its persistence-guarded terminal step (test barrier stage
+        /// 3) blocks a concurrent join-status read; after release the read
+        /// returns the complete 404-with-outcome shape.
+        #[tokio::test]
+        async fn wp_b_t8b_status_blocks_through_finalize_terminal_step() {
+            let (state, _keep) = fresh_state().await;
+            let group = "fd".repeat(16);
+            let event_group = group.clone();
+            let member = hex::encode(state.agent.agent_id().as_bytes());
+            seed_pending_attempt(&state, &group, &event_group, &member, "a8b", String::new()).await;
+            join_apply_test_barrier::arm(3);
+            let fin_state = Arc::clone(&state);
+            let fin_group = group.clone();
+            let fin_event_group = event_group.clone();
+            let fin_member = member.clone();
+            let finalize = tokio::spawn(async move {
+                let arc = group_membership_lock_for_known_group(&fin_state, &fin_group)
+                    .await
+                    .expect("known group");
+                let guard = arc.lock().await;
+                finalize_join_attempt_with_reason(
+                    &fin_state,
+                    &fin_group,
+                    &fin_event_group,
+                    &fin_member,
+                    "a8b",
+                    JoinAttemptOutcome::Refused,
+                    Some("invite_secret_consumed"),
+                    JoinFinalizeGuard::Owned(guard),
+                )
+                .await
+            });
+            for _ in 0..200 {
+                if join_apply_test_barrier::reached(3) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert!(
+                join_apply_test_barrier::reached(3),
+                "the finalize parked inside its terminal step"
+            );
+            // The group is ALREADY removed from the map inside the parked
+            // step — a status read that did not take the locks would now
+            // answer a bare 404.
+            assert!(!state.named_groups.read().await.contains_key(&group));
+            let status_state = Arc::clone(&state);
+            let status_group = group.clone();
+            let status =
+                tokio::spawn(async move { join_status_body(&status_state, &status_group).await });
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            assert!(
+                !status.is_finished(),
+                "join-status is BLOCKED on the finalize's locks (never a torn read)"
+            );
+            join_apply_test_barrier::release(3);
+            let disposition = finalize.await.expect("finalize task");
+            assert_eq!(disposition, JoinFinalizeDisposition::Finalized);
+            let (code, body) = status.await.expect("status task");
+            assert_eq!(code.as_u16(), 404);
+            assert_eq!(
+                body.get("last_join_outcome")
+                    .and_then(|o| o.get("reason"))
+                    .and_then(serde_json::Value::as_str),
+                Some("invite_secret_consumed"),
+                "the 404 carries the terminal outcome — the shape is complete"
+            );
+        }
+
+        /// #477 (r7 item 7): T1 — ALL FIVE OwnerCertified gate failures
+        /// (Revoked, InvalidSignature, NotChainedToOwner, AgentMismatch,
+        /// Expired) reject through the REAL apply path and stage NOTHING
+        /// (the certificate-evidence outcomes are retryable, never
+        /// terminal — design C1).
+        #[tokio::test]
+        async fn wp_b_t1d_owner_cert_outcomes_never_stage() {
+            use base64::Engine as _;
+            let owner = crate::identity::UserKeypair::generate().expect("owner");
+            let other_user = crate::identity::UserKeypair::generate().expect("other user");
+            let now_secs = now_millis_u64() / 1_000;
+            for case in [
+                "revoked",
+                "invalid_signature",
+                "not_chained",
+                "agent_mismatch",
+                "expired",
+            ] {
+                let (state, _keep) = fresh_state().await;
+                let group = "fe".repeat(16);
+                let authority_hex = hex::encode(state.agent.agent_id().as_bytes());
+                let mut info = x0x::groups::GroupInfo::with_policy(
+                    "G".to_string(),
+                    String::new(),
+                    state.agent.agent_id(),
+                    group.clone(),
+                    x0x::groups::GroupPolicy {
+                        admission: x0x::groups::GroupAdmission::OwnerCertified(owner.user_id()),
+                        ..Default::default()
+                    },
+                );
+                info.state_revision = 1;
+                let secret = format!("seed-oc-{case}");
+                info.record_issued_invite_v2(
+                    secret.clone(),
+                    now_secs.saturating_sub(60),
+                    now_secs + 3_600,
+                    x0x::groups::GroupRole::Member,
+                    None,
+                    x0x::groups::InviteOrigin::Explicit,
+                    None,
+                );
+                state.named_groups.write().await.insert(group.clone(), info);
+                let kp = test_joiner_keypair();
+                let joiner_id = kp.agent_id();
+                // Evidence injection per case.
+                let cert = match case {
+                    "revoked" => {
+                        let record = x0x::revocation::RevocationRecord::sign(
+                            x0x::revocation::RevokedSubject::Agent(joiner_id),
+                            kp.public_key(),
+                            kp.secret_key(),
+                            now_secs,
+                            Some("t1d".to_string()),
+                        )
+                        .expect("self-revocation");
+                        let set = state.agent.revocation_set();
+                        set.write()
+                            .await
+                            .verify_and_insert(record, None)
+                            .expect("revocation inserted");
+                        None
+                    }
+                    "invalid_signature" => {
+                        let good =
+                            crate::identity::AgentCertificate::issue(&owner, &kp).expect("cert");
+                        let mut bytes = bincode::serialize(&good).expect("bincode");
+                        let flip = bytes.len() - 100;
+                        bytes[flip] ^= 0xff;
+                        Some(
+                            bincode::deserialize::<crate::identity::AgentCertificate>(&bytes)
+                                .expect("tampered cert decodes"),
+                        )
+                    }
+                    "not_chained" => Some(
+                        crate::identity::AgentCertificate::issue(&other_user, &kp).expect("cert"),
+                    ),
+                    "agent_mismatch" => Some(
+                        crate::identity::AgentCertificate::issue(&owner, &test_joiner_keypair())
+                            .expect("cert"),
+                    ),
+                    _ => Some(
+                        crate::identity::AgentCertificate::issue_with_expiry(
+                            &owner,
+                            &kp,
+                            Some(now_secs.saturating_sub(10_000)),
+                        )
+                        .expect("cert"),
+                    ),
+                };
+                if let Some(cert) = cert {
+                    state.agent.identity_discovery_cache().write().await.insert(
+                        joiner_id,
+                        x0x::DiscoveredAgent {
+                            agent_id: joiner_id,
+                            machine_id: x0x::identity::MachineId([0u8; 32]),
+                            user_id: None,
+                            self_name: None,
+                            addresses: Vec::new(),
+                            announced_at: 1,
+                            last_seen: 1,
+                            machine_public_key: Vec::new(),
+                            nat_type: None,
+                            can_receive_direct: None,
+                            is_relay: None,
+                            is_coordinator: None,
+                            reachable_via: Vec::new(),
+                            relay_candidates: Vec::new(),
+                            cert_not_after: None,
+                            agent_certificate: Some(cert),
+                            agent_public_key: BASE64
+                                .encode(kp.public_key().as_bytes())
+                                .into_bytes(),
+                            cert_digest: None,
+                        },
+                    );
+                }
+                let (event, sender) = signed_member_joined(
+                    &kp,
+                    &group,
+                    &authority_hex,
+                    &secret,
+                    now_millis_u64(),
+                    x0x::groups::GroupRole::Member,
+                );
+                let result =
+                    apply_named_group_metadata_event(&state, event, sender, true, None).await;
+                assert!(!result.accepted, "({case}) rejected");
+                assert!(
+                    state
+                        .pending_join_refusals
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .is_empty(),
+                    "({case}) an OwnerCertified outcome stages NO refusal (retryable, C1)"
+                );
+                let gate_hits = counter_for(&state, &group, |c| {
+                    c.member_joined_events_rejected_owner_cert_pending
+                });
+                if case == "revoked" {
+                    // A revoked SENDER is refused by the apply's revocation
+                    // gate before the admission check runs.
+                    assert_eq!(gate_hits, 0, "({case}) rejected at the revocation gate");
+                } else {
+                    assert_eq!(
+                        gate_hits, 1,
+                        "({case}) the OwnerCertified admission gate produced the rejection"
+                    );
+                }
+                assert!(
+                    refused_reason_count(&state, &group, "invite_secret_consumed") == 0
+                        && counter_for(&state, &group, |c| c.invites_refused_reasons.len() as u64)
+                            == 0,
+                    "({case}) no refusal reason counted"
+                );
+                // The ledger secret is UNTOUCHED — the joiner can retry.
+                let groups = state.named_groups.read().await;
+                let record = groups
+                    .get(&group)
+                    .and_then(|info| info.issued_invites.get(&secret))
+                    .expect("ledger record");
+                assert!(
+                    record.consumed_by.is_none(),
+                    "({case}) the invite is not consumed"
                 );
             }
         }

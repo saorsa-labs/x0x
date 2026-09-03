@@ -19,6 +19,11 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 
 [dependencies]
 anyhow = "1.0"
+# TEMP (2026-09-04): tinyvec 1.13.0 (published 2026-09-03) fails to compile on
+# stable rustc 1.98 ("cannot find macro `vec`", Lokathor/tinyvec#225). Cargo.lock
+# is gitignored, so every fresh CI resolve picks it up. Constrain the transitive
+# dependency until a fixed release ships, then delete this line.
+tinyvec = { version = ">=1.12, <1.13", default-features = false }
 ant-quic = "0.27.47"
 saorsa-mls = "0.3.8"
 async-trait = "0.1"
