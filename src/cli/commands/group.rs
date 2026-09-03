@@ -165,6 +165,7 @@ pub async fn join(
     display_name: Option<&str>,
     home: bool,
     expected_owner_user_id: Option<&str>,
+    wait: Option<u64>,
 ) -> Result<()> {
     client.ensure_running().await?;
     let mut body = json!({ "invite": invite_link });
@@ -179,7 +180,50 @@ pub async fn join(
     }
     let resp = client.post("/groups/join", &body).await?;
     print_value(client.format(), &resp);
+    if let Some(seconds) = wait {
+        // #477: --wait polls the typed status; the refusal (or seat /
+        // timeout) is printed when it lands.
+        if let Some(group_id) = resp.get("group_id").and_then(|v| v.as_str()) {
+            join_wait(client, group_id, seconds).await?;
+        }
+    }
     Ok(())
+}
+
+/// `x0x group join-status` — GET /groups/:id/join-status (#477): the
+/// pending-join state plus any terminal typed outcome.
+pub async fn join_status(client: &DaemonClient, group_id: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let resp = client
+        .get(&format!("/groups/{group_id}/join-status"))
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
+/// `x0x group join --wait <secs>` — poll join-status until terminal or the
+/// window closes; prints the typed refusal when one is recorded (#477).
+pub async fn join_wait(client: &DaemonClient, group_id: &str, seconds: u64) -> Result<()> {
+    client.ensure_running().await?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(seconds);
+    loop {
+        let resp = client
+            .get(&format!("/groups/{group_id}/join-status"))
+            .await?;
+        if resp.get("last_join_outcome").is_some_and(|v| !v.is_null()) {
+            print_value(client.format(), &resp);
+            return Ok(());
+        }
+        let pending = resp
+            .get("join_state")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| s == "pending_authority_commit");
+        if !pending || std::time::Instant::now() >= deadline {
+            print_value(client.format(), &resp);
+            return Ok(());
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
 }
 
 /// `x0x group set-name` — PUT /groups/:id/display-name.
@@ -955,7 +999,7 @@ mod tests {
         let mock_resp = serde_json::json!({"id": "joined-group"});
         let (url, _shutdown) = start_mock_server(mock_resp).await;
         let client = DaemonClient::new(None, Some(&url), crate::cli::OutputFormat::Json).unwrap();
-        let result = join(&client, "invite-code-123", None, false, None).await;
+        let result = join(&client, "invite-code-123", None, false, None, None).await;
         assert!(result.is_ok(), "join should succeed: {:?}", result);
     }
 

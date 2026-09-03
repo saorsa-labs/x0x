@@ -27,9 +27,10 @@ use crate::{Agent, KvStoreHandle, TaskListHandle};
 use super::auth::SessionStore;
 use super::routes::public_group_bootstrap_outbox::PublicGroupBootstrapObligation;
 use super::routes::{
-    ExpectedJoinResultInviter, FileChunkAckSlot, NamedGroupMetadataEvent, PendingCausalApproval,
-    PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome, PendingWelcomeReceive,
-    PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
+    ExpectedJoinResultInviter, FileChunkAckSlot, JoinRefusalSignLimiter, LastJoinOutcome,
+    ListenerRegistration, NamedGroupMetadataEvent, PendingCausalApproval, PendingJoinAttempt,
+    PendingJoinRefusal, PendingJoinResult, PendingTreeKemMetadataEvent, PendingWelcome,
+    PendingWelcomeReceive, PredecessorRelayObligation, RestSubscription, WelcomeFetchWaiter,
 };
 use super::sse::SseEvent;
 use super::ws::{SharedTopicState, WsOutboundStats, WsSession};
@@ -719,7 +720,7 @@ pub(super) struct AppState {
     /// `Durable` before consulting it for another state transition.
     pub(super) named_groups_requires_durability_confirmation: AtomicBool,
     /// Background metadata listeners for named groups (one per group id).
-    pub(super) group_metadata_tasks: RwLock<HashMap<String, tokio::task::JoinHandle<()>>>,
+    pub(super) group_metadata_tasks: RwLock<HashMap<String, ListenerRegistration>>,
     /// Cached group cards discovered via gossip or imported from peers.
     pub(super) group_card_cache: RwLock<HashMap<String, x0x::groups::GroupCard>>,
     /// Phase C.2: per-shard cache of signed cards received via
@@ -796,6 +797,23 @@ pub(super) struct AppState {
     /// group's next durable persist happens (the confirmation itself) and
     /// on restart (the set is memory-only; the stub was never on disk).
     pub(super) pending_join_stubs: StdMutex<std::collections::HashSet<String>>,
+    /// #477: authority-side staged join refusals, keyed
+    /// `(group_id, member_agent_id, attempt_id)` — terminal facts with a
+    /// lazy ML-DSA signature materialized on first capable serve. Bounded
+    /// (1024) and TTL-swept alongside `pending_join_results`.
+    pub(super) pending_join_refusals: StdMutex<HashMap<String, PendingJoinRefusal>>,
+    /// #477: joiner-side pending-join attempt registry, keyed
+    /// `join_result_key` — the attempt id, the pinned inviter, and the
+    /// poll task handle, so a typed refusal / timeout / seat can
+    /// compare-finalize exactly this attempt's state.
+    pub(super) pending_join_attempts: StdMutex<HashMap<String, PendingJoinAttempt>>,
+    /// #477: joiner-side terminal outcomes, keyed by the LOCAL group key —
+    /// served by `GET /groups/:id/join-status` (and the 404 path after the
+    /// stub is finalized away). Process-local; a restart clears them.
+    pub(super) last_join_outcomes: StdMutex<HashMap<String, LastJoinOutcome>>,
+    /// #477 A2: the refusal lazy-signing limiter (per-member tokens +
+    /// global bucket; bounded).
+    pub(super) join_refusal_sign_limiter: StdMutex<JoinRefusalSignLimiter>,
     /// #458 r3: intervening state-commits delivered with a join-result
     /// response, keyed by `join_result_key` — consumed (and verified) by
     /// the joiner's chain-verified adoption. Transient, single-apply scope.

@@ -82,6 +82,10 @@ pub struct GroupCounters {
     /// `invite_not_addressed_to_me`, mode/pin matrix outcomes).
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub invites_refused_reasons: std::collections::BTreeMap<String, u64>,
+    /// #477: terminal join-attempt outcomes and refusal-serve bookkeeping.
+    pub join_attempts_timed_out: u64,
+    pub join_refusal_stale_attempt: u64,
+    pub join_refusal_signing_throttled: u64,
     /// #468 A5: UNIQUE authenticated fork-evidence records adopted into
     /// `invite_lineage` (deduplicated by `(revision, state_hash,
     /// committed_by)`; replays do not increment).
@@ -295,6 +299,30 @@ impl GroupsDiagnostics {
         });
         true
     }
+    /// #477: record a join attempt that timed out without any authority
+    /// answer (the poll deadline owner's terminal path).
+    pub fn record_join_attempt_timed_out(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.join_attempts_timed_out = c.join_attempts_timed_out.saturating_add(1);
+        });
+    }
+
+    /// #477: record a refusal serve skipped because the fetch's attempt id
+    /// does not match the staged refusal (stale attempt).
+    pub fn record_join_refusal_stale_attempt(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.join_refusal_stale_attempt = c.join_refusal_stale_attempt.saturating_add(1);
+        });
+    }
+
+    /// #477: record a refusal serve skipped because the signing rate
+    /// limiter had no budget.
+    pub fn record_join_refusal_signing_throttled(&self, group_id: &str) {
+        self.with_counters(group_id, |c| {
+            c.join_refusal_signing_throttled = c.join_refusal_signing_throttled.saturating_add(1);
+        });
+    }
+
     /// #469 A2: record a typed invite refusal reason.
     pub fn record_invite_refusal(&self, group_id: &str, reason: &str) {
         self.with_counters(group_id, |c| {
@@ -525,6 +553,15 @@ impl GroupsDiagnostics {
             dst.messages_dropped_decode_failed = dst
                 .messages_dropped_decode_failed
                 .saturating_add(src.messages_dropped_decode_failed);
+            dst.join_attempts_timed_out = dst
+                .join_attempts_timed_out
+                .saturating_add(src.join_attempts_timed_out);
+            dst.join_refusal_stale_attempt = dst
+                .join_refusal_stale_attempt
+                .saturating_add(src.join_refusal_stale_attempt);
+            dst.join_refusal_signing_throttled = dst
+                .join_refusal_signing_throttled
+                .saturating_add(src.join_refusal_signing_throttled);
             for (reason, count) in &src.invites_refused_reasons {
                 let entry = dst
                     .invites_refused_reasons
