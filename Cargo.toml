@@ -20,6 +20,10 @@ exclude = ["proofs/**", "tests/proof-reports/**", "target/**"]
 [dependencies]
 anyhow = "1.0"
 ant-quic = "0.27.47"
+# CI pin (2026-09-03): tinyvec 1.13.0 (published 2026-09-03) fails to compile on the
+# pinned rustc 1.95.0 ("cannot find macro `vec`"); Cargo.lock is not committed, so
+# constrain the transitive dep (via ant-quic) until tinyvec or the toolchain moves.
+tinyvec = { version = ">=1.9, <1.13", default-features = false }
 saorsa-mls = "0.3.8"
 async-trait = "0.1"
 bincode = "1.3"
