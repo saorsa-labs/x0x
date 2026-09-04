@@ -18,6 +18,7 @@ async fn agent_with_network_in(dir: &TempDir) -> Agent {
             bind_addr: Some("127.0.0.1:0".parse().unwrap()),
             bootstrap_nodes: vec![],
             port_mapping_enabled: false,
+            mdns_enabled: false,
             ..Default::default()
         })
         .with_peer_cache_dir(dir.path().join("peers"))
