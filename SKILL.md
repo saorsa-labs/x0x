@@ -301,7 +301,7 @@ x0x trust set <agent_id> trusted               # POST /contacts/trust {"agent_id
 curl -X PATCH "http://$API/contacts/<agent_id>" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"trust_level":"trusted"}'
 x0x trust evaluate <agent_id> <machine_id>     # POST /trust/evaluate — would this (agent,machine) pass?
-x0x contacts revoke <agent_id>                 # POST /contacts/:agent_id/revoke — publish a revocation
+x0x contacts revoke <agent_id> --reason "left the org"   # POST /contacts/:agent_id/revoke — publish a revocation (--reason required)
 x0x contacts revocations <agent_id>            # GET /contacts/:agent_id/revocations — revocations seen for it
 ```
 

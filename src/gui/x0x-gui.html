@@ -832,6 +832,10 @@ function handleWsMsg(m){
    JS SECTION 3: ROUTER & UTILS
    ═══════════════════════════════════════════════════════════════════ */
 function navigate(view,data){
+  // Leaving the space view for any non-space view (Home, DMs, admin, …)
+  // must drop the group's signed-public gossip subscription — mountSpace
+  // only unsubscribes the PREVIOUS topic when another space is mounted.
+  if(view!=='space'&&signedPublicTopic)wsUnsub(signedPublicTopic);
   S.set('view',view);
   if(data)Object.entries(data).forEach(([k,v])=>S.set(k,v));
   renderView();
