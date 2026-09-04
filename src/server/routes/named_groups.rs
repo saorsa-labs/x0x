@@ -3843,6 +3843,12 @@ pub(in crate::server) enum SaveFault {
     /// corrective re-save then FAILS (the failed content stays on disk),
     /// reproducing the crash-between-rollback-and-resave shape.
     ReplacedNotDurableAfterWriteThenError = 5,
+    /// #477 (r10 item 1): the FIRST durable write (a preflight durability
+    /// confirmation) succeeds unfaulted and the cell degrades to
+    /// [`SaveFault::ReplacedNotDurableAfterWriteThenError`] — the NEXT
+    /// write (the candidate install) is `ReplacedNotDurable` after the
+    /// rename and its corrective re-save fails.
+    PreflightOkThenReplacedNotDurableAfterWriteThenError = 6,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3872,6 +3878,14 @@ fn save_fault_after_write_not_durable() -> bool {
         return false;
     }
     let ordering = std::sync::atomic::Ordering::SeqCst;
+    // Variant 6: consume this (unfaulted) write and arm variant 5 for the
+    // next one.
+    if SAVE_FAULT_INJECT
+        .compare_exchange(6, 5, ordering, ordering)
+        .is_ok()
+    {
+        return false;
+    }
     SAVE_FAULT_INJECT
         .compare_exchange(4, 0, ordering, ordering)
         .is_ok()
@@ -3917,18 +3931,36 @@ async fn write_join_install_pending_marker(
 }
 
 /// The group ids whose install markers are present (startup exclusion set).
-async fn read_join_install_pending_markers(named_groups_path: &FsPath) -> HashSet<String> {
+///
+/// #477 (r10 item 2): the markers are the SOLE recovery evidence when the raw
+/// roster file still holds a failed join, so a read failure must not fail
+/// open. Only a missing directory means "no markers"; every other I/O error
+/// (permissions, a non-directory in its place, an entry-iteration failure)
+/// is propagated so startup refuses to load a roster it cannot vet.
+async fn read_join_install_pending_markers(
+    named_groups_path: &FsPath,
+) -> std::io::Result<HashSet<String>> {
     let mut marked = HashSet::new();
     let dir = join_install_pending_dir(named_groups_path);
-    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
-        return marked;
+    let mut entries = match tokio::fs::read_dir(&dir).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(marked),
+        Err(e) => {
+            return Err(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot read the join-install marker directory {}: {e}",
+                    dir.display()
+                ),
+            ));
+        }
     };
-    while let Ok(Some(entry)) = entries.next_entry().await {
+    while let Some(entry) = entries.next_entry().await? {
         if let Some(name) = entry.file_name().to_str() {
             marked.insert(name.to_string());
         }
     }
-    marked
+    Ok(marked)
 }
 
 /// Clear every install marker — called ONLY after a DURABLE roster save
@@ -14169,6 +14201,26 @@ pub(in crate::server) async fn join_group_via_invite(
                     // the process stops first), the startup loader still
                     // excludes this group. A marker that cannot be made
                     // durable aborts the install before any roster write.
+                    // #477 (r10 item 1): a raised durability flag means the
+                    // persist helper would first run a DURABLE preflight
+                    // save — which clears every install marker (the on-disk
+                    // view then matches the live map). Run that preflight
+                    // HERE, before this install's marker is written, so the
+                    // marker written below outlives the preflight and still
+                    // covers a post-rename failure whose corrective save
+                    // fails. A preflight that cannot confirm durability
+                    // aborts the install before any roster write.
+                    if state
+                        .named_groups_requires_durability_confirmation
+                        .load(Ordering::Acquire)
+                        && !confirm_named_groups_durability_unlocked(&state).await
+                    {
+                        tracing::error!(group_id = %group_id_hex, "join install: the pending roster durability confirmation did not succeed; refusing to install");
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "named-group state is not directory-durable",
+                        );
+                    }
                     if let Err(e) =
                         write_join_install_pending_marker(&state.named_groups_path, &group_id_hex)
                             .await
@@ -24178,7 +24230,7 @@ pub(in crate::server) async fn load_named_groups_merged(
         // process stopped, or the corrective re-save failed) — it is
         // excluded here so a restart can never resurrect it. The marker
         // stays until the next durable roster save clears it.
-        for group_id in read_join_install_pending_markers(named_groups_path).await {
+        for group_id in read_join_install_pending_markers(named_groups_path).await? {
             if merged.remove(&group_id).is_some() {
                 tracing::warn!(
                     group_id = %group_id,
@@ -33379,6 +33431,122 @@ pub(in crate::server) mod tests {
             (entry.attempt_id.clone(), resend.event.clone())
         }
 
+        /// #477 (r10 item 1): the durability flag is ALREADY raised when the
+        /// join arrives (a previous `ReplacedNotDurable`). The install must
+        /// run the preflight durable save BEFORE writing its own marker —
+        /// otherwise the preflight (which clears every marker) erases the
+        /// evidence, and a post-rename failure whose corrective save also
+        /// fails leaves the failed join on disk with NO marker, so a restart
+        /// resurrects it.
+        #[tokio::test]
+        async fn wp_b_t1c_raised_flag_preflight_keeps_install_marker() {
+            let (authority_state, _a) = fresh_state().await;
+            let (joiner_state, _j) = fresh_state().await;
+            let group = "ee".repeat(16);
+            let joiner = hex::encode(joiner_state.agent.agent_id().as_bytes());
+            let authority_hex = hex::encode(authority_state.agent.agent_id().as_bytes());
+            seed_authority_group(
+                &authority_state,
+                &group,
+                "sec-preflight",
+                None,
+                false,
+                false,
+            )
+            .await;
+            {
+                let mut groups = authority_state.named_groups.write().await;
+                let info = groups.get_mut(&group).expect("authority group");
+                info.add_member(
+                    joiner.clone(),
+                    x0x::groups::GroupRole::Member,
+                    Some(authority_hex.clone()),
+                    None,
+                );
+            }
+            let (_inviter, link) = mint_real_invite(&authority_state, &group).await;
+            // A previous non-durable save left the flag raised: the next
+            // roster write starts with a preflight durable save.
+            joiner_state
+                .named_groups_requires_durability_confirmation
+                .store(true, Ordering::Release);
+            // Variant 6: the preflight durable save passes unfaulted; the
+            // NEXT write (the candidate install) is `ReplacedNotDurable`
+            // after the rename, and its corrective re-save then fails.
+            let (code, body) = {
+                let _fault =
+                    set_save_fault(SaveFault::PreflightOkThenReplacedNotDurableAfterWriteThenError);
+                route_join(&joiner_state, link).await
+            };
+            assert_eq!(
+                code,
+                StatusCode::SERVICE_UNAVAILABLE,
+                "persist failure ⇒ 503: {body:?}"
+            );
+            assert!(
+                !joiner_state.named_groups.read().await.contains_key(&group),
+                "the live map rolled back the failed join"
+            );
+            let raw_file = load_named_groups(&joiner_state.named_groups_path)
+                .await
+                .expect("reload named_groups.json");
+            assert!(
+                raw_file.contains_key(&group),
+                "precondition: the raw roster file still holds the failed join (corrective save failed)"
+            );
+            let markers = read_join_install_pending_markers(&joiner_state.named_groups_path)
+                .await
+                .expect("read install markers");
+            assert!(
+                markers.contains(&group),
+                "the install marker written AFTER the preflight survives the failed corrective save"
+            );
+            let restarted = load_named_groups_merged(
+                &joiner_state.named_groups_path,
+                &joiner_state.home_suite_groups_path,
+            )
+            .await
+            .expect("startup loader");
+            assert!(
+                !restarted.contains_key(&group),
+                "a restart never resurrects the failed join even though the flag was raised beforehand"
+            );
+        }
+
+        /// #477 (r10 item 2): the install markers are the only recovery
+        /// evidence when the raw roster still holds a failed join, so a
+        /// marker-read failure must fail CLOSED (startup refuses to load),
+        /// never open (silently "no markers"). Only a missing directory
+        /// means "no markers".
+        #[tokio::test]
+        async fn wp_b_t1d_marker_read_failure_does_not_fail_open() {
+            let (joiner_state, _j) = fresh_state().await;
+            let named = joiner_state.named_groups_path.clone();
+            let sidecar = joiner_state.home_suite_groups_path.clone();
+            // Missing directory ⇒ empty set, loader succeeds.
+            assert!(read_join_install_pending_markers(&named)
+                .await
+                .expect("missing marker dir reads as empty")
+                .is_empty());
+            load_named_groups_merged(&named, &sidecar)
+                .await
+                .expect("startup loader with no marker dir");
+            // A non-directory in the marker directory's place ⇒ read error
+            // ⇒ the reader AND the startup loader fail closed.
+            let dir = join_install_pending_dir(&named);
+            tokio::fs::write(&dir, b"not a directory")
+                .await
+                .expect("plant a file where the marker dir belongs");
+            let err = read_join_install_pending_markers(&named)
+                .await
+                .expect_err("an unreadable marker dir is an error, not an empty set");
+            assert_ne!(err.kind(), std::io::ErrorKind::NotFound);
+            assert!(
+                load_named_groups_merged(&named, &sidecar).await.is_err(),
+                "the startup loader propagates the marker-read failure instead of loading unvetted state"
+            );
+        }
+
         /// #477 (r7 item 1): a REAL route join whose durable base-seated
         /// persist FAILS (the #470 save fault cell, through the PRODUCTION
         /// persist path) returns 503 and installs NOTHING — the group record
@@ -33475,6 +33643,7 @@ pub(in crate::server) mod tests {
                     assert!(
                         read_join_install_pending_markers(&joiner_state.named_groups_path)
                             .await
+                            .expect("read install markers")
                             .is_empty(),
                         "({fault:?}) the durable save cleared the install marker"
                     );
@@ -33494,6 +33663,7 @@ pub(in crate::server) mod tests {
                     assert!(
                         read_join_install_pending_markers(&joiner_state.named_groups_path)
                             .await
+                            .expect("read install markers")
                             .is_empty(),
                         "({fault:?}) the durable corrective save cleared the install marker"
                     );
