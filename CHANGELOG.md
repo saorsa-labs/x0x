@@ -4,6 +4,15 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Fixed
+
+- Self-update transactional handoff could commit on a stale/foreign listener (#493/#415 class): the helper's health probe accepted any HTTP 200 without reading the body, so it never proved the responder was the spawned target — `finish_success` could report the new version while an old binary still answered. The probe now reads the full bounded response and requires `ok` with the exact expected version (`to_version` for the target step, `from_version` for the rollback step), failing closed on malformed/truncated/oversized bodies; a timed-out target child is terminated and reaped before the backup is restored, so a late target can no longer race the rollback daemon; probe I/O and post-SIGKILL reaping are wall-clock bounded.
+- Test-suite de-flake and hermeticity: the gossip-cache adapter fixture now binds loopback with port mapping off instead of `0.0.0.0:0`, which let LAN/mesh peers (mDNS auto-connect) pollute the shared cache precondition (#462); the suppressed-peer rejection tests quiesce the connection before their scenarios and assert the seam contract (per-seam refusal returns + zero `PeerConnected`) instead of a cache counter shared with ant-quic's transport-layer writes; the TreeKEM home-rename restart tests perform a real `Agent::shutdown()` barrier plus gossip-topic readiness and verified-certificate events instead of fixed sleeps (10.2s → 5.9s); the handoff commit test runs under production watchdog bounds. Full-suite local evidence runs should use `just test-full` (nextest `--no-fail-fast`).
+
+### Added
+
+- `NetworkConfig.mdns_enabled` (default `true`, mirroring ant-quic): embedders, operators and tests can disable mDNS discovery/auto-connect — the vector by which co-located LAN nodes connect beneath x0x's policy gates (#417, #462).
+
 ## [v0.41.1] - 2026-09-04
 
 GUI event-stream repair release, plus SKILL.md/API documentation parity fixes from a full surface audit (routes ↔ SKILL.md ↔ CLI ↔ GUI).

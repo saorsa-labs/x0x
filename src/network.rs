@@ -244,6 +244,17 @@ pub struct NetworkConfig {
     #[serde(default = "default_port_mapping_enabled")]
     pub port_mapping_enabled: bool,
 
+    /// #417/#462 hermeticity + operator control: surface ant-quic's
+    /// first-party mDNS discovery toggle at the x0x config layer. ant-quic's
+    /// default is mDNS browsing + advertising WITH auto-connect of
+    /// discovered peers; x0x mirrors that (`true`). When `false`, x0x calls
+    /// `mdns_enabled(false)` on the ant-quic builder, so co-located nodes
+    /// on the same LAN cannot discover and auto-connect to this node — the
+    /// hermetic posture for tests, and for operators on hostile-discovery
+    /// LANs where unsolicited mDNS-driven connections are policy-forbidden.
+    #[serde(default = "default_mdns_enabled")]
+    pub mdns_enabled: bool,
+
     /// X0X-0070b: application-level peer-relay fallback configuration.
     /// Defaults to disabled (matches `RelayPolicy::default()`); the
     /// engine only activates when a runtime explicitly opts in via
@@ -465,6 +476,10 @@ fn default_port_mapping_enabled() -> bool {
     true
 }
 
+fn default_mdns_enabled() -> bool {
+    true
+}
+
 fn default_connection_timeout() -> Duration {
     DEFAULT_CONNECTION_TIMEOUT
 }
@@ -507,6 +522,7 @@ impl Default for NetworkConfig {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            mdns_enabled: true,
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
@@ -1857,6 +1873,12 @@ impl NetworkNode {
         // (or with policy against it) can disable it via `NetworkConfig`
         // (and downstream via the daemon's config TOML / CLI flag).
         builder = builder.port_mapping_enabled(config.port_mapping_enabled);
+
+        // #417/#462: mirror ant-quic's mDNS toggle so embedders and tests
+        // can keep co-located nodes from discovering each other via the
+        // shared mDNS service and auto-connecting beneath x0x's policy
+        // gates.
+        builder = builder.mdns_enabled(config.mdns_enabled);
 
         // Single-cache architecture: the endpoint owns the bootstrap cache;
         // x0x borrows the same instance below instead of opening a second
@@ -5776,6 +5798,7 @@ async fn test_mesh_connections_are_bidirectional() {
             inbound_allowlist: std::collections::HashSet::new(),
             max_peers_per_ip: 3,
             port_mapping_enabled: true,
+            mdns_enabled: true,
             peer_relay: PeerRelayConfig::default(),
             network_id: None,
             observed_prefix_enabled: false,
@@ -6649,6 +6672,11 @@ mod message_tests {
     }
 
     #[test]
+    fn default_mdns_enabled_value() {
+        assert!(default_mdns_enabled());
+    }
+
+    #[test]
     fn default_connection_timeout_value() {
         assert_eq!(default_connection_timeout(), Duration::from_secs(30));
     }
@@ -6668,6 +6696,7 @@ mod message_tests {
         let config = NetworkConfig::default();
         assert_eq!(config.max_connections, default_max_connections());
         assert_eq!(config.port_mapping_enabled, default_port_mapping_enabled());
+        assert_eq!(config.mdns_enabled, default_mdns_enabled());
         assert_eq!(config.connection_timeout, default_connection_timeout());
         assert_eq!(config.stats_interval, default_stats_interval());
         assert_eq!(config.max_peers_per_ip, default_max_peers_per_ip());

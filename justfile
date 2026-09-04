@@ -25,6 +25,14 @@ test:
 test-verbose:
     cargo nextest run --all-features --workspace --no-capture
 
+# Full-coverage suite run. nextest is fail-fast by default: the first failure
+# cancels everything still queued, so a single flake can hide up to ~800
+# unexecuted tests (observed 2503/3300 and 2885/3300 partial runs during
+# v0.41.1 post-release verification). Use this whenever a run must prove the
+# whole suite rather than everything-up-to-first-failure.
+test-full:
+    cargo nextest run --all-features --workspace --no-fail-fast
+
 # Run the F1 GSS-rotation ADR gate tests (gate 3 ordering + gate 7a
 # producer). The filter `test(/(^|::)f1_/)` selects the five f1_
 # tests added to `mod tests` in src/server/routes/named_groups.rs. The

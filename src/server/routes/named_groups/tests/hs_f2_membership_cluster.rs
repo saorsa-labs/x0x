@@ -185,6 +185,34 @@ async fn diagnostics_row(
         .unwrap_or_else(|| panic!("diagnostics row for {group_id}"))
 }
 
+/// Bounded-poll variant of [`diagnostics_row`] for counter assertions:
+/// the diagnostics bookkeeping lands asynchronously relative to the roster
+/// state these tests observe through other paths, so an immediate read can
+/// legitimately see a stale snapshot (observed on a CI host:
+/// `member_joined_events_applied == 0` right after the roster poll saw the
+/// active member). Poll until the counter reaches `at_least` or the bound
+/// expires, and return the final row either way.
+async fn diagnostics_counter_at_least(
+    state: &AppState,
+    group_id: &str,
+    at_least: u64,
+    what: &str,
+) -> crate::groups::diagnostics::GroupDiagnostic {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let row = diagnostics_row(state, group_id).await;
+        if row.counters.member_joined_events_applied >= at_least {
+            return row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "diagnostics counter {what} never reached {at_least} (last: {})",
+            row.counters.member_joined_events_applied
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 // ── #447 ──────────────────────────────────────────────────────────────────
 
 /// #447: the authority rejects a certified joiner with
@@ -1506,6 +1534,80 @@ async fn drive_joiner_welcome_install(
     Ok(())
 }
 
+/// Restart readiness barrier (#447 CI-flake follow-up): after an owner
+/// restart, `is_connected` proves only the QUIC transport. The single
+/// certified announce that follows needs gossip pubsub (announce publish,
+/// one-shot 5 s blob fetch with no retry) already routing between the
+/// peers. Prove delivery end-to-end in BOTH directions via the PUBLIC
+/// agent APIs: both sides subscribe to the announce-blob topic, publish a
+/// nonce-tagged probe, and each side awaits receipt of the REMOTE probe.
+/// The probes are inert for production: the blob responder ignores any
+/// payload lacking the `ANNOUNCE_BLOB_REQUEST_DOMAIN` prefix
+/// (`spawn_blob_responder`), and announce traffic never matches a probe
+/// nonce.
+async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()> {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let base = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
+
+    let topic = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
+    let mut owner_sub = owner.subscribe(topic).await?;
+    let mut joiner_sub = joiner.subscribe(topic).await?;
+
+    // Probe rounds carry FRESH nonces (the epidemic layer dedupes by
+    // message identity); success requires BOTH directions to deliver the
+    // CURRENT round's remote probe. The 20 s watchdog is a diagnostic
+    // guard — a healthy mesh answers the first round.
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        let mut round = 0u64;
+        loop {
+            let owner_probe =
+                format!("hs-f2/restart-gossip-probe/{base}.{round}/owner").into_bytes();
+            let joiner_probe =
+                format!("hs-f2/restart-gossip-probe/{base}.{round}/joiner").into_bytes();
+            owner.publish(topic, owner_probe.clone()).await?;
+            joiner.publish(topic, joiner_probe.clone()).await?;
+            let mut owner_got = false;
+            let mut joiner_got = false;
+            let quiet = tokio::time::sleep(std::time::Duration::from_secs(1));
+            tokio::pin!(quiet);
+            while !(owner_got && joiner_got) {
+                tokio::select! {
+                    _ = &mut quiet => break,
+                    message = owner_sub.recv() => {
+                        let Some(message) = message else {
+                            anyhow::bail!("owner gossip subscription closed");
+                        };
+                        if message.payload.as_ref() == joiner_probe.as_slice() {
+                            owner_got = true;
+                        }
+                    }
+                    message = joiner_sub.recv() => {
+                        let Some(message) = message else {
+                            anyhow::bail!("joiner gossip subscription closed");
+                        };
+                        if message.payload.as_ref() == owner_probe.as_slice() {
+                            joiner_got = true;
+                        }
+                    }
+                }
+            }
+            if owner_got && joiner_got {
+                return Ok(());
+            }
+            round += 1;
+        }
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!(
+            "gossip delivery between the restarted owner and the joiner \
+             never became bidirectionally ready within 20 s"
+        )
+    })??;
+    Ok(())
+}
+
 /// #457/#447/#458 review r2 item 5 — the REAL end-to-end walkthrough on the
 /// certified-TreeKEM OwnerCertified Home path: two REAL agents on loopback
 /// networking, the owner provisions a TreeKEM OwnerCertified Home, RENAMES
@@ -1589,9 +1691,6 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         eprintln!("SKIP: loopback connect unavailable in this environment");
         return Ok(());
     }
-    // Let the 3 s anonymous auto re-announce fire and the gossip mesh settle
-    // BEFORE the joiner's single identity announce.
-    tokio::time::sleep(std::time::Duration::from_secs(5)).await;
 
     // Owner state + TreeKEM OwnerCertified Home.
     let owner_state =
@@ -1649,6 +1748,16 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     // RESTART the owner daemon: same dirs, agent key persisted, AppState
     // rebuilt, production snapshot restore, listeners re-armed.
     drop(owner_state);
+    // Restart barrier: `Agent::drop` only aborts the two heartbeat handles
+    // — it neither cancels the shutdown token nor drains the tracked
+    // listeners, so shadowing `owner_agent` alone would keep the OLD
+    // owner's network, PubSub and blob-responder tasks alive, sharing
+    // identity and peer state with the replacement (the CI flake: the
+    // joiner's single certified announce could be served by the leaked
+    // old owner and its one-shot 5 s blob fetch had no retry). A real
+    // daemon restart is clean: shut the old agent down, THEN rebuild.
+    owner_agent.shutdown().await;
+    drop(owner_agent);
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     // Reconnect the restarted daemon to the joiner and let the mesh settle —
@@ -1669,7 +1778,16 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         owner_net.is_connected(&joiner_peer).await,
         "restarted owner must reconnect to the joiner"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Readiness barrier replacing the old fixed 2 s settle: the QUIC
+    // reconnect above proves TRANSPORT only — prove gossip pubsub routes
+    // in BOTH directions before the one-shot certified announce depends
+    // on it.
+    await_restart_gossip_ready(&owner_agent, &joiner_agent).await?;
+    // Evidence channel, subscribed before ANY announce activity on the
+    // restarted owner: the verified-certificate broadcast fires the
+    // instant a fetched announce blob is patched into the discovery
+    // cache. Receipt below is the success condition.
+    let mut cert_events = owner_agent.subscribe_verified_certificates();
     // The restarted daemon's STARTUP announce (anonymous — real daemons
     // announce at boot) starts its identity listener so it can INGEST.
     owner_agent.announce_identity(false, false).await?;
@@ -1694,6 +1812,31 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
     joiner_agent.announce_identity(true, true).await?;
     let joiner_id = joiner_agent.agent_id();
     let joiner_hex = hex::encode(joiner_id.as_bytes());
+    // Await the joiner's verified-certificate event — receipt IS the
+    // success condition. The 45 s bound is a diagnostic guard only; if it
+    // ever elapses, the cache loop below reports the full DIAG picture.
+    let cert_event = tokio::time::timeout(std::time::Duration::from_secs(45), async {
+        loop {
+            match cert_events.recv().await {
+                Ok(event) if event.agent_id == joiner_id => break Some(event),
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(missed)) => {
+                    eprintln!("DIAG verified-cert receiver lagged by {missed} events");
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break None,
+            }
+        }
+    })
+    .await
+    .unwrap_or_else(|_| {
+        eprintln!("DIAG no verified-certificate event within 45 s of the single announce");
+        None
+    });
+    assert!(
+        cert_event.is_some_and(|event| event.agent_id == joiner_id),
+        "#447: the single identity announce must land the joiner's verified \
+         certificate event on the restarted owner"
+    );
     let evidence_deadline = std::time::Instant::now() + std::time::Duration::from_secs(45);
     loop {
         let resolved = {
@@ -1846,7 +1989,13 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         joiner_disk.contains(&group_id),
         "r2: the confirmed join is durable on the joiner"
     );
-    let owner_row = diagnostics_row(owner_state.as_ref(), &group_id).await;
+    let owner_row = diagnostics_counter_at_least(
+        owner_state.as_ref(),
+        &group_id,
+        1,
+        "member_joined_events_applied (certified MemberJoined on the single-announce evidence)",
+    )
+    .await;
     assert!(
         owner_row.counters.member_joined_events_applied >= 1,
         "authority applied the certified MemberJoined on the single-announce evidence"
@@ -2304,6 +2453,11 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
 
     // RESTART the owner daemon.
     drop(owner_state);
+    // Restart barrier (identical to the TreeKEM Home variant): `Agent::drop`
+    // alone leaks the old owner's network/PubSub/blob-responder tasks into
+    // the replacement — shut the old agent down first, THEN rebuild.
+    owner_agent.shutdown().await;
+    drop(owner_agent);
     let owner_agent = Arc::new(build_owner_agent().await?);
     owner_agent.join_network().await?;
     owner_agent
@@ -2331,7 +2485,9 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
             .await,
         "restarted owner must reconnect"
     );
-    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    // Readiness barrier replacing the old fixed 2 s settle: prove gossip
+    // pubsub routes BOTH directions before the one-shot certified announce.
+    await_restart_gossip_ready(&owner_agent, &joiner_agent).await?;
     owner_agent.announce_identity(false, false).await?;
     let owner_state =
         secure_endpoint_test_state_at(owner_dir.path(), Arc::clone(&owner_agent)).await?;
@@ -2417,7 +2573,13 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    let owner_row = diagnostics_row(owner_state.as_ref(), &home_id).await;
+    let owner_row = diagnostics_counter_at_least(
+        owner_state.as_ref(),
+        &home_id,
+        1,
+        "member_joined_events_applied (certified join from ONE announce)",
+    )
+    .await;
     assert!(
         owner_row.counters.member_joined_events_applied >= 1,
         "authority applied the certified join from ONE announce"

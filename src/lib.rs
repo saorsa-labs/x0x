@@ -17968,6 +17968,8 @@ mod tests {
         network::NetworkConfig {
             bind_addr: Some("127.0.0.1:0".parse().expect("loopback addr")),
             bootstrap_nodes: Vec::new(),
+            port_mapping_enabled: false,
+            mdns_enabled: false,
             ..network::NetworkConfig::default()
         }
     }
@@ -20113,6 +20115,16 @@ mod tests {
             "bob connected before rejection"
         );
 
+        // Quiesce the connection before the intentional rejection (issue
+        // #241 pattern): the initial dial can leave duplicate/zombie legs
+        // whose delayed setup/close events would race the rejection
+        // scenario below — the redial must be the sole inbound attempt.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
         alice_network
             .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
             .await
@@ -20121,6 +20133,27 @@ mod tests {
             alice_network.is_reconnect_suppressed(bob_id),
             "PolicyRejection sets a permanent tombstone"
         );
+
+        // Alice's registry transition to disconnected is asynchronous: a
+        // one-shot !is_connected read here can race the in-flight close.
+        // Bounded-poll for the disconnected state (same pattern as the
+        // admin-revocation test) so bob's explicit connect_addr below is
+        // the SOLE intentional redial — not a racer against the original
+        // session's teardown.
+        {
+            let disc = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(5) * test_time_multiplier();
+            while tokio::time::Instant::now() < disc {
+                if !alice_network.is_connected(&bob_peer).await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "bob disconnected after policy reject (bounded poll)"
+            );
+        }
 
         // Watch for any `PeerConnected` for bob: the gate must suppress it.
         let mut events = alice_network.subscribe();
@@ -20216,40 +20249,47 @@ mod tests {
             "bob connected before rejection"
         );
 
+        // Quiesce the connection before the intentional rejection (issue
+        // #241 pattern): the initial dial can leave duplicate/zombie legs
+        // whose delayed setup/accept bookkeeping would land after the
+        // PolicyRejection close and be misattributed to the refused seams.
+        await_quiesced_connection(
+            alice_network,
+            &bob_peer,
+            std::time::Duration::from_secs(1) * test_time_multiplier(),
+        )
+        .await;
         alice_network
             .disconnect_with_reason(&bob_peer, network::DisconnectReason::PolicyRejection)
             .await
             .expect("policy reject");
         assert!(alice_network.is_reconnect_suppressed(bob_id));
 
-        // Baselines for the no-side-effect assertions.
+        // Event subscription starts BEFORE the seam calls: every
+        // wrapper-side record_success site is paired with a
+        // NetworkEvent::PeerConnected emit in the same block (see the
+        // invariant-C note at the final assertions), so event-absence is
+        // the seam-side cache-write detector.
         let mut events = alice_network.subscribe();
-        let cache = alice_network.bootstrap_cache().expect("bootstrap cache");
-        // The original session's inbound accept can record_success after
-        // the PolicyRejection close (accept() already yielded). Wait until
-        // that bookkeeping is idle so it is not blamed on the refused seams.
-        let stabilize_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(1);
-        let mut successes_before = cache
-            .get_peer(&bob_peer)
-            .await
-            .expect("bob cached from initial connect")
-            .stats
-            .success_count;
-        let mut last_change = tokio::time::Instant::now();
-        while tokio::time::Instant::now() < stabilize_deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            let now_count = cache
-                .get_peer(&bob_peer)
-                .await
-                .expect("bob cached")
-                .stats
-                .success_count;
-            if now_count != successes_before {
-                successes_before = now_count;
-                last_change = tokio::time::Instant::now();
-            } else if last_change.elapsed() >= std::time::Duration::from_millis(150) {
-                break;
+        // Causal barrier, not a quiet-window heuristic: the connection
+        // was quiesced before the PolicyRejection close (see above), so
+        // the only in-flight bookkeeping is the close itself. Bounded-poll
+        // until Alice's transport reports bob disconnected (same pattern
+        // as the admin-revocation test) so the seams below run against a
+        // fully torn-down original session.
+        {
+            let disc = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(5) * test_time_multiplier();
+            while tokio::time::Instant::now() < disc {
+                if !alice_network.is_connected(&bob_peer).await {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
+            assert!(
+                !alice_network.is_connected(&bob_peer).await,
+                "bob disconnected after policy reject (bounded poll)"
+            );
         }
         let set_at_before = alice_network
             .reconnect_suppression_set_at(bob_id)
@@ -20297,19 +20337,31 @@ mod tests {
             );
         }
 
-        // No seam produced a PeerConnected for bob.
-        while let Ok(event) = events.try_recv() {
-            if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
-                assert_ne!(
-                    peer_id, bob_id,
-                    "refused dials must not surface a PeerConnected event"
-                );
+        // Regression-detection drain, NOT a settle heuristic: each of
+        // the four wrapper-side record_success sites (see the invariant-C
+        // note below) emits NetworkEvent::PeerConnected in the same block
+        // as its cache write, so a gate-skipping regression surfaces as a
+        // bob PeerConnected here. The emits are synchronous inside the
+        // seam calls above; the bounded drain (≤1 s ×
+        // test_time_multiplier) covers event-hop latency only.
+        {
+            let drain_until = tokio::time::Instant::now()
+                + std::time::Duration::from_secs(1) * test_time_multiplier();
+            while tokio::time::Instant::now() < drain_until {
+                while let Ok(event) = events.try_recv() {
+                    if let network::NetworkEvent::PeerConnected { peer_id, .. } = event {
+                        assert_ne!(
+                            peer_id, bob_id,
+                            "refused dials must not surface a PeerConnected event"
+                        );
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             }
         }
 
-        // Admission stays Suppressed (invariant A), the tombstone was not
-        // refreshed (invariant F), and no cache success was recorded
-        // (invariant C).
+        // Admission stays Suppressed (invariant A) and the tombstone was
+        // not refreshed (invariant F).
         assert_eq!(
             alice_network.peer_admission(&bob_peer).await,
             network::PeerAdmission::Suppressed,
@@ -20322,11 +20374,26 @@ mod tests {
             set_at_before,
             "refused dials must not refresh the tombstone (set_at write-once)"
         );
-        let cached_after = cache.get_peer(&bob_peer).await.expect("bob still cached");
-        assert_eq!(
-            cached_after.stats.success_count, successes_before,
-            "refused dials must not record a cache success"
-        );
+        // Invariant C (no cache success from the refused seams) is NOT
+        // asserted via the shared bootstrap-cache success_count: that
+        // counter is shared with ant-quic's transport layer, whose
+        // fire-and-forget observe_peer_reachability spawns (ant-quic
+        // p2p_endpoint.rs observe_peer_reachability →
+        // BootstrapCache::observe_direct_reachability /
+        // observe_inbound_peer_address) write success_count unordered —
+        // instrumented runs show +2 landing seconds after the close with
+        // no is_connected flicker and no events, before or after any
+        // x0x-observable barrier. The #292 gate-before-cache-write
+        // invariant is enforced exactly by return-shape (every seam above
+        // must return the dial gate's "reconnect-suppressed" refusal) plus
+        // event-absence (the bounded drain above): each wrapper-side
+        // record_success site — connect_addr_with_origin, connect_peer,
+        // connect_peer_with_addrs, and the inbound accept loop
+        // (src/network.rs ~2732/2847/2989/4454) — emits
+        // NetworkEvent::PeerConnected in the same block as its cache
+        // write, so a skipped gate cannot write without surfacing the
+        // paired event. Transport-layer cache writes are outside this
+        // test's scope by design.
 
         // Invariant B: gossip toward the suppressed peer is held — reported
         // success like the plane-pending hold, but nothing reaches the wire,
