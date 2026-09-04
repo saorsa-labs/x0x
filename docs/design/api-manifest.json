@@ -2118,8 +2118,7 @@
       "method": "GET",
       "path": "/groups/:id/join-status",
       "request": {
-        "fields": [],
-        "kind": "fields"
+        "kind": "none"
       }
     },
     {

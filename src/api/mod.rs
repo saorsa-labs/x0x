@@ -1207,7 +1207,7 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         cli_name: "group join-status",
         description: "Pending-join status with the typed terminal outcome (#477)",
         category: "named-groups",
-        request: RequestSpec::Fields(&[]),
+        request: RequestSpec::None,
     },
     EndpointDef {
         method: Method::Put,

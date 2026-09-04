@@ -3838,6 +3838,11 @@ pub(in crate::server) enum SaveFault {
     /// `ReplacedNotDurable` AFTER the rename. One-shot: the cell clears
     /// when it fires, so a caller's corrective re-save runs unfaulted.
     ReplacedNotDurableAfterWrite = 4,
+    /// #477 (r9 item 1): like `ReplacedNotDurableAfterWrite`, but the
+    /// cell degrades to [`SaveFault::Error`] when it fires — the caller's
+    /// corrective re-save then FAILS (the failed content stays on disk),
+    /// reproducing the crash-between-rollback-and-resave shape.
+    ReplacedNotDurableAfterWriteThenError = 5,
 }
 
 #[cfg_attr(not(test), allow(dead_code))]
@@ -3859,18 +3864,88 @@ fn save_fault_legacy_write_fails() -> bool {
     cfg!(test) && SAVE_FAULT_INJECT.load(std::sync::atomic::Ordering::SeqCst) == 2
 }
 
-/// #477 (r8 item 1): one-shot post-rename fault — fires once, then clears.
+/// #477 (r8 item 1): one-shot post-rename fault — fires once, then clears
+/// (variant 4) or degrades to the legacy-write error (variant 5).
 #[cfg_attr(not(test), allow(dead_code))]
 fn save_fault_after_write_not_durable() -> bool {
-    cfg!(test)
-        && SAVE_FAULT_INJECT
-            .compare_exchange(
-                4,
-                0,
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            )
+    if !cfg!(test) {
+        return false;
+    }
+    let ordering = std::sync::atomic::Ordering::SeqCst;
+    SAVE_FAULT_INJECT
+        .compare_exchange(4, 0, ordering, ordering)
+        .is_ok()
+        || SAVE_FAULT_INJECT
+            .compare_exchange(5, 2, ordering, ordering)
             .is_ok()
+}
+
+/// #477 (r9 item 1) — the join-install intent markers: one empty file per
+/// group id under `<named_groups.json>.install-pending/`, written DURABLY
+/// before the only fallible install step (the base-seated roster persist)
+/// and cleared by the next DURABLE roster save (the moment the on-disk
+/// view is known to match the live map). If the process stops — or the
+/// corrective re-save fails — between a `ReplacedNotDurable` rollback and
+/// a durable save, the marker survives and the startup loader
+/// (`load_named_groups_merged`) excludes the group: a failed join can
+/// never be resurrected by a restart. (The symmetric window — a crash
+/// after a DURABLE install save but before this same save cleared the
+/// marker — drops a legitimate self-rejoin at restart; the authority's
+/// seat is untouched and the joiner simply joins again.)
+fn join_install_pending_dir(named_groups_path: &FsPath) -> PathBuf {
+    let mut dir = named_groups_path.as_os_str().to_owned();
+    dir.push(".install-pending");
+    PathBuf::from(dir)
+}
+
+/// Durably record that `group_id`'s install is in flight (r9 item 1).
+async fn write_join_install_pending_marker(
+    named_groups_path: &FsPath,
+    group_id: &str,
+) -> std::io::Result<()> {
+    let dir = join_install_pending_dir(named_groups_path);
+    tokio::fs::create_dir_all(&dir).await?;
+    // The directory entry itself must be durable before the marker is.
+    sync_parent_dir_for_path(&dir)?;
+    let marker = dir.join(group_id);
+    match write_named_groups_json_atomic(&marker, "pending").await? {
+        AtomicWriteOutcome::Durable => Ok(()),
+        outcome => Err(std::io::Error::other(format!(
+            "join install marker not durable ({outcome:?})"
+        ))),
+    }
+}
+
+/// The group ids whose install markers are present (startup exclusion set).
+async fn read_join_install_pending_markers(named_groups_path: &FsPath) -> HashSet<String> {
+    let mut marked = HashSet::new();
+    let dir = join_install_pending_dir(named_groups_path);
+    let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+        return marked;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Some(name) = entry.file_name().to_str() {
+            marked.insert(name.to_string());
+        }
+    }
+    marked
+}
+
+/// Clear every install marker — called ONLY after a DURABLE roster save
+/// (the on-disk view now matches the live map, which never contains a
+/// rolled-back install). Best effort: a failure leaves the markers in
+/// place, which is the safe direction.
+async fn clear_join_install_pending_markers(named_groups_path: &FsPath) {
+    let dir = join_install_pending_dir(named_groups_path);
+    match tokio::fs::remove_dir_all(&dir).await {
+        Ok(()) => {
+            let _ = sync_parent_dir_for_path(&dir);
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to clear join install markers after a durable save");
+        }
+    }
 }
 
 /// #470 — RAII fault guard (see [`DeleteFaultGuard`]).
@@ -14088,6 +14163,22 @@ pub(in crate::server) async fn join_group_via_invite(
                     if let Some(lineage) = info.invite_lineage.as_mut() {
                         lineage.seated_at_revision = Some(info.state_revision);
                     }
+                    // #477 (r9 item 1): the install-intent marker is
+                    // DURABLE before the fallible persist — if the rollback
+                    // below cannot reach disk (corrective save fails, or
+                    // the process stops first), the startup loader still
+                    // excludes this group. A marker that cannot be made
+                    // durable aborts the install before any roster write.
+                    if let Err(e) =
+                        write_join_install_pending_marker(&state.named_groups_path, &group_id_hex)
+                            .await
+                    {
+                        tracing::error!(group_id = %group_id_hex, "join install: cannot record the install marker durably: {e}");
+                        return api_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "named-group state is not directory-durable",
+                        );
+                    }
                     let outcome = persist_named_groups_mutation_unlocked(&state, |groups| {
                         groups.insert(group_id_hex.clone(), info.clone());
                         true
@@ -14106,9 +14197,12 @@ pub(in crate::server) async fn join_group_via_invite(
                         // the on-disk view excludes the failed join too (a
                         // restart must not reload it). The corrective save
                         // is `confirm_named_groups_durability_unlocked` —
-                        // it clears the raised durability flag on success;
-                        // if it fails as well the flag stays raised and the
-                        // next roster mutation re-persists first.
+                        // it clears the raised durability flag (and the
+                        // install marker) on success; if it fails as well,
+                        // or the process stops first, the DURABLE install
+                        // marker written above makes the startup loader
+                        // exclude the group (r9 item 1) and the flag stays
+                        // raised so the next roster mutation re-persists.
                         {
                             let mut groups = state.named_groups.write().await;
                             if groups.get(&group_id_hex) == Some(&info) {
@@ -14120,7 +14214,7 @@ pub(in crate::server) async fn join_group_via_invite(
                         {
                             tracing::error!(
                                 group_id = %group_id_hex,
-                                "join install rollback: the corrective roster re-save did not confirm durability; the failed join may remain on disk until the next successful save"
+                                "join install rollback: the corrective roster re-save did not confirm durability; the install marker keeps the failed join excluded at startup until the next durable save"
                             );
                         }
                         return api_error(
@@ -24078,7 +24172,21 @@ pub(in crate::server) async fn load_named_groups_merged(
     Box::pin(async move {
         let named = load_named_groups(named_groups_path).await?;
         let sidecar = load_home_suite_groups(sidecar_path).await?;
-        Ok(merge_home_suite_groups(named, sidecar))
+        let mut merged = merge_home_suite_groups(named, sidecar);
+        // #477 (r9 item 1): a group whose join-install marker survived is
+        // a FAILED install whose rollback never reached disk durably (the
+        // process stopped, or the corrective re-save failed) — it is
+        // excluded here so a restart can never resurrect it. The marker
+        // stays until the next durable roster save clears it.
+        for group_id in read_join_install_pending_markers(named_groups_path).await {
+            if merged.remove(&group_id).is_some() {
+                tracing::warn!(
+                    group_id = %group_id,
+                    "startup: dropping a named group whose join install never completed (rollback marker present)"
+                );
+            }
+        }
+        Ok(merged)
     })
     .await
 }
@@ -26492,9 +26600,14 @@ pub(in crate::server) async fn save_named_groups_checked_unlocked(
             }
         });
     match &outcome {
-        Ok(AtomicWriteOutcome::Durable) => state
-            .named_groups_requires_durability_confirmation
-            .store(false, Ordering::Release),
+        Ok(AtomicWriteOutcome::Durable) => {
+            state
+                .named_groups_requires_durability_confirmation
+                .store(false, Ordering::Release);
+            // #477 (r9 item 1): the on-disk view now matches the live map
+            // — every in-flight install marker is obsolete.
+            clear_join_install_pending_markers(&state.named_groups_path).await;
+        }
         Ok(AtomicWriteOutcome::ReplacedNotDurable) => state
             .named_groups_requires_durability_confirmation
             .store(true, Ordering::Release),
@@ -33274,6 +33387,7 @@ pub(in crate::server) mod tests {
         #[tokio::test]
         async fn wp_b_t1_persist_failure_installs_nothing() {
             for fault in [
+                SaveFault::ReplacedNotDurableAfterWriteThenError,
                 SaveFault::ReplacedNotDurableAfterWrite,
                 SaveFault::ReplacedNotDurable,
                 SaveFault::NotReplaced,
@@ -33312,23 +33426,76 @@ pub(in crate::server) mod tests {
                     !joiner_state.named_groups.read().await.contains_key(&group),
                     "({fault:?}) the group record was rolled back"
                 );
-                // #477 (r8 item 1): the PERSISTED view excludes the failed
-                // join too — a restart reloads exactly what the live map
-                // shows. For the post-rename fault the destination DID hold
-                // the failed join until the corrective re-save ran.
-                let reloaded = load_named_groups(&joiner_state.named_groups_path)
+                // #477 (r8/r9 item 1): what a RESTART reloads through the
+                // PRODUCTION startup loader excludes the failed join.
+                let raw_file = load_named_groups(&joiner_state.named_groups_path)
                     .await
                     .expect("reload named_groups.json");
+                let restarted = load_named_groups_merged(
+                    &joiner_state.named_groups_path,
+                    &joiner_state.home_suite_groups_path,
+                )
+                .await
+                .expect("startup loader");
                 assert!(
-                    !reloaded.contains_key(&group),
-                    "({fault:?}) the on-disk roster excludes the failed join"
+                    !restarted.contains_key(&group),
+                    "({fault:?}) a restart never resurrects the failed join"
                 );
+                if fault == SaveFault::ReplacedNotDurableAfterWriteThenError {
+                    // The corrective re-save FAILED (crash-equivalent): the
+                    // raw file still holds the failed join — only the
+                    // durable install marker keeps it out at startup.
+                    assert!(
+                        raw_file.contains_key(&group),
+                        "({fault:?}) the raw roster file still holds the failed join (the corrective save failed)"
+                    );
+                    assert!(
+                        joiner_state
+                            .named_groups_requires_durability_confirmation
+                            .load(Ordering::Acquire),
+                        "({fault:?}) the durability flag stays raised"
+                    );
+                    // The next DURABLE save (any roster mutation) writes
+                    // the rolled-back map and clears the marker.
+                    {
+                        let _persistence_guard =
+                            joiner_state.named_groups_persistence_lock.lock().await;
+                        assert!(
+                            confirm_named_groups_durability_unlocked(&joiner_state).await,
+                            "({fault:?}) the unfaulted corrective save is durable"
+                        );
+                    }
+                    let raw_after = load_named_groups(&joiner_state.named_groups_path)
+                        .await
+                        .expect("reload named_groups.json");
+                    assert!(
+                        !raw_after.contains_key(&group),
+                        "({fault:?}) the durable save wrote the rolled-back roster"
+                    );
+                    assert!(
+                        read_join_install_pending_markers(&joiner_state.named_groups_path)
+                            .await
+                            .is_empty(),
+                        "({fault:?}) the durable save cleared the install marker"
+                    );
+                } else {
+                    assert!(
+                        !raw_file.contains_key(&group),
+                        "({fault:?}) the on-disk roster excludes the failed join"
+                    );
+                }
                 if fault == SaveFault::ReplacedNotDurableAfterWrite {
                     assert!(
                         !joiner_state
                             .named_groups_requires_durability_confirmation
                             .load(Ordering::Acquire),
                         "({fault:?}) the corrective re-save confirmed durability"
+                    );
+                    assert!(
+                        read_join_install_pending_markers(&joiner_state.named_groups_path)
+                            .await
+                            .is_empty(),
+                        "({fault:?}) the durable corrective save cleared the install marker"
                     );
                 }
                 assert!(
