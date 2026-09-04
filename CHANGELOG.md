@@ -11,7 +11,7 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- `NetworkConfig.mdns_enabled` (default `true`, mirroring ant-quic): embedders, operators and tests can disable mDNS discovery/auto-connect — the vector by which co-located LAN nodes connect beneath x0x's policy gates (#417, #462).
+- `NetworkConfig.mdns_enabled` (default `true`, mirroring ant-quic): embedders and tests can disable mDNS discovery/auto-connect — the vector by which co-located LAN nodes connect beneath x0x's policy gates (#417, #462). Daemon behavior is unchanged (mDNS stays on; a TOML knob can follow when requested).
 
 ## [v0.41.1] - 2026-09-04
 
