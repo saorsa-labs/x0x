@@ -4,6 +4,34 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.41.3] - 2026-09-05
+
+Emergency GUI fix: the embedded GUI was completely dead in v0.41.1 and v0.41.2.
+
+### Fixed
+
+- **The GUI rendered a blank page on every load (regression from v0.41.1,
+  commit bdd3f46).** The peer-events log was converted from
+  `onmessage = e => {...};` to `addEventListener('peer-lifecycle', e => {...}`
+  but kept the assignment's `};` terminator instead of `});`
+  (`src/gui/x0x-gui.html:3411`). The GUI is ONE inline `<script>`, so the
+  unclosed argument list made the browser throw
+  `SyntaxError: missing ) after argument list` and abandon the entire script:
+  no handlers bound, no requests fired, nothing painted. Verified in Chrome
+  against a live daemon — the dashboard, identity panel and discovered-agent
+  table now render with zero console errors.
+
+### Added
+
+- **Regression gate: `tests/gui_script_syntax.rs`.** A dependency-free
+  delimiter scanner over the embedded GUI's inline script (CI has no Node),
+  handling string, template, comment and regex literals — including template
+  literals nested inside `${...}` interpolations. It fails on the exact v0.41.1
+  defect and on any `addEventListener(` call that is not closed as a call.
+  The existing GUI suites match endpoint strings and never checked that the
+  script parses, which is why a fatal syntax error shipped twice while every
+  GUI job stayed green.
+
 ## [v0.41.2] - 2026-09-04
 
 Post-v0.41.1 hardening patch: self-update handoff commit-proof, test de-flake/hermeticity batch, and the CI gate ceiling fix. No wire-protocol, storage, or config changes; daemon behavior is unchanged except as described under Fixed.
