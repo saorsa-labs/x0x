@@ -4,6 +4,20 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.41.1] - 2026-09-04
+
+GUI event-stream repair release, plus SKILL.md/API documentation parity fixes from a full surface audit (routes ↔ SKILL.md ↔ CLI ↔ GUI).
+
+### Fixed
+
+- GUI "live presence" toggle and peer-events log were silently dead: both SSE consumers read `onmessage`, which never fires for the server's named events (`event: presence`, `event: peer-lifecycle`), and the presence handler also checked a nonexistent `type` field. Both now listen on the event name and parse the correct payload (`{"event":"online"|"offline","agent_id",...}` / `{"peer_id","event","at_ms"}`).
+- GUI WebSocket client no longer leaks group-topic subscriptions after leaving a space (it now sends `unsubscribe`), surfaces ADR-0040 `mention`/delegation frames as toasts (they were arriving on subscribed group topics and being dropped), and logs `error` frames instead of swallowing them.
+- `gui-coverage` now counts `ownerApi(...)` call sites: they share `api(...)`'s path/method shape and were introduced during the #446 owner-act work, but the checker was never taught the token, so nine wired owner-act endpoints scored as uncovered. Whitelist cleanup: dropped the redundant `GET /home` / `POST /home/rename` entries (both genuinely wired) and documented the `agentCardPath()` indirection on `GET /agent/card`.
+
+### Documentation
+
+- SKILL.md: corrected the stale `x0x agent identity_words` cross-reference (identity words are the `identity_words` field in `x0x agent` / `x0x find` output, not a subcommand); completed the `?token=` browser-endpoint allow-list (`/peers/events`, `/presence/events` were accepted by the daemon but unlisted); documented the v0.41 `POST /groups/join` home-mode wire fields (`mode`, `expected_owner_user_id`) and the invite mint fields (`expiry_secs`, `intended_joiner`); added exec `sessions`/`cancel`, contact revocation, presence `find`/`status`, group rename, and a durable-history quick reference (§4.10); completed the WS frame lists (`unsubscribe` client frame; `unsubscribed`, `live`, `error` server frames); fixed the capability-matrix CLI cell for durable history (`x0x history list/message/search/stats/purge`).
+
 ## [v0.41.0] - 2026-09-03
 
 Home Suite hardening release. Summarises the notable user-facing changes since v0.39.9 (the v0.39.10–v0.40.4 tags carried no changelog entries).

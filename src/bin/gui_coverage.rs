@@ -1,10 +1,10 @@
 //! GUI endpoint coverage checker.
 //!
-//! Compares every `api(...)` call in `src/gui/x0x-gui.html` against the
-//! authoritative endpoint registry in `src/api/mod.rs`. Emits a coverage
-//! report and exits non-zero when coverage falls below the configured
-//! threshold (default 95 %) or when the GUI calls a path the daemon does
-//! not expose.
+//! Compares every `api(...)` / `ownerApi(...)` call in
+//! `src/gui/x0x-gui.html` against the authoritative endpoint registry in
+//! `src/api/mod.rs`. Emits a coverage report and exits non-zero when
+//! coverage falls below the configured threshold (default 95 %) or when
+//! the GUI calls a path the daemon does not expose.
 //!
 //! Usage:
 //!   gui-coverage [--gui PATH] [--whitelist PATH] [--threshold PCT] [--json]
@@ -117,7 +117,8 @@ fn call_matches(gui_method: &str, gui_path: &str, ep: &EndpointDef) -> bool {
     })
 }
 
-/// Extract all `api('/path', {method: 'POST'})` style calls from the GUI.
+/// Extract all `api('/path', {method: 'POST'})` / `ownerApi(...)` style
+/// calls from the GUI.
 ///
 /// The parser walks the entire file as one string, tracking line numbers
 /// so a multi-line `api(...)` call is recognised the same as a one-liner.
@@ -126,16 +127,31 @@ fn extract_gui_calls(html: &str) -> Vec<(String, String, usize)> {
     let bytes = html.as_bytes();
     let mut i = 0usize;
     while i < bytes.len() {
-        if !(i + 4 <= bytes.len() && &bytes[i..i + 4] == b"api(") {
+        // `ownerApi(...)` call sites share `api(...)`'s path/method shape
+        // (they only change which bearer is sent), so they count toward
+        // coverage — see the matching extractor in
+        // tests/gui_named_group_parity.rs. `symApi(` targets the separate
+        // Symphony daemon and deliberately does NOT match (capital `A`).
+        let token_len = if bytes[i..].starts_with(b"ownerApi(") {
+            // Same identifier boundary as `api(`: don't match `my_ownerApi(`.
+            let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            if !prev_ok {
+                i += 1;
+                continue;
+            }
+            "ownerApi(".len()
+        } else if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"api(" {
+            let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            if !prev_ok {
+                i += 1;
+                continue;
+            }
+            4
+        } else {
             i += 1;
             continue;
-        }
-        let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
-        if !prev_ok {
-            i += 1;
-            continue;
-        }
-        let start = i + 4;
+        };
+        let start = i + token_len;
         let (raw_args, consumed) = match take_balanced_parens(&html[start..]) {
             Some(x) => x,
             None => {
