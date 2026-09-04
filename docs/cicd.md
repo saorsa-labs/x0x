@@ -23,8 +23,10 @@ commit.
   run) cannot ship: `build-release` depends on `require-green-ci`, and the
   entire `sign-release → create-release → publish-*` chain depends on
   `build-release`, so a red/unknown gate blocks every downstream job.
-- The gate polls for up to 20 minutes so a CI run still in flight may finish
+- The gate polls for up to 45 minutes so a CI run still in flight may finish
   before the release proceeds; after that it fails with a clear message.
+  (#476: raised from 20 minutes — the Coverage Gate alone now runs longer
+  than the old ceiling, which forced a manual rerun on the v0.41.0 tag.)
 - `ci.yml` is not triggered by the tag push itself (it gates on branch
   `main`), so the observed run is the one from when the commit was merged.
 

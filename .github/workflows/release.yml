@@ -67,9 +67,11 @@ jobs:
           # for release that was merged to main already has a run we can
           # observe. ci.yml is NOT triggered by the tag push itself (it gates
           # on branch main), so this observes the run from the merge. Poll for
-          # up to 20 minutes so a CI run still in flight may finish, then
-          # require conclusion == success.
-          deadline=$(( $(date +%s) + 20 * 60 ))
+          # up to 45 minutes so a CI run still in flight may finish, then
+          # require conclusion == success. (#476: the Coverage Gate alone now
+          # runs past 20 minutes — the old ceiling forced a manual rerun on
+          # every release; v0.41.0's tag had to be released by hand.)
+          deadline=$(( $(date +%s) + 45 * 60 ))
           while :; do
             json=$(gh run list --workflow ci.yml --commit "${SHA}" \
                    --json status,conclusion --limit 50 || echo '[]')
@@ -85,7 +87,7 @@ jobs:
               exit 1
             fi
             if [ "$(date +%s)" -ge "${deadline}" ]; then
-              echo "::error::CI did not reach a terminal state within 20 minutes for ${SHA} (status=${status}). Refusing to release on unknown CI."
+              echo "::error::CI did not reach a terminal state within 45 minutes for ${SHA} (status=${status}). Refusing to release on unknown CI."
               exit 1
             fi
             echo "CI run is '${status}'; waiting 30s before re-checking..."
