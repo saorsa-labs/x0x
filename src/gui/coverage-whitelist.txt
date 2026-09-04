@@ -40,7 +40,8 @@ GET /gui
 # ── Admin/daemon — intentionally absent from end-user GUI ──
 POST /shutdown
 
-# ── ADR-0038 Home space — entered from the sidebar via navigate('homespace'),
-# not a URL the coverage crawler follows from /api listing. GUI calls both.
-GET /home
-POST /home/rename
+# ── Identity card — the GUI calls it via the agentCardPath() helper
+# (share links need the query params), so the first argument is a
+# function call, not a path literal the crawler can statically match.
+# The endpoint IS wired: shareIdentity/generateCard/genCardModal. ──
+GET /agent/card

@@ -798,6 +798,7 @@ function wsConnect(){
 }
 function wsSend(obj){if(ws&&ws.readyState===1)ws.send(JSON.stringify(obj))}
 function wsSub(topic){wsSubs.add(topic);wsSend({type:'subscribe',topics:[topic]})}
+function wsUnsub(topic){if(!wsSubs.delete(topic))return;wsSend({type:'unsubscribe',topics:[topic]})}
 function wsPub(topic,obj){wsSend({type:'publish',topic,payload:b64e(obj)})}
 function b64e(o){return btoa(unescape(encodeURIComponent(JSON.stringify(o))))}
 function b64d(s){try{return JSON.parse(decodeURIComponent(escape(atob(s))))}catch(e){return null}}
@@ -809,10 +810,22 @@ function handleWsMsg(m){
     if(d&&d.text)onDirectMessage(m.sender||'',d);
     return;
   }
+  if(m.type==='mention'){
+    // ADR-0040: daemon-side mention/delegation routing arrives on the
+    // group topic we are subscribed to; surface it instead of dropping.
+    const where=short(m.group_id||m.topic||'',10);
+    const who=short(m.author_agent_id||'',10);
+    toast(m.reason==='delegation'
+      ?'Delegation grant in '+where+' from '+who
+      :'Mentioned by '+who+' in '+where,'info');
+    return;
+  }
   if(m.type==='message'){
     if(m.origin===S.get('agentId'))return;
     onGossipMessage(m.topic,m.origin,b64d(m.payload));
+    return;
   }
+  if(m.type==='error'){console.warn('ws error:',m.message||m)}
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -2033,7 +2046,7 @@ async function mountSpace(){
   // All three surfaces (GUI, Dioxus, SwiftUI) use the same topic +
   // dedup strategy.
   if(signedPublicPollTimer){clearInterval(signedPublicPollTimer);signedPublicPollTimer=null}
-  if(signedPublicTopic){wsSubs.delete(signedPublicTopic);signedPublicTopic=''}
+  if(signedPublicTopic){wsUnsub(signedPublicTopic);signedPublicTopic=''}
   signedPublicSeen.clear();
   if(currentSpaceConfidentiality==='signed_public'){
     // Fetch the stable group_id (Phase D.3) which is what the daemon
@@ -3372,7 +3385,9 @@ function togglePeerEvents(on){
   try{
     const url=BASE+'/peers/events'+(SESSION_TOKEN?'?token='+encodeURIComponent(SESSION_TOKEN):'');
     peerEventsSse=new EventSource(url);
-    peerEventsSse.onmessage=e=>{
+    // Server emits NAMED SSE events (`event: peer-lifecycle`) —
+    // `onmessage` only fires for unnamed events.
+    peerEventsSse.addEventListener('peer-lifecycle',e=>{
       if(!out)return;
       const line=document.createElement('div');
       line.textContent=new Date().toLocaleTimeString()+' '+e.data;
@@ -3581,15 +3596,19 @@ function togglePresenceLive(on){
     try{
       const url=BASE+'/presence/events'+(SESSION_TOKEN?'?token='+encodeURIComponent(SESSION_TOKEN):'');
       presenceSse=new EventSource(url);
-      presenceSse.onmessage=e=>{
+      // Server emits NAMED SSE events (`event: presence`, payload
+      // `{"event":"online"|"offline","agent_id",...}`) — `onmessage` only
+      // fires for unnamed events, so listen on the event name and read
+      // the `event` field.
+      presenceSse.addEventListener('presence',e=>{
         try{
           const ev=JSON.parse(e.data);
-          if(ev.type==='online'||ev.type==='offline'){
-            toast(ev.type==='online'?'Online: '+short(ev.agent_id||'',10):'Offline: '+short(ev.agent_id||'',10),'info');
+          if(ev.event==='online'||ev.event==='offline'){
+            toast(ev.event==='online'?'Online: '+short(ev.agent_id||'',10):'Offline: '+short(ev.agent_id||'',10),'info');
             pollPresence();
           }
         }catch(_){}
-      };
+      });
       presenceSse.onerror=()=>{try{presenceSse.close()}catch(_){};presenceSse=null;
         const cb=document.getElementById('p-live');if(cb)cb.checked=false;
         toast('Presence event stream dropped','warn');
