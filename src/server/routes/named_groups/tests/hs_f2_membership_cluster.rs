@@ -185,6 +185,34 @@ async fn diagnostics_row(
         .unwrap_or_else(|| panic!("diagnostics row for {group_id}"))
 }
 
+/// Bounded-poll variant of [`diagnostics_row`] for counter assertions:
+/// the diagnostics bookkeeping lands asynchronously relative to the roster
+/// state these tests observe through other paths, so an immediate read can
+/// legitimately see a stale snapshot (observed on a CI host:
+/// `member_joined_events_applied == 0` right after the roster poll saw the
+/// active member). Poll until the counter reaches `at_least` or the bound
+/// expires, and return the final row either way.
+async fn diagnostics_counter_at_least(
+    state: &AppState,
+    group_id: &str,
+    at_least: u64,
+    what: &str,
+) -> crate::groups::diagnostics::GroupDiagnostic {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        let row = diagnostics_row(state, group_id).await;
+        if row.counters.member_joined_events_applied >= at_least {
+            return row;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "diagnostics counter {what} never reached {at_least} (last: {})",
+            row.counters.member_joined_events_applied
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    }
+}
+
 // ── #447 ──────────────────────────────────────────────────────────────────
 
 /// #447: the authority rejects a certified joiner with
@@ -1961,7 +1989,13 @@ async fn integration_treekem_home_rename_restart_single_announce_end_to_end() ->
         joiner_disk.contains(&group_id),
         "r2: the confirmed join is durable on the joiner"
     );
-    let owner_row = diagnostics_row(owner_state.as_ref(), &group_id).await;
+    let owner_row = diagnostics_counter_at_least(
+        owner_state.as_ref(),
+        &group_id,
+        1,
+        "member_joined_events_applied (certified MemberJoined on the single-announce evidence)",
+    )
+    .await;
     assert!(
         owner_row.counters.member_joined_events_applied >= 1,
         "authority applied the certified MemberJoined on the single-announce evidence"
@@ -2539,7 +2573,13 @@ async fn integration_real_home_provision_rename_restart_join_e2e() -> Result<()>
         );
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
     }
-    let owner_row = diagnostics_row(owner_state.as_ref(), &home_id).await;
+    let owner_row = diagnostics_counter_at_least(
+        owner_state.as_ref(),
+        &home_id,
+        1,
+        "member_joined_events_applied (certified join from ONE announce)",
+    )
+    .await;
     assert!(
         owner_row.counters.member_joined_events_applied >= 1,
         "authority applied the certified join from ONE announce"
