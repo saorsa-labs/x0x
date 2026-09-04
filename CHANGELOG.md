@@ -2,6 +2,8 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
 ### Fixed
 
 - Self-update transactional handoff could commit on a stale/foreign listener (#493/#415 class): the helper's health probe accepted any HTTP 200 without reading the body, so it never proved the responder was the spawned target — `finish_success` could report the new version while an old binary still answered. The probe now reads the full bounded response and requires `ok` with the exact expected version (`to_version` for the target step, `from_version` for the rollback step), failing closed on malformed/truncated/oversized bodies; a timed-out target child is terminated and reaped before the backup is restored, so a late target can no longer race the rollback daemon; probe I/O and post-SIGKILL reaping are wall-clock bounded.
