@@ -339,6 +339,40 @@ impl DaemonClient {
         Ok(resp)
     }
 
+    /// #477: GET that returns the parsed body even for non-2xx (the
+    /// join-status 404 carries the terminal outcome).
+    pub async fn get_with_error_body(&self, path: &str) -> Result<serde_json::Value> {
+        if self.dump {
+            return self.emit_dump("GET", path, None);
+        }
+        let resp = self
+            .client
+            .get(format!("{}{}", self.base_url, path))
+            .headers(self.auth_headers())
+            .send()
+            .await
+            .context("request failed — is x0xd running?")?;
+        let status = resp.status();
+        let text = resp.text().await.context("failed to read response body")?;
+        let body: serde_json::Value = if text.trim().is_empty() {
+            serde_json::json!({ "status": status.as_u16() })
+        } else {
+            serde_json::from_str(&text).context("failed to parse response")?
+        };
+        // #477 (r3 item 5): ONLY 404 passes through with its body (the
+        // join-status terminal shape); every other non-2xx is an error so
+        // auth/server failures never print as terminal outcomes.
+        if status.is_success() || status.as_u16() == 404 {
+            let mut body = body;
+            if let serde_json::Value::Object(map) = &mut body {
+                map.entry("status".to_string())
+                    .or_insert(serde_json::Value::from(status.as_u16()));
+            }
+            return Ok(body);
+        }
+        Err(error_from_body(status, &body))
+    }
+
     async fn handle_response(&self, resp: reqwest::Response) -> Result<serde_json::Value> {
         let status = resp.status();
         let text = resp.text().await.context("failed to read response body")?;

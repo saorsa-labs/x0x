@@ -48,19 +48,20 @@ use routes::{
     evaluate_trust, exec_cancel, exec_diagnostics, exec_run, exec_sessions, file_accept_handler,
     file_reject_handler, file_send_handler, file_transfer_status_handler, file_transfers_handler,
     find_agent, forward_add, forward_list, forward_remove, get_a2a_agent_card, get_agent_card,
-    get_constitution, get_constitution_json, get_group_card, get_group_public_messages,
-    get_group_state, get_group_state_commits, get_kv_value, get_mls_group, get_named_group,
-    get_named_group_members, get_profile, get_sync_devices, gossip_diagnostics,
-    group_membership_lock, groups_diagnostics, handle_file_message, handle_join_result_message,
-    handle_treekem_catchup_request, handle_treekem_catchup_response, handle_welcome_blob_message,
-    health, history_diagnostics, history_list, history_message, history_purge, history_search,
-    history_stats, identity_revocations, identity_revoke, import_agent_card, import_group_card,
-    ingest_public_message, introduction, join_group_via_invite, join_kv_store, leave_group,
-    list_contacts, list_discovery_subscriptions, list_join_requests, list_kv_keys, list_kv_stores,
-    list_machines, list_mls_groups, list_named_groups, list_revocations, list_task_lists,
-    list_tasks, load_causal_approval_queue, load_named_groups_merged,
-    load_predecessor_relay_outbox, load_treekem_member_key_packages, machine_for_agent_handler,
-    machines_by_user_handler, migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
+    get_constitution, get_constitution_json, get_group_card, get_group_join_status,
+    get_group_public_messages, get_group_state, get_group_state_commits, get_kv_value,
+    get_mls_group, get_named_group, get_named_group_members, get_profile, get_sync_devices,
+    gossip_diagnostics, group_membership_lock, groups_diagnostics, handle_file_message,
+    handle_join_result_message, handle_treekem_catchup_request, handle_treekem_catchup_response,
+    handle_welcome_blob_message, health, history_diagnostics, history_list, history_message,
+    history_purge, history_search, history_stats, identity_revocations, identity_revoke,
+    import_agent_card, import_group_card, ingest_public_message, introduction,
+    join_group_via_invite, join_kv_store, leave_group, list_contacts, list_discovery_subscriptions,
+    list_join_requests, list_kv_keys, list_kv_stores, list_machines, list_mls_groups,
+    list_named_groups, list_revocations, list_task_lists, list_tasks, load_causal_approval_queue,
+    load_named_groups_merged, load_predecessor_relay_outbox, load_treekem_member_key_packages,
+    machine_for_agent_handler, machines_by_user_handler,
+    migrate_unsplit_home_suite_store_if_needed, mls_decrypt, mls_encrypt,
     named_group_metadata_event_group_id, named_group_metadata_event_kind, network_status,
     now_millis_u64, owner_agents, owner_agents_issue, owner_agents_revoke, owner_riders_issue,
     owner_riders_list, owner_riders_revoke, peer_health_handler, peers, pin_machine, presence,
@@ -886,6 +887,10 @@ pub async fn serve_with_options(
         treekem_pending_events: RwLock::new(HashMap::new()),
         owner_cert_pending_joins: RwLock::new(HashMap::new()),
         pending_join_stubs: StdMutex::new(std::collections::HashSet::new()),
+        pending_join_refusals: StdMutex::new(HashMap::new()),
+        pending_join_attempts: StdMutex::new(HashMap::new()),
+        last_join_outcomes: StdMutex::new(HashMap::new()),
+        join_refusal_sign_limiter: StdMutex::new(Default::default()),
         pending_adoption_chains: StdMutex::new(HashMap::new()),
         pending_head_attestations: StdMutex::new(HashMap::new()),
         causal_approval_queue: RwLock::new(HashMap::new()),
@@ -1418,7 +1423,8 @@ pub async fn serve_with_options(
                     len = msg.payload.len(),
                     verified = msg.verified,
                 );
-                handle_join_result_message(&join_result_state, &msg.sender, join_msg).await;
+                handle_join_result_message(&join_result_state, &msg.sender, msg.verified, join_msg)
+                    .await;
             }
         }));
     }
@@ -1824,6 +1830,7 @@ pub async fn serve_with_options(
         .route("/groups/cards/import", post(import_group_card))
         .route("/groups/cards/:id", get(get_group_card))
         .route("/groups/join", post(join_group_via_invite))
+        .route("/groups/:id/join-status", get(get_group_join_status))
         .route("/groups/:id", get(get_named_group))
         .route("/groups/:id", patch(update_named_group))
         .route("/groups/:id/policy", patch(update_group_policy))
@@ -2106,8 +2113,11 @@ pub async fn serve_with_options(
         //    here (after begin_shutdown, before agent.shutdown) guarantees
         //    join_network has fully stopped before the Agent stops are run.
         let mut bg_tasks = bg_tasks;
-        bg_tasks
-            .extend(std::mem::take(&mut *state.group_metadata_tasks.write().await).into_values());
+        bg_tasks.extend(
+            std::mem::take(&mut *state.group_metadata_tasks.write().await)
+                .into_values()
+                .map(|reg| reg.handle),
+        );
         bg_tasks
             .extend(std::mem::take(&mut *state.public_message_tasks.write().await).into_values());
         bg_tasks.extend(std::mem::take(&mut *state.directory_tasks.write().await).into_values());

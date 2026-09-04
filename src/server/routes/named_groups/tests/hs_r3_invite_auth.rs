@@ -1917,7 +1917,7 @@ async fn addressed_invite_consumed_exactly_once_under_concurrent_volleys() -> Re
             .await
             .counters
             .invites_refused_reasons
-            .get("invite_not_addressed_to_joiner"),
+            .get("invite_not_addressed"),
         Some(&1),
         "the wrong agent's refusal is the not-addressed reason"
     );
@@ -2113,7 +2113,7 @@ async fn addressed_invite_survives_restart_reload() -> Result<()> {
             .await
             .counters
             .invites_refused_reasons
-            .get("invite_not_addressed_to_joiner"),
+            .get("invite_not_addressed"),
         Some(&1)
     );
 

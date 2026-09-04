@@ -1293,6 +1293,16 @@ enum GroupSub {
         /// `owner_mismatch`). Only meaningful with `--home`.
         #[arg(long, value_name = "HEX", requires = "home")]
         owner: Option<String>,
+        /// #477: poll the join status until terminal (or this many
+        /// seconds) and print the typed refusal when one is recorded.
+        #[arg(long, value_name = "SECS")]
+        wait: Option<u64>,
+    },
+    /// #477: show a group's join status (pending / typed terminal
+    /// outcome).
+    JoinStatus {
+        /// Group ID.
+        group_id: String,
     },
     /// Set your display name in a group.
     SetName {
@@ -2404,6 +2414,7 @@ async fn run(
                 display_name,
                 home,
                 owner,
+                wait,
             }) => {
                 commands::group::join(
                     &client,
@@ -2411,8 +2422,12 @@ async fn run(
                     display_name.as_deref(),
                     home,
                     owner.as_deref(),
+                    wait,
                 )
                 .await
+            }
+            Some(GroupSub::JoinStatus { group_id }) => {
+                commands::group::join_status(&client, &group_id).await
             }
             Some(GroupSub::SetName { group_id, name }) => {
                 commands::group::set_name(&client, &group_id, &name).await
