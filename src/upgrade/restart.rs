@@ -2,8 +2,9 @@
 //!
 //! The file swap in [`super::Upgrader`] is already transactional. This module
 //! makes the *restart* transactional too: the swap is only committed once a
-//! replacement process answers `GET /health` on the pre-upgrade API address;
-//! otherwise the previous binary is restored and respawned. A terminal-
+//! replacement process answers `GET /health` with `ok: true` and the expected
+//! version on the pre-upgrade API address; otherwise the previous binary is
+//! restored and respawned. A terminal-
 //! launched daemon (no systemd/launchd) can therefore never be left silently
 //! DOWN with the new bytes on disk.
 //!
@@ -40,6 +41,11 @@ pub const SUPERVISED_ENV_VAR: &str = "X0X_SUPERVISED";
 /// Bound on the old process's graceful cancel before it hard-exits. The macOS
 /// SIGTERM-hang incident is why this must be bounded, not generous.
 const GRACEFUL_CANCEL_BOUND: Duration = Duration::from_secs(5);
+/// Bound on each bounded phase of [`terminate_and_reap`]: the graceful
+/// SIGTERM window before the unconditional kill, and the post-kill reap
+/// attempt. The readiness watch already expired by then, so this only caps
+/// how long a wedged target can stall the rollback.
+const TERMINATE_GRACE: Duration = Duration::from_secs(5);
 /// Default bound for the helper's wait on the old pid dying and the API port
 /// freeing. Also the default bound for each `/health` wait (restart commit).
 const DEFAULT_HANDOFF_TIMEOUT: Duration = Duration::from_secs(30);
@@ -419,9 +425,10 @@ fn bounded_graceful_wait(api_addr: Option<SocketAddr>, bound: Duration) {
 ///    old process hangs past the bound: abort the spawn, restore the backup,
 ///    leave the old process up, write `UPGRADE_FAILED`. **No SIGKILL.**
 /// 2. Spawn the new binary with the captured argv/cwd and wait for
-///    `GET /health` 200 (bounded). Health ok ⇒ delete the handoff file, exit 0.
+///    `GET /health` to answer `ok: true` with the target version (bounded).
+///    Healthy ⇒ delete the handoff file, exit 0.
 /// 3. On spawn/health failure: restore the backup, respawn the previous
-///    binary, wait for `/health` again.
+///    binary, wait for `/health` to report the previous version again.
 /// 4. If the rollback respawn also fails: write `UPGRADE_FAILED`, eprint, exit
 ///    nonzero. Never exit 0 after a failed respawn.
 ///
@@ -458,10 +465,16 @@ pub fn run_upgrade_handoff(handoff_path: &Path) -> i32 {
         return 3;
     }
 
-    // Step 2: prove the new binary serves before committing the restart.
+    // Step 2: prove the new binary serves the target version before
+    // committing the restart.
     let health_timeout = env_timeout(HEALTH_TIMEOUT_ENV);
-    let new_outcome =
-        spawn_and_await_health(&handoff.target_path, &handoff, &data_dir, health_timeout);
+    let new_outcome = spawn_and_await_health(
+        &handoff.target_path,
+        &handoff,
+        &data_dir,
+        health_timeout,
+        &handoff.to_version,
+    );
     match new_outcome {
         SpawnHealthOutcome::Healthy => {
             finish_success(handoff_path, &handoff, &handoff.to_version, "new");
@@ -491,7 +504,13 @@ pub fn run_upgrade_handoff(handoff_path: &Path) -> i32 {
         eprintln!("x0xd: UPGRADE FAILED — {reason}");
         return 4;
     }
-    match spawn_and_await_health(&handoff.target_path, &handoff, &data_dir, health_timeout) {
+    match spawn_and_await_health(
+        &handoff.target_path,
+        &handoff,
+        &data_dir,
+        health_timeout,
+        &handoff.from_version,
+    ) {
         SpawnHealthOutcome::Healthy => {
             finish_success(handoff_path, &handoff, &handoff.from_version, "restored");
             return 0;
@@ -539,12 +558,20 @@ enum SpawnHealthOutcome {
 }
 
 /// Spawn `binary` with the captured argv/cwd (own process group, no terminal)
-/// and wait for `/health` 200 on the handoff's API address.
+/// and wait for `/health` to answer `ok: true` with `expected_version` on the
+/// handoff's API address.
+///
+/// The [`std::process::Child`] is retained for the whole watch: if the
+/// readiness deadline expires, that exact child is terminated and reaped
+/// *before* `Unhealthy` is returned, so a late-binding target cannot contend
+/// with the rollback respawn for the API port. On success the child is
+/// dropped unreaped — a healthy daemon must survive the helper's exit.
 fn spawn_and_await_health(
     binary: &Path,
     handoff: &UpgradeHandoff,
     data_dir: &Path,
     health_timeout: Duration,
+    expected_version: &str,
 ) -> SpawnHealthOutcome {
     let mut cmd = std::process::Command::new(binary);
     cmd.args(build_spawn_args(&handoff.argv));
@@ -566,13 +593,66 @@ fn spawn_and_await_health(
         cmd.creation_flags(CREATE_NEW_PROCESS_GROUP);
     }
 
-    if let Err(e) = cmd.spawn() {
-        return SpawnHealthOutcome::SpawnFailed(e);
-    }
-    if wait_for_health(handoff, data_dir, health_timeout) {
+    let mut child = match cmd.spawn() {
+        Ok(child) => child,
+        Err(e) => return SpawnHealthOutcome::SpawnFailed(e),
+    };
+    if wait_for_health(handoff, data_dir, health_timeout, expected_version) {
+        drop(child);
         SpawnHealthOutcome::Healthy
     } else {
+        terminate_and_reap(&mut child);
         SpawnHealthOutcome::Unhealthy
+    }
+}
+
+/// Terminate and reap a spawned process whose readiness watch expired.
+///
+/// The child held (or was about to hold) the pre-upgrade API address; the
+/// rollback respawn cannot bind until it is gone. SIGTERM first — the
+/// daemon's own graceful path releases its binds — escalating to an
+/// unconditional kill within [`TERMINATE_GRACE`] so the helper stays bounded.
+/// Even the post-kill reap is bounded: a child wedged in uninterruptible
+/// sleep (D-state) would otherwise hold `wait()` open-ended, and a zombie
+/// left behind is reparented to init when the helper exits right after.
+/// The direct child is the whole story: production daemons do not fork
+/// listeners, and the test fixtures `exec` their wrappers.
+#[cfg(unix)]
+fn terminate_and_reap(child: &mut std::process::Child) {
+    let pid = child.id() as libc::pid_t;
+    if unsafe { libc::kill(pid, libc::SIGTERM) } != 0 {
+        // Already dead or unreachable: fall through to the reap below.
+        let _ = child.kill();
+    }
+    let deadline = Instant::now() + TERMINATE_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+            Err(_) => break,
+        }
+    }
+    let _ = child.kill();
+    reap_bounded(child);
+}
+
+#[cfg(not(unix))]
+fn terminate_and_reap(child: &mut std::process::Child) {
+    let _ = child.kill();
+    reap_bounded(child);
+}
+
+/// Bounded reap after the unconditional kill: poll `try_wait` for
+/// [`TERMINATE_GRACE`] and give up rather than block on a child the kernel
+/// will not harvest (uninterruptible sleep). The orphaned entry is init's /
+/// the runtime's to collect once this helper exits.
+fn reap_bounded(child: &mut std::process::Child) {
+    let deadline = Instant::now() + TERMINATE_GRACE;
+    while Instant::now() < deadline {
+        match child.try_wait() {
+            Ok(Some(_)) | Err(_) => return,
+            Ok(None) => std::thread::sleep(POLL_INTERVAL),
+        }
     }
 }
 
@@ -601,14 +681,20 @@ fn wait_for_old_process_release(handoff: &UpgradeHandoff, timeout: Duration) -> 
     }
 }
 
-/// Wait (bounded) for `GET /health` 200 on the pre-upgrade API address, or on
-/// the address the replacement advertised in `<data_dir>/api.port` when the
-/// pre-upgrade bind was ephemeral.
-fn wait_for_health(handoff: &UpgradeHandoff, data_dir: &Path, timeout: Duration) -> bool {
+/// Wait (bounded) for `GET /health` to answer `ok: true` with
+/// `expected_version` on the pre-upgrade API address, or on the address the
+/// replacement advertised in `<data_dir>/api.port` when the pre-upgrade bind
+/// was ephemeral.
+fn wait_for_health(
+    handoff: &UpgradeHandoff,
+    data_dir: &Path,
+    timeout: Duration,
+    expected_version: &str,
+) -> bool {
     let deadline = Instant::now() + timeout;
     loop {
         if let Some(addr) = resolve_health_addr(handoff, data_dir) {
-            if http_health_ok(addr) {
+            if http_health_ok(addr, expected_version) {
                 return true;
             }
         }
@@ -672,9 +758,37 @@ fn addr_is_free(addr: SocketAddr) -> bool {
     }
 }
 
-/// Minimal `GET /health` probe: any HTTP/1.x 200 status line commits the
-/// restart. `/health` is auth-exempt on the daemon API.
-fn http_health_ok(addr: SocketAddr) -> bool {
+/// Cap on the `/health` response this probe will buffer. The real body is a
+/// few hundred bytes; anything larger is not our daemon.
+const HEALTH_RESPONSE_CAP: usize = 16 * 1024;
+
+/// Overall wall-clock bound on one `/health` probe exchange — the second
+/// bound beside the byte cap above. The socket timeouts are per-operation:
+/// a responder trickling bytes with sub-timeout gaps could otherwise stretch
+/// a single probe arbitrarily, deferring `wait_for_health`'s deadline check
+/// and everything it guards (`terminate_and_reap`, the rollback) past
+/// `health_timeout` without ever firing a timeout. A bounded watchdog must
+/// bound the probe, not just each read (code-review finding).
+const PROBE_IO_BOUND: Duration = Duration::from_secs(5);
+
+/// Minimal mirror of the daemon's `/health` envelope —
+/// `server::routes::status`'s `ApiResponse<HealthData>`, whose `data` is
+/// `#[serde(flatten)]`ed into `{"ok":true,"status":…,"version":…,…}`. Those
+/// types are `pub(in crate::server)` and Serialize-only, so the probe carries
+/// its own Deserialize shape; unknown fields are ignored.
+#[derive(serde::Deserialize)]
+struct HealthProbe {
+    ok: bool,
+    version: String,
+}
+
+/// Bounded `GET /health` readiness probe: the responder must answer HTTP 200
+/// whose full (size-capped) body parses as the daemon's health envelope with
+/// `ok == true` and `version == expected_version`. A bare 200 — from an old
+/// image still bound to the address, or a foreign listener — never commits
+/// the restart, and a truncated or malformed body fails closed.
+/// `/health` is auth-exempt on the daemon API.
+fn http_health_ok(addr: SocketAddr, expected_version: &str) -> bool {
     let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_secs(2)) else {
         return false;
     };
@@ -686,10 +800,35 @@ fn http_health_ok(addr: SocketAddr) -> bool {
     {
         return false;
     }
-    let mut buf = [0u8; 256];
-    let n = stream.read(&mut buf).unwrap_or(0);
-    let head = String::from_utf8_lossy(&buf[..n]);
-    head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")
+    let started = Instant::now();
+    let mut response = Vec::with_capacity(1024);
+    let mut chunk = [0u8; 1024];
+    loop {
+        if started.elapsed() >= PROBE_IO_BOUND {
+            return false;
+        }
+        match stream.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                if response.len() + n > HEALTH_RESPONSE_CAP {
+                    return false;
+                }
+                response.extend_from_slice(&chunk[..n]);
+            }
+            Err(_) => return false,
+        }
+    }
+    let response = String::from_utf8_lossy(&response);
+    let Some((head, body)) = response.split_once("\r\n\r\n") else {
+        return false;
+    };
+    if !(head.starts_with("HTTP/1.1 200") || head.starts_with("HTTP/1.0 200")) {
+        return false;
+    }
+    match serde_json::from_str::<HealthProbe>(body) {
+        Ok(probe) => probe.ok && probe.version == expected_version,
+        Err(_) => false,
+    }
 }
 
 /// Restore the backup bytes over the target — the same
@@ -1081,14 +1220,28 @@ mod tests {
         assert!(addr_is_free(addr));
     }
 
-    #[test]
-    fn http_health_ok_accepts_200_and_rejects_non_200() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let addr = listener.local_addr().unwrap();
-        let server = std::thread::spawn(move || {
-            for (status, body) in [("200 OK", "ok"), ("503 Service Unavailable", "bad")] {
-                let (mut sock, _) = listener.accept().unwrap();
-                let mut buf = [0u8; 128];
+    /// The daemon's `/health` body — mirrors `ApiResponse<HealthData>`'s
+    /// flattened serialization (`status.rs`); the probe ignores unknown
+    /// fields, as it must against real responses.
+    fn health_body(version: &str) -> String {
+        format!(
+            "{{\"ok\":true,\"status\":\"ok\",\"version\":\"{version}\",\"peers\":0,\
+             \"send_ready_peers\":0,\"uptime_secs\":0,\"warnings\":[]}}"
+        )
+    }
+
+    /// Serve one canned HTTP response per accepted connection, in order.
+    fn serve_responses(
+        listener: TcpListener,
+        responses: Vec<(String, String)>,
+    ) -> std::thread::JoinHandle<()> {
+        std::thread::spawn(move || {
+            for (status, body) in responses {
+                let (mut sock, _) = match listener.accept() {
+                    Ok(pair) => pair,
+                    Err(_) => return,
+                };
+                let mut buf = [0u8; 256];
                 let _ = sock.read(&mut buf);
                 let resp = format!(
                     "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
@@ -1096,12 +1249,74 @@ mod tests {
                 );
                 let _ = sock.write_all(resp.as_bytes());
             }
-        });
-        assert!(http_health_ok(addr));
-        assert!(!http_health_ok(addr));
+        })
+    }
+
+    #[test]
+    fn http_health_ok_accepts_200_and_rejects_non_200() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(
+            listener,
+            vec![
+                ("200 OK".to_string(), health_body("1.2.3")),
+                ("503 Service Unavailable".to_string(), health_body("1.2.3")),
+            ],
+        );
+        assert!(http_health_ok(addr, "1.2.3"));
+        assert!(!http_health_ok(addr, "1.2.3"));
         server.join().unwrap();
     }
 
+    #[test]
+    fn http_health_ok_rejects_200_with_wrong_version() {
+        // The production bug this probe closes: an OLD (or foreign) listener
+        // answering 200 ok:true must not commit a new-version restart.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = serve_responses(listener, vec![("200 OK".to_string(), health_body("9.9.7"))]);
+        assert!(!http_health_ok(addr, "9.9.9"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_health_ok_rejects_malformed_truncated_or_not_ok_bodies() {
+        // Truncated JSON, a non-JSON body, and ok:false must all fail closed
+        // — a garbled responder never commits the restart.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let truncated = "{\"ok\":true,\"version\":\"1.2".to_string();
+        let not_ok = "{\"ok\":false,\"version\":\"1.2.3\"}".to_string();
+        let server = serve_responses(
+            listener,
+            vec![
+                ("200 OK".to_string(), truncated),
+                ("200 OK".to_string(), "ok".to_string()),
+                ("200 OK".to_string(), not_ok),
+            ],
+        );
+        assert!(!http_health_ok(addr, "1.2.3"));
+        assert!(!http_health_ok(addr, "1.2.3"));
+        assert!(!http_health_ok(addr, "1.2.3"));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn http_health_ok_rejects_oversized_health_body() {
+        // A body beyond HEALTH_RESPONSE_CAP is not our daemon; the probe
+        // must stop buffering and fail closed. (The wall-clock
+        // PROBE_IO_BOUND trickle case is documented on the const — a
+        // timing-based test here would itself be flaky.)
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let oversized = format!(
+            "{{\"ok\":true,\"version\":\"1.2.3\",\"pad\":\"{}\"}}",
+            "x".repeat(HEALTH_RESPONSE_CAP + 1024)
+        );
+        let server = serve_responses(listener, vec![("200 OK".to_string(), oversized)]);
+        assert!(!http_health_ok(addr, "1.2.3"));
+        server.join().unwrap();
+    }
     #[test]
     fn env_timeout_defaults_and_overrides() {
         // No env manipulation here (process-global and racy under nextest's

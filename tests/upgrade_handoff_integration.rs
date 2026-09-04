@@ -174,6 +174,21 @@ fn run_helper(handoff_path: &Path) -> std::process::ExitStatus {
         .unwrap()
 }
 
+/// Run the real `x0xd --upgrade-handoff` helper with the production watchdog
+/// bounds (no env overrides): the happy path is event-driven — the waits end
+/// on the old pid dying and the target answering /health, never on the
+/// bound — so shortened test timeouts must not be load-bearing here.
+fn run_helper_production_bounds(handoff_path: &Path) -> std::process::ExitStatus {
+    Command::new(X0XD_BIN)
+        .arg("--upgrade-handoff")
+        .arg(handoff_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .unwrap()
+}
+
 /// Minimal HTTP client for the fixture daemon / real daemon `/health`.
 fn http_get_health(port: u16) -> Option<String> {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).ok()?;
@@ -268,7 +283,10 @@ fn fixture_role_health_daemon() {
             Ok((mut stream, _)) => {
                 let mut buf = [0u8; 512];
                 let _ = stream.read(&mut buf);
-                let body = format!("{{\"ok\":true,\"data\":{{\"version\":\"{version}\"}}}}");
+                let body = format!(
+                    "{{\"ok\":true,\"status\":\"ok\",\"version\":\"{version}\",\"peers\":0,\
+                     \"send_ready_peers\":0,\"uptime_secs\":0,\"warnings\":[]}}"
+                );
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
                      {}\r\nConnection: close\r\n\r\n{body}",
@@ -404,12 +422,17 @@ fn handoff_commits_when_new_binary_serves_health() {
     write_health_wrapper(&backup, port, OLD_VERSION, &old_stop);
 
     let handoff_path = write_handoff(data.path(), &target, &backup, old_pid, port);
-    let status = run_helper(&handoff_path);
+    let status = run_helper_production_bounds(&handoff_path);
 
     assert!(status.success(), "healthy new binary commits the restart");
+    // The helper's own probe already saw the target answer ok with the target
+    // version moments before exiting 0 — ONE immediate check, no polling
+    // window that could mask a rollback masquerading as success.
+    let body =
+        http_get_health(port).expect("target daemon must answer /health immediately after commit");
     assert!(
-        wait_for_health_version(port, NEW_VERSION, Duration::from_secs(10)),
-        "the daemon now answering must be the target version"
+        body.contains(&format!("\"{NEW_VERSION}\"")),
+        "the daemon now answering must be the target version: {body}"
     );
     assert!(
         !handoff_path.exists(),
@@ -425,6 +448,64 @@ fn handoff_commits_when_new_binary_serves_health() {
     );
 
     stop_daemon(&new_stop);
+}
+
+/// Control for the readiness probe: the spawned target answers 200 ok:true
+/// but reports the OLD version. A bare-200 probe would commit that as the
+/// new image; the version-checked probe must reject it, roll the backup over
+/// the target, and — with an unspawneable backup — end loud: `UPGRADE_FAILED`
+/// written, nonzero exit, handoff intent kept, and the wrongly-versioned
+/// target terminated so nothing keeps serving the port.
+#[test]
+fn handoff_does_not_commit_when_health_version_is_not_target() {
+    let install = TempDir::new().unwrap();
+    let data = TempDir::new().unwrap();
+    let port = free_port();
+
+    let old_stop = install.path().join("stop-old");
+    let old_pid = spawn_old_daemon(port, OLD_VERSION, &old_stop, FROM);
+    assert!(
+        wait_for_bind(port, Duration::from_secs(10)),
+        "old daemon must be serving before the handoff"
+    );
+
+    let target = install.path().join("x0xd");
+    let backup = install.path().join("x0xd.backup");
+    let wrong_stop = install.path().join("stop-wrong-version");
+    // The "new" binary serves the OLD version: 200, ok, wrong identity.
+    write_health_wrapper(&target, port, OLD_VERSION, &wrong_stop);
+    // The rollback image exists but is not executable, so the rollback spawn
+    // fails and the run ends in the loud branch right after the restore.
+    std::fs::write(&backup, b"previous binary (not executable)").unwrap();
+
+    let handoff_path = write_handoff(data.path(), &target, &backup, old_pid, port);
+    let status = run_helper(&handoff_path);
+
+    assert!(
+        !status.success(),
+        "an old-version 200 must not take the commit branch: {status:?}"
+    );
+    let failed = data.path().join(restart::UPGRADE_FAILED_FILE_NAME);
+    let content = std::fs::read_to_string(&failed).unwrap();
+    assert!(
+        content.contains("rollback spawn"),
+        "artifact must show the helper rolled back instead of committing: {content}"
+    );
+    assert!(
+        handoff_path.exists(),
+        "no-commit handoff keeps the intent file for diagnosis"
+    );
+    // The wrongly-versioned target was terminated before rollback: nothing
+    // answers the API port afterwards.
+    assert!(
+        !wait_for_bind(port, Duration::from_secs(1)),
+        "rejected target must not keep serving after rollback"
+    );
+    // Rollback consumed the backup over the target.
+    assert!(!backup.exists(), "restore consumes the backup file");
+
+    stop_daemon(&wrong_stop);
+    stop_daemon(&old_stop);
 }
 
 /// Design test 5: both the new spawn and the rollback spawn fail. The helper
