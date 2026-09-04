@@ -1,7 +1,7 @@
 ---
 name: x0x
 description: "Secure computer-to-computer networking for AI agents — gossip broadcast, direct messaging, CRDTs, group encryption. Post-quantum encrypted, NAT-traversing. Everything you need to build any decentralized application."
-version: 0.41.0
+version: 0.41.1
 license: MIT OR Apache-2.0
 repository: https://github.com/saorsa-labs/x0x
 homepage: https://saorsalabs.com
@@ -147,7 +147,7 @@ curl -s "http://$API/health"
 curl -s -H "Authorization: Bearer $TOKEN" "http://$API/status"
 ```
 
-`/health` and `/constitution*` are public; every other route needs the `Authorization: Bearer` header (durable token or a session token — see §3.4). Browser endpoints (`/gui`, `/ws`, `/ws/direct`, `/events`, `/direct/events`) also accept `?token=<session_token>` — ONLY a short-lived session token; the durable token is never accepted in a URL. The API binds `127.0.0.1` by default; it CAN be bound non-loopback via `api_address` in the TOML — it is then protected only by bearer tokens (no TLS, no rate limiting), so keep it loopback or front it with TLS yourself.
+`/health` and `/constitution*` are public; every other route needs the `Authorization: Bearer` header (durable token or a session token — see §3.4). Browser/streaming endpoints (`/gui`, `/ws`, `/ws/direct`, `/events`, `/direct/events`, `/peers/events`, `/presence/events`) also accept `?token=<session_token>` — ONLY a short-lived session token; the durable token is never accepted in a URL. The API binds `127.0.0.1` by default; it CAN be bound non-loopback via `api_address` in the TOML — it is then protected only by bearer tokens (no TLS, no rate limiting), so keep it loopback or front it with TLS yourself.
 
 ### 1.4 First message
 
@@ -280,19 +280,29 @@ Rider sends are signed by the daemon's key but carry a provenance envelope **ins
 x0x agents list                          # GET /agents/discovered — discovery cache (self_names included)
 x0x presence online                      # GET /presence/online — online agents (network view)
 x0x presence foaf                        # GET /presence/foaf?ttl=3 — friends-of-friends walk
-x0x find <words...> / x0x connect <words...>   # 4-word location words (see x0x agent identity_words)
+x0x presence find <agent_id>             # GET /presence/find/:id — FOAF walk to a specific agent
+x0x presence status <agent_id>           # GET /presence/status/:id — local cache view
+x0x peers                                # GET /peers — connected gossip peers (transport view)
+x0x find <words...> / x0x connect <words...>   # 4-word location words — the word form is the
+                                               # identity_words field in `x0x agent` / `x0x find` output
 curl -N -H "Authorization: Bearer $TOKEN" "http://$API/presence/events"   # SSE online/offline
 curl -H "Authorization: Bearer $TOKEN" "http://$API/agents/reachability/<agent_id>"
+x0x agents find <agent_id>               # POST /agents/find/:id — active network-wide lookup
+x0x agents machine <agent_id>            # GET /agents/:id/machine — which machine an agent runs on
+x0x agents by-user <user_id>             # GET /users/:user_id/agents (also /users/:user_id/machines)
 ```
 
 **Contacts & trust** — `blocked` (silently dropped) | `unknown` | `known` | `trusted`:
 
 ```bash
 x0x contacts add <agent_id> --label peer-a     # POST /contacts {"agent_id","trust_level","label"}
+x0x contacts remove <agent_id>                 # DELETE /contacts/:agent_id
 x0x trust set <agent_id> trusted               # POST /contacts/trust {"agent_id","level"}
 curl -X PATCH "http://$API/contacts/<agent_id>" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"trust_level":"trusted"}'
 x0x trust evaluate <agent_id> <machine_id>     # POST /trust/evaluate — would this (agent,machine) pass?
+x0x contacts revoke <agent_id>                 # POST /contacts/:agent_id/revoke — publish a revocation
+x0x contacts revocations <agent_id>            # GET /contacts/:agent_id/revocations — revocations seen for it
 ```
 
 **Machines & pinning** — track which machines an agent runs on; pin a contact to specific hardware so an unexpected `(agent, machine)` pair is rejected: `x0x machines discovered|list|pin|unpin`, `POST /contacts/:agent_id/machines/:machine_id/pin`.
@@ -328,9 +338,12 @@ curl -X POST "http://$API/groups" -H "Authorization: Bearer $TOKEN" -H "Content-
 curl -X POST "http://$API/groups/<gid>/members" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"agent_id":"<64-hex>"}'
 # Invite links (share out-of-band), then join on the other agent:
+# invite body: {"expiry_secs":<0=never>,"intended_joiner":"<64-hex>"} (both optional; #469)
 curl -X POST "http://$API/groups/<gid>/invite" -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{}'   # -> x0x://invite/... (Content-Type required for any non-empty body, else 415)
 curl -X POST "http://$API/groups/join" -H "Authorization: Bearer $TOKEN" \
   -H "Content-Type: application/json" -d '{"invite":"x0x://invite/<...>"}'
+# join body: {"invite","display_name"?,"mode"?:"group"|"home","expected_owner_user_id"?}
+# (home mode REQUIRES expected_owner_user_id — the #469 owner pin; mismatch is rejected server-side)
 # After joining, poll GET /groups/<gid>/members until your agent_id is "active"
 # (typically <1 s while the inviter is online); posting earlier returns 403 members-only.
 ```
@@ -359,7 +372,7 @@ curl -X POST "http://$API/groups/<gid>/secure/encrypt" -H "Authorization: Bearer
   -H "Content-Type: application/json" -d '{"payload_b64":"'$(echo -n secret | base64 | tr -d '\n')'"}'
 ```
 
-**Admin & advanced** (full shapes in the [API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)): roles (`PATCH .../members/:id/role`), policy axes (`PATCH .../policy`), bans, access requests (`.../requests`), the signed state chain (`.../state`, `.../state/commits`, `.../state/seal`, `.../state/withdraw`), discovery (`/groups/discover?q=`, `nearby`, `discover/subscribe`), group cards (`x0x://group/...`), and the sealed-envelope family (`secure/decrypt`, `secure/reseal`, `/groups/secure/open-envelope`). CLI: `x0x group set-role|policy|ban|requests|state|state-seal|delete|discover|card|secure-decrypt|secure-reseal|...`.
+**Admin & advanced** (full shapes in the [API Reference](https://github.com/saorsa-labs/x0x/blob/main/docs/api-reference.md)): roles (`PATCH .../members/:id/role`), policy axes (`PATCH .../policy`), bans, access requests (`.../requests`), group rename (`PUT .../display-name`, CLI `x0x group set-name`), the signed state chain (`.../state`, `.../state/commits`, `.../state/seal`, `.../state/withdraw`), discovery (`/groups/discover?q=`, `nearby`, `discover/subscribe`), group cards (`x0x://group/...`), and the sealed-envelope family (`secure/decrypt`, `secure/reseal`, `/groups/secure/open-envelope`). CLI: `x0x group set-role|policy|ban|requests|state|state-seal|delete|discover|card|secure-decrypt|secure-reseal|...`.
 
 ### 4.4 Delegation (ADR-0040)
 
@@ -412,6 +425,8 @@ Runs a command on ANOTHER agent's machine. Disabled by default and fully gated o
 
 ```bash
 x0x exec <agent_id> -- echo hi           # POST /exec/run {"agent_id","argv":[...],"stdin_b64"?,"timeout_ms"?}
+x0x exec sessions                        # GET /exec/sessions — local pending + remote active sessions
+x0x exec cancel <request_id>             # POST /exec/cancel
 ```
 
 ### 4.8 WebSocket (bidirectional)
@@ -422,8 +437,8 @@ wscat -c "ws://$API/ws?token=$SESSION"           # or /ws/direct for auto-subscr
 curl -H "Authorization: Bearer $TOKEN" "http://$API/ws/sessions"
 ```
 
-Client → server: `{"type":"subscribe","topics":[...]}`, `{"type":"publish","topic","payload"}`, `{"type":"send_direct","agent_id","payload"}`, `{"type":"ping"}`. **`payload` values in `publish`/`send_direct` are base64** — the server rejects non-base64 payloads with an error frame.
-Server → client: `connected` (session_id, agent_id), `message` (topic, payload, origin), `direct_message` (sender, machine_id, payload, received_at), `mention` (topic, group_id, msg_id, author_agent_id, reason `mention`|`delegation`), `subscribed`, `pong`. **`mention` frames require this session to be SUBSCRIBED to the group's topic** — routing still happens daemon-side, but an unsubscribed `/ws` session receives nothing. Multiple sessions on one topic share a single gossip subscription. Plain `ws://` is fine because the API is loopback by default; if you bind it non-loopback (§1.3), front it with TLS before using `wss://`-grade flows.
+Client → server: `{"type":"subscribe","topics":[...],"backfill"?}`, `{"type":"unsubscribe","topics":[...]}`, `{"type":"publish","topic","payload"}`, `{"type":"send_direct","agent_id","payload"}`, `{"type":"ping"}`. **`payload` values in `publish`/`send_direct` are base64** — the server rejects non-base64 payloads with an error frame.
+Server → client: `connected` (session_id, agent_id), `message` (topic, payload, origin), `direct_message` (sender, machine_id, payload, received_at), `mention` (topic, group_id, msg_id, author_agent_id, reason `mention`|`delegation`), `subscribed`/`unsubscribed` (topics), `live` (topic — ADR-0023 backfill-replay-done marker), `error` (message), `pong`. **`mention` frames require this session to be SUBSCRIBED to the group's topic** — routing still happens daemon-side, but an unsubscribed `/ws` session receives nothing. Multiple sessions on one topic share a single gossip subscription. Plain `ws://` is fine because the API is loopback by default; if you bind it non-loopback (§1.3), front it with TLS before using `wss://`-grade flows.
 
 ### 4.9 Identity ops (sign / verify / revoke)
 
@@ -436,7 +451,19 @@ x0x identity revoke --agent-id <64-hex>          # POST /identity/revoke {"agent
 x0x identity revoke --agent-id <64-hex> --machine-id <64-hex> --move-epoch <N>   # ADR-0043 binding form: permanent (agent,machine) tombstone (all three required together)
 ```
 
-`/agent/sign` is owner-plane (never reachable by riders). Revoking a third party requires a user-signed AgentCertificate for the subject.
+`/agent/sign` is owner-plane (never reachable by riders). Revoking a third party requires a user-signed AgentCertificate for the subject. `x0x identity revocations` (`GET /identity/revocations`) lists the revocation events this daemon has seen.
+
+### 4.10 Durable history (local, ADR-0023)
+
+Everything this daemon sent/received lands in `<data_dir>/history.db`; queries are purely LOCAL (§5.1 — no network backfill).
+
+```bash
+x0x history list "group:<gid>" --limit 50         # GET /history?scope&since_ms&until_ms&limit&before_id
+x0x history message <msg_id> --scope group:<gid>  # GET /history/message/:msg_id (scope hint for group ids)
+x0x history search "group:<gid>" <terms>          # GET /history/search?scope&q=
+x0x history stats                                 # GET /history/stats
+x0x history purge "dm:<agent_hex>"                # DELETE /history?scope= — destructive LOCAL purge
+```
 
 ---
 
@@ -634,7 +661,7 @@ Status: **GA** = working as specified · **caveat #N** = open issue, see §7.4 �
 | Relay (header v2, digest-bound) | `--relay` + `/diagnostics/relay` | — | GA |
 | Voice 1:1 (datagram + fallback) | library (`voice` feature) | `--example voice_call` | GA (lib) · 2nd concurrent call refused (typed `SessionConflict` via `start_lane`; `IoError`-wrapped via trait `start()`) |
 | Diagnostics (11 areas) | `/diagnostics/*` | `x0x diagnostics <area>` | GA |
-| Durable history | `/history*` | — | GA (local-only; Tier-2 Home backfill designed, not shipped — §5.1) |
+| Durable history | `/history*` | `x0x history list/message/search/stats/purge` | GA (local-only; Tier-2 Home backfill designed, not shipped — §4.10, §5.1) |
 | Self-update | daemon: `/upgrade(+/apply)` · CLI: standalone | `x0x upgrade --check/--apply` | GA |
 
 ---
