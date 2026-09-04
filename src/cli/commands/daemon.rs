@@ -306,6 +306,11 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
                  <array>\n\
              {prog_args}\
                  </array>\n\
+                 <key>EnvironmentVariables</key>\n\
+                 <dict>\n\
+                     <key>{}</key>\n\
+                     <string>1</string>\n\
+                 </dict>\n\
                  <key>RunAtLoad</key>\n\
                  <true/>\n\
                  <key>KeepAlive</key>\n\
@@ -316,6 +321,13 @@ pub async fn autostart(name: Option<&str>) -> Result<()> {
                  <string>{}</string>\n\
              </dict>\n\
              </plist>\n",
+            // launchd ancestry alone is NOT classified as supervision
+            // (`is_supervised`, src/upgrade/restart.rs) — without this var a
+            // KeepAlive agent takes the transactional-handoff path on
+            // self-update and launchd relaunches a second daemon on the same
+            // data dir (#493). With it, self-update exits and lets launchd
+            // restart the new binary.
+            crate::upgrade::restart::SUPERVISED_ENV_VAR,
             log_path.display(),
             log_path.display()
         );
