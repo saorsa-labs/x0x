@@ -2023,11 +2023,20 @@ function renderSpace(){
 async function mountSpace(){
   const sid=S.get('spaceId');
   const app=S.get('spaceApp');
+  // Generation guard: three awaited REST calls happen before the topic
+  // subscribes below. If the user navigates elsewhere (or mounts another
+  // space) mid-flight, a stale continuation must not subscribe topics for
+  // a space nobody is viewing (leak) or resurrect a subscription the
+  // newer view just dropped.
+  const gen=++spaceMountGen;
+  const stale=()=>gen!==spaceMountGen||S.get('view')!=='space'||S.get('spaceId')!==sid;
   // Load channels for this space
   await loadSpaceChannels(sid);
+  if(stale())return;
   renderSidebar();
   // Subscribe to the base chat topic (for backward compat) and channel topic
   const g=await api('/groups/'+sid);
+  if(stale())return;
   if(g&&g.ok){
     spaceChatTopic=g.chat_topic||'';
     if(spaceChatTopic)wsSub(spaceChatTopic);
@@ -2057,6 +2066,7 @@ async function mountSpace(){
     // uses for the public topic; it can differ from the mls_group_id
     // we use for other REST calls.
     const st=await api('/groups/'+sid+'/state');
+    if(stale())return;
     if(st&&st.ok&&st.group_id){
       signedPublicTopic='x0x.groups.public.'+st.group_id;
       signedPublicSpaceId=sid;
@@ -2212,6 +2222,7 @@ async function sendSpaceChatSignedPublic(sid,text,inp){
 /// space.
 let signedPublicPollTimer=null;
 let signedPublicTopic='';
+let spaceMountGen=0;
 let signedPublicSpaceId='';
 const signedPublicSeen=new Set();
 async function signedPublicPoll(sid,force){

@@ -133,6 +133,12 @@ fn extract_gui_calls(html: &str) -> Vec<(String, String, usize)> {
         // tests/gui_named_group_parity.rs. `symApi(` targets the separate
         // Symphony daemon and deliberately does NOT match (capital `A`).
         let token_len = if bytes[i..].starts_with(b"ownerApi(") {
+            // Same identifier boundary as `api(`: don't match `my_ownerApi(`.
+            let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
+            if !prev_ok {
+                i += 1;
+                continue;
+            }
             "ownerApi(".len()
         } else if i + 4 <= bytes.len() && &bytes[i..i + 4] == b"api(" {
             let prev_ok = i == 0 || !is_ident_char(bytes[i - 1]);
