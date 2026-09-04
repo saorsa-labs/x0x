@@ -66,3 +66,19 @@ just coverage-check
 `coverage-thresholds.toml` also defines advisory per-module targets for the
 90% ratchet workstreams. Advisory misses warn in CI; required thresholds fail.
 Coverage exclusions must be listed in `docs/coverage-exclusions.md`.
+
+## Local full-suite runs
+
+`cargo nextest` is fail-fast by default: the first failure cancels everything
+still queued. On this suite that hides up to ~800 unexecuted tests (observed
+2503/3300 and 2885/3300 partial runs during v0.41.1 post-release verification),
+which makes an ordinary local run unsuitable as release or flake-triage
+evidence. Any run that must prove the whole suite uses:
+
+```bash
+just test-full   # cargo nextest run --all-features --workspace --no-fail-fast
+```
+
+Test processes run under the `.config/nextest.toml` wrapper, which pins
+`X0X_HOME`/`HOME` to a scratch directory; plain `cargo test` bypasses it and
+trips the #456 real-home guard, so always drive the suite through nextest.
