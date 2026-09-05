@@ -1899,6 +1899,7 @@ fn home_pointer_mint_decision(
     desired: &SyncValue,
     stored: Option<&SyncValue>,
     local_agent_hex: &str,
+    stored_is_retired: bool,
 ) -> bool {
     let SyncValue::HomePointer {
         group_id: desired_id,
@@ -1921,6 +1922,14 @@ fn home_pointer_mint_decision(
     else {
         return true; // defensively: a foreign kind is not a Home winner
     };
+
+    // r3 P2: the slot is held by a Home we can PROVE is retired. Take it —
+    // the ordering rule below would otherwise refuse, because a replacement
+    // Home is always newer than the dead one, leaving every device yielding
+    // to a tombstone forever.
+    if stored_is_retired && desired_id != stored_id {
+        return true;
+    }
 
     if desired_id == stored_id {
         // Single-writer refresh: only the Home's designated primary agent,
@@ -1977,6 +1986,14 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
+    /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
+    ///
+    /// Proof is local: the group is in our roster and carries the terminal
+    /// `withdrawn` flag. Inability to see the group is NOT proof — a Home on
+    /// an unreachable device is unknown, and treating unknown as retired
+    /// would let a partitioned device mint over the owner's real Home.
+    /// Implementations MUST be non-blocking and answer `false` when unsure.
+    fn canonical_pointer_is_retired(&self, group_id: &str) -> bool;
 }
 
 /// Current daemon self-profile names, best-effort snapshot.
@@ -2399,10 +2416,21 @@ impl OwnerSyncService {
             .store
             .stored_value(SyncKind::HomePointer, HOME_POINTER_KEY)
             .await;
+        // r3 P2: a stored pointer naming a Home we hold and know to be
+        // retired must not keep the slot. Without this the ordering rule
+        // would refuse every replacement, since a new Home is always NEWER
+        // than the dead one it replaces.
+        let stored_is_retired = match (&stored, self.view()) {
+            (Some(SyncValue::HomePointer { group_id, .. }), Some(view)) => {
+                view.canonical_pointer_is_retired(group_id)
+            }
+            _ => false,
+        };
         home_pointer_mint_decision(
             desired,
             stored.as_ref(),
             &hex::encode(self.agent.agent_id().as_bytes()),
+            stored_is_retired,
         )
     }
 
@@ -3908,7 +3936,7 @@ mod home_pointer_election_tests {
         for _ in 0..10 {
             let mut mints = 0;
             for (agent_hex, desired) in &devices {
-                if home_pointer_mint_decision(desired, register.as_ref(), agent_hex) {
+                if home_pointer_mint_decision(desired, register.as_ref(), agent_hex, false) {
                     register = Some(desired.clone());
                     mints += 1;
                 }
@@ -3940,9 +3968,19 @@ mod home_pointer_election_tests {
         let newer = home_ptr("g-aaa", "agent-b", 2_000, vec![]);
 
         // Newer already in the slot: the older device takes it.
-        assert!(home_pointer_mint_decision(&older, Some(&newer), "agent-a"));
+        assert!(home_pointer_mint_decision(
+            &older,
+            Some(&newer),
+            "agent-a",
+            false
+        ));
         // Older already in the slot: the newer device yields.
-        assert!(!home_pointer_mint_decision(&newer, Some(&older), "agent-b"));
+        assert!(!home_pointer_mint_decision(
+            &newer,
+            Some(&older),
+            "agent-b",
+            false
+        ));
     }
 
     /// Equal `provisioned_at_ms` — a genuine simultaneous genesis, or just
@@ -3952,8 +3990,31 @@ mod home_pointer_election_tests {
     fn home_pointer_election_breaks_timestamp_ties_on_group_id() {
         let a = home_ptr("g-aaa", "agent-a", 5_000, vec![]);
         let b = home_ptr("g-bbb", "agent-b", 5_000, vec![]);
-        assert!(home_pointer_mint_decision(&a, Some(&b), "agent-a"));
-        assert!(!home_pointer_mint_decision(&b, Some(&a), "agent-b"));
+        assert!(home_pointer_mint_decision(&a, Some(&b), "agent-a", false));
+        assert!(!home_pointer_mint_decision(&b, Some(&a), "agent-b", false));
+    }
+
+    /// A slot held by a PROVABLY retired Home must be takeable (r3 P2).
+    ///
+    /// The ordering rule alone refuses every replacement here, because a new
+    /// Home is always NEWER than the dead one it replaces — so without this
+    /// override the register keeps naming a tombstone forever and every
+    /// device yields to it. The proof is local (`withdrawn` in our own
+    /// roster); an unreachable remote Home is unknown, not retired, and must
+    /// NOT be overridden.
+    #[test]
+    fn a_provably_retired_pointer_can_be_replaced_by_a_newer_home() {
+        let retired = home_ptr("g-old", "agent-a", 1_000, vec![]);
+        let replacement = home_ptr("g-new", "agent-a", 9_999, vec![]);
+
+        assert!(
+            !home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", false),
+            "without proof of retirement the ordering rule stands: a newer Home does not win"
+        );
+        assert!(
+            home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", true),
+            "a provably retired pointer must be replaceable despite being older"
+        );
     }
 
     /// The owner's first device must publish: an empty register is not a
@@ -3963,7 +4024,8 @@ mod home_pointer_election_tests {
         assert!(home_pointer_mint_decision(
             &home_ptr("g-aaa", "agent-a", 1, vec![]),
             None,
-            "agent-a"
+            "agent-a",
+            false
         ));
     }
 
@@ -3985,11 +4047,11 @@ mod home_pointer_election_tests {
             }],
         );
         assert!(
-            home_pointer_mint_decision(&refreshed, Some(&stored), "agent-a"),
+            home_pointer_mint_decision(&refreshed, Some(&stored), "agent-a", false),
             "the primary agent must be able to refresh its own Home pointer"
         );
         assert!(
-            !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b"),
+            !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b", false),
             "a co-member must not refresh the primary's Home pointer"
         );
     }

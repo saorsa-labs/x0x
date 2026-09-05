@@ -136,6 +136,17 @@ impl SyncDaemonView for DaemonView {
             })
     }
 
+    fn canonical_pointer_is_retired(&self, group_id: &str) -> bool {
+        // Fail SAFE when the roster lock is contended: "unsure" must answer
+        // false, so a busy daemon never mints over a live canonical Home.
+        let Ok(groups) = self.state.named_groups.try_read() else {
+            return false;
+        };
+        groups.iter().any(|(id, info)| {
+            (id.as_str() == group_id || info.stable_group_id() == group_id) && info.withdrawn
+        })
+    }
+
     fn apply_names(
         &self,
         human_name: Option<String>,
