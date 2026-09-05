@@ -360,10 +360,10 @@ history rows, no KV, no tasks), so the common case retires cleanly.
 | Phase | Content | Depends on |
 |---|---|---|
 | **P0** ✅ | D3 + D4: stop the register war, make the published pointer deterministic | — |
-| **P1** | Election + `GET /home` states + suppression at provisioning | P0 |
-| **P2** | Invite delivery channel (§5.4) — the one new mechanism; ADR-0041 amendment if `SyncKind::HomeInvite` | P1 |
-| **P3** | Winner-driven adoption + retirement gate + D5/D6/D7 cleanup | P2, #447 |
-| **P4** | `conflict` UX, forced adopt/retire endpoints, GUI | P3 |
+| **P1** ✅ | Election + `GET /home` states + suppression at provisioning | P0 |
+| **P2** ✅ | Invite delivery channel (§5.4) — `SyncKind::HomeInvite`; needs the ADR-0041 amendment | P1 |
+| **P3** ✅ | Winner-driven adoption + D5 (`!withdrawn` filter) | P2, #447 |
+| **P4** | Retirement gate + D6/D7 cleanup; `conflict` state and forced adopt/retire endpoints | P3 |
 
 P0 is small, independently shippable, and blocks a regression that lands the
 moment anyone enrolls a second device. After P1 a second device *reports* the
@@ -378,6 +378,30 @@ pass; `mint()` would no-op on the unchanged value, but then quiescence is not
 observable at the decision level and the regression test cannot assert
 termination. The contract is therefore "a write would change something", not
 "we are allowed to write".
+
+**P1–P3 as implemented.** `HomeResolution` / `resolve_home` (`home.rs`) is the
+state machine; `provision_home` yields when the register already names a Home;
+`GET /home` answers `local` / `adoption_pending` / `elsewhere` with 200 instead
+of a bare 404. `find_home` gained the `!withdrawn` filter (D5) and deterministic
+`min_by(stable_group_id)` selection — without the latter, a device seated in
+both its old duplicate and the canonical Home during adoption could answer with
+either. `resolve_home` additionally prefers the canonical Home whenever we are
+seated in it, so the transition settles deterministically.
+
+Adoption rides `SyncKind::HomeInvite` (0x05), keyed by joiner agent hex.
+The seated device enumerates the owner's agents from synced `IssuanceJournal`
+records — the daemon journals its own certificate (`lib.rs:12029-12055`), so a
+peer's agent id is already known without any new discovery — and mints an
+addressed v4 invite for each agent not yet seated. `DaemonView::apply_home_invite`
+redeems it in `mode: "home"` with the owner pinned. Both sides are idempotent
+and fire every sync pass until the join lands; a refusal (#447's cert-blob
+race) retries and never falls back to minting.
+
+**Still open (P4):** retirement. The loser keeps its duplicate group after
+adopting — unused, and no longer Home-resolved, but present. Retiring it needs
+D6 (retiring a Hidden Home publishes a public card) and D7 (history,
+delegations, task lists and rider grants are orphaned) fixed first, plus the
+`conflict` state and the forced adopt/retire endpoints.
 
 Known limitation carried into P1: because a yielding device publishes nothing
 and only strict improvements take the slot, a register naming a Home whose
