@@ -10,13 +10,17 @@
 //! in v0.41.1 and v0.41.2 while every existing GUI suite stayed green, because
 //! those suites match endpoint strings and never check that the script parses.
 //!
-//! The check therefore uses a REAL JavaScript parser — `node --check` — rather
-//! than a hand-rolled scanner. Correctly distinguishing a regex literal from
-//! division needs full parser context, so any heuristic either rejects valid
-//! code (`return /[)]/.test(s)`) or accepts invalid code (`i++ / (x;`). All
-//! GitHub-hosted runner images ship Node, so this runs for real in CI; if Node
-//! is missing the test FAILS LOUDLY rather than skipping, so the gate can never
-//! pass vacuously.
+//! The check therefore uses a REAL JavaScript parser rather than a hand-rolled
+//! scanner: correctly distinguishing a regex literal from division needs full
+//! parser context, so any heuristic either rejects valid code
+//! (`return /[)]/.test(s)`) or accepts invalid code (`i++ / (x;`).
+//!
+//! Specifically it compiles with `node:vm`'s `Script`, which is the BROWSER
+//! CLASSIC-SCRIPT grammar the GUI is actually served under — not `node --check`,
+//! whose CommonJS grammar diverges in both directions (it accepts top-level
+//! `return;` and rejects `let require = 1;`). All GitHub-hosted runner images
+//! ship Node, so this runs for real in CI; if Node is missing the test FAILS
+//! LOUDLY rather than skipping, so the gate can never pass vacuously.
 
 use std::process::Command;
 
@@ -43,7 +47,15 @@ fn extract_main_script(html: &str) -> &str {
     best
 }
 
-fn node_check(source: &str, label: &str) -> Result<(), String> {
+/// Compile `source` as a BROWSER CLASSIC SCRIPT and report any syntax error.
+///
+/// Deliberately not `node --check`: that applies CommonJS grammar, which
+/// diverges from a `<script>` in both directions — it accepts top-level
+/// `return;` (a browser rejects it) and rejects `let require = 1;` (a browser
+/// accepts it). `new vm.Script(...)` compiles a real classic script and never
+/// executes it, which is exactly the grammar the GUI is served under. Both
+/// divergences are pinned by `parse_gate_uses_browser_script_grammar`.
+fn parse_as_classic_script(source: &str, label: &str) -> Result<(), String> {
     let dir = std::env::temp_dir().join(format!(
         "x0x-gui-parse-{}-{}",
         std::process::id(),
@@ -53,14 +65,22 @@ fn node_check(source: &str, label: &str) -> Result<(), String> {
     let path = dir.join("script.js");
     std::fs::write(&path, source).expect("write the extracted script");
 
-    let out = Command::new("node").arg("--check").arg(&path).output();
+    let out = Command::new("node")
+        .arg("-e")
+        .arg(
+            "const fs=require('node:fs'),vm=require('node:vm');\
+             const p=process.env.X0X_GUI_SCRIPT_PATH;\
+             new vm.Script(fs.readFileSync(p,'utf8'),{filename:p});",
+        )
+        .env("X0X_GUI_SCRIPT_PATH", &path)
+        .output();
     let _ = std::fs::remove_dir_all(&dir);
 
     match out {
         Ok(o) if o.status.success() => Ok(()),
         Ok(o) => Err(String::from_utf8_lossy(&o.stderr).trim().to_string()),
         Err(e) => panic!(
-            "cannot run `node --check` to validate the embedded GUI script: {e}.\n\
+            "cannot run Node to validate the embedded GUI script: {e}.\n\
              This gate needs Node — every GitHub-hosted runner image ships it, and \
              it is required locally too. It deliberately fails instead of skipping: \
              a fatal GUI SyntaxError shipped twice (v0.41.1, v0.41.2) precisely \
@@ -84,7 +104,7 @@ fn embedded_gui_script_parses() {
         script.len()
     );
 
-    if let Err(stderr) = node_check(script, "gui") {
+    if let Err(stderr) = parse_as_classic_script(script, "gui") {
         panic!(
             "src/gui/x0x-gui.html: the inline GUI script does NOT parse.\n\
              The whole GUI is ONE script, so this renders a blank page in every \
@@ -95,8 +115,8 @@ fn embedded_gui_script_parses() {
     }
 }
 
-/// Guards the gate itself: `node --check` must reject the exact defect shape
-/// and accept the corrected one, so a broken harness cannot silently pass.
+/// Guards the gate itself: it must reject the exact defect shape and accept the
+/// corrected one, so a broken harness cannot silently pass.
 #[test]
 fn parse_gate_rejects_the_v0_41_1_defect_shape() {
     let broken = r#"
@@ -106,7 +126,7 @@ fn parse_gate_rejects_the_v0_41_1_defect_shape() {
       el.onerror = () => {};
     "#;
     assert!(
-        node_check(broken, "broken").is_err(),
+        parse_as_classic_script(broken, "broken").is_err(),
         "the gate must reject an addEventListener call closed with '}};'"
     );
 
@@ -117,7 +137,7 @@ fn parse_gate_rejects_the_v0_41_1_defect_shape() {
       el.onerror = () => {};
     "#;
     assert!(
-        node_check(fixed, "fixed").is_ok(),
+        parse_as_classic_script(fixed, "fixed").is_ok(),
         "the gate must accept the corrected form"
     );
 
@@ -130,7 +150,24 @@ fn parse_gate_rejects_the_v0_41_1_defect_shape() {
       const html = `<div>${items.map(t => `<b>${t}</b>`).join('')}</div>`;
     "#;
     assert!(
-        node_check(tricky, "tricky").is_ok(),
+        parse_as_classic_script(tricky, "tricky").is_ok(),
         "the gate must accept valid regex literals, division and nested templates"
+    );
+}
+
+/// The gate must use browser classic-script grammar, not Node's CommonJS
+/// grammar. These two cases are exactly where the two diverge, so they fail if
+/// anyone swaps `vm.Script` back for `node --check`.
+#[test]
+fn parse_gate_uses_browser_script_grammar() {
+    assert!(
+        parse_as_classic_script("return;", "toplevel_return").is_err(),
+        "top-level `return;` is invalid in a browser <script> and must be \
+         rejected — `node --check` wrongly accepts it via the CommonJS wrapper"
+    );
+    assert!(
+        parse_as_classic_script("let require = 1;", "shadow_require").is_ok(),
+        "`let require = 1;` is valid in a browser <script> and must be \
+         accepted — `node --check` wrongly rejects it as a CommonJS binding"
     );
 }
