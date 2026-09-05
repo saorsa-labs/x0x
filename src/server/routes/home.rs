@@ -1246,17 +1246,24 @@ pub(in crate::server::routes) mod tests {
         Ok(())
     }
 
-    /// WHY (r3 P2): the REAL lifecycle — advertise, then withdraw, then
-    /// reconcile/restart. This is the case the earlier test could not reach,
+    /// WHY (r3 P2): the stored-pointer lifecycle — advertise, then withdraw,
+    /// then re-provision. This is the case the earlier test could not reach,
     /// because it only inserted an already-withdrawn group into an EMPTY
-    /// store.
+    /// store, so no stored pointer ever governed.
     ///
     /// Tombstone retention never clears owner-sync state, so the stored
     /// `("home")` record outlives the Home it names. Filtering the publisher
     /// stops future advertisements but leaves the old record governing: the
     /// device yields to a dead pointer, provisions no replacement, and
-    /// `GET /home` reports `elsewhere` for a group that no longer exists —
-    /// permanently, across restarts.
+    /// `GET /home` reports `elsewhere` for a group that no longer exists.
+    ///
+    /// SCOPE LIMIT — this is an IN-PROCESS re-provision. It sets `withdrawn`
+    /// and calls `provision_home` directly; it does not restart a process or
+    /// reload the record store from disk. The claim it supports is "a stored
+    /// retired pointer stops governing a re-provision", NOT "this survives a
+    /// real restart" — the on-disk reload path holds by construction
+    /// (the record store is read back through the same `canonical_home`
+    /// accessor) but is not exercised here.
     #[tokio::test]
     async fn a_retired_advertised_home_does_not_suppress_its_replacement() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
@@ -1289,7 +1296,7 @@ pub(in crate::server::routes) mod tests {
             "precondition: the retired Home is still the stored canonical pointer"
         );
 
-        // 3. Reconcile / restart.
+        // 3. Re-provision in-process (NOT a process/disk restart — see above).
         assert!(
             effective_canonical_home(&state).await.is_none(),
             "a pointer to a Home we hold and know to be retired must stop governing"

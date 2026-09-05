@@ -71,6 +71,22 @@ the owner's canonical Home is elected on the existing Tier-1 register.**
   strictly preferable under `(provisioned_at_ms, group_id)` — oldest wins, id
   breaks ties. Both devices compare the same tuples, so they elect the same
   winner; the value strictly decreases, so the register converges.
+- **One exception to that ordering: a locally proven retired pointer.** The
+  stored record outlives the Home it names — tombstone retention never touches
+  owner-sync state — so a device that retires its own advertised Home would
+  otherwise yield to a dead pointer forever and never build a replacement.
+  When the pointer names a group this device can prove is retired, it may be
+  replaced **regardless of the tuple ordering**. The exception is required
+  rather than convenient: a replacement Home is always *newer* than the dead
+  one it replaces, so the strict-decrease rule would refuse every replacement
+  and the register would keep naming a tombstone permanently.
+- **Proof of retirement is local and terminal**: the group is present in this
+  device's own roster AND carries the terminal `withdrawn` flag. Inability to
+  see the group is explicitly **not** proof. A canonical Home on an
+  unreachable device is *unknown*, not retired, and treating unknown as
+  retired would let any partitioned device mint over the owner's real Home and
+  refork the space this decision exists to unify. Where the proof cannot be
+  obtained cheaply (a contended roster lock), the answer is "not retired".
 - The publisher and the resolver share one predicate, including `!withdrawn`:
   a retired Home is never advertised as canonical and never resolves locally.
 - `GET /home` reports a **state** — `local`, `adoption_pending`, `elsewhere` —
@@ -148,5 +164,22 @@ ADR-0039 reconciled rather than bypassed — before implementation.
 - A second device with the owner's Home advertised provisions nothing and
   `GET /home` reports `elsewhere` with 200.
 - A withdrawn Home neither resolves locally nor is advertised as canonical.
+- **Retired-pointer lifecycle:** after a device advertises its Home and then
+  withdraws it, a re-provision must produce a NEW usable Home rather than
+  yielding to the stored pointer. Covered by
+  `a_retired_advertised_home_does_not_suppress_its_replacement`, which was
+  confirmed to fail against the pre-fix behaviour. **Scope limit:** that test
+  sets `withdrawn` and calls `provision_home` in-process; it does **not**
+  restart a process or reload state from disk, so the on-disk record-store
+  reload path is asserted only by construction, not exercised.
+- **Unreachable-remote negative control:** a canonical pointer naming a group
+  this device cannot see must keep governing, and the device must still yield
+  rather than fork. Covered by
+  `an_unreachable_remote_home_is_never_treated_as_retired`.
+- Without proof of retirement, the tuple ordering still refuses a newer Home —
+  the exception must not widen into "newest wins".
 - A daemon with no `user.key` provisions no Home and mints no records.
 - `SyncKind::ALL.len() == 4` — the Tier-1 tripwire remains untripped.
+- **Not yet validated:** full distributed convergence across independent
+  record stores, and the retired-pointer lifecycle across a real process
+  restart. The election tests use a single in-memory register.

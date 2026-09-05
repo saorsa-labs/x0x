@@ -441,6 +441,19 @@ Tests encode *why* (Rule 9), asserting invariants rather than mechanics.
 - **Refusal never mints (#447 rule).** Make the winner defer admission (cert
   blob not yet landed): the loser retries and must **not** provision a second
   Home. This is the test that stops the fix reintroducing the bug under a race.
+- **Retired canonical pointer (r3 P2).** The stored `("home")` record outlives
+  the Home it names, so filtering the publisher is only half the fix: the old
+  record keeps governing and the device yields to a dead pointer forever. Both
+  the consumer (`effective_canonical_home`) and the producer (a
+  `stored_is_retired` override on the mint rule) key off the SAME local,
+  terminal proof — the group is in our own roster and `withdrawn`. The
+  producer half is required, not cosmetic: a replacement Home is always newer
+  than the dead one, so the strict-decrease rule would refuse every
+  replacement. Absence of local knowledge is never proof, so an unreachable
+  remote Home keeps governing (negative control:
+  `an_unreachable_remote_home_is_never_treated_as_retired`).
+  *Coverage limit:* the lifecycle test re-provisions IN-PROCESS; it does not
+  restart a process or reload the store from disk.
 - **No wedge after retirement (D5).** Retire a duplicate, restart: `GET /home`
   resolves to the canonical Home, not a tombstone, and mutations do not 409.
 - **Hidden stays hidden (D6).** Retiring a Home publishes no discovery card.
