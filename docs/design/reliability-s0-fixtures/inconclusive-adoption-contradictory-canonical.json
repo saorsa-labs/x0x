@@ -10,10 +10,8 @@
   "alice_b_status": 200,
   "alice_b_body": {
     "ok": true,
-    "state": "elsewhere",
-    "owner_user_id": "owner-a",
-    "canonical_group_id": "home-b",
-    "local_group_id": null,
-    "detail": "Home is on another enrolled device"
+    "state": "adoption_pending",
+    "canonical_group_id": "home-c",
+    "group_id": "home-a"
   }
 }

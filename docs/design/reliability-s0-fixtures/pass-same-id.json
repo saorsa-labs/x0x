@@ -3,13 +3,15 @@
   "alice_status": 200,
   "alice_body": {
     "ok": true,
-    "group_id": "home-a",
-    "resolution": "local"
+    "state": "local",
+    "canonical_group_id": null,
+    "group_id": "home-a"
   },
   "alice_b_status": 200,
   "alice_b_body": {
     "ok": true,
-    "group_id": "home-a",
-    "resolution": "local"
+    "state": "local",
+    "canonical_group_id": null,
+    "group_id": "home-a"
   }
 }

@@ -16,13 +16,15 @@
 #   docs/design/reliability-s0-home-dedup-smoke.sh --self-test
 #
 # Exit codes (live and --fixture):
-#   0  PASS — both 2xx, same non-empty group_id
-#             (B may be local-ish or honest elsewhere/adoption_pending
-#             naming that same canonical id)
-#   1  FAIL — both 2xx, both local-ish/authoritative, different group_ids
-#   3  inconclusive — non-2xx, parse/schema errors, missing ids,
-#                     honest B pointing at a different group_id, or
-#                     any other unclassifiable pair
+#   0  PASS — both 2xx; A.canonical_id == B.canonical_id
+#             local/pre507: canonical = group_id
+#             elsewhere / adoption_pending: canonical = canonical_group_id
+#             (elsewhere has no group_id; adoption_pending.group_id may be
+#             a losing local Home and is not the comparison key)
+#   1  FAIL — both 2xx, both authoritative local, different group_ids
+#   3  inconclusive — non-2xx, parse/schema errors, missing required id
+#                     for that state, contradictory canonicals, unknown
+#                     state, or any other unclassifiable pair
 #
 # --self-test exits 0 only when every required fixture matches its
 # expected classifier exit; that is the offline proof, not an S0 PASS.
@@ -37,10 +39,12 @@ FIXTURE_DIR="${SCRIPT_DIR}/reliability-s0-fixtures"
 REQUIRED_FIXTURES=(
   pass-same-id
   pass-elsewhere-canonical
+  pass-adoption-pending-canonical
   fail-duplicate-local
   inconclusive-b-500-elsewhere
   inconclusive-b-503-same-id
   inconclusive-elsewhere-wrong-id
+  inconclusive-adoption-contradictory-canonical
 )
 
 usage() {
@@ -115,12 +119,21 @@ classify_pair() {
 import json
 import sys
 
-HONEST = frozenset({"elsewhere", "adoption_pending"})
-LOCALISH_RES = frozenset({"", "local", "local-ish", "authoritative"})
+# Wire from #507 home.rs @ 413028e:
+#   local / pre507: canonical = group_id
+#   elsewhere:      canonical = canonical_group_id (no group_id)
+#   adoption_pending: canonical = canonical_group_id
+#                     (group_id is the losing local Home)
 
 
 def is_2xx(status: int) -> bool:
     return 200 <= status <= 299
+
+
+def as_id(value) -> str:
+    if value is None:
+        return ""
+    return str(value).strip()
 
 
 def load(status_s: str, path: str):
@@ -150,40 +163,61 @@ def load(status_s: str, path: str):
 
 
 def snapshot(label: str, status: int, body: dict) -> dict:
-    group_raw = body.get("group_id")
-    if group_raw is None:
-        group_id = ""
-    else:
-        group_id = str(group_raw).strip()
-    resolution_raw = body.get("resolution")
-    if resolution_raw is None:
-        resolution = ""
-    else:
-        resolution = str(resolution_raw).strip().lower()
-    honest = resolution in HONEST
-    # Absent resolution is local-ish (pre-#507 GET /home has no field).
-    localish = (
-        is_2xx(status)
-        and bool(group_id)
-        and not honest
-        and resolution in LOCALISH_RES
-    )
-    return {
+    group_id = as_id(body.get("group_id"))
+    canonical_field = as_id(body.get("canonical_group_id"))
+    snap = {
         "label": label,
         "status": status,
+        "state": "(non-2xx)",
         "group_id": group_id,
-        "resolution": resolution or "(absent)",
-        "honest": honest,
-        "localish": localish,
+        "canonical_id": "",
+        "authoritative_local": False,
         "ok_http": is_2xx(status),
+        "classifiable": False,
     }
+    if not snap["ok_http"]:
+        return snap
+    if "ok" in body and body["ok"] is not True:
+        snap["state"] = "(ok!=true)"
+        return snap
+    raw_state = body.get("state")
+    if raw_state is None:
+        kind = "pre507_local"
+        snap["state"] = "pre507_local"
+    else:
+        kind = str(raw_state).strip().lower()
+        snap["state"] = kind
+    if kind in ("local", "pre507_local"):
+        if not group_id:
+            return snap
+        snap["canonical_id"] = group_id
+        snap["authoritative_local"] = True
+        snap["classifiable"] = True
+        return snap
+    if kind == "elsewhere":
+        if not canonical_field:
+            return snap
+        snap["canonical_id"] = canonical_field
+        snap["authoritative_local"] = False
+        snap["classifiable"] = True
+        return snap
+    if kind == "adoption_pending":
+        if not canonical_field:
+            return snap
+        snap["canonical_id"] = canonical_field
+        snap["authoritative_local"] = False
+        snap["classifiable"] = True
+        return snap
+    snap["state"] = f"unknown:{kind}"
+    return snap
 
 
 def emit(snap: dict) -> None:
     print(
-        f"{snap['label']}: status={snap['status']} "
+        f"{snap['label']}: status={snap['status']} state={snap['state']} "
         f"group_id={snap['group_id'] or '(none)'} "
-        f"resolution={snap['resolution']}"
+        f"canonical_id={snap['canonical_id'] or '(none)'} "
+        f"authoritative_local={snap['authoritative_local']}"
     )
 
 
@@ -192,46 +226,40 @@ alice_b = snapshot("alice-b", *load(sys.argv[3], sys.argv[4]))
 emit(alice)
 emit(alice_b)
 
-# Rule 2: any PASS requires both HTTP statuses in 2xx (GET /home is
-# expected to be exactly 200; other 2xx is accepted, non-2xx never PASS).
 if not alice["ok_http"] or not alice_b["ok_http"]:
     print(
         "INCONCLUSIVE: non-2xx on at least one side "
-        "(never PASS — error/elsewhere-in-error-body is not acceptance)"
+        "(never PASS — HTTP errors are not acceptance)"
     )
     sys.exit(3)
 
-# Rule 1 (2xx path): required fields for a classifiable pair.
-if not alice["group_id"] or not alice_b["group_id"]:
-    print("INCONCLUSIVE: 2xx but missing required non-empty group_id")
-    sys.exit(3)
-
-# Rule 3: same-id PASS (absent resolution treated as local-ish above).
-if alice["group_id"] == alice_b["group_id"]:
-    print("PASS: both 2xx with the same group_id")
+if (
+    alice["classifiable"]
+    and alice_b["classifiable"]
+    and alice["canonical_id"]
+    and alice_b["canonical_id"]
+    and alice["canonical_id"] == alice_b["canonical_id"]
+):
+    print("PASS: both 2xx with the same canonical Home id")
     sys.exit(0)
 
-# Rule 4: honest B must name A's canonical Home. Different id is
-# conflicting pointers — inconclusive, never PASS.
-if alice_b["honest"]:
+if (
+    alice["authoritative_local"]
+    and alice_b["authoritative_local"]
+    and alice["group_id"]
+    and alice_b["group_id"]
+    and alice["group_id"] != alice_b["group_id"]
+):
     print(
-        "INCONCLUSIVE: alice-b reports elsewhere/adoption_pending "
-        "but group_id differs from alice (conflicting pointers; no acceptance)"
-    )
-    sys.exit(3)
-
-# Rule 5: two authoritative Homes.
-if alice["localish"] and alice_b["localish"]:
-    print(
-        "FAIL: both 2xx local-ish with different group_ids "
+        "FAIL: both 2xx authoritative local with different group_ids "
         "(duplicate authoritative Homes; #507 / #449 class)"
     )
     sys.exit(1)
 
-# Rule 6.
 print(
-    "INCONCLUSIVE: pair is not same-id PASS, not honest-B+canonical PASS, "
-    "and not a duplicate-authoritative FAIL"
+    "INCONCLUSIVE: pair is not same-canonical PASS "
+    "and not a duplicate-authoritative FAIL "
+    "(missing required id, unknown state, or contradictory canonicals)"
 )
 sys.exit(3)
 PY
@@ -299,14 +327,14 @@ if [[ "$MODE" == "self-test" ]]; then
       verdict="MISMATCH"
       failed=1
     fi
-    printf '%-34s expected=%s actual=%s  %s\n' "$name" "$expected" "$actual" "$verdict"
+    printf '%-46s expected=%s actual=%s  %s\n' "$name" "$expected" "$actual" "$verdict"
     printf '%s\n' "$out" | sed 's/^/  /'
   done
   if [[ "$failed" -ne 0 ]]; then
     echo "SELF-TEST FAIL: one or more fixtures did not match expected exit"
     exit 1
   fi
-  echo "SELF-TEST PASS: six required fixtures matched expected exits"
+  echo "SELF-TEST PASS: eight required fixtures matched expected exits"
   exit 0
 fi
 

@@ -28,9 +28,9 @@
 
 | ID | Scenario | Steps (product path) | Acceptance (PASS) | Fails for |
 |---|---|---|---|---|
-| A1 | Fresh owned install provisions Home | New `X0X_HOME`, start daemon, load owner, `GET /home` / `x0x home` | Exactly one Home; resolution `local`; version healthy | Pre-#507 duplicate-mint class |
+| A1 | Fresh owned install provisions Home | New `X0X_HOME`, start daemon, load owner, `GET /home` / `x0x home` | Exactly one Home; `state` `local`; version healthy | Pre-#507 duplicate-mint class |
 | A2 | Un-owned install has no Home | Fresh install without owner key; `GET /home` | Documented 404 / un-owned message; no silent Home | False Home invent |
-| A3 | Upgrade path does not invent a second Home | Install A on tip; enroll device B sharing owner; both `GET /home` | Same `group_id` / honest resolution; never two authoritative Homes. Seating B is #449 (open), not current #507. | **#507** (report + no mint); #449 open |
+| A3 | Upgrade path does not invent a second Home | Install A on tip; enroll device B sharing owner; both `GET /home` | Same canonical Home (`group_id` when `state` is `local` / pre-#507; `canonical_group_id` when `elsewhere` / `adoption_pending`); never two authoritative Homes. Seating B is #449 (open), not current #507. | **#507** (report + no mint); #449 open |
 | A4 | Downgrade caveat surface | Owned install on tip; ops #451 forbids on old bins | Product refuses or docs warn | Related #451 |
 
 ### B. Identity / Home
@@ -38,7 +38,7 @@
 | ID | Scenario | Steps | Acceptance (PASS) | Fails for |
 |---|---|---|---|---|
 | B1 | Single Home per owner (enrolled) | Device A provisions; enroll B; B reconciles | B does not mint; both agree on pointer. Seating is not required for current #507. | **#507** |
-| B2 | Honest `GET /home` reporting | On B before seat: `GET /home` | 200 `elsewhere` or `adoption_pending` naming **A's** `group_id` — not B's duplicate as owner's Home | **#507** |
+| B2 | Honest `GET /home` reporting | On B before seat: `GET /home` | 200 `state=elsewhere` (`canonical_group_id`, no `group_id`) or `state=adoption_pending` (`canonical_group_id` = winner; `group_id` may be the local loser) naming **A's** Home — not B's duplicate as canonical | **#507** |
 | B3 | Withdrawn Home excluded | Withdraw Home; `GET /home` / provision | Tombstone not canonical; provision not wedged | **#507** D5 |
 | B4 | Rider / device auto-seat | Owner-certified Rider present | **Out of scope for current #507.** Mode-based exclusion (`OwnerIssuedCert.mode`) is unsound under Accepted [ADR-0039](../adr/0039-agent-harness-boundary.md) (mode-agnostic Home eligibility; synced journal materializes mode `Acp`). Inventing a device-only filter would amend ADR-0039 — forbidden for the current #507 PR. Full device-vs-rider Home eligibility needs future ADR / #449 work. Do **not** require “Rider never joins Home” as a #507 PASS. | future ADR / #449 — not a current #507 gate |
 | B5 | Pointer election terminates | Two enrolled conflicting Homes; wait ≥2 reconciles | Pointer stops flipping | **#507** D3 |
@@ -70,7 +70,7 @@
 |---|---|---|---|---|
 | E1 | Home survives restart | Restart same X0X_HOME | Same Home local; no second mint | **#507** |
 | E2 | Encrypted KV survives restart | Put; restart; get | Value present; sealed on wire | **#508** |
-| E3 | Offline then enroll | B comes online enrolled | Honest `GET /home` (same pointer, or `elsewhere` / `adoption_pending` naming A's Home); no second mint. Seating is #449, not current #507. | **#507** (report + no mint) |
+| E3 | Offline then enroll | B comes online enrolled | Honest `GET /home` (same canonical via `state`); no second mint. Seating is #449, not current #507. | **#507** (report + no mint) |
 | E4 | Kill during Hidden withdraw | Withdraw; kill; restart; scan **local** discovery | Still no synthesized Hidden card on local discover. Do not treat unproved public broadcast as the gate. | **#509** (local residual) |
 
 ### F. Tasks + group KV
@@ -100,16 +100,26 @@ Prefer reducing contention (scheduling) over hiding the failure. #510 remains ha
 
 ## First runnable smoke (S0)
 
-Two named local instances sharing owner key (enrolled). Compare `GET /home`.
+Two named local instances sharing owner key (enrolled). Compare `GET /home` using the **#507 wire** (`home.rs` @ `413028e`): read `state`; do **not** look for a `resolution` field.
 
-- **PASS (0):** both HTTP statuses in 2xx (prefer exactly 200) **and** both have the same non-empty `group_id`. B may be local-ish (absent `resolution` counts as local-ish for pre-#507) or honest `elsewhere` / `adoption_pending` **naming that same canonical id**.
-- **FAIL (1):** both 2xx, both local-ish/authoritative, different non-empty `group_id`s.
-- **INCONCLUSIVE (3):** non-2xx on either side; JSON/schema errors; missing `group_id`; honest B pointing at a **different** `group_id` than A (conflicting pointers); anything else. Non-2xx never PASS.
+Canonical identity by `state`:
+
+| `state` | Canonical id | Authoritative local? | Notes |
+|---|---|---|---|
+| `local` | `group_id` (required) | yes | `canonical_group_id` is null |
+| absent (`pre507_local`) | `group_id` (required) | yes | pre-#507 200 body |
+| `elsewhere` | `canonical_group_id` (required) | no | **no `group_id`** on the wire |
+| `adoption_pending` | `canonical_group_id` (required) | no | `group_id` is the **losing** local Home — not the comparison key |
+| unknown / missing required id / `ok` false | — | — | inconclusive |
+
+- **PASS (0):** both HTTP statuses in 2xx (prefer exactly 200) **and** `A.canonical_id == B.canonical_id` (both non-empty). Covers both-local same `group_id`; A local + B `elsewhere` same canonical; A local + B `adoption_pending` whose `canonical_group_id` matches A even when B.`group_id` is a different local loser.
+- **FAIL (1):** both 2xx, both authoritative local, different non-empty `group_id`s.
+- **INCONCLUSIVE (3):** non-2xx on either side (never PASS); JSON/schema errors; missing required id for that `state`; contradictory canonicals (e.g. A local/`home-a` + B `adoption_pending` `group_id=home-a` `canonical_group_id=home-c`); anything else.
 
 Runnable skeleton: [`reliability-s0-home-dedup-smoke.sh`](reliability-s0-home-dedup-smoke.sh).
 
 - **Live daemon mode** still uses `ALICE_URL` / `ALICE_B_URL` / `ALICE_TOK` / `ALICE_B_TOK` against already-running local named instances (no mesh).
-- **Fixture mode** is the acceptance-oracle proof without a daemon or mesh: `--fixture <name>` or `--self-test` over [`reliability-s0-fixtures/`](reliability-s0-fixtures/). Required fixtures: `pass-same-id`, `pass-elsewhere-canonical`, `fail-duplicate-local`, `inconclusive-b-500-elsewhere`, `inconclusive-b-503-same-id`, `inconclusive-elsewhere-wrong-id`.
+- **Fixture mode** is the acceptance-oracle proof without a daemon or mesh: `--fixture <name>` or `--self-test` over [`reliability-s0-fixtures/`](reliability-s0-fixtures/). Required fixtures: `pass-same-id`, `pass-elsewhere-canonical`, `pass-adoption-pending-canonical`, `fail-duplicate-local`, `inconclusive-b-500-elsewhere`, `inconclusive-b-503-same-id`, `inconclusive-elsewhere-wrong-id`, `inconclusive-adoption-contradictory-canonical`.
 
 ## Future / #449 complete (not current #507 gates)
 
