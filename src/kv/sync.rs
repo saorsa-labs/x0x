@@ -10,7 +10,7 @@ use crate::kv::encrypted::{
     open_mutation, seal_mutation, AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind,
     SharedKvSecureContext,
 };
-use crate::kv::store::AccessPolicy;
+use crate::kv::store::{AccessPolicy, MergeOutcome};
 use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
@@ -813,8 +813,9 @@ impl KvStoreSync {
                             // Pass sender identity for access control enforcement.
                             // The gossip V2 wire format includes a verified AgentId.
                             let writer = msg.sender.as_ref();
-                            match s.merge_delta(&delta, peer_id, writer) {
-                                Ok(()) => {
+                            match s.merge_delta_with_outcome(&delta, peer_id, writer) {
+                                Ok(MergeOutcome::Rejected) => false,
+                                Ok(MergeOutcome::Applied) => {
                                     // Digest-verified full-replace adopt
                                     // (issue #240, checkpoint-less deletion
                                     // cold-sync): while bootstrapping, when
@@ -829,8 +830,15 @@ impl KvStoreSync {
                                     // must not apply what the merge would
                                     // not. Without verification any holder
                                     // could truncate local state at will.
-                                    if listener_bootstrap_active
-                                        .load(std::sync::atomic::Ordering::Relaxed)
+                                    // Checkpointed replacement is handled atomically by
+                                    // merge_delta_with_outcome. A digest declaration
+                                    // carries no freshness and must never override that
+                                    // checkpoint/HWM (including a stale rejected serve).
+                                    // Keep this decision, merge and prune under `s`.
+                                    if delta.owner_checkpoint.is_none()
+                                        && s.highest_checkpoint_seq == 0
+                                        && listener_bootstrap_active
+                                            .load(std::sync::atomic::Ordering::Relaxed)
                                     {
                                         let declared = listener_served
                                             .lock()
@@ -1864,9 +1872,22 @@ mod tests {
     /// in tests, so `KvStoreSync` is testable end-to-end without a live mesh.
     async fn make_node() -> Arc<NetworkNode> {
         Arc::new(
-            NetworkNode::new(NetworkConfig::default(), None, None)
-                .await
-                .expect("network node"),
+            NetworkNode::new(
+                NetworkConfig {
+                    bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+                    bootstrap_nodes: Vec::new(),
+                    mdns_enabled: false,
+                    port_mapping_enabled: false,
+                    ..NetworkConfig::default()
+                },
+                Some(ant_quic::BootstrapCacheConfig {
+                    persist: false,
+                    ..ant_quic::BootstrapCacheConfig::default()
+                }),
+                None,
+            )
+            .await
+            .expect("network node"),
         )
     }
 
@@ -4130,5 +4151,218 @@ mod tests {
             .get("k_doomed")
             .expect("a re-served key must be accepted after a prune");
         assert_eq!(entry.value, b"y");
+    }
+
+    /// A replayed owner's old full serve must not prune an already adopted
+    /// checkpoint, including after restart. Exercise BOTH pubsub listener loops:
+    /// the side-topic declaration arrives before the main-topic stale snapshot.
+    #[tokio::test(start_paused = true)]
+    async fn stale_checkpoint_full_serve_cannot_prune_newer_state_across_restart() {
+        use crate::kv::store::{
+            content_root, make_owner_checkpoint, AnchorChannel, OwnerCheckpointParams,
+        };
+
+        fn checkpointed(
+            store: &KvStore,
+            kp: &crate::identity::AgentKeypair,
+            seq: u64,
+        ) -> KvStoreDelta {
+            let mut delta = store.full_delta();
+            delta.owner_checkpoint = Some(
+                make_owner_checkpoint(OwnerCheckpointParams {
+                    topic: "kv-stale-checkpoint-prune",
+                    store_id: store.id(),
+                    secret_key: kp.secret_key(),
+                    public_key: kp.public_key(),
+                    policy: store.policy(),
+                    policy_version: store.policy_version(),
+                    checkpoint_seq: seq,
+                    content_root: content_root(store.id(), store.name(), &store.checkpoint_pairs()),
+                    timestamp: 0,
+                })
+                .expect("checkpoint"),
+            );
+            delta
+        }
+
+        async fn publish(pubsub: &PubSubManager, topic: &str, delta: &KvStoreDelta) {
+            pubsub
+                .publish(
+                    topic.to_string(),
+                    bytes::Bytes::from(encode_delta(peer(1), delta).expect("encode")),
+                )
+                .await
+                .expect("publish delta");
+        }
+
+        let node = make_node().await;
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let signing = Arc::new(crate::gossip::SigningContext::from_keypair(&kp));
+        let pubsub = Arc::new(PubSubManager::new(node, Some(signing)).expect("pubsub"));
+        let topic = "kv-stale-checkpoint-prune";
+        let side = format!("{topic}{STATE_SYNC_TOPIC_SUFFIX}");
+        let mut origin = KvStore::new(store_id(1), "S".into(), owner, AccessPolicy::Signed)
+            .expect("owner store");
+        origin
+            .put(
+                "prejoin".into(),
+                b"one".to_vec(),
+                "text/plain".into(),
+                peer(1),
+            )
+            .expect("prejoin");
+        let mut stale = checkpointed(&origin, &kp, 1);
+        for key in ["live", "offline"] {
+            origin
+                .put(
+                    key.into(),
+                    key.as_bytes().to_vec(),
+                    "text/plain".into(),
+                    peer(1),
+                )
+                .expect("put");
+        }
+        let mut current = checkpointed(&origin, &kp, 3);
+        let temp = tempfile::tempdir().expect("snapshot directory");
+        let snapshot = temp.path().join("replica.bin");
+        let mut restored = None;
+
+        for round in 0..2 {
+            let replica = restored.take().unwrap_or_else(|| {
+                KvStore::new_replica(
+                    store_id(1),
+                    String::new(),
+                    Some(owner),
+                    AnchorChannel::RestParam,
+                )
+            });
+            let sync = KvStoreSync::new(
+                replica,
+                Arc::clone(&pubsub),
+                topic.into(),
+                peer(2),
+                Some(agent(2)),
+            )
+            .expect("replica sync");
+            sync.set_persist_path(snapshot.clone());
+            sync.start().await.expect("start");
+            current.version += 10; // fresh delivery, including same-checkpoint replay after restart
+            publish(&pubsub, topic, &current).await;
+            for _ in 0..100 {
+                if sync.read().await.highest_checkpoint_seq == 3 + round {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(sync.read().await.highest_checkpoint_seq, 3 + round);
+
+            // An authenticated OwnerAnnounce follows the marker on the SAME
+            // side-topic queue. Observing its version proves the declaration
+            // was consumed; no arbitrary sleep substitutes for that ordering.
+            for message in [
+                KvSyncMessage::StateServedV2 {
+                    responder: peer(1),
+                    digest: stale.served_digest(&store_id(1)).expect("full digest"),
+                    entry_count: 1,
+                },
+                KvSyncMessage::OwnerAnnounce {
+                    owner,
+                    policy: AccessPolicy::Signed,
+                    policy_version: 100 + round,
+                },
+            ] {
+                pubsub
+                    .publish(
+                        side.clone(),
+                        bytes::Bytes::from(bincode::serialize(&message).expect("side message")),
+                    )
+                    .await
+                    .expect("publish side");
+            }
+            for _ in 0..100 {
+                if sync.read().await.policy_version() == 100 + round {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            assert_eq!(sync.read().await.policy_version(), 100 + round);
+            stale.version += 1;
+            publish(&pubsub, topic, &stale).await;
+            // Current-checkpoint replay must also remain harmless.
+            current.version += 10;
+            publish(&pubsub, topic, &current).await;
+            let barrier_key = format!("barrier-{round}");
+            let mut barrier = KvStoreDelta::new(1000 + round);
+            barrier.added.insert(
+                barrier_key.clone(),
+                (
+                    KvEntry::new(
+                        barrier_key.clone(),
+                        b"barrier".to_vec(),
+                        "text/plain".into(),
+                    ),
+                    (peer(1), 1000 + round),
+                ),
+            );
+            publish(&pubsub, topic, &barrier).await;
+            for _ in 0..100 {
+                if sync.read().await.get(&barrier_key).is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            {
+                let state = sync.read().await;
+                assert!(
+                    state.get(&barrier_key).is_some(),
+                    "main-topic ordering barrier"
+                );
+                assert!(
+                    state.get("live").is_some(),
+                    "stale serve must not erase newer live data"
+                );
+                if round == 0 {
+                    assert!(
+                        state.get("offline").is_some(),
+                        "stale serve must not erase recovered offline data"
+                    );
+                }
+                assert_eq!(state.highest_checkpoint_seq, 3 + round);
+            }
+
+            // Positive control: a newer genuine owner checkpoint still performs
+            // authoritative deletion, removing both the named key and barrier.
+            let deleted = if round == 0 { "offline" } else { "live" };
+            origin.remove(deleted).expect("owner deletion");
+            current = checkpointed(&origin, &kp, 4 + round);
+            publish(&pubsub, topic, &current).await;
+            for _ in 0..100 {
+                if sync.read().await.highest_checkpoint_seq == 4 + round {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+            {
+                let state = sync.read().await;
+                assert_eq!(state.highest_checkpoint_seq, 4 + round);
+                assert!(
+                    state.get(deleted).is_none(),
+                    "new checkpoint deletion must apply"
+                );
+                assert!(
+                    state.get(&barrier_key).is_none(),
+                    "new checkpoint replaces complete set"
+                );
+                assert!(state.get("prejoin").is_some());
+            }
+            sync.persist().await.expect("persist");
+            sync.cancel_sync();
+            restored = load_snapshot(&snapshot).expect("reload");
+            assert_eq!(
+                restored.as_ref().expect("snapshot").highest_checkpoint_seq,
+                4 + round
+            );
+        }
     }
 }
