@@ -1,5 +1,5 @@
 {
-  "expected_exit": 0,
+  "expected_exit": 3,
   "snapshot": {
     "agent_id": "acp-1",
     "owner_machine_id": "owner-m",
@@ -8,10 +8,7 @@
       "kind": "pending",
       "machine_id": null
     },
-    "harness_machine": {
-      "machine_id": "harness-m",
-      "agent_ids": []
-    },
+    "harness_machine": null,
     "ledger_capture": {
       "method": "GET",
       "path": "/owner/placement",
@@ -39,7 +36,7 @@
             "agent_id": "acp-1",
             "mode": "acp",
             "from_journal": true,
-            "is_local": false,
+            "is_local": true,
             "revoked": false,
             "placement": null,
             "cert_not_after": null
