@@ -96,7 +96,7 @@ Do **not**:
 - inflate wall-clock deadlines first
 - add retries / retry-until-green to paper over flakes
 
-Prefer reducing contention (scheduling) over hiding the failure. UAT scenarios A1–F5 / D1–D5 / E1–E4 / S0 are otherwise unchanged.
+Prefer reducing contention (scheduling) over hiding the failure. #510 remains harness-risk only; it does not change product gates on #507 / #508 / #509.
 
 ## First runnable smoke (S0)
 
