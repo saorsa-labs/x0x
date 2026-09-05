@@ -16152,6 +16152,20 @@ impl KvStoreHandle {
         self.sync.read().await.latest_checkpoint.is_some()
     }
 
+    /// Fully retire this handle: invalidate the secure context (group
+    /// lifecycle — local authorization fails closed immediately) AND cancel
+    /// the background sync loops.
+    ///
+    /// Called when the bound group disappears locally (leave, removal,
+    /// withdrawal). Even a clone of this handle held elsewhere afterwards
+    /// refuses local writes (membership is gone) and every seal/open — a
+    /// departed member cannot keep operating a group store on a stale
+    /// secret/roster snapshot.
+    pub fn retire(&self) {
+        self.sync.invalidate_secure_context();
+        self.sync.cancel_sync();
+    }
+
     /// Tear down this replica's background sync loops (delta listener,
     /// responder, and the bootstrap requester — whose schedule is infinite
     /// while unconverged, issue #238). A discarded handle must call this or

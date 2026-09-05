@@ -127,7 +127,7 @@ pub(super) use status::{
 pub(super) use stores::{
     apply_direct_kv_store_delta, create_group_kv_store, create_kv_store, delete_kv_value,
     get_kv_value, gss_kv_refresh, join_kv_store, list_kv_keys, list_kv_stores, put_kv_value,
-    KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
+    retire_group_kv_stores, KvStoreDirectDelta, KV_STORE_DELTA_DM_PREFIX,
 };
 pub(super) use sync::{enroll_device, get_sync_devices, unenroll_device, DaemonView};
 pub(super) use tasks::{

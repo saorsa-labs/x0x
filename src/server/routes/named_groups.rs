@@ -16020,6 +16020,10 @@ async fn retain_withdrawn_group_tombstone(
     if !matches!(outcome, Ok(AtomicWriteOutcome::Durable)) {
         return false;
     }
+    // #341 Phase B: the group is withdrawn — retire its encrypted stores so
+    // a local handle cannot keep reading/writing/publishing on a stale
+    // secret/roster snapshot.
+    super::retire_group_kv_stores(state, &stable_group_id).await;
     let _ = prune_treekem_cache_groups(state, &aliases, reason).await;
     wipe_local_group_crypto_material(state, group_id, Some(&stable_group_id), reason).await;
     remove_directory_cache_entries_for_group_info(state, &info).await;
@@ -16329,6 +16333,8 @@ async fn leave_treekem_group(
             "named-group state is not directory-durable",
         );
     }
+    // #341 Phase B: left/removed group — retire its encrypted stores.
+    super::retire_group_kv_stores(&state, &id).await;
     let _ = prune_treekem_cache_groups(&state, &cache_aliases, "treekem_leave").await;
     state.group_card_cache.write().await.remove(&id);
     state.mls_groups.write().await.remove(&id);
@@ -17519,6 +17525,8 @@ pub(in crate::server) async fn leave_group(
             "named-group state is not directory-durable",
         );
     }
+    // #341 Phase B: left/removed group — retire its encrypted stores.
+    super::retire_group_kv_stores(&state, &id).await;
     let mut cache = state.group_card_cache.write().await;
     prune_expired_group_cards(&mut cache, now_millis_u64());
     cache.remove(&id);

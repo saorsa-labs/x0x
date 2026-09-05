@@ -25,7 +25,8 @@ use tokio::sync::RwLock;
 /// never subscribe to the side channel and are unaffected.
 const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
 
-/// An async hook that refreshes the sync's [`KvSecureContext`] snapshot
+/// An async hook that refreshes the sync's
+/// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext) snapshot
 /// before cryptographic or membership decisions.
 ///
 /// Encrypted stores (#341 Phase B) bind to a context whose authoritative
@@ -421,6 +422,20 @@ impl KvStoreSync {
     /// [`start`](Self::start) for encrypted stores.
     pub fn set_author_signing(&mut self, signing: AuthorSigning) {
         self.author_signing = Some(std::sync::Arc::new(signing));
+    }
+
+    /// Invalidate this sync's secure context (group lifecycle: leave,
+    /// removal, withdrawal — see
+    /// [`KvSecureContext::invalidate`](crate::kv::encrypted::KvSecureContext::invalidate)).
+    ///
+    /// After this, LOCAL authorization fails closed (the store consults the
+    /// same context for membership) and every seal/open refuses. Pair with
+    /// [`cancel_sync`](Self::cancel_sync) — that is what
+    /// `KvStoreHandle::retire` does.
+    pub fn invalidate_secure_context(&self) {
+        if let Some(ctx) = self.secure.as_ref() {
+            ctx.invalidate();
+        }
     }
 
     /// Seal a delta publication for an encrypted store into gossip bytes.
@@ -1492,6 +1507,17 @@ impl KvStoreSync {
     /// signing material is a hard error — the plaintext path is unreachable
     /// by construction for encrypted stores.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
+        // Policy check at the PUBLIC boundary (the start() guard only covers
+        // the background loops): a sync constructed for an encrypted store
+        // but never configured (or not yet started) must hard-error here —
+        // falling through to the plaintext branch would leak the delta.
+        let store_is_encrypted = { self.store.read().await.is_encrypted() };
+        if store_is_encrypted && self.secure.is_none() {
+            return Err(KvError::SecureRecord(
+                "encrypted store publish refused: no secure context attached                  (set_secure_context) — plaintext publication is unreachable for encrypted stores"
+                    .to_string(),
+            ));
+        }
         let serialized = if let Some(ctx) = self.secure.as_ref() {
             Self::seal_publication(
                 &self.store,
@@ -2412,6 +2438,65 @@ mod tests {
             wait_key_absent(&sync_a, "plaintext-key").await,
             "plaintext delta must never apply to an encrypted store"
         );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_encrypted_sync_never_publishes_plaintext() {
+        // WHY (PR #508 review P1): publish_delta is a PUBLIC method callable
+        // before start()/configuration — the startup guard does not cover
+        // direct calls. An encrypted store's sync with no secure context
+        // must hard-error at this boundary instead of falling into the
+        // plaintext branch, and a subscribed observer must receive NOTHING.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp = AgentKeypair::generate().expect("kp");
+        let a = kp.agent_id();
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
+        let store = KvStore::new_encrypted(
+            store_id(1),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctxs.pop().expect("ctx") as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        // NOTE: no set_secure_context / set_author_signing, no start().
+        let sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            "store/enc-unpub".to_string(),
+            peer(1),
+            Some(a),
+        )
+        .expect("kv sync");
+
+        // Observer watches the topic from BEFORE the publish attempt.
+        let mut observer = pubsub.subscribe("store/enc-unpub".to_string()).await;
+
+        let mut delta = KvStoreDelta::new(1);
+        delta.added.insert(
+            "confidential-key".to_string(),
+            (
+                KvEntry::new(
+                    "confidential-key".to_string(),
+                    b"secret".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (peer(1), 1),
+            ),
+        );
+        let err = sync
+            .publish_delta(peer(1), delta)
+            .await
+            .expect_err("unconfigured encrypted publish must hard-error");
+        assert!(
+            matches!(err, crate::kv::KvError::SecureRecord(ref m) if m.contains("no secure context")),
+            "got {err:?}"
+        );
+
+        // The observer heard nothing: no plaintext ever left the process.
+        let leak = tokio::time::timeout(Duration::from_millis(300), observer.recv()).await;
+        assert!(leak.is_err(), "plaintext delta was published to the topic");
     }
 
     #[tokio::test]

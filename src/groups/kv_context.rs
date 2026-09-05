@@ -243,6 +243,23 @@ impl KvSecureContext for GssKvSecureContext {
             .active_members
             .contains(agent)
     }
+
+    fn invalidate(&self) {
+        let mut state = self
+            .state
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.shared_secret.is_some() || !state.active_members.is_empty() {
+            tracing::warn!(
+                target: "x0x::kv",
+                "gss kv context INVALIDATED for group {} (epoch {}): group left/removed/withdrawn —                  sealing, opening, and membership all fail closed until a re-armed refresh",
+                state.stable_group_id,
+                state.secret_epoch
+            );
+        }
+        state.shared_secret = None;
+        state.active_members.clear();
+    }
 }
 
 #[cfg(test)]
@@ -327,6 +344,36 @@ mod tests {
         assert!(ctx.open(&store_id, epoch0, &nonce0, &ct0).is_err());
         let (epoch, _, _) = ctx.seal(&store_id, b"post-rekey").expect("seal");
         assert_eq!(epoch, epoch1);
+    }
+
+    #[test]
+    fn invalidate_fails_closed_everywhere() {
+        let member = AgentId([1; 32]);
+        let info = group("inv-g", member);
+        let ctx = GssKvSecureContext::from_group(&info).expect("context");
+        let store_id = KvStoreId::new([7; 32]);
+        assert!(ctx.seal(&store_id, b"x").is_ok());
+        assert!(ctx.is_active_member(&member));
+
+        ctx.invalidate();
+        // No key: seal and open refuse...
+        assert!(ctx.seal(&store_id, b"x").is_err());
+        let (_, nonce, ct) = {
+            // A pre-invalidation record can no longer be opened either.
+            let pre = GssKvSecureContext::from_group(&info).expect("context");
+            let (e, n, c) = pre.seal(&store_id, b"old").expect("seal");
+            assert!(ctx.open(&store_id, e, &n, &c).is_err());
+            (e, n, c)
+        };
+        let _ = (nonce, ct);
+        // ...and the roster is gone: the v1 write rule admits nobody.
+        assert!(!ctx.is_active_member(&member));
+
+        // A later refresh from a REJOINED group state re-arms the context.
+        let rejoined = group("inv-g", member);
+        ctx.update_from_group(&rejoined);
+        assert!(ctx.seal(&store_id, b"x").is_ok());
+        assert!(ctx.is_active_member(&member));
     }
 
     #[test]

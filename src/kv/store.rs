@@ -56,7 +56,7 @@ pub enum AccessPolicy {
     /// **fail-closed** on any replica that carries it without a secure
     /// context. Phase B (#341) wires the real path: [`KvStore::new_encrypted`]
     /// constructs the policy ONLY with an attached
-    /// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext), and the
+    /// [`KvSecureContext`], and the
     /// v1 write rule becomes **active group membership** — local writes,
     /// remote merges, and checkpoint adoption all consult the context.
     /// Confidentiality is provided by the sync layer: an encrypted store's
@@ -799,7 +799,7 @@ impl KvStore {
     /// context, so an Encrypted store built here could not honor its policy.
     /// The name must not over-promise — use
     /// [`new_encrypted`](Self::new_encrypted) with a live
-    /// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext); a replica
+    /// [`KvSecureContext`]; a replica
     /// that carries the policy without a context fails closed.
     pub fn new(id: KvStoreId, name: String, owner: AgentId, policy: AccessPolicy) -> Result<Self> {
         if let AccessPolicy::Encrypted { group_id } = &policy {
@@ -3581,14 +3581,14 @@ mod tests {
     /// derivation path as the GSS backend without a groups dependency.
     struct TestCtx {
         group_id: Vec<u8>,
-        members: HashSet<AgentId>,
+        members: std::sync::Mutex<HashSet<AgentId>>,
     }
 
     impl TestCtx {
         fn new(group: u8, members: &[AgentId]) -> Arc<Self> {
             Arc::new(Self {
                 group_id: vec![group; 16],
-                members: members.iter().copied().collect(),
+                members: std::sync::Mutex::new(members.iter().copied().collect()),
             })
         }
     }
@@ -3646,7 +3646,17 @@ mod tests {
                 .map_err(|_| KvError::SecureRecord("test open failed".to_string()))
         }
         fn is_active_member(&self, agent: &AgentId) -> bool {
-            self.members.contains(agent)
+            self.members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains(agent)
+        }
+
+        fn invalidate(&self) {
+            self.members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
     }
 

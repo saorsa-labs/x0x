@@ -889,6 +889,7 @@ async fn rehydrate_encrypted_group_store(
         state,
         std::sync::Arc::clone(&secure),
         stable_group_id.clone(),
+        entry.topic.clone(),
     );
     state
         .agent

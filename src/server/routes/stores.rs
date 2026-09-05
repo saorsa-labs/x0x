@@ -705,18 +705,71 @@ pub(in crate::server) fn gss_kv_refresh(
     state: &Arc<AppState>,
     ctx: Arc<x0x::groups::GssKvSecureContext>,
     group_key: String,
+    topic: String,
 ) -> x0x::kv::sync::SecureRefreshFn {
     let state = Arc::clone(state);
     Arc::new(move || {
         let ctx = Arc::clone(&ctx);
         let state = Arc::clone(&state);
         let group_key = group_key.clone();
+        let topic = topic.clone();
         Box::pin(async move {
-            if let Some(info) = state.named_groups.read().await.get(&group_key) {
-                ctx.update_from_group(info);
+            let lifecycle = {
+                let groups = state.named_groups.read().await;
+                match groups.get(&group_key) {
+                    // Group gone (leave/removal) or withdrawn: the local
+                    // agent must not keep operating the store on a stale
+                    // secret/roster snapshot.
+                    None => Some("group removed (left or deleted)"),
+                    Some(info) if info.withdrawn => Some("group state withdrawn"),
+                    Some(info) => {
+                        ctx.update_from_group(info);
+                        None
+                    }
+                }
+            };
+            if let Some(reason) = lifecycle {
+                tracing::warn!(
+                    target: "x0x::kv",
+                    "retiring encrypted store {topic}: {reason} — invalidating context and cancelling sync"
+                );
+                ctx.invalidate();
+                if let Some(h) = state.kv_stores.write().await.remove(&topic) {
+                    h.retire();
+                }
             }
         }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
     })
+}
+
+/// Retire EVERY encrypted store handle bound to `stable_group_id` (topic
+/// prefix `x0x/group/<gid>/kv/`): invalidate its secure context (local
+/// authorization fails closed immediately, even for handles cloned
+/// elsewhere) and cancel its sync loops.
+///
+/// Called from the group-lifecycle paths — leave, group deletion, and
+/// state withdrawal — so a departed member cannot keep reading, writing,
+/// or publishing old-epoch records through a live handle. The per-store
+/// refresh hook ([`gss_kv_refresh`]) is the second layer: it invalidates
+/// and retires on the next sync activity even if a lifecycle path is
+/// missed.
+pub(in crate::server) async fn retire_group_kv_stores(state: &AppState, stable_group_id: &str) {
+    let prefix = format!("x0x/group/{stable_group_id}/kv/");
+    let mut stores = state.kv_stores.write().await;
+    let doomed: Vec<String> = stores
+        .keys()
+        .filter(|topic| topic.starts_with(&prefix))
+        .cloned()
+        .collect();
+    for topic in &doomed {
+        if let Some(h) = stores.remove(topic) {
+            tracing::info!(
+                target: "x0x::kv",
+                "retiring encrypted store {topic}: group {stable_group_id} left/removed/withdrawn"
+            );
+            h.retire();
+        }
+    }
 }
 
 /// Resolve the GSS secure context for a group store, re-reading the group
@@ -854,7 +907,7 @@ pub(in crate::server) async fn create_group_kv_store(
         Ok(ctx) => ctx,
         Err(resp) => return resp,
     };
-    let refresh = gss_kv_refresh(&state, Arc::clone(&secure), id.clone());
+    let refresh = gss_kv_refresh(&state, Arc::clone(&secure), id.clone(), topic.clone());
 
     match state
         .agent
@@ -1054,6 +1107,128 @@ mod tests {
         assert_eq!(code2, StatusCode::OK, "{resp2:?}");
         assert_eq!(resp2.0["store_id"], resp.0["store_id"]);
         let _ = store_id;
+    }
+
+    /// WHY (PR #508 review P1): the leave/removal path deletes the group
+    /// from `named_groups`. The refresh hook must treat a MISSING group as
+    /// lifecycle: invalidate the context AND retire the live handle, so the
+    /// departed member cannot keep reading, writing, or publishing
+    /// old-epoch records on a stale secret/roster snapshot.
+    #[tokio::test]
+    async fn leave_invalidates_and_retires_group_encrypted_store() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "ab".repeat(16);
+        seed_group(&state, &group_key, state.agent.agent_id()).await;
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_key.clone()),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(CreateGroupStoreRequest {
+                name: "ws".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+        let handle = state.kv_stores.read().await.get(&topic).cloned().unwrap();
+
+        // The member LEAVES: the group entry disappears from the map.
+        state.named_groups.write().await.remove(&group_key);
+
+        // Next sync activity runs the refresh hook -> lifecycle branch. The
+        // hook is rebuilt exactly as create wired it, bound to the context
+        // snapshot the live sync captured BEFORE the leave.
+        let pre_leave_info = crate::groups::GroupInfo::new(
+            group_key.clone(),
+            String::new(),
+            state.agent.agent_id(),
+            group_key.clone(),
+        );
+        let ctx =
+            Arc::new(x0x::groups::GssKvSecureContext::from_group(&pre_leave_info).expect("ctx"));
+        assert!(ctx.is_active_member(&state.agent.agent_id()));
+        let hook = gss_kv_refresh(&state, ctx, group_key.clone(), topic.clone());
+        hook().await;
+
+        // The handle is retired out of the registry...
+        assert!(
+            !state.kv_stores.read().await.contains_key(&topic),
+            "retired handle must leave the registry"
+        );
+        // ...and a STALE clone (held elsewhere) fails closed on writes.
+        let err = handle
+            .put_with_delta("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("post-leave write must be refused");
+        assert!(
+            matches!(err, x0x::error::IdentityError::Unauthorized(_)),
+            "got {err:?}"
+        );
+    }
+
+    /// WHY (PR #508 review P1): a WITHDRAWN group is equally terminal — the
+    /// tombstone keeps the roster entry but the store must not operate.
+    #[tokio::test]
+    async fn withdrawn_group_invalidates_encrypted_store() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "cd".repeat(16);
+        seed_group(&state, &group_key, state.agent.agent_id()).await;
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_key.clone()),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(CreateGroupStoreRequest {
+                name: "ws".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+        let handle = state.kv_stores.read().await.get(&topic).cloned().unwrap();
+
+        // The group is WITHDRAWN (tombstone retained, roster intact).
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&group_key)
+            .expect("group")
+            .withdrawn = true;
+
+        // Directly retire the way the withdraw lifecycle path does.
+        retire_group_kv_stores(&state, &group_key).await;
+        assert!(
+            !state.kv_stores.read().await.contains_key(&topic),
+            "withdrawal must retire the handle"
+        );
+        // A stale clone fails closed on writes even though the roster entry
+        // would still say "active member".
+        let err = handle
+            .put_with_delta("k".to_string(), b"v".to_vec(), "text/plain".to_string())
+            .await
+            .expect_err("post-withdrawal write must be refused");
+        assert!(matches!(err, x0x::error::IdentityError::Unauthorized(_)));
+
+        // And the refresh hook independently invalidates on withdrawn state
+        // (second layer, for handles the lifecycle paths miss).
+        let ctx = Arc::new(
+            x0x::groups::GssKvSecureContext::from_group(
+                state
+                    .named_groups
+                    .read()
+                    .await
+                    .get(&group_key)
+                    .expect("group"),
+            )
+            .expect("ctx"),
+        );
+        assert!(ctx.is_active_member(&state.agent.agent_id()));
+        let hook = gss_kv_refresh(&state, Arc::clone(&ctx), group_key.clone(), topic);
+        hook().await;
+        assert!(
+            !ctx.is_active_member(&state.agent.agent_id()),
+            "withdrawn group must invalidate the context"
+        );
     }
 
     #[tokio::test]

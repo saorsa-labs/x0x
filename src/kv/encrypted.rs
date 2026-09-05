@@ -1,7 +1,8 @@
 //! Encrypted group-scoped KvStore wire format and secure-context boundary
 //! (issue #341 Phase B, design: `docs/design/encrypted-kvstore.md`).
 //!
-//! An encrypted store never publishes a plaintext [`KvStoreDelta`]. Every
+//! An encrypted store never publishes a plaintext
+//! [`KvStoreDelta`](crate::kv::KvStoreDelta). Every
 //! gossip publication — incremental delta, full-state serve, or state-sync
 //! control message — is wrapped in a **sign-then-encrypt** envelope:
 //!
@@ -66,7 +67,8 @@ pub const SIG_ALGORITHM_ML_DSA65: u8 = 0;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[repr(u8)]
 pub enum KvMutationKind {
-    /// An incremental [`KvStoreDelta`] (a regular put/remove/update).
+    /// An incremental [`KvStoreDelta`](crate::kv::KvStoreDelta) (a regular
+    /// put/remove/update).
     Delta = 0,
     /// A full-state delta (bootstrap / post-rekey current-state serve).
     FullState = 1,
@@ -246,6 +248,16 @@ pub trait KvSecureContext: Send + Sync {
     /// Whether `agent` is an active member of the bound group — the v1
     /// write rule for encrypted stores.
     fn is_active_member(&self, agent: &AgentId) -> bool;
+
+    /// Invalidate the context: the group is gone locally (this agent left,
+    /// the group was removed, or its state was withdrawn).
+    ///
+    /// Implementations MUST subsequently refuse to seal/open and report NO
+    /// active members, so a departed member's store fails closed on local
+    /// writes, on publishing (no key), and on inbound records — instead of
+    /// operating on a stale secret/roster snapshot. A later refresh from a
+    /// REJOINED group state may re-arm the context.
+    fn invalidate(&self);
 }
 
 /// The local agent's ML-DSA-65 signing material for sealed mutations.
@@ -608,6 +620,13 @@ mod tests {
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner)
                 .contains(agent)
+        }
+
+        fn invalidate(&self) {
+            self.members
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .clear();
         }
     }
 
