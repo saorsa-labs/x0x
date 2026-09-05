@@ -2521,46 +2521,6 @@ async fn upsert_discovered_machine_from_agent(
     }
 }
 
-/// Whether ADR-0043 pairing should drop an inbound identity announce.
-///
-/// ACP-attached harnesses (ADR-0039) own their machine key. Lazy mint
-/// used to pin them to the *owner daemon* machine when discovery had not
-/// seen them yet; the harness then announces from its own machine and
-/// ingest dropped the beat. Remote replicas kept a fresh machine record
-/// (`agent_ids: []`) and never bound the agent. Fail-open for
-/// `PlacementPinned` when the owner journal says ACP. Binding tombstones
-/// still drop.
-fn pairing_denial_drops_identity_announce(
-    denial: Option<key_move::PairingDenial>,
-    acp_issued: bool,
-) -> bool {
-    match denial {
-        Some(key_move::PairingDenial::PlacementPinned { .. }) if acp_issued => false,
-        Some(_) => true,
-        None => false,
-    }
-}
-
-/// True when this owner's journal lists `agent_id` as ACP-attached.
-async fn journal_lists_acp_agent(
-    journal_path: Option<&std::path::Path>,
-    owner_hex: Option<&str>,
-    agent_id: &identity::AgentId,
-) -> bool {
-    let (Some(path), Some(owner)) = (journal_path, owner_hex) else {
-        return false;
-    };
-    let want = hex::encode(agent_id.as_bytes());
-    profile::IssuedCertRecord::load(path)
-        .await
-        .into_iter()
-        .any(|record| {
-            record.user_id == owner
-                && record.agent_id == want
-                && record.mode == profile::CertMode::Acp
-        })
-}
-
 const MAX_MACHINE_ANNOUNCEMENT_DECODE_BYTES: u64 = 64 * 1024;
 
 /// Magic prefix marking an identity announcement that carries the agent
@@ -8212,8 +8172,6 @@ impl Agent {
             .subscribe(MOVE_ACTIVATION_TOPIC.to_string())
             .await;
         let move_state_for_listener = std::sync::Arc::clone(&self.move_state);
-        let cert_journal_path_for_listener = self.cert_journal_path.clone();
-        let owner_hex_for_listener = self.user_id().map(|uid| hex::encode(uid.as_bytes()));
 
         let own_peer_id_for_cache_exclude = ant_quic::PeerId(self.machine_id().0);
         self.spawn_tracked(async move {
@@ -8963,22 +8921,14 @@ impl Agent {
                 {
                     let revoked = revocation_set.read().await;
                     let placements = move_state_for_listener.read().await;
-                    let denial = key_move::enforce_pairing(
+                    if key_move::enforce_pairing(
                         &revoked,
                         placements.placement_view(),
                         &announcement.agent_id,
                         &announcement.machine_id,
-                    );
-                    let acp_issued = matches!(
-                        denial,
-                        Some(key_move::PairingDenial::PlacementPinned { .. })
-                    ) && journal_lists_acp_agent(
-                        cert_journal_path_for_listener.as_deref(),
-                        owner_hex_for_listener.as_deref(),
-                        &announcement.agent_id,
                     )
-                    .await;
-                    if pairing_denial_drops_identity_announce(denial, acp_issued) {
+                    .is_some()
+                    {
                         tracing::debug!(
                             agent = %hex::encode(&announcement.agent_id.0[..8]),
                             machine = %hex::encode(&announcement.machine_id.0[..8]),
@@ -10562,8 +10512,8 @@ impl Agent {
         let local_machine = self.machine_id();
         let now = Self::unix_timestamp_secs();
 
-        // Resolve each roster agent's machine from discovery (best-effort,
-        // one read of the cache — this machine is the fallback pin).
+        // Resolve each roster agent's machine from one discovery snapshot.
+        // ACP harnesses have no owner-machine fallback.
         let machine_of: std::collections::HashMap<identity::AgentId, identity::MachineId> = {
             let cache = self.identity_discovery_cache.read().await;
             cache
@@ -10589,16 +10539,17 @@ impl Agent {
             }
             let is_local = agent_id == local_agent;
             let known_machine = machine_of.get(&agent_id).copied();
-            // ACP-attached harnesses mint their own machine key. Pinning
-            // them to this owner daemon (the old fallback) makes ADR-0043
-            // ingest drop their identity announces, so replicas never bind
-            // `agent_id` onto the harness machine. Wait for discovery.
-            if !is_local && record.mode == profile::CertMode::Acp && known_machine.is_none() {
-                continue;
-            }
             let placement = if is_local {
                 key_move::Placement::Roaming
+            } else if record.mode == profile::CertMode::Acp {
+                // An absent or placeholder machine is not a harness binding.
+                // Defer minting; never substitute the owner daemon's machine.
+                let Some(machine) = known_machine.filter(|machine| machine.0 != [0; 32]) else {
+                    continue;
+                };
+                key_move::Placement::Pinned(machine)
             } else {
+                // Riders execute through the owner's daemon (ADR-0039).
                 key_move::Placement::Pinned(known_machine.unwrap_or(local_machine))
             };
             let custodian = match placement {
@@ -22731,33 +22682,130 @@ fn test_cert_events() -> tokio::sync::broadcast::Sender<VerifiedCertificate> {
 }
 
 #[test]
-fn pairing_gate_fail_opens_acp_issue_time_pin_mismatch() {
-    // WHY: ACP-attached harnesses announce from their own machine key.
-    // Lazy mint pins them to the owner daemon when discovery is empty;
-    // that mismatch must not black-hole identity fanout (`agent_ids: []`
-    // on every replica except the announcer). Binding tombstones still drop.
+fn pairing_gate_fail_closed_acp_issue_time_pin_mismatch() {
+    // WHY: even an owner-signed, historically wrong ACP pin remains authority
+    // until explicitly repaired. An inbound announce cannot override it.
+    let owner = identity::UserKeypair::generate().expect("owner");
+    let agent = identity::AgentKeypair::generate().expect("agent");
     let pin = identity::MachineId([0x11; 32]);
-    assert!(
-        !pairing_denial_drops_identity_announce(
-            Some(key_move::PairingDenial::PlacementPinned { pinned_to: pin }),
-            true,
-        ),
-        "ACP issue-time pin mismatch must accept the harness announce"
+    let harness = identity::MachineId([0x22; 32]);
+    let placement = key_move::PlacementRecord::sign(
+        agent.agent_id(),
+        owner.public_key().as_bytes(),
+        key_move::Placement::Pinned(pin),
+        0,
+        1,
+        owner.secret_key(),
+    )
+    .expect("signed pin");
+    let placements = std::collections::HashMap::from([(agent.agent_id(), placement)]);
+    let revoked = revocation::RevocationSet::new();
+    assert_eq!(
+        key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &harness),
+        Some(key_move::PairingDenial::PlacementPinned { pinned_to: pin }),
+        "ACP issue-time pin mismatch must deny the harness announce"
     );
-    assert!(
-        pairing_denial_drops_identity_announce(
-            Some(key_move::PairingDenial::PlacementPinned { pinned_to: pin }),
-            false,
-        ),
-        "non-ACP pin mismatch must still drop"
+    assert!(key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &pin).is_none());
+}
+
+#[tokio::test]
+async fn placement_mint_acp_waits_for_discovery_and_never_rewrites_existing_pin() {
+    // WHY: discovery can lag issuance or contain an unknown-machine placeholder.
+    // Neither permits minting an owner pin, and later discovery is not recovery.
+    let dir = tempfile::tempdir().expect("isolated identity directory");
+    let owner = identity::UserKeypair::generate().expect("owner");
+    let harness = identity::AgentKeypair::generate().expect("harness");
+    let cert = identity::AgentCertificate::issue(&owner, &harness).expect("certificate");
+    let record = profile::IssuedCertRecord::from_cert(&owner.user_id(), &cert).expect("record");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_identity_dir(dir.path())
+        .with_user_key(owner)
+        // No network config: no sockets, discovery tasks, or mesh connections.
+        .build()
+        .await
+        .expect("offline owner");
+    profile::IssuedCertRecord::append(agent.cert_journal_path().expect("journal"), &record)
+        .await
+        .expect("journal ACP issuance");
+
+    assert_eq!(agent.move_mint_placements().await.expect("local mint"), 1);
+    {
+        let state = agent.move_state.read().await;
+        assert_eq!(
+            state
+                .placement(&agent.agent_id())
+                .expect("local placement")
+                .placement,
+            key_move::Placement::Roaming
+        );
+        assert!(state.placement(&harness.agent_id()).is_none());
+        assert!(state.log(&harness.agent_id()).is_empty());
+    }
+    let mut discovered = discovered_agent_fixture(0x22, 1, &[], None);
+    discovered.agent_id = harness.agent_id();
+    discovered.machine_id = identity::MachineId([0; 32]);
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered.clone());
+    assert_eq!(
+        agent
+            .move_mint_placements()
+            .await
+            .expect("defer placeholder"),
+        0
     );
-    assert!(
-        pairing_denial_drops_identity_announce(Some(key_move::PairingDenial::BindingRevoked), true,),
-        "ACP must not bypass a binding tombstone"
+    assert!(agent
+        .move_state
+        .read()
+        .await
+        .log(&harness.agent_id())
+        .is_empty());
+
+    let harness_machine = identity::MachineId([0x22; 32]);
+    assert_ne!(harness_machine, agent.machine_id());
+    discovered.machine_id = harness_machine;
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered.clone());
+    assert_eq!(agent.move_mint_placements().await.expect("harness mint"), 1);
+    {
+        let state = agent.move_state.read().await;
+        assert_eq!(
+            state
+                .placement(&harness.agent_id())
+                .expect("harness pin")
+                .placement,
+            key_move::Placement::Pinned(harness_machine)
+        );
+        assert!(matches!(&state.log(&harness.agent_id())[0].record,
+            key_move::MoveRecord::PlacementMint { custodian_machine, .. } if *custodian_machine == harness_machine));
+    }
+    discovered.machine_id = agent.machine_id();
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered);
+    assert_eq!(
+        agent.move_mint_placements().await.expect("idempotent mint"),
+        0
     );
-    assert!(
-        !pairing_denial_drops_identity_announce(None, true),
-        "absent pairing evidence stays fail-open"
+    let state = agent.move_state.read().await;
+    assert_eq!(state.log(&harness.agent_id()).len(), 1);
+    assert_eq!(
+        state
+            .placement(&harness.agent_id())
+            .expect("unchanged pin")
+            .placement,
+        key_move::Placement::Pinned(harness_machine)
     );
 }
 
