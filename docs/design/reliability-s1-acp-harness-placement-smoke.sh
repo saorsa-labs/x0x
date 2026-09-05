@@ -1,23 +1,26 @@
 #!/usr/bin/env bash
 # S1 ACP harness placement smoke — offline fixtures (live dual-daemon blocked).
 #
-# Observes an assembled snapshot of owner_machine_id, placement
+# Requires a captured successful GET /owner/placement response, then
+# observes an assembled snapshot of owner_machine_id, placement
 # {kind,machine_id}, and harness_machine {machine_id, agent_ids}.
 # Does not start daemons, touch the mesh, or implement #512 / #507 /
 # #508 / #509 product fixes.
 #
-# Live dual-daemon (G3) is BLOCKED until a corrected #512 tip exists.
-# Current #512 tip 833bfe86 is HOLD (P1: mode=Acp fail-open bypasses
-# PlacementPinned). Offline --self-test is the acceptance-oracle proof
+# Live dual-daemon (G3) is not accepted by this offline-only script.
+# Reviewed #512 tip f1418a0 removes the unsafe bypass; authenticated
+# identity-ingest regression evidence remains pending. Offline --self-test is the acceptance-oracle proof
 # available now. No Ben Mac.
 #
 # Exit codes (--fixture / --classify-snapshot):
 #   0  PASS — pinned to harness ≠ owner and agent_ids contains agent
-#             OR pending/unbound with no harness bind (G1)
-#   1  FAIL — pinned to owner with empty agent_ids
+#             OR pending with no pin/bind and agent absent from a
+#             successful lazy-mint ledger capture (G1)
+#   1  FAIL — pinned to owner with valid empty binding evidence
 #             OR agent bound on a machine that is not the pin
 #             (wrong-machine / mode=Acp fail-open never PASS)
-#   3  inconclusive — missing placement / required ids / other shapes
+#   3  inconclusive — missing/error ledger, malformed or contradictory
+#                     evidence, missing placement / ids / other shapes
 #
 # --self-test exits 0 only when every required fixture matches.
 #
@@ -30,18 +33,28 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 FIXTURE_DIR="${SCRIPT_DIR}/reliability-s1-acp-fixtures"
 
 REQUIRED_FIXTURES=(
-  pass-pin-harness-machine
-  pass-pending-unknown-harness
+  fail-open-wrong-machine-must-not-pass
   fail-pinned-to-owner-empty-agent-ids
   inconclusive-missing-placement
-  fail-open-wrong-machine-must-not-pass
+  inconclusive-pending-body-error
+  inconclusive-pending-existing-ledger-pin
+  inconclusive-pending-http-error
+  inconclusive-pending-malformed-bindings
+  inconclusive-pending-missing-harness
+  inconclusive-pending-missing-ledger
+  inconclusive-pending-missing-rows
+  inconclusive-pending-owner-pin
+  inconclusive-pending-read-only-endpoint
+  pass-pending-known-empty-binding
+  pass-pending-unknown-harness
+  pass-pin-harness-machine
 )
 
 usage() {
   cat <<'EOF'
 S1 ACP harness placement smoke (offline fixtures).
 
-Live dual-daemon is BLOCKED until a corrected #512 tip (not HOLD 833bfe86).
+Live dual-daemon remains unaccepted at reviewed #512 f1418a0 (ingest regression pending).
 Offline fixture mode is the acceptance-oracle proof (no daemon, no mesh):
 
   docs/design/reliability-s1-acp-harness-placement-smoke.sh --self-test
@@ -118,7 +131,10 @@ PENDING_KINDS = frozenset({"pending", "unbound", "deferred", "unknown"})
 def as_id(value) -> str:
     if value is None:
         return ""
-    return str(value).strip()
+    if not isinstance(value, str):
+        print("INCONCLUSIVE: identifiers must be strings or null")
+        sys.exit(3)
+    return value.strip()
 
 
 def as_kind(value) -> str:
@@ -147,20 +163,34 @@ def load_snapshot(path: str) -> dict:
     return body
 
 
+def inconclusive(reason):
+    print(f"INCONCLUSIVE: {reason}")
+    sys.exit(3)
+
+
 def agent_ids_of(harness) -> list:
+    if harness is None:
+        return []
     if not isinstance(harness, dict):
-        return []
+        inconclusive("harness_machine must be an object or explicit null")
     raw = harness.get("agent_ids")
-    if not isinstance(raw, list):
-        return []
-    return [as_id(x) for x in raw if as_id(x)]
+    if not isinstance(raw, list) or any(not isinstance(x, str) or not x.strip() for x in raw):
+        inconclusive("harness agent_ids must be an array of nonempty strings")
+    if "machine_id" not in harness:
+        inconclusive("missing harness machine_id")
+    machine_id = as_id(harness["machine_id"])
+    if raw and not machine_id:
+        inconclusive("bound agents require a known harness machine")
+    return [x.strip() for x in raw]
 
 
 snap = load_snapshot(sys.argv[1])
 agent_id = as_id(snap.get("agent_id"))
 owner_machine_id = as_id(snap.get("owner_machine_id"))
 placement = snap.get("placement")
-harness = snap.get("harness_machine")
+if "harness_machine" not in snap:
+    inconclusive("missing harness observation (use explicit null for observed absence)")
+harness = snap["harness_machine"]
 harness_machine_id = as_id(harness.get("machine_id") if isinstance(harness, dict) else None)
 bound_ids = agent_ids_of(harness)
 bound = bool(agent_id and agent_id in bound_ids)
@@ -168,8 +198,10 @@ bound = bool(agent_id and agent_id in bound_ids)
 if isinstance(placement, dict):
     kind = as_kind(placement.get("kind"))
     pin_machine = as_id(placement.get("machine_id"))
-    if not pin_machine:
-        pin_machine = as_id(placement.get("pinned_machine"))
+    alias_pin = as_id(placement.get("pinned_machine"))
+    if pin_machine and alias_pin and pin_machine != alias_pin:
+        inconclusive("conflicting placement machine identifiers")
+    pin_machine = pin_machine or alias_pin
 else:
     kind = ""
     pin_machine = ""
@@ -189,9 +221,43 @@ if not isinstance(placement, dict):
     print("INCONCLUSIVE: missing placement object")
     sys.exit(3)
 
-if kind in PENDING_KINDS and not bound:
-    print("PASS: pending/unbound — mint deferred until harness machine known (G1)")
+# A per-agent 404 is not a mint attempt. Retain the actual ledger trigger
+# response and compare its rows with the assembled observation before PASS.
+capture = snap.get("ledger_capture")
+if not isinstance(capture, dict):
+    inconclusive("missing GET /owner/placement capture")
+if capture.get("method") != "GET" or capture.get("path") != "/owner/placement":
+    inconclusive("ledger capture must identify the lazy-mint endpoint")
+if type(capture.get("http_status")) is not int or capture["http_status"] != 200:
+    inconclusive("ledger mint request did not return HTTP 200")
+body = capture.get("body")
+if not isinstance(body, dict) or body.get("ok") is not True:
+    inconclusive("missing or unsuccessful ledger body")
+rows = body.get("placements")
+if not isinstance(rows, list) or any(
+    not isinstance(row, dict) or not isinstance(row.get("agent_id"), str)
+    or not row["agent_id"].strip() for row in rows
+):
+    inconclusive("missing or malformed ledger placements")
+matching = [row for row in rows if row["agent_id"].strip() == agent_id]
+if len(matching) > 1:
+    inconclusive("duplicate agent placement rows")
+
+if kind in PENDING_KINDS:
+    if pin_machine or matching or bound:
+        inconclusive("pending contradicts a pin, ledger record, or bound agent")
+    print("PASS: successful mint deferred this unbound agent (G1)")
     sys.exit(0)
+
+if kind == "pinned":
+    if len(matching) != 1:
+        inconclusive("pinned snapshot lacks its ledger record")
+    row = matching[0]
+    if row.get("kind") != "pinned" or as_id(row.get("pinned_machine")) != pin_machine:
+        inconclusive("snapshot pin disagrees with ledger record")
+    epoch = placement.get("epoch")
+    if type(epoch) is not int or epoch < 0 or type(row.get("epoch")) is not int or row["epoch"] != epoch:
+        inconclusive("missing or inconsistent placement epoch")
 
 if kind != "pinned":
     print(f"INCONCLUSIVE: unclassifiable placement kind {kind or '(empty)'}")
@@ -275,8 +341,8 @@ if [[ "$MODE" == "list" ]]; then
 fi
 
 if [[ "$MODE" == "blocked-live" ]]; then
-  echo "LIVE BLOCKED: dual-daemon S1 is gated on a corrected #512 tip." >&2
-  echo "Current #512 head 833bfe86 is HOLD (P1: mode=Acp fail-open bypasses PlacementPinned)." >&2
+  echo "LIVE UNACCEPTED: use retained evidence from the corrected #512 tip and real ingest regression." >&2
+  echo "Reviewed #512 head f1418a0 removes the bypass; real identity-ingest regression is pending." >&2
   echo "Offline proof: $0 --self-test   (no daemon, no mesh, no Ben Mac)" >&2
   usage >&2
   exit 3
@@ -304,7 +370,7 @@ if [[ "$MODE" == "self-test" ]]; then
     echo "SELF-TEST FAIL: one or more fixtures did not match expected exit"
     exit 1
   fi
-  echo "SELF-TEST PASS: five required fixtures matched expected exits"
+  echo "SELF-TEST PASS: all required fixtures matched expected exits"
   exit 0
 fi
 

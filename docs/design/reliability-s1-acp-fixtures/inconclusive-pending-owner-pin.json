@@ -4,12 +4,11 @@
     "agent_id": "acp-1",
     "owner_machine_id": "owner-m",
     "journal_mode": "acp",
-    "harness_machine": {
-      "machine_id": "harness-m",
-      "agent_ids": [
-        "acp-1"
-      ]
+    "placement": {
+      "kind": "pending",
+      "machine_id": "owner-m"
     },
+    "harness_machine": null,
     "ledger_capture": {
       "method": "GET",
       "path": "/owner/placement",

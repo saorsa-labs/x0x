@@ -11,7 +11,25 @@
     },
     "harness_machine": {
       "machine_id": "harness-m",
-      "agent_ids": ["acp-1"]
+      "agent_ids": [
+        "acp-1"
+      ]
+    },
+    "ledger_capture": {
+      "method": "GET",
+      "path": "/owner/placement",
+      "http_status": 200,
+      "body": {
+        "ok": true,
+        "placements": [
+          {
+            "agent_id": "acp-1",
+            "kind": "pinned",
+            "pinned_machine": "harness-m",
+            "epoch": 0
+          }
+        ]
+      }
     }
   }
 }

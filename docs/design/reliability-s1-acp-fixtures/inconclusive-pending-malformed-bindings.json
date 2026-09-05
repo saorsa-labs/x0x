@@ -1,17 +1,16 @@
 {
-  "expected_exit": 1,
+  "expected_exit": 3,
   "snapshot": {
     "agent_id": "acp-1",
     "owner_machine_id": "owner-m",
     "journal_mode": "acp",
     "placement": {
-      "kind": "pinned",
-      "machine_id": "owner-m",
-      "epoch": 0
+      "kind": "pending",
+      "machine_id": null
     },
     "harness_machine": {
       "machine_id": "harness-m",
-      "agent_ids": []
+      "agent_ids": "acp-1"
     },
     "ledger_capture": {
       "method": "GET",
@@ -19,14 +18,7 @@
       "http_status": 200,
       "body": {
         "ok": true,
-        "placements": [
-          {
-            "agent_id": "acp-1",
-            "kind": "pinned",
-            "pinned_machine": "owner-m",
-            "epoch": 0
-          }
-        ]
+        "placements": []
       }
     }
   }

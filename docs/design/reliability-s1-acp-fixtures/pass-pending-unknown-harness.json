@@ -8,6 +8,15 @@
       "kind": "pending",
       "machine_id": null
     },
-    "harness_machine": null
+    "harness_machine": null,
+    "ledger_capture": {
+      "method": "GET",
+      "path": "/owner/placement",
+      "http_status": 200,
+      "body": {
+        "ok": true,
+        "placements": []
+      }
+    }
   }
 }
