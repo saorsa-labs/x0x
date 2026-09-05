@@ -73,19 +73,36 @@ impl SyncDaemonView for DaemonView {
 
     fn home_pointer(&self) -> Option<SyncValue> {
         let owner = self.state.agent.identity().user_keypair()?.user_id();
+        let local_hex = hex::encode(self.state.agent.agent_id().as_bytes());
         let groups = self.state.named_groups.try_read().ok()?;
-        // Mirror of `routes::home::find_home` (same module subtree): any
-        // group stamped as Home for this owner.
+        // #449 (D4): this MUST use the same predicate as
+        // `routes::home::find_home` — a weaker one (any owner-certified
+        // group carrying Home metadata) let a device publish a Home it is
+        // not a member of, or a half-shaped group, as the owner's Home.
+        // Combined with `.find()` over an UNORDERED map that made the
+        // published pointer nondeterministic: with two Home-stamped groups
+        // in the roster (exactly what cross-device adoption creates) the
+        // selection could differ on every reconcile pass, and every flip
+        // re-minted the `"home"` record. Select the lexicographically
+        // smallest stable id so the choice is stable across passes.
+        let pending: Vec<String> = {
+            let pending = self
+                .state
+                .pending_join_stubs
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            pending.iter().cloned().collect()
+        };
         groups
-            .values()
-            .find(|info| {
-                info.home.is_some()
-                    && info
-                        .policy
-                        .admission
-                        .owner_certified_user_id()
-                        .is_some_and(|u| *u == owner)
+            .iter()
+            .filter(|(id, info)| {
+                !pending.iter().any(|p| p == id.as_str())
+                    && info.home.is_some()
+                    && super::home::is_home_policy(&info.policy, &owner)
+                    && info.has_active_member(&local_hex)
             })
+            .map(|(_, info)| info)
+            .min_by(|a, b| a.stable_group_id().cmp(b.stable_group_id()))
             .map(|info| SyncValue::HomePointer {
                 group_id: info.stable_group_id().to_string(),
                 policy: info.policy.clone(),
@@ -468,6 +485,116 @@ mod tests {
         );
         crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(data_dir, agent)
             .await
+    }
+
+    /// Build a Home-shaped group for `owner`, optionally seating `member`.
+    fn home_group(
+        state: &AppState,
+        owner: &crate::identity::UserId,
+        group_id: &str,
+        seat_local_agent: bool,
+    ) -> crate::groups::GroupInfo {
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            group_id.to_string(),
+            crate::server::routes::home::home_policy(owner),
+        );
+        info.home = Some(crate::groups::HomeMetadata {
+            primary_agent: hex::encode(state.agent.agent_id().as_bytes()),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 0,
+        });
+        if !seat_local_agent {
+            info.members_v2.clear();
+        }
+        info
+    }
+
+    /// WHY (#449 D4): the pointer this device publishes as "the owner's
+    /// Home" must be the SAME group `find_home` would resolve, and must not
+    /// change between reconcile passes.
+    ///
+    /// The old predicate accepted any owner-certified group carrying Home
+    /// metadata — no full policy match, no membership check — and selected
+    /// it with `.find()` over an unordered map. With two Home-stamped groups
+    /// in the roster (exactly what cross-device adoption creates) the choice
+    /// could differ every pass, and each flip re-minted the `"home"` record.
+    /// Two independently-seeded roster maps (distinct `RandomState`, so
+    /// distinct iteration orders) holding the SAME two Home-shaped groups
+    /// must publish the SAME pointer — a property `.find()` cannot give.
+    #[tokio::test]
+    async fn published_home_pointer_is_stable_across_passes() -> anyhow::Result<()> {
+        // The duplicate-Home situation #449 is about: two Home-shaped groups
+        // for one owner, inserted in opposite orders on two daemons.
+        let (lo, hi) = ("aa".repeat(16), "bb".repeat(16));
+        let mut published = Vec::new();
+        let dirs = [tempfile::tempdir()?, tempfile::tempdir()?];
+
+        for (i, dir) in dirs.iter().enumerate() {
+            let state = owned_state(dir.path(), [0x4A; 32]).await?;
+            let owner = state
+                .agent
+                .identity()
+                .user_keypair()
+                .expect("owned state has a user key")
+                .user_id();
+            {
+                let mut groups = state.named_groups.write().await;
+                let order = if i == 0 { [&hi, &lo] } else { [&lo, &hi] };
+                for id in order {
+                    groups.insert(id.clone(), home_group(&state, &owner, id, true));
+                }
+            }
+            let view = DaemonView::new(Arc::clone(&state));
+            let SyncValue::HomePointer { group_id, .. } =
+                view.home_pointer().expect("a Home is published")
+            else {
+                panic!("home_pointer must publish a HomePointer");
+            };
+            published.push(group_id);
+        }
+
+        assert_eq!(
+            published[0], published[1],
+            "two daemons with the same two Homes must publish the same pointer"
+        );
+        assert_eq!(
+            published[0], lo,
+            "selection is the smallest stable group id, never map iteration order"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449 D4): a Home we are not seated in belongs to another device.
+    /// Publishing it as ours would advertise a Home we cannot serve and, once
+    /// the apply arm acts on pointers, would let a non-member overwrite the
+    /// owner's canonical Home.
+    #[tokio::test]
+    async fn home_pointer_ignores_a_home_we_are_not_a_member_of() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4B; 32]).await?;
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key")
+            .user_id();
+
+        let foreign = "cc".repeat(16);
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(foreign.clone(), home_group(&state, &owner, &foreign, false));
+
+        let view = DaemonView::new(Arc::clone(&state));
+        assert!(
+            view.home_pointer().is_none(),
+            "a Home without our agent seated must not be published as ours"
+        );
+        Ok(())
     }
 
     async fn response_json(

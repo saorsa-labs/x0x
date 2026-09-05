@@ -67,7 +67,10 @@ pub(in crate::server) fn home_policy(
 /// Whether `policy` is EXACTLY the Home policy for `owner` — all five axes
 /// (review fix 3: the crash-recovery scan must match the whole shape, not
 /// just name+admission).
-fn is_home_policy(policy: &crate::groups::GroupPolicy, owner: &crate::identity::UserId) -> bool {
+pub(in crate::server) fn is_home_policy(
+    policy: &crate::groups::GroupPolicy,
+    owner: &crate::identity::UserId,
+) -> bool {
     *policy == home_policy(owner)
 }
 
