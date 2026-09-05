@@ -19,6 +19,9 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Test release metadata validation
+        run: python3 .github/scripts/test_release_metadata.py
+
       - name: Validate release metadata (pull request)
         if: github.event_name == 'pull_request'
         run: |
