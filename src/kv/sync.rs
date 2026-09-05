@@ -2254,13 +2254,24 @@ mod tests {
         .is_ok()
     }
 
-    async fn wait_key_absent(sync: &KvStoreSync, key: &str) -> bool {
-        tokio::time::timeout(Duration::from_secs(2), async {
-            tokio::time::sleep(Duration::from_millis(2000)).await;
-        })
-        .await
-        .is_ok()
-            && sync.read().await.get(key).is_none()
+    /// A fresh, authorized sealed publication must pass through the same
+    /// subscription and serial listener as the adversarial message. Never put
+    /// the marker locally: observing it must prove the listener merged it.
+    async fn encrypted_listener_barrier(sync: &KvStoreSync, key: &str, seq: u64) {
+        assert!(sync.read().await.get(key).is_none(), "marker must be fresh");
+        let entry = KvEntry::new(
+            key.to_string(),
+            b"barrier".to_vec(),
+            "text/plain".to_string(),
+        );
+        let delta = KvStoreDelta::for_put(key.to_string(), entry, (peer(99), seq), seq);
+        sync.publish_delta(peer(99), delta)
+            .await
+            .expect("publish authorized sealed barrier");
+        assert!(
+            wait_for_key(sync, key).await,
+            "encrypted listener did not consume sealed barrier {key}"
+        );
     }
 
     #[tokio::test]
@@ -2384,7 +2395,7 @@ mod tests {
         .await;
         sync_b.start().await.expect("start b");
         sync_c.start().await.expect("start c");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        encrypted_listener_barrier(&sync_b, "nonmember-ready", 1001).await;
 
         let delta = {
             let mut s = sync_c.write().await;
@@ -2405,8 +2416,11 @@ mod tests {
         };
         sync_c.publish_delta(peer(3), delta).await.expect("publish");
 
+        // Sequential local publishes enter the same FIFO subscription. The
+        // marker proves the earlier adversarial record reached the listener.
+        encrypted_listener_barrier(&sync_b, "nonmember-processed", 1002).await;
         assert!(
-            wait_key_absent(&sync_b, "intruder-key").await,
+            sync_b.read().await.get("intruder-key").is_none(),
             "non-member author's sealed record must never merge"
         );
     }
@@ -2435,7 +2449,7 @@ mod tests {
         )
         .await;
         sync_a.start().await.expect("start");
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        encrypted_listener_barrier(&sync_a, "plaintext-ready", 1001).await;
 
         let mut delta = KvStoreDelta::new(1);
         delta.added.insert(
@@ -2455,8 +2469,11 @@ mod tests {
             .await
             .expect("publish plaintext");
 
+        // The post-publication barrier must merge before absence is checked;
+        // a scheduler delay cannot masquerade as a plaintext ingestion failure.
+        encrypted_listener_barrier(&sync_a, "plaintext-processed", 1002).await;
         assert!(
-            wait_key_absent(&sync_a, "plaintext-key").await,
+            sync_a.read().await.get("plaintext-key").is_none(),
             "plaintext delta must never apply to an encrypted store"
         );
     }
