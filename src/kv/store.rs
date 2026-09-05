@@ -9,12 +9,12 @@
 //!   from non-owners are rejected. Use for app stores, agent skill registries.
 //! - **Allowlisted**: Only explicitly allowed writers can write. The owner
 //!   manages the allowlist. Use for team workspaces, private swarms.
-//! - **Encrypted**: Reserved for group-scoped encrypted stores. Reserved
-//!   means reserved: [`KvStore::new`] refuses to construct one (returning
-//!   [`KvError::EncryptedPolicyReserved`]), and a replica that already
-//!   carries the policy (e.g. deserialized legacy state) fails closed — no
-//!   authorized writer, no local writes, no delta application — until
-//!   encrypted sync is wired.
+//! - **Encrypted**: group-scoped confidential store (#341). Constructed
+//!   only via [`KvStore::new_encrypted`] with an attached secure context;
+//!   the v1 write rule is active group membership, and the sync layer seals
+//!   every publication (see `kv::encrypted`). A replica carrying the
+//!   policy WITHOUT a context — e.g. deserialized legacy state — fails
+//!   closed: no authorized writer, no local writes, no delta application.
 //! - **AppendOnly**: Like `Signed` (owner-only writes), but existing keys are
 //!   immutable — no update, no delete, even by the owner. Use for
 //!   tamper-evident event logs where the author must not be able to rewrite
@@ -29,6 +29,7 @@
 //!   directories with many mutually-unknown publishers.
 
 use crate::identity::AgentId;
+use crate::kv::encrypted::KvSecureContext;
 use crate::kv::{KvEntry, KvError, KvStoreDelta, Result};
 use saorsa_gossip_crdt_sync::{LwwRegister, OrSet};
 use saorsa_gossip_types::PeerId;
@@ -50,14 +51,19 @@ pub enum AccessPolicy {
 
     /// Reserved for group-scoped encrypted stores.
     ///
-    /// The variant is **unconstructible** through ordinary constructors
-    /// ([`KvStore::new`] returns
-    /// [`KvError::EncryptedPolicyReserved`]) and **fail-closed** on any
-    /// replica that already carries it: the sync path still publishes
-    /// plaintext deltas and enforces no group membership, so until encrypted
-    /// sync is wired the name must not promise confidentiality. The variant
-    /// itself stays (bincode discriminant 2 is pinned on disk and on the
-    /// wire).
+    /// Phase A (#358) made the variant **unconstructible** through
+    /// [`KvStore::new`] ([`KvError::EncryptedPolicyReserved`]) and
+    /// **fail-closed** on any replica that carries it without a secure
+    /// context. Phase B (#341) wires the real path: [`KvStore::new_encrypted`]
+    /// constructs the policy ONLY with an attached
+    /// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext), and the
+    /// v1 write rule becomes **active group membership** — local writes,
+    /// remote merges, and checkpoint adoption all consult the context.
+    /// Confidentiality is provided by the sync layer: an encrypted store's
+    /// gossip publications are sign-then-encrypt sealed records, never
+    /// plaintext deltas. A deserialized replica without a re-attached
+    /// context remains fail-closed. The bincode discriminant (2) is pinned
+    /// on disk and on the wire.
     Encrypted {
         /// MLS group ID for this store.
         group_id: Vec<u8>,
@@ -628,7 +634,7 @@ pub fn make_owner_checkpoint(params: OwnerCheckpointParams<'_>) -> Result<OwnerC
 /// - HashMap for entry content (the KvEntry values)
 /// - LWW-Register for store metadata (name)
 /// - Access control via owner, allowlist, and policy
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Clone, Serialize, Deserialize)]
 pub struct KvStore {
     /// Unique identifier for this store.
     id: KvStoreId,
@@ -719,6 +725,42 @@ pub struct KvStore {
     /// Monotonic sequence counter for unique OR-Set tags.
     #[serde(skip, default = "default_seq_counter")]
     seq_counter: Arc<AtomicU64>,
+
+    // ---------------------------------------------------------------------
+    // NOT-persisted extension (#341 Phase B): the secure context backing an
+    // [`AccessPolicy::Encrypted`] store. `serde(skip)` keeps the bincode
+    // wire/disk layout unchanged — a deserialized store carries `None` and
+    // stays fail-closed until a caller re-attaches a context via
+    // [`KvStore::set_secure_context`]. Never insert a PERSISTED field after
+    // `seq_counter` without the `de_tolerant` treatment (see above).
+    // ---------------------------------------------------------------------
+    /// Group secure context for `Encrypted` stores. `None` on every other
+    /// policy, and on `Encrypted` replicas restored from a snapshot until
+    /// re-attached — which is exactly the Phase A fail-closed state.
+    #[serde(skip, default)]
+    secure: Option<std::sync::Arc<dyn KvSecureContext>>,
+}
+
+impl std::fmt::Debug for KvStore {
+    /// Manual impl because `Arc<dyn KvSecureContext>` is not `Debug`; the
+    /// context is summarized by presence only (never its contents).
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("KvStore")
+            .field("id", &self.id)
+            .field("name_register", &self.name)
+            .field("policy", &self.policy)
+            .field("owner", &self.owner)
+            .field("allowed_writers", &self.allowed_writers)
+            .field("version", &self.version)
+            .field("entry_count", &self.entries.len())
+            .field("anchor_channel", &self.anchor_channel)
+            .field("policy_version", &self.policy_version)
+            .field("ownership_conflict", &self.ownership_conflict)
+            .field("latest_checkpoint", &self.latest_checkpoint)
+            .field("highest_checkpoint_seq", &self.highest_checkpoint_seq)
+            .field("secure_context_attached", &self.secure.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// Deserialize a trailing, defaultable `KvStore` field, tolerating its absence.
@@ -753,15 +795,17 @@ impl KvStore {
     /// # Errors
     ///
     /// [`KvError::EncryptedPolicyReserved`] if `policy` is
-    /// [`AccessPolicy::Encrypted`]: the secure sync path is not wired yet,
-    /// so an Encrypted replica would gossip plaintext while authorizing
-    /// every writer. The name must not over-promise — the variant stays
-    /// reserved (and deserialized replicas fail closed) until that lands.
+    /// [`AccessPolicy::Encrypted`]: this constructor accepts no secure
+    /// context, so an Encrypted store built here could not honor its policy.
+    /// The name must not over-promise — use
+    /// [`new_encrypted`](Self::new_encrypted) with a live
+    /// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext); a replica
+    /// that carries the policy without a context fails closed.
     pub fn new(id: KvStoreId, name: String, owner: AgentId, policy: AccessPolicy) -> Result<Self> {
         if let AccessPolicy::Encrypted { group_id } = &policy {
             tracing::warn!(
                 target: "x0x::kv",
-                "refused to construct store {} with reserved encrypted policy (group_id {}) — secure sync is not wired; use a Signed/Allowlisted/AppendOnly store until then",
+                "refused to construct store {} with reserved encrypted policy (group_id {}) — use KvStore::new_encrypted with an attached secure context",
                 id,
                 hex::encode(group_id)
             );
@@ -789,7 +833,105 @@ impl KvStore {
             allowed_writers: HashSet::new(),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
+            secure: None,
         })
+    }
+
+    /// Create a new empty group-scoped encrypted store (#341 Phase B).
+    ///
+    /// This is the ONLY production path that constructs
+    /// [`AccessPolicy::Encrypted`]: the caller must supply a live
+    /// [`KvSecureContext`] bound to the same `group_id`, so every
+    /// authorization decision on this store (local writes, remote merges,
+    /// checkpoint adoption) consults real group membership and every
+    /// publication is sealed by the sync layer. A store created here without
+    /// a running encrypted sync is inert (writes still refuse), never
+    /// plaintext-gossiping.
+    ///
+    /// The plain [`new`](Self::new) keeps rejecting `Encrypted` — a caller
+    /// without a context has no way to honor the policy, so the name must
+    /// not construct.
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::Unauthorized`] if `ctx` is bound to a different group than
+    /// `group_id` (mis-wired construction).
+    pub fn new_encrypted(
+        id: KvStoreId,
+        name: String,
+        owner: AgentId,
+        group_id: Vec<u8>,
+        ctx: Arc<dyn KvSecureContext>,
+    ) -> Result<Self> {
+        if ctx.group_id() != group_id {
+            return Err(KvError::Unauthorized(format!(
+                "secure context is bound to group {} but the store requests group {}",
+                hex::encode(ctx.group_id()),
+                hex::encode(&group_id)
+            )));
+        }
+        let mut name_reg = LwwRegister::new(name.clone());
+        // Stamp the creator-set name with a non-empty clock so it wins LWW
+        // merge against replicas initialized with empty names (see `new`).
+        name_reg.set(name, PeerId::new(owner.0));
+        Ok(Self {
+            id,
+            keys: OrSet::new(),
+            entries: HashMap::new(),
+            name: name_reg,
+            policy: AccessPolicy::Encrypted { group_id },
+            owner: Some(owner),
+            anchor_channel: AnchorChannel::Creator,
+            policy_version: 0,
+            ownership_conflict: None,
+            latest_checkpoint: None,
+            highest_checkpoint_seq: 0,
+            allowed_writers: HashSet::new(),
+            version: 0,
+            seq_counter: Arc::new(AtomicU64::new(0)),
+            secure: Some(ctx),
+        })
+    }
+
+    /// Attach (or replace) the secure context on an `Encrypted` replica.
+    ///
+    /// This is the snapshot-restore / rehydration path: a deserialized store
+    /// carries no context (the field is `serde(skip)`) and is fail-closed
+    /// until the caller re-binds one. Rejects a context bound to a different
+    /// group and a context-less call on a non-encrypted store (a no-op
+    /// attachment there would be silently meaningless).
+    ///
+    /// # Errors
+    ///
+    /// [`KvError::EncryptedPolicyReserved`] if the store is not
+    /// `Encrypted`; [`KvError::Unauthorized`] on a group binding mismatch.
+    pub fn set_secure_context(&mut self, ctx: Arc<dyn KvSecureContext>) -> Result<()> {
+        let AccessPolicy::Encrypted { group_id } = &self.policy else {
+            return Err(KvError::EncryptedPolicyReserved {
+                group_id: Vec::new(),
+            });
+        };
+        if ctx.group_id() != *group_id {
+            return Err(KvError::Unauthorized(format!(
+                "secure context is bound to group {} but the store is bound to group {}",
+                hex::encode(ctx.group_id()),
+                hex::encode(group_id)
+            )));
+        }
+        self.secure = Some(ctx);
+        Ok(())
+    }
+
+    /// The attached secure context, if any (encrypted stores only).
+    #[must_use]
+    pub fn secure_context(&self) -> Option<&Arc<dyn KvSecureContext>> {
+        self.secure.as_ref()
+    }
+
+    /// True when this store carries the group-encrypted policy.
+    #[must_use]
+    pub fn is_encrypted(&self) -> bool {
+        matches!(self.policy, AccessPolicy::Encrypted { .. })
     }
 
     /// Force-build a live replica carrying the reserved
@@ -853,6 +995,7 @@ impl KvStore {
             allowed_writers: HashSet::new(),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
+            secure: None,
         }
     }
 
@@ -880,6 +1023,7 @@ impl KvStore {
             allowed_writers: HashSet::new(),
             version: 0,
             seq_counter: Arc::new(AtomicU64::new(0)),
+            secure: None,
         }
     }
 
@@ -1026,11 +1170,14 @@ impl KvStore {
                     || self.allowed_writers.contains(agent_id)
             }
             AccessPolicy::Encrypted { .. } => {
-                // Reserved for encrypted sync — fail closed (#341 Phase A):
-                // the sync path still carries plaintext deltas and no group
-                // membership check exists, so nobody is authorized on an
-                // Encrypted replica until the secure sync path is wired.
-                false
+                // Group-encrypted store (#341 Phase B): the v1 write rule is
+                // ACTIVE GROUP MEMBERSHIP, evaluated by the attached secure
+                // context. Without a context (reserved policy, or a replica
+                // deserialized from a snapshot that has not been re-bound
+                // yet) this stays fail-closed (#341 Phase A).
+                self.secure
+                    .as_ref()
+                    .is_some_and(|ctx| ctx.is_active_member(agent_id))
             }
             AccessPolicy::AppendOnly => {
                 // Owner-only writes, exactly like Signed. Immutability of
@@ -1081,10 +1228,24 @@ impl KvStore {
     /// - [`KvError::Unauthorized`] if `writer` is not authorized for `key`.
     pub fn authorize_write(&self, writer: &AgentId, key: &str) -> Result<()> {
         match &self.policy {
-            AccessPolicy::Encrypted { .. } => {
-                // Matches the inbound path: the reserved Encrypted policy is
-                // currently permissive at the store layer (#341).
-                Ok(())
+            AccessPolicy::Encrypted { group_id } => {
+                // #341 Phase B: the v1 write rule is active group
+                // membership, via the attached secure context. Without a
+                // context this is the reserved fail-closed state — notably
+                // this closes the Phase A hole where `authorize_write` (and
+                // therefore local removes through the handle layer) was
+                // unconditionally permissive on a reserved Encrypted store.
+                match self.secure.as_ref() {
+                    Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                    Some(_) => Err(KvError::Unauthorized(format!(
+                        "encrypted store: writer {} is not an active member of group {}",
+                        hex::encode(writer.as_bytes()),
+                        hex::encode(group_id)
+                    ))),
+                    None => Err(KvError::EncryptedPolicyReserved {
+                        group_id: group_id.clone(),
+                    }),
+                }
             }
             AccessPolicy::SelfKeyed => {
                 if self.is_authorized_for_key(writer, key) {
@@ -1167,19 +1328,39 @@ impl KvStore {
     ///   store's policy.
     pub fn authorize_local_write(&self, writer: &AgentId) -> Result<()> {
         if let AccessPolicy::Encrypted { group_id } = &self.policy {
-            // Matches the inbound path: the reserved Encrypted policy
-            // authorizes nobody until secure sync is wired. Fail closed,
-            // loudly — never `OwnerUnknown`, this is not an ownership issue.
-            tracing::warn!(
-                target: "x0x::kv",
-                "refused local write by {} on reserved encrypted store {} (group_id {}) — secure sync is not wired",
-                hex::encode(writer.as_bytes()),
-                self.id,
-                hex::encode(group_id)
-            );
-            return Err(KvError::EncryptedPolicyReserved {
-                group_id: group_id.clone(),
-            });
+            // #341 Phase B: with an attached secure context the v1 write
+            // rule is active group membership. Without one this is the
+            // reserved fail-closed state — loudly, and never `OwnerUnknown`
+            // (this is not an ownership issue).
+            return match self.secure.as_ref() {
+                Some(ctx) if ctx.is_active_member(writer) => Ok(()),
+                Some(_) => {
+                    tracing::warn!(
+                        target: "x0x::kv",
+                        "refused local write by {} on encrypted store {} (group_id {}) — writer is not an active group member",
+                        hex::encode(writer.as_bytes()),
+                        self.id,
+                        hex::encode(group_id)
+                    );
+                    Err(KvError::Unauthorized(format!(
+                        "encrypted store: writer {} is not an active member of group {}",
+                        hex::encode(writer.as_bytes()),
+                        hex::encode(group_id)
+                    )))
+                }
+                None => {
+                    tracing::warn!(
+                        target: "x0x::kv",
+                        "refused local write by {} on reserved encrypted store {} (group_id {}) — no secure context attached; secure sync is not wired",
+                        hex::encode(writer.as_bytes()),
+                        self.id,
+                        hex::encode(group_id)
+                    );
+                    Err(KvError::EncryptedPolicyReserved {
+                        group_id: group_id.clone(),
+                    })
+                }
+            };
         }
         if matches!(self.policy, AccessPolicy::SelfKeyed) {
             // Legacy key-less check: a SelfKeyed store cannot validate the
@@ -1288,6 +1469,27 @@ impl KvStore {
             return Err(KvError::OwnerTokenInvalid(
                 "append-only policy is terminal; policy downgrade rejected".to_string(),
             ));
+        }
+        // Encrypted is TERMINAL the same way (#341 Phase B): members joined
+        // on the confidentiality promise, so no owner announce — however
+        // authentic — may silently un-encrypt the store (that would flip
+        // every replica back onto plaintext gossip paths). A refresh to a
+        // DIFFERENT group binding is equally rejected.
+        if let AccessPolicy::Encrypted {
+            group_id: anchored_group,
+        } = &self.policy
+        {
+            match &policy {
+                AccessPolicy::Encrypted {
+                    group_id: announce_group,
+                } if announce_group == anchored_group => {}
+                _ => {
+                    return Err(KvError::OwnerTokenInvalid(
+                        "encrypted policy is terminal; confidentiality downgrade rejected"
+                            .to_string(),
+                    ));
+                }
+            }
         }
         if policy_version >= self.policy_version {
             self.policy = policy;
@@ -1914,19 +2116,27 @@ impl KvStore {
         peer_id: PeerId,
         cp: &OwnerCheckpoint,
     ) -> bool {
-        // 0. Reserved Encrypted policy is fail-closed (#341 Phase A, I1):
-        //    this path runs in merge_delta BEFORE the sender-auth check, so
-        //    without this gate a genuine owner checkpoint would apply its
-        //    plaintext entries and refresh the policy in step 10 — flipping
-        //    the replica Encrypted→Signed and re-opening every write path.
+        // 0. Encrypted policy WITHOUT an attached secure context is
+        //    fail-closed (#341 Phase A, I1): this path runs in merge_delta
+        //    BEFORE the sender-auth check, so without this gate a genuine
+        //    owner checkpoint would apply its plaintext entries and refresh
+        //    the policy in step 10 — flipping the replica Encrypted→Signed
+        //    and re-opening every write path. WITH a context (#341 Phase B)
+        //    the record arrived sealed and author-verified through the
+        //    encrypted sync path, so the ordinary gates below (anchor,
+        //    signature, store binding, sequence, integrity, root) apply —
+        //    the checkpoint author's membership was already enforced by the
+        //    sync layer before merge.
         if let AccessPolicy::Encrypted { group_id } = &self.policy {
-            tracing::warn!(
-                target: "x0x::kv",
-                "rejected owner checkpoint for encrypted store {} (group_id {}) — secure sync is not wired",
-                self.id,
-                hex::encode(group_id)
-            );
-            return false;
+            if self.secure.is_none() {
+                tracing::warn!(
+                    target: "x0x::kv",
+                    "rejected owner checkpoint for encrypted store {} (group_id {}) — no secure context attached; secure sync is not wired",
+                    self.id,
+                    hex::encode(group_id)
+                );
+                return false;
+            }
         }
         // 1. Anchor gate: never learn the owner from a relay.
         let Some(expected_owner) = self.owner else {
@@ -2028,6 +2238,26 @@ impl KvStore {
                 cp.policy
             );
             return false;
+        }
+        // 6c. Encrypted is TERMINAL (#341 Phase B): a checkpoint claiming the
+        //     store is no longer group-encrypted (or is bound to a DIFFERENT
+        //     group) is hostile by definition on an encrypted replica —
+        //     adopting it would downgrade the policy in step 10 and move the
+        //     store back onto plaintext paths. Reject the whole checkpoint.
+        if let AccessPolicy::Encrypted {
+            group_id: anchored_group,
+        } = &self.policy
+        {
+            let keeps_binding = matches!(&cp.policy, AccessPolicy::Encrypted { group_id } if group_id == anchored_group);
+            if !keeps_binding {
+                tracing::warn!(
+                    "encrypted violation: rejected owner checkpoint seq {} for store {} — it downgrades the terminal encrypted policy to {}",
+                    cp.checkpoint_seq,
+                    self.id,
+                    cp.policy
+                );
+                return false;
+            }
         }
         if matches!(self.policy, AccessPolicy::AppendOnly)
             || matches!(cp.policy, AccessPolicy::AppendOnly)
@@ -3341,6 +3571,379 @@ mod tests {
             ),
             "encrypted"
         );
+    }
+
+    // -- #341 Phase B: encrypted stores with an attached secure context --
+
+    use crate::kv::encrypted::KvSecureContext;
+
+    /// Fixed-member secure context for store-layer tests — the same
+    /// derivation path as the GSS backend without a groups dependency.
+    struct TestCtx {
+        group_id: Vec<u8>,
+        members: HashSet<AgentId>,
+    }
+
+    impl TestCtx {
+        fn new(group: u8, members: &[AgentId]) -> Arc<Self> {
+            Arc::new(Self {
+                group_id: vec![group; 16],
+                members: members.iter().copied().collect(),
+            })
+        }
+    }
+
+    impl KvSecureContext for TestCtx {
+        fn group_id(&self) -> Vec<u8> {
+            self.group_id.clone()
+        }
+        fn current_epoch(&self) -> u64 {
+            3
+        }
+        fn seal(
+            &self,
+            _store_id: &KvStoreId,
+            plaintext: &[u8],
+        ) -> crate::kv::Result<(u64, [u8; 24], Vec<u8>)> {
+            use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+            use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+            let epoch = self.current_epoch();
+            let mut nonce = [0u8; 24];
+            rand::RngCore::fill_bytes(&mut rand::rngs::OsRng, &mut nonce);
+            let cipher = XChaCha20Poly1305::new(blake3::hash(&self.group_id).as_bytes().into());
+            let ct = cipher
+                .encrypt(
+                    XNonce::from_slice(&nonce),
+                    Payload {
+                        msg: plaintext,
+                        aad: b"test",
+                    },
+                )
+                .map_err(|_| KvError::SecureRecord("test seal failed".to_string()))?;
+            Ok((epoch, nonce, ct))
+        }
+        fn open(
+            &self,
+            _store_id: &KvStoreId,
+            epoch: u64,
+            nonce: &[u8; 24],
+            ciphertext: &[u8],
+        ) -> crate::kv::Result<Vec<u8>> {
+            use chacha20poly1305::aead::{Aead, KeyInit, Payload};
+            use chacha20poly1305::{XChaCha20Poly1305, XNonce};
+            if epoch != self.current_epoch() {
+                return Err(KvError::SecureRecord(format!("no key for epoch {epoch}")));
+            }
+            let cipher = XChaCha20Poly1305::new(blake3::hash(&self.group_id).as_bytes().into());
+            cipher
+                .decrypt(
+                    XNonce::from_slice(nonce),
+                    Payload {
+                        msg: ciphertext,
+                        aad: b"test",
+                    },
+                )
+                .map_err(|_| KvError::SecureRecord("test open failed".to_string()))
+        }
+        fn is_active_member(&self, agent: &AgentId) -> bool {
+            self.members.contains(agent)
+        }
+    }
+
+    #[test]
+    fn encrypted_with_context_authorizes_active_members() {
+        // WHY (#341 Phase B): the ONLY production construction path for the
+        // Encrypted policy is new_encrypted with a live secure context, and
+        // from that moment the v1 write rule is ACTIVE GROUP MEMBERSHIP at
+        // every enforcement point — is_authorized, local writes, and the
+        // inbound merge — while non-members are rejected everywhere.
+        let owner = agent(1);
+        let member = agent(2);
+        let outsider = agent(9);
+        let group_id = vec![7u8; 16];
+        let ctx = TestCtx::new(7, &[owner, member]);
+
+        let mut store = KvStore::new_encrypted(
+            store_id(3),
+            "GroupStore".to_string(),
+            owner,
+            group_id.clone(),
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        assert!(store.is_encrypted());
+        assert!(store.secure_context().is_some());
+
+        // Membership rule, at every enforcement point.
+        assert!(store.is_authorized(&owner));
+        assert!(store.is_authorized(&member));
+        assert!(!store.is_authorized(&outsider));
+        store.authorize_local_write(&member).expect("member writes");
+        let err = store
+            .authorize_local_write(&outsider)
+            .expect_err("outsider must not write");
+        assert!(matches!(err, KvError::Unauthorized(_)), "got {err:?}");
+
+        // Inbound merge: a member delta applies; an outsider delta applies
+        // nothing (silent reject).
+        let mut member_view = KvStore::new_encrypted(
+            store_id(3),
+            String::new(),
+            owner,
+            group_id.clone(),
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("member replica");
+        member_view.authorize_local_write(&member).expect("member");
+        member_view
+            .put(
+                "mkey".to_string(),
+                b"mv".to_vec(),
+                "text/plain".to_string(),
+                peer(2),
+            )
+            .expect("member put");
+        let delta = member_view.full_delta();
+        store
+            .merge_delta(&delta, peer(2), Some(&member))
+            .expect("member merge");
+        assert_eq!(
+            store.get("mkey").map(|e| e.value.clone()),
+            Some(b"mv".to_vec()),
+            "member delta applies"
+        );
+
+        let mut outsider_view =
+            KvStore::new_encrypted_unchecked(store_id(3), String::new(), owner, group_id.clone());
+        outsider_view
+            .set_secure_context(Arc::clone(&ctx) as Arc<dyn KvSecureContext>)
+            .expect("attach ctx");
+        let d2 = outsider_view.full_delta();
+        let before = store.current_version();
+        store
+            .merge_delta(&d2, peer(9), Some(&outsider))
+            .expect("outsider merge is a silent reject");
+        assert_eq!(
+            store.current_version(),
+            before,
+            "outsider delta must not mutate"
+        );
+
+        // Context binding guards: a foreign-group context is refused at
+        // construction AND at re-attachment; a non-encrypted store refuses
+        // attachment outright.
+        let foreign = TestCtx::new(8, &[owner]);
+        assert!(KvStore::new_encrypted(
+            store_id(4),
+            "X".to_string(),
+            owner,
+            group_id.clone(),
+            foreign.clone(),
+        )
+        .is_err());
+        let mut signed_store =
+            KvStore::new(store_id(5), "S".to_string(), owner, AccessPolicy::Signed)
+                .expect("signed store");
+        let err = signed_store
+            .set_secure_context(foreign)
+            .expect_err("non-encrypted store must refuse a context");
+        assert!(
+            matches!(err, KvError::EncryptedPolicyReserved { .. }),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn encrypted_with_context_adopts_owner_checkpoint() {
+        // WHY (#341 Phase B): gate 0 of try_adopt_full_snapshot must reject
+        // ONLY context-less Encrypted replicas (Phase A state). With a live
+        // context the sealed path has already authenticated authorship, so
+        // the ordinary gates (anchor, signature, binding, root) apply and a
+        // late joiner cold-recovers the group store exactly like Signed.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let member = agent(2);
+        let group_id = vec![7u8; 16];
+        let ctx = TestCtx::new(7, &[owner, member]);
+        let topic = "store/enc-adopt-b";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+
+        let mut owner_store = KvStore::new_encrypted(
+            id,
+            "S".to_string(),
+            owner,
+            group_id.clone(),
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted owner store");
+        owner_store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp = checkpoint_for(&owner_store, topic, &kp, 1);
+        let mut delta = owner_store.full_delta();
+        delta.owner_checkpoint = Some(cp);
+
+        // Fresh member replica: empty, anchored on the group creator.
+        let mut joiner = KvStore::new_encrypted(
+            id,
+            String::new(),
+            owner,
+            group_id,
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted joiner");
+        joiner
+            .merge_delta(&delta, peer(9), Some(&owner))
+            .expect("merge");
+        assert_eq!(
+            joiner.get("k").map(|e| e.value.clone()),
+            Some(b"v".to_vec()),
+            "owner checkpoint adopts on a context-ful encrypted replica"
+        );
+        assert_eq!(joiner.highest_checkpoint_seq, 1, "high-water advances");
+        assert!(joiner.latest_checkpoint.is_some(), "checkpoint cached");
+        assert!(
+            matches!(joiner.policy(), AccessPolicy::Encrypted { .. }),
+            "policy stays Encrypted"
+        );
+    }
+
+    #[test]
+    fn encrypted_policy_is_terminal() {
+        // WHY (#341 Phase B): members joined on the confidentiality promise,
+        // so no owner-signed announce or checkpoint may silently un-encrypt
+        // a replica (that would move it back onto plaintext paths). The
+        // same-group refresh IS allowed; any other transition — including a
+        // different group binding — is rejected.
+        let owner = agent(1);
+        let group_id = vec![7u8; 16];
+        let ctx = TestCtx::new(7, &[owner]);
+        let mut store = KvStore::new_encrypted(
+            store_id(8),
+            "T".to_string(),
+            owner,
+            group_id.clone(),
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+
+        // Owner-signed downgrade announce: rejected, policy unchanged.
+        let err = store
+            .learn_ownership(owner, AccessPolicy::Signed, 5, &owner)
+            .expect_err("downgrade announce must be rejected");
+        assert!(
+            matches!(err, KvError::OwnerTokenInvalid(ref m) if m.contains("encrypted policy is terminal")),
+            "got {err:?}"
+        );
+        let err = store
+            .learn_ownership(
+                owner,
+                AccessPolicy::Encrypted {
+                    group_id: vec![9; 16],
+                },
+                5,
+                &owner,
+            )
+            .expect_err("re-binding announce must be rejected");
+        assert!(matches!(err, KvError::OwnerTokenInvalid(_)), "got {err:?}");
+
+        // Same-group refresh at a forward version: allowed.
+        store
+            .learn_ownership(
+                owner,
+                AccessPolicy::Encrypted {
+                    group_id: group_id.clone(),
+                },
+                5,
+                &owner,
+            )
+            .expect("same-group refresh applies");
+        assert!(store.is_encrypted());
+
+        // A checkpoint claiming Signed must not ADOPT (gate 6c). Built so
+        // the checkpoint signer IS the anchored owner — every other gate
+        // (anchor, signature, binding, root) passes, and adoption is
+        // rejected solely by the terminal-encrypted rule. The content may
+        // still flow through the membership-gated sender-auth path, and the
+        // relay cache may carry the checkpoint, but the replica's POLICY
+        // never leaves Encrypted.
+        let kp = crate::identity::AgentKeypair::generate().expect("keypair");
+        let owner = kp.agent_id();
+        let ctx = TestCtx::new(7, &[owner]);
+        let topic = "store/enc-terminal";
+        let id = KvStoreId::for_topic_owner(topic, &owner);
+        let mut signed_store =
+            KvStore::new(id, "S".to_string(), owner, AccessPolicy::Signed).expect("signed store");
+        signed_store
+            .put(
+                "k".to_string(),
+                b"v".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        let cp = checkpoint_for(&signed_store, topic, &kp, 1);
+        assert!(matches!(cp.policy, AccessPolicy::Signed));
+        let mut delta = signed_store.full_delta();
+        delta.owner_checkpoint = Some(cp);
+
+        let mut encrypted_replica = KvStore::new_encrypted(
+            id,
+            String::new(),
+            owner,
+            group_id,
+            Arc::clone(&ctx) as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted replica");
+        encrypted_replica
+            .merge_delta(&delta, peer(9), Some(&owner))
+            .expect("merge");
+        assert!(
+            encrypted_replica.is_encrypted(),
+            "policy must stay Encrypted after a Signed-claiming checkpoint"
+        );
+        assert_eq!(
+            encrypted_replica.highest_checkpoint_seq, 0,
+            "Signed-claiming checkpoint must not be adopted (no high-water advance)"
+        );
+        assert!(
+            encrypted_replica.latest_checkpoint.is_none(),
+            "Signed-claiming checkpoint must not be cached or adopted"
+        );
+    }
+
+    #[test]
+    fn reserved_encrypted_rejects_unkeyed_authorize_write() {
+        // WHY (#341 Phase A follow-up): authorize_write was unconditionally
+        // permissive on the reserved Encrypted policy, so the handle layer's
+        // remove path (check_local_remove -> authorize_write) could mutate a
+        // context-less Encrypted replica. It must now be fail-closed without
+        // a context (and membership-gated with one).
+        let owner = agent(1);
+        let group_id = vec![7u8; 16];
+        let ctx = TestCtx::new(7, &[owner]);
+
+        let mut reserved =
+            KvStore::new_encrypted_unchecked(store_id(6), "R".to_string(), owner, group_id.clone());
+        let err = reserved
+            .authorize_write(&owner, "k")
+            .expect_err("context-less authorize_write must fail closed");
+        assert!(
+            matches!(err, KvError::EncryptedPolicyReserved { .. }),
+            "got {err:?}"
+        );
+
+        reserved
+            .set_secure_context(Arc::clone(&ctx) as Arc<dyn KvSecureContext>)
+            .expect("attach");
+        reserved
+            .authorize_write(&owner, "k")
+            .expect("active member passes");
     }
 
     // -- Owner-signed checkpoint protocol (cold-recovery while owner offline) --

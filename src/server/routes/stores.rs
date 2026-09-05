@@ -6,11 +6,11 @@
 use super::super::crdt_subscriptions;
 use super::super::state::AppState;
 use super::super::{
-    api_error, bad_request, direct_message_send_config, not_found, parse_agent_id_hex,
+    api_error, bad_request, direct_message_send_config, forbidden, not_found, parse_agent_id_hex,
 };
 use super::named_groups::GROUP_BACKGROUND_PUBLISH_DELAY;
 use crate as x0x;
-use axum::extract::{Path, State};
+use axum::extract::{Extension, Path, State};
 use axum::http::StatusCode;
 use axum::response::IntoResponse;
 use axum::Json;
@@ -20,6 +20,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use x0x::contacts::TrustLevel;
 use x0x::identity::AgentId;
+use x0x::kv::encrypted::KvSecureContext;
 use x0x::logging::LogHexId;
 
 pub(in crate::server) const KV_STORE_DELTA_DM_PREFIX: &[u8] = b"X0X-KV-DELTA-V1\n";
@@ -586,8 +587,13 @@ pub(in crate::server) async fn put_kv_value(
 
     match handle.put_with_delta(key, value, content_type).await {
         Ok(delta) => {
-            let recipients = kv_store_delta_direct_recipients(&state).await;
-            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            // #341 Phase B: encrypted stores replicate ONLY via the sealed
+            // gossip path — never ship the plaintext local delta over the
+            // DM direct-delivery side channel.
+            if !handle.is_encrypted().await {
+                let recipients = kv_store_delta_direct_recipients(&state).await;
+                spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            }
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
         Err(e) => {
@@ -661,8 +667,12 @@ pub(in crate::server) async fn delete_kv_value(
 
     match handle.remove_with_delta(&key).await {
         Ok(delta) => {
-            let recipients = kv_store_delta_direct_recipients(&state).await;
-            spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            // #341 Phase B: see put_kv_value — no plaintext DM fallback for
+            // encrypted stores.
+            if !handle.is_encrypted().await {
+                let recipients = kv_store_delta_direct_recipients(&state).await;
+                spawn_kv_store_delta_delivery(&state, recipients, &id, handle.peer_id(), &delta);
+            }
             (StatusCode::OK, Json(serde_json::json!({ "ok": true })))
         }
         Err(e) if matches!(e, x0x::error::IdentityError::ImmutableKey(_)) => {
@@ -671,6 +681,242 @@ pub(in crate::server) async fn delete_kv_value(
         }
         Err(e) if matches!(e, x0x::error::IdentityError::Unauthorized(_)) => {
             api_error(StatusCode::FORBIDDEN, format!("{e}"))
+        }
+        Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group-scoped encrypted stores (#341 Phase B)
+// ---------------------------------------------------------------------------
+
+/// Request body for `POST /groups/:id/stores`.
+#[derive(Debug, Deserialize)]
+pub(in crate::server) struct CreateGroupStoreRequest {
+    name: String,
+}
+
+/// Deterministic refresh hook for a GSS encrypted-store context: re-reads
+/// the authoritative group from the daemon's named-groups map (under the
+/// read guard — no `GroupInfo` clone) and refreshes the context snapshot.
+/// The sync loops call this before every seal/open, so a rekey or roster
+/// change takes effect on the very next record.
+pub(in crate::server) fn gss_kv_refresh(
+    state: &Arc<AppState>,
+    ctx: Arc<x0x::groups::GssKvSecureContext>,
+    group_key: String,
+) -> x0x::kv::sync::SecureRefreshFn {
+    let state = Arc::clone(state);
+    Arc::new(move || {
+        let ctx = Arc::clone(&ctx);
+        let state = Arc::clone(&state);
+        let group_key = group_key.clone();
+        Box::pin(async move {
+            if let Some(info) = state.named_groups.read().await.get(&group_key) {
+                ctx.update_from_group(info);
+            }
+        }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+    })
+}
+
+/// Resolve the GSS secure context for a group store, re-reading the group
+/// under the named-groups read lock. Fails when the group is gone or the
+/// daemon holds no shared secret for it yet.
+async fn gss_context_for_group(
+    state: &Arc<AppState>,
+    group_key: &str,
+) -> Result<Arc<x0x::groups::GssKvSecureContext>, (StatusCode, Json<serde_json::Value>)> {
+    let groups = state.named_groups.read().await;
+    let Some(info) = groups.get(group_key) else {
+        return Err(not_found("group not found"));
+    };
+    match x0x::groups::GssKvSecureContext::from_group(info) {
+        Some(ctx) => Ok(Arc::new(ctx)),
+        None => Err(api_error(
+            StatusCode::CONFLICT,
+            "local daemon holds no shared secret for this group yet — join or refresh group state first",
+        )),
+    }
+}
+
+/// Shared metadata payload for create / idempotent re-open responses.
+async fn group_store_json(
+    handle: &x0x::KvStoreHandle,
+    topic: &str,
+    store_id: &x0x::kv::KvStoreId,
+    stable_group_id: &str,
+    epoch: u64,
+) -> serde_json::Value {
+    let ownership = handle.ownership_info().await;
+    serde_json::json!({
+        "ok": true,
+        "id": topic,
+        "store_id": hex::encode(store_id.as_bytes()),
+        "group_id": stable_group_id,
+        "topic": topic,
+        "policy": "encrypted",
+        "epoch": epoch,
+        "checkpoint_available": handle.has_checkpoint().await,
+        "ownership": ownership,
+    })
+}
+
+/// `POST /groups/:id/stores` — open (create or re-open) a group-scoped
+/// ENCRYPTED KvStore bound to the named group (#341 Phase B, design:
+/// `docs/design/encrypted-kvstore.md`).
+///
+/// Store identity is deterministic from `(stable group id, name)`, so every
+/// member computes the same store id and topic with no out-of-band anchor;
+/// ownership is anchored on the GROUP CREATOR. Every publication is
+/// sign-then-encrypt sealed under the group's current secret epoch and the
+/// v1 write rule is active group membership.
+///
+/// Guards: caller must be an active member, the group must be
+/// `MlsEncrypted` on the GSS plane (the v1 backend, ADR-0010), and a rider
+/// token must explicitly cover the group (ADR-0039 deny-by-default).
+///
+/// Idempotent: opening an already-open store returns 200 with its metadata
+/// instead of a conflict.
+pub(in crate::server) async fn create_group_kv_store(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Extension(actor): Extension<crate::server::rider_auth::ActorContext>,
+    Json(req): Json<CreateGroupStoreRequest>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let caller_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let name = req.name.trim().to_string();
+    if name.is_empty() {
+        return bad_request("store name must not be empty");
+    }
+    // Group authorization + v1-backend gates (single read pass).
+    let creator = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(&id) else {
+            return not_found("group not found");
+        };
+        if info.withdrawn {
+            return api_error(StatusCode::CONFLICT, "group is withdrawn");
+        }
+        if !info.has_active_member(&caller_hex) {
+            return forbidden("not a member");
+        }
+        if !actor.rider_allows_group(info.stable_group_id()) {
+            return forbidden("rider token is not granted this group");
+        }
+        if info.policy.confidentiality != x0x::groups::GroupConfidentiality::MlsEncrypted {
+            return bad_request(
+                "group is not MlsEncrypted — encrypted stores require a confidential group",
+            );
+        }
+        if info.secure_plane != x0x::mls::SecureGroupPlane::Gss {
+            return bad_request(
+                "encrypted stores v1 are GSS-backed (ADR-0010); TreeKEM-plane groups are not supported yet",
+            );
+        }
+        info.creator
+    };
+    let stable_group_id = {
+        // The stable group id is creation-fixed; re-read to avoid holding
+        // the lock across the derive.
+        let groups = state.named_groups.read().await;
+        match groups.get(&id) {
+            Some(info) => info.stable_group_id().to_string(),
+            None => return not_found("group not found"),
+        }
+    };
+
+    let (store_id, topic) = x0x::kv::encrypted::group_store_identity(&stable_group_id, &name);
+    // Idempotent re-open: an already-open store returns its metadata.
+    if let Some(handle) = state.kv_stores.read().await.get(&topic) {
+        let secure = gss_context_for_group(&state, &id).await;
+        let epoch = secure.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
+        return (
+            StatusCode::OK,
+            Json(group_store_json(handle, &topic, &store_id, &stable_group_id, epoch).await),
+        );
+    }
+
+    // Serialize concurrent create/rehydrate for this store.
+    let reservation =
+        crdt_subscriptions::handle_reservation(&state, crdt_subscriptions::KIND_KV_STORE, &topic)
+            .await;
+    let _guard = reservation.lock().await;
+    if let Some(handle) = state.kv_stores.read().await.get(&topic) {
+        let secure = gss_context_for_group(&state, &id).await;
+        let epoch = secure.as_ref().map(|c| c.current_epoch()).unwrap_or(0);
+        return (
+            StatusCode::OK,
+            Json(group_store_json(handle, &topic, &store_id, &stable_group_id, epoch).await),
+        );
+    }
+
+    let secure = match gss_context_for_group(&state, &id).await {
+        Ok(ctx) => ctx,
+        Err(resp) => return resp,
+    };
+    let refresh = gss_kv_refresh(&state, Arc::clone(&secure), id.clone());
+
+    match state
+        .agent
+        .open_group_kv_store_persistent(
+            &name,
+            &stable_group_id,
+            creator,
+            Arc::clone(&secure) as Arc<dyn KvSecureContext>,
+            refresh,
+            &state.kv_store_state_dir,
+        )
+        .await
+    {
+        Ok(handle) => {
+            state
+                .kv_stores
+                .write()
+                .await
+                .insert(topic.clone(), handle.clone());
+            // Persist the registration so a restart re-opens the store with
+            // the group binding (creator + stable group id) instead of
+            // skipping it (manifest_policy fail-closes unknown policies).
+            let mut extra = serde_json::Map::new();
+            extra.insert(
+                "policy".to_string(),
+                serde_json::Value::String("encrypted".to_string()),
+            );
+            extra.insert(
+                "expected_owner".to_string(),
+                serde_json::Value::String(hex::encode(creator.as_bytes())),
+            );
+            extra.insert(
+                "stable_group_id".to_string(),
+                serde_json::Value::String(stable_group_id.clone()),
+            );
+            if let Err(e) = crdt_subscriptions::record(
+                &state,
+                crdt_subscriptions::CrdtSubscriptionEntry {
+                    kind: crdt_subscriptions::KIND_KV_STORE.to_string(),
+                    id: topic.clone(),
+                    name: name.clone(),
+                    topic: topic.clone(),
+                    role: crdt_subscriptions::ROLE_CREATED.to_string(),
+                    extra,
+                },
+            )
+            .await
+            {
+                tracing::error!("failed to persist group kv store registration {topic}: {e}");
+                if let Some(h) = state.kv_stores.write().await.remove(&topic) {
+                    h.cancel_sync();
+                }
+                return api_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    format!("failed to persist subscription registration: {e}"),
+                );
+            }
+            let epoch = secure.current_epoch();
+            (
+                StatusCode::CREATED,
+                Json(group_store_json(&handle, &topic, &store_id, &stable_group_id, epoch).await),
+            )
         }
         Err(e) => api_error(StatusCode::INTERNAL_SERVER_ERROR, format!("{e}")),
     }
@@ -699,5 +945,204 @@ mod tests {
         assert_eq!(decoded.store_id, "store-1");
         assert_eq!(decoded.peer_id, peer_id);
         assert_eq!(decoded.delta.version, delta.version);
+    }
+
+    // -- #341 Phase B: POST /groups/:id/stores ---------------------------------
+
+    use crate::groups::{GroupConfidentiality, GroupInfo, GroupPolicy, GssKvSecureContext};
+    use crate::mls::SecureGroupPlane;
+
+    /// Agent + AppState over a temp dir, WITH an in-process gossip runtime
+    /// (the encrypted-store happy path spawns real sync loops).
+    async fn encrypted_store_test_state() -> (Arc<AppState>, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let data_dir = dir.path().to_path_buf();
+        let agent = Arc::new(
+            x0x::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_network_config(x0x::network::NetworkConfig::default())
+                .build()
+                .await
+                .unwrap(),
+        );
+        let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+            &data_dir, agent,
+        )
+        .await
+        .unwrap();
+        (state, dir)
+    }
+
+    /// Seed an MlsEncrypted/GSS group owned by the DAEMON AGENT (the caller),
+    /// unless a foreign creator is requested.
+    async fn seed_group(state: &AppState, group_key: &str, creator: x0x::identity::AgentId) {
+        let mut info = GroupInfo::new(
+            "kv-group".to_string(),
+            String::new(),
+            creator,
+            group_key.to_string(),
+        );
+        info.migrate_from_v1();
+        let _ = info.rotate_shared_secret();
+        state
+            .named_groups
+            .write()
+            .await
+            .insert(group_key.to_string(), info);
+    }
+
+    #[tokio::test]
+    async fn create_group_kv_store_route_creates_encrypted_store() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let group_key = "ab".repeat(16);
+        seed_group(&state, &group_key, state.agent.agent_id()).await;
+
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_key.clone()),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(CreateGroupStoreRequest {
+                name: "workspace".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::CREATED, "{resp:?}");
+        assert_eq!(resp.0["policy"], "encrypted");
+        assert_eq!(resp.0["group_id"], group_key);
+        assert!(resp.0["store_id"].as_str().is_some());
+        let topic = resp.0["topic"].as_str().expect("topic").to_string();
+
+        // The deterministic identity is what got registered.
+        let (store_id, derived_topic) =
+            x0x::kv::encrypted::group_store_identity(&group_key, "workspace");
+        assert_eq!(topic, derived_topic);
+        assert!(state.kv_stores.read().await.contains_key(&topic));
+        let handle = state.kv_stores.read().await.get(&topic).cloned().unwrap();
+        assert!(
+            handle.is_encrypted().await,
+            "registered handle is encrypted"
+        );
+
+        // A member write goes through the sealed publish path and reads back.
+        handle
+            .put_with_delta(
+                "royalty-split".to_string(),
+                b"hush".to_vec(),
+                "text/plain".to_string(),
+            )
+            .await
+            .expect("member put on encrypted store");
+        let entry = handle
+            .get("royalty-split")
+            .await
+            .expect("get")
+            .expect("present");
+        assert_eq!(entry.value, b"hush".to_vec());
+
+        // Idempotent re-open returns 200 with the same store id.
+        let (code2, resp2) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(group_key),
+            Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+            Json(CreateGroupStoreRequest {
+                name: "workspace".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code2, StatusCode::OK, "{resp2:?}");
+        assert_eq!(resp2.0["store_id"], resp.0["store_id"]);
+        let _ = store_id;
+    }
+
+    #[tokio::test]
+    async fn create_group_kv_store_route_guards() {
+        let (state, _dir) = encrypted_store_test_state().await;
+        let owner_actor = crate::server::rider_auth::ActorContext::Owner { durable: true };
+
+        // Unknown group -> 404.
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path("missing".to_string()),
+            Extension(owner_actor.clone()),
+            Json(CreateGroupStoreRequest {
+                name: "n".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::NOT_FOUND, "{resp:?}");
+
+        // Non-member: the group exists but the daemon agent is not in it.
+        let outsider = x0x::identity::AgentId([9; 32]);
+        seed_group(&state, &"cd".repeat(16), outsider).await;
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path("cd".repeat(16)),
+            Extension(owner_actor.clone()),
+            Json(CreateGroupStoreRequest {
+                name: "n".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::FORBIDDEN, "{resp:?}");
+
+        // SignedPublic group -> 400 (encrypted stores need a confidential group).
+        let signed_key = "ef".repeat(16);
+        {
+            let mut info = GroupInfo::new(
+                "public".to_string(),
+                String::new(),
+                state.agent.agent_id(),
+                signed_key.clone(),
+            );
+            info.migrate_from_v1();
+            info.policy.confidentiality = GroupConfidentiality::SignedPublic;
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(signed_key.clone(), info);
+        }
+        let (code, resp) = create_group_kv_store(
+            State(Arc::clone(&state)),
+            Path(signed_key),
+            Extension(owner_actor.clone()),
+            Json(CreateGroupStoreRequest {
+                name: "n".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
+
+        // TreeKEM-plane group -> 400 (v1 encrypted stores are GSS-backed).
+        let treekem_key = "12".repeat(16);
+        {
+            let mut info = GroupInfo::new(
+                "treekem".to_string(),
+                String::new(),
+                state.agent.agent_id(),
+                treekem_key.clone(),
+            );
+            info.migrate_from_v1();
+            info.secure_plane = SecureGroupPlane::TreeKem;
+            state
+                .named_groups
+                .write()
+                .await
+                .insert(treekem_key.clone(), info);
+        }
+        let (code, resp) = create_group_kv_store(
+            State(state),
+            Path(treekem_key),
+            Extension(owner_actor.clone()),
+            Json(CreateGroupStoreRequest {
+                name: "n".to_string(),
+            }),
+        )
+        .await;
+        assert_eq!(code, StatusCode::BAD_REQUEST, "{resp:?}");
+        let _ = GssKvSecureContext::from_group; // keep backend import referenced
+        let _ = GroupPolicy::default();
     }
 }

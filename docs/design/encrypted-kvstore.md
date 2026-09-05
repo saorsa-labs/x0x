@@ -2,7 +2,21 @@
 
 ## Status
 
-Proposal — design document only, not implemented.
+**v1 IMPLEMENTED for the named-group GSS backend** (issue #341 Phase B) —
+see `x0x::kv::encrypted`, `x0x::groups::GssKvSecureContext`, and
+`POST /groups/:id/stores`. Decisions as shipped: `SecureContext` is a trait
+(`KvSecureContext`) with GSS as the v1 backend and TreeKEM as a future
+impl behind the same boundary; sign-then-encrypt with ML-DSA-65; AAD
+binds domain/group/store/epoch (no `state_hash`); XChaCha20-Poly1305 with
+a fresh random 192-bit nonce per record; v1 write rule is active group
+membership with the verified author preserved at the merge decision
+point; `Encrypted` is TERMINAL (no announce or checkpoint may un-encrypt
+a replica). Partitioned concurrent rekey reconciliation and quorum
+checkpoint authority remain open (see the rekey section below).
+
+The original proposal text follows, retained as the design record.
+
+---
 
 This document describes the application requirement and a suggested architecture
 for encrypting KvStore sync traffic for `MlsEncrypted` named groups. It is meant

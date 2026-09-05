@@ -685,97 +685,107 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             if state.kv_stores.read().await.contains_key(&entry.id) {
                 return RehydrateOutcome::AlreadyPresent; // re-created/joined via REST since startup
             }
-            let result = match entry.role.as_str() {
-                ROLE_JOINED => {
-                    // The `self_keyed` directory policy is the one owner-free
-                    // join: knowing only the topic is enough (I4), so no
-                    // stored anchor is required — the persisted policy field
-                    // routes here.
-                    if manifest_policy(&entry.extra) == Some(crate::kv::AccessPolicy::SelfKeyed) {
-                        state
-                            .agent
-                            .join_self_keyed_kv_store_persistent(
-                                &entry.topic,
-                                &state.kv_store_state_dir,
-                            )
-                            .await
-                    } else {
-                        // The owner anchor is REQUIRED: a join without it is
-                        // a dead replica, not a successful rehydration. A
-                        // legacy entry with no stored anchor, or a malformed
-                        // one, is migration-required — skip it loudly rather
-                        // than creating a read-only handle that can never
-                        // accept Signed state.
-                        let owner = match entry.extra.get("expected_owner").and_then(|v| v.as_str())
+            // #341 Phase B: encrypted group stores carry their own manifest
+            // shape (group binding + creator) and re-open through the same
+            // idempotent path as POST /groups/:id/stores — joiner and
+            // creator alike, since ownership anchors on the GROUP CREATOR.
+            let result = if entry.extra.get("policy").and_then(|v| v.as_str()) == Some("encrypted")
+            {
+                rehydrate_encrypted_group_store(&state, &entry).await
+            } else {
+                match entry.role.as_str() {
+                    ROLE_JOINED => {
+                        // The `self_keyed` directory policy is the one owner-free
+                        // join: knowing only the topic is enough (I4), so no
+                        // stored anchor is required — the persisted policy field
+                        // routes here.
+                        if manifest_policy(&entry.extra) == Some(crate::kv::AccessPolicy::SelfKeyed)
                         {
-                            Some(hex_str) => match parse_owner_hex(hex_str) {
-                                Some(id) => id,
-                                None => {
-                                    tracing::warn!(
-                                        id = %entry.id,
-                                        "stored expected_owner is malformed; \
-                                         skipping rehydration (migration_required)"
-                                    );
-                                    return RehydrateOutcome::Skipped;
-                                }
-                            },
+                            state
+                                .agent
+                                .join_self_keyed_kv_store_persistent(
+                                    &entry.topic,
+                                    &state.kv_store_state_dir,
+                                )
+                                .await
+                        } else {
+                            // The owner anchor is REQUIRED: a join without it is
+                            // a dead replica, not a successful rehydration. A
+                            // legacy entry with no stored anchor, or a malformed
+                            // one, is migration-required — skip it loudly rather
+                            // than creating a read-only handle that can never
+                            // accept Signed state.
+                            let owner =
+                                match entry.extra.get("expected_owner").and_then(|v| v.as_str()) {
+                                    Some(hex_str) => match parse_owner_hex(hex_str) {
+                                        Some(id) => id,
+                                        None => {
+                                            tracing::warn!(
+                                                id = %entry.id,
+                                                "stored expected_owner is malformed; \
+                                                 skipping rehydration (migration_required)"
+                                            );
+                                            return RehydrateOutcome::Skipped;
+                                        }
+                                    },
+                                    None => {
+                                        tracing::warn!(
+                                            id = %entry.id,
+                                            "no stored expected_owner for joined store; \
+                                             skipping rehydration (migration_required). \
+                                             Re-join with an owner anchor to recover."
+                                        );
+                                        return RehydrateOutcome::Skipped;
+                                    }
+                                };
+                            state
+                                .agent
+                                .join_kv_store_persistent(
+                                    &entry.topic,
+                                    owner,
+                                    crate::kv::store::AnchorChannel::Persistence,
+                                    &state.kv_store_state_dir,
+                                )
+                                .await
+                        }
+                    }
+                    ROLE_CREATED => {
+                        // Restore the persisted policy: an append-only store must
+                        // never rehydrate as plain Signed (that would silently
+                        // drop its immutability guarantees). A malformed policy
+                        // string FAILS CLOSED (skip loudly) — defaulting it to
+                        // Signed would be a silent downgrade. The state snapshot
+                        // (restored inside create_kv_store_persistent) is the
+                        // final authority and itself fails closed on conflicts.
+                        let policy = match manifest_policy(&entry.extra) {
+                            Some(policy) => policy,
                             None => {
                                 tracing::warn!(
                                     id = %entry.id,
-                                    "no stored expected_owner for joined store; \
-                                     skipping rehydration (migration_required). \
-                                     Re-join with an owner anchor to recover."
+                                    "stored kv-store policy is malformed; \
+                                     skipping rehydration (migration_required)"
                                 );
                                 return RehydrateOutcome::Skipped;
                             }
                         };
                         state
                             .agent
-                            .join_kv_store_persistent(
+                            .create_kv_store_persistent(
+                                &entry.name,
                                 &entry.topic,
-                                owner,
-                                crate::kv::store::AnchorChannel::Persistence,
+                                policy,
                                 &state.kv_store_state_dir,
                             )
                             .await
                     }
-                }
-                ROLE_CREATED => {
-                    // Restore the persisted policy: an append-only store must
-                    // never rehydrate as plain Signed (that would silently
-                    // drop its immutability guarantees). A malformed policy
-                    // string FAILS CLOSED (skip loudly) — defaulting it to
-                    // Signed would be a silent downgrade. The state snapshot
-                    // (restored inside create_kv_store_persistent) is the
-                    // final authority and itself fails closed on conflicts.
-                    let policy = match manifest_policy(&entry.extra) {
-                        Some(policy) => policy,
-                        None => {
-                            tracing::warn!(
-                                id = %entry.id,
-                                "stored kv-store policy is malformed; \
-                                 skipping rehydration (migration_required)"
-                            );
-                            return RehydrateOutcome::Skipped;
-                        }
-                    };
-                    state
-                        .agent
-                        .create_kv_store_persistent(
-                            &entry.name,
-                            &entry.topic,
-                            policy,
-                            &state.kv_store_state_dir,
-                        )
-                        .await
-                }
-                other => {
-                    tracing::warn!(
-                        id = %entry.id,
-                        role = other,
-                        "unknown kv-store subscription role — skipping"
-                    );
-                    return RehydrateOutcome::Skipped;
+                    other => {
+                        tracing::warn!(
+                            id = %entry.id,
+                            role = other,
+                            "unknown kv-store subscription role — skipping"
+                        );
+                        return RehydrateOutcome::Skipped;
+                    }
                 }
             };
             match result {
@@ -806,6 +816,92 @@ async fn rehydrate_one(state: Arc<AppState>, entry: CrdtSubscriptionEntry) -> Re
             RehydrateOutcome::Skipped
         }
     }
+}
+
+/// Re-open an encrypted group store from its manifest entry (#341 Phase B).
+///
+/// Creator and joiner re-open identically: the store's owner is the GROUP
+/// CREATOR (persisted as `expected_owner`), the binding is the stable group
+/// id, and the GSS secure context is rebuilt from the live named-groups map
+/// with a per-record refresh hook (so rekeys and roster changes apply on the
+/// next record). Any missing ingredient — malformed entry, missing group,
+/// no shared secret yet, topic/derivation mismatch — is a loud skip via
+/// `Err`; the entry stays in the manifest and retries next restart.
+/// Fail-closed by design: the alternative (opening the snapshot
+/// context-less) yields a replica that can never sync.
+async fn rehydrate_encrypted_group_store(
+    state: &Arc<AppState>,
+    entry: &CrdtSubscriptionEntry,
+) -> crate::error::Result<crate::KvStoreHandle> {
+    fn skip_err(msg: &str) -> crate::error::IdentityError {
+        crate::error::IdentityError::Storage(std::io::Error::other(msg.to_string()))
+    }
+    let Some(stable_group_id) = entry
+        .extra
+        .get("stable_group_id")
+        .and_then(|v| v.as_str())
+        .map(str::to_string)
+    else {
+        return Err(skip_err(
+            "encrypted store manifest entry has no stable_group_id; \
+             skipping rehydration (migration_required)",
+        ));
+    };
+    let Some(creator) = entry
+        .extra
+        .get("expected_owner")
+        .and_then(|v| v.as_str())
+        .and_then(parse_owner_hex)
+    else {
+        return Err(skip_err(
+            "encrypted store manifest entry has a malformed expected_owner \
+             (group creator); skipping rehydration (migration_required)",
+        ));
+    };
+    // The derived identity must agree with the persisted topic; a mismatch
+    // means the manifest was hand-edited or written by a divergent build.
+    let (store_id, topic) =
+        crate::kv::encrypted::group_store_identity(&stable_group_id, &entry.name);
+    if topic != entry.topic {
+        return Err(skip_err(&format!(
+            "encrypted store manifest topic {} does not match the derived topic {topic}; \
+             skipping rehydration",
+            entry.topic
+        )));
+    }
+    let _ = store_id;
+    let secure = {
+        let groups = state.named_groups.read().await;
+        match groups
+            .get(&stable_group_id)
+            .and_then(crate::groups::GssKvSecureContext::from_group)
+        {
+            Some(ctx) => std::sync::Arc::new(ctx),
+            None => {
+                return Err(skip_err(&format!(
+                    "group {stable_group_id} is missing or holds no shared secret yet; \
+                     skipping encrypted store rehydration (retries next restart)"
+                )));
+            }
+        }
+    };
+    let refresh = super::routes::gss_kv_refresh(
+        state,
+        std::sync::Arc::clone(&secure),
+        stable_group_id.clone(),
+    );
+    state
+        .agent
+        .open_group_kv_store_persistent(
+            &entry.name,
+            &stable_group_id,
+            creator,
+            std::sync::Arc::clone(&secure)
+                as std::sync::Arc<dyn crate::kv::encrypted::KvSecureContext>,
+            refresh,
+            &state.kv_store_state_dir,
+        )
+        .await
 }
 
 #[cfg(test)]

@@ -15746,13 +15746,32 @@ impl Agent {
         topic: &str,
         persist_path: Option<std::path::PathBuf>,
     ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
+        self.spawn_kv_sync_inner(store, topic, persist_path, None, None)
+            .await
+    }
+
+    /// Construct, arm persistence for, and start a `KvStoreSync` bound to a
+    /// group secure context (#341 Phase B).
+    ///
+    /// The context and the local agent's signing material are attached
+    /// BEFORE the background loops start, so an encrypted store can never
+    /// run a plaintext-capable sync window.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_kv_sync_inner(
+        &self,
+        store: kv::KvStore,
+        topic: &str,
+        persist_path: Option<std::path::PathBuf>,
+        secure: Option<std::sync::Arc<dyn kv::encrypted::KvSecureContext>>,
+        secure_refresh: Option<kv::sync::SecureRefreshFn>,
+    ) -> error::Result<(std::sync::Arc<kv::KvStoreSync>, saorsa_gossip_types::PeerId)> {
         let runtime = self.gossip_runtime.as_ref().ok_or_else(|| {
             error::IdentityError::Storage(std::io::Error::other(
                 "gossip runtime not initialized - configure agent with network first",
             ))
         })?;
         let peer_id = runtime.peer_id();
-        let sync = kv::KvStoreSync::new(
+        let mut sync = kv::KvStoreSync::new(
             store,
             std::sync::Arc::clone(runtime.pubsub()),
             topic.to_string(),
@@ -15760,6 +15779,13 @@ impl Agent {
             Some(self.agent_id()),
         )
         .map_err(|e| kv_storage_err(format!("kv store sync creation failed: {e}")))?;
+        if let Some(secure) = secure {
+            sync.set_secure_context(secure, secure_refresh);
+            let signing =
+                kv::encrypted::AuthorSigning::from_keypair(self.identity().agent_keypair())
+                    .map_err(|e| kv_storage_err(format!("kv author signing setup failed: {e}")))?;
+            sync.set_author_signing(signing);
+        }
         // Arm persistence BEFORE start so no merged delta can land
         // unpersisted, and write an initial snapshot so the file exists from
         // the first moment the store does.
@@ -15782,6 +15808,120 @@ impl Agent {
             .await
             .map_err(|e| kv_storage_err(format!("kv store sync start failed: {e}")))?;
         Ok((sync, peer_id))
+    }
+
+    /// Open (create or restore) a group-scoped encrypted KvStore
+    /// (#341 Phase B) bound to a named secure group.
+    ///
+    /// This is the ONLY production path constructing an
+    /// [`kv::AccessPolicy::Encrypted`] store: it requires a live
+    /// [`kv::encrypted::KvSecureContext`] for the group (the daemon builds
+    /// one from the named-group GSS plane) and seals every publication
+    /// through the store's sync loops.
+    ///
+    /// Store identity is deterministic from `(stable_group_id, name)` —
+    /// every member computes the same store id and topic, so creator and
+    /// joiner converge without an out-of-band anchor. The store's owner is
+    /// anchored on the group `creator`, which is equally stable. Opening an
+    /// existing local snapshot re-attaches `secure` (snapshots carry no
+    /// context — fail-closed by design until this call).
+    ///
+    /// Idempotent: re-opening an already-open store returns a second live
+    /// handle to the same snapshot-backed state; REST callers must keep the
+    /// registry single-handle (the daemon routes do).
+    ///
+    /// # Errors
+    ///
+    /// Gossip runtime not initialized; a corrupt/foreign snapshot (fail
+    /// closed); a context bound to a different group; snapshot persistence
+    /// failures; sync start failures.
+    pub async fn open_group_kv_store_persistent(
+        &self,
+        name: &str,
+        stable_group_id: &str,
+        creator: identity::AgentId,
+        secure: std::sync::Arc<dyn kv::encrypted::KvSecureContext>,
+        secure_refresh: kv::sync::SecureRefreshFn,
+        state_dir: &std::path::Path,
+    ) -> error::Result<KvStoreHandle> {
+        if name.is_empty() {
+            return Err(kv_storage_err(
+                "group kv store name must not be empty".to_string(),
+            ));
+        }
+        let (store_id, topic) = kv::encrypted::group_store_identity(stable_group_id, name);
+        let group_id_bytes = stable_group_id.as_bytes().to_vec();
+        let persist_path = kv_snapshot_path(state_dir, &store_id);
+        let store = match kv::sync::load_snapshot(&persist_path) {
+            Ok(Some(snap)) => {
+                if snap.id() != &store_id {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot store-id mismatch for topic {topic}"
+                    )));
+                }
+                if snap.owner() != Some(&creator) {
+                    return Err(kv_storage_err(format!(
+                        "kv snapshot for topic {topic} is anchored on a different owner than the group creator"
+                    )));
+                }
+                match snap.policy() {
+                    kv::AccessPolicy::Encrypted { group_id } if *group_id == group_id_bytes => snap,
+                    other => {
+                        return Err(kv_storage_err(format!(
+                            "kv snapshot for topic {topic} carries policy {other}; refusing to open as an encrypted group store"
+                        )));
+                    }
+                }
+            }
+            Ok(None) => kv::KvStore::new_encrypted(
+                store_id,
+                name.to_string(),
+                creator,
+                group_id_bytes,
+                std::sync::Arc::clone(&secure),
+            )
+            .map_err(|e| kv_storage_err(format!("kv store creation failed: {e}")))?,
+            Err(e) => {
+                return Err(kv_storage_err(format!(
+                    "kv snapshot for topic {topic} is unreadable ({e}); refusing to start with amnesia — repair or remove the snapshot file explicitly"
+                )));
+            }
+        };
+        let mut store = store;
+        // Snapshots deserialize WITHOUT a context (serde(skip)); re-attach
+        // so the replica leaves the fail-closed state only now that the
+        // sync is provably sealed-path.
+        store
+            .set_secure_context(std::sync::Arc::clone(&secure))
+            .map_err(|e| kv_storage_err(format!("kv secure context re-attach failed: {e}")))?;
+
+        let (sync, peer_id) = self
+            .spawn_kv_sync_inner(
+                store,
+                &topic,
+                Some(persist_path),
+                Some(secure),
+                Some(secure_refresh),
+            )
+            .await?;
+
+        // Only the GROUP CREATOR (the store's anchored owner) produces
+        // owner-signed checkpoints; other members never do.
+        let owner_signing = if self.agent_id() == creator {
+            let (pk_bytes, sk_bytes) = self.identity().agent_keypair().to_bytes();
+            Some(std::sync::Arc::new(OwnerSigningMaterial {
+                public_key_bytes: pk_bytes,
+                secret_key_bytes: sk_bytes,
+            }))
+        } else {
+            None
+        };
+        Ok(KvStoreHandle {
+            sync,
+            agent_id: self.agent_id(),
+            peer_id,
+            owner_signing,
+        })
     }
 
     /// Join an existing key-value store by topic, anchoring ownership on the
@@ -15995,6 +16135,21 @@ impl KvStoreHandle {
     #[must_use]
     pub fn peer_id(&self) -> saorsa_gossip_types::PeerId {
         self.peer_id
+    }
+
+    /// True when this handle's store is a group-encrypted store (#341
+    /// Phase B). Callers MUST NOT ship the plaintext local delta of such a
+    /// store through any side channel (DM direct delivery included) — its
+    /// replication is exclusively the sealed gossip path.
+    pub async fn is_encrypted(&self) -> bool {
+        self.sync.read().await.is_encrypted()
+    }
+
+    /// True when this replica holds an owner-signed checkpoint (its own or
+    /// a relayed one) — surfaced so clients can tell whether a fresh
+    /// encrypted-store joiner can already serve current state.
+    pub async fn has_checkpoint(&self) -> bool {
+        self.sync.read().await.latest_checkpoint.is_some()
     }
 
     /// Tear down this replica's background sync loops (delta listener,
@@ -16335,7 +16490,10 @@ impl KvStoreHandle {
     ///
     /// # Errors
     ///
-    /// Returns an error if the delta fails to merge into the local store.
+    /// Returns an error if the store is an encrypted group store (#341
+    /// Phase B — plaintext deltas must never enter through the DM side
+    /// channel; those stores merge ONLY sealed, author-verified records),
+    /// or if the delta fails to merge into the local store.
     pub async fn apply_remote_delta(
         &self,
         peer_id: saorsa_gossip_types::PeerId,
@@ -16344,6 +16502,12 @@ impl KvStoreHandle {
     ) -> error::Result<()> {
         {
             let mut store = self.sync.write().await;
+            if store.is_encrypted() {
+                return Err(error::IdentityError::Storage(std::io::Error::other(
+                    "kv direct delta rejected: encrypted stores accept only sealed \
+                     sync records, never plaintext direct deltas",
+                )));
+            }
             store
                 .merge_delta(delta, peer_id, writer.as_ref())
                 .map_err(|e| {
