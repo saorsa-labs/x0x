@@ -39,8 +39,8 @@ use routes::{
     apply_upgrade, approve_join_request, ban_group_member, bootstrap_cache_stats,
     broadcast_current_manifest, cancel_join_request, causal_relay_step, check_upgrade,
     connect_agent, connect_diagnostics_handler, connect_machine, connectivity_diagnostics,
-    create_discovery_subscription, create_group_invite, create_join_request, create_kv_store,
-    create_mls_group, create_mls_welcome, create_named_group, create_task_list,
+    create_discovery_subscription, create_group_invite, create_group_kv_store, create_join_request,
+    create_kv_store, create_mls_group, create_mls_welcome, create_named_group, create_task_list,
     daemon_shutdown_hook, delete_contact, delete_discovery_subscription, delete_kv_value,
     delete_machine, direct_connections, direct_message_send_config, direct_send, discover_groups,
     discover_groups_nearby, discovered_agent, discovered_agents, discovered_machine,
@@ -1891,6 +1891,8 @@ pub async fn serve_with_options(
         .route("/groups/:id/state/seal", post(seal_group_state))
         .route("/groups/:id/state/withdraw", post(withdraw_group_state))
         .route("/groups/:id", delete(leave_group))
+        // Group-scoped encrypted KvStore (#341 Phase B)
+        .route("/groups/:id/stores", post(create_group_kv_store))
         // KvStore endpoints
         .route("/stores", get(list_kv_stores))
         .route("/stores", post(create_kv_store))

@@ -23,12 +23,18 @@
 //! ```
 
 pub mod delta;
+pub mod encrypted;
 pub mod entry;
 pub mod error;
 pub mod store;
 pub mod sync;
 
 pub use delta::KvStoreDelta;
+pub use encrypted::{
+    encrypted_record_aad, group_store_identity, store_record_key, AuthorSigning,
+    EncryptedKvStoreRecordV1, KvMutationKind, KvSecureContext, SharedKvSecureContext,
+    SignedKvMutation, SIGNED_MUTATION_DOMAIN, SIG_ALGORITHM_ML_DSA65,
+};
 pub use entry::KvEntry;
 pub use error::{KvError, Result};
 pub use store::{

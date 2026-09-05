@@ -104,6 +104,18 @@ pub enum KvError {
         group_id: Vec<u8>,
     },
 
+    /// An encrypted store record (issue #341 Phase B) was rejected on the
+    /// receive path.
+    ///
+    /// Covers: foreign group/store binding, an envelope epoch ahead of the
+    /// local group epoch (receiver behind on group-secret sync), stale
+    /// pre-rekey material, AEAD authentication failure, author-id derivation
+    /// mismatch, and inner signature failure. The record is dropped without
+    /// being applied; the reason is safe to log (it never contains decrypted
+    /// key or value material).
+    #[error("encrypted kv record rejected: {0}")]
+    SecureRecord(String),
+
     /// A `SelfKeyed` writer's per-agent quota would be exceeded (issue #340).
     ///
     /// The quota is a deterministic admission rule (lowest-N in lexicographic

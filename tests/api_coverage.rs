@@ -502,6 +502,11 @@ const COVERED: &[CoveredEndpoint] = &[
     // ── Key-value stores ────────────────────────────────────────────────
     covered!(Get, "/stores", "GET /stores"),
     covered!(Post, "/stores", "POST /stores"),
+    covered!(
+        Post,
+        "/groups/:id/stores",
+        create_group_kv_store_route_creates_encrypted_store
+    ),
     covered!(Post, "/stores/:id/join", "POST /stores/:id/join"),
     covered!(Get, "/stores/:id/keys", "GET /stores/:id/keys"),
     covered!(Put, "/stores/:id/:key", "PUT /stores/:id/:key"),
@@ -560,6 +565,12 @@ const COVERAGE_MARKER_SOURCES: &[(&str, &str)] = &[
     (
         "src/server/routes/key_move.rs",
         include_str!("../src/server/routes/key_move.rs"),
+    ),
+    // #341 Phase B: the group-scoped encrypted-store route's coverage lives
+    // in the stores route lib tests.
+    (
+        "src/server/routes/stores.rs",
+        include_str!("../src/server/routes/stores.rs"),
     ),
     (
         "src/server/routes/sync.rs",

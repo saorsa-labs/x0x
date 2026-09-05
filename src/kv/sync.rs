@@ -6,8 +6,12 @@
 use crate::gossip::wire::{decode_delta, encode_delta};
 use crate::gossip::PubSubManager;
 use crate::identity::AgentId;
+use crate::kv::encrypted::{
+    open_mutation, seal_mutation, AuthorSigning, EncryptedKvStoreRecordV1, KvMutationKind,
+    SharedKvSecureContext,
+};
 use crate::kv::store::AccessPolicy;
-use crate::kv::{KvStore, KvStoreDelta, Result};
+use crate::kv::{KvError, KvStore, KvStoreDelta, KvStoreId, Result};
 use saorsa_gossip_types::PeerId;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
@@ -20,6 +24,20 @@ use tokio::sync::RwLock;
 /// existing `(PeerId, KvStoreDelta)` wire format — pre-#96 nodes simply
 /// never subscribe to the side channel and are unaffected.
 const STATE_SYNC_TOPIC_SUFFIX: &str = "/state-sync";
+
+/// An async hook that refreshes the sync's
+/// [`KvSecureContext`](crate::kv::encrypted::KvSecureContext) snapshot
+/// before cryptographic or membership decisions.
+///
+/// Encrypted stores (#341 Phase B) bind to a context whose authoritative
+/// state (group secret, epoch, active membership) lives in async daemon
+/// state, while the trait itself is synchronous. The daemon supplies this
+/// hook — typically [`crate::groups::GssKvSecureContext::refresh_hook`] —
+/// and every encrypted publish/receive path awaits it first, so a rekey or
+/// roster change takes effect on the very next record.
+pub type SecureRefreshFn = std::sync::Arc<
+    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
+>;
 
 /// Delays between state-request retries for a first-time joiner whose
 /// store is still empty. Spread out so a slow mesh (peer discovery,
@@ -286,6 +304,23 @@ pub struct KvStoreSync {
     /// string (round-4 review: flag-only teardown left ghost listeners and a
     /// live responder until daemon shutdown).
     cancel: tokio_util::sync::CancellationToken,
+
+    /// Group secure context for an [`AccessPolicy::Encrypted`] store
+    /// (#341 Phase B). `None` for every plaintext policy. When set, ALL
+    /// publications (deltas, full-state serves, side-topic control
+    /// messages) are sign-then-encrypt sealed and every receipt is opened,
+    /// author-verified, and membership-checked before merge.
+    secure: Option<SharedKvSecureContext>,
+
+    /// Async hook refreshing `secure` before each seal/open decision (see
+    /// [`SecureRefreshFn`]). Optional: contexts that cannot go stale (test
+    /// fixtures) need no refresh.
+    secure_refresh: Option<SecureRefreshFn>,
+
+    /// The local agent's ML-DSA-65 signing material, REQUIRED for encrypted
+    /// stores (every member signs its own mutations; the design doc's
+    /// sign-then-encrypt flow).
+    author_signing: Option<std::sync::Arc<AuthorSigning>>,
 }
 
 /// Structural teardown (parallel-review finding): the background loops hold
@@ -346,7 +381,217 @@ impl KvStoreSync {
             persist: std::sync::Mutex::new(None),
             stopped: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             cancel: tokio_util::sync::CancellationToken::new(),
+            secure: None,
+            secure_refresh: None,
+            author_signing: None,
         })
+    }
+
+    /// Attach the group secure context (and its async refresh hook) for an
+    /// [`AccessPolicy::Encrypted`] store (#341 Phase B).
+    ///
+    /// MUST be called before [`start`](Self::start): the loops capture the
+    /// context once. [`start_with_spawner`](Self::start_with_spawner) fails
+    /// at startup when an encrypted store runs without one — a sync that
+    /// could only ever fail-open (plaintext publication) must never start.
+    ///
+    /// # Panics
+    ///
+    /// Debug-asserts the store is actually `Encrypted`: the context drives
+    /// the SEALED publish/receive branch, so attaching one to a plaintext
+    /// store would silently flip its wire format. A mismatch is a wiring
+    /// bug, not a runtime condition.
+    pub fn set_secure_context(
+        &mut self,
+        ctx: SharedKvSecureContext,
+        refresh: Option<SecureRefreshFn>,
+    ) {
+        debug_assert!(self.secure.is_none(), "secure context attached twice");
+        if let Ok(store) = self.store.try_read() {
+            debug_assert!(
+                store.is_encrypted(),
+                "set_secure_context on a non-encrypted store would flip its wire format"
+            );
+        }
+        self.secure = Some(ctx);
+        self.secure_refresh = refresh;
+    }
+
+    /// Attach the local agent's signing material, required to publish to an
+    /// encrypted store. MUST be called before
+    /// [`start`](Self::start) for encrypted stores.
+    pub fn set_author_signing(&mut self, signing: AuthorSigning) {
+        self.author_signing = Some(std::sync::Arc::new(signing));
+    }
+
+    /// Invalidate this sync's secure context (group lifecycle: leave,
+    /// removal, withdrawal — see
+    /// [`KvSecureContext::invalidate`](crate::kv::encrypted::KvSecureContext::invalidate)).
+    ///
+    /// After this, LOCAL authorization fails closed (the store consults the
+    /// same context for membership) and every seal/open refuses. Pair with
+    /// [`cancel_sync`](Self::cancel_sync) — that is what
+    /// `KvStoreHandle::retire` does.
+    pub fn invalidate_secure_context(&self) {
+        if let Some(ctx) = self.secure.as_ref() {
+            ctx.invalidate();
+        }
+    }
+
+    /// Seal a delta publication for an encrypted store into gossip bytes.
+    ///
+    /// Used by [`publish_delta`](Self::publish_delta) (incremental) and the
+    /// responder's full-state serve — the design doc requires that NO
+    /// plaintext `KvStoreDelta` can leave the process for an encrypted
+    /// store, so both paths go through the same sealer.
+    async fn seal_publication(
+        store: &Arc<RwLock<KvStore>>,
+        ctx: &SharedKvSecureContext,
+        refresh: Option<&SecureRefreshFn>,
+        signing: &Arc<AuthorSigning>,
+        kind: KvMutationKind,
+        local_peer_id: PeerId,
+        delta: &KvStoreDelta,
+    ) -> Result<Vec<u8>> {
+        if let Some(refresh) = refresh {
+            refresh().await;
+        }
+        let store_id = { *store.read().await.id() };
+        let payload = bincode::serialize(delta)
+            .map_err(|e| KvError::Gossip(format!("sealed delta serialize failed: {e}")))?;
+        let record = seal_mutation(ctx.as_ref(), signing.as_ref(), kind, &store_id, &payload)?;
+        encode_delta(local_peer_id, &record)
+            .map_err(|e| KvError::Gossip(format!("sealed delta encode failed: {e}")))
+    }
+
+    /// Open and merge one encrypted record received on the main topic.
+    ///
+    /// Implements the design doc's receive flow: decrypt → verify author
+    /// binding + signature → membership check → merge with the VERIFIED
+    /// author identity preserved at the merge decision point. Returns true
+    /// when the store mutated (callers persist after merge).
+    async fn merge_encrypted_record(
+        ctx: &SharedKvSecureContext,
+        refresh: Option<&SecureRefreshFn>,
+        store: &Arc<RwLock<KvStore>>,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> bool {
+        if let Some(refresh) = refresh {
+            refresh().await;
+        }
+        // Envelope decode: a plaintext delta arriving on an encrypted
+        // store's topic fails to decode as an envelope and is dropped here
+        // — it can never reach the merge. The envelope's sender peer tags
+        // the OR-Set merge (the same role the plaintext path's tuple
+        // sender plays); AUTHORITY comes from the inner signature.
+        let (sender_peer, record) = match decode_delta::<EncryptedKvStoreRecordV1>(payload) {
+            Ok(decoded) => decoded,
+            Err(e) => {
+                tracing::warn!("rejected malformed sealed record for store {store_id}: {e}");
+                return false;
+            }
+        };
+        let mutation = match open_mutation(ctx.as_ref(), store_id, &record) {
+            Ok(m) => m,
+            Err(e) => {
+                // Reason is safe to log: never contains decrypted content.
+                tracing::warn!("rejected sealed record for store {store_id}: {e}");
+                return false;
+            }
+        };
+        // Membership IS the v1 write rule — enforce before merge, with the
+        // verified author identity (never the transport sender).
+        if !ctx.is_active_member(&mutation.author_id) {
+            tracing::warn!(
+                "rejected sealed record for store {store_id}: author {} is not an active group member",
+                hex::encode(mutation.author_id.as_bytes())
+            );
+            return false;
+        }
+        let delta: KvStoreDelta = match bincode::deserialize(&mutation.payload) {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!(
+                    "rejected sealed record for store {store_id}: bad delta payload: {e}"
+                );
+                return false;
+            }
+        };
+        let mut s = store.write().await;
+        match s.merge_delta(&delta, sender_peer, Some(&mutation.author_id)) {
+            Ok(()) => true,
+            Err(e) => {
+                tracing::warn!("failed to merge sealed delta for store {store_id}: {e}");
+                false
+            }
+        }
+    }
+
+    /// Seal a state-sync control message for an encrypted store. Returns
+    /// ready-to-publish gossip bytes, or `None` (logged) on any failure.
+    async fn seal_control_message(
+        ctx: &SharedKvSecureContext,
+        refresh: Option<&SecureRefreshFn>,
+        signing: &Arc<AuthorSigning>,
+        store_id: &KvStoreId,
+        local_peer_id: PeerId,
+        msg: &KvSyncMessage,
+    ) -> Option<Vec<u8>> {
+        if let Some(refresh) = refresh {
+            refresh().await;
+        }
+        let payload = bincode::serialize(msg).ok()?;
+        let record = seal_mutation(
+            ctx.as_ref(),
+            signing.as_ref(),
+            KvMutationKind::Control,
+            store_id,
+            &payload,
+        )
+        .map_err(|e| tracing::warn!("failed to seal control message: {e}"))
+        .ok()?;
+        encode_delta(local_peer_id, &record).ok()
+    }
+
+    /// Open a sealed state-sync control message.
+    ///
+    /// Returns the message AND the verified inner author (the pubsub
+    /// transport sender may be a relay; for sealed control traffic the
+    /// author signature inside the envelope is the trusted identity —
+    /// exactly the "author binding" of the design doc applied to control
+    /// messages such as `OwnerAnnounce`).
+    async fn open_control_message(
+        ctx: &SharedKvSecureContext,
+        refresh: Option<&SecureRefreshFn>,
+        store_id: &KvStoreId,
+        payload: &[u8],
+    ) -> Option<(AgentId, KvSyncMessage)> {
+        if let Some(refresh) = refresh {
+            refresh().await;
+        }
+        let (_, record) = decode_delta::<EncryptedKvStoreRecordV1>(payload).ok()?;
+        let mutation = open_mutation(ctx.as_ref(), store_id, &record)
+            .map_err(|e| {
+                tracing::warn!("rejected sealed control message for store {store_id}: {e}")
+            })
+            .ok()?;
+        if mutation.kind != KvMutationKind::Control {
+            tracing::warn!(
+                "rejected sealed control message for store {store_id}: wrong kind {:?}",
+                mutation.kind
+            );
+            return None;
+        }
+        if !ctx.is_active_member(&mutation.author_id) {
+            tracing::warn!(
+                "rejected sealed control message for store {store_id}: author {} is not an active group member",
+                hex::encode(mutation.author_id.as_bytes())
+            );
+            return None;
+        }
+        let msg = bincode::deserialize::<KvSyncMessage>(&mutation.payload).ok()?;
+        Some((mutation.author_id, msg))
     }
 
     /// Enable on-disk snapshot persistence at `path`.
@@ -455,6 +700,22 @@ impl KvStoreSync {
     {
         let mut sub = self.pubsub.subscribe(self.topic.clone()).await;
         let store = Arc::clone(&self.store);
+        // #341 Phase B fail-closed startup: an encrypted store syncs ONLY
+        // through the sealed path, which requires the secure context and the
+        // author signing material. Refusing to start here can never degrade
+        // into plaintext publication.
+        let store_is_encrypted = { store.read().await.is_encrypted() };
+        if store_is_encrypted && (self.secure.is_none() || self.author_signing.is_none()) {
+            return Err(KvError::SecureRecord(
+                "encrypted store sync requires an attached secure context and author \
+                 signing material (set_secure_context + set_author_signing) before start"
+                    .to_string(),
+            ));
+        }
+        // Capture the encrypted-path handles once: the policy is
+        // creation-fixed, so a stale snapshot cannot drift mid-life.
+        let listener_secure = self.secure.clone();
+        let listener_refresh = self.secure_refresh.clone();
         // Capture the bootstrap decision BEFORE any listener can merge a
         // cached delta. Otherwise a partial cache replay landing between
         // subscribe and this check could make the store non-empty and skip
@@ -486,6 +747,9 @@ impl KvStoreSync {
 
         let loop_persist_ctx = persist_ctx.clone();
         let listener_cancel = self.cancel.clone();
+        // Store id snapshot for the encrypted receive path (static for the
+        // store's life).
+        let listener_store_id = { *store.read().await.id() };
         // StateServed evidence: written by the responder loop (which owns
         // the side-topic subscription), read by the listener (verified
         // full-replace adopt, issue #240) and the bootstrap requester
@@ -520,6 +784,25 @@ impl KvStoreSync {
                 if msg.topic != main_topic {
                     // Cross-topic replay defense: ignore envelopes not on our
                     // subscribed topic (see start_with_spawner).
+                    continue;
+                }
+                // #341 Phase B: an encrypted store takes the SEALED path —
+                // the payload is an EncryptedKvStoreRecordV1, and a plaintext
+                // delta can never decode, verify, or merge here.
+                if let Some(ctx) = listener_secure.as_ref() {
+                    let merged = Self::merge_encrypted_record(
+                        ctx,
+                        listener_refresh.as_ref(),
+                        &store,
+                        &listener_store_id,
+                        &msg.payload,
+                    )
+                    .await;
+                    if merged {
+                        if let Some(ctx) = loop_persist_ctx.as_ref() {
+                            let _ = persist_snapshot(&store, ctx).await;
+                        }
+                    }
                     continue;
                 }
                 let decoded = decode_delta::<KvStoreDelta>(&msg.payload);
@@ -664,6 +947,12 @@ impl KvStoreSync {
         let local_agent_id = self.local_agent_id;
         let responder_served = Arc::clone(&served_evidence);
         let responder_cancel = self.cancel.clone();
+        // Encrypted-path handles (#341 Phase B): Some together whenever the
+        // store is encrypted (enforced by the startup guard above).
+        let responder_secure = self.secure.clone();
+        let responder_refresh = self.secure_refresh.clone();
+        let responder_signing = self.author_signing.clone();
+        let responder_store_id = { *self.store.read().await.id() };
         spawn(Box::pin(async move {
             // Response-storm damping (issue #238 review): one full-state
             // response per cooldown window, regardless of how many replicas
@@ -688,8 +977,27 @@ impl KvStoreSync {
                     // Cross-topic replay defense (see start_with_spawner).
                     continue;
                 }
-                let Ok(sync_msg) = bincode::deserialize::<KvSyncMessage>(&msg.payload) else {
-                    continue;
+                // #341 Phase B: encrypted stores seal their control traffic
+                // too. The verified identity is then the INNER signature's
+                // author (a relay's transport sender proves nothing); the
+                // plaintext path keeps the pub/sub-verified sender.
+                let (sync_msg, verified_sender) = if let Some(ctx) = responder_secure.as_ref() {
+                    match Self::open_control_message(
+                        ctx,
+                        responder_refresh.as_ref(),
+                        &responder_store_id,
+                        &msg.payload,
+                    )
+                    .await
+                    {
+                        Some((author, m)) => (m, Some(author)),
+                        None => continue,
+                    }
+                } else {
+                    match bincode::deserialize::<KvSyncMessage>(&msg.payload) {
+                        Ok(m) => (m, msg.sender),
+                        Err(_) => continue,
+                    }
                 };
                 match sync_msg {
                     KvSyncMessage::StateRequest { requester } => {
@@ -714,7 +1022,23 @@ impl KvStoreSync {
                             }
                         };
                         if let Some(announce) = announce {
-                            match bincode::serialize(&announce) {
+                            let serialized = if let (Some(ctx), Some(signing)) =
+                                (responder_secure.as_ref(), responder_signing.as_ref())
+                            {
+                                Self::seal_control_message(
+                                    ctx,
+                                    responder_refresh.as_ref(),
+                                    signing,
+                                    &responder_store_id,
+                                    local_peer_id,
+                                    &announce,
+                                )
+                                .await
+                                .ok_or_else(|| "seal failed".to_string())
+                            } else {
+                                bincode::serialize(&announce).map_err(|e| e.to_string())
+                            };
+                            match serialized {
                                 Ok(serialized) => {
                                     if let Err(e) = responder_pubsub
                                         .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
@@ -771,7 +1095,27 @@ impl KvStoreSync {
                         };
                         let mut markers: Vec<KvSyncMessage> = Vec::new();
                         if let Some(full) = full {
-                            if let Ok(serialized) = encode_delta(local_peer_id, &full) {
+                            // #341 Phase B: the full-state serve on the main
+                            // topic is SEALED for encrypted stores — never a
+                            // plaintext delta.
+                            let serialized = if let (Some(ctx), Some(signing)) =
+                                (responder_secure.as_ref(), responder_signing.as_ref())
+                            {
+                                Self::seal_publication(
+                                    &responder_store,
+                                    ctx,
+                                    responder_refresh.as_ref(),
+                                    signing,
+                                    KvMutationKind::FullState,
+                                    local_peer_id,
+                                    &full,
+                                )
+                                .await
+                                .map_err(|e| e.to_string())
+                            } else {
+                                encode_delta(local_peer_id, &full).map_err(|e| e.to_string())
+                            };
+                            if let Ok(serialized) = serialized {
                                 if let Err(e) = responder_pubsub
                                     .publish(
                                         responder_topic.clone(),
@@ -825,7 +1169,23 @@ impl KvStoreSync {
                             }
                         }
                         for marker in markers {
-                            match bincode::serialize(&marker) {
+                            let serialized = if let (Some(ctx), Some(signing)) =
+                                (responder_secure.as_ref(), responder_signing.as_ref())
+                            {
+                                Self::seal_control_message(
+                                    ctx,
+                                    responder_refresh.as_ref(),
+                                    signing,
+                                    &responder_store_id,
+                                    local_peer_id,
+                                    &marker,
+                                )
+                                .await
+                                .ok_or_else(|| "seal failed".to_string())
+                            } else {
+                                bincode::serialize(&marker).map_err(|e| e.to_string())
+                            };
+                            match serialized {
                                 Ok(serialized) => {
                                     if let Err(e) = responder_pubsub
                                         .publish(sync_topic.clone(), bytes::Bytes::from(serialized))
@@ -872,10 +1232,13 @@ impl KvStoreSync {
                         // Owner-marker checkpoints also self-correlate: the
                         // local high-water mark only rises by MERGING the
                         // checkpoint-bearing full delta, so satisfying the
-                        // gate proves the state actually arrived.
+                        // gate proves the state actually arrived. For sealed
+                        // control traffic the verified identity is the INNER
+                        // author (`verified_sender`), never a relay's
+                        // transport sender.
                         let owner_verified = {
                             let anchored = responder_store.read().await.owner().copied();
-                            anchored.is_some() && msg.sender.as_ref() == anchored.as_ref()
+                            anchored.is_some() && verified_sender.as_ref() == anchored.as_ref()
                         };
                         let mut ev = responder_served
                             .lock()
@@ -925,10 +1288,12 @@ impl KvStoreSync {
                         policy,
                         policy_version,
                     } => {
-                        // Only a signature-verified sender is trusted; the
-                        // pub/sub layer drops signed messages that fail
-                        // verification, so `sender: Some(..)` is verified.
-                        let Some(sender) = msg.sender else {
+                        // Only a signature-verified sender is trusted. On the
+                        // plaintext path that is the pub/sub layer's verified
+                        // transport sender; on the sealed path (#341 Phase B)
+                        // it is the inner mutation's verified author (and the
+                        // message was additionally membership-gated).
+                        let Some(sender) = verified_sender else {
                             tracing::warn!(
                                 "ignoring unsigned KvStore ownership announcement on {}",
                                 msg.topic
@@ -1006,6 +1371,12 @@ impl KvStoreSync {
             let requester_cancel = self.cancel.clone();
             let requester_served = Arc::clone(&served_evidence);
             let requester_bootstrap_active = Arc::clone(&bootstrap_active);
+            // Encrypted-path handles: StateRequest is SEALED for encrypted
+            // stores, so only members can trigger full-state broadcasts.
+            let requester_secure = self.secure.clone();
+            let requester_refresh = self.secure_refresh.clone();
+            let requester_signing = self.author_signing.clone();
+            let requester_store_id = { *self.store.read().await.id() };
             spawn(Box::pin(async move {
                 // Disarms the adopt window on ANY exit (converged, silenced,
                 // cancelled, torn down) — the listener's verified
@@ -1051,7 +1422,24 @@ impl KvStoreSync {
                     let request = KvSyncMessage::StateRequest {
                         requester: local_peer_id,
                     };
-                    let Ok(serialized) = bincode::serialize(&request) else {
+                    let serialized = if let (Some(ctx), Some(signing)) =
+                        (requester_secure.as_ref(), requester_signing.as_ref())
+                    {
+                        // #341 Phase B: sealed state request — non-members
+                        // cannot even trigger a full-state broadcast.
+                        Self::seal_control_message(
+                            ctx,
+                            requester_refresh.as_ref(),
+                            signing,
+                            &requester_store_id,
+                            local_peer_id,
+                            &request,
+                        )
+                        .await
+                    } else {
+                        bincode::serialize(&request).ok()
+                    };
+                    let Some(serialized) = serialized else {
                         return;
                     };
                     if let Err(e) = requester_pubsub
@@ -1112,14 +1500,48 @@ impl KvStoreSync {
     }
 
     /// Publish a local delta to the gossip network.
+    ///
+    /// For an encrypted store (#341 Phase B) the delta is NEVER serialized
+    /// plaintext: it is sign-then-encrypt sealed into an
+    /// `EncryptedKvStoreRecordV1` envelope first. A missing context or
+    /// signing material is a hard error — the plaintext path is unreachable
+    /// by construction for encrypted stores.
     pub async fn publish_delta(&self, local_peer_id: PeerId, delta: KvStoreDelta) -> Result<()> {
-        let serialized = encode_delta(local_peer_id, &delta)
-            .map_err(|e| crate::kv::KvError::Gossip(format!("serialize delta failed: {e}")))?;
+        // Policy check at the PUBLIC boundary (the start() guard only covers
+        // the background loops): a sync constructed for an encrypted store
+        // but never configured (or not yet started) must hard-error here —
+        // falling through to the plaintext branch would leak the delta.
+        let store_is_encrypted = { self.store.read().await.is_encrypted() };
+        if store_is_encrypted && self.secure.is_none() {
+            return Err(KvError::SecureRecord(
+                "encrypted store publish refused: no secure context attached                  (set_secure_context) — plaintext publication is unreachable for encrypted stores"
+                    .to_string(),
+            ));
+        }
+        let serialized = if let Some(ctx) = self.secure.as_ref() {
+            Self::seal_publication(
+                &self.store,
+                ctx,
+                self.secure_refresh.as_ref(),
+                self.author_signing.as_ref().ok_or_else(|| {
+                    KvError::SecureRecord(
+                        "encrypted store publish requires author signing material".to_string(),
+                    )
+                })?,
+                KvMutationKind::Delta,
+                local_peer_id,
+                &delta,
+            )
+            .await?
+        } else {
+            encode_delta(local_peer_id, &delta)
+                .map_err(|e| KvError::Gossip(format!("serialize delta failed: {e}")))?
+        };
 
         self.pubsub
             .publish(self.topic.clone(), bytes::Bytes::from(serialized))
             .await
-            .map_err(|e| crate::kv::KvError::Gossip(format!("publish delta failed: {e}")))?;
+            .map_err(|e| KvError::Gossip(format!("publish delta failed: {e}")))?;
 
         Ok(())
     }
@@ -1290,15 +1712,15 @@ pub fn load_snapshot(path: &Path) -> Result<Option<KvStore>> {
     };
     let body: SnapshotBody = bincode::deserialize(body_bytes)?;
     let store = body.store;
-    // #341 Phase A: a snapshot written before the reservation guard can
-    // still carry the reserved Encrypted policy. The replica opens
-    // fail-closed (no authorized writer, no local writes, no delta
-    // application) — surface that loudly at open time, not only on first
-    // rejected use.
+    // #341: a snapshot carrying the Encrypted policy opens fail-closed
+    // (the secure context is `serde(skip)` and must be re-attached by the
+    // caller — see `KvStore::set_secure_context`) unless/until that happens:
+    // no authorized writer, no local writes, no delta application. Surface
+    // that loudly at open time, not only on first rejected use.
     if let AccessPolicy::Encrypted { group_id } = store.policy() {
         tracing::warn!(
             target: "x0x::kv",
-            "opened snapshot of reserved encrypted store {} (group_id {}) — replica is fail-closed until secure sync is wired",
+            "opened snapshot of encrypted store {} (group_id {}) WITHOUT a secure context — replica is fail-closed until a context is re-attached (set_secure_context)",
             store.id(),
             hex::encode(group_id)
         );
@@ -1722,6 +2144,461 @@ mod tests {
         assert!(
             landed.is_ok(),
             "remote delta was not merged by start() loop"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // #341 Phase B: encrypted store sync (sealed publish/receive paths)
+    // ------------------------------------------------------------------
+
+    use crate::groups::{GroupInfo, GssKvSecureContext};
+    use crate::identity::AgentKeypair;
+    use crate::kv::encrypted::{AuthorSigning, KvSecureContext};
+
+    /// Build a minimal MlsEncrypted group whose active members are `members`
+    /// (member[0] is the creator) with a rotated shared secret (epoch >= 1),
+    /// plus one INDEPENDENT context per member — the same shape as two
+    /// daemons each holding their own snapshot of the same group.
+    fn encrypted_group(members: &[AgentId]) -> (GroupInfo, Vec<Arc<GssKvSecureContext>>, Vec<u8>) {
+        let mut info = GroupInfo::new(
+            "kv-group".to_string(),
+            String::new(),
+            members[0],
+            "ab".repeat(16),
+        );
+        info.migrate_from_v1();
+        for m in &members[1..] {
+            info.members_v2.insert(
+                hex::encode(m.as_bytes()),
+                crate::groups::GroupMember::new_member(
+                    hex::encode(m.as_bytes()),
+                    None,
+                    Some(hex::encode(members[0].as_bytes())),
+                    0,
+                ),
+            );
+        }
+        let _ = info.rotate_shared_secret();
+        let group_id = info.stable_group_id().as_bytes().to_vec();
+        let ctxs = members
+            .iter()
+            .map(|_| {
+                Arc::new(
+                    GssKvSecureContext::from_group(&info).expect("group holds a shared secret"),
+                )
+            })
+            .collect();
+        (info, ctxs, group_id)
+    }
+
+    /// Build an encrypted-store sync bound to `ctx`, signed as `local_kp`.
+    #[allow(clippy::too_many_arguments)]
+    async fn make_encrypted_sync(
+        topic: &str,
+        pubsub: Arc<PubSubManager>,
+        id_byte: u8,
+        creator: AgentId,
+        local: AgentId,
+        local_kp: &AgentKeypair,
+        ctx: Arc<GssKvSecureContext>,
+        group_id: Vec<u8>,
+        gossip_peer: PeerId,
+    ) -> KvStoreSync {
+        let store = KvStore::new_encrypted(
+            store_id(id_byte),
+            "Enc".to_string(),
+            creator,
+            group_id,
+            ctx.clone() as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let mut sync = KvStoreSync::new(store, pubsub, topic.to_string(), gossip_peer, Some(local))
+            .expect("kv sync");
+        sync.set_secure_context(ctx, None);
+        sync.set_author_signing(AuthorSigning::from_keypair(local_kp).expect("author signing"));
+        sync
+    }
+
+    async fn wait_for_key(sync: &KvStoreSync, key: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let present = { sync.read().await.get(key).is_some() };
+                if present {
+                    return;
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .is_ok()
+    }
+
+    async fn wait_key_absent(sync: &KvStoreSync, key: &str) -> bool {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            tokio::time::sleep(Duration::from_millis(2000)).await;
+        })
+        .await
+        .is_ok()
+            && sync.read().await.get(key).is_none()
+    }
+
+    #[tokio::test]
+    async fn encrypted_store_sealed_delta_round_trip() {
+        // WHY (#341 Phase B): the core end-to-end property — a member's put
+        // on an encrypted store is published as a SEALED record, and a peer
+        // member's listener opens it, verifies the author, checks group
+        // membership, and merges. No plaintext delta is involved at any
+        // point on the wire.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_b = ctxs.pop().expect("ctx b");
+        let ctx_a = ctxs.pop().expect("ctx a");
+
+        let topic = "store/enc-rt";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            a,
+            &kp_a,
+            ctx_a,
+            group_id.clone(),
+            peer(1),
+        )
+        .await;
+        let sync_b = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            b,
+            &kp_b,
+            ctx_b,
+            group_id,
+            peer(2),
+        )
+        .await;
+        sync_a.start().await.expect("start a");
+        sync_b.start().await.expect("start b");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // A mutates locally and publishes through the SEALED path.
+        let delta = {
+            let mut s = sync_a.write().await;
+            s.put(
+                "secret-key".to_string(),
+                b"hush".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+            let entry = s.get("secret-key").cloned().expect("entry");
+            KvStoreDelta::for_put(
+                "secret-key".to_string(),
+                entry,
+                (peer(1), s.next_seq()),
+                s.current_version(),
+            )
+        };
+        sync_a.publish_delta(peer(1), delta).await.expect("publish");
+
+        assert!(
+            wait_for_key(&sync_b, "secret-key").await,
+            "peer member must decrypt, verify, and merge the sealed delta"
+        );
+        let value = sync_b
+            .read()
+            .await
+            .get("secret-key")
+            .map(|e| e.value.clone());
+        assert_eq!(value, Some(b"hush".to_vec()));
+    }
+
+    #[tokio::test]
+    async fn encrypted_store_rejects_nonmember_author() {
+        // WHY (#341 Phase B): AEAD alone proves only "a key holder sealed
+        // this". A peer holding the group secret but NOT in the roster (the
+        // removed-before-rekey case) must fail the membership gate at every
+        // receiver — even though its record decrypts and its signature is
+        // valid.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let kp_c = AgentKeypair::generate().expect("kp"); // holds a context, NOT a member
+        let (a, b, c) = (kp_a.agent_id(), kp_b.agent_id(), kp_c.agent_id());
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_c = ctxs.pop().expect("ctx outsider");
+        let ctx_b = ctxs.pop().expect("ctx b");
+
+        let topic = "store/enc-nonmember";
+        let sync_c = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            c,
+            &kp_c,
+            ctx_c,
+            group_id.clone(),
+            peer(3),
+        )
+        .await;
+        let sync_b = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            b,
+            &kp_b,
+            ctx_b,
+            group_id,
+            peer(2),
+        )
+        .await;
+        sync_b.start().await.expect("start b");
+        sync_c.start().await.expect("start c");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let delta = {
+            let mut s = sync_c.write().await;
+            s.put(
+                "intruder-key".to_string(),
+                b"x".to_vec(),
+                "text/plain".to_string(),
+                peer(3),
+            )
+            .expect("put");
+            let entry = s.get("intruder-key").cloned().expect("entry");
+            KvStoreDelta::for_put(
+                "intruder-key".to_string(),
+                entry,
+                (peer(3), s.next_seq()),
+                s.current_version(),
+            )
+        };
+        sync_c.publish_delta(peer(3), delta).await.expect("publish");
+
+        assert!(
+            wait_key_absent(&sync_b, "intruder-key").await,
+            "non-member author's sealed record must never merge"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_store_rejects_plaintext_delta() {
+        // WHY (#341 Phase B, hard requirement 1): a plaintext KvStoreDelta
+        // injected onto an encrypted store's topic must not decode as a
+        // sealed envelope and must never reach the merge.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let a = kp_a.agent_id();
+        let (_info, ctxs, group_id) = encrypted_group(&[a]);
+        let topic = "store/enc-plain";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            a,
+            &kp_a,
+            ctxs.into_iter().next().expect("ctx"),
+            group_id,
+            peer(1),
+        )
+        .await;
+        sync_a.start().await.expect("start");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        let mut delta = KvStoreDelta::new(1);
+        delta.added.insert(
+            "plaintext-key".to_string(),
+            (
+                KvEntry::new(
+                    "plaintext-key".to_string(),
+                    b"leak".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (peer(9), 1),
+            ),
+        );
+        let raw = encode_delta(peer(9), &delta).expect("encode plaintext delta");
+        pubsub
+            .publish(topic.to_string(), bytes::Bytes::from(raw))
+            .await
+            .expect("publish plaintext");
+
+        assert!(
+            wait_key_absent(&sync_a, "plaintext-key").await,
+            "plaintext delta must never apply to an encrypted store"
+        );
+    }
+
+    #[tokio::test]
+    async fn unconfigured_encrypted_sync_never_publishes_plaintext() {
+        // WHY (PR #508 review P1): publish_delta is a PUBLIC method callable
+        // before start()/configuration — the startup guard does not cover
+        // direct calls. An encrypted store's sync with no secure context
+        // must hard-error at this boundary instead of falling into the
+        // plaintext branch, and a subscribed observer must receive NOTHING.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp = AgentKeypair::generate().expect("kp");
+        let a = kp.agent_id();
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
+        let store = KvStore::new_encrypted(
+            store_id(1),
+            "Enc".to_string(),
+            a,
+            group_id,
+            ctxs.pop().expect("ctx") as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        // NOTE: no set_secure_context / set_author_signing, no start().
+        let sync = KvStoreSync::new(
+            store,
+            Arc::clone(&pubsub),
+            "store/enc-unpub".to_string(),
+            peer(1),
+            Some(a),
+        )
+        .expect("kv sync");
+
+        // Observer watches the topic from BEFORE the publish attempt.
+        let mut observer = pubsub.subscribe("store/enc-unpub".to_string()).await;
+
+        let mut delta = KvStoreDelta::new(1);
+        delta.added.insert(
+            "confidential-key".to_string(),
+            (
+                KvEntry::new(
+                    "confidential-key".to_string(),
+                    b"secret".to_vec(),
+                    "text/plain".to_string(),
+                ),
+                (peer(1), 1),
+            ),
+        );
+        let err = sync
+            .publish_delta(peer(1), delta)
+            .await
+            .expect_err("unconfigured encrypted publish must hard-error");
+        assert!(
+            matches!(err, crate::kv::KvError::SecureRecord(ref m) if m.contains("no secure context")),
+            "got {err:?}"
+        );
+
+        // The observer heard nothing: no plaintext ever left the process.
+        let leak = tokio::time::timeout(Duration::from_millis(300), observer.recv()).await;
+        assert!(leak.is_err(), "plaintext delta was published to the topic");
+    }
+
+    #[tokio::test]
+    async fn encrypted_sync_requires_context_and_signing() {
+        // WHY (#341 Phase B): an encrypted store sync without its secure
+        // context or author signing material must REFUSE TO START — the
+        // only alternative would be a plaintext-capable sync window.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp = AgentKeypair::generate().expect("kp");
+        let a = kp.agent_id();
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a]);
+        let store = KvStore::new_encrypted(
+            store_id(1),
+            "Enc".to_string(),
+            a,
+            group_id,
+            // Satisfy the store constructor; the SYNC is what must refuse.
+            ctxs.pop().expect("ctx") as Arc<dyn KvSecureContext>,
+        )
+        .expect("encrypted store");
+        let sync = KvStoreSync::new(
+            store,
+            pubsub,
+            "store/enc-guard".to_string(),
+            peer(1),
+            Some(a),
+        )
+        .expect("kv sync");
+        // NOTE: no set_secure_context / set_author_signing.
+        let err = sync
+            .start_with_spawner(|fut| {
+                tokio::spawn(fut);
+            })
+            .await
+            .expect_err("encrypted sync must refuse to start unconfigured");
+        assert!(
+            matches!(err, crate::kv::KvError::SecureRecord(_)),
+            "got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn encrypted_bootstrap_converges_via_sealed_state_request() {
+        // WHY (#341 Phase B): late joiners bootstrap from current state —
+        // the state request, the full-state serve, and the evidence markers
+        // ALL travel sealed. B joins after A's write and must still receive
+        // the pre-join key.
+        let node = make_node().await;
+        let pubsub = Arc::new(PubSubManager::new(node, None).expect("pubsub"));
+        let kp_a = AgentKeypair::generate().expect("kp");
+        let kp_b = AgentKeypair::generate().expect("kp");
+        let (a, b) = (kp_a.agent_id(), kp_b.agent_id());
+        let (_info, mut ctxs, group_id) = encrypted_group(&[a, b]);
+        let ctx_b = ctxs.pop().expect("ctx b");
+        let ctx_a = ctxs.pop().expect("ctx a");
+
+        let topic = "store/enc-bootstrap";
+        let sync_a = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            a,
+            &kp_a,
+            ctx_a,
+            group_id.clone(),
+            peer(1),
+        )
+        .await;
+        sync_a.start().await.expect("start a");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // The owner writes BEFORE B ever joins (B misses this delta).
+        {
+            let mut s = sync_a.write().await;
+            s.put(
+                "early-key".to_string(),
+                b"early".to_vec(),
+                "text/plain".to_string(),
+                peer(1),
+            )
+            .expect("put");
+        }
+
+        let sync_b = make_encrypted_sync(
+            topic,
+            Arc::clone(&pubsub),
+            1,
+            a,
+            b,
+            &kp_b,
+            ctx_b,
+            group_id,
+            peer(2),
+        )
+        .await;
+        sync_b.start().await.expect("start b");
+
+        assert!(
+            wait_for_key(&sync_b, "early-key").await,
+            "late joiner must converge via the sealed state-request path"
         );
     }
 
