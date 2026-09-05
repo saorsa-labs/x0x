@@ -8,9 +8,9 @@
 
 | PR | Closes / refs | Failure class |
 |---|---|---|
-| [#507](https://github.com/saorsa-labs/x0x/pull/507) | #449 / ADR-0060 | Second enrolled device mints a second Home; `GET /home` lies; pointer oscillation; withdrawn Home still resolves |
+| [#507](https://github.com/saorsa-labs/x0x/pull/507) | Partial #449 / ADR-0060 (**#449 stays open**) | Election + honest `GET /home` + provision suppression + withdrawn-Home guards. Does **not** seat a second device. HomeInvite / cross-device adoption **withdrawn**. |
 | [#508](https://github.com/saorsa-labs/x0x/pull/508) | #341 Phase B | Encrypted group KV publishes plaintext / leave retains write / fail-open without context |
-| [#509](https://github.com/saorsa-labs/x0x/pull/509) | #506 | Withdrawing a Hidden group (incl. Home) publishes a public discovery card |
+| [#509](https://github.com/saorsa-labs/x0x/pull/509) | #506 | **Proved class (a):** local discovery residual (`GET /groups/discover` synthesizing withdrawn Hidden cards). **Unproved class (b):** public broadcast to the mesh — do not claim PASS/FAIL without evidence. |
 
 **Durable DM baseline:** ADR-0030 — product `POST /direct/send` is durable-by-default; 200 = recipient committed + dispatched; 409 `recipient_ack_semantics_unavailable` against non-v2; no silent downgrade.
 
@@ -30,29 +30,29 @@
 |---|---|---|---|---|
 | A1 | Fresh owned install provisions Home | New `X0X_HOME`, start daemon, load owner, `GET /home` / `x0x home` | Exactly one Home; resolution `local`; version healthy | Pre-#507 duplicate-mint class |
 | A2 | Un-owned install has no Home | Fresh install without owner key; `GET /home` | Documented 404 / un-owned message; no silent Home | False Home invent |
-| A3 | Upgrade path does not invent a second Home | Install A on tip; enroll device B sharing owner; both `GET /home` | Same `group_id` / honest resolution; never two authoritative Homes | **#507 / #449** |
+| A3 | Upgrade path does not invent a second Home | Install A on tip; enroll device B sharing owner; both `GET /home` | Same `group_id` / honest resolution; never two authoritative Homes. Seating B is #449 (open), not current #507. | **#507** (report + no mint); #449 open |
 | A4 | Downgrade caveat surface | Owned install on tip; ops #451 forbids on old bins | Product refuses or docs warn | Related #451 |
 
 ### B. Identity / Home
 
 | ID | Scenario | Steps | Acceptance (PASS) | Fails for |
 |---|---|---|---|---|
-| B1 | Single Home per owner (enrolled) | Device A provisions; enroll B; B reconciles | B does not mint; both agree on pointer | **#507** |
-| B2 | Honest `GET /home` reporting | On B before seat: `GET /home` | 200 `elsewhere` or `adoption_pending` — not B's duplicate as owner's Home | **#507** |
+| B1 | Single Home per owner (enrolled) | Device A provisions; enroll B; B reconciles | B does not mint; both agree on pointer. Seating is not required for current #507. | **#507** |
+| B2 | Honest `GET /home` reporting | On B before seat: `GET /home` | 200 `elsewhere` or `adoption_pending` naming **A's** `group_id` — not B's duplicate as owner's Home | **#507** |
 | B3 | Withdrawn Home excluded | Withdraw Home; `GET /home` / provision | Tombstone not canonical; provision not wedged | **#507** D5 |
-| B4 | Rider agents not auto-seated | Owner-certified Rider present | Rider never joins Home | **#507** |
+| B4 | Rider / device auto-seat | Owner-certified Rider present | **Out of scope for current #507.** Mode-based exclusion (`OwnerIssuedCert.mode`) is unsound under Accepted [ADR-0039](../adr/0039-agent-harness-boundary.md) (mode-agnostic Home eligibility; synced journal materializes mode `Acp`). Inventing a device-only filter would amend ADR-0039 — forbidden for the current #507 PR. Full device-vs-rider Home eligibility needs future ADR / #449 work. Do **not** require “Rider never joins Home” as a #507 PASS. | future ADR / #449 — not a current #507 gate |
 | B5 | Pointer election terminates | Two enrolled conflicting Homes; wait ≥2 reconciles | Pointer stops flipping | **#507** D3 |
 
 ### C. Invite / join / leave / revoke
 
 | ID | Scenario | Steps | Acceptance (PASS) | Fails for |
 |---|---|---|---|---|
-| C1 | Home adoption invite | Winner mints HomeInvite; joiner redeems mode home | Seats; refused admission retries, never second Home | **#507** |
+| C1 | Home adoption invite | Winner mints HomeInvite; joiner redeems mode home | **Pending future #449 implementation / ADR review** — not current #507 acceptance. HomeInvite / cross-device adoption is **withdrawn** from current #507. Current #507 multi-device PASS is honest reporting + no new mint when a pointer already names a Home (B1 / B2 / A3), not seating. | future #449 — not a current #507 gate |
 | C2 | Ordinary invite single-use | Invite; join; replay | Replay refused; no double seat | baseline |
 | C3 | Leave encrypted group cuts KV | Leave; attempt put/get | Fail closed | **#508** |
 | C4 | Remove member cuts encrypted KV | Ban/remove; peer put | Fails | **#508** |
-| C5 | Hidden withdraw must not publicize | Withdraw Hidden/Home; probe discovery | No public card for strangers | **#509** |
-| C6 | Public withdraw still tombstones | Public group withdraw | Tombstone supersedes prior public card | #509 regression |
+| C5 | Hidden withdraw local residual | Withdraw Hidden/Home; probe **local** `GET /groups/discover` | **Proved class (a):** local discovery must not synthesize a live card for a withdrawn Hidden/Home. **Unproved class (b):** public broadcast to the mesh — do not claim PASS/FAIL without evidence. | **#509** (local residual) |
+| C6 | Public withdraw still tombstones | Public group withdraw; probe **local** discovery | Local view: tombstone supersedes the prior public card. Mesh-wide public broadcast is unproved — do not claim PASS/FAIL without evidence. | #509 local residual |
 
 ### D. Durable DMs (ADR-0030)
 
@@ -70,8 +70,8 @@
 |---|---|---|---|---|
 | E1 | Home survives restart | Restart same X0X_HOME | Same Home local; no second mint | **#507** |
 | E2 | Encrypted KV survives restart | Put; restart; get | Value present; sealed on wire | **#508** |
-| E3 | Offline then enroll | B comes online enrolled | Honest adopt; no duplicate | **#507** |
-| E4 | Kill during Hidden withdraw | Withdraw; kill; restart; scan discovery | Still no public Hidden card | **#509** |
+| E3 | Offline then enroll | B comes online enrolled | Honest `GET /home` (same pointer, or `elsewhere` / `adoption_pending` naming A's Home); no second mint. Seating is #449, not current #507. | **#507** (report + no mint) |
+| E4 | Kill during Hidden withdraw | Withdraw; kill; restart; scan **local** discovery | Still no synthesized Hidden card on local discover. Do not treat unproved public broadcast as the gate. | **#509** (local residual) |
 
 ### F. Tasks + group KV
 
@@ -81,7 +81,7 @@
 | F2 | Encrypted store create + put/get | POST /groups/:id/stores Encrypted | Round-trip sealed | **#508** |
 | F3 | Plaintext delta rejected | Plaintext on encrypted topic | Never merges | **#508** |
 | F4 | Unconfigured encrypted sync | Publish without secure context | Hard error; no plaintext publish | **#508** |
-| F5 | Home tasks follow elected Home | Tasks on A; B adopts | B sees lists; loser not authoritative | **#507** |
+| F5 | Home tasks follow elected Home | Tasks on A; B adopts | **Pending #449 seating.** After B is seated on the elected Home, B sees lists; loser not authoritative. Not a current #507 gate. | future #449 |
 
 ## Harness risk (#510)
 
@@ -100,6 +100,23 @@ Prefer reducing contention (scheduling) over hiding the failure. UAT scenarios A
 
 ## First runnable smoke (S0)
 
-Two named local instances sharing owner key (enrolled). Compare GET /home. FAIL if both 200 local-ish with different group_ids. PASS if same group_id or B reports elsewhere/adoption_pending.
+Two named local instances sharing owner key (enrolled). Compare `GET /home`.
 
-Runnable skeleton (observes already-running local named instances; does not start daemons): [`reliability-s0-home-dedup-smoke.sh`](reliability-s0-home-dedup-smoke.sh).
+- **PASS (0):** both HTTP statuses in 2xx (prefer exactly 200) **and** both have the same non-empty `group_id`. B may be local-ish (absent `resolution` counts as local-ish for pre-#507) or honest `elsewhere` / `adoption_pending` **naming that same canonical id**.
+- **FAIL (1):** both 2xx, both local-ish/authoritative, different non-empty `group_id`s.
+- **INCONCLUSIVE (3):** non-2xx on either side; JSON/schema errors; missing `group_id`; honest B pointing at a **different** `group_id` than A (conflicting pointers); anything else. Non-2xx never PASS.
+
+Runnable skeleton: [`reliability-s0-home-dedup-smoke.sh`](reliability-s0-home-dedup-smoke.sh).
+
+- **Live daemon mode** still uses `ALICE_URL` / `ALICE_B_URL` / `ALICE_TOK` / `ALICE_B_TOK` against already-running local named instances (no mesh).
+- **Fixture mode** is the acceptance-oracle proof without a daemon or mesh: `--fixture <name>` or `--self-test` over [`reliability-s0-fixtures/`](reliability-s0-fixtures/). Required fixtures: `pass-same-id`, `pass-elsewhere-canonical`, `fail-duplicate-local`, `inconclusive-b-500-elsewhere`, `inconclusive-b-503-same-id`, `inconclusive-elsewhere-wrong-id`.
+
+## Future / #449 complete (not current #507 gates)
+
+These remain open until #449 seating lands and any rider/device Home eligibility rule is **ADR-reviewed**. They must **not** be used to declare partial #507 complete.
+
+| ID | Scenario | Why it is not a current #507 gate |
+|---|---|---|
+| C1 (complete) | HomeInvite redeem seats the joiner on the elected Home | HomeInvite / cross-device adoption **withdrawn** from current #507 |
+| B4 (complete) | Device vs Rider Home eligibility | Requires a future ADR. Must not invent `OwnerIssuedCert.mode` exclusion — Accepted [ADR-0039](../adr/0039-agent-harness-boundary.md) is **mode-agnostic** Home eligibility; the synced journal materializes mode `Acp` |
+| F5 (complete) | Home tasks follow elected Home after B is seated | Requires #449 seating; current #507 only converges the pointer and reports honestly |

@@ -1,0 +1,15 @@
+{
+  "expected_exit": 1,
+  "alice_status": 200,
+  "alice_body": {
+    "ok": true,
+    "group_id": "home-a",
+    "resolution": "local"
+  },
+  "alice_b_status": 200,
+  "alice_b_body": {
+    "ok": true,
+    "group_id": "home-b",
+    "resolution": "local"
+  }
+}
