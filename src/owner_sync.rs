@@ -1390,6 +1390,18 @@ impl OwnerSyncStore {
         self.records.read().await.values().cloned().collect()
     }
 
+    /// The winning value for one `(kind, key)`, if any.
+    ///
+    /// Used by the #449 Home-pointer mint gate, which must decide whether
+    /// to yield to a peer's canonical Home before minting its own.
+    pub async fn stored_value(&self, kind: SyncKind, key: &str) -> Option<SyncValue> {
+        self.records
+            .read()
+            .await
+            .get(&(kind, key.to_string()))
+            .map(|record| record.value.clone())
+    }
+
     /// The per-kind version table (with record hashes) for the handshake.
     pub async fn version_vector(&self) -> Vec<KindVersions> {
         let records = self.records.read().await;
@@ -1850,6 +1862,111 @@ async fn read_paged_records<R: AsyncRead + Unpin>(
 
 pub const DEFAULT_SYNC_INTERVAL: Duration = Duration::from_secs(60);
 
+/// #449 (D3): whether a device may mint `desired` into the single
+/// `("home")` register, given the current winner `stored`.
+///
+/// The register is one LWW slot per owner, and [`OwnerSyncStore::mint`]
+/// short-circuits ONLY on exact value equality — otherwise it takes the slot
+/// at `version + 1`. `reconcile_local_state` runs every
+/// [`DEFAULT_SYNC_INTERVAL`], so two enrolled devices holding different Homes
+/// used to fight over the slot forever: each pass bumped the version, flipped
+/// the canonical pointer, re-signed a record and re-persisted the store, once
+/// per device per minute, without end.
+///
+/// The rule that ends it — deterministic, clock-skew tolerant, and monotone,
+/// so it terminates:
+///
+/// - empty register: mint (we may genuinely be the owner's first device);
+/// - the register already names OUR Home: only that Home's designated primary
+///   agent refreshes it, so the slot has a single writer and roster churn
+///   cannot ping-pong between co-members;
+/// - the register names a DIFFERENT Home: mint only if ours is strictly
+///   preferable under `(provisioned_at_ms, group_id)` — oldest Home wins, id
+///   breaks ties. Both devices compare the same two tuples and so compute the
+///   same winner; the value strictly decreases under that order, so the
+///   register converges after at most one flip per device.
+///
+/// Yielding devices publish nothing, which is what lets `mint`'s equality
+/// check hold the slot stable once converged.
+///
+/// Consequence accepted for this phase: a non-primary co-member does not
+/// refresh the winner's roster projection, so `HomePointer.roster` can go
+/// stale. Harmless today — the apply arm is a no-op (#449 P1+ acts on it),
+/// and the authoritative roster is the group's signed commit chain, never
+/// this pointer.
+#[must_use]
+fn home_pointer_mint_decision(
+    desired: &SyncValue,
+    stored: Option<&SyncValue>,
+    local_agent_hex: &str,
+    stored_is_retired: bool,
+) -> bool {
+    let SyncValue::HomePointer {
+        group_id: desired_id,
+        primary_agent: desired_primary,
+        provisioned_at_ms: desired_at,
+        ..
+    } = desired
+    else {
+        debug_assert!(false, "mint decision called with a non-HomePointer value");
+        return false;
+    };
+    let Some(stored_value) = stored else {
+        return true; // empty register
+    };
+    let SyncValue::HomePointer {
+        group_id: stored_id,
+        provisioned_at_ms: stored_at,
+        ..
+    } = stored_value
+    else {
+        return true; // defensively: a foreign kind is not a Home winner
+    };
+
+    // r3 P2: the slot is held by a Home we can PROVE is retired. Take it —
+    // the ordering rule below would otherwise refuse, because a replacement
+    // Home is always newer than the dead one, leaving every device yielding
+    // to a tombstone forever.
+    if stored_is_retired && desired_id != stored_id {
+        return true;
+    }
+
+    if desired_id == stored_id {
+        // Single-writer refresh: only the Home's designated primary agent,
+        // and only when the value actually changed. `mint` would no-op on an
+        // unchanged value anyway, but deciding "no" here keeps the contract
+        // "a write would change something" — so the register's quiescence is
+        // observable at THIS level, which is what the oscillation regression
+        // test asserts on.
+        return local_agent_hex == desired_primary && desired != stored_value;
+    }
+
+    // Strict improvement only — monotone, therefore terminating.
+    (*desired_at, desired_id.as_str()) < (*stored_at, stored_id.as_str())
+}
+
+/// The owner's canonical Home, as advertised on the Tier-1 register (#449).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CanonicalHome {
+    /// Stable group id of the owner's Home.
+    pub group_id: String,
+    /// Hex agent id of that Home's designated primary agent.
+    pub primary_agent: String,
+    /// Unix ms when it was provisioned (the election's first key).
+    pub provisioned_at_ms: u64,
+    /// Roster projection as of the advertising device's last mint.
+    pub roster: Vec<HomeRosterEntry>,
+}
+
+/// Record key for the owner's canonical Home pointer.
+///
+/// A CONSTANT key, so `(HomePointer, "home")` is one LWW register per owner
+/// rather than one record per device. Every enrolled device writes the same
+/// slot, which is what makes it an election (see
+/// `home_pointer_mint_decision`, #449). Not an intra-doc link: that function
+/// is private, and a public item may not link to one.
+pub const HOME_POINTER_KEY: &str = "home";
+
 /// Concurrent sync sessions this daemon will run at once (inbound +
 /// outbound combined). The acceptor's bounded queue drops (resets) streams
 /// beyond this — an enrolled peer cannot wedge an unbounded task set
@@ -1869,6 +1986,14 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
+    /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
+    ///
+    /// Proof is local: the group is in our roster and carries the terminal
+    /// `withdrawn` flag. Inability to see the group is NOT proof — a Home on
+    /// an unreachable device is unknown, and treating unknown as retired
+    /// would let a partitioned device mint over the owner's real Home.
+    /// Implementations MUST be non-blocking and answer `false` when unsure.
+    fn canonical_pointer_is_retired(&self, group_id: &str) -> bool;
 }
 
 /// Current daemon self-profile names, best-effort snapshot.
@@ -2210,14 +2335,16 @@ impl OwnerSyncService {
             )
             .await;
             if let Some(home_value) = view.home_pointer() {
-                self.mint_or_log(
-                    SyncKind::HomePointer,
-                    "home",
-                    home_value,
-                    owner_kp,
-                    local_machine,
-                )
-                .await;
+                if self.should_mint_home_pointer(&home_value).await {
+                    self.mint_or_log(
+                        SyncKind::HomePointer,
+                        HOME_POINTER_KEY,
+                        home_value,
+                        owner_kp,
+                        local_machine,
+                    )
+                    .await;
+                }
             }
         }
 
@@ -2253,6 +2380,58 @@ impl OwnerSyncService {
             }
         }
         Ok(())
+    }
+
+    /// The owner's CANONICAL Home per the Tier-1 `("home")` register (#449).
+    ///
+    /// `None` means no owner device has advertised a Home yet — which is not
+    /// the same as "this owner has no Home": an un-synced device simply has
+    /// not heard one. Callers must treat absence as "unknown", never as
+    /// "none exists".
+    pub async fn canonical_home(&self) -> Option<CanonicalHome> {
+        match self
+            .store
+            .stored_value(SyncKind::HomePointer, HOME_POINTER_KEY)
+            .await
+        {
+            Some(SyncValue::HomePointer {
+                group_id,
+                primary_agent,
+                provisioned_at_ms,
+                roster,
+                ..
+            }) => Some(CanonicalHome {
+                group_id,
+                primary_agent,
+                provisioned_at_ms,
+                roster,
+            }),
+            _ => None,
+        }
+    }
+
+    /// Thin async wrapper over [`home_pointer_mint_decision`] (#449 D3).
+    async fn should_mint_home_pointer(&self, desired: &SyncValue) -> bool {
+        let stored = self
+            .store
+            .stored_value(SyncKind::HomePointer, HOME_POINTER_KEY)
+            .await;
+        // r3 P2: a stored pointer naming a Home we hold and know to be
+        // retired must not keep the slot. Without this the ordering rule
+        // would refuse every replacement, since a new Home is always NEWER
+        // than the dead one it replaces.
+        let stored_is_retired = match (&stored, self.view()) {
+            (Some(SyncValue::HomePointer { group_id, .. }), Some(view)) => {
+                view.canonical_pointer_is_retired(group_id)
+            }
+            _ => false,
+        };
+        home_pointer_mint_decision(
+            desired,
+            stored.as_ref(),
+            &hex::encode(self.agent.agent_id().as_bytes()),
+            stored_is_retired,
+        )
     }
 
     async fn mint_or_log(
@@ -2292,10 +2471,10 @@ impl OwnerSyncService {
                 // future surfacing (ADR-0041 Tier-1 scope).
             }
             SyncValue::HomePointer { .. } => {
-                // Stored in the record map for adoption by future Home
-                // provisioning; cross-machine Home adoption (TreeKEM
-                // re-key, key packages) is deliberately out of Tier-1
-                // scope (gapcheck blocker 32).
+                // The register is read on demand (`canonical_home`) by the
+                // Home resolution path rather than pushed here: provisioning,
+                // `GET /home` and adoption all need the CURRENT winner, not
+                // whatever happened to arrive last (#449).
             }
             SyncValue::IssuanceJournal {
                 agent_id,
@@ -3710,5 +3889,170 @@ mod r5_tests {
         .await
         .expect_err("poisoned store refuses sessions");
         assert!(matches!(err, SyncError::Poisoned(_)));
+    }
+}
+
+/// #449 (D3): the `"home"` register must converge, not oscillate.
+#[cfg(test)]
+mod home_pointer_election_tests {
+    use super::*;
+
+    fn home_ptr(
+        group_id: &str,
+        primary: &str,
+        provisioned_at_ms: u64,
+        roster: Vec<HomeRosterEntry>,
+    ) -> SyncValue {
+        SyncValue::HomePointer {
+            group_id: group_id.into(),
+            policy: GroupPolicy::default(),
+            roster,
+            primary_agent: primary.into(),
+            provisioned_at_ms,
+        }
+    }
+
+    /// An owner's second device must not fight the first for the register.
+    ///
+    /// Regression test for the write-amplification loop: before the mint
+    /// gate, each device re-minted its own Home every
+    /// [`DEFAULT_SYNC_INTERVAL`], so the canonical pointer flipped forever
+    /// and every flip re-signed and re-persisted a record. The property that
+    /// matters is TERMINATION — the devices must stop writing — so this
+    /// asserts the mint count falls to zero and stays there, not merely that
+    /// some particular device won.
+    #[test]
+    fn home_pointer_election_terminates_instead_of_oscillating() {
+        // Two owner devices, each having auto-provisioned its own Home.
+        // Ids are deliberately ordered against the timestamps so a naive
+        // id-only rule would disagree with the intended winner.
+        let devices = [
+            ("agent-a", home_ptr("g-bbb", "agent-a", 1_000, vec![])),
+            ("agent-b", home_ptr("g-aaa", "agent-b", 2_000, vec![])),
+        ];
+
+        let mut register: Option<SyncValue> = None;
+        let mut mints_per_round = Vec::new();
+        for _ in 0..10 {
+            let mut mints = 0;
+            for (agent_hex, desired) in &devices {
+                if home_pointer_mint_decision(desired, register.as_ref(), agent_hex, false) {
+                    register = Some(desired.clone());
+                    mints += 1;
+                }
+            }
+            mints_per_round.push(mints);
+        }
+
+        // Writes must cease. Pre-fix this was [2, 2, 2, …] without end.
+        assert!(
+            mints_per_round[2..].iter().all(|&m| m == 0),
+            "register never settled — devices still minting: {mints_per_round:?}"
+        );
+
+        let Some(SyncValue::HomePointer { group_id, .. }) = register else {
+            panic!("register empty after convergence");
+        };
+        assert_eq!(
+            group_id, "g-bbb",
+            "the OLDEST Home must win, regardless of id ordering"
+        );
+    }
+
+    /// Both devices must elect the same winner from the same pair of
+    /// candidates, whichever order they observe them in — otherwise the
+    /// register cannot converge in the field.
+    #[test]
+    fn home_pointer_election_is_order_independent() {
+        let older = home_ptr("g-zzz", "agent-a", 1_000, vec![]);
+        let newer = home_ptr("g-aaa", "agent-b", 2_000, vec![]);
+
+        // Newer already in the slot: the older device takes it.
+        assert!(home_pointer_mint_decision(
+            &older,
+            Some(&newer),
+            "agent-a",
+            false
+        ));
+        // Older already in the slot: the newer device yields.
+        assert!(!home_pointer_mint_decision(
+            &newer,
+            Some(&older),
+            "agent-b",
+            false
+        ));
+    }
+
+    /// Equal `provisioned_at_ms` — a genuine simultaneous genesis, or just
+    /// coarse clocks — must still break deterministically, on group id, or
+    /// both devices could believe they won.
+    #[test]
+    fn home_pointer_election_breaks_timestamp_ties_on_group_id() {
+        let a = home_ptr("g-aaa", "agent-a", 5_000, vec![]);
+        let b = home_ptr("g-bbb", "agent-b", 5_000, vec![]);
+        assert!(home_pointer_mint_decision(&a, Some(&b), "agent-a", false));
+        assert!(!home_pointer_mint_decision(&b, Some(&a), "agent-b", false));
+    }
+
+    /// A slot held by a PROVABLY retired Home must be takeable (r3 P2).
+    ///
+    /// The ordering rule alone refuses every replacement here, because a new
+    /// Home is always NEWER than the dead one it replaces — so without this
+    /// override the register keeps naming a tombstone forever and every
+    /// device yields to it. The proof is local (`withdrawn` in our own
+    /// roster); an unreachable remote Home is unknown, not retired, and must
+    /// NOT be overridden.
+    #[test]
+    fn a_provably_retired_pointer_can_be_replaced_by_a_newer_home() {
+        let retired = home_ptr("g-old", "agent-a", 1_000, vec![]);
+        let replacement = home_ptr("g-new", "agent-a", 9_999, vec![]);
+
+        assert!(
+            !home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", false),
+            "without proof of retirement the ordering rule stands: a newer Home does not win"
+        );
+        assert!(
+            home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", true),
+            "a provably retired pointer must be replaceable despite being older"
+        );
+    }
+
+    /// The owner's first device must publish: an empty register is not a
+    /// reason to stay silent, or no Home is ever advertised at all.
+    #[test]
+    fn home_pointer_mints_into_an_empty_register() {
+        assert!(home_pointer_mint_decision(
+            &home_ptr("g-aaa", "agent-a", 1, vec![]),
+            None,
+            "agent-a",
+            false
+        ));
+    }
+
+    /// Once the register names a Home, only that Home's designated PRIMARY
+    /// agent may refresh it. Co-members re-minting their own roster
+    /// projection of the same group would reintroduce the oscillation in a
+    /// different guise.
+    #[test]
+    fn only_the_primary_agent_refreshes_its_own_home_pointer() {
+        let stored = home_ptr("g-aaa", "agent-a", 1_000, vec![]);
+        let refreshed = home_ptr(
+            "g-aaa",
+            "agent-a",
+            1_000,
+            vec![HomeRosterEntry {
+                agent_id: "agent-b".into(),
+                role: GroupRole::Member,
+                state: GroupMemberState::Active,
+            }],
+        );
+        assert!(
+            home_pointer_mint_decision(&refreshed, Some(&stored), "agent-a", false),
+            "the primary agent must be able to refresh its own Home pointer"
+        );
+        assert!(
+            !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b", false),
+            "a co-member must not refresh the primary's Home pointer"
+        );
     }
 }

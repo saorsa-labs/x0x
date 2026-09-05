@@ -67,8 +67,123 @@ pub(in crate::server) fn home_policy(
 /// Whether `policy` is EXACTLY the Home policy for `owner` — all five axes
 /// (review fix 3: the crash-recovery scan must match the whole shape, not
 /// just name+admission).
-fn is_home_policy(policy: &crate::groups::GroupPolicy, owner: &crate::identity::UserId) -> bool {
+pub(in crate::server) fn is_home_policy(
+    policy: &crate::groups::GroupPolicy,
+    owner: &crate::identity::UserId,
+) -> bool {
     *policy == home_policy(owner)
+}
+
+/// #449: where the owner's Home lives, from THIS device's point of view.
+///
+/// Before this existed, `GET /home` had exactly two outcomes — a local Home
+/// or a 404 — so a second owner device could not say "the Home is on another
+/// device". It returned its OWN duplicate as the owner's Home instead, which
+/// is what made N devices silently become N Homes with no error anywhere.
+#[derive(Debug, Clone)]
+pub(in crate::server) enum HomeResolution {
+    /// We are seated in the owner's canonical Home.
+    Local {
+        group_id: String,
+        info: Box<crate::groups::GroupInfo>,
+    },
+    /// The canonical Home lives on another device and we hold none.
+    Elsewhere { canonical: String },
+    /// We hold a Home that LOST the election; adoption into `canonical` is
+    /// pending. Our local Home stays fully usable until that completes.
+    AdoptionPending { local: String, canonical: String },
+    /// No Home anywhere yet, or an un-owned install.
+    Unknown,
+}
+
+/// Resolve [`HomeResolution`] for the current owner (#449).
+///
+/// The canonical Home is the Tier-1 `("home")` register winner. Absence of a
+/// register value means "no owner device has advertised one yet" — NOT "none
+/// exists" — so an un-synced device with its own Home still reports `Local`.
+/// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
+///
+/// Proof means: the group is in our own roster and carries the terminal
+/// `withdrawn` flag. Not being able to see the group is deliberately NOT
+/// proof — a canonical Home living on an unreachable device is simply
+/// unknown, and treating unknown as retired would let any partitioned device
+/// mint over the owner's real Home.
+async fn is_provably_retired(state: &Arc<AppState>, group_id: &str) -> bool {
+    state.named_groups.read().await.iter().any(|(id, info)| {
+        (id.as_str() == group_id || info.stable_group_id() == group_id) && info.withdrawn
+    })
+}
+
+/// The canonical Home pointer that should actually govern this device (r3 P2).
+///
+/// The stored `("home")` record survives the withdrawal of the Home it names —
+/// tombstone retention never touches owner-sync state — so a device that
+/// retires its own advertised Home would otherwise keep yielding to the dead
+/// pointer forever and never build a replacement. Filtering the PUBLISHER was
+/// only half the fix; the stored record has to stop governing too.
+pub(in crate::server) async fn effective_canonical_home(state: &Arc<AppState>) -> Option<String> {
+    let canonical = state
+        .owner_sync
+        .as_ref()?
+        .canonical_home()
+        .await
+        .map(|home| home.group_id)?;
+    if is_provably_retired(state, &canonical).await {
+        tracing::info!(
+            group_id = %canonical,
+            "canonical Home pointer names a group we hold and know to be retired; ignoring it (#449)"
+        );
+        return None;
+    }
+    Some(canonical)
+}
+
+pub(in crate::server) async fn resolve_home(state: &Arc<AppState>) -> HomeResolution {
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return HomeResolution::Unknown;
+    };
+    let owner = user_kp.user_id();
+    let local = find_home(state.as_ref(), &owner).await;
+    let canonical = effective_canonical_home(state).await;
+    // Prefer the CANONICAL Home whenever we are already seated in it. After
+    // adoption a device is briefly seated in both its old duplicate and the
+    // canonical Home; without this, `find_home`'s smallest-id rule could
+    // keep answering with the duplicate.
+    if let Some(canonical) = canonical.as_deref() {
+        let groups = state.named_groups.read().await;
+        if let Some(info) = groups.get(canonical).filter(|info| {
+            !info.withdrawn
+                && info.home.is_some()
+                && is_home_policy(&info.policy, &owner)
+                && info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes()))
+        }) {
+            return HomeResolution::Local {
+                group_id: canonical.to_string(),
+                info: Box::new(info.clone()),
+            };
+        }
+    }
+
+    match (local, canonical) {
+        (Some((group_id, info)), canonical) => {
+            match canonical {
+                // Seated in a Home the register does NOT name: we lost the
+                // election and must adopt the canonical one.
+                Some(canonical) if canonical != group_id => HomeResolution::AdoptionPending {
+                    local: group_id,
+                    canonical,
+                },
+                // Uncontested, or already the canonical Home.
+                _ => HomeResolution::Local {
+                    group_id,
+                    info: Box::new(info),
+                },
+            }
+        }
+        // Not seated anywhere, but the owner's Home is advertised elsewhere.
+        (None, Some(canonical)) => HomeResolution::Elsewhere { canonical },
+        (None, None) => HomeResolution::Unknown,
+    }
 }
 
 /// TRUSTED Home resolution (review fix 1): a group is this machine's Home
@@ -95,14 +210,23 @@ pub(in crate::server) async fn find_home(
             pending.iter().cloned().collect()
         };
         let groups = state.named_groups.read().await;
+        // #449: `.find()` over an unordered map made this nondeterministic
+        // once a device was seated in more than one Home-shaped group —
+        // which is exactly the state adoption passes through. Select the
+        // smallest stable id so every caller agrees, and never match a
+        // WITHDRAWN group: withdrawal keeps `members_v2` and `home`
+        // populated, so a retired Home would otherwise still resolve here
+        // and wedge `GET /home` plus re-provisioning forever (D5).
         let found = groups
             .iter()
-            .find(|(id, info)| {
+            .filter(|(id, info)| {
                 !pending_before.iter().any(|p| p == id.as_str())
+                    && !info.withdrawn
                     && info.home.is_some()
                     && is_home_policy(&info.policy, owner)
                     && info.has_active_member(&local_hex)
             })
+            .min_by(|(_, a), (_, b)| a.stable_group_id().cmp(b.stable_group_id()))
             .map(|(id, info)| (id.clone(), info.clone()));
         let pending_after: Vec<String> = {
             let pending = state
@@ -527,7 +651,26 @@ pub(in crate::server) async fn provision_home(state: &Arc<AppState>) {
         return;
     }
 
-    // 3) Fresh provisioning through the full creation path.
+    // 3) #449: another owner device has already advertised the owner's Home.
+    //    Minting a second one here is exactly the reported bug — N devices
+    //    becoming N competing Homes. Yield instead: `GET /home` reports
+    //    `elsewhere`, and adoption seats us in the canonical Home.
+    //
+    //    Absence of a register value means "nobody has advertised one yet",
+    //    NOT "none exists", so an un-synced or first device still provisions
+    //    optimistically — that is what keeps an offline install usable.
+    //    A pointer naming a Home we hold and know to be RETIRED does not
+    //    count (r3 P2): the stored record outlives the group it names, so
+    //    yielding to it would leave this device permanently without a Home.
+    if let Some(canonical) = effective_canonical_home(state).await {
+        tracing::info!(
+            canonical_group_id = %canonical,
+            "owner's Home is advertised by another device; not provisioning a duplicate (#449)"
+        );
+        return;
+    }
+
+    // 4) Fresh provisioning through the full creation path.
     let req = CreateGroupRequest {
         name: "Home".to_string(),
         description: "Owner's personal space (auto-provisioned)".to_string(),
@@ -651,6 +794,29 @@ fn primary_agent_trusted(
     })
 }
 
+/// 200 body for "the owner's Home lives on another device" (#449).
+///
+/// Deliberately NOT a 404: the caller asked where the owner's Home is, and
+/// "on another device, not yet joined" answers that. A 404 here is what made
+/// a second device look Home-less and silently provision a duplicate.
+fn home_elsewhere_response(
+    owner: &crate::identity::UserId,
+    canonical: &str,
+    local: Option<&str>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "state": "elsewhere",
+            "owner_user_id": hex::encode(owner.as_bytes()),
+            "canonical_group_id": canonical,
+            "local_group_id": local,
+            "detail": "the owner's Home lives on another device; this device is not a member yet",
+        })),
+    )
+}
+
 /// GET /home — resolve the Home group and its metadata. Trust-checked
 /// (review fix 5): the group must be the CURRENT owner's Home with our
 /// agent an active member; the primary agent's verification status is
@@ -670,8 +836,22 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         return not_found("no Home provisioned (un-owned install)");
     };
     let owner = user_kp.user_id();
-    let Some((group_id, info)) = find_home(state.as_ref(), &owner).await else {
-        return not_found("no Home provisioned");
+    // #449: "the Home is on another device" is a real answer, not a 404.
+    // Reporting 404 there is what let a duplicate stay invisible.
+    let (group_id, info, adopting_from) = match resolve_home(&state).await {
+        HomeResolution::Local { group_id, info } => (group_id, *info, None),
+        HomeResolution::AdoptionPending { local, canonical } => {
+            match find_home(state.as_ref(), &owner).await {
+                Some((_, info)) => (local, info, Some(canonical)),
+                // Raced with a membership change: fall back to the honest
+                // "not seated here" answer rather than serving stale state.
+                None => return home_elsewhere_response(&owner, &canonical, None),
+            }
+        }
+        HomeResolution::Elsewhere { canonical } => {
+            return home_elsewhere_response(&owner, &canonical, None)
+        }
+        HomeResolution::Unknown => return not_found("no Home provisioned"),
     };
     let home = info
         .home
@@ -716,6 +896,12 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
             // axis is OwnerCertified(owner), so this IS the Home policy
             // admission owner id (additive, backwards-compatible field).
             "owner_user_id": hex::encode(owner.as_bytes()),
+            // #449: which Home this device is actually serving. `local` is
+            // the settled case; `adoption_pending` means this Home LOST the
+            // election and stays usable only until we are seated in
+            // `canonical_group_id`.
+            "state": if adopting_from.is_some() { "adoption_pending" } else { "local" },
+            "canonical_group_id": adopting_from,
             "group_id": group_id,
             "name": info.name,
             "description": info.description,
@@ -976,6 +1162,213 @@ pub(in crate::server::routes) mod tests {
         assert!(
             find_home(&state, &owner).await.is_some(),
             "provisioned despite corrupt marker"
+        );
+        Ok(())
+    }
+
+    /// Publish `group_id` as the owner's canonical Home on the Tier-1
+    /// register, as a peer device would (#449).
+    async fn advertise_canonical_home(state: &Arc<AppState>, group_id: &str) {
+        let sync = state.owner_sync.as_ref().expect("owned state wires sync");
+        let owner_kp = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key");
+        sync.store()
+            .mint(
+                crate::owner_sync::SyncKind::HomePointer,
+                crate::owner_sync::HOME_POINTER_KEY,
+                &crate::owner_sync::SyncValue::HomePointer {
+                    group_id: group_id.to_string(),
+                    policy: home_policy(&owner_kp.user_id()),
+                    roster: vec![],
+                    primary_agent: "aa".repeat(32),
+                    provisioned_at_ms: 1,
+                },
+                owner_kp,
+                state.agent.machine_id(),
+            )
+            .await
+            .expect("mint canonical Home pointer");
+    }
+
+    /// WHY (#449): THE bug. A second owner device used to auto-provision its
+    /// OWN Home because dedup was per-machine, leaving an owner with N
+    /// devices holding N competing Homes and no error anywhere.
+    ///
+    /// Once a peer has advertised the owner's Home on the Tier-1 register,
+    /// this device must yield rather than mint a duplicate.
+    #[tokio::test]
+    async fn second_device_does_not_provision_a_duplicate_home() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5A; 32]).await?;
+        let owner = owner_of(&state);
+        let canonical = "dd".repeat(16);
+        advertise_canonical_home(&state, &canonical).await;
+
+        provision_home(&state).await;
+
+        assert!(
+            find_home(&state, &owner).await.is_none(),
+            "a second device must not provision its own Home once the owner's is advertised"
+        );
+        let home_shaped = state
+            .named_groups
+            .read()
+            .await
+            .values()
+            .filter(|info| is_home_policy(&info.policy, &owner))
+            .count();
+        assert_eq!(home_shaped, 0, "no duplicate Home group may be created");
+        Ok(())
+    }
+
+    /// WHY (#449): "the Home is on another device" must be a real answer.
+    /// Reporting 404 is what let the duplicate stay invisible — the device
+    /// looked Home-less, so nothing ever revealed the fork.
+    #[tokio::test]
+    async fn get_home_reports_a_home_that_lives_elsewhere() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5B; 32]).await?;
+        let canonical = "ee".repeat(16);
+        advertise_canonical_home(&state, &canonical).await;
+
+        let response = get_home(State(Arc::clone(&state))).await.into_response();
+        let (status, body) = response_json(response).await?;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "elsewhere is 200, not 404: {body:?}"
+        );
+        assert_eq!(body["state"], "elsewhere");
+        assert_eq!(body["canonical_group_id"], canonical);
+        Ok(())
+    }
+
+    /// WHY (r3 P2): the stored-pointer lifecycle — advertise, then withdraw,
+    /// then re-provision. This is the case the earlier test could not reach,
+    /// because it only inserted an already-withdrawn group into an EMPTY
+    /// store, so no stored pointer ever governed.
+    ///
+    /// Tombstone retention never clears owner-sync state, so the stored
+    /// `("home")` record outlives the Home it names. Filtering the publisher
+    /// stops future advertisements but leaves the old record governing: the
+    /// device yields to a dead pointer, provisions no replacement, and
+    /// `GET /home` reports `elsewhere` for a group that no longer exists.
+    ///
+    /// SCOPE LIMIT — this is an IN-PROCESS re-provision. It sets `withdrawn`
+    /// and calls `provision_home` directly; it does not restart a process or
+    /// reload the record store from disk. The claim it supports is "a stored
+    /// retired pointer stops governing a re-provision", NOT "this survives a
+    /// real restart" — the on-disk reload path holds by construction
+    /// (the record store is read back through the same `canonical_home`
+    /// accessor) but is not exercised here.
+    #[tokio::test]
+    async fn a_retired_advertised_home_does_not_suppress_its_replacement() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5D; 32]).await?;
+        let owner = owner_of(&state);
+
+        // 1. Advertise our real Home, exactly as a live device would.
+        provision_home(&state).await;
+        let (advertised, _) = find_home(&state, &owner).await.expect("Home provisioned");
+        advertise_canonical_home(&state, &advertised).await;
+
+        // 2. Retire it. The stored pointer still names it.
+        state
+            .named_groups
+            .write()
+            .await
+            .get_mut(&advertised)
+            .expect("advertised Home")
+            .withdrawn = true;
+        assert_eq!(
+            state
+                .owner_sync
+                .as_ref()
+                .expect("sync")
+                .canonical_home()
+                .await
+                .map(|home| home.group_id)
+                .as_deref(),
+            Some(advertised.as_str()),
+            "precondition: the retired Home is still the stored canonical pointer"
+        );
+
+        // 3. Re-provision in-process (NOT a process/disk restart — see above).
+        assert!(
+            effective_canonical_home(&state).await.is_none(),
+            "a pointer to a Home we hold and know to be retired must stop governing"
+        );
+        provision_home(&state).await;
+
+        let (replacement, info) = find_home(&state, &owner)
+            .await
+            .expect("a usable replacement Home must be provisioned");
+        assert_ne!(replacement, advertised, "the replacement is a NEW Home");
+        assert!(!info.withdrawn);
+        Ok(())
+    }
+
+    /// WHY (r3 P2): proof of retirement is LOCAL, and absence of knowledge is
+    /// not proof. A canonical Home living on a device we cannot currently
+    /// reach is unknown, not retired — clearing it would let any partitioned
+    /// device mint over the owner's real Home and refork the space this whole
+    /// issue exists to unify.
+    #[tokio::test]
+    async fn an_unreachable_remote_home_is_never_treated_as_retired() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5E; 32]).await?;
+        let remote = "ac".repeat(16);
+        advertise_canonical_home(&state, &remote).await;
+
+        assert_eq!(
+            effective_canonical_home(&state).await.as_deref(),
+            Some(remote.as_str()),
+            "a Home we simply cannot see must keep governing — unknown is not retired"
+        );
+
+        provision_home(&state).await;
+        assert!(
+            find_home(&state, &owner_of(&state)).await.is_none(),
+            "we must still yield to an unreachable canonical Home, not fork a new one"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449 D5): withdrawal keeps `members_v2` and `home` populated, so
+    /// without an explicit filter a RETIRED Home still resolves here — which
+    /// would make `GET /home` serve a tombstone and `provision_home` return
+    /// early forever, wedging Home permanently.
+    #[tokio::test]
+    async fn find_home_ignores_a_withdrawn_home() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x5C; 32]).await?;
+        let owner = owner_of(&state);
+        let id = "ab".repeat(16);
+        let mut info = crate::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            String::new(),
+            state.agent.agent_id(),
+            id.clone(),
+            home_policy(&owner),
+        );
+        info.home = Some(crate::groups::HomeMetadata {
+            primary_agent: hex::encode(state.agent.agent_id().as_bytes()),
+            placements: std::collections::BTreeMap::new(),
+            provisioned_at_ms: 1,
+        });
+        assert!(
+            info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes())),
+            "precondition: the creator is seated, so only `withdrawn` can exclude it"
+        );
+        info.withdrawn = true;
+        state.named_groups.write().await.insert(id, info);
+
+        assert!(
+            find_home(&state, &owner).await.is_none(),
+            "a withdrawn Home must never resolve as this device's Home"
         );
         Ok(())
     }
