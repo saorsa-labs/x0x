@@ -22859,31 +22859,208 @@ fn test_cert_events() -> tokio::sync::broadcast::Sender<VerifiedCertificate> {
     tokio::sync::broadcast::channel(VERIFIED_CERT_EVENT_CAPACITY).0
 }
 
-#[test]
-fn pairing_gate_fail_closed_acp_issue_time_pin_mismatch() {
-    // WHY: even an owner-signed, historically wrong ACP pin remains authority
-    // until explicitly repaired. An inbound announce cannot override it.
+#[tokio::test]
+async fn identity_ingest_preserves_owner_pin_despite_synced_rider_journal() {
+    // WHY: #512's former exception ran AFTER enforce_pairing returned a denial.
+    // Exercise the real signed PubSub -> identity listener -> discovery path,
+    // including the advisory ACP-shaped journal left by a synced Rider issuance.
+    fn certified_announcement(
+        subject: &identity::AgentKeypair,
+        machine: &identity::MachineKeypair,
+        cert: &identity::AgentCertificate,
+        announced_at: u64,
+    ) -> IdentityAnnouncement {
+        let mut announcement =
+            signed_identity_announcement_fixture(subject.agent_id(), machine, announced_at);
+        announcement.user_id = Some(cert.user_id().expect("certificate owner"));
+        announcement.agent_certificate = Some(cert.clone());
+        announcement.agent_public_key = subject.public_key().as_bytes().to_vec();
+        announcement.machine_signature = ant_quic::crypto::raw_public_keys::pqc::sign_with_ml_dsa(
+            machine.secret_key(),
+            &bincode::serialize(&announcement.to_unsigned()).expect("announcement bytes"),
+        )
+        .expect("machine attestation")
+        .as_bytes()
+        .to_vec();
+        announcement
+            .verify()
+            .expect("authentic certified announcement");
+        announcement
+    }
+
+    async fn publish(receiver: &Agent, announcement: &IdentityAnnouncement) {
+        // A verified relay envelope is valid for discovery; the listener still
+        // verifies the subject's machine attestation and owner certificate.
+        let fanout = receiver
+            .gossip_runtime
+            .as_ref()
+            .expect("private runtime")
+            .pubsub()
+            .publish_with_fanout(
+                IDENTITY_ANNOUNCE_TOPIC.to_string(),
+                serialize_identity_announcement(announcement)
+                    .expect("wire announcement")
+                    .into(),
+            )
+            .await
+            .expect("publish through real PubSub");
+        assert_eq!(fanout, 0, "fixture must never send to remote peers");
+    }
+
+    async fn await_certificate(
+        events: &mut tokio::sync::broadcast::Receiver<VerifiedCertificate>,
+        expected: identity::AgentId,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if events.recv().await.expect("certificate listener").agent_id == expected {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("listener must admit the positive-control certificate");
+    }
+
+    async fn listener_barrier(
+        receiver: &Agent,
+        machine: &identity::MachineKeypair,
+        events: &mut tokio::sync::broadcast::Receiver<VerifiedCertificate>,
+        now: u64,
+    ) {
+        let sentinel = identity::AgentKeypair::generate().expect("sentinel");
+        let cert = identity::AgentCertificate::issue(
+            receiver.identity.user_keypair().expect("fixture owner"),
+            &sentinel,
+        )
+        .expect("sentinel certificate");
+        publish(
+            receiver,
+            &certified_announcement(&sentinel, machine, &cert, now),
+        )
+        .await;
+        await_certificate(events, sentinel.agent_id()).await;
+    }
+
+    let dir = tempfile::tempdir().expect("isolated fixture");
     let owner = identity::UserKeypair::generate().expect("owner");
-    let agent = identity::AgentKeypair::generate().expect("agent");
-    let pin = identity::MachineId([0x11; 32]);
-    let harness = identity::MachineId([0x22; 32]);
+    let subject = identity::AgentKeypair::generate().expect("subject");
+    let pinned = identity::MachineKeypair::generate().expect("pinned machine");
+    let third = identity::MachineKeypair::generate().expect("third unrevoked machine");
+    let cert = identity::AgentCertificate::issue(&owner, &subject).expect("subject certificate");
+    let now = Agent::unix_timestamp_secs();
     let placement = key_move::PlacementRecord::sign(
-        agent.agent_id(),
+        subject.agent_id(),
         owner.public_key().as_bytes(),
-        key_move::Placement::Pinned(pin),
-        0,
-        1,
+        key_move::Placement::Pinned(pinned.machine_id()),
+        7,
+        now,
         owner.secret_key(),
     )
-    .expect("signed pin");
-    let placements = std::collections::HashMap::from([(agent.agent_id(), placement)]);
-    let revoked = revocation::RevocationSet::new();
-    assert_eq!(
-        key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &harness),
-        Some(key_move::PairingDenial::PlacementPinned { pinned_to: pin }),
-        "ACP issue-time pin mismatch must deny the harness announce"
+    .expect("intentional owner-signed later-epoch pin");
+    let rider = profile::IssuedCertRecord::from_cert_with_mode(
+        &owner.user_id(),
+        &cert,
+        profile::CertMode::Rider,
+        None,
+    )
+    .expect("Rider issuance");
+    // OwnerSyncService::apply_journal_line materializes exactly this Tier-1
+    // subset: hosting mode/certificate bytes do not travel and default to ACP.
+    // This fixture covers the resulting local hint, not the sync protocol.
+    let synced: profile::IssuedCertRecord = serde_json::from_value(serde_json::json!({
+        "user_id": rider.user_id,
+        "agent_id": rider.agent_id,
+        "cert_digest": rider.cert_digest,
+        "issued_at": rider.issued_at,
+        "not_after": null
+    }))
+    .expect("materialized synced Rider journal line");
+    assert_eq!(synced.mode, profile::CertMode::Acp);
+    assert!(synced.cert_b64.is_none());
+
+    let receiver = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_identity_dir(dir.path())
+        .with_peer_cache_dir(dir.path().join("peers"))
+        .with_user_key(owner)
+        .with_network_config(network::NetworkConfig {
+            bind_addr: Some("127.0.0.1:0".parse().expect("loopback")),
+            bootstrap_nodes: Vec::new(),
+            mdns_enabled: false,
+            port_mapping_enabled: false,
+            network_id: Some(format!(
+                "pr512-ingest-{}",
+                hex::encode(&subject.agent_id().0[..16])
+            )),
+            ..network::NetworkConfig::default()
+        })
+        .build()
+        .await
+        .expect("isolated receiver");
+    assert_ne!(third.machine_id(), pinned.machine_id());
+    assert_ne!(third.machine_id(), receiver.machine_id());
+    profile::IssuedCertRecord::append(receiver.cert_journal_path().expect("journal"), &synced)
+        .await
+        .expect("persist synced hint");
+    receiver
+        .move_state
+        .write()
+        .await
+        .cache_placement(
+            placement,
+            key_move::PlacementAuthority::cert_issuer(&cert).expect("issuer"),
+        )
+        .expect("authenticated placement admission");
+    assert!(!receiver
+        .revocation_set
+        .read()
+        .await
+        .is_machine_revoked(&third.machine_id()));
+    receiver
+        .start_identity_listener()
+        .await
+        .expect("real listener");
+    let mut events = receiver.subscribe_verified_certificates();
+
+    // First prove the asynchronously installed subscription is ready.
+    listener_barrier(&receiver, &pinned, &mut events, now).await;
+    let denied = certified_announcement(&subject, &third, &cert, now);
+    publish(&receiver, &denied).await;
+    // FIFO delivery on one subscribed topic plus a fresh accepted sentinel
+    // proves the preceding rejected announce reached the listener (no sleep).
+    listener_barrier(&receiver, &pinned, &mut events, now).await;
+    assert!(
+        !receiver
+            .identity_discovery_cache
+            .read()
+            .await
+            .contains_key(&subject.agent_id()),
+        "identity ingest must reject a third machine despite the synced ACP journal hint"
     );
-    assert!(key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &pin).is_none());
+    assert!(!receiver
+        .machine_discovery_cache
+        .read()
+        .await
+        .contains_key(&third.machine_id()));
+
+    let accepted = certified_announcement(&subject, &pinned, &cert, now);
+    publish(&receiver, &accepted).await;
+    await_certificate(&mut events, subject.agent_id()).await;
+    assert_eq!(
+        receiver
+            .identity_discovery_cache
+            .read()
+            .await
+            .get(&subject.agent_id())
+            .expect("pinned announcement admitted")
+            .machine_id,
+        pinned.machine_id()
+    );
+    receiver.shutdown().await;
 }
 
 #[tokio::test]
