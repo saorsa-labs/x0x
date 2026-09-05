@@ -361,8 +361,8 @@ history rows, no KV, no tasks), so the common case retires cleanly.
 |---|---|---|
 | **P0** ✅ | D3 + D4: stop the register war, make the published pointer deterministic | — |
 | **P1** ✅ | Election + `GET /home` states + suppression at provisioning | P0 |
-| **P2** ✅ | Invite delivery channel (§5.4) — `SyncKind::HomeInvite`; needs the ADR-0041 amendment | P1 |
-| **P3** ✅ | Winner-driven adoption + D5 (`!withdrawn` filter) | P2, #447 |
+| **P2** ⛔ | Invite delivery channel (§5.4) — WITHDRAWN, see below | P1 |
+| **P3** ⛔ | Winner-driven adoption — WITHDRAWN. D5 (`!withdrawn` filter) landed with P1 | P2, #447 |
 | **P4** | Retirement gate + D6/D7 cleanup; `conflict` state and forced adopt/retire endpoints | P3 |
 
 P0 is small, independently shippable, and blocks a regression that lands the
@@ -388,20 +388,33 @@ both its old duplicate and the canonical Home during adoption could answer with
 either. `resolve_home` additionally prefers the canonical Home whenever we are
 seated in it, so the transition settles deterministically.
 
-Adoption rides `SyncKind::HomeInvite` (0x05), keyed by joiner agent hex.
-The seated device enumerates the owner's agents from synced `IssuanceJournal`
-records — the daemon journals its own certificate (`lib.rs:12029-12055`), so a
-peer's agent id is already known without any new discovery — and mints an
-addressed v4 invite for each agent not yet seated. `DaemonView::apply_home_invite`
-redeems it in `mode: "home"` with the owner pinned. Both sides are idempotent
-and fire every sync pass until the join lands; a refusal (#447's cert-blob
-race) retries and never falls back to minting.
+**P2/P3 WITHDRAWN after review of `4629117`.** An implementation of §5.4 as a
+fifth Tier-1 kind (`SyncKind::HomeInvite`) plus a `CertMode::Acp` filter was
+written, reviewed, and removed. Three blocking defects, all properties of the
+mechanism rather than bugs in it:
 
-**Still open (P4):** retirement. The loser keeps its duplicate group after
-adopting — unused, and no longer Home-resolved, but present. Retiring it needs
-D6 (retiring a Hidden Home publishes a public card) and D7 (history,
-delegations, task lists and rider grants are orphaned) fixed first, plus the
-`conflict` state and the forced adopt/retire endpoints.
+1. **Signed-record compatibility.** The new variant was inserted ahead of
+   `IssuanceJournal`, shifting its bincode discriminant so `verify()`
+   reconstructed different signed bytes and invalidated pre-upgrade issuance
+   signatures. Appending fixes the ordering, but any change to a signed value's
+   shape sits in this hazard class and needs an old-record fixture.
+2. **Protocol compatibility.** A fifth closed-enum kind under an unchanged
+   protocol version 2 cannot be decoded by older peers, aborting the entire
+   owner-sync session — including unrelated names, profile and journal sync.
+   The kind needs negotiation or a staged rollout.
+3. **No trustworthy cross-device device/rider signal.** `apply_journal_line`
+   materializes synced issuance records with `mode: Acp`
+   (`owner_sync.rs:2567-2577`), and `owner_issued_certificates()` treats
+   journal records as authoritative on ties. A Rider issued on device A
+   therefore arrives on device B indistinguishable from a device agent, so the
+   filter was defeated in exactly the multi-device case it existed for. The
+   certificate does not carry hosting mode either. Inventing a device-only
+   rule in the implementation would have silently amended ADR-0039's
+   mode-agnostic Home eligibility and deny-by-default rider scope.
+
+So adoption, retirement, and any device-vs-rider Home eligibility rule are
+deferred and must be decided explicitly — with ADR-0039 reconciled, not
+bypassed. **#449 remains open.**
 
 Known limitation carried into P1: because a yielding device publishes nothing
 and only strict improvements take the slot, a register naming a Home whose

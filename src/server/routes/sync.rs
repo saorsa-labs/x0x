@@ -21,87 +21,6 @@ use super::status::ApiResponse;
 use crate::owner_sync::{OwnerEnrollment, SyncDaemonView, SyncProfileNames, SyncValue};
 use crate::server::state::AppState;
 
-/// Home invite lifetime (#449). Long enough to survive a device being off
-/// for a few days, short enough that a leaked record stops admitting.
-const HOME_INVITE_TTL_SECS: u64 = 7 * 24 * 60 * 60;
-
-fn now_unix_ms_local() -> u64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis() as u64)
-}
-
-/// Whether an owner-issued certificate identifies a DEVICE that should be
-/// invited into the owner's Home (#449).
-///
-/// ADR-0039 `Rider` agents are owner-certified too, so they would pass Home's
-/// `OwnerCertified` admission on merit — but they are scoped API-key
-/// sub-agents, not machines the owner runs. Inviting them would quietly widen
-/// the owner's private space, the opposite of ADR-0038's "membership = the
-/// owner's agents only". An expired certificate is skipped because it cannot
-/// pass admission at the far end anyway; minting for it just burns a fresh
-/// invite secret on every pass.
-#[must_use]
-fn is_owner_device_cert(
-    mode: crate::profile::CertMode,
-    not_after: Option<u64>,
-    now_secs: u64,
-) -> bool {
-    mode == crate::profile::CertMode::Acp && !not_after.is_some_and(|exp| exp <= now_secs)
-}
-
-/// Mint a v4 `SignedInvite` for `joiner` into the owner's Home (#449).
-///
-/// Addressed (`intended_joiner`), so the authority compares it against
-/// `MemberJoined.member_agent_id` and the invite cannot be redeemed by any
-/// other agent even if the record leaks.
-async fn mint_home_invite(
-    state: &Arc<AppState>,
-    home_id: &str,
-    joiner: &str,
-) -> Option<(String, u64)> {
-    use axum::response::IntoResponse;
-    let body = serde_json::json!({
-        "expiry_secs": HOME_INVITE_TTL_SECS,
-        "intended_joiner": joiner,
-    })
-    .to_string();
-    let mut headers = axum::http::HeaderMap::new();
-    headers.insert(
-        axum::http::header::CONTENT_TYPE,
-        axum::http::HeaderValue::from_static("application/json"),
-    );
-    let response = super::named_groups::create_group_invite(
-        State(Arc::clone(state)),
-        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
-        axum::extract::Path(home_id.to_string()),
-        headers,
-        axum::body::Bytes::from(body),
-    )
-    .await
-    .into_response();
-    if !response.status().is_success() {
-        tracing::warn!(
-            target: "x0x::owner_sync",
-            status = %response.status(),
-            "Home invite mint failed; retrying next pass"
-        );
-        return None;
-    }
-    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
-        .await
-        .ok()?;
-    let body: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
-    let invite = body
-        .get("invite")
-        .and_then(serde_json::Value::as_str)?
-        .to_string();
-    Some((
-        invite,
-        now_unix_ms_local().saturating_add(HOME_INVITE_TTL_SECS.saturating_mul(1_000)),
-    ))
-}
-
 /// Adapter over live daemon state for the sync service.
 ///
 /// `profile_names` keeps a last-seen mirror: `apply_names` writes it
@@ -178,6 +97,14 @@ impl SyncDaemonView for DaemonView {
             .iter()
             .filter(|(id, info)| {
                 !pending.iter().any(|p| p == id.as_str())
+                    // Review P2: withdrawal keeps `home` and `members_v2`
+                    // populated, so without this a RETIRED Home would be
+                    // republished as the owner's canonical one — and because
+                    // provisioning yields to a named canonical Home, every
+                    // device would then refuse to make a replacement while
+                    // `GET /home` reported `elsewhere`. Mirrors the
+                    // `!withdrawn` guard in `find_home`.
+                    && !info.withdrawn
                     && info.home.is_some()
                     && super::home::is_home_policy(&info.policy, &owner)
                     && info.has_active_member(&local_hex)
@@ -207,165 +134,6 @@ impl SyncDaemonView for DaemonView {
                     .map(|h| h.provisioned_at_ms)
                     .unwrap_or_default(),
             })
-    }
-
-    fn apply_home_invite(&self, group_id: &str, invite_b64: &str) {
-        let state = Arc::clone(&self.state);
-        let group_id = group_id.to_string();
-        let invite = invite_b64.to_string();
-        tokio::spawn(async move {
-            let Some(owner) = state.agent.identity().user_keypair().map(|kp| kp.user_id()) else {
-                return;
-            };
-            // Idempotent: this fires on every sync pass until the join
-            // lands, so a completed adoption must not re-redeem.
-            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-            if state
-                .named_groups
-                .read()
-                .await
-                .get(&group_id)
-                .is_some_and(|info| !info.withdrawn && info.has_active_member(&local_hex))
-            {
-                return;
-            }
-            let req = serde_json::json!({
-                "invite": invite,
-                // #469 A3: home mode pins the admission owner, so an invite
-                // whose owner countersignature covers a DIFFERENT owner is
-                // refused rather than joined.
-                "mode": "home",
-                "expected_owner_user_id": hex::encode(owner.as_bytes()),
-            });
-            let req = match serde_json::from_value(req) {
-                Ok(req) => req,
-                Err(e) => {
-                    tracing::warn!(target: "x0x::owner_sync", "malformed Home join request: {e}");
-                    return;
-                }
-            };
-            use axum::response::IntoResponse;
-            let response =
-                super::named_groups::join_group_via_invite(State(Arc::clone(&state)), Json(req))
-                    .await
-                    .into_response();
-            if response.status().is_success() {
-                tracing::info!(
-                    target: "x0x::owner_sync",
-                    group_id = %group_id,
-                    "joined the owner's canonical Home (#449 adoption)"
-                );
-            } else {
-                // #447: the winner may not have our cert blob yet, so a
-                // refusal is expected and TRANSIENT. Retry on the next pass
-                // — never fall back to minting a second Home, which is the
-                // bug this whole path exists to remove.
-                tracing::debug!(
-                    target: "x0x::owner_sync",
-                    group_id = %group_id,
-                    status = %response.status(),
-                    "Home adoption deferred; retrying next sync pass"
-                );
-            }
-        });
-    }
-
-    fn reconcile_home_invites(&self) {
-        let state = Arc::clone(&self.state);
-        tokio::spawn(async move {
-            let Some(sync) = state.owner_sync.clone() else {
-                return;
-            };
-            let Some(owner_kp) = state.agent.identity().user_keypair() else {
-                return;
-            };
-            // #449: adoption is scoped to ENROLLED devices. Enrollment
-            // (`POST /sync/devices/enroll`) is the owner's explicit "these
-            // machines are mine" assertion and the trust anchor for the whole
-            // mechanism (ADR-0060) — an agent merely holding an owner cert is
-            // not thereby a device the owner wants seated in Home. With no
-            // enrolled peer there is also nobody to sync an invite TO, so
-            // minting one would burn a fresh invite secret every pass for no
-            // reader.
-            let enrolled_peers = sync
-                .store()
-                .enrolled_devices()
-                .await
-                .into_iter()
-                .any(|device| device.machine_id != state.agent.machine_id().0);
-            if !enrolled_peers {
-                return;
-            }
-            // Only the device SEATED in the canonical Home can seal
-            // `MemberAdded`, so only it issues invites.
-            let (home_id, home_info) = match super::home::resolve_home(&state).await {
-                super::home::HomeResolution::Local { group_id, info } => (group_id, info),
-                _ => return,
-            };
-            let machine = state.agent.machine_id();
-            let local_hex = hex::encode(state.agent.agent_id().as_bytes());
-            let now = now_unix_ms_local();
-
-            let now_secs = now / 1_000;
-            for cert in state.agent.owner_issued_certificates().await {
-                // #449: invite the owner's DEVICES, not everything the owner
-                // ever certified. ADR-0039 `Rider` agents are owner-certified
-                // too — and so would pass Home's `OwnerCertified` admission —
-                // but they are scoped API-key sub-agents, not machines the
-                // owner runs. Auto-seating them would quietly widen the
-                // owner's private space, the opposite of ADR-0038's
-                // "membership = the owner's agents only".
-                if !is_owner_device_cert(cert.mode, cert.not_after, now_secs) {
-                    continue;
-                }
-                let joiner = cert.agent_id;
-                if joiner == local_hex || home_info.has_active_member(&joiner) {
-                    continue;
-                }
-                // Idempotent: keep a live invite rather than re-minting one
-                // every pass (each mint consumes a fresh secret).
-                if let Some(crate::owner_sync::SyncValue::HomeInvite {
-                    group_id,
-                    expires_at_ms,
-                    ..
-                }) = sync
-                    .store()
-                    .stored_value(crate::owner_sync::SyncKind::HomeInvite, &joiner)
-                    .await
-                {
-                    if group_id == home_id && (expires_at_ms == 0 || expires_at_ms > now) {
-                        continue;
-                    }
-                }
-                let Some((invite_b64, expires_at_ms)) =
-                    mint_home_invite(&state, &home_id, &joiner).await
-                else {
-                    continue;
-                };
-                if let Err(e) = sync
-                    .store()
-                    .mint(
-                        crate::owner_sync::SyncKind::HomeInvite,
-                        &joiner,
-                        &crate::owner_sync::SyncValue::HomeInvite {
-                            group_id: home_id.clone(),
-                            invite_b64,
-                            for_agent: joiner.clone(),
-                            expires_at_ms,
-                        },
-                        owner_kp,
-                        machine,
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        target: "x0x::owner_sync",
-                        agent = %joiner,
-                        "failed to publish Home invite: {e}"
-                    );
-                }
-            }
-        });
     }
 
     fn apply_names(
@@ -807,26 +575,40 @@ mod tests {
         Ok(())
     }
 
-    /// WHY (#449): a rider must never be auto-seated in the owner's Home.
+    /// WHY (review P2): a RETIRED Home must never be advertised as canonical.
     ///
-    /// ADR-0039 `Rider` agents ARE owner-certified, so they pass Home's
-    /// `OwnerCertified` admission on merit — the only thing keeping a scoped
-    /// API-key sub-agent out of the owner's private space is this filter.
-    /// Home membership is the owner's DEVICES (ADR-0038), not everything the
-    /// owner has ever certified.
-    #[test]
-    fn home_invites_go_to_devices_never_to_riders() {
-        use crate::profile::CertMode;
-        assert!(is_owner_device_cert(CertMode::Acp, None, 100));
+    /// Withdrawal keeps `home` and `members_v2` populated, so without an
+    /// explicit guard the publisher would republish a retired Home as the
+    /// owner's canonical one. Because provisioning yields to a named canonical
+    /// Home, every device would then refuse to create a replacement while
+    /// `GET /home` reported `elsewhere` — the owner would be left with no Home
+    /// and no way to get one. Mirrors the `!withdrawn` guard in `find_home`.
+    #[tokio::test]
+    async fn a_withdrawn_home_is_never_published_as_canonical() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x4C; 32]).await?;
+        let owner = state
+            .agent
+            .identity()
+            .user_keypair()
+            .expect("owned state has a user key")
+            .user_id();
+
+        let id = "dd".repeat(16);
+        let mut info = home_group(&state, &owner, &id, true);
         assert!(
-            !is_owner_device_cert(CertMode::Rider, None, 100),
-            "a rider must never be invited into the owner's Home"
+            info.has_active_member(&hex::encode(state.agent.agent_id().as_bytes())),
+            "precondition: seated, so only `withdrawn` can exclude it"
         );
+        info.withdrawn = true;
+        state.named_groups.write().await.insert(id, info);
+
+        let view = DaemonView::new(Arc::clone(&state));
         assert!(
-            !is_owner_device_cert(CertMode::Acp, Some(100), 100),
-            "an expired cert cannot pass admission; minting for it burns invites"
+            view.home_pointer().is_none(),
+            "a withdrawn Home must not be advertised as the owner's canonical Home"
         );
-        assert!(is_owner_device_cert(CertMode::Acp, Some(101), 100));
+        Ok(())
     }
 
     /// WHY (#449 D4): a Home we are not seated in belongs to another device.
