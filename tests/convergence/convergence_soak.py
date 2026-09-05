@@ -225,6 +225,9 @@ class Node:
         self.config_path.write_text(
             f'instance_name = "{self.name}"\n'
             f'data_dir = "{self.data_dir}"\n'
+            # Legacy daemons do not honor X0X_HOME; keep named identities
+            # under the disposable node root on every supported version.
+            f'identity_dir = "{self.data_dir}"\n'
             f'api_address = "127.0.0.1:{self.api_port}"\n'
             f'bind_address = "127.0.0.1:{self.quic_port}"\n'
             f'log_level = "{self.log_level}"\n'
@@ -2260,7 +2263,8 @@ def run_forged_first_seen_gate(args, out_dir):
         # real gossip via the daemon's /publish wire API.
         cmd = [str(inj), "--daemon", creator.base, "--token", creator.token,
                "--topic", topic, "--variant", "missing_att"]
-        log(f"forged_first_seen_task: injector {cmd}")
+        log(f"forged_first_seen_task: injector={inj} daemon={creator.base} "
+            f"topic={topic} variant=missing_att")
         proc = subprocess.run(cmd, capture_output=True, text=True,
                               timeout=60)
         published = False
