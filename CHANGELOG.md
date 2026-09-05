@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [v0.41.4] - 2026-09-05
+
 ### Added
 
 - **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design
@@ -54,6 +56,51 @@ All notable changes to this project will be documented in this file.
   announce (however authentic) or an adopted checkpoint claiming any
   non-Encrypted policy — or a different group binding — is rejected
   instead of silently un-encrypting replicas back onto plaintext paths.
+
+- **Encrypted-store lifecycle checks.** Publication fails closed when an
+  encrypted sync has no configured security context. Missing or withdrawn
+  groups invalidate GSS contexts and retire associated daemon store handles.
+
+- **Canonical Home reporting.** Enrolled owner devices elect a deterministic
+  canonical pointer and report local, adoption-pending or elsewhere state.
+  A pointer to a locally proven withdrawn Home no longer suppresses a live
+  replacement. An unknown or unreachable remote Home is never assumed retired.
+  Cross-device adoption and duplicate retirement remain outstanding (#449);
+  ADR-0060 remains Proposed.
+
+- **Hidden-group local discovery.** Withdrawing a Hidden group no longer
+  leaves it listed through cached cards or synthesized discovery responses.
+  ListedToContacts entries and public withdrawal tombstones retain their
+  listing behavior. Regression coverage includes a subscribed-peer negative
+  observation with a public tombstone positive control (#506).
+
+- **Stale KV checkpoints cannot prune newer state.** Full-state synchronization
+  now distinguishes rejected stale checkpoints from accepted merges before
+  destructive pruning, under the same store lock. Genuine owner deletions and
+  checkpoint-less deletion recovery remain supported (#518).
+
+- **Gossip participation diagnostics.** `/diagnostics/gossip` now exposes the
+  resolved Leaf/Full mode, its reason, and subscription-aware relay counters
+  needed to measure forwarding efficiency (#521).
+
+- **Published agent-card version consistency.** Version bumps update Cargo,
+  SKILL and the static agent card together. Release validation checks the
+  packaged card too; reformatted JSON is supported, and invalid inputs are
+  rejected before any version file is written (#520).
+
+### Testing
+
+- Home acceptance tooling uses the actual API response fields and rejects
+  failed HTTP responses instead of reporting a false pass.
+- Convergence fixtures explicitly keep current and legacy identities inside
+  disposable data directories. Injector command logging omits the API token.
+
+- Encrypted-store rejection tests prove the listener processed an authorized
+  sealed marker before checking that a forbidden key is absent (#518).
+- Restart readiness tests retain delayed probes from the current invocation
+  across retry rounds while preserving the 20-second watchdog. Core, groups
+  and network CI jobs omit unused release prebuilds; all test commands and
+  deadline limits remain unchanged (#523).
 
 ## [v0.41.3] - 2026-09-05
 
