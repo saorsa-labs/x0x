@@ -2,7 +2,7 @@
 
 **Owner:** Tester
 **Scope:** Reproducible user-acceptance matrix. Observes real product paths (CLI/REST against **local named instances**). Does **not** implement product fixes on #507 / #508 / #509.
-**Out of scope as product pass:** #510 (harness flakiness under parallel load) — treat as harness risk; never close a product gate because an isolation re-run was green.
+**Out of scope as product pass:** [#510](https://github.com/saorsa-labs/x0x/issues/510) (P2 — test scheduling/diagnostics; [source-grounded triage](https://github.com/saorsa-labs/x0x/issues/510#issuecomment-5551971328)). Treat as **harness risk only**. Never close a product gate because an isolation re-run was green. Do **not** weaken required observations, skip/quarantine the tests, inflate deadlines, or add retries to paper over flakes (ADR-0025: completed observations; a genuine production-path bug has presented with the same isolated-pass signature).
 
 **Target regressions (product):**
 
@@ -19,7 +19,7 @@
 1. Two (or three) **named local instances** under distinct `X0X_HOME` / data dirs and ports — e.g. `alice`, `bob`, `alice-device-b`. Prefer loopback + shared hermetic `network_id`, **not** production mesh / public discovery daemons.
 2. Observe via CLI (`x0x …`) and matching REST. Prefer CLI when it is the product surface.
 3. Each scenario names **PASS** and the **FAIL signature** that proves the target regression is still live.
-4. Do not bump timeouts or quarantine tests to make a scenario green (#510).
+4. Do not bump timeouts, quarantine/skip required tests, or add retries to paper over flakes and make a scenario green (#510 / ADR-0025).
 5. No merge / release from this slice. Authors do not approve their own PR.
 
 ## Matrix
@@ -85,7 +85,18 @@
 
 ## Harness risk (#510)
 
-Isolation PASS is insufficient to dismiss hs_f2 / a2a deadline failures under full-suite load. Product scenarios run as dedicated local-instance scripts, not saturated nextest. Do not raise budgets/auto-retry first.
+[#510](https://github.com/saorsa-labs/x0x/issues/510) is **P2** (test scheduling/diagnostics; keep open). Triage: [comment 5551971328](https://github.com/saorsa-labs/x0x/issues/510#issuecomment-5551971328). This UAT slice treats it as **harness risk only** — not a product acceptance gate.
+
+Isolation PASS is insufficient to dismiss `hs_f2_membership_cluster` / a2a deadline failures under full-suite load. The same isolated-pass signature has already hidden a genuine production-path defect. Product scenarios run as dedicated local-instance scripts, not saturated nextest.
+
+Do **not**:
+
+- weaken or drop required observations
+- skip / quarantine the discovered tests
+- inflate wall-clock deadlines first
+- add retries / retry-until-green to paper over flakes
+
+Prefer reducing contention (scheduling) over hiding the failure. UAT scenarios A1–F5 / D1–D5 / E1–E4 / S0 are otherwise unchanged.
 
 ## First runnable smoke (S0)
 
