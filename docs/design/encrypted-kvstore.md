@@ -14,6 +14,25 @@ point; `Encrypted` is TERMINAL (no announce or checkpoint may un-encrypt
 a replica). Partitioned concurrent rekey reconciliation and quorum
 checkpoint authority remain open (see the rekey section below).
 
+### ADR scope and security-property honesty
+
+- **GSS-only in v1, per the accepted ADR landscape.** ADR-0010 describes
+  the GSS plane and — though its forward path was superseded — remains the
+  accurate description of the legacy GSS groups; ADR-0012 (TreeKEM as the
+  default plane for NEW private groups) explicitly RETAINS the GSS plane
+  for grandfathered groups and public encrypted presets. Encrypted KvStore
+  v1 binds `SecureContext` to that GSS plane and the daemon route
+  REJECTS `SecureGroupPlane::TreeKem` groups for encrypted stores.
+- **No FS/PCS claims.** GSS gives rekey-on-removal FUTURE confidentiality
+  only: no per-message forward secrecy within an epoch, no post-compromise
+  security, and old ciphertext already received by a removed member stays
+  readable to them. Any statement that encrypted KvStore records carry
+  TreeKEM-grade forward secrecy is wrong for this backend.
+- **A TreeKEM `SecureContext` backend is future work and stays Proposed**:
+  implementing it behind the existing trait boundary does not change any
+  Accepted ADR; making it the default for encrypted stores WOULD be a new
+  decision and requires human engineering review (David).
+
 The original proposal text follows, retained as the design record.
 
 ---

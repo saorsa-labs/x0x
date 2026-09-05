@@ -1,11 +1,23 @@
 //! GSS-backed [`KvSecureContext`] for encrypted group KvStores (issue #341
 //! Phase B).
 //!
+//! ## ADR scope (read before claiming properties)
+//!
 //! This is the v1 secure backend chosen by the encrypted-KvStore design
-//! (`docs/design/encrypted-kvstore.md`, ADR-0010): the named-group GSS
-//! plane, whose entire crypto state is `GroupInfo.shared_secret` +
-//! `secret_epoch`. A `TreeKem` backend can implement the same trait later
-//! without touching store or sync code.
+//! (`docs/design/encrypted-kvstore.md`): the named-group **GSS** plane —
+//! the legacy plane ADR-0010 describes and ADR-0012 explicitly RETAINS for
+//! grandfathered groups and public encrypted presets. Its entire crypto
+//! state is `GroupInfo.shared_secret` + `secret_epoch`.
+//!
+//! - **GSS is not TreeKEM.** This backend provides rekey-on-removal FUTURE
+//!   confidentiality only: there is NO per-message forward secrecy within
+//!   an epoch and NO post-compromise security. Old records already received
+//!   by a removed member stay readable to them. Do not claim otherwise.
+//! - Encrypted KvStore v1 REJECTS `SecureGroupPlane::TreeKem` groups (the
+//!   daemon route gate does this explicitly) — a TreeKEM-backed context is
+//!   future work and any decision to ship it stays Proposed until human
+//!   engineering review. The [`KvSecureContext`] trait is the boundary that
+//!   keeps that future change store/sync-neutral.
 //!
 //! The context keeps a **synchronous internal snapshot** (secret, epoch,
 //! active-member set) of the authoritative `GroupInfo` because the store
@@ -90,6 +102,11 @@ impl GssKvSecureContext {
     /// Cheap no-op when nothing security-relevant changed. Ignores group
     /// states for a DIFFERENT stable group id (guards against a mis-wired
     /// refresh hook silently re-keying the context onto another group).
+    ///
+    /// A WITHDRAWN group is terminal lifecycle (#341): the snapshot is
+    /// INVALIDATED (secret dropped, roster emptied) and never re-armed from
+    /// a tombstone, so an `invalidate()`d context cannot be resurrected by
+    /// refreshing from withdrawn state.
     pub fn update_from_group(&self, info: &GroupInfo) {
         let mut state = self
             .state
@@ -102,6 +119,17 @@ impl GssKvSecureContext {
                 state.stable_group_id,
                 info.stable_group_id()
             );
+            return;
+        }
+        if info.withdrawn {
+            tracing::warn!(
+                target: "x0x::kv",
+                "gss kv context INVALIDATED for group {} (epoch {}): authoritative state is WITHDRAWN —                  sealing, opening, and membership all fail closed",
+                state.stable_group_id,
+                state.secret_epoch
+            );
+            state.shared_secret = None;
+            state.active_members.clear();
             return;
         }
         let next = GssState::from_group(info);
@@ -127,8 +155,14 @@ impl GssKvSecureContext {
     ///
     /// `fetch_group` re-reads the authoritative `GroupInfo` (however the
     /// embedder holds it — the daemon reads its named-groups map) and this
-    /// context is refreshed from whatever it returns. Returning `None`
-    /// leaves the current snapshot untouched.
+    /// context is refreshed from whatever it returns.
+    ///
+    /// Lifecycle: `None` means the group NO LONGER EXISTS locally (left,
+    /// removed) — the context is INVALIDATED, never left holding the stale
+    /// secret/roster. A returned withdrawn tombstone likewise invalidates
+    /// (see [`update_from_group`](Self::update_from_group)). `fetch_group`
+    /// must therefore return the last-known state while a read is merely
+    /// contended, and `None` only when the group is truly gone.
     #[must_use]
     pub fn refresh_hook<F, Fut>(ctx: Arc<Self>, fetch_group: F) -> crate::kv::sync::SecureRefreshFn
     where
@@ -142,8 +176,15 @@ impl GssKvSecureContext {
             let ctx = Arc::clone(&ctx);
             let fetch_group = Arc::clone(&fetch_group);
             Box::pin(async move {
-                if let Some(info) = fetch_group().await {
-                    ctx.update_from_group(&info);
+                match fetch_group().await {
+                    Some(info) => ctx.update_from_group(&info),
+                    None => {
+                        tracing::warn!(
+                            target: "x0x::kv",
+                            "gss kv refresh found NO group state — invalidating context (group left or removed)"
+                        );
+                        ctx.invalidate();
+                    }
                 }
             }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
         })
@@ -374,6 +415,107 @@ mod tests {
         ctx.update_from_group(&rejoined);
         assert!(ctx.seal(&store_id, b"x").is_ok());
         assert!(ctx.is_active_member(&member));
+    }
+
+    #[tokio::test]
+    async fn refresh_hook_invalidates_when_group_disappears() {
+        // Regression (PR #508 review r2 P1): the exported helper used to
+        // treat `None` from the authoritative source as a no-op, retaining
+        // the stale secret and roster after the group vanished (leave or
+        // removal). `None` is lifecycle: the context must fail closed on
+        // sealing, opening, AND membership until a re-armed refresh.
+        let member = AgentId([1; 32]);
+        let info = group("gone-g", member);
+        let ctx = Arc::new(GssKvSecureContext::from_group(&info).expect("context"));
+        let store_id = KvStoreId::new([8; 32]);
+        let (epoch, nonce, ciphertext) = ctx.seal(&store_id, b"before leave").expect("seal");
+        assert!(ctx.is_active_member(&member));
+
+        // The authoritative state is gone: fetch returns None.
+        let hook = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), || async { None });
+        hook().await;
+
+        assert!(
+            !ctx.is_active_member(&member),
+            "stale roster must not survive a missing-group refresh"
+        );
+        assert!(
+            ctx.seal(&store_id, b"after leave").is_err(),
+            "stale secret must not survive a missing-group refresh"
+        );
+        assert!(
+            ctx.open(&store_id, epoch, &nonce, &ciphertext).is_err(),
+            "old-epoch records must not open after a missing-group refresh"
+        );
+
+        // Re-arm ONLY from a live, matching, non-withdrawn group state.
+        let rejoined = group("gone-g", member);
+        let rearm = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), move || {
+            let rejoined = rejoined.clone();
+            async move { Some(rejoined) }
+        });
+        rearm().await;
+        assert!(ctx.seal(&store_id, b"rejoined").is_ok());
+        assert!(ctx.is_active_member(&member));
+    }
+
+    #[tokio::test]
+    async fn refresh_hook_never_rearms_from_withdrawn_tombstone() {
+        // Regression (PR #508 review r2 P1): a withdrawn GroupInfo passed
+        // through the helper used to RESTORE the secret and roster — even
+        // on an already-invalidated context. A tombstone is terminal
+        // lifecycle: it must deepen the invalidation, never re-arm it.
+        let member = AgentId([1; 32]);
+        let mut info = group("wd-g", member);
+        let ctx = Arc::new(GssKvSecureContext::from_group(&info).expect("context"));
+        // Retired context (e.g. the leave path already invalidated it).
+        ctx.invalidate();
+        // The tombstone still carries a secret + roster (as retained
+        // withdrawn state can); refreshing from it must NOT re-arm.
+        info.withdrawn = true;
+        let hook = GssKvSecureContext::refresh_hook(Arc::clone(&ctx), move || {
+            let info = info.clone();
+            async move { Some(info) }
+        });
+        hook().await;
+
+        assert!(
+            !ctx.is_active_member(&member),
+            "withdrawn refresh must not restore the roster"
+        );
+        assert!(
+            ctx.seal(&KvStoreId::new([9; 32]), b"after withdrawal")
+                .is_err(),
+            "withdrawn refresh must not restore the secret"
+        );
+    }
+
+    #[tokio::test]
+    async fn update_from_group_withdrawn_invalidates_armed_context() {
+        // Direct boundary coverage: update_from_group itself (not only the
+        // helper) invalidates an ARMED context on withdrawn state — and a
+        // FOREIGN group's tombstone still does nothing (guard ordering).
+        let member = AgentId([1; 32]);
+        let info = group("arm-g", member);
+        let ctx = GssKvSecureContext::from_group(&info).expect("context");
+        let store_id = KvStoreId::new([4; 32]);
+        assert!(ctx.seal(&store_id, b"armed").is_ok());
+
+        // Foreign tombstone: ignored entirely, context stays armed.
+        let mut foreign = group("other-g", member);
+        foreign.withdrawn = true;
+        ctx.update_from_group(&foreign);
+        assert!(
+            ctx.seal(&store_id, b"still armed").is_ok(),
+            "a foreign tombstone must not touch this context"
+        );
+
+        // Matching tombstone: invalidates.
+        let mut withdrawn = group("arm-g", member);
+        withdrawn.withdrawn = true;
+        ctx.update_from_group(&withdrawn);
+        assert!(!ctx.is_active_member(&member));
+        assert!(ctx.seal(&store_id, b"post-withdraw").is_err());
     }
 
     #[test]
