@@ -8,10 +8,7 @@
       "kind": "pending",
       "machine_id": null
     },
-    "harness_machine": {
-      "machine_id": "harness-m",
-      "agent_ids": []
-    },
+    "harness_machine": null,
     "ledger_capture": {
       "method": "GET",
       "path": "/owner/placement",
@@ -42,7 +39,7 @@
             "is_local": false,
             "revoked": false,
             "placement": null,
-            "cert_not_after": null
+            "cert_not_after": 1800000001
           }
         ]
       }

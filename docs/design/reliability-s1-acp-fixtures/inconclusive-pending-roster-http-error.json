@@ -1,5 +1,5 @@
 {
-  "expected_exit": 0,
+  "expected_exit": 3,
   "snapshot": {
     "agent_id": "acp-1",
     "owner_machine_id": "owner-m",
@@ -8,10 +8,7 @@
       "kind": "pending",
       "machine_id": null
     },
-    "harness_machine": {
-      "machine_id": "harness-m",
-      "agent_ids": []
-    },
+    "harness_machine": null,
     "ledger_capture": {
       "method": "GET",
       "path": "/owner/placement",
@@ -28,7 +25,7 @@
     "roster_capture": {
       "method": "GET",
       "path": "/owner/agents",
-      "http_status": 200,
+      "http_status": 403,
       "request_started_at_unix_ms": 1800000000000,
       "response_received_at_unix_ms": 1800000000100,
       "body": {

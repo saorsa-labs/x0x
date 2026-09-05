@@ -43,27 +43,24 @@ The corrected `f1418a0` **removes the identity-ingest bypass** and **defers mint
 
 Observe via CLI / REST on isolated named local instances: explicit disposable `identity_dir` and data directories, loopback, empty bootstrap peers and disabled persistent peer cache, mDNS and UPnP. A shared `network_id` alone is not network isolation. Assemble one observational snapshot and retain the underlying HTTP captures (without tokens):
 
-```json
-{
-  "ledger_capture": {"method": "GET", "path": "/owner/placement", "http_status": 200,
-    "body": {"ok": true, "placements": []}},
-  "agent_id": "…",
-  "owner_machine_id": "…",
-  "placement": {"kind": "pending", "machine_id": null},
-  "journal_mode": "acp",
-  "harness_machine": null
-}
-```
+Complete pending example: [`pass-pending-unknown-harness.json`](reliability-s1-acp-fixtures/pass-pending-unknown-harness.json). Its `snapshot` contains the agent and owner IDs, placement/harness observations, and two retained HTTP response captures:
 
-`ledger_capture` must preserve the actual successful durable-owner `GET /owner/placement` response after issuance (and again after discovery). The abbreviated empty `placements` above illustrates pending only. For a pinned snapshot retain its actual ledger row, including `agent_id`, `kind`, `pinned_machine`, and `epoch`; the oracle checks it agrees with the assembled pin. This hand-built format is not a product wire response or cryptographic attestation.
+- `roster_capture`: successful `GET /owner/agents`, after issuance and before the mint request.
+- `ledger_capture`: successful `GET /owner/placement`, which actually triggers lazy mint.
 
-G1 maps to `placement.kind=pending` only after HTTP 200, `body.ok=true`, a valid `placements` array, and **no row for this agent**. Also require no pin and an explicitly observed absent harness (`null`) or a valid machine observation whose `agent_ids` array excludes this agent. Preserve the observation showing absence; missing or malformed captures are inconclusive. A per-agent 404 alone proves neither that mint ran nor that prevention worked.
+For pending, both capture wrappers record `request_started_at_unix_ms` and `response_received_at_unix_ms` from the same local recorder, immediately before sending and after receiving each request. Await the roster response before invoking mint; require its receive timestamp to be strictly before the mint request's start. Missing, overlapping, or reversed timing is inconclusive. These are recorder metadata, not fields returned by the API.
 
-Sources when live evidence is collected: `GET /owner/placement` / `GET /owner/agents/:id/placement` (`kind`, `pinned_machine`, `epoch`); identity / health for `owner_machine_id`; `GET /machines/discovered/:id` / `x0x machines get` for `agent_ids`.
+`ledger_capture` must preserve the actual successful durable-owner `GET /owner/placement` response after issuance (and again after discovery). An empty matching-agent selection in `placements` illustrates pending only. For a pinned snapshot retain its actual ledger row, including `agent_id`, `kind`, `pinned_machine`, and `epoch`; the oracle checks it agrees with the assembled pin. This hand-built format is not a product wire response or cryptographic attestation.
+
+An omitted agent could be unissued or mistyped. Before G1, retain `GET /owner/agents` with HTTP 200 and `ok=true`. Its `owner_user_id` must match the snapshot and ledger, and exactly one `agents` row must match `agent_id`. For this fresh ACP fixture require the actual API fields `mode="acp"`, `from_journal=true`, `is_local=false`, `revoked=false`, `placement=null`, and `cert_not_after` either null or later than the ledger response time. An issuance POST success alone does not replace this roster/ordering check. These requirements select a clean G1 fixture; they do not claim the mint implementation filters expired/revoked records. Do not revoke, renew, move, or change owner between these sequential captures.
+
+G1 maps to `placement.kind=pending` only with that earlier eligible roster evidence and after HTTP 200, `body.ok=true`, a valid `placements` array, and **no row for this agent**. Also require no pin and an explicitly observed absent harness (`null`) or a valid machine observation whose `agent_ids` array excludes this agent. Preserve the observation showing absence; missing or malformed captures are inconclusive. A per-agent 404 alone proves neither that mint ran nor that prevention worked.
+
+Sources when live evidence is collected: `GET /owner/agents` (`owner_user_id`, `agents` eligibility fields above); `GET /owner/placement` / `GET /owner/agents/:id/placement` (`kind`, `pinned_machine`, `epoch`); identity / health for `owner_machine_id`; `GET /machines/discovered/:id` / `x0x machines get` for `agent_ids`.
 
 | ID | Scenario | Steps (product path) | Acceptance (PASS) | FAIL signature |
 |---|---|---|---|---|
-| G1 | Defer mint until harness machine known | Issue ACP cert; trigger `GET /owner/placement` **before** harness announce/discovery and retain status/body | Successful ledger capture omits agent; normalize to pending with no pin/binding; **no** epoch-0 `Pinned(owner)` | Epoch-0 pin to owner machine while harness unknown |
+| G1 | Defer mint until harness machine known | Issue ACP cert; capture matching eligible `GET /owner/agents` row; then trigger `GET /owner/placement` **before** discovery and retain ordered status/body captures | Successful ledger capture omits agent; normalize to pending with no pin/binding; **no** epoch-0 `Pinned(owner)` | Epoch-0 pin to owner machine while harness unknown |
 | G2 | After discovery, pin = harness ≠ owner | Harness announces; trigger `GET /owner/placement` again; read ledger + `machines get` | `Pinned(harness_machine)`; `harness ≠ owner`; `agent_ids` contains ACP id | Still `Pinned(owner)` and/or `agent_ids: []` |
 | G3 | Second local daemon binds agent | Second isolated named instance on the same test `network_id`; observe presence / `agent_ids` | Replica machine record lists the ACP id | Replica `agent_ids: []` while QUIC/machine present |
 | G4 | Intentional/current pin still enforced | Pin ACP to machine X (epoch ≥ 0, including later epochs); announce from unrevoked machine Y; journal may say `mode=Acp` | `PlacementPinned` **denies**; Y must **not** bind solely because journal `mode=Acp` | Ingest accepts Y and `agent_ids` gains the ACP id on Y (**P1** @ `833bfe86`) |
@@ -78,16 +75,16 @@ G4 regressions the HOLD asked for: intentional/current pin, later placement epoc
 
 Classifier (one snapshot; no daemon):
 
-- **PASS (0):** `Pinned` to harness machine **≠** owner **and** `harness_machine.agent_ids` contains `agent_id`. **Or** pending/unbound with no pin or harness bind **and** a successful lazy-mint ledger capture omitting this agent (G1). All PASS results require consistent ledger evidence.
+- **PASS (0):** `Pinned` to harness machine **≠** owner **and** `harness_machine.agent_ids` contains `agent_id`. **Or** pending/unbound with no pin or harness bind **and** a successful lazy-mint ledger capture omitting this agent (G1). All PASS results require consistent ledger evidence; pending also requires matching eligible roster evidence captured before mint. Pinned acceptance remains unchanged.
 - **FAIL (1):** `Pinned` to **owner** with valid empty `agent_ids` or an explicitly absent harness (current hole). **Or** agent bound on a machine that is **not** the pin (wrong-machine / `mode=Acp` fail-open — never PASS).
-- **INCONCLUSIVE (3):** missing/error ledger capture, missing `placement` or required ids, malformed binding evidence, contradictory pending/pin observations, or any other unclassifiable shape.
+- **INCONCLUSIVE (3):** missing/error ledger or pending roster capture, ineligible/unissued/mismatched agent or owner, missing/reversed capture order, missing `placement` or required ids, malformed binding evidence, contradictory pending/pin observations, or any other unclassifiable shape.
 
 Required fixtures:
 
 | name | expected |
 |---|---|
 | `pass-pin-harness-machine` | 0 |
-| `pass-pending-unknown-harness` / `pass-pending-known-empty-binding` | 0 |
+| `pass-pending-unknown-harness` / `pass-pending-known-empty-binding` / `pass-pending-unexpired-cert` | 0 |
 | `inconclusive-pending-*` (missing/error/contradictory evidence controls) | 3 |
 | `fail-pinned-to-owner-empty-agent-ids` | 1 |
 | `inconclusive-missing-placement` | 3 |
@@ -98,8 +95,8 @@ Required fixtures:
 Do **not** run against unsafe `833bfe86`. Review the corrected tip and its real listener regression first; use exact binary/source identities and retain observations. This outline has not been executed by the offline oracle:
 
 1. Two (or three) **named local** instances: `owner`, `harness` (ACP key under a distinct data dir), optional `replica`. Use the complete isolation settings above and a shared test `network_id`. **Not** Ben Mac, not public discovery.
-2. Owner issues ACP cert for the harness public key (`x0x owner agents issue` / `POST /owner/agents/issue`).
-3. **G1:** invoke durable-owner `GET /owner/placement` **before** the harness is discovered. Retain HTTP status and complete body; require 200/`ok=true` and no placement row for this agent. Only then normalize to pending/no pin. `GET /owner/agents/:id/placement` is an optional read-only cross-check: its 404 alone is not a mint trigger or PASS.
+2. Owner issues ACP cert for the harness public key (`x0x owner agents issue` / `POST /owner/agents/issue`). Await success, then capture `GET /owner/agents` with its request/response times, status and complete body. Require the matching owner and exactly one eligible nonlocal ACP row as specified above. Never infer issuance from absence in the placement ledger.
+3. **G1:** invoke durable-owner `GET /owner/placement` **before** the harness is discovered. Retain request/response times, HTTP status and complete body; require the roster response to precede this request, 200/`ok=true` and no placement row for this agent. Only then normalize to pending/no pin. `GET /owner/agents/:id/placement` is an optional read-only cross-check: its 404 alone is not a mint trigger or PASS.
 4. Start harness daemon; announce; invoke `GET /owner/placement` again and retain its response. **G2:** pin `machine_id` = harness ≠ owner; `x0x machines get <harness>` `agent_ids` contains the ACP id.
 5. **G3:** on the replica instance, presence / discovered machine `agent_ids` contains the ACP id.
 6. **G4:** owner-signed pin to machine X (including a later epoch); announce from Y; expect `PlacementPinned` even if journal `mode=Acp`.

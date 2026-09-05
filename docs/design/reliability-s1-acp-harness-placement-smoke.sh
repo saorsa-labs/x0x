@@ -15,11 +15,13 @@
 # Exit codes (--fixture / --classify-snapshot):
 #   0  PASS — pinned to harness ≠ owner and agent_ids contains agent
 #             OR pending with no pin/bind and agent absent from a
-#             successful lazy-mint ledger capture (G1)
+#             successful lazy-mint ledger capture after matching eligible
+#             owner roster evidence (G1)
 #   1  FAIL — pinned to owner with valid empty binding evidence
 #             OR agent bound on a machine that is not the pin
 #             (wrong-machine / mode=Acp fail-open never PASS)
-#   3  inconclusive — missing/error ledger, malformed or contradictory
+#   3  inconclusive — missing/error ledger or pending issuance evidence,
+#                     invalid capture ordering, malformed or contradictory
 #                     evidence, missing placement / ids / other shapes
 #
 # --self-test exits 0 only when every required fixture matches.
@@ -38,14 +40,29 @@ REQUIRED_FIXTURES=(
   inconclusive-missing-placement
   inconclusive-pending-body-error
   inconclusive-pending-existing-ledger-pin
+  inconclusive-pending-expired-cert
   inconclusive-pending-http-error
+  inconclusive-pending-local-agent
   inconclusive-pending-malformed-bindings
+  inconclusive-pending-missing-capture-order
   inconclusive-pending-missing-harness
   inconclusive-pending-missing-ledger
   inconclusive-pending-missing-rows
+  inconclusive-pending-no-roster
+  inconclusive-pending-not-journaled
   inconclusive-pending-owner-pin
+  inconclusive-pending-preexisting-placement
   inconclusive-pending-read-only-endpoint
+  inconclusive-pending-revoked-agent
+  inconclusive-pending-rider-mode
+  inconclusive-pending-roster-after-mint
+  inconclusive-pending-roster-body-error
+  inconclusive-pending-roster-http-error
+  inconclusive-pending-typo-agent
+  inconclusive-pending-unissued-agent
+  inconclusive-pending-wrong-owner
   pass-pending-known-empty-binding
+  pass-pending-unexpired-cert
   pass-pending-unknown-harness
   pass-pin-harness-machine
 )
@@ -246,7 +263,49 @@ if len(matching) > 1:
 if kind in PENDING_KINDS:
     if pin_machine or matching or bound:
         inconclusive("pending contradicts a pin, ledger record, or bound agent")
-    print("PASS: successful mint deferred this unbound agent (G1)")
+    # Omission only proves deferral if this owner's issued ACP agent was
+    # eligible before the mint request. A typo or pre-issuance read is not G1.
+    roster_capture = snap.get("roster_capture")
+    if not isinstance(roster_capture, dict):
+        inconclusive("pending requires a retained owner roster capture")
+    if roster_capture.get("method") != "GET" or roster_capture.get("path") != "/owner/agents":
+        inconclusive("roster capture must be GET /owner/agents")
+    if type(roster_capture.get("http_status")) is not int or roster_capture["http_status"] != 200:
+        inconclusive("owner roster request did not return HTTP 200")
+    roster_body = roster_capture.get("body")
+    if not isinstance(roster_body, dict) or roster_body.get("ok") is not True:
+        inconclusive("missing or unsuccessful owner roster body")
+    owner_id = as_id(snap.get("owner_user_id"))
+    if not owner_id or as_id(roster_body.get("owner_user_id")) != owner_id or as_id(body.get("owner_user_id")) != owner_id:
+        inconclusive("snapshot, roster and placement ledger must name the same owner")
+    times = [
+        roster_capture.get("request_started_at_unix_ms"),
+        roster_capture.get("response_received_at_unix_ms"),
+        capture.get("request_started_at_unix_ms"),
+        capture.get("response_received_at_unix_ms"),
+    ]
+    if any(type(t) is not int or t <= 0 for t in times) or not (times[0] <= times[1] < times[2] <= times[3]):
+        inconclusive("roster response must precede the lazy-mint request")
+    agents = roster_body.get("agents")
+    if not isinstance(agents, list) or any(
+        not isinstance(entry, dict) or not isinstance(entry.get("agent_id"), str)
+        or not entry["agent_id"].strip() for entry in agents
+    ):
+        inconclusive("missing or malformed owner roster agents")
+    issued = [entry for entry in agents if entry["agent_id"].strip() == agent_id]
+    if len(issued) != 1:
+        inconclusive("pending agent must appear exactly once on the owner's roster")
+    issued = issued[0]
+    if issued.get("mode") != "acp" or issued.get("from_journal") is not True or issued.get("is_local") is not False or issued.get("revoked") is not False:
+        inconclusive("pending requires a journaled, nonlocal, nonrevoked ACP agent")
+    if "placement" not in issued or issued["placement"] is not None:
+        inconclusive("G1 requires an initially unplaced roster agent")
+    if "cert_not_after" not in issued:
+        inconclusive("missing roster certificate expiry")
+    expiry = issued["cert_not_after"]
+    if expiry is not None and (type(expiry) is not int or expiry * 1000 <= times[3]):
+        inconclusive("ACP certificate is expired or invalid at the mint observation")
+    print("PASS: successful mint deferred this previously rostered ACP agent (G1)")
     sys.exit(0)
 
 if kind == "pinned":
