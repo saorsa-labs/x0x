@@ -23,14 +23,17 @@ Emergency GUI fix: the embedded GUI was completely dead in v0.41.1 and v0.41.2.
 
 ### Added
 
-- **Regression gate: `tests/gui_script_syntax.rs`.** A dependency-free
-  delimiter scanner over the embedded GUI's inline script (CI has no Node),
-  handling string, template, comment and regex literals — including template
-  literals nested inside `${...}` interpolations. It fails on the exact v0.41.1
-  defect and on any `addEventListener(` call that is not closed as a call.
-  The existing GUI suites match endpoint strings and never checked that the
-  script parses, which is why a fatal syntax error shipped twice while every
-  GUI job stayed green.
+- **Regression gate: `tests/gui_script_syntax.rs`.** The extracted inline
+  script is validated with a REAL JavaScript parser (`node --check`), not a
+  hand-rolled scanner: telling a regex literal from division needs full parser
+  context, so any heuristic either rejects valid code (`return /[)]/.test(s)`)
+  or accepts invalid code (`i++ / (x;`). Every GitHub-hosted runner image ships
+  Node; if Node is absent the test fails loudly rather than skipping, so the
+  gate cannot pass vacuously. A companion test proves the gate rejects the exact
+  v0.41.1 defect shape and accepts valid regexes, division and nested template
+  literals. The existing GUI suites match endpoint strings and never checked
+  that the script parses, which is why a fatal syntax error shipped twice while
+  every GUI job stayed green.
 
 ## [v0.41.2] - 2026-09-04
 
