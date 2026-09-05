@@ -10498,6 +10498,10 @@ impl Agent {
     /// Mint epoch-0 `PlacementMint` records for every certificated agent
     /// on this owner's roster that has no move state yet (ADR-0043 §8.2).
     /// See the module docs for placement defaults and the ≥1-Roaming rule.
+    ///
+    /// ACP-attached agents (ADR-0039) are skipped until discovery knows
+    /// their harness machine — pinning them to this owner daemon made
+    /// inbound identity announces fail the pairing gate.
     pub async fn move_mint_placements(&self) -> error::Result<usize> {
         let user_kp = self.identity.user_keypair().ok_or_else(|| {
             error::IdentityError::CertificateVerification("no owner user key loaded".to_string())
@@ -10508,8 +10512,8 @@ impl Agent {
         let local_machine = self.machine_id();
         let now = Self::unix_timestamp_secs();
 
-        // Resolve each roster agent's machine from discovery (best-effort,
-        // one read of the cache — this machine is the fallback pin).
+        // Resolve each roster agent's machine from one discovery snapshot.
+        // ACP harnesses have no owner-machine fallback.
         let machine_of: std::collections::HashMap<identity::AgentId, identity::MachineId> = {
             let cache = self.identity_discovery_cache.read().await;
             cache
@@ -10534,12 +10538,19 @@ impl Agent {
                 }
             }
             let is_local = agent_id == local_agent;
+            let known_machine = machine_of.get(&agent_id).copied();
             let placement = if is_local {
                 key_move::Placement::Roaming
+            } else if record.mode == profile::CertMode::Acp {
+                // An absent or placeholder machine is not a harness binding.
+                // Defer minting; never substitute the owner daemon's machine.
+                let Some(machine) = known_machine.filter(|machine| machine.0 != [0; 32]) else {
+                    continue;
+                };
+                key_move::Placement::Pinned(machine)
             } else {
-                key_move::Placement::Pinned(
-                    machine_of.get(&agent_id).copied().unwrap_or(local_machine),
-                )
+                // Riders execute through the owner's daemon (ADR-0039).
+                key_move::Placement::Pinned(known_machine.unwrap_or(local_machine))
             };
             let custodian = match placement {
                 key_move::Placement::Pinned(machine) => machine,
@@ -22846,6 +22857,134 @@ fn discovered_agent_fixture(
 fn test_cert_events() -> tokio::sync::broadcast::Sender<VerifiedCertificate> {
     // E2d: standalone event ring for cache-only tests (no Agent needed).
     tokio::sync::broadcast::channel(VERIFIED_CERT_EVENT_CAPACITY).0
+}
+
+#[test]
+fn pairing_gate_fail_closed_acp_issue_time_pin_mismatch() {
+    // WHY: even an owner-signed, historically wrong ACP pin remains authority
+    // until explicitly repaired. An inbound announce cannot override it.
+    let owner = identity::UserKeypair::generate().expect("owner");
+    let agent = identity::AgentKeypair::generate().expect("agent");
+    let pin = identity::MachineId([0x11; 32]);
+    let harness = identity::MachineId([0x22; 32]);
+    let placement = key_move::PlacementRecord::sign(
+        agent.agent_id(),
+        owner.public_key().as_bytes(),
+        key_move::Placement::Pinned(pin),
+        0,
+        1,
+        owner.secret_key(),
+    )
+    .expect("signed pin");
+    let placements = std::collections::HashMap::from([(agent.agent_id(), placement)]);
+    let revoked = revocation::RevocationSet::new();
+    assert_eq!(
+        key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &harness),
+        Some(key_move::PairingDenial::PlacementPinned { pinned_to: pin }),
+        "ACP issue-time pin mismatch must deny the harness announce"
+    );
+    assert!(key_move::enforce_pairing(&revoked, &placements, &agent.agent_id(), &pin).is_none());
+}
+
+#[tokio::test]
+async fn placement_mint_acp_waits_for_discovery_and_never_rewrites_existing_pin() {
+    // WHY: discovery can lag issuance or contain an unknown-machine placeholder.
+    // Neither permits minting an owner pin, and later discovery is not recovery.
+    let dir = tempfile::tempdir().expect("isolated identity directory");
+    let owner = identity::UserKeypair::generate().expect("owner");
+    let harness = identity::AgentKeypair::generate().expect("harness");
+    let cert = identity::AgentCertificate::issue(&owner, &harness).expect("certificate");
+    let record = profile::IssuedCertRecord::from_cert(&owner.user_id(), &cert).expect("record");
+    let agent = Agent::builder()
+        .with_machine_key(dir.path().join("machine.key"))
+        .with_agent_key_path(dir.path().join("agent.key"))
+        .with_agent_cert_path(dir.path().join("agent.cert"))
+        .with_contact_store_path(dir.path().join("contacts.json"))
+        .with_identity_dir(dir.path())
+        .with_user_key(owner)
+        // No network config: no sockets, discovery tasks, or mesh connections.
+        .build()
+        .await
+        .expect("offline owner");
+    profile::IssuedCertRecord::append(agent.cert_journal_path().expect("journal"), &record)
+        .await
+        .expect("journal ACP issuance");
+
+    assert_eq!(agent.move_mint_placements().await.expect("local mint"), 1);
+    {
+        let state = agent.move_state.read().await;
+        assert_eq!(
+            state
+                .placement(&agent.agent_id())
+                .expect("local placement")
+                .placement,
+            key_move::Placement::Roaming
+        );
+        assert!(state.placement(&harness.agent_id()).is_none());
+        assert!(state.log(&harness.agent_id()).is_empty());
+    }
+    let mut discovered = discovered_agent_fixture(0x22, 1, &[], None);
+    discovered.agent_id = harness.agent_id();
+    discovered.machine_id = identity::MachineId([0; 32]);
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered.clone());
+    assert_eq!(
+        agent
+            .move_mint_placements()
+            .await
+            .expect("defer placeholder"),
+        0
+    );
+    assert!(agent
+        .move_state
+        .read()
+        .await
+        .log(&harness.agent_id())
+        .is_empty());
+
+    let harness_machine = identity::MachineId([0x22; 32]);
+    assert_ne!(harness_machine, agent.machine_id());
+    discovered.machine_id = harness_machine;
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered.clone());
+    assert_eq!(agent.move_mint_placements().await.expect("harness mint"), 1);
+    {
+        let state = agent.move_state.read().await;
+        assert_eq!(
+            state
+                .placement(&harness.agent_id())
+                .expect("harness pin")
+                .placement,
+            key_move::Placement::Pinned(harness_machine)
+        );
+        assert!(matches!(&state.log(&harness.agent_id())[0].record,
+            key_move::MoveRecord::PlacementMint { custodian_machine, .. } if *custodian_machine == harness_machine));
+    }
+    discovered.machine_id = agent.machine_id();
+    agent
+        .identity_discovery_cache
+        .write()
+        .await
+        .insert(harness.agent_id(), discovered);
+    assert_eq!(
+        agent.move_mint_placements().await.expect("idempotent mint"),
+        0
+    );
+    let state = agent.move_state.read().await;
+    assert_eq!(state.log(&harness.agent_id()).len(), 1);
+    assert_eq!(
+        state
+            .placement(&harness.agent_id())
+            .expect("unchanged pin")
+            .placement,
+        key_move::Placement::Pinned(harness_machine)
+    );
 }
 
 #[cfg(test)]
