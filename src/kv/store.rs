@@ -627,6 +627,14 @@ pub fn make_owner_checkpoint(params: OwnerCheckpointParams<'_>) -> Result<OwnerC
     Ok(cp)
 }
 
+/// Internal merge disposition: a successful public call may deliberately ignore
+/// stale or unauthorized input. Callers must not treat that as mutation authority.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MergeOutcome {
+    Applied,
+    Rejected,
+}
+
 /// A replicated key-value store using CRDTs with access control.
 ///
 /// Combines:
@@ -1906,11 +1914,25 @@ impl KvStore {
         peer_id: PeerId,
         writer: Option<&AgentId>,
     ) -> Result<()> {
+        self.merge_delta_with_outcome(delta, peer_id, writer)
+            .map(|_| ())
+    }
+
+    /// Merge and report whether the input passed the admission gates. The caller
+    /// must hold the same store lock through any dependent destructive action.
+    pub(crate) fn merge_delta_with_outcome(
+        &mut self,
+        delta: &KvStoreDelta,
+        peer_id: PeerId,
+        writer: Option<&AgentId>,
+    ) -> Result<MergeOutcome> {
         // SelfKeyed directories take the per-key path: no owner gate, no
         // checkpoint adoption — the store has no owner for life (I3/I8), so
         // both owner-anchored blocks below would no-op anyway.
         if matches!(self.policy, AccessPolicy::SelfKeyed) {
-            return self.merge_delta_self_keyed(delta, peer_id, writer);
+            return self
+                .merge_delta_self_keyed(delta, peer_id, writer)
+                .map(|()| MergeOutcome::Applied);
         }
         // Authoritative full-snapshot checkpoint adoption (cold-recovery path):
         // if the checkpoint's content root matches the relayed entry set, adopt
@@ -1921,7 +1943,7 @@ impl KvStore {
         // maybe_cache_checkpoint if the resulting state matches.
         if let Some(cp) = delta.owner_checkpoint.as_ref() {
             if self.try_adopt_full_snapshot(delta, peer_id, cp) {
-                return Ok(());
+                return Ok(MergeOutcome::Applied);
             }
             // Stale-delta gate: a delta carrying a genuine owner checkpoint
             // at or below the adopted high-water mark was published at or
@@ -1939,7 +1961,7 @@ impl KvStore {
                     self.highest_checkpoint_seq,
                     self.id
                 );
-                return Ok(());
+                return Ok(MergeOutcome::Rejected);
             }
         }
         // Access control: reject unauthorized writes
@@ -1950,7 +1972,7 @@ impl KvStore {
                     hex::encode(writer_id.as_bytes()),
                     self.id
                 );
-                return Ok(()); // Silent rejection — don't propagate errors for spam
+                return Ok(MergeOutcome::Rejected); // Silent rejection — don't propagate errors for spam
             }
         } else {
             // No writer identity applies nothing under ANY policy: the
@@ -1960,7 +1982,7 @@ impl KvStore {
             // sync is wired — it is no longer an anonymous-merge escape
             // hatch.
             tracing::warn!("rejected anonymous delta for store {}", self.id);
-            return Ok(());
+            return Ok(MergeOutcome::Rejected);
         }
 
         // Canonical-map gate, ALL policies: a delta carrying the same key in
@@ -1977,7 +1999,7 @@ impl KvStore {
                     "rejected ambiguous delta for store {}: key {key:?} appears in both added and updated",
                     self.id
                 );
-                return Ok(());
+                return Ok(MergeOutcome::Rejected);
             }
         }
 
@@ -2062,7 +2084,7 @@ impl KvStore {
         }
 
         self.version += 1;
-        Ok(())
+        Ok(MergeOutcome::Applied)
     }
 
     /// AppendOnly guard for one incoming delta entry.
