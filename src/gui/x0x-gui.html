@@ -3408,7 +3408,7 @@ function togglePeerEvents(on){
       line.textContent=new Date().toLocaleTimeString()+' '+e.data;
       out.prepend(line);
       while(out.children.length>20)out.removeChild(out.lastChild);
-    };
+    });
     peerEventsSse.onerror=()=>{if(out)out.innerHTML='<span style="color:var(--am)">peer event stream unavailable</span>'};
   }catch(e){
     if(out)out.innerHTML='<span style="color:var(--rd)">failed to open peer events</span>';
