@@ -1597,6 +1597,16 @@ async fn publish_group_card_to_discovery_inner(
     let (signed_card, commit, updated_info) = {
         let groups = state.named_groups.read().await;
         let info = groups.get(group_id)?;
+        // #506: the single choke point for public-discovery card publishing.
+        // Refusing Hidden HERE means no caller — present or future — can leak
+        // a Hidden group's card by getting its own gate wrong, which is
+        // exactly how the withdrawn-Hidden leak happened. `to_group_card`
+        // deliberately still yields a card for a withdrawn Hidden group: the
+        // member-scoped withdrawal signal needs it, and that is not a leak
+        // because members already know the group.
+        if !group_card_is_publicly_publishable(info) {
+            return None;
+        }
         let mut candidate = info.clone();
         // Reseal bumps the commit chain; non-reseal republishes the
         // currently-sealed state (idempotent refresh).
@@ -4684,6 +4694,93 @@ async fn process_treekem_commit_after_crypto_recheck(
     Ok(())
 }
 
+/// Whether this group's card may go to PUBLIC discovery (#506).
+///
+/// Takes the whole `GroupInfo` rather than just the policy so the invariant
+/// that broke is expressible: **withdrawal does not make a Hidden group
+/// publishable.** The gate used to read `info.withdrawn || … != Hidden`, so
+/// deleting a Hidden group published its name, description, tags, owner agent
+/// id and member count to public discovery.
+#[must_use]
+pub(in crate::server) fn group_card_is_publicly_publishable(info: &x0x::groups::GroupInfo) -> bool {
+    info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+}
+
+#[cfg(test)]
+mod issue506_hidden_card_leak {
+    use super::*;
+
+    fn group(
+        discoverability: x0x::groups::GroupDiscoverability,
+        withdrawn: bool,
+    ) -> x0x::groups::GroupInfo {
+        let policy = x0x::groups::GroupPolicy {
+            discoverability,
+            ..Default::default()
+        };
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            "private".to_string(),
+            x0x::identity::AgentId([7u8; 32]),
+            "ab".repeat(16),
+            policy,
+        );
+        info.withdrawn = withdrawn;
+        info
+    }
+
+    /// WHY (#506): withdrawal must NOT make a Hidden group publishable.
+    ///
+    /// The gate read `info.withdrawn || … != Hidden`, so deleting a Hidden
+    /// group published a public discovery card carrying its name,
+    /// description, tags, owner agent id and member count — the one operation
+    /// a privacy-conscious owner would reach for was the one that disclosed
+    /// the group. For a PUBLIC group the withdrawn card is a legitimate
+    /// tombstone superseding an already-public card, so that must keep
+    /// working; a Hidden group has no public card to supersede.
+    #[test]
+    fn withdrawal_does_not_make_a_hidden_group_publishable() {
+        use x0x::groups::GroupDiscoverability::{Hidden, PublicDirectory};
+        assert!(
+            !group_card_is_publicly_publishable(&group(Hidden, false)),
+            "a live Hidden group publishes no card"
+        );
+        assert!(
+            !group_card_is_publicly_publishable(&group(Hidden, true)),
+            "#506: deleting a Hidden group must not publish it"
+        );
+        assert!(
+            group_card_is_publicly_publishable(&group(PublicDirectory, false)),
+            "public groups still publish"
+        );
+        assert!(
+            group_card_is_publicly_publishable(&group(PublicDirectory, true)),
+            "a public group's withdrawn card is a legitimate tombstone"
+        );
+    }
+
+    /// WHY (#506): the observable end of the same bug — after a Hidden group
+    /// is withdrawn and the post-state-change hook runs, no card for it may
+    /// be left anywhere the daemon serves or republishes from.
+    #[tokio::test]
+    async fn withdrawn_hidden_group_leaves_no_card_behind() -> anyhow::Result<()> {
+        let (state, _dir) = tests::secure_endpoint_test_state().await?;
+        let id = "ab".repeat(16);
+        let info = group(x0x::groups::GroupDiscoverability::Hidden, true);
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(id.clone(), info);
+
+        maybe_publish_group_card_after_state_change(state.as_ref(), &id).await;
+
+        let cache = state.group_card_cache.read().await;
+        assert!(
+            !cache.contains_key(&id) && !cache.contains_key(&stable),
+            "a withdrawn Hidden group must leave no card to serve or republish"
+        );
+        Ok(())
+    }
+}
+
 async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
     let info = {
         let groups = state.named_groups.read().await;
@@ -4691,9 +4788,19 @@ async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id:
     };
     if let Some(info) = info {
         refresh_group_card_cache_from_info(state, group_id, &info).await;
-        let discoverable = info.withdrawn
-            || info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden;
-        if discoverable {
+        // #506: `info.withdrawn ||` used to sit in front of this, so a
+        // WITHDRAWN Hidden group published a public discovery card carrying
+        // its name, description, tags, owner agent id and member count — a
+        // group whose whole point is being undiscoverable became discoverable
+        // at the moment it was deleted. For a public group the withdrawn card
+        // is a legitimate tombstone that supersedes an already-public one; a
+        // Hidden group has no public card to supersede, so the tombstone was
+        // its FIRST and only public disclosure.
+        //
+        // Hidden delete propagation is the signed `GroupDeleted`
+        // metadata/direct event, which is member-scoped — exactly as
+        // `withdraw_named_group_terminal` already documents.
+        if group_card_is_publicly_publishable(&info) {
             publish_group_card_to_discovery(state, group_id).await;
         } else {
             let mut cache = state.group_card_cache.write().await;
@@ -41148,7 +41255,7 @@ pub(in crate::server) mod tests {
         let kem_blob = BASE64.encode(vec![0xbbu8; 1_184]);
 
         let build_info = |n_joiners: usize| -> GroupInfo {
-            let mut info = GroupInfo::with_policy(
+            let mut info = x0x::groups::GroupInfo::with_policy(
                 "growth".to_string(),
                 "growth-curve".to_string(),
                 agent_id,
