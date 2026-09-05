@@ -4,20 +4,93 @@
 //! subscription, so the negative observation cannot be vacuous.
 //!
 //! Two real agents on loopback networking (the `hs_f2_membership_cluster`
-//! harness pattern): the owner drives the REAL `POST /groups/:id/state/withdraw`
-//! endpoint for a Hidden group first and a PublicDirectory group second. The
-//! observer subscribes to `GLOBAL_GROUP_DISCOVERY_TOPIC` before either
-//! withdrawal. The public tombstone's arrival closes the observation window:
-//! by then any Hidden broadcast (published earlier, same topic, same fan-out
-//! path) would have been observed. A residual quiet-window drain follows.
+//! harness pattern), hermetically isolated: mDNS disabled and a network_id
+//! unique to this test process, so the cluster can never touch the public
+//! mesh or another test's plane. The owner drives the REAL
+//! `POST /groups/:id/state/withdraw` endpoint for a Hidden group first and a
+//! PublicDirectory group second. The public tombstone's arrival closes the
+//! main observation window; a residual quiet-window drain follows. BOTH
+//! windows classify every payload through the same
+//! [`DiscoveryTopicScanner`], so a Hidden event is flagged whether it arrives
+//! before or after the tombstone.
+//!
+//! Detection power is proven OFFLINE (no network) by
+//! `discovery_scanner_flags_hidden_in_both_orderings`, which injects a valid
+//! Hidden card-publish event into both orderings — [hidden, pub] and
+//! [pub, hidden] — and requires the scanner to flag it. If the online
+//! classification wiring ever regresses to "parse and discard", that test
+//! fails first.
 
 use super::*;
+
+/// Shared classifier for EVERY window that observes the public discovery
+/// topic. The wire shape is internally tagged —
+/// `{"event": "group_card_published", ...}` — per
+/// `#[serde(tag = "event", rename_all = "snake_case")]` on
+/// `NamedGroupMetadataEvent`.
+struct DiscoveryTopicScanner {
+    hidden_stable: String,
+    hidden_name: String,
+    public_stable: String,
+    hidden_violations: Vec<String>,
+    public_tombstone: Option<serde_json::Value>,
+}
+
+impl DiscoveryTopicScanner {
+    fn new(hidden_stable: String, hidden_name: &str, public_stable: String) -> Self {
+        Self {
+            hidden_stable,
+            hidden_name: hidden_name.to_string(),
+            public_stable,
+            hidden_violations: Vec::new(),
+            public_tombstone: None,
+        }
+    }
+
+    fn is_card_publish(value: &serde_json::Value) -> bool {
+        value["event"].as_str() == Some("group_card_published")
+    }
+
+    /// Classify ONE parsed payload. Returns `true` when the PublicDirectory
+    /// tombstone positive control has been observed (closing the main
+    /// window). Hidden references are recorded in BOTH windows — this is the
+    /// #509-review fix: the previous main loop parsed and discarded.
+    fn observe(&mut self, value: &serde_json::Value) -> bool {
+        if !Self::is_card_publish(value) {
+            return false; // probe payloads and other event kinds never carry cards
+        }
+        let group_id = value["group_id"].as_str().unwrap_or_default();
+        if group_id == self.hidden_stable
+            || value["card"]["name"].as_str() == Some(self.hidden_name.as_str())
+        {
+            self.hidden_violations.push(value.to_string());
+        }
+        if group_id == self.public_stable {
+            self.public_tombstone = Some(value.clone());
+            return true;
+        }
+        false
+    }
+
+    /// Parse and classify one raw payload; non-JSON payloads (readiness
+    /// probes) are inert for classification.
+    fn observe_payload(&mut self, payload: &[u8]) -> bool {
+        match serde_json::from_slice::<serde_json::Value>(payload) {
+            Ok(value) => self.observe(&value),
+            Err(_) => false,
+        }
+    }
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Result<()> {
     let owner_dir = tempfile::tempdir()?;
     let observer_dir = tempfile::tempdir()?;
 
+    // Hermetic plane: no mDNS discovery (defaults ON — #337/#417 class) and a
+    // network_id unique to this process, shared by both agents so they can
+    // gossip with each other and nothing else.
+    let network_id = format!("issue506-broadcast-control-{}", std::process::id());
     let loopback_cfg = || x0x::network::NetworkConfig {
         bind_addr: Some(
             "127.0.0.1:0"
@@ -26,6 +99,8 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
         ),
         bootstrap_nodes: Vec::new(),
         port_mapping_enabled: false,
+        mdns_enabled: false,
+        network_id: Some(network_id.clone()),
         ..x0x::network::NetworkConfig::default()
     };
 
@@ -33,17 +108,15 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
         dir: &tempfile::TempDir,
         net_cfg: x0x::network::NetworkConfig,
     ) -> x0x::error::Result<x0x::Agent> {
-        {
-            Agent::builder()
-                .with_machine_key(dir.path().join("machine.key"))
-                .with_agent_key_path(dir.path().join("agent.key"))
-                .with_agent_cert_path(dir.path().join("agent.cert"))
-                .with_peer_cache_disabled()
-                .with_contact_store_path(dir.path().join("contacts.json"))
-                .with_network_config(net_cfg)
-                .build()
-                .await
-        }
+        Agent::builder()
+            .with_machine_key(dir.path().join("machine.key"))
+            .with_agent_key_path(dir.path().join("agent.key"))
+            .with_agent_cert_path(dir.path().join("agent.cert"))
+            .with_peer_cache_disabled()
+            .with_contact_store_path(dir.path().join("contacts.json"))
+            .with_network_config(net_cfg)
+            .build()
+            .await
     }
 
     let owner_agent = Arc::new(build_agent(&owner_dir, loopback_cfg()).await?);
@@ -74,8 +147,9 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
     if !owner_net.is_connected(&observer_peer).await {
-        eprintln!("SKIP: loopback connect unavailable in this environment");
-        return Ok(());
+        // This is a release acceptance control: a dead observation channel is
+        // a real failure, never a skip-shaped pass.
+        anyhow::bail!("loopback connect unavailable: the acceptance control cannot run");
     }
 
     // Pubsub readiness barrier (the hs_f2 `await_restart_gossip_ready`
@@ -83,8 +157,8 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
     // publish FRESH nonce-tagged probes on the exact topic under observation
     // and each awaits the REMOTE probe, so bidirectional gossip routing on
     // `GLOBAL_GROUP_DISCOVERY_TOPIC` is proven live BEFORE the withdrawals.
-    // Probe payloads are not valid metadata-event JSON; the classifiers below
-    // skip them, and a real peer's DirectoryMessage decoder drops them.
+    // Probe payloads are not valid metadata-event JSON; the scanner skips
+    // them, and a real peer's DirectoryMessage decoder drops them.
     {
         use std::sync::atomic::{AtomicU64, Ordering};
         static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
@@ -219,34 +293,20 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
         "public withdraw failed: {body}"
     );
 
-    // Classify every message seen on the public discovery topic. The wire
-    // shape is internally tagged — {"event": "group_card_published", ...} —
-    // per `#[serde(tag = "event", rename_all = "snake_case")]`.
-    fn is_card_publish(value: &serde_json::Value) -> bool {
-        value["event"].as_str() == Some("group_card_published")
-    }
+    let mut scanner = DiscoveryTopicScanner::new(
+        hidden_stable.clone(),
+        "Issue506WireHidden",
+        public_stable.clone(),
+    );
 
-    fn references_hidden(value: &serde_json::Value, hidden_stable: &str) -> bool {
-        is_card_publish(value)
-            && (value["group_id"].as_str() == Some(hidden_stable)
-                || value["card"]["name"].as_str() == Some("Issue506WireHidden"))
-    }
-
-    let mut hidden_violations: Vec<String> = Vec::new();
-    let mut public_tombstone: Option<serde_json::Value> = None;
+    // Main window: EVERY parsed payload is classified (Hidden references are
+    // recorded here too — the #509-review P2 fix); the window closes when the
+    // PublicDirectory tombstone positive control is observed.
     tokio::time::timeout(std::time::Duration::from_secs(45), async {
-        // Returns Ok(()) once the PublicDirectory tombstone is observed.
         loop {
             match discovery_sub.recv().await {
                 Some(message) => {
-                    let Ok(value) = serde_json::from_slice::<serde_json::Value>(&message.payload)
-                    else {
-                        continue;
-                    };
-                    let is_public_tombstone = is_card_publish(&value)
-                        && value["group_id"].as_str() == Some(public_stable.as_str());
-                    if is_public_tombstone {
-                        public_tombstone = Some(value);
+                    if scanner.observe_payload(&message.payload) {
                         return Ok(());
                     }
                 }
@@ -263,7 +323,10 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
         )
     })??;
 
-    let tombstone = public_tombstone.expect("positive control observed");
+    let tombstone = scanner
+        .public_tombstone
+        .clone()
+        .expect("positive control observed");
     assert_eq!(
         tombstone["card"]["withdrawn"],
         serde_json::json!(true),
@@ -271,7 +334,7 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
     );
 
     // Residual quiet window after the tombstone: drain anything still in
-    // flight and re-check for Hidden references.
+    // flight — classified through the SAME scanner — and re-check.
     let quiet = tokio::time::sleep(std::time::Duration::from_secs(3));
     tokio::pin!(quiet);
     loop {
@@ -279,19 +342,91 @@ async fn subscribed_peer_sees_no_public_broadcast_for_hidden_withdrawal() -> Res
             _ = &mut quiet => break,
             message = discovery_sub.recv() => {
                 let Some(message) = message else { break };
-                if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&message.payload) {
-                    if references_hidden(&value, &hidden_stable) {
-                        hidden_violations.push(value.to_string());
-                    }
-                }
+                scanner.observe_payload(&message.payload);
             }
         }
     }
 
     assert!(
-        hidden_violations.is_empty(),
+        scanner.hidden_violations.is_empty(),
         "#506 wire-level: subscribed peer observed public discovery broadcast(s) for \
-         the withdrawn Hidden group: {hidden_violations:?}"
+         the withdrawn Hidden group: {:?}",
+        scanner.hidden_violations
     );
     Ok(())
+}
+
+/// Offline sequence/mutation control (no network): the scanner must flag an
+/// injected VALID Hidden card-publish event in BOTH orderings — before the
+/// public tombstone (main window) and after it (residual window). If the
+/// online classification wiring ever regresses to "parse and discard", this
+/// test fails first, so the wire control cannot silently pass through the
+/// exact regression it exists to catch.
+#[test]
+fn discovery_scanner_flags_hidden_in_both_orderings() {
+    let hidden_stable = "e1".repeat(16);
+    let public_stable = "f2".repeat(16);
+    let card_publish = |group_id: &str, name: &str, withdrawn: bool| {
+        serde_json::json!({
+            "event": "group_card_published",
+            "group_id": group_id,
+            "card": {
+                "group_id": group_id,
+                "name": name,
+                "withdrawn": withdrawn,
+            },
+        })
+    };
+    let hidden_event = card_publish(&hidden_stable, "Issue506WireHidden", true);
+    let public_event = card_publish(&public_stable, "Issue506WirePublic", true);
+    let unrelated_event = serde_json::json!({
+        "event": "member_added",
+        "group_id": public_stable,
+    });
+
+    // [hidden, pub] — the exact production ordering under test: the Hidden
+    // event arrives BEFORE the tombstone closes the main window.
+    let mut scanner = DiscoveryTopicScanner::new(
+        hidden_stable.clone(),
+        "Issue506WireHidden",
+        public_stable.clone(),
+    );
+    assert!(
+        !scanner.observe(&hidden_event),
+        "a Hidden card-publish must NOT close the main window"
+    );
+    assert!(
+        scanner.observe(&public_event),
+        "the PublicDirectory tombstone must close the main window"
+    );
+    assert_eq!(
+        scanner.hidden_violations.len(),
+        1,
+        "#509-review P2: a valid Hidden card-publish before the tombstone MUST be flagged: {:?}",
+        scanner.hidden_violations
+    );
+    assert!(scanner.public_tombstone.is_some());
+
+    // [pub, hidden] — a late Hidden event lands in the residual window.
+    let mut late = DiscoveryTopicScanner::new(
+        hidden_stable.clone(),
+        "Issue506WireHidden",
+        public_stable.clone(),
+    );
+    assert!(late.observe(&public_event));
+    assert!(!late.observe(&hidden_event));
+    assert_eq!(
+        late.hidden_violations.len(),
+        1,
+        "a valid Hidden card-publish after the tombstone MUST be flagged: {:?}",
+        late.hidden_violations
+    );
+
+    // Green side: unrelated events and non-card kinds never produce
+    // violations and never close the window.
+    let mut clean = DiscoveryTopicScanner::new(hidden_stable, "Issue506WireHidden", public_stable);
+    assert!(!clean.observe(&unrelated_event));
+    assert!(!clean.observe_payload(b"issue506/discovery-route-probe/0.0/owner"));
+    assert!(clean.hidden_violations.is_empty());
+    assert!(clean.public_tombstone.is_none());
 }
