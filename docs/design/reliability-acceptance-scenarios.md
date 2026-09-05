@@ -1,7 +1,7 @@
 # x0x reliability campaign — slice (2) user acceptance scenarios
 
 **Owner:** Tester
-**Scope:** Reproducible user-acceptance matrix. Observes real product paths (CLI/REST against **local named instances**). Does **not** implement product fixes on #507 / #508 / #509.
+**Scope:** Reproducible user-acceptance matrix. Observes real product paths (CLI/REST against **local named instances**). Does **not** implement product fixes on #507 / #508 / #509 / #512.
 **Out of scope as product pass:** [#510](https://github.com/saorsa-labs/x0x/issues/510) (P2 — test scheduling/diagnostics; [source-grounded triage](https://github.com/saorsa-labs/x0x/issues/510#issuecomment-5551971328)). Treat as **harness risk only**. Never close a product gate because an isolation re-run was green. Do **not** weaken required observations, skip/quarantine the tests, inflate deadlines, or add retries to paper over flakes (ADR-0025: completed observations; a genuine production-path bug has presented with the same isolated-pass signature).
 
 **Target regressions (product):**
@@ -11,6 +11,7 @@
 | [#507](https://github.com/saorsa-labs/x0x/pull/507) | Partial #449 / ADR-0060 (**#449 stays open**) | Election + honest `GET /home` + provision suppression + withdrawn-Home guards. Does **not** seat a second device. HomeInvite / cross-device adoption **withdrawn**. |
 | [#508](https://github.com/saorsa-labs/x0x/pull/508) | #341 Phase B | Encrypted group KV publishes plaintext / leave retains write / fail-open without context |
 | [#509](https://github.com/saorsa-labs/x0x/pull/509) | #506 | **Proved class (a):** local discovery residual (`GET /groups/discover` synthesizing withdrawn Hidden cards). **Unproved class (b):** public broadcast to the mesh — do not claim PASS/FAIL without evidence. |
+| [#512](https://github.com/saorsa-labs/x0x/pull/512) | HOLD P1 @ `833bfe86` | ACP mint pins to **owner** machine; identity announce dropped; `agent_ids: []`. Fail-open on journal `mode=Acp` bypasses `PlacementPinned` (unsound; synced Riders materialize `Acp`). **Live UAT blocked** until a corrected tip. Offline G1–G6 / S1 ready now. |
 
 **Durable DM baseline:** ADR-0030 — product `POST /direct/send` is durable-by-default; 200 = recipient committed + dispatched; 409 `recipient_ack_semantics_unavailable` against non-v2; no silent downgrade.
 
@@ -83,6 +84,21 @@
 | F4 | Unconfigured encrypted sync | Publish without secure context | Hard error; no plaintext publish | **#508** |
 | F5 | Home tasks follow elected Home | Tasks on A; B adopts | **Pending #449 seating.** After B is seated on the elected Home, B sees lists; loser not authoritative. Not a current #507 gate. | future #449 |
 
+### G. ACP harness placement (#512)
+
+Full brief: [`reliability-acp-harness-placement-acceptance.md`](reliability-acp-harness-placement-acceptance.md). **Local-first only.** Live dual-daemon (G3) is **blocked** until a **corrected** #512 tip — current `833bfe86` is HOLD (P1: `mode=Acp` fail-open bypasses `PlacementPinned`). No Ben Mac. Offline S1 fixtures are ready now.
+
+| ID | Scenario | Steps | Acceptance (PASS) | Fails for |
+|---|---|---|---|---|
+| G1 | Defer mint until harness machine known | Issue ACP cert; read placement before harness discovery | Pending / unbound — **no** epoch-0 pin to owner machine | **#512** epoch-0 `Pinned(owner)` |
+| G2 | After discovery, pin = harness ≠ owner | Harness announces; `GET /owner/placement` + `machines get` | `Pinned(harness)`; harness ≠ owner; `agent_ids` contains ACP id | **#512** still `Pinned(owner)` / empty `agent_ids` |
+| G3 | Second local daemon binds agent | David-only dual-daemon on hermetic `network_id` | Replica `agent_ids` contains ACP id | Replica empty `agent_ids` (QUIC present) |
+| G4 | Intentional/current pin still enforced | Pin to X; announce from Y; journal may say `mode=Acp` | `PlacementPinned` denies; Y must not bind because `mode=Acp` | **#512 HOLD P1** fail-open |
+| G5 | Synced Rider issuance must not inherit ACP fail-open | Synced Rider line materializes `mode=Acp`; wrong-machine announce | Pin still enforced | Fail-open via synced `Acp` |
+| G6 | No silent repair of existing bad pins | Pre-existing `Pinned(owner)` after upgrade | Do **not** claim auto-heal; recovery needs Proposed ADR | “Upgrade fixed old pins” |
+
+S1 offline oracle: [`reliability-s1-acp-harness-placement-smoke.sh`](reliability-s1-acp-harness-placement-smoke.sh) `--self-test` over [`reliability-s1-acp-fixtures/`](reliability-s1-acp-fixtures/). Compare `owner_machine_id`, `placement.{kind,machine_id}`, `harness_machine.{machine_id,agent_ids}`. PASS when pinned to harness ≠ owner and `agent_ids` contains the agent, or pending unbound. FAIL when pinned to owner with empty `agent_ids`, or bound on a machine that is not the pin. Missing `placement` → 3. Wrong-machine bind never PASS.
+
 ## Harness risk (#510)
 
 [#510](https://github.com/saorsa-labs/x0x/issues/510) is **P2** (test scheduling/diagnostics; keep open). Triage: [comment 5551971328](https://github.com/saorsa-labs/x0x/issues/510#issuecomment-5551971328). This UAT slice treats it as **harness risk only** — not a product acceptance gate.
@@ -96,7 +112,7 @@ Do **not**:
 - inflate wall-clock deadlines first
 - add retries / retry-until-green to paper over flakes
 
-Prefer reducing contention (scheduling) over hiding the failure. #510 remains harness-risk only; it does not change product gates on #507 / #508 / #509.
+Prefer reducing contention (scheduling) over hiding the failure. #510 remains harness-risk only; it does not change product gates on #507 / #508 / #509 / #512.
 
 ## First runnable smoke (S0)
 

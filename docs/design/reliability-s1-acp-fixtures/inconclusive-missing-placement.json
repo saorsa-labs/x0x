@@ -1,0 +1,12 @@
+{
+  "expected_exit": 3,
+  "snapshot": {
+    "agent_id": "acp-1",
+    "owner_machine_id": "owner-m",
+    "journal_mode": "acp",
+    "harness_machine": {
+      "machine_id": "harness-m",
+      "agent_ids": ["acp-1"]
+    }
+  }
+}
