@@ -74,6 +74,55 @@ class ReleaseCardTests(unittest.TestCase):
         self.assertEqual(self.validate(tag='9.8.7').returncode, 0)
         self.assertEqual(self.validate(tag='9.8.6').returncode, 1)
 
+    def test_bump_accepts_reformatted_json_and_preserves_other_bytes(self):
+        card = json.loads((ROOT / CARD).read_text())
+        # Put another version before the top-level field to catch accidental
+        # first-match replacement in nested objects.
+        card = {'metadata': {'version': 'keep-me'}, **card}
+        for indent, newline in [(None, '\n'), (4, '\n'), ('\t', '\n'), (2, '\r\n')]:
+            with self.subTest(indent=indent, newline=newline):
+                before = json.dumps(card, indent=indent).replace('\n', newline)
+                (self.root / CARD).write_bytes(before.encode('utf-8'))
+                result = subprocess.run(['bash', 'scripts/bump-version.sh', '9.8.7'],
+                                        cwd=self.root, capture_output=True, text=True)
+                self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+                self.assertEqual((self.root / CARD).read_bytes().decode('utf-8'), before.replace(
+                    '"version": "' + self.version + '"', '"version": "9.8.7"', 1))
+                self.assertEqual(self.validate(tag='9.8.7').returncode, 0)
+
+    def test_invalid_card_leaves_every_version_file_unchanged(self):
+        valid = json.loads((ROOT / CARD).read_text())
+        missing_version = dict(valid)
+        del missing_version['version']
+        for card_text in ['{broken json', json.dumps(missing_version),
+                          json.dumps({**valid, 'version': 17}),
+                          '{"version": "0.1.0", "version": "0.2.0"}']:
+            with self.subTest(card_text=card_text):
+                for name in ['Cargo.toml', 'SKILL.md']:
+                    shutil.copyfile(ROOT / name, self.root / name)
+                (self.root / CARD).write_text(card_text)
+                paths = [Path('Cargo.toml'), Path('SKILL.md'), CARD]
+                before = {path: (self.root / path).read_bytes() for path in paths}
+                result = subprocess.run(['bash', 'scripts/bump-version.sh', '9.8.7'],
+                                        cwd=self.root, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual({path: (self.root / path).read_bytes() for path in paths},
+                                 before, 'validation failure must not partially bump versions')
+
+    def test_unmatched_version_file_leaves_inputs_unchanged(self):
+        for broken in ['Cargo.toml', 'SKILL.md']:
+            with self.subTest(broken=broken):
+                for name in ['Cargo.toml', 'SKILL.md']:
+                    shutil.copyfile(ROOT / name, self.root / name)
+                (self.root / broken).write_text('no version field here\n')
+                paths = [Path('Cargo.toml'), Path('SKILL.md'), CARD]
+                before = {path: (self.root / path).read_bytes() for path in paths}
+                result = subprocess.run(['bash', 'scripts/bump-version.sh', '9.8.7'],
+                                        cwd=self.root, capture_output=True, text=True)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual({path: (self.root / path).read_bytes() for path in paths},
+                                 before)
+
 
 if __name__ == '__main__':
     unittest.main()
