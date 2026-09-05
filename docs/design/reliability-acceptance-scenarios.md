@@ -100,7 +100,7 @@ Prefer reducing contention (scheduling) over hiding the failure. #510 remains ha
 
 ## First runnable smoke (S0)
 
-Two named local instances sharing owner key (enrolled). Compare `GET /home` using the **#507 wire** (`home.rs` @ `413028e`): read `state`; do **not** look for a `resolution` field.
+Two named local instances sharing owner key (enrolled). Compare `GET /home` using the **#507 wire** (`home.rs` @ `413028e`): read `state`.
 
 Canonical identity by `state`:
 
