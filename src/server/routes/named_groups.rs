@@ -1597,6 +1597,16 @@ async fn publish_group_card_to_discovery_inner(
     let (signed_card, commit, updated_info) = {
         let groups = state.named_groups.read().await;
         let info = groups.get(group_id)?;
+        // #506: the single choke point for public-discovery card publishing.
+        // Refusing Hidden HERE means no caller — present or future — can leak
+        // a Hidden group's card by getting its own gate wrong, which is
+        // exactly how the withdrawn-Hidden leak happened. `to_group_card`
+        // deliberately still yields a card for a withdrawn Hidden group: the
+        // member-scoped withdrawal signal needs it, and that is not a leak
+        // because members already know the group.
+        if !group_card_is_listable(info) {
+            return None;
+        }
         let mut candidate = info.clone();
         // Reseal bumps the commit chain; non-reseal republishes the
         // currently-sealed state (idempotent refresh).
@@ -3628,6 +3638,15 @@ async fn refresh_group_card_cache_from_info(
     let now_ms = now_millis_u64();
     prune_expired_group_cards(&mut cache, now_ms);
     let stable_key = info.stable_group_id().to_string();
+    // #506: the cache feeds `GET /groups/discover` and card republishing, so it
+    // must never hold a Hidden card — including the withdrawn tombstone
+    // `to_signed_group_card` deliberately still produces. Remove any stale
+    // entries instead of caching, so no caller can repopulate the leak.
+    if !group_card_is_listable(info) {
+        cache.remove(key);
+        cache.remove(&stable_key);
+        return;
+    }
     match info.to_signed_group_card(state.agent.identity().agent_keypair()) {
         Ok(Some(card)) => {
             cache_group_card_if_newer(&mut cache, key.to_string(), card.clone());
@@ -4684,6 +4703,330 @@ async fn process_treekem_commit_after_crypto_recheck(
     Ok(())
 }
 
+/// Whether this group's card may appear on a **listing** surface (#506).
+///
+/// Listing surfaces are the ones that enumerate groups a caller does not
+/// already know: the public-discovery publication pipeline entry point and the
+/// local `GET /groups/discover` projection. The invariant that broke here:
+/// **withdrawal does not make a Hidden group listable.** The gate used to read
+/// `info.withdrawn || … != Hidden`, so deleting a Hidden group published its
+/// name, description, tags, owner agent id and member count to public
+/// discovery — and the local discovery response still synthesized it.
+///
+/// This is deliberately NOT the public-shard gate
+/// ([`x0x::groups::may_publish_to_public_shards`], `PublicDirectory`-only):
+/// `ListedToContacts` groups stay on local listing surfaces and are stopped
+/// downstream before any public shard publish. Member-scoped surfaces
+/// (`GroupDeleted` propagation, the card-by-id fallback for callers that
+/// already know the group) are not listing surfaces and keep tombstone access.
+#[must_use]
+pub(in crate::server) fn group_card_is_listable(info: &x0x::groups::GroupInfo) -> bool {
+    info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden
+}
+
+#[cfg(test)]
+mod issue506_hidden_card_leak {
+    use super::*;
+
+    fn group(
+        discoverability: x0x::groups::GroupDiscoverability,
+        withdrawn: bool,
+    ) -> x0x::groups::GroupInfo {
+        let policy = x0x::groups::GroupPolicy {
+            discoverability,
+            ..Default::default()
+        };
+        let mut info = x0x::groups::GroupInfo::with_policy(
+            "Home".to_string(),
+            "private".to_string(),
+            x0x::identity::AgentId([7u8; 32]),
+            "ab".repeat(16),
+            policy,
+        );
+        info.withdrawn = withdrawn;
+        info
+    }
+
+    /// WHY (#506): withdrawal must NOT make a Hidden group publishable.
+    ///
+    /// The gate read `info.withdrawn || … != Hidden`, so deleting a Hidden
+    /// group published a public discovery card carrying its name,
+    /// description, tags, owner agent id and member count — the one operation
+    /// a privacy-conscious owner would reach for was the one that disclosed
+    /// the group. For a PUBLIC group the withdrawn card is a legitimate
+    /// tombstone superseding an already-public card, so that must keep
+    /// working; a Hidden group has no public card to supersede.
+    #[test]
+    fn withdrawal_does_not_make_a_hidden_group_publishable() {
+        use x0x::groups::GroupDiscoverability::{Hidden, PublicDirectory};
+        assert!(
+            !group_card_is_listable(&group(Hidden, false)),
+            "a live Hidden group publishes no card"
+        );
+        assert!(
+            !group_card_is_listable(&group(Hidden, true)),
+            "#506: deleting a Hidden group must not publish it"
+        );
+        assert!(
+            group_card_is_listable(&group(PublicDirectory, false)),
+            "public groups still publish"
+        );
+        assert!(
+            group_card_is_listable(&group(PublicDirectory, true)),
+            "a public group's withdrawn card is a legitimate tombstone"
+        );
+    }
+
+    /// WHY (#506): the observable end of the same bug — after a Hidden group
+    /// is withdrawn and the post-state-change hook runs, no card for it may
+    /// be left anywhere the daemon serves or republishes from.
+    #[tokio::test]
+    async fn withdrawn_hidden_group_leaves_no_card_behind() -> anyhow::Result<()> {
+        let (state, _dir) = tests::secure_endpoint_test_state().await?;
+        let id = "ab".repeat(16);
+        let info = group(x0x::groups::GroupDiscoverability::Hidden, true);
+        let stable = info.stable_group_id().to_string();
+        state.named_groups.write().await.insert(id.clone(), info);
+
+        maybe_publish_group_card_after_state_change(state.as_ref(), &id).await;
+
+        let cache = state.group_card_cache.read().await;
+        assert!(
+            !cache.contains_key(&id) && !cache.contains_key(&stable),
+            "a withdrawn Hidden group must leave no card to serve or republish"
+        );
+        Ok(())
+    }
+}
+
+// #506 local-discovery acceptance: the *response* of `GET /groups/discover`
+// must hide Hidden groups (withdrawn or not, from synthesis or cache) while
+// preserving tombstones of listable groups, ListedToContacts visibility, the
+// member-scoped card-by-id fallback, and the Social (shard-cache-only) nearby
+// endpoint's semantics.
+#[cfg(test)]
+mod issue506_local_discovery {
+    use super::*;
+    use axum::extract::{Query, State};
+    use axum::response::IntoResponse;
+    use std::collections::HashMap;
+
+    fn local_group(
+        state: &crate::server::AppState,
+        name: &str,
+        id_hex: &str,
+        discoverability: x0x::groups::GroupDiscoverability,
+    ) -> x0x::groups::GroupInfo {
+        let policy = x0x::groups::GroupPolicy {
+            discoverability,
+            ..Default::default()
+        };
+        x0x::groups::GroupInfo::with_policy(
+            name.to_string(),
+            "issue506 local discovery fixture".to_string(),
+            state.agent.agent_id(),
+            id_hex.to_string(),
+            policy,
+        )
+    }
+
+    async fn discover_groups_response(
+        state: &std::sync::Arc<crate::server::AppState>,
+    ) -> anyhow::Result<(axum::http::StatusCode, serde_json::Value)> {
+        let resp = discover_groups(State(state.clone()), Query(HashMap::new()))
+            .await
+            .into_response();
+        let status = resp.status();
+        let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+        Ok((status, serde_json::from_slice(&bytes)?))
+    }
+
+    /// The #506 acceptance path end-to-end: drive the REAL withdrawal
+    /// endpoint (`POST /groups/:id/state/withdraw`) on a Hidden group and on
+    /// a PublicDirectory group, then assert on the REAL discovery response.
+    /// Positive controls: the public group's withdrawn tombstone stays listed
+    /// and carries `withdrawn: true`; the Hidden group is gone by name AND
+    /// stable id, and the card cache holds no entry for it.
+    #[tokio::test]
+    async fn real_withdrawal_then_discover_hides_hidden_keeps_public_tombstone(
+    ) -> anyhow::Result<()> {
+        use x0x::groups::GroupDiscoverability::{Hidden, PublicDirectory};
+
+        let (state, _dir) = tests::secure_endpoint_test_state().await?;
+        let hidden_id = "1d".repeat(16);
+        let public_id = "2e".repeat(16);
+        let hidden = local_group(&state, "Issue506Hidden", &hidden_id, Hidden);
+        let public = local_group(&state, "Issue506Public", &public_id, PublicDirectory);
+        let hidden_stable = hidden.stable_group_id().to_string();
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(hidden_id.clone(), hidden);
+            groups.insert(public_id.clone(), public);
+        }
+
+        for id in [&hidden_id, &public_id] {
+            let resp = withdraw_group_state(
+                State(std::sync::Arc::clone(&state)),
+                axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner {
+                    durable: true,
+                }),
+                Path(id.clone()),
+            )
+            .await
+            .into_response();
+            let status = resp.status();
+            let bytes = axum::body::to_bytes(resp.into_body(), usize::MAX).await?;
+            assert_eq!(
+                status,
+                axum::http::StatusCode::OK,
+                "real withdrawal of {id} failed: {}",
+                String::from_utf8_lossy(&bytes)
+            );
+        }
+
+        let (status, body) = discover_groups_response(&state).await?;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let groups = body["groups"].as_array().cloned().unwrap_or_default();
+        let names: Vec<&str> = groups.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            !names.contains(&"Issue506Hidden"),
+            "#506: withdrawn Hidden group must not appear in the discovery response"
+        );
+        assert!(
+            !groups.iter().any(|c| c["group_id"] == hidden_stable),
+            "#506: withdrawn Hidden group must not appear under its stable id either"
+        );
+        let tombstone = groups
+            .iter()
+            .find(|c| c["name"] == "Issue506Public")
+            .expect("positive control: withdrawn PublicDirectory tombstone stays listed");
+        assert_eq!(tombstone["withdrawn"], serde_json::json!(true));
+
+        let cache = state.group_card_cache.read().await;
+        assert!(
+            !cache.contains_key(&hidden_id) && !cache.contains_key(&hidden_stable),
+            "no cache entry may survive the real withdrawal of a Hidden group"
+        );
+        Ok(())
+    }
+
+    /// The local listing gate is Hidden-only — deliberately NOT the
+    /// PublicDirectory-only public-shard gate. Covers every merge source of
+    /// the discovery response, including a Hidden card planted in the local
+    /// cache (the member-scoped metadata path can put one there).
+    #[tokio::test]
+    async fn discover_response_semantics_matrix() -> anyhow::Result<()> {
+        use x0x::groups::GroupDiscoverability::{Hidden, ListedToContacts, PublicDirectory};
+
+        let (state, _dir) = tests::secure_endpoint_test_state().await?;
+        let hidden_id = "3d".repeat(16);
+        let contacts_id = "4e".repeat(16);
+        let public_id = "5f".repeat(16);
+        let tombstone_id = "6a".repeat(16);
+        let cache_hidden_id = "7b".repeat(16);
+
+        let mut withdrawn_hidden = local_group(&state, "MatrixHidden", &hidden_id, Hidden);
+        withdrawn_hidden.withdrawn = true;
+        let contacts = local_group(&state, "MatrixContacts", &contacts_id, ListedToContacts);
+        let public = local_group(&state, "MatrixPublic", &public_id, PublicDirectory);
+        let mut tombstone = local_group(&state, "MatrixTombstone", &tombstone_id, PublicDirectory);
+        tombstone.withdrawn = true;
+        {
+            let mut groups = state.named_groups.write().await;
+            groups.insert(hidden_id.clone(), withdrawn_hidden);
+            groups.insert(contacts_id.clone(), contacts);
+            groups.insert(public_id.clone(), public);
+            groups.insert(tombstone_id.clone(), tombstone);
+        }
+
+        // A withdrawn Hidden card CAN legitimately sit in the local cache
+        // (member-scoped metadata application caches cards it receives). The
+        // discovery response must filter it at the merge.
+        let mut cache_hidden = local_group(&state, "MatrixCacheHidden", &cache_hidden_id, Hidden);
+        cache_hidden.withdrawn = true;
+        let cache_hidden_stable = cache_hidden.stable_group_id().to_string();
+        let card = cache_hidden
+            .to_signed_group_card(state.agent.identity().agent_keypair())?
+            .expect("withdrawn Hidden info still yields a member-scoped tombstone card");
+        {
+            let mut cache = state.group_card_cache.write().await;
+            cache.insert(cache_hidden_id.clone(), card.clone());
+            cache.insert(cache_hidden_stable.clone(), card);
+        }
+
+        let (status, body) = discover_groups_response(&state).await?;
+        assert_eq!(status, axum::http::StatusCode::OK);
+        let groups = body["groups"].as_array().cloned().unwrap_or_default();
+        let names: Vec<&str> = groups.iter().filter_map(|c| c["name"].as_str()).collect();
+        assert!(
+            !names.contains(&"MatrixHidden") && !names.contains(&"MatrixCacheHidden"),
+            "Hidden groups must never appear in local discovery, synthesized or cached: {names:?}"
+        );
+        assert!(
+            !groups.iter().any(|c| c["group_id"] == cache_hidden_stable),
+            "cache-sourced Hidden card must be filtered at the discovery merge"
+        );
+        assert!(
+            names.contains(&"MatrixContacts"),
+            "ListedToContacts stays on local listing surfaces"
+        );
+        assert!(
+            names.contains(&"MatrixPublic"),
+            "live PublicDirectory stays listed"
+        );
+        assert!(
+            names.contains(&"MatrixTombstone"),
+            "withdrawn PublicDirectory tombstone stays listed"
+        );
+        Ok(())
+    }
+
+    /// The cache itself must refuse Hidden cards at refresh time — this is
+    /// what stops the ~10 refresh callers from repopulating the leak the
+    /// withdrawal hook cleans up.
+    #[tokio::test]
+    async fn refresh_refuses_and_removes_hidden_cards() -> anyhow::Result<()> {
+        use x0x::groups::GroupDiscoverability::{Hidden, ListedToContacts};
+
+        let (state, _dir) = tests::secure_endpoint_test_state().await?;
+        let key = "8c".repeat(16);
+        let mut hidden = local_group(&state, "RefreshHidden", &key, Hidden);
+        hidden.withdrawn = true;
+        let stable = hidden.stable_group_id().to_string();
+        let card = hidden
+            .to_signed_group_card(state.agent.identity().agent_keypair())?
+            .expect("withdrawn Hidden info yields a tombstone card");
+        {
+            let mut cache = state.group_card_cache.write().await;
+            cache.insert(key.clone(), card.clone());
+            cache.insert(stable.clone(), card);
+        }
+
+        refresh_group_card_cache_from_info(state.as_ref(), &key, &hidden).await;
+        {
+            let cache = state.group_card_cache.read().await;
+            assert!(
+                !cache.contains_key(&key) && !cache.contains_key(&stable),
+                "refresh must remove stale Hidden entries, not cache them"
+            );
+        }
+
+        // Listable control: a ListedToContacts group still caches.
+        let contacts_key = "9d".repeat(16);
+        let contacts = local_group(&state, "RefreshContacts", &contacts_key, ListedToContacts);
+        let contacts_stable = contacts.stable_group_id().to_string();
+        refresh_group_card_cache_from_info(state.as_ref(), &contacts_key, &contacts).await;
+        {
+            let cache = state.group_card_cache.read().await;
+            assert!(
+                cache.contains_key(&contacts_key) && cache.contains_key(&contacts_stable),
+                "listable groups keep caching under both keys"
+            );
+        }
+        Ok(())
+    }
+}
+
 async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id: &str) {
     let info = {
         let groups = state.named_groups.read().await;
@@ -4691,15 +5034,23 @@ async fn maybe_publish_group_card_after_state_change(state: &AppState, group_id:
     };
     if let Some(info) = info {
         refresh_group_card_cache_from_info(state, group_id, &info).await;
-        let discoverable = info.withdrawn
-            || info.policy.discoverability != x0x::groups::GroupDiscoverability::Hidden;
-        if discoverable {
+        // #506: `info.withdrawn ||` used to sit in front of this, so a
+        // WITHDRAWN Hidden group published a public discovery card carrying
+        // its name, description, tags, owner agent id and member count — a
+        // group whose whole point is being undiscoverable became discoverable
+        // at the moment it was deleted. For a public group the withdrawn card
+        // is a legitimate tombstone that supersedes an already-public one; a
+        // Hidden group has no public card to supersede, so the tombstone was
+        // its FIRST and only public disclosure.
+        //
+        // Hidden delete propagation is the signed `GroupDeleted`
+        // metadata/direct event, which is member-scoped — exactly as
+        // `withdraw_named_group_terminal` already documents.
+        // `refresh_group_card_cache_from_info` already refuses to cache a
+        // Hidden group's card and removes stale entries under both keys, so
+        // only the publish decision remains here.
+        if group_card_is_listable(&info) {
             publish_group_card_to_discovery(state, group_id).await;
-        } else {
-            let mut cache = state.group_card_cache.write().await;
-            prune_expired_group_cards(&mut cache, now_millis_u64());
-            cache.remove(group_id);
-            cache.remove(info.stable_group_id());
         }
     } else {
         let mut cache = state.group_card_cache.write().await;
@@ -20438,6 +20789,15 @@ pub(in crate::server) async fn discover_groups(
 ) -> impl IntoResponse {
     let mut cards: HashMap<String, x0x::groups::GroupCard> = HashMap::new();
     let mut merge_card = |card: &x0x::groups::GroupCard| {
+        // #506: a Hidden card never appears on this listing surface, no matter
+        // which store it came from. Live Hidden cards cannot be synthesized
+        // (`to_group_card` yields none), but withdrawn Hidden tombstones can be
+        // synthesized and can sit in the local cache (e.g. applied over the
+        // member-scoped metadata topic); they are member-scoped signals, not
+        // listing entries. Tombstones of *listable* groups stay listed.
+        if card.policy_summary.discoverability == x0x::groups::GroupDiscoverability::Hidden {
+            return;
+        }
         let entry = cards.entry(card.group_id.clone());
         match entry {
             std::collections::hash_map::Entry::Vacant(v) => {
@@ -20472,6 +20832,11 @@ pub(in crate::server) async fn discover_groups(
     let groups = state.named_groups.read().await;
     let signing_kp = state.agent.identity().agent_keypair();
     for info in groups.values() {
+        // #506: the synthesis fallback is the last listing gate — a withdrawn
+        // Hidden group must not re-enter the response through `named_groups`.
+        if !group_card_is_listable(info) {
+            continue;
+        }
         if let Ok(Some(card)) = info.to_signed_group_card(signing_kp) {
             merge_card(&card);
         }
@@ -29527,6 +29892,7 @@ pub(in crate::server) mod tests {
     mod cache_hardening_followup;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue506_public_broadcast_control;
     mod pr291_restart_marker_matrix;
     mod wp_c;
 
@@ -41156,7 +41522,7 @@ pub(in crate::server) mod tests {
         let kem_blob = BASE64.encode(vec![0xbbu8; 1_184]);
 
         let build_info = |n_joiners: usize| -> GroupInfo {
-            let mut info = GroupInfo::with_policy(
+            let mut info = x0x::groups::GroupInfo::with_policy(
                 "growth".to_string(),
                 "growth-curve".to_string(),
                 agent_id,
