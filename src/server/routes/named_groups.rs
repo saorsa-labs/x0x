@@ -29884,6 +29884,7 @@ pub(in crate::server) mod tests {
     mod cache_hardening_followup;
     mod hs_f2_membership_cluster;
     mod hs_r3_invite_auth;
+    mod issue506_public_broadcast_control;
     mod pr291_restart_marker_matrix;
     mod wp_c;
 
