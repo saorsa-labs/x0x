@@ -545,16 +545,66 @@ fn test_crdt_merge_performance() {
     assert_eq!(list1.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
     assert_eq!(list2.tasks_ordered().len(), TASKS_PER_REPLICA as usize);
 
+    // #503: timing is an OBSERVATION, not a correctness assertion. A
+    // wall-clock budget is a property of the runner's scheduling, not of the
+    // merge — this exact assertion failed PR CI on the GUI-only #502 while
+    // passing locally with ~8x margin. The deliberate timing lane for merge
+    // cost is `benches/crdt_merge_throughput.rs` (criterion, never gates
+    // PRs).
+    let list1_pre_merge = list1.clone();
     let start = Instant::now();
     list1.merge(&list2).unwrap();
     let elapsed = start.elapsed();
+    println!(
+        "Merged {} tasks into {} in {:?} (observation only; see benches/crdt_merge_throughput)",
+        TASKS_PER_REPLICA, TASKS_PER_REPLICA, elapsed
+    );
 
+    // Correctness at scale (#503): the union is complete and BOTH replicas'
+    // content survives the merge.
     assert_eq!(
         list1.tasks_ordered().len(),
         (TASKS_PER_REPLICA * 2) as usize
     );
-    println!("Merged 100 tasks in {:?}", elapsed);
-    assert!(elapsed.as_millis() < 10, "Merge should be < 10ms");
+    let titles: std::collections::HashSet<String> = list1
+        .tasks_ordered()
+        .into_iter()
+        .map(|task| task.title().to_string())
+        .collect();
+    for i in 0..TASKS_PER_REPLICA {
+        assert!(
+            titles.contains(&format!("Task {i}")),
+            "post-merge list must contain every task from BOTH replicas (missing Task {i})"
+        );
+    }
+
+    // Negative/robustness semantics: merging is IDEMPOTENT (re-merging the
+    // same replica neither duplicates nor drops tasks)…
+    list1.merge(&list2).unwrap();
+    assert_eq!(
+        list1.tasks_ordered().len(),
+        (TASKS_PER_REPLICA * 2) as usize,
+        "re-merging an already-merged replica must not change the union"
+    );
+
+    // …and DIRECTION-INDEPENDENT (CRDT commutativity at this scale: merging
+    // the pre-merge replica-1 into replica-2 yields the same union).
+    let mut reverse = list2.clone();
+    reverse.merge(&list1_pre_merge).unwrap();
+    assert_eq!(
+        reverse.tasks_ordered().len(),
+        (TASKS_PER_REPLICA * 2) as usize,
+        "merge direction must not change the union"
+    );
+    let reverse_titles: std::collections::HashSet<String> = reverse
+        .tasks_ordered()
+        .into_iter()
+        .map(|task| task.title().to_string())
+        .collect();
+    assert_eq!(
+        reverse_titles, titles,
+        "both merge directions agree on content"
+    );
 }
 
 // ============================================================================
