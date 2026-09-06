@@ -184,21 +184,35 @@ pub(in crate::server) async fn home_retire_blockers(
     }
 
     // Durable history — and therefore group delegations, which live only there.
-    if let Some(history) = state.agent.history() {
-        let store = Arc::clone(history.store());
-        let query = crate::history::HistoryQuery {
-            scope: Some(crate::history::Scope::Group(stable_id.clone())),
-            limit: 1,
-            ..Default::default()
-        };
-        match tokio::task::spawn_blocking(move || store.query(&query)).await {
-            Ok(Ok(rows)) if !rows.is_empty() => {
-                blockers.push("has durable history (and possibly delegations)".to_string());
+    //
+    // Review P2: a MISSING handle is not evidence of emptiness. History is off
+    // by default in the library (`AgentBuilder::with_history`), and a disabled
+    // or unopened store says nothing about the rows already on disk at
+    // `<data_dir>/history.db` — which an operator can re-enable at any time.
+    // Treating `None` as "no history" would let this path delete a Home whose
+    // messages and delegations are sitting in a database we simply did not
+    // open. "Cannot prove empty" must behave like "not empty", so an absent
+    // handle is itself a blocker.
+    match state.agent.history() {
+        Some(history) => {
+            let store = Arc::clone(history.store());
+            let query = crate::history::HistoryQuery {
+                scope: Some(crate::history::Scope::Group(stable_id.clone())),
+                limit: 1,
+                ..Default::default()
+            };
+            match tokio::task::spawn_blocking(move || store.query(&query)).await {
+                Ok(Ok(rows)) if !rows.is_empty() => {
+                    blockers.push("has durable history (and possibly delegations)".to_string());
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(e)) => blockers.push(format!("history unreadable: {e}")),
+                Err(e) => blockers.push(format!("history probe failed: {e}")),
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(e)) => blockers.push(format!("history unreadable: {e}")),
-            Err(e) => blockers.push(format!("history probe failed: {e}")),
         }
+        None => blockers.push(
+            "history store unavailable — cannot prove this Home has no durable rows".to_string(),
+        ),
     }
 
     // Group-scoped CRDT task lists are namespaced by convention, not keyed,
@@ -1376,19 +1390,27 @@ pub(in crate::server::routes) mod tests {
     /// Publish `group_id` as the owner's canonical Home on the Tier-1
     /// register, as a peer device would (#449).
     /// WHY (#449, ADR-0060 validation gap): the retired-pointer lifecycle
-    /// across a REAL restart — state dropped and rebuilt from the same data
-    /// dir, so both the named-group roster and the owner-sync record store
-    /// are reloaded from disk.
+    /// across a DISK RELOAD. The `AppState` is dropped and rebuilt from the
+    /// same data dir, so the named-group roster and the owner-sync record
+    /// store are both re-read from disk.
     ///
-    /// ADR-0060 recorded this as unvalidated: the earlier test re-provisioned
-    /// in-process, so the on-disk reload path held only by construction. The
-    /// hazard is specific — tombstone retention never clears owner-sync
-    /// state, so a persisted pointer to a Home that was retired before
-    /// shutdown could come back after restart and suppress every replacement
-    /// permanently, which is the worst version of this bug: an owner left
-    /// with no Home and no way to obtain one.
+    /// SCOPE LIMIT — this is a disk-reload fixture, NOT a process restart.
+    /// It does not exit, reap or respawn a process; everything happens in one
+    /// test process. It therefore exercises the persistence and reload path,
+    /// and says nothing about process teardown, signal handling or
+    /// supervision. Concretely: dropping `AppState` does not synchronously
+    /// release every resource the way process exit would — an enabled history
+    /// store still holds its sqlite file across the drop — which is why this
+    /// fixture deliberately runs WITHOUT history. It covers the owner-sync
+    /// pointer lifecycle only.
+    ///
+    /// The hazard it does cover: tombstone retention never clears owner-sync
+    /// state, so a persisted pointer to a Home retired before shutdown could
+    /// come back on reload and suppress every replacement permanently — the
+    /// worst form of this bug, an owner left with no Home and no way to
+    /// obtain one.
     #[tokio::test]
-    async fn a_retired_pointer_does_not_survive_restart_to_suppress_replacement(
+    async fn a_retired_pointer_reloaded_from_disk_does_not_suppress_replacement(
     ) -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
         let retired_id = {
@@ -1410,7 +1432,7 @@ pub(in crate::server::routes) mod tests {
             home_id
         };
 
-        // Real restart: same data dir, everything reloaded from disk.
+        // Disk reload (NOT a process restart): same data dir, state rebuilt.
         let state = owned_state(dir.path(), [0x6D; 32]).await?;
         let owner = owner_of(&state);
         assert_eq!(
@@ -1423,7 +1445,7 @@ pub(in crate::server::routes) mod tests {
                 .map(|home| home.group_id)
                 .as_deref(),
             Some(retired_id.as_str()),
-            "precondition: the stored pointer to the retired Home survived restart"
+            "precondition: the stored pointer to the retired Home survived the reload"
         );
         assert!(
             effective_canonical_home(&state).await.is_none(),
@@ -1434,10 +1456,46 @@ pub(in crate::server::routes) mod tests {
 
         let (replacement, info) = find_home(&state, &owner)
             .await
-            .expect("a usable replacement Home must be provisioned after restart");
+            .expect("a usable replacement Home must be provisioned after the reload");
         assert_ne!(replacement, retired_id, "the replacement is a NEW Home");
         assert!(!info.withdrawn);
         Ok(())
+    }
+
+    /// Owned test state with a REAL, isolated durable-history store.
+    ///
+    /// Review P2: `owned_state` never calls `AgentBuilder::with_history`, and
+    /// history is off by default in the library — so `agent.history()` is
+    /// `None` there and every history-dependent assertion built on it is
+    /// vacuous. The retirement gate is *about* durable rows, so its tests must
+    /// run against a store that actually exists. The db lives under the test's
+    /// own tempdir; nothing is shared and no network is involved.
+    async fn owned_state_with_history(
+        data_dir: &std::path::Path,
+        owner_seed: [u8; 32],
+    ) -> anyhow::Result<Arc<AppState>> {
+        let user = crate::identity::UserKeypair::from_seed(&owner_seed)?;
+        let agent = Arc::new(
+            crate::Agent::builder()
+                .with_machine_key(data_dir.join("machine.key"))
+                .with_agent_key_path(data_dir.join("agent.key"))
+                .with_agent_cert_path(data_dir.join("agent.cert"))
+                .with_user_key(user)
+                .with_contact_store_path(data_dir.join("contacts.json"))
+                .with_history(crate::history::HistoryConfig {
+                    enabled: true,
+                    db_path: Some(data_dir.join("history.db")),
+                    ..Default::default()
+                })
+                .build()
+                .await?,
+        );
+        anyhow::ensure!(
+            agent.history().is_some(),
+            "test fixture must provide a live history store, or the retirement \
+             gate's history assertions are vacuous"
+        );
+        super::super::named_groups::tests::secure_endpoint_test_state_at(data_dir, agent).await
     }
 
     /// Create a REAL second Home-shaped group and stamp it, mimicking the
@@ -1466,6 +1524,53 @@ pub(in crate::server::routes) mod tests {
         Ok(id)
     }
 
+    /// WHY (review P2): an ABSENT history store must block retirement.
+    ///
+    /// History is off by default in the library, so `agent.history()` is
+    /// `None` on an install that never enabled it — but rows for this group
+    /// may already sit in `<data_dir>/history.db`, and an operator can
+    /// re-enable the store at any time. Treating a missing handle as "no
+    /// history" would let this path delete a Home whose messages and
+    /// delegations are in a database we simply did not open. "Cannot prove
+    /// empty" must behave like "not empty".
+    ///
+    /// Uses `owned_state` deliberately — the fixture WITHOUT history — which
+    /// is the exact configuration that made the earlier blocker test vacuous.
+    #[tokio::test]
+    async fn an_unavailable_history_store_blocks_retirement() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x6E; 32]).await?;
+        assert!(
+            state.agent.history().is_none(),
+            "precondition: this fixture has NO history store"
+        );
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
+        let duplicate = provision_duplicate_home(&state).await?;
+        advertise_canonical_home(&state, &canonical).await;
+
+        let blockers = home_retire_blockers(&state, &duplicate).await;
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("history store unavailable")),
+            "an absent history store must block retirement, got {blockers:?}"
+        );
+
+        reconcile_home_duplicates(&state).await;
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&duplicate)
+                .is_some_and(|info| !info.withdrawn),
+            "nothing may be retired while emptiness cannot be proven"
+        );
+        Ok(())
+    }
+
     /// WHY (#449 P4): the ordering rule — **join first, retire second.**
     ///
     /// Retiring a duplicate before this device is seated in the canonical
@@ -1475,7 +1580,7 @@ pub(in crate::server::routes) mod tests {
     #[tokio::test]
     async fn nothing_is_retired_before_adoption_completes() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x6A; 32]).await?;
+        let state = owned_state_with_history(dir.path(), [0x6A; 32]).await?;
         provision_home(&state).await;
         let owner = owner_of(&state);
         let (local_home, _) = find_home(&state, &owner).await.expect("local Home");
@@ -1508,7 +1613,7 @@ pub(in crate::server::routes) mod tests {
     #[tokio::test]
     async fn empty_duplicate_is_retired_once_seated_in_canonical() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x6B; 32]).await?;
+        let state = owned_state_with_history(dir.path(), [0x6B; 32]).await?;
         provision_home(&state).await;
         let owner = owner_of(&state);
         let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
@@ -1541,7 +1646,7 @@ pub(in crate::server::routes) mod tests {
     #[tokio::test]
     async fn duplicate_with_history_is_kept_and_reported() -> anyhow::Result<()> {
         let dir = tempfile::tempdir()?;
-        let state = owned_state(dir.path(), [0x6C; 32]).await?;
+        let state = owned_state_with_history(dir.path(), [0x6C; 32]).await?;
         provision_home(&state).await;
         let owner = owner_of(&state);
         let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
@@ -1556,9 +1661,10 @@ pub(in crate::server::routes) mod tests {
             .expect("duplicate")
             .stable_group_id()
             .to_string();
-        let Some(history) = state.agent.history() else {
-            return Ok(()); // history disabled in this build: blocker unreachable
-        };
+        let history = state
+            .agent
+            .history()
+            .expect("fixture guarantees a live history store");
         // Insert through the store directly so the row is durable BEFORE the
         // probe runs — the async writer would race the assertion.
         let payload = b"a message the owner would lose".to_vec();

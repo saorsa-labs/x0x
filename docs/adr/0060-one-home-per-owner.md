@@ -180,10 +180,13 @@ ADR-0039 reconciled rather than bypassed — before implementation.
   the exception must not widen into "newest wins".
 - A daemon with no `user.key` provisions no Home and mints no records.
 - `SyncKind::ALL.len() == 4` — the Tier-1 tripwire remains untripped.
-- **Retired-pointer lifecycle across a real restart** — now covered by
-  `a_retired_pointer_does_not_survive_restart_to_suppress_replacement`
-  (ADR-0061): the state is dropped and rebuilt from the same data dir, so both
-  the roster and the owner-sync record store reload from disk, and the
-  persisted pointer to the retired Home must not suppress a replacement.
+- **Retired-pointer lifecycle across a DISK RELOAD** — covered by
+  `a_retired_pointer_reloaded_from_disk_does_not_suppress_replacement`: the
+  state is dropped and rebuilt from the same data dir, so the roster and the
+  owner-sync record store re-read from disk, and the persisted pointer to the
+  retired Home must not suppress a replacement.
 - **Not yet validated:** full distributed convergence across independent
-  record stores. The election tests use a single in-memory register.
+  record stores (the election tests use a single in-memory register), and the
+  lifecycle across a genuine PROCESS restart. The reload fixture above is not
+  a process boundary — it does not exit, reap or respawn anything, and drop
+  does not release resources the way process exit does.

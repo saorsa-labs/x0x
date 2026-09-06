@@ -1,6 +1,8 @@
 # ADR 0061: Duplicate-Home Retirement Is Gated on Provable Emptiness
 
-- **Status:** Proposed
+- **Status:** Proposed — **NUMBER CONTENDED.** ADR-0061 is also claimed by a
+  Proposed ADR under OMP/#472. This document is held out of integration until
+  the numbering is reconciled; renumber before any merge.
 - **Date:** 2026-09-06
 - **Decision owners:** David Irvine (direction), Claude (drafting)
 - **Reviewers:** — (independent review pending)
@@ -116,10 +118,14 @@ We will adopt option 3.
   (`empty_duplicate_is_retired_once_seated_in_canonical`).
 - A duplicate carrying one durable history row is **kept**, and the blocker is
   reported (`duplicate_with_history_is_kept_and_reported`).
-- A pointer to a Home retired before shutdown does not, after a real restart
-  from the same data dir, suppress a replacement
-  (`a_retired_pointer_does_not_survive_restart_to_suppress_replacement`) —
-  this also closes the restart gap ADR 0060 recorded as unvalidated.
-- **Not validated here:** forced retirement of a non-empty duplicate, and the
-  history/delegation/task-list/rider-grant purge or repoint that it would
-  require. Deliberately out of scope; see Negative above.
+- An **absent** history store blocks retirement, because history is off by
+  default and a store we never opened says nothing about the rows on disk
+  (`an_unavailable_history_store_blocks_retirement`). "Cannot prove empty"
+  behaves like "not empty".
+- A pointer to a Home retired before shutdown does not, after a **disk
+  reload** from the same data dir, suppress a replacement
+  (`a_retired_pointer_reloaded_from_disk_does_not_suppress_replacement`).
+- **Not validated here:** forced retirement of a non-empty duplicate and the
+  history/delegation/task-list/rider-grant purge it would require
+  (deliberately out of scope); and the lifecycle across a genuine PROCESS
+  restart — the reload fixture is not a process boundary.
