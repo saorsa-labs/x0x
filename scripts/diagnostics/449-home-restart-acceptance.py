@@ -27,6 +27,24 @@ Predicates are lifted from the existing tests, not invented:
   agent, local agent is a member; ADR-0065 — duplicates read-only
   (`retirement: "manual_only"`, NO `safe_to_retire`), nothing withdrawn.
 
+API SHAPE AUDIT (all four endpoints this harness touches, verified against the
+server routes at this base — run 34064199876 failed on exactly this class of
+adapter mismatch):
+  GET /health  -> ApiResponse ENVELOPE {ok, data:{status,version,...}};
+                  auth-EXEMPT (server/auth.rs:270). Only the STATUS CODE is
+                  used here, so the envelope shape cannot mismatch.
+  GET /agent   -> ApiResponse ENVELOPE {ok, data:{agent_id,...}}
+                  (server/routes/identity.rs:81-99).
+  GET /home    -> FLAT body {ok, state, name, group_id, primary_agent{...},
+                  members[...], duplicates[...], warnings{...}}
+                  (server/routes/home.rs).
+  GET /groups  -> FLAT body {ok, groups:[{group_id,...}]}, and it EXCLUDES
+                  withdrawn tombstones (named_groups.rs:11370-11372).
+  <data_dir>/api.port  -> a SOCKET ADDRESS, not a port (server/mod.rs:1034);
+                  the product itself re-reads it as `trim().parse::<SocketAddr>()`
+                  (upgrade/restart.rs:714-716).
+No other endpoint or on-disk producer is consumed.
+
 SCOPE LIMIT: a POPULATED `duplicates[]` is not runtime-reachable on a single
 device with this code — one device holds two stamped Homes only after adoption
 (not implemented) or from a pre-fix fork made by an older binary, and seeding
@@ -37,6 +55,7 @@ convergence or issue closure is claimed.
 """
 import argparse
 import hashlib
+import ipaddress
 import json
 import os
 import signal
@@ -74,9 +93,71 @@ def digest(value):
     return hashlib.sha256(("449-acceptance:" + value).encode()).hexdigest()[:16]
 
 
-def api_call(port, token, path):
+# Structured startup categories. Retained in the receipt INSTEAD of raw log
+# tails, so a startup failure is diagnosable without carrying tokens, payloads
+# or arbitrary daemon output (run 34064199876 was undiagnosable from evidence).
+STARTUP_MISSING_PORT = "port-file-absent"
+STARTUP_MISSING_TOKEN = "token-file-absent"
+STARTUP_EMPTY_TOKEN = "token-file-empty"
+STARTUP_INVALID_ADDRESS = "port-file-not-a-socket-address"
+STARTUP_NON_LOOPBACK = "port-file-address-not-loopback"
+STARTUP_HEALTH_NOT_READY = "health-endpoint-not-ready"
+
+
+class AddressError(ValueError):
+    """Carries a structured category, never the offending bytes."""
+
+    def __init__(self, category):
+        super().__init__(category)
+        self.category = category
+
+
+def parse_api_address(text):
+    """Parse `<data_dir>/api.port`, which holds a SOCKET ADDRESS, not a port.
+
+    The daemon writes `actual_api_addr.to_string()` (src/server/mod.rs:1034)
+    and the product itself reads it back as `s.trim().parse::<SocketAddr>()`
+    (src/upgrade/restart.rs:714-716), so this mirrors that exact contract:
+    `127.0.0.1:PORT` or bracketed `[::1]:PORT`. Reading it as an integer is
+    what made every phase of run 34064199876 time out.
+
+    A bare port is REJECTED: no producer writes one, so accepting it would be
+    undocumented leniency that could mask a malformed file.
+
+    Returns `(host, port)`; raises `AddressError` with a category.
+    """
+    text = text.strip()
+    if not text:
+        raise AddressError(STARTUP_INVALID_ADDRESS)
+    if text.startswith("["):
+        host, sep, port_text = text.partition("]")
+        if not sep or not port_text.startswith(":"):
+            raise AddressError(STARTUP_INVALID_ADDRESS)
+        host, port_text = host[1:], port_text[1:]
+    else:
+        host, sep, port_text = text.rpartition(":")
+        if not sep or ":" in host:  # bare port, or an unbracketed IPv6
+            raise AddressError(STARTUP_INVALID_ADDRESS)
+    if not port_text.isdigit():
+        raise AddressError(STARTUP_INVALID_ADDRESS)
+    port = int(port_text)
+    if not 1 <= port <= 65535:
+        raise AddressError(STARTUP_INVALID_ADDRESS)
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise AddressError(STARTUP_INVALID_ADDRESS) from None
+    if not address.is_loopback:
+        # The daemon runs in a loopback-only namespace; anything else means we
+        # would be dialling something we did not start.
+        raise AddressError(STARTUP_NON_LOOPBACK)
+    return host, port
+
+
+def api_call(host, port, token, path):
+    authority = f"[{host}]" if ":" in host else host
     request = urllib.request.Request(
-        f"http://127.0.0.1:{port}{path}",
+        f"http://{authority}:{port}{path}",
         headers={"Authorization": f"Bearer {token}"},
     )
     try:
@@ -92,19 +173,34 @@ def api_call(port, token, path):
 
 
 def wait_for_api(root, deadline):
+    """Poll until ready, retaining WHY it was not ready as a category."""
     port_file, token_file = root / "api.port", root / "api-token"
+    category = STARTUP_MISSING_PORT
     while time.monotonic() < deadline:
-        if port_file.is_file() and token_file.is_file():
+        if not port_file.is_file():
+            category = STARTUP_MISSING_PORT
+        elif not token_file.is_file():
+            category = STARTUP_MISSING_TOKEN
+        else:
             try:
-                port = int(port_file.read_text().strip())
-                token = token_file.read_text().strip()
-            except ValueError:
-                time.sleep(POLL_INTERVAL_S)
-                continue
-            if port and token and api_call(port, token, "/health")[0] == 200:
-                return port, token
+                host, port = parse_api_address(port_file.read_text())
+            except AddressError as error:
+                category = error.category
+            except OSError:
+                category = STARTUP_MISSING_PORT
+            else:
+                try:
+                    token = token_file.read_text().strip()
+                except OSError:
+                    token = ""
+                if not token:
+                    category = STARTUP_EMPTY_TOKEN
+                elif api_call(host, port, token, "/health")[0] == 200:
+                    return host, port, token
+                else:
+                    category = STARTUP_HEALTH_NOT_READY
         time.sleep(POLL_INTERVAL_S)
-    raise PhaseError("startup", "daemon API not ready before deadline")
+    raise PhaseError("startup", category)
 
 
 def start_daemon(binary, root, log_path):
@@ -165,14 +261,14 @@ def duplicates_projection(raw):
     }
 
 
-def observe(port, token, call=api_call):
+def observe(host, port, token, call=api_call):
     """One observation. Fetches the REAL local agent id and compares it in
     memory against the Home projection (review P2); only booleans and salted
     digests are retained. `call` is injectable so the decode path has pure
     controls against the real response shapes (review r2 P1)."""
     # GET /agent returns the ApiResponse ENVELOPE: {ok, data:{agent_id,...}}
     # (src/server/routes/identity.rs:81-99), NOT a top-level agent_id.
-    agent_status, agent_body = call(port, token, "/agent")
+    agent_status, agent_body = call(host, port, token, "/agent")
     if agent_status != 200 or not isinstance(agent_body, dict):
         raise PhaseError("observe", f"/agent status {agent_status}")
     if agent_body.get("ok") is not True:
@@ -185,7 +281,7 @@ def observe(port, token, call=api_call):
         raise PhaseError("observe", "/agent data has no agent_id")
 
     # GET /home is a FLAT body (routes/home.rs), not the envelope.
-    home_status, home = call(port, token, "/home")
+    home_status, home = call(host, port, token, "/home")
     if home_status != 200 or not isinstance(home, dict):
         raise PhaseError("observe", f"/home status {home_status}")
     if home.get("ok") is not True:
@@ -204,7 +300,7 @@ def observe(port, token, call=api_call):
     # therefore invisible as a field and shows up only as the live set
     # shrinking — so the identity set below, not a "withdrawn" counter, is the
     # no-deletion evidence.
-    groups_status, groups_body = call(port, token, "/groups")
+    groups_status, groups_body = call(host, port, token, "/groups")
     if groups_status != 200 or not isinstance(groups_body, dict):
         raise PhaseError("observe", f"/groups status {groups_status}")
     if groups_body.get("ok") is not True:
@@ -248,8 +344,8 @@ def phase(binary, root, private_logs, label):
     outcome = {"label": label, "pid": process.pid, "ok": False,
                "failure": None, "observation": None}
     try:
-        port, token = wait_for_api(root, time.monotonic() + STARTUP_TIMEOUT_S)
-        outcome["observation"] = observe(port, token)
+        host, port, token = wait_for_api(root, time.monotonic() + STARTUP_TIMEOUT_S)
+        outcome["observation"] = observe(host, port, token)
         outcome["ok"] = True
     except PhaseError as error:
         outcome["failure"] = {"stage": error.stage, "detail": error.detail}
@@ -431,13 +527,13 @@ def self_test():
                                          "created_at": 1, "member_count": 1}]}
 
     def fake(routes):
-        def call(_port, _token, path):
+        def call(_host, _port, _token, path):
             return routes[path]
         return call
 
     def observe_case(name, routes, expect_ok, expect_stage=None):
         try:
-            result = observe(1, "t", call=fake(routes))
+            result = observe("127.0.0.1", 1, "t", call=fake(routes))
             got_ok, stage = True, None
         except PhaseError as error:
             got_ok, stage = False, error.stage
@@ -464,26 +560,71 @@ def self_test():
     observe_case("groups_entry_without_id", {**base,
         "/groups": (200, {"ok": True, "groups": [{"name": "x"}]})}, False, "observe")
 
-    detached = observe(1, "t", call=fake({**base, "/groups": (200, {"ok": True,
+    detached = observe("127.0.0.1", 1, "t", call=fake({**base, "/groups": (200, {"ok": True,
         "groups": [{"group_id": "other", "name": "x", "description": "",
                     "creator": "aa", "created_at": 1, "member_count": 1}]})}))
     cases.append(("observe:home_detached_from_inventory_detected",
                   True, detached["home_group_in_inventory"] is False))
 
     # Positive decode must actually compute the identity comparisons.
-    decoded = observe(1, "t", call=fake(base))
+    decoded = observe("127.0.0.1", 1, "t", call=fake(base))
     cases.append(("observe:home_group_in_inventory_true",
                   True, decoded["home_group_in_inventory"] is True))
     cases.append(("observe:primary_is_local_agent_true",
                   True, decoded["primary_is_local_agent"] is True))
     cases.append(("observe:local_agent_is_member_true",
                   True, decoded["local_agent_is_member"] is True))
-    mismatch = observe(1, "t", call=fake({**base, "/home": (200, {**HOME_OK,
+    mismatch = observe("127.0.0.1", 1, "t", call=fake({**base, "/home": (200, {**HOME_OK,
         "primary_agent": {"agent_id": "bb"}, "members": [{"agent_id": "bb"}]})}))
     cases.append(("observe:primary_mismatch_detected",
                   True, mismatch["primary_is_local_agent"] is False))
     cases.append(("observe:missing_membership_detected",
                   True, mismatch["local_agent_is_member"] is False))
+
+    # --- api.port address parsing: the run-34064199876 regression ---
+    # Producer forms are `actual_api_addr.to_string()` (src/server/mod.rs:1034);
+    # in-repo fixtures also carry a trailing newline.
+    addr_ok = [
+        ("ipv4_producer_form", "127.0.0.1:12700", ("127.0.0.1", 12700)),
+        ("ipv4_trailing_newline", "127.0.0.1:9999\n", ("127.0.0.1", 9999)),
+        ("ipv4_surrounding_space", "  127.0.0.1:41234  ", ("127.0.0.1", 41234)),
+        ("ipv6_bracketed_loopback", "[::1]:12700", ("::1", 12700)),
+        ("ipv4_high_port", "127.0.0.1:65535", ("127.0.0.1", 65535)),
+        ("ipv4_alt_loopback", "127.0.0.2:8080", ("127.0.0.2", 8080)),
+    ]
+    for name, text, expect in addr_ok:
+        try:
+            got = parse_api_address(text)
+        except AddressError as error:
+            got = f"raised {error.category}"
+        cases.append((f"addr:{name}", True, got == expect))
+
+    addr_bad = [
+        # THE regression: an integer parse "succeeded" on this and the harness
+        # then never became ready. It must now be an explicit category.
+        ("bare_port_rejected", "12700", STARTUP_INVALID_ADDRESS),
+        ("empty", "", STARTUP_INVALID_ADDRESS),
+        ("whitespace_only", "   \n", STARTUP_INVALID_ADDRESS),
+        ("stale_advertisement", "stale-advertisement", STARTUP_INVALID_ADDRESS),
+        ("host_without_port", "127.0.0.1", STARTUP_INVALID_ADDRESS),
+        ("port_not_numeric", "127.0.0.1:abc", STARTUP_INVALID_ADDRESS),
+        ("port_zero", "127.0.0.1:0", STARTUP_INVALID_ADDRESS),
+        ("port_out_of_range", "127.0.0.1:65536", STARTUP_INVALID_ADDRESS),
+        ("port_negative", "127.0.0.1:-1", STARTUP_INVALID_ADDRESS),
+        ("unbracketed_ipv6", "::1:12700", STARTUP_INVALID_ADDRESS),
+        ("unclosed_bracket", "[::1:12700", STARTUP_INVALID_ADDRESS),
+        ("hostname_not_ip", "localhost:12700", STARTUP_INVALID_ADDRESS),
+        ("non_loopback_ipv4", "10.0.0.5:12700", STARTUP_NON_LOOPBACK),
+        ("non_loopback_wildcard", "0.0.0.0:12700", STARTUP_NON_LOOPBACK),
+        ("non_loopback_ipv6", "[2001:db8::1]:12700", STARTUP_NON_LOOPBACK),
+    ]
+    for name, text, expect in addr_bad:
+        try:
+            parse_api_address(text)
+            got = "accepted"
+        except AddressError as error:
+            got = error.category
+        cases.append((f"addr:{name}", True, got == expect))
 
     failed = [(n, e, g) for n, e, g in cases if e != g]
     for name, expect, got in cases:
