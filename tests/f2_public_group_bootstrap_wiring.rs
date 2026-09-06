@@ -71,6 +71,14 @@ struct BootstrapObservations {
 struct BootstrapTrace(Arc<Mutex<BootstrapObservations>>);
 
 impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BootstrapTrace {
+    fn enabled(
+        &self,
+        metadata: &tracing::Metadata<'_>,
+        _: tracing_subscriber::layer::Context<'_, S>,
+    ) -> bool {
+        metadata.target() == "x0x::server::routes::public_group_bootstrap_outbox"
+    }
+
     fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
         if event.metadata().target() != "x0x::server::routes::public_group_bootstrap_outbox" {
             return;
@@ -658,6 +666,7 @@ fn bootstrap_diagnostic_summaries_redact_payloads_and_classify_responses() {
 fn bootstrap_diagnostic_trace_keeps_only_allowed_events_and_bounds_history() {
     let observations = Arc::new(Mutex::new(BootstrapObservations::default()));
     let subscriber = tracing_subscriber::registry().with(BootstrapTrace(Arc::clone(&observations)));
+    let unrelated_fields_evaluated = std::cell::Cell::new(0);
     tracing::subscriber::with_default(subscriber, || {
         for _ in 0..65 {
             tracing::warn!(
@@ -673,9 +682,14 @@ fn bootstrap_diagnostic_trace_keeps_only_allowed_events_and_bounds_history() {
         );
         tracing::warn!(
             target: "unrelated",
+            expensive_field = {
+                unrelated_fields_evaluated.set(unrelated_fields_evaluated.get() + 1);
+                "DO_NOT_EMIT_FIXTURE_SECRET"
+            },
             "public-group bootstrap delivery attempt failed"
         );
     });
+    assert_eq!(unrelated_fields_evaluated.get(), 0);
     let observations = observations.lock().unwrap();
     assert_eq!(observations.events.len(), 64);
     assert_eq!(observations.dropped_events, 1);
