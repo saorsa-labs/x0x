@@ -41,6 +41,21 @@ pub struct GossipConfig {
     #[serde(default = "default_dispatch_workers")]
     pub dispatch_workers: usize,
 
+    /// Experimental x0x Leaf peer selection limit; 0 retains stock sg policy.
+    #[serde(
+        default = "default_leaf_max_eager_degree",
+        deserialize_with = "deserialize_leaf_degree"
+    )]
+    pub leaf_max_eager_degree: usize,
+
+    /// Observe-only subscribed-topic outbound threshold. 0 disables it.
+    #[serde(default = "default_leaf_egress_soft")]
+    pub leaf_egress_soft_bytes_per_sec: u64,
+
+    /// Observe-only hard threshold; slice 1 never sheds bytes.
+    #[serde(default = "default_leaf_egress_hard")]
+    pub leaf_egress_hard_bytes_per_sec: u64,
+
     /// Operator opt-in to Full (pass-through relay) participation.
     ///
     /// TOML: `gossip.relay = true`. The `--relay` CLI flag sets the same
@@ -82,6 +97,24 @@ const fn default_dispatch_workers() -> usize {
     1
 }
 
+fn deserialize_leaf_degree<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<usize, D::Error> {
+    let value = i64::deserialize(deserializer)?;
+    // Preserve out-of-range status until normalization can emit a warning.
+    Ok(usize::try_from(value).unwrap_or(13))
+}
+
+const fn default_leaf_max_eager_degree() -> usize {
+    2
+}
+const fn default_leaf_egress_soft() -> u64 {
+    65_536
+}
+const fn default_leaf_egress_hard() -> u64 {
+    131_072
+}
+
 impl Default for GossipConfig {
     fn default() -> Self {
         Self {
@@ -90,6 +123,9 @@ impl Default for GossipConfig {
             arwl: 6,
             prwl: 3,
             dispatch_workers: default_dispatch_workers(),
+            leaf_max_eager_degree: default_leaf_max_eager_degree(),
+            leaf_egress_soft_bytes_per_sec: default_leaf_egress_soft(),
+            leaf_egress_hard_bytes_per_sec: default_leaf_egress_hard(),
             relay: false,
             participation: ParticipationMode::Leaf,
             participation_reason: String::new(),
@@ -124,8 +160,32 @@ impl GossipConfig {
         }
     }
 
+    /// Validate the budget separately so budget typos can fall back without
+    /// turning an otherwise valid daemon config into a restart loop.
+    pub fn validate_egress_budget(&self) -> Result<(), String> {
+        if self.leaf_max_eager_degree > 12 {
+            return Err("leaf_max_eager_degree must be 0 or 1..=12".into());
+        }
+        if self.leaf_egress_hard_bytes_per_sec != 0
+            && self.leaf_egress_soft_bytes_per_sec > self.leaf_egress_hard_bytes_per_sec
+        {
+            return Err("leaf egress hard threshold must be >= soft (or 0 to disable)".into());
+        }
+        Ok(())
+    }
+
+    /// Restore only invalid budget settings to defaults; return an operator warning.
+    pub fn normalize_egress_budget(&mut self) -> Option<String> {
+        let error = self.validate_egress_budget().err()?;
+        self.leaf_max_eager_degree = default_leaf_max_eager_degree();
+        self.leaf_egress_soft_bytes_per_sec = default_leaf_egress_soft();
+        self.leaf_egress_hard_bytes_per_sec = default_leaf_egress_hard();
+        Some(format!("{error}; using default Leaf egress budget"))
+    }
+
     /// Validate configuration parameters.
     pub fn validate(&self) -> Result<(), String> {
+        self.validate_egress_budget()?;
         if self.active_view_size == 0 {
             return Err("active_view_size must be > 0".to_string());
         }
@@ -153,6 +213,34 @@ impl GossipConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice1_budget_defaults_escape_and_invalid_fallback() {
+        for degree in [0, 1, 2, 12] {
+            let mut config: GossipConfig =
+                toml::from_str(&format!("leaf_max_eager_degree = {degree}")).unwrap();
+            assert!(config.validate_egress_budget().is_ok());
+            assert!(config.normalize_egress_budget().is_none());
+            assert_eq!(config.leaf_max_eager_degree, degree);
+            assert_eq!(config.leaf_egress_soft_bytes_per_sec, 65536);
+        }
+        for text in [
+            "leaf_max_eager_degree = -1",
+            "leaf_max_eager_degree = 13",
+            "leaf_egress_soft_bytes_per_sec = 200000",
+        ] {
+            let mut config: GossipConfig = toml::from_str(text).unwrap();
+            config.dispatch_workers = 4;
+            assert!(config.validate_egress_budget().is_err());
+            assert!(config.normalize_egress_budget().is_some());
+            assert!(config.validate().is_ok());
+            assert_eq!(config.leaf_max_eager_degree, 2);
+            assert_eq!(config.leaf_egress_hard_bytes_per_sec, 131072);
+            assert_eq!(config.dispatch_workers, 4);
+        }
+        let config: GossipConfig = toml::from_str("").unwrap();
+        assert_eq!(config.leaf_max_eager_degree, 2);
+    }
 
     #[test]
     fn test_default_config() {

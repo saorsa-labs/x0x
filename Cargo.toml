@@ -185,3 +185,18 @@ strip = "none"
 # Embed debuginfo in the binary so gdb / perf on remote VPS can resolve
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
+
+# Experimental #504 slice-1 prerequisite: saorsa-gossip draft PR #51.
+# Pin the family together so TopicId/transport types have one source.
+[patch.crates-io]
+saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
+saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }

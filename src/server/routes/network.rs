@@ -575,6 +575,7 @@ pub(in crate::server) async fn gossip_diagnostics(
         Some(snap) => {
             let pubsub_stages =
                 augment_pubsub_stage_diagnostics(state.agent.gossip_pubsub_stage_stats());
+            let egress = state.agent.gossip_egress_diagnostics().unwrap_or_default();
             let (agents, machines, users) = state.agent.discovery_cache_entry_counts().await;
             (
                 StatusCode::OK,
@@ -582,6 +583,9 @@ pub(in crate::server) async fn gossip_diagnostics(
                 "ok": true,
                 "stats": snap,
                 "participation": state.agent.gossip_participation(),
+                "subscribed_topics": egress["subscribed_topics"],
+                "outbound_by_topic_named": egress["outbound_by_topic_named"],
+                "egress_budget": egress["egress_budget"],
                 "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
@@ -657,6 +661,11 @@ mod participation_diagnostics_tests {
                 .await
                 .unwrap();
             let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(body["subscribed_topics"].is_array());
+            assert!(body["outbound_by_topic_named"].is_array());
+            assert_eq!(body["egress_budget"]["leaf_max_eager_degree"], 2);
+            assert_eq!(body["egress_budget"]["byte_policy"], "observe_only");
+            assert_eq!(body["egress_budget"]["applies_to_leaf"], !relay);
             let participation = &body["participation"];
             assert_eq!(participation["mode"], if relay { "full" } else { "leaf" });
             assert_eq!(
