@@ -1,134 +1,221 @@
+# Manual-only, disposable #517 mixed-version diagnostic.
+# This branch replaces build.yml temporarily; never merge this workflow to main.
 name: Build
 
 on:
-  push:
-    branches: [main]
-  pull_request:
-    branches: [main]
   workflow_dispatch:
+    inputs:
+      expected_commit:
+        description: "Exact frozen diagnostic commit to execute"
+        required: true
+        type: string
 
-env:
-  CARGO_TERM_COLOR: always
+permissions:
+  contents: read
 
 jobs:
-  validate-release-metadata:
-    name: Validate release metadata
-    runs-on: ubuntu-latest
+  diagnostic:
+    name: Linux namespace + v0.30.1 mixed-version gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 35
+    env:
+      RUSTFLAGS: -D warnings
+      CARGO_INCREMENTAL: 0
+      CARGO_TERM_COLOR: never
+      EXPECTED_DISPATCH_COMMIT: ${{ inputs.expected_commit }}
+      EXPECTED_SOURCE_COMMIT: 2bae852a3dd7a695f0c63c39267f0e9dcf53eaf8
+      EXPECTED_SOURCE_TREE: 9f4a8f0129a0ebd65ddb3c4002e228e1a8d5e589
+      EXPECTED_LOCK_SHA256: 5769726f49c34214f818a9c21e435cfabe02ba5efc1e47a62d6b888c1ee6f9c2
+      EXPECTED_ISOLATION_SHA256: 2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced
+      EXPECTED_DRIVER_SHA256: 94b6921b458fb95164ac2724fe687f21c7c20259c7f0d9203ef02026946d27b4
+      EXPECTED_COLLECTOR_SHA256: 3d4b37a4c862f5b9444371a4bec3d54982dbb6e5781eec4de979fe71236ed6a0
+      EXPECTED_VERSION_PREFLIGHT_SHA256: f16102398010fc3469a2fdd7d2fd9a6da7194f420edbb6b333057193adb352eb
+      EXPECTED_CONTROLS_SHA256: 0d0430f08692c3af3ec47008c57057021f3b979124258f2a630410caa1132f8f
+      LEGACY_ARCHIVE_SHA256: 6a60ba7870cfaee26cf6dfe0d3a09dddf5c95066f8be70cc70d1277ba3e934e1
+      LEGACY_SIGNATURE_ASSET_SHA256: ad528462fa7fdf0ebbea37ddc4eff1739ab56a779e4c490a59e07504d7c9d886
+      LEGACY_CHECKSUM_ASSET_SHA256: 35678c5bc00d06764e741a516ac4261f24575f3c9d731c678a641be67dca2806
+      LEGACY_PUBLIC_KEY_ASSET_SHA256: 216486ab0c98ec3a781f6df6d04f4b4a1d9850b61400bbc899a63b9d91cbcbfa
+      LEGACY_MANIFEST_ASSET_SHA256: ccdd09cc2dfa19abc66e5e72bb39c002395df8db2831008e16b2f075c5f077df
+      LEGACY_RELEASE: v0.30.1
+
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
         with:
           fetch-depth: 0
+          persist-credentials: false
 
-      - name: Test release metadata validation
-        run: python3 .github/scripts/test_release_metadata.py
+      # The repository and proven #535 CI pin rust-version/toolchain to 1.95.0.
+      # The action revision is the existing reviewed Linux executor pin.
+      - uses: dtolnay/rust-toolchain@6bed0761d98439e5a578e2877258200ad565ba87
+        with:
+          toolchain: 1.95.0
 
-      - name: Validate release metadata (pull request)
-        if: github.event_name == 'pull_request'
+      - name: Install namespace and provenance tools
+        shell: bash
         run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode pull_request \
-            --base-sha "${{ github.event.pull_request.base.sha }}"
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y gnupg iproute2 util-linux
 
-      - name: Validate release metadata (push or dispatch)
-        if: github.event_name != 'pull_request'
+      - name: Assert exact source and #535 namespace helper
+        shell: bash
         run: |
-          python3 .github/scripts/validate_release_metadata.py \
-            --mode push_main
+          set -euo pipefail
+          # Dispatch must name the frozen commit; this prevents a stale branch
+          # or an accidental public workflow from running the diagnostic.
+          test -n "$EXPECTED_DISPATCH_COMMIT"
+          test "$GITHUB_SHA" = "$EXPECTED_DISPATCH_COMMIT"
+          # The workflow/helper commit is additive. Prove the product source
+          # remains the exact 2bae base while allowing these diagnostic files.
+          test "$(git merge-base HEAD "$EXPECTED_SOURCE_COMMIT")" = "$EXPECTED_SOURCE_COMMIT"
+          test "$(git rev-parse "$EXPECTED_SOURCE_COMMIT^{tree}")" = "$EXPECTED_SOURCE_TREE"
+          git diff --quiet "$EXPECTED_SOURCE_COMMIT" -- \
+            . ':(exclude).github/diagnostics/517/**' \
+            ':(exclude).github/workflows/build.yml'
+          test -z "$(git status --porcelain)"
+          test "$(sha256sum .github/diagnostics/517/Cargo.lock.pinned | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA256"
+          test "$(sha256sum .github/diagnostics/517/isolated-runtime.py | cut -d' ' -f1)" = "$EXPECTED_ISOLATION_SHA256"
+          test "$(sha256sum .github/diagnostics/517/mixed-driver.py | cut -d' ' -f1)" = "$EXPECTED_DRIVER_SHA256"
+          test "$(sha256sum .github/diagnostics/517/collect-evidence.py | cut -d' ' -f1)" = "${EXPECTED_COLLECTOR_SHA256}"
+          test "$(sha256sum .github/diagnostics/517/binary-preflight.py | cut -d' ' -f1)" = "${EXPECTED_VERSION_PREFLIGHT_SHA256}"
+          test "$(sha256sum .github/diagnostics/517/test_controls.py | cut -d' ' -f1)" = "${EXPECTED_CONTROLS_SHA256}"
+          test "$(sha256sum tests/convergence/convergence_soak.py | cut -d' ' -f1)" = a45c241cc361080417ade3e06c1cf0234274bff9b46b54bb745af2bcd0383a9a
+          {
+            printf '{"checkout_commit":"%s","checkout_tree":"%s",' "$(git rev-parse HEAD)" "$(git rev-parse HEAD^{tree})"
+            printf '"source_base_commit":"%s","source_base_tree":"%s",' "$EXPECTED_SOURCE_COMMIT" "$EXPECTED_SOURCE_TREE"
+            printf '"convergence_soak_sha256":"%s",' "$(sha256sum tests/convergence/convergence_soak.py | cut -d' ' -f1)"
+            printf '"isolated_runtime_sha256":"%s"}\n' "$(sha256sum .github/diagnostics/517/isolated-runtime.py | cut -d' ' -f1)"
+          } > "$RUNNER_TEMP/x0x-517-source.json"
 
-  build-matrix:
-    name: Build ${{ matrix.platform }}
-    needs: validate-release-metadata
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # Linux x86_64 GNU
-          - platform: linux-x64-gnu
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
-            cross: false
+      - name: Run synthetic driver and collector controls
+        shell: bash
+        run: python3 .github/diagnostics/517/test_controls.py
 
-          # Linux x86_64 musl (static linking)
-          - platform: linux-x64-musl
-            os: ubuntu-latest
-            target: x86_64-unknown-linux-musl
-            cross: true
+      - name: Fetch reviewed lock and build current binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Cargo.lock is intentionally untracked. Transfer the reviewed
+          # exact lock artifact into the checkout before any locked fetch.
+          cp .github/diagnostics/517/Cargo.lock.pinned Cargo.lock
+          test "$(sha256sum Cargo.lock | cut -d' ' -f1)" = "$EXPECTED_LOCK_SHA256"
+          cargo fetch --locked
+          CARGO_NET_OFFLINE=true cargo build --locked --offline --release --bin x0xd
+          current="$RUNNER_TEMP/x0x-517-current-x0xd"
+          cp target/release/x0xd "$current"
+          chmod 755 "$current"
+          {
+            printf '{"lock_sha256":"%s",' "$(sha256sum Cargo.lock | cut -d' ' -f1)"
+            printf '"binary_sha256":"%s",' "$(sha256sum "$current" | cut -d' ' -f1)"
+            printf '"file":"%s"}\n' "$(file -b "$current")"
+          } > "$RUNNER_TEMP/x0x-517-current.json"
 
-          # Linux ARM64
-          - platform: linux-arm64-gnu
-            os: ubuntu-latest
-            target: aarch64-unknown-linux-gnu
-            cross: true
+      - name: Download and authenticate official Linux v0.30.1 binary
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: saorsa-labs/x0x
+        run: |
+          set -euo pipefail
+          legacy="$RUNNER_TEMP/x0x-517-legacy"
+          mkdir -p "$legacy"
+          gh release download "$LEGACY_RELEASE" --repo "$GH_REPO" \
+            --pattern 'x0x-linux-x64-gnu.tar.gz' \
+            --pattern 'x0x-linux-x64-gnu.tar.gz.sha256' \
+            --pattern 'x0x-linux-x64-gnu.tar.gz.asc' \
+            --pattern 'SAORSA_PUBLIC_KEY.asc' \
+            --pattern 'release-manifest.json' \
+            --dir "$legacy"
+          cd "$legacy"
+          test "$(sha256sum x0x-linux-x64-gnu.tar.gz | cut -d' ' -f1)" = "$LEGACY_ARCHIVE_SHA256"
+          test "$(sha256sum x0x-linux-x64-gnu.tar.gz.asc | cut -d' ' -f1)" = "$LEGACY_SIGNATURE_ASSET_SHA256"
+          test "$(sha256sum x0x-linux-x64-gnu.tar.gz.sha256 | cut -d' ' -f1)" = "$LEGACY_CHECKSUM_ASSET_SHA256"
+          test "$(sha256sum SAORSA_PUBLIC_KEY.asc | cut -d' ' -f1)" = "$LEGACY_PUBLIC_KEY_ASSET_SHA256"
+          test "$(sha256sum release-manifest.json | cut -d' ' -f1)" = "$LEGACY_MANIFEST_ASSET_SHA256"
+          sha256sum -c x0x-linux-x64-gnu.tar.gz.sha256
+          gpg_home="$RUNNER_TEMP/x0x-517-gnupg"
+          install -d -m 700 "$gpg_home"
+          gpg --batch --homedir "$gpg_home" --import SAORSA_PUBLIC_KEY.asc
+          gpg --batch --homedir "$gpg_home" --verify x0x-linux-x64-gnu.tar.gz.asc x0x-linux-x64-gnu.tar.gz
+          extract="$RUNNER_TEMP/x0x-517-legacy-extract"
+          mkdir -p "$extract"
+          tar -xzf x0x-linux-x64-gnu.tar.gz -C "$extract"
+          legacy_binary="$extract/x0x-linux-x64-gnu/x0xd"
+          test -x "$legacy_binary"
+          test "$(file -b "$legacy_binary" | cut -d',' -f1)" = 'ELF 64-bit LSB pie executable'
+          {
+            printf '{"release":"%s","archive_sha256":"%s",' "$LEGACY_RELEASE" "$LEGACY_ARCHIVE_SHA256"
+            printf '"binary_sha256":"%s",' "$(sha256sum "$legacy_binary" | cut -d' ' -f1)"
+            printf '"file":"%s","executed":false}\n' "$(file -b "$legacy_binary")"
+          } > "$RUNNER_TEMP/x0x-517-legacy.json"
 
-          # macOS x86_64 (cross-compiled on Apple Silicon)
-          - platform: macos-x64
-            os: macos-14
-            target: x86_64-apple-darwin
-            cross: false
+      - name: Capture current and legacy versions inside namespace
+        shell: bash
+        run: |
+          set -euo pipefail
+          version_out="$RUNNER_TEMP/x0x-517-version.json"
+          version_stdout="$RUNNER_TEMP/x0x-517-version-wrapper.stdout"
+          version_stderr="$RUNNER_TEMP/x0x-517-version-wrapper.stderr"
+          set +e
+          X0X_RUNTIME_TIMEOUT_SECONDS=120 \
+            python3 .github/diagnostics/517/isolated-runtime.py \
+            python3 .github/diagnostics/517/binary-preflight.py \
+              --current "$RUNNER_TEMP/x0x-517-current-x0xd" \
+              --legacy "$RUNNER_TEMP/x0x-517-legacy-extract/x0x-linux-x64-gnu/x0xd" \
+              --expected-current-sha256 "$(jq -r .binary_sha256 "$RUNNER_TEMP/x0x-517-current.json")" \
+              --output "$version_out" >"$version_stdout" 2>"$version_stderr"
+          version_rc=$?
+          set -e
+          printf '{"exit":%d}\n' "$version_rc" > "$RUNNER_TEMP/x0x-517-version-exit.json"
+          test "$version_rc" = 0
 
-          # macOS ARM64 (Apple Silicon)
-          - platform: macos-arm64
-            os: macos-14
-            target: aarch64-apple-darwin
-            cross: false
+      - name: Run exactly two named gates inside latest #535 namespace lifecycle
+        shell: bash
+        run: |
+          set -euo pipefail
+          out="$RUNNER_TEMP/x0x-517-gate-$GITHUB_RUN_ID-$GITHUB_RUN_ATTEMPT"
+          test ! -e "$out"
+          mkdir "$out"
+          set +e
+          X0X_RUNTIME_TIMEOUT_SECONDS=900 \
+            python3 .github/diagnostics/517/isolated-runtime.py \
+            python3 .github/diagnostics/517/mixed-driver.py \
+              --repo-root "$GITHUB_WORKSPACE" \
+              --current-binary "$RUNNER_TEMP/x0x-517-current-x0xd" \
+              --legacy-binary "$RUNNER_TEMP/x0x-517-legacy-extract/x0x-linux-x64-gnu/x0xd" \
+              --out-dir "$out" \
+              --report-file "$RUNNER_TEMP/x0x-517-driver-result.json" \
+              >"$RUNNER_TEMP/x0x-517-driver-wrapper.stdout" \
+              2>"$RUNNER_TEMP/x0x-517-driver.stderr"
+          driver_rc=$?
+          set -e
+          printf '{"exit":%d}\n' "$driver_rc" > "$RUNNER_TEMP/x0x-517-driver-exit.json"
+          exit "$driver_rc"
 
-          # Windows x86_64
-          - platform: windows-x64
-            os: windows-latest
-            target: x86_64-pc-windows-msvc
-            cross: false
+      - name: Collect only whitelisted #517 evidence
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          upload="$RUNNER_TEMP/x0x-517-upload"
+          test ! -e "$upload"
+          mkdir "$upload"
+          python3 .github/diagnostics/517/collect-evidence.py \
+            --wrapper-stdout "$RUNNER_TEMP/x0x-517-driver-wrapper.stdout" \
+            --driver-result "$RUNNER_TEMP/x0x-517-driver-result.json" \
+            --driver-exit "$RUNNER_TEMP/x0x-517-driver-exit.json" \
+            --source-meta "$RUNNER_TEMP/x0x-517-source.json" \
+            --current-meta "$RUNNER_TEMP/x0x-517-current.json" \
+            --legacy-meta "$RUNNER_TEMP/x0x-517-legacy.json" \
+            --version-meta "$RUNNER_TEMP/x0x-517-version.json" \
+            --version-exit "$RUNNER_TEMP/x0x-517-version-exit.json" \
+            --version-wrapper-stdout "$RUNNER_TEMP/x0x-517-version-wrapper.stdout" \
+            --upload-dir "$upload"
 
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: Install Rust stable
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: always()
         with:
-          targets: ${{ matrix.target }}
-
-      - name: Cache cargo registry
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/registry
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-registry-
-
-      - name: Cache cargo index
-        uses: actions/cache@v5
-        with:
-          path: ~/.cargo/git
-          key: ${{ runner.os }}-${{ matrix.target }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-cargo-git-
-
-      - name: Cache target directory
-        uses: actions/cache@v5
-        with:
-          path: target
-          key: ${{ runner.os }}-${{ matrix.target }}-target-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: |
-            ${{ runner.os }}-${{ matrix.target }}-target-
-
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install cross --locked
-
-      - name: Build (native)
-        if: ${{ !matrix.cross }}
-        run: cargo build --release --target ${{ matrix.target }}
-
-      - name: Build (cross)
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }}
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v5
-        with:
-          name: x0x-${{ matrix.platform }}
-          path: |
-            target/${{ matrix.target }}/release/x0x*
-            !target/${{ matrix.target }}/release/*.d
-            !target/${{ matrix.target }}/release/*.pdb
+          name: diagnose-517-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/x0x-517-upload/
           if-no-files-found: error
+          retention-days: 14
