@@ -1,10 +1,8 @@
 # Design: Leaf gossip egress budget (issue #504)
 
 - **Status:** Draft for review — **source-and-evidence only**. No runtime
-  acceptance is claimed. Revised 2026-09-06 after Codex FAIL on
-  [#534](https://github.com/saorsa-labs/x0x/pull/534) (B1 P1 degree
-  enforcement, B2 P2 executable name-lookup) plus Claude non-hold notes
-  (recipe clarity, shed-ladder, §6.1 before Winston capture).
+  acceptance is claimed. Revised after PR #534 B1/B2 review and reconciled
+  with the concurrent documentation revision `ad33b67`.
 - **Date:** 2026-09-06
 - **Issue:** [#504](https://github.com/saorsa-labs/x0x/issues/504)
 - **Related:** ADR 0034 (Leaf default), [#380](https://github.com/saorsa-labs/x0x/issues/380)
@@ -22,12 +20,12 @@ budget, does **not** change Leaf/Full behaviour, and does **not** close #504.
 
 v0.41.2 Windows Leaf, default config, ~35 min idle on the public mesh, ~25
 connected peers, one `public_open` group, one message, no file transfers
-(`x0x diagnostics gossip`):
+(`x0x diagnostics gossip --json`):
 
 | kind | bytes | msgs | implied rate |
 |---|---|---|---|
-| eager | 1.54 GB / 97,744 | ~44 MB/min (~733 KiB/s) | ~16 KiB/msg |
-| ihave | 118 MB / 20.7k | ~3.4 MB/min | smaller |
+| eager | 1.54 GB | 97,744 | ~44 MB/min (~716 KiB/s) |
+| ihave | 118 MB | ~20.7k | ~3.4 MB/min |
 | iwant | 75 MB | — | smaller |
 | anti_entropy | 5.1 MB | — | noise |
 
@@ -118,18 +116,11 @@ promote every lazy peer to eager. It:
 
 1. drops disconnected peers
 2. inserts new connected peers as **lazy**
-3. calls `maintain_degree_at`, which demotes above 12 and **promotes up to 6**
+3. calls `maintain_degree_at`, which demotes above 12 and promotes up to 6
 
 So a Leaf with 25 plane peers still eager-forwards each subscribed-topic
 payload to **6–12** peers, not 25. That is already enough to explain
-Winston's numbers (see §3.3).
-
-Inbound frames do the same promotion. `handle_eager_admitted` and
-`handle_iwant_admitted` (sg `crates/pubsub/src/lib.rs` ~6588 and ~6868)
-`add_new_peer_lazy(from)` then `maintain_degree_at` toward **MIN_EAGER_DEGREE
-= 6**. The 30 s `spawn_degree_maintainer` repeats that. **This is why
-truncating two x0x `set_topic_peers` call sites cannot enforce degree 2**
-(see §6.0).
+Winston's numbers (see §4).
 
 `docs/architecture-gossip-nat.md:250–270` still says the 1 s refresh
 "promotes ALL lazy peers back to eager". That was true of an older sg; it is
@@ -149,7 +140,7 @@ No live per-topic capture is in this tree. The ranking below is from
 `leaf_still_accepts_subscribed_topic_passthrough_frames`
 (`src/gossip/pubsub.rs:2747`) locks that in.
 
-Label a live capture with the **precomputed hex map in §5.4** — do not wait
+Label a live capture with the **precomputed hex map in §5.3** — do not wait
 for a Rust name-map to land.
 
 ### 3.1 Always-on subscriptions (every desktop daemon)
@@ -163,9 +154,9 @@ unconditional, once per process:
 | `x0x.machine.announce.v2` | `9087591cb1460b0c` | **global** machine flood (~12–16 KiB ML-DSA payloads) |
 | `x0x.machine.announce.v3` | `0fe8dab9818469c5` | second global machine topic (ADR-0043) |
 | `x0x.user.announce.v2` | `2f144a8e4595c85f` | **global** user roster flood |
-| `x0x.identity.shard.v2.<own>` | compute (§5.4) | own shard only — quieter |
-| `x0x.machine.shard.v2.<own>` | compute (§5.4) | own shard only — quieter |
-| `x0x.user.shard.v2.<own>` | compute (§5.4) | only if a user key exists |
+| `x0x.identity.shard.v2.<own>` | compute (§5.3) | own shard only — quieter |
+| `x0x.machine.shard.v2.<own>` | compute (§5.3) | own shard only — quieter |
+| `x0x.user.shard.v2.<own>` | compute (§5.3) | only if a user key exists |
 | `x0x.revocation.v1` | `bd56420e10cce2c8` | global, usually idle |
 | `x0x.revocation.v2` | `2041a15425a97c03` | global, usually idle |
 | `x0x.move.activation.v1` | `1c024f5cc8369f71` | global, usually idle |
@@ -184,7 +175,7 @@ DM / capability (started from `start_dm_inbox` +
 | topic | hex8 | why it is loud |
 |---|---|---|
 | `x0x/dm/v1/bus` | `a746d680e31732d1` | **#501**: whole-network compat DM bus. Every Leaf subscribes unconditionally and therefore eager-forwards **every gossip DM on the mesh** |
-| own inbox | **not** `from_entity(name)` — see §5.4 | should be quiet when idle |
+| own inbox | **not** `from_entity(name)` — see §5.3 | should be quiet when idle |
 | peer inbox + bus **pre-warm** | bus hex above | `ensure_subscribed_topic_id` on connect/receipt (`src/dm_inbox.rs:779–806`) — joins the bus again and the peer's inbox |
 | `x0x/caps/v1` | `dc7b2786c9d47788` | mesh-wide capability advert, 600 s republish, Bulk |
 | `x0x/caps/v2/digest` | `72e595c2a0f13284` | digest extension, same cadence |
@@ -198,8 +189,8 @@ Daemon-only listeners (`src/server/mod.rs:1073–1088`):
 |---|---|---|
 | `x0x.discovery.groups` | `8404a8731fd56b98` | **global** group-card anti-entropy; every daemon |
 | `x0x.groups.public.v1` | `76c8448d415e21a8` | **global** public-message fallback. Winston joined a `public_open` group — this bus carries those messages mesh-wide |
-| `x0x.directory.{tag,name,id}.*` | compute (§5.4) | only persisted shard subscriptions |
-| per-group topic | compute (§5.4) | only for locally known groups |
+| `x0x.directory.{tag,name,id}.*` | compute (§5.3) | only persisted shard subscriptions |
+| per-group topic | compute (§5.3) | only for locally known groups |
 | `x0x/release` | `378a3991c784ddc5` | only if the upgrade listener is running |
 
 Presence beacons ride `GossipStreamType::Bulk`, not PlumTree EAGER. They are
@@ -209,7 +200,7 @@ not Winston's `eager` counter.
 
 ```text
 C0 pass:  Δparticipation.relay_bytes / Δt  ≤ 150 KiB/s
-#504:     Δparticipation.epidemic_forward_bytes / Δt  ≈ 733 KiB/s
+#504:     Δparticipation.epidemic_forward_bytes / Δt  ≈ 716 KiB/s
 ```
 
 `classify_outbound_relay_json` (`src/gossip/participation.rs:110–128`) already
@@ -257,14 +248,12 @@ idle gossip egress well below a typical shared uplink, not zero delivery.
 | Leaf operator override | any | 1–12 | TOML |
 | **Full / `--relay` / seed / `:443` / managed** | **no Leaf budget** | sg 6–12 | backbone; do not starve relays |
 
-64 KiB/s = 3.8 MB/min. Winston's 44 MB/min is ~12× that. Degree 12 → 2 is a
-~6× fan-out cut (to ~7 MB/min) **if** unique rate is unchanged **and** the
-cap holds after inbound EAGER/IWANT (§6.0). Closing #501 and/or making
-global announce consume-only on Leaf is what gets the rest.
+64 KiB/s ≈ 3.93 MB/min. Winston's 44 MB/min is ~12× that. Degree 12 → 2 is a
+~6× fan-out cut (to ~7 MB/min) **if** unique rate is unchanged. Closing #501
+and/or making global announce consume-only on Leaf is what gets the rest.
 
-C0's 150 KiB/s `relay_bytes` gate stays. Add a sibling **observe** of
-`epidemic_forward_bytes` on the §5 capture; do not treat the byte hard-cap
-as slice-1 behaviour.
+C0's 150 KiB/s `relay_bytes` gate stays. Add a sibling gate on
+`epidemic_forward_bytes` for Leaf only (see §5).
 
 ### 4.2 Config surface
 
@@ -273,233 +262,268 @@ when `resolved_participation() == Leaf`. Full ignores them.
 
 ```toml
 [gossip]
-# Existing dead knobs stay (do not imply they work).
+# Existing dead knobs stay (do not imply they work). New live knobs:
 
-# Target PlumTree eager-set size on this Leaf. This is a bound that
-# set_topic_peers, initialize_topic_peers, handle_eager, handle_iwant,
-# and the 30s degree maintainer must all honor. It is NOT "truncate the
-# plane list on two call sites".
-# 0 = do not override sg 6–12. Default 2.
+# Sustained PlumTree eager-set ceiling for a Leaf; requires the sg hook in §6.1.
+# 0 = stock sg degree policy (6–12), not zero peers. Default 2.
 leaf_max_eager_degree = 2
 
 # Rolling 60s epidemic (subscribed-topic) outbound. 0 = disabled.
-# Slice 1: parse + meter + warn only. Slice 2: fail-soft shed (§4.3).
+# Slice 1: both thresholds observe-only. Later: metered fail-soft shed (§4.3).
 leaf_egress_soft_bytes_per_sec = 65536
 leaf_egress_hard_bytes_per_sec = 131072
 ```
 
-Prefer Full/bootstrap peers in the eager slots. The helper already exists
-for ACK topics: `select_one_full_bootstrap_eager_peer`
-(`src/gossip/pubsub.rs:1351`). Reuse it so a Leaf's two eager slots are
-backbone, not two other Leaves.
+Prefer Full/bootstrap peers at the front of the truncated list. The helper
+already exists for ACK topics:
+`select_one_full_bootstrap_eager_peer` (`src/gossip/pubsub.rs:1351`). Reuse
+it so a Leaf's two eager slots are backbone, not two other Leaves.
 
 Do **not** bind this slice to `skip_legacy_dm_bus` (#501). That is a topic-
 membership change with a compat trade-off; keep it on its own PR.
 
-### 4.3 Fail-soft behaviour (shed ladder)
+### 4.3 Fail-soft behaviour
 
-**Slice 1 does not shed bytes.** It enforces eager degree. Soft/hard byte
-fields are parsed, validated, and surfaced on `/diagnostics/gossip` as
-observe-only (`current_epidemic_bytes_per_sec`,
-`egress_budget_soft_exceeded`, `egress_budget_hard_exceeded` stay 0 unless
-the operator is over the observed rate — incrementing those counters is
-allowed; dropping frames is not).
+**Slice 1 is fan-out-first; both byte thresholds are observe-only.** Count
+`egress_budget_soft_exceeded` / `egress_budget_hard_exceeded` and rate-limit
+warnings with topic hex, name, priority, origin, and bytes/s. No byte shedding
+is authorized by this slice.
 
-**Slice 2** (after named capture) may shed when the hard budget is exceeded,
-in this order, **never** disconnect, **never** fail `subscribe` or
-**local-origin** `publish`, **never** drop the node's own inbox:
+A later, explicitly metered shedding policy can consider IHAVE flush and
+anti-entropy serve first, then eligible forwarded payloads. Recovery traffic
+is not free to discard indefinitely: define retry/delivery bounds and count
+attempted, sent, deferred and dropped bytes/messages per topic, priority,
+origin and reason before enabling any shed hook.
 
-| step | what | why this order |
-|---|---|---|
-| 0 | Increment `egress_budget_hard_exceeded`; warn with topic hex8 + name + bytes/s (rate-limited) | loud, reversible |
-| 1 | Shed **IHAVE flush** (lazy advertisements) | recoverable via IWANT / anti-entropy |
-| 2 | Shed **anti-entropy serve** | same; delays catch-up, does not isolate |
-| 3 | Shed **Bulk-class eager republish of received** payloads (`classify_x0x_topic` Bulk: announce / shard / directory / caps / release / public discovery — `src/gossip/pubsub.rs:1464–1478`) | this is the wifi burner |
-| 4 | **Do not shed** Critical: own `x0x/dm/v1/inbox/<self>`, targeted caps request/response | delivery contract |
-| 5 | **Do not shed** local-origin publish, including this node's own identity/machine announce | the node must stay findable |
-| 6 | **Do not shed** inbound delivery to local subscribers | consume-only is a later slice, not silent drop |
+Bulk-only shedding cannot cover the leading suspects. `classify_x0x_topic`
+currently classifies `x0x.identity.announce.v2` and `x0x/dm/v1/bus` as
+**Critical**, while `x0x.groups.public.v1` and `x0x.machine.announce.v3` are
+**Normal**. Shards, directory, caps and release include Bulk topics; do not
+generalize that to all announcements. Shedding the top measured topics may
+therefore require an explicit Critical/Normal forwarding policy, with its
+own delivery/recovery acceptance and meters. Preserve local-origin publish,
+local subscriptions, the node's own inbox and targeted control traffic;
+never disconnect to meet a byte budget. Do not silently reclassify topics.
 
-Identity announce is Bulk **when forwarding someone else's beat** and
-must stay unsuppressed **when this node authors a beat**. The shed hook
-has to distinguish origin, not just topic name. If sg has no origin-aware
-shed, stay on observe-only rather than inventing an unmetered drop.
-
-Invalid TOML (hard < soft, degree outside `0..=12`): fail-soft to defaults
-+ a `x0xd --check` warning. Do not refuse process start (the
-`active_view_size = 0` restart-loop is the anti-pattern).
+Invalid TOML (hard < soft, or degree outside 0–12): fail-soft to defaults +
+a `x0xd --check` warning. Degree 0 is a **valid** escape hatch, not a typo.
+Do not refuse process start for a budget typo (the `active_view_size = 0`
+restart-loop is the anti-pattern to avoid).
 
 ### 4.4 What we will not do in the first implementation
 
-- Treat "truncate the `Vec<PeerId>` on `apply_topic_peers` /
-  `initialize_topic_peers`" as degree enforcement. Codex FAIL: it is not
-  (§6.0).
-- Full PlumTree rewrite. An sg **eager-bound API** (or an x0x post-inbound
-  clamp that is proven against handle_eager / IWANT / maintainer) is the
-  smallest complete lever.
-- Consume-only subscribe (deliver locally, do not eager-forward) — later,
-  after named-topic evidence.
+- Full PlumTree rewrite. A minimal saorsa-gossip eager-degree configuration
+  hook **is required in slice 1** (§6.1); truncate-only cannot prove the cap.
+- Consume-only subscribe (deliver locally, do not eager-forward) — needs an
+  sg hook or a dangerous x0x-side "accept but don't republish" fork.
+  Follow-up, after named-topic evidence.
 - Changing identity heartbeat cadence again (already 600 s).
 - Fixing #505 (ant-quic MTU / IP fragmentation). Mention only: some
   measurement hosts (OCI) cannot join the public mesh until that lands.
-- Asking Winston to recapture **without** a name-lookup. The table +
-  scripts in §5.4 are that lookup; they land in this doc, not in a later
-  Rust PR.
 
 ## 5. Measurement recipe (Winston / Ben Mac)
 
-Capture **on current main / v0.41.x** using this section. Do **not** wait
-for slice-1 Rust. The hex map below is the name-lookup. A later
-`outbound_by_topic_named` field is convenience, not a gate.
+No implementation in this PR can substitute for a live Leaf on the public
+mesh. Capture **one idle window** on current main (or the first-slice build)
+and attach the JSON.
 
-Winston's host is **Windows**. Commands below are given for PowerShell
-first, then Unix.
-
-### 5.1 Setup (both)
+### 5.1 Setup
 
 - One Leaf: default config, **no** `--relay`, `gossip.relay` unset.
-- Confirm `participation.mode == "leaf"`, `reason == "default_leaf"`,
-  `passthrough_refresh_runs == 0`.
+- Confirm `x0x diagnostics gossip --json` → `participation.mode == "leaf"`,
+  `reason == "default_leaf"`, `passthrough_refresh_runs == 0`.
 - Same workload as #504 if possible: one `public_open` group, no file
   transfers, no extra `x0x subscribe`.
-- Record: OS, `x0x --version` or `/health` `version`, `/health` `peers`,
-  NAT, `#501 skip_legacy_dm_bus` (default off).
-- Window: **20 minutes** idle after `peers` has been stable for 2 minutes
-  (≥300 s is the minimum usable window; #504 was ~35 min).
+- Note OS, version (`x0x --version` / `/health`), peer count
+  (`/health` `peers`, `/diagnostics/transport`), NAT, and whether #501's
+  bus skip is on or off (default off).
+- Fixed window: **20 minutes** idle after `peers` has been stable for 2
+  minutes. Shorter windows (5 min) are ok as a smoke but the #504 number
+  was 35 min.
 
-### 5.2 Windows (Winston) — PowerShell
+If the CLI or HTTP endpoint returns **401**, export the running daemon's
+API token as `X0X_API_TOKEN` and retry: POSIX shells use
+`export X0X_API_TOKEN='your-daemon-token'`; PowerShell uses
+`$env:X0X_API_TOKEN = 'your-daemon-token'`. Keep the token out of attachments.
+Direct HTTP requests need `Authorization: Bearer <token>` too.
 
-API port is whatever `x0x health` prints (often `12700`). If `x0x` is on
-PATH, the CLI wrappers are enough.
+### 5.2 Commands
 
-```powershell
-# 0) confirm Leaf
-x0x diagnostics gossip | Out-File -Encoding utf8 gossip-probe.json
-# Open gossip-probe.json and check participation.mode / reason /
-# passthrough_refresh_runs. Stop if not leaf / default_leaf / 0.
+The CLI defaults to Text. Every capture must request `--json`; changing
+the filename extension does not change the output format. The helper below
+runs `x0x diagnostics gossip --json`, `x0x diagnostics transport --json`,
+and `x0x health --json` at both endpoints, preserves their responses and
+ranks **t1−t0** topic EAGER bytes. It also supplies the name map (§5.3).
 
-# 1) t0
-x0x diagnostics gossip     | Out-File -Encoding utf8 gossip-t0.json
-x0x diagnostics transport  | Out-File -Encoding utf8 transport-t0.json
-[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() | Out-File t0.epoch
-
-# 2) wait 20 minutes. Do not publish. Do not extra-subscribe.
-Start-Sleep -Seconds 1200
-
-# 3) t1
-x0x diagnostics gossip     | Out-File -Encoding utf8 gossip-t1.json
-x0x diagnostics transport  | Out-File -Encoding utf8 transport-t1.json
-[DateTimeOffset]::UtcNow.ToUnixTimeSeconds() | Out-File t1.epoch
-```
-
-Equivalent HTTP if the CLI is not on PATH (replace port / token):
-
-```powershell
-$h = @{ Authorization = "Bearer $env:X0X_API_TOKEN" }
-Invoke-RestMethod http://127.0.0.1:12700/diagnostics/gossip -Headers $h |
-  ConvertTo-Json -Depth 20 | Out-File -Encoding utf8 gossip-t0.json
-```
-
-Delta (no `jq` required):
-
-```powershell
-$t0 = Get-Content gossip-t0.json -Raw | ConvertFrom-Json
-$t1 = Get-Content gossip-t1.json -Raw | ConvertFrom-Json
-$dt = [int](Get-Content t1.epoch) - [int](Get-Content t0.epoch)
-$epi = [int64]$t1.participation.epidemic_forward_bytes - [int64]$t0.participation.epidemic_forward_bytes
-$rel = [int64]$t1.participation.relay_bytes - [int64]$t0.participation.relay_bytes
-"dt_s=$dt  epidemic_KiB_s=$([math]::Round($epi/$dt/1024,2))  epidemic_MB_min=$([math]::Round($epi/1MB/($dt/60),2))  relay_KiB_s=$([math]::Round($rel/$dt/1024,2))"
-```
-
-Per-topic rank + label (uses the map in §5.4):
-
-```powershell
-$map = @{
-  '802ee0ebd00757bd'='x0x.identity.announce.v2'
-  '9087591cb1460b0c'='x0x.machine.announce.v2'
-  '0fe8dab9818469c5'='x0x.machine.announce.v3'
-  '2f144a8e4595c85f'='x0x.user.announce.v2'
-  'bd56420e10cce2c8'='x0x.revocation.v1'
-  '2041a15425a97c03'='x0x.revocation.v2'
-  '1c024f5cc8369f71'='x0x.move.activation.v1'
-  'a746d680e31732d1'='x0x/dm/v1/bus'
-  'dc7b2786c9d47788'='x0x/caps/v1'
-  '72e595c2a0f13284'='x0x/caps/v2/digest'
-  '143d90e8ad14052e'='x0x/caps/v1/request/targeted-v2'
-  '48c7b5c7b6b981ca'='x0x/caps/v1/response/targeted-v2'
-  '8404a8731fd56b98'='x0x.discovery.groups'
-  '76c8448d415e21a8'='x0x.groups.public.v1'
-  '29f3042b0b96bc05'='x0x/announce/v3/blob'
-  'c7770a8688e4f8e8'='x0x/announce/v2/blob'
-  '378a3991c784ddc5'='x0x/release'
-}
-$rows = @()
-$t1.pubsub_stages.outbound_by_topic.PSObject.Properties | ForEach-Object {
-  $hex = $_.Name
-  $eagerB = 0; if ($_.Value.eager.bytes) { $eagerB = [int64]$_.Value.eager.bytes }
-  $name = $map[$hex]; if (-not $name) { $name = 'unknown-hex' }
-  $rows += [pscustomobject]@{ hex8=$hex; name=$name; eager_bytes=$eagerB }
-}
-$rows | Sort-Object eager_bytes -Descending | Select-Object -First 8 | Format-Table -AutoSize
-```
-
-Attach: `gossip-t0.json`, `gossip-t1.json`, `transport-t0.json`,
-`transport-t1.json`, the printed delta line, the top-8 table.
-
-### 5.3 Unix / macOS (Ben Mac)
+Save this as `capture-egress.py` in a new evidence directory. Requires
+Python 3 and `x0x` on PATH. Install the BLAKE3 helper and run:
 
 ```bash
-x0x diagnostics gossip > gossip-t0.json
-x0x diagnostics transport > transport-t0.json
-date -u +%s > t0.epoch
-sleep 1200
-x0x diagnostics gossip > gossip-t1.json
-x0x diagnostics transport > transport-t1.json
-date -u +%s > t1.epoch
-
-python3 - <<'PY'
-import json, pathlib
-t0=json.loads(pathlib.Path("gossip-t0.json").read_text())
-t1=json.loads(pathlib.Path("gossip-t1.json").read_text())
-dt=int(pathlib.Path("t1.epoch").read_text())-int(pathlib.Path("t0.epoch").read_text())
-epi=int(t1["participation"]["epidemic_forward_bytes"])-int(t0["participation"]["epidemic_forward_bytes"])
-rel=int(t1["participation"]["relay_bytes"])-int(t0["participation"]["relay_bytes"])
-print(f"dt_s={dt} epidemic_KiB_s={epi/dt/1024:.2f} epidemic_MB_min={epi/1e6/(dt/60):.2f} relay_KiB_s={rel/dt/1024:.2f}")
-MAP={
-  "802ee0ebd00757bd":"x0x.identity.announce.v2",
-  "9087591cb1460b0c":"x0x.machine.announce.v2",
-  "0fe8dab9818469c5":"x0x.machine.announce.v3",
-  "2f144a8e4595c85f":"x0x.user.announce.v2",
-  "bd56420e10cce2c8":"x0x.revocation.v1",
-  "2041a15425a97c03":"x0x.revocation.v2",
-  "1c024f5cc8369f71":"x0x.move.activation.v1",
-  "a746d680e31732d1":"x0x/dm/v1/bus",
-  "dc7b2786c9d47788":"x0x/caps/v1",
-  "72e595c2a0f13284":"x0x/caps/v2/digest",
-  "143d90e8ad14052e":"x0x/caps/v1/request/targeted-v2",
-  "48c7b5c7b6b981ca":"x0x/caps/v1/response/targeted-v2",
-  "8404a8731fd56b98":"x0x.discovery.groups",
-  "76c8448d415e21a8":"x0x.groups.public.v1",
-  "29f3042b0b96bc05":"x0x/announce/v3/blob",
-  "c7770a8688e4f8e8":"x0x/announce/v2/blob",
-  "378a3991c784ddc5":"x0x/release",
-}
-rows=[]
-for hex8, row in (t1.get("pubsub_stages") or {}).get("outbound_by_topic") or {}.items():
-    b=int(((row.get("eager") or {}).get("bytes")) or 0)
-    rows.append((b, hex8, MAP.get(hex8,"unknown-hex")))
-for b,h,n in sorted(rows, reverse=True)[:8]:
-    print(f"{h}  {n}  eager_bytes={b}")
-PY
+# macOS / Linux
+python3 -m venv .venv
+.venv/bin/python -m pip install blake3
+.venv/bin/python capture-egress.py
 ```
 
-### 5.4 Executable name-lookup (`TopicId::from_entity`)
+```powershell
+# Windows PowerShell (no activation or execution-policy change required)
+py -3 -m venv .venv
+.\.venv\Scripts\python.exe -m pip install blake3
+.\.venv\Scripts\python.exe capture-egress.py
+```
 
-sg `TopicId::from_entity(bytes)` is **BLAKE3 of the topic UTF-8 bytes**.
-`Display` / `outbound_by_topic` keys are **hex of the first 8 bytes**
-(16 hex chars), lowercase (`saorsa_gossip_types::TopicId`).
+```python
+import json
+import subprocess
+import sys
+import time
+from pathlib import Path
+from blake3 import blake3
 
-**Well-known map (precomputed 2026-09-06, python `blake3` == rust `blake3`
-crate):**
+TOPICS = """
+x0x.identity.announce.v2
+x0x.machine.announce.v2
+x0x.machine.announce.v3
+x0x.user.announce.v2
+x0x.revocation.v1
+x0x.revocation.v2
+x0x.move.activation.v1
+x0x/dm/v1/bus
+x0x/caps/v1
+x0x/caps/v2/digest
+x0x/caps/v1/request/targeted-v2
+x0x/caps/v1/response/targeted-v2
+x0x/announce/v2/blob
+x0x.discovery.groups
+x0x.groups.public.v1
+x0x/announce/v3/blob
+x0x/release
+""".split() + sys.argv[1:]
+def topic_hex8(name):
+    # DM inbox names already contain the full raw TopicId, not an entity name.
+    prefix = "x0x/dm/v1/inbox/"
+    if name.startswith(prefix):
+        raw_hex = name[len(prefix):]
+        if len(raw_hex) != 64 or len(bytes.fromhex(raw_hex)) != 32:
+            raise ValueError("Inbox name must end in its full 32-byte topic hex")
+        return raw_hex[:16].lower()
+    return blake3(name.encode("utf-8")).hexdigest()[:16]
+
+
+NAMES = {topic_hex8(t): t for t in TOPICS}
+Path("topic-names.json").write_text(json.dumps(NAMES, indent=2), encoding="utf-8")
+
+
+def snapshot(label):
+    result = {}
+    for name, args in (("gossip", ["diagnostics", "gossip"]),
+                       ("transport", ["diagnostics", "transport"]),
+                       ("health", ["health"])):
+        raw = subprocess.check_output(["x0x", *args, "--json"], encoding="utf-8")
+        obj = json.loads(raw)  # Reject errors/Text output rather than treating as zero.
+        if obj.get("ok") is False:
+            raise RuntimeError(f"{name} failed: {obj}")
+        Path(f"{name}-{label}.json").write_text(raw, encoding="utf-8")
+        result[name] = obj.get("data", obj)
+    result["epoch"] = time.time()
+    result["monotonic"] = time.monotonic()
+    Path(f"{label}.json").write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return result
+
+
+def checked_delta(before, after, label):
+    if after < before:
+        raise RuntimeError(f"Counter reset: {label}; reject/restart window")
+    return after - before
+
+
+a = snapshot("t0")
+time.sleep(1200)  # Idle: no publishes or extra subscriptions during this interval.
+b = snapshot("t1")
+dt = b["monotonic"] - a["monotonic"]
+uptime_delta = b["health"]["uptime_secs"] - a["health"]["uptime_secs"]
+if dt < 300 or abs(uptime_delta - dt) > 5:
+    raise RuntimeError("Restart or invalid timing: reject/restart window")
+for sample in (a, b):
+    p = sample["gossip"]["participation"]
+    if (p["mode"] != "leaf" or p["reason"] != "default_leaf"
+            or p["passthrough_refresh_runs"] != 0 or sample["health"]["peers"] == 0):
+        raise RuntimeError("Not a usable default Leaf window")
+for key in ("epidemic_forward_bytes", "epidemic_forward_msgs", "relay_bytes",
+            "relay_msgs", "unsubscribed_refused_frames", "passthrough_refresh_runs"):
+    d = checked_delta(a["gossip"]["participation"][key],
+                      b["gossip"]["participation"][key], key)
+    if key.endswith("_bytes"):
+        print(f"{key}: {d / dt / 1024:.2f} KiB/s; {d / dt * 60 / 1e6:.2f} MB/min")
+old = a["gossip"]["pubsub_stages"]["outbound_by_topic"]
+new = b["gossip"]["pubsub_stages"]["outbound_by_topic"]
+rows = []
+for topic in old.keys() | new.keys():
+    before, after = old.get(topic, {}), new.get(topic, {})
+    if topic in old and topic not in new:
+        raise RuntimeError("Topic counters disappeared: reject/restart window")
+    for kind in before.keys() | after.keys():
+        for metric in ("bytes", "msgs"):
+            checked_delta(before.get(kind, {}).get(metric, 0),
+                          after.get(kind, {}).get(metric, 0), f"{topic}/{kind}/{metric}")
+    delta = checked_delta(before.get("eager", {}).get("bytes", 0),
+                          after.get("eager", {}).get("bytes", 0), topic)
+    rows.append((delta, topic, NAMES.get(topic, "unknown-hex")))
+for delta, topic, name in sorted(rows, reverse=True)[:8]:
+    print(f"{delta:12d} bytes  {delta / dt / 1024:9.2f} KiB/s  {topic}  {name}")
+```
+
+Retain the console output with the JSON. Reject and restart the entire
+window on daemon restart, any counter reset/disappearance, CLI failure, or
+invalid JSON. A restart can grow counters past t0 again, so nonnegative
+deltas alone are insufficient: compare uptime progression with elapsed
+time (as above) and confirm daemon continuity from service logs. Endpoint
+samples cannot establish mode/peer continuity throughout; discard a run if
+logs show a mode change or isolation between samples. A newly appearing
+topic may use zero at t0 only within a confirmed uninterrupted run.
+
+Equivalent HTTP: `GET /diagnostics/gossip`, `GET /diagnostics/transport`,
+`GET /health`, with the same timing and validation rules.
+
+### 5.3 Counters to delta
+
+From `participation` (already subscription-aware):
+
+| field | meaning |
+|---|---|
+| `epidemic_forward_bytes` / `_msgs` | subscribed-topic outbound — **#504 primary** |
+| `relay_bytes` / `_msgs` | unsubscribed forward — must stay ~0 on Leaf |
+| `unsubscribed_refused_frames` | C0 still live |
+| `passthrough_refresh_runs` | must stay 0 |
+
+From `pubsub_stages` (sg 0.5.74):
+
+| field | meaning |
+|---|---|
+| `outbound_kind_*` eager/ihave/iwant/anti_entropy | Winston's four buckets |
+| `outbound_by_topic` | **per-topic** msgs/bytes by kind |
+| `outbound_publish_origin` | **do not use** for Leaf soak (mis-labels epidemic as relay) |
+| `zero_fanout_publishes` / `republish_per_peer_timeout` | delivery vs congestion |
+
+`outbound_by_topic` keys are the **first 8 bytes / 16 hex characters** of
+`TopicId` (`Display`), not topic names and not eight hex characters.
+sg 0.5.74 derives `TopicId` as BLAKE3 of the exact UTF-8 topic string; the
+helper's `hexdigest()[:16]` implements that derivation and writes the map
+for every fixed topic listed above. `TopicId::from_entity` is a Rust API,
+not an operator CLI command.
+
+Pass exact node-specific identity/machine/user shard strings as extra quoted
+helper arguments on either OS. DM inbox ids are an exception: `dm_inbox_topic`
+hashes `b"x0x/dm/v1/inbox/" || agent_id_bytes` (`src/dm.rs`), while
+`DmInboxService::inbox_topic_name` embeds the resulting **full 32-byte topic
+hex** in `x0x/dm/v1/inbox/<topic-hex>`. Pass that actual human-readable name;
+the helper extracts its first 16 hex characters instead of hashing it again.
+Runtime named diagnostics must likewise use stored topic ids, not rehash
+names supplied to `subscribe_topic_id`. Unknown keys remain
+`unknown-hex`. Rank by **Δeager.bytes = t1.eager.bytes − t0.eager.bytes**,
+never the cumulative t1 count; report Δbytes/Δt beside each row.
+
+Precomputed fixed-topic lookup (also generated by the helper):
 
 | hex8 | topic |
 |---|---|
@@ -521,77 +545,14 @@ crate):**
 | `c7770a8688e4f8e8` | `x0x/announce/v2/blob` (legacy; usually absent) |
 | `378a3991c784ddc5` | `x0x/release` |
 
-**Not in the table (compute):**
+Also record:
 
-- Own / peer shards: `x0x.identity.shard.v2.<u16>` etc. — still
-  `from_entity` of that string.
-- Own inbox: **not** `from_entity("x0x/dm/v1/inbox/...")`.
-  `dm_inbox_topic` is `blake3(b"x0x/dm/v1/inbox/" || agent_id_bytes)`
-  (`src/dm.rs:1068–1072`). The human name embeds the **full 32-byte**
-  topic hex (`src/dm_inbox.rs:400–404`). If a hex8 is unknown, check
-  whether it is the prefix of that inbox hex.
+- `/health` `peers` at t0 and t1 (Winston: ~25)
+- `discovery_cache_entries` from the same gossip payload (agents / machines /
+  users) — proxy for announce-topic population
+- Whether a `public_open` group is joined (yes for the original report)
 
-**Windows — compute one name (Python; PowerShell has no BLAKE3):**
-
-```powershell
-pip install blake3
-python -c "import blake3,sys; print(blake3.blake3(sys.argv[1].encode()).hexdigest()[:16])" "x0x.identity.shard.v2.0042"
-```
-
-**Windows — authoritative check against the same crate x0x uses**
-(needs Rust + the repo, optional):
-
-```powershell
-# from a checkout that depends on saorsa-gossip-types 0.5.74
-cargo test -q -p x0x --lib topic_id_hex8_matches_design_table -- --exact
-# (that test is part of slice 1a — until it exists, use the Python line)
-```
-
-One-off rustc is also fine:
-
-```rust
-// rust-script / cargo-eval sketch — do not add this file until slice 1a
-use saorsa_gossip_types::TopicId;
-fn main() {
-    let t = TopicId::from_entity("x0x/dm/v1/bus".as_bytes());
-    println!("{t}"); // must print a746d680e31732d1
-}
-```
-
-**Unix:**
-
-```bash
-python3 -c "import blake3,sys; print(blake3.blake3(sys.argv[1].encode()).hexdigest()[:16])" "x0x/dm/v1/bus"
-# expect: a746d680e31732d1
-```
-
-If `blake3` is missing: `pip install blake3` (same on Windows). Do not use
-SHA-256 — that is a different `TopicId`.
-
-### 5.5 Counters to delta
-
-From `participation` (already subscription-aware):
-
-| field | meaning |
-|---|---|
-| `epidemic_forward_bytes` / `_msgs` | subscribed-topic outbound — **#504 primary** |
-| `relay_bytes` / `_msgs` | unsubscribed forward — must stay ~0 on Leaf |
-| `unsubscribed_refused_frames` | C0 still live |
-| `passthrough_refresh_runs` | must stay 0 |
-
-From `pubsub_stages` (sg 0.5.74):
-
-| field | meaning |
-|---|---|
-| `outbound_kind_*` eager/ihave/iwant/anti_entropy | Winston's four buckets |
-| `outbound_by_topic` | **per-topic** msgs/bytes by kind (keys = hex8) |
-| `outbound_publish_origin` | **do not use** for Leaf soak (mis-labels epidemic as relay) |
-| `zero_fanout_publishes` / `republish_per_peer_timeout` | delivery vs congestion |
-
-Also record `/health` `peers` at t0 and t1, `discovery_cache_entries`, and
-whether a `public_open` group is joined.
-
-### 5.6 Acceptance of the *measurement* (not of a fix)
+### 5.4 Acceptance of the *measurement* (not of a fix)
 
 A capture is usable when:
 
@@ -599,168 +560,122 @@ A capture is usable when:
 2. `Δt` is ≥ 300 s (prefer 1200 s)
 3. `Δrelay_bytes / Δt` is consistent with C0 (≤ 150 KiB/s; expect ≪ that)
 4. `Δepidemic_forward_bytes / Δt` is reported in KiB/s **and** MB/min
-5. Top 8 `outbound_by_topic` rows are labelled with §5.4 names or
-   `unknown-hex` plus a computed name
-6. Peer count did not collapse to 0 (that would be an #505 / isolation run)
+5. Top 8 `outbound_by_topic` rows are labelled with names or marked `unknown-hex`
+6. No daemon restart or counter reset; uptime advances by Δt and all compared
+   counters are monotonic. Otherwise reject/restart, even if t1 totals exceed t0.
+7. Peer count did not collapse to 0 (that would be an #505 / isolation run)
 
 This PR does **not** claim that capture. Platform/soak credit only when
 Winston or Ben attach the JSON.
 
-### 5.7 What Ben Mac should add if Winston's host is the only public Leaf
+### 5.5 What Ben Mac should add if Winston's host is the only public Leaf
 
-Same recipe on macOS, same window, default Leaf, same hex map. If both see
-the same top topics, the budget can target those names. If they diverge
-(bus vs announce), do not ship a Leaf-default `skip_legacy_dm_bus` from
-this work — keep #501 separate.
+Same recipe on macOS, same window, default Leaf. If both see the same top
+topics, the budget can target those names. If they diverge (bus vs announce),
+do not ship a Leaf-default `skip_legacy_dm_bus` from this work — keep #501
+separate.
 
 ## 6. Smallest first implementation slice
 
-**Rejected first slice (Codex B1 P1 FAIL):** truncate the peer `Vec` on
-`apply_topic_peers` and `initialize_topic_peers` only, then assert
-`set_topic_peers` was called with ≤ 2 ids.
+**Slice 1 — sustained Leaf eager ceiling + named meters, with a minimal sg
+dependency. x0x truncate-only is an experiment; its sustained cap is unproven.**
 
-That cannot hold `leaf_max_eager_degree = 2`.
+### 6.1 Mechanism and dependency boundary
 
-### 6.0 Why two-site truncate leaks back to degree 6
+sg 0.5.74 can add an unlisted inbound EAGER sender as lazy, then
+`maintain_degree_at` promotes toward 6 **before forwarding in that handler**.
+The cached IWANT path also adds the requester and maintains degree. A
+one-second refresh, or truncation after the inbound handler returns, cannot
+undo already emitted frames or prevent concurrent publishers seeing the
+expanded set. Therefore option (1), an x0x-only sustained cap, is not
+established by the available API. Use option (2): a minimal configurable sg
+ceiling is a **slice 1 prerequisite**, not a later optional optimization.
+Do not wire HyParView `active_view_size` as an egress fix.
 
-x0x writers that touch PlumTree peer sets today
-(`src/gossip/pubsub.rs`):
+1. **sg dependency (separate implementation/review):** expose an eager-degree
+   ceiling per PlumTree instance (or equivalent per-topic policy). Leaf uses
+   configured degree D; Full and degree 0 retain stock 6–12. Replace the
+   effective `MAX_EAGER_DEGREE` with D and clamp the promotion target to
+   `min(MIN_EAGER_DEGREE, D)`. Enforce under the topic-state lock on every
+   creation, initialization, refresh, inbound EAGER, cached IWANT, GRAFT and
+   repair/maintenance path (including the 30s degree maintainer), before the eager recipients are selected. Audit
+   direct promotions and scoring-driven replacements too; none may bypass
+   the ceiling. A global constant changed to 2 is unacceptable because it
+   would also change Full. Publish/pin the compatible sg release before
+   x0x claims a sustained Leaf cap; 0.5.74 alone cannot satisfy this gate.
+2. **x0x config:** `leaf_max_eager_degree` defaults to 2, validates
+   `== 0 || (1..=12)`; 0 restores stock sg policy, never zero peers.
+   Soft/hard byte defaults are §4.2 and remain observe-only.
+3. **All four full-plane writers** in `src/gossip/pubsub.rs` must use one
+   ordered Leaf selection policy: `apply_topic_peers` (periodic refresh),
+   `initialize_topic_peers`, `refresh_subscribed_topic_id` (pre-warm/reverse
+   ACK), and `apply_preferred_eager_peer` (ACK preference). This includes
+   the initializer call as well as all three direct `set_topic_peers`
+   call sites. No full-plane overwrite may bypass policy.
+4. **Deterministic ordering:** deduplicate plane ids, sort by full 32-byte
+   PeerId, select slot 0 via `select_one_full_bootstrap_eager_peer` with
+   stable tie-breaking, then append the remaining sorted ids excluding it
+   and truncate to D. Sort any candidate inputs whose order affects the
+   helper. The plane originates in a HashMap: preserving its iteration
+   order makes slot 1 flap. An unchanged eligible peer set must produce
+   identical selections at every writer. On selected-peer failure, remove
+   the failed id and choose the next live eligible peer deterministically;
+   retain access to the full plane as replacement candidates. The sg
+   ceiling must survive inbound expansion between x0x refreshes; maintenance
+   may replace a selected peer but may never enlarge the eager set past D.
+5. **Diagnostics:** add `subscribed_topics: [{name, topic_id_hex8}]`, named
+   outbound rows and `egress_budget` limits, current 60s rate and exceed
+   counts. Keep repair sends separately identifiable. No hard-byte shedding
+   in slice 1, regardless of the top topic's priority.
 
-| # | site | what it passes |
-|---|---|---|
-| W1 | `initialize_topic_peers` (subscribe + publish + refresh_subscribed) | **full** `gossip_plane_peers()` |
-| W2 | `apply_topic_peers` (1 s `refresh_topic_peers`) | **full** plane |
-| W3 | `refresh_subscribed_topic_id` | W1, then a **second** `plumtree.set_topic_peers(full plane)` that **bypasses** `apply_topic_peers` |
-| W4 | `apply_preferred_eager_peer` (C5b ACK: inbox + bus) | preferred Full first, then **the rest of the plane**, via **direct** `plumtree.set_topic_peers` |
-| W5 | `subscribe_topic_id` / `publish*` | W1 |
+The degree invariant bounds unsolicited eager publish/epidemic fan-out
+per forwarding event to D. Cached IWANT replies are solicited recovery
+traffic, including to non-selected peers; a ceiling alone does **not** bound
+all outbound bytes or the lifetime recipient count of a message repaired
+to multiple requesters. Meter those replies separately and include them in
+the §5 total byte window. Do not claim a hard byte budget from a degree cap.
 
-Even if W1–W5 all truncate to 2 ids, sg 0.5.74 **re-grows** the eager set:
+### 6.2 Acceptance tests (unit / in-process — no public mesh)
 
-| # | site (sg `crates/pubsub/src/lib.rs`) | effect |
-|---|---|---|
-| S1 | `handle_eager_admitted` ~6588 | `add_new_peer_lazy(from)` + `maintain_degree_at` → promote toward **6** |
-| S2 | `handle_iwant_admitted` ~6868 | same, when the requester is served from cache |
-| S3 | `spawn_degree_maintainer` (30 s) | `maintain_degree` → **6–12** |
-| S4 | `set_topic_peers` / `initialize_topic_peers` themselves | after inserting connected peers as lazy, `maintain_degree_at` promotes toward **6** if more than 2 peers are in the topic's lazy/eager sets |
+Use the real sg handlers and an outbound transport recorder; a mock proving
+only the vector passed to `set_topic_peers` is insufficient. These are
+**required future gates**, not tests run or runtime credit for this document.
 
-Passing only 2 ids into `set_topic_peers` keeps S4 at 2 **until the next
-inbound EAGER or IWANT from a third peer**, or until S3 runs on a topic
-that has accumulated lazy peers from those frames. A Leaf subscribed to
-global announce/bus will receive those frames continuously. The cap must
-live where `maintain_degree_at` reads its bounds, or be re-applied after
-every inbound promotion.
-
-### 6.1 Slice 1a — name-map (before / with Winston capture)
-
-No behaviour change. Unblocks §5 on current binaries via this doc; the
-runtime field is so the next capture does not need a side script.
-
-1. Land the §5.4 table (this document — **done**).
-2. When Rust is written: `GET /diagnostics/gossip` grows
-   `subscribed_topics: [{ name, topic_id_hex8 }]` and
-   `outbound_by_topic_named` (same rows as `outbound_by_topic` + `name`).
-3. Unit test `topic_id_hex8_matches_design_table` pins every row in §5.4
-   so a hash/Display change cannot silently break Winston's labels.
-4. Inbox ids use the stored `topic_id_by_name` map, not `from_entity(name)`.
-
-Winston does **not** wait on (2)–(4). Use §5.2 + §5.4 now.
-
-### 6.2 Slice 1b — enforce eager degree on **all** paths
-
-**Required mechanism (pick one; do not ship truncate-only):**
-
-**Preferred — saorsa-gossip eager-bound API (small, complete).**
-
-Add instance bounds on `PlumtreePubSub`, defaulting to today's 6/12:
-
-```rust
-pub fn with_eager_degree_bounds(self, min: usize, max: usize) -> Self
-```
-
-`maintain_degree_at` / `maintain_degree` / opportunistic graft read those
-instead of `MIN_EAGER_DEGREE` / `MAX_EAGER_DEGREE`. Then S1–S4 honor Leaf
-`max = 2` (min is a **target**, not a floor that invents peers: if only
-one plane peer exists, eager size is 1).
-
-x0x: `PubSubManager::new_with_participation` calls
-`with_eager_degree_bounds(1, leaf_max)` when Leaf and `leaf_max > 0`.
-Full does not call it.
-
-**Also** funnel W1–W5 through **one** helper
-(`apply_eager_peer_set(topic, plane)`) that:
-
-- reorders with `select_one_full_bootstrap_eager_peer`
-- passes the full connected set (so disconnects still evict)
-- never calls `plumtree.set_topic_peers` / `initialize_topic_peers`
-  except through that helper
-
-The helper does **not** replace the sg bound. It only stops W3/W4 from
-bypassing policy and keeps bootstrap in the 2 slots when maintenance
-promotes.
-
-**Fallback if an sg bump cannot ship with slice 1b:** x0x clamp after
-every `handle_incoming` that reached PlumTree **and** at the end of the
-1 s refresh, demoting eager > N. Acceptance tests in §6.3 **must still
-inject inbound EAGER + IWANT + a maintainer tick** and assert fan-out ≤ N.
-A clamp that only runs on the 1 s timer is a FAIL (S1/S2 win between
-ticks). Document the race and the sg-API follow-up.
-
-`leaf_max_eager_degree = 0` means "do not override sg" — **not** "eager
-set empty".
-
-Byte shed stays observe-only (§4.3).
-
-### 6.3 Acceptance tests (unit / in-process — no public mesh)
-
-Name them for the invariant. **A test that only inspects the `Vec` passed
-to `set_topic_peers` is not sufficient** (that was the FAIL).
-
-| test | why |
+| test / scenario | required evidence |
 |---|---|
-| `topic_id_hex8_matches_design_table` | Slice 1a: §5.4 hex8 values match `TopicId::from_entity` Display. |
-| `gossip_diagnostics_maps_outbound_topic_hex_to_subscribed_name` | Hex8 for `x0x/dm/v1/bus` appears with that name once 1a Rust lands. |
-| `leaf_eager_bound_is_installed_on_plumtree_not_only_on_x0x_lists` | Construction with `leaf_max_eager_degree = 2` installs sg max=2 (or the clamp hook). Full does not. |
-| `leaf_refresh_and_ack_paths_share_one_peer_helper` | W3 (`refresh_subscribed_topic_id`) and W4 (`apply_preferred_eager_peer`) do not call `plumtree.set_topic_peers` directly. |
-| `leaf_publish_fanout_stays_at_degree_after_inbound_eager_from_eight_peers` | **Actual outbound:** subscribe; inject 8 `handle_incoming` EAGER frames from 8 peers on that topic; `publish_with_fanout`; `attempted <= 2`. Why: S1 must not grow the set. |
-| `leaf_publish_fanout_stays_at_degree_after_iwant_from_extra_peers` | Same after IWANT serve (S2). |
-| `leaf_publish_fanout_stays_at_degree_after_degree_maintainer_tick` | Force or wait a `maintain_degree` pass (S3). |
-| `leaf_delivery_survives_selected_peer_failure` | Two eager slots, bootstrap preferred. Disconnect slot 0. A subsequent publish is received by a subscriber behind a remaining connected peer (slot 1 or a promoted replacement). `fan_out >= 1` or, if no replacement exists, `zero_fanout` increments and local subscribe still delivers — no panic, no isolated-forever topic. Why: a 2-peer cap must not make "preferred peer died" into "mesh gone". |
-| `leaf_both_selected_peers_failed_is_fail_soft` | Disconnect both selected peers and empty the plane: publish returns Ok, `zero_fanout` + warn path, no process death. |
-| `full_eager_degree_remains_sg_default` | `--relay` still allows 6–12 after the same inbound EAGER flood. |
-| `leaf_max_eager_degree_zero_means_sg_default` | Escape hatch; 0 must not become "zero peers". |
-| `partial_toml_leaf_budget_falls_back_to_defaults` | Same class as `partial_toml_section_falls_back_to_defaults`. |
-| `leaf_epidemic_bytes_are_not_relay_bytes` | Keep the C0 vs #504 split. |
-| `leaf_refresh_topic_peers_skips_unsubscribed_passthrough_topics` | Existing C0 test stays green. |
+| All four writers, D=2, ≥8 plane peers | Initialization, repeated periodic refresh, DM pre-warm/reverse ACK refresh and preferred ACK refresh all preserve the cap. Record actual eager recipients for local publishes and unique subscribed inbound messages: fan-out ≤ D on every event. |
+| EAGER from non-selected peers | Deliver successive unique EAGER payloads from multiple unlisted peers between refreshes and interleave publishers. Real inbound promotion/maintenance must keep eager degree ≤ D and outbound epidemic fan-out ≤ D, including before the next refresh; local subscribed delivery continues. |
+| Cached IWANT from non-selected peers | Populate cache, issue IWANT from multiple non-selected peers, observe successful solicited recovery replies separately, then publish/forward new messages before refresh. Actual eager fan-out remains ≤ D despite repair promotion. Repeat after refresh and GRAFT/maintenance. |
+| Deterministic remainder | Permute identical HashMap-derived plane/candidate inputs across every writer. Slots 0 and 1 remain identical; prefer an eligible Full/bootstrap in slot 0. Cover no preferred peer, ties and duplicates. |
+| Selected-peer failure | Disconnect one selected peer, then both; with other live plane peers available, refresh/repair selects replacements without transient cap escape. Within a declared bounded in-process timeout, local subscribers receive new messages and recover a deliberately missed cached message via IHAVE/IWANT. Record delivery plus outbound sends, not just set size. |
+| Full and escape hatch | Full passes the full plane and retains sg 6–12 behavior even with Leaf config present; Leaf D=0 restores stock behavior. Cover D=1, 2, 12 and partial/invalid TOML fallback without isolation or restart-loop. |
+| Named diagnostics and participation | Map DM bus hex8 to its name; retain the epidemic-vs-relay split and existing Leaf unsubscribed refusal tests. Exceed byte thresholds without shedding in slice 1. |
 
-Do **not** add a live-mesh soak to CI. Document the §5 recipe as the
-external gate: Leaf, `Δepidemic_forward_bytes/Δt` after 1b, same peers.
+If the sg prerequisite or these tests are absent, label any x0x truncation
+build **experimental: sustained cap unproven**. Do not call it the #504 fix.
+No public-mesh soak in CI: §5 remains the external before/after Leaf gate,
+with comparable peers/workload and recovery evidence, distinct from C0.
 
-### 6.4 Later slices (not this one)
+### 6.3 Later slices (not this one)
 
 | slice | what | depends on |
 |---|---|---|
-| 2 | Fail-soft Bulk shed at hard byte budget, origin-aware (§4.3) | named capture + a meter we can increment in tests |
+| 2 | Fail-soft byte shedding, including explicit Critical/Normal forwarding policy if needed | named capture + per-topic/origin/priority meters + delivery/recovery gates |
 | 3 | Consume-only / no-forward for global announce on Leaf | sg API or a carefully metered x0x fork; evidence that announce (not the bus) is the top row |
 | 4 | #501 `skip_legacy_dm_bus` default-on-Leaf decision | #501 PR + the same capture |
 | 5 | Honest HyParView mapping **or** delete dead knobs | independent cleanup; does not close #504 |
 | — | #505 ant-quic MTU | other repo; only blocks some measurement hosts |
 
-If slice 1b shipped the x0x clamp fallback, the sg eager-bound API becomes
-a 1b-hotfix, not slice 2.
-
 ## 7. Success criteria for *this* document
 
 - [x] View-size knobs cited as dead, with files
 - [x] Dominant idle paths identified from subscribe sites (not from a live run)
-- [x] Operator budget + fail-soft ladder + Leaf vs Full defaults
-- [x] Executable Winston/Ben capture (Windows + Unix + hex map +
-      `from_entity` recipe)
-- [x] First slice covers **all** peer-update and inbound promotion paths,
-      with fan-out and selected-peer-failure tests — no two-site truncate
-- [x] Name-lookup available **before** asking for a recapture
+- [x] Operator budget + fail-soft + Leaf vs Full defaults
+- [x] Concrete capture recipe for Winston / Ben
+- [x] Smallest slice with acceptance tests, no rewrite
 
 **Not claimed:** runtime reduction on the public mesh, C0 soak re-run, or
-#504 closed. **Not implemented:** any Rust.
+#504 closed.
 
 ## 8. Checkpoint
 
@@ -769,9 +684,7 @@ a 1b-hotfix, not slice 2.
   `GossipConfig`.
 - Confirmed: Leaf still refreshes and eager-forwards **subscribed** system
   topics; C0 only refuses **unsubscribed** ones.
-- Confirmed: sg PlumTree eager degree is hardcoded 6–12;
-  `handle_eager` / `handle_iwant` / 30 s maintainer promote toward 6;
-  W3/W4 bypass `apply_topic_peers`.
-- Unverified: which named topic owns Winston's 1.54 GB. Recipe in §5
-  (executable now).
-- Left alone: ant-quic (#505), DM-bus default (#501), live soak, Rust.
+- Confirmed: sg PlumTree eager degree is hardcoded 6–12; x0x's 1 s refresh
+  feeds the entire plane into that cap.
+- Unverified: which named topic owns Winston's 1.54 GB. Recipe in §5.
+- Left alone: ant-quic (#505), DM-bus default (#501), live soak.
