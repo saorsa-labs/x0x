@@ -116,9 +116,7 @@ jobs:
         uses: actions/upload-artifact@v5
         with:
           name: test-results
-          path: |
-            target/nextest/
-            ${{ runner.temp }}/x0x-archive-*/extract/target/nextest/
+          path: target/nextest/
 
   coverage:
     name: Coverage Gate

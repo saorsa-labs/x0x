@@ -667,23 +667,42 @@ fn all_endpoints_covered() {
 const REQUIRED_NAMED_GROUP_RUN: &str = "run: bash scripts/ci/nextest-isolated.sh \
     --all-features --test named_group_integration -- --run-ignored ignored-only";
 const NEXTEST_ISOLATED_HELPER: &str = include_str!("../scripts/ci/nextest-isolated.sh");
+const NEXTEST_REUSE: &str = include_str!("../scripts/ci/nextest-reuse.py");
 
-fn named_group_ci_contract_is_active(workflow: &str, helper: &str) -> bool {
+fn named_group_ci_contract_is_active(workflow: &str, helper: &str, reuse: &str) -> bool {
     let active_run = workflow
         .lines()
         .any(|line| line.trim() == REQUIRED_NAMED_GROUP_RUN);
     let helper_lines: Vec<_> = helper.lines().map(str::trim).collect();
-    let archive = helper_lines.iter().position(|line| {
-        *line == r#"cargo nextest archive "${build[@]}" --archive-file "$scratch/tests.tar.zst""#
+    let metadata = helper_lines
+        .iter()
+        .position(|line| *line == r#"cargo metadata "${metadata[@]}" > "$scratch/cargo.json""#);
+    let binaries = helper_lines.windows(2).position(|lines| {
+        lines == [
+            r#"cargo nextest list "${build[@]}" --locked --cargo-metadata "$scratch/cargo.json" \"#,
+            r#"--list-type binaries-only --message-format json > "$scratch/binaries.json""#,
+        ]
     });
-    let isolated_run = helper_lines.windows(2).position(|lines| {
-        lines
-            == [
-                r"python3 scripts/ci/isolated-runtime.py cargo nextest run \",
-                r#"--archive-file "$scratch/tests.tar.zst" --extract-to "$scratch/extract" "$@""#,
-            ]
+    let custody = helper_lines
+        .iter()
+        .position(|line| *line == r#"python3 scripts/ci/nextest-reuse.py record "$scratch""#);
+    let isolated_run = helper_lines.iter().position(|line| {
+        *line == r#"python3 scripts/ci/isolated-runtime.py python3 scripts/ci/nextest-reuse.py run "$scratch" "$@""#
     });
-    active_run && matches!((archive, isolated_run), (Some(build), Some(run)) if build < run)
+    let reuse_lines: Vec<_> = reuse.lines().map(str::trim).collect();
+    let verified = reuse_lines
+        .iter()
+        .position(|line| *line == "verify(scratch)");
+    let execute = reuse_lines.windows(2).position(|lines| {
+        lines == [
+            "os.execvp('cargo', ['cargo', 'nextest', 'run', '--binaries-metadata',",
+            "str(scratch / 'binaries.json'), '--cargo-metadata', str(scratch / 'cargo.json'), *arguments])",
+        ]
+    });
+    active_run
+        && matches!((verified, execute), (Some(check), Some(run)) if check < run)
+        && matches!((metadata, binaries, custody, isolated_run),
+        (Some(graph), Some(build), Some(record), Some(run)) if graph < build && build < record && record < run)
 }
 
 /// Verifies daemon-backed named-group behavior is required by the CI-visible
@@ -691,11 +710,15 @@ fn named_group_ci_contract_is_active(workflow: &str, helper: &str) -> bool {
 #[test]
 fn named_group_ignored_integration_suite_is_required_by_ci() {
     assert!(
-        named_group_ci_contract_is_active(INTEGRATION_WORKFLOW, NEXTEST_ISOLATED_HELPER),
+        named_group_ci_contract_is_active(
+            INTEGRATION_WORKFLOW,
+            NEXTEST_ISOLATED_HELPER,
+            NEXTEST_REUSE
+        ),
         "\n\nThe named-group REST endpoints in COVERED rely on \
          tests/named_group_integration.rs for daemon-backed behavior. \
          Keep an active CI step with:\n  {REQUIRED_NAMED_GROUP_RUN}\n\
-         and keep the helper's archive-to-isolated-runtime execution contract.\n"
+         and keep the helper's binary-metadata-to-isolated-runtime execution contract.\n"
     );
 }
 
@@ -711,12 +734,19 @@ fn named_group_ci_contract_rejects_missing_or_inert_execution() {
         ),
     ] {
         assert!(
-            !named_group_ci_contract_is_active(&broken_workflow, NEXTEST_ISOLATED_HELPER),
+            !named_group_ci_contract_is_active(
+                &broken_workflow,
+                NEXTEST_ISOLATED_HELPER,
+                NEXTEST_REUSE
+            ),
             "missing target, ignored-only selection, isolation, or active step must fail"
         );
     }
     for broken_helper in [
-        NEXTEST_ISOLATED_HELPER.replace("cargo nextest archive", "# cargo nextest archive"),
+        NEXTEST_ISOLATED_HELPER.replace("cargo nextest list", "# cargo nextest list"),
+        NEXTEST_ISOLATED_HELPER.replace("--list-type binaries-only", "--list-type full"),
+        NEXTEST_ISOLATED_HELPER.replace("--cargo-metadata", "--different-metadata"),
+        NEXTEST_ISOLATED_HELPER.replace("nextest-reuse.py record", "nextest-reuse.py ignored"),
         NEXTEST_ISOLATED_HELPER.replace("python3 scripts/ci/isolated-runtime.py ", ""),
         NEXTEST_ISOLATED_HELPER.replace(
             "python3 scripts/ci/isolated-runtime.py",
@@ -724,9 +754,18 @@ fn named_group_ci_contract_rejects_missing_or_inert_execution() {
         ),
     ] {
         assert!(
-            !named_group_ci_contract_is_active(INTEGRATION_WORKFLOW, &broken_helper),
-            "building the archive and executing it through isolation must remain active"
+            !named_group_ci_contract_is_active(INTEGRATION_WORKFLOW, &broken_helper, NEXTEST_REUSE),
+            "binary-only preparation, graph/custody and isolated execution must remain active"
         );
+    }
+    for broken_reuse in [
+        NEXTEST_REUSE.replace("verify(scratch)", "# verify(scratch)"),
+        NEXTEST_REUSE.replace("--binaries-metadata", "--missing-binaries"),
+        NEXTEST_REUSE.replace("--cargo-metadata", "--missing-graph"),
+        NEXTEST_REUSE.replace(", *arguments])", "])"),
+    ] {
+        assert!(!named_group_ci_contract_is_active(INTEGRATION_WORKFLOW, NEXTEST_ISOLATED_HELPER, &broken_reuse),
+            "runtime must verify custody and forward both metadata files and every runtime argument");
     }
 }
 
