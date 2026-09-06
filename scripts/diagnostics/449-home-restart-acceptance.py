@@ -165,20 +165,31 @@ def duplicates_projection(raw):
     }
 
 
-def observe(port, token):
+def observe(port, token, call=api_call):
     """One observation. Fetches the REAL local agent id and compares it in
     memory against the Home projection (review P2); only booleans and salted
-    digests are retained."""
-    agent_status, agent_body = api_call(port, token, "/agent")
+    digests are retained. `call` is injectable so the decode path has pure
+    controls against the real response shapes (review r2 P1)."""
+    # GET /agent returns the ApiResponse ENVELOPE: {ok, data:{agent_id,...}}
+    # (src/server/routes/identity.rs:81-99), NOT a top-level agent_id.
+    agent_status, agent_body = call(port, token, "/agent")
     if agent_status != 200 or not isinstance(agent_body, dict):
         raise PhaseError("observe", f"/agent status {agent_status}")
-    local_agent = agent_body.get("agent_id")
+    if agent_body.get("ok") is not True:
+        raise PhaseError("observe", "/agent ok is not true")
+    agent_data = agent_body.get("data")
+    if not isinstance(agent_data, dict):
+        raise PhaseError("observe", "/agent envelope has no data object")
+    local_agent = agent_data.get("agent_id")
     if not isinstance(local_agent, str) or not local_agent:
-        raise PhaseError("observe", "/agent returned no agent_id")
+        raise PhaseError("observe", "/agent data has no agent_id")
 
-    home_status, home = api_call(port, token, "/home")
+    # GET /home is a FLAT body (routes/home.rs), not the envelope.
+    home_status, home = call(port, token, "/home")
     if home_status != 200 or not isinstance(home, dict):
         raise PhaseError("observe", f"/home status {home_status}")
+    if home.get("ok") is not True:
+        raise PhaseError("observe", "/home ok is not true")
 
     primary = home.get("primary_agent")
     primary_id = primary.get("agent_id") if isinstance(primary, dict) else None
@@ -188,10 +199,22 @@ def observe(port, token):
         if isinstance(members, list) else None
     )
 
-    groups_status, groups_body = api_call(port, token, "/groups")
-    groups = groups_body.get("groups") if isinstance(groups_body, dict) else None
-    if groups_status != 200 or not isinstance(groups, list):
+    # GET /groups is flat {ok, groups:[...]} and DELIBERATELY EXCLUDES
+    # withdrawn tombstones (named_groups.rs:11370-11372). A withdrawal is
+    # therefore invisible as a field and shows up only as the live set
+    # shrinking — so the identity set below, not a "withdrawn" counter, is the
+    # no-deletion evidence.
+    groups_status, groups_body = call(port, token, "/groups")
+    if groups_status != 200 or not isinstance(groups_body, dict):
         raise PhaseError("observe", f"/groups status {groups_status}")
+    if groups_body.get("ok") is not True:
+        raise PhaseError("observe", "/groups ok is not true")
+    groups = groups_body.get("groups")
+    if not isinstance(groups, list) or not all(isinstance(g, dict) for g in groups):
+        raise PhaseError("observe", "/groups payload is not a list of objects")
+    group_ids = [g.get("group_id") for g in groups]
+    if not all(isinstance(g, str) and g for g in group_ids):
+        raise PhaseError("observe", "/groups entry without a group_id")
 
     return {
         "home_status": home_status,
@@ -208,9 +231,8 @@ def observe(port, token):
         "duplicates": duplicates_projection(home.get("duplicates")),
         "unretired_duplicate_home": home.get("warnings", {}).get(
             "unretired_duplicate_home"),
-        "group_total": len(groups),
-        "group_withdrawn": sum(
-            1 for g in groups if isinstance(g, dict) and g.get("withdrawn")),
+        "group_total": len(group_ids),
+        "group_id_digests": sorted(digest(g) for g in group_ids),
     }
 
 
@@ -268,7 +290,11 @@ def evaluate(before, after, control):
     checks["distinct_pids"] = before["pid"] != after["pid"]
     # Nothing deleted across the restart.
     checks["group_total_unchanged"] = a["group_total"] == b["group_total"]
-    checks["no_new_withdrawn"] = a["group_withdrawn"] == b["group_withdrawn"]
+    # `/groups` excludes withdrawn tombstones, so a deletion is invisible as a
+    # field and shows only as the live SET changing. Comparing the identity set
+    # (not just the count) also catches a delete paired with a create.
+    checks["group_identity_set_unchanged"] = (
+        a["group_id_digests"] == b["group_id_digests"])
     # CONTRAST fixture (not a mutation test of restart behaviour): a distinct
     # owner on a distinct root must yield a distinct Home, so an evaluator that
     # always reported "equal" cannot pass.
@@ -287,7 +313,8 @@ def _obs(**over):
         "local_agent_is_member": True, "members_decoded": True, "member_count": 1,
         "duplicates": {"decoded": True, "count": 0, "is_empty": True,
                        "retirement_values": [], "any_safe_to_retire_field": False},
-        "unretired_duplicate_home": False, "group_total": 1, "group_withdrawn": 0,
+        "unretired_duplicate_home": False, "group_total": 1,
+        "group_id_digests": ["aaaa"],
     }
     base.update(over)
     return base
@@ -338,10 +365,12 @@ def self_test():
                                  "retirement_values": ["automatic"],
                                  "any_safe_to_retire_field": False}), 2),
          _phase(contrast, 3))
-    case("group_withdrawn_across_restart", False,
-         _phase(good_a, 1), _phase(_obs(group_withdrawn=1), 2), _phase(contrast, 3))
     case("group_disappeared_across_restart", False,
-         _phase(good_a, 1), _phase(_obs(group_total=0), 2), _phase(contrast, 3))
+         _phase(good_a, 1), _phase(_obs(group_total=0, group_id_digests=[]), 2),
+         _phase(contrast, 3))
+    case("group_replaced_across_restart", False,  # same count, different set
+         _phase(good_a, 1), _phase(_obs(group_id_digests=["zzzz"]), 2),
+         _phase(contrast, 3))
     case("state_not_local", False,
          _phase(good_a, 1), _phase(_obs(state="elsewhere"), 2), _phase(contrast, 3))
     case("non_200_home", False,
@@ -371,6 +400,72 @@ def self_test():
     for name, raw, expect in schema:
         cases.append((f"schema:{name}", expect, duplicates_projection(raw)["decoded"]))
 
+    # --- observe() decode controls against the REAL response shapes ---
+    AGENT_OK = {"ok": True, "data": {"agent_id": "aa", "machine_id": "mm",
+                                     "user_id": "uu", "kem_public_key_b64": "k",
+                                     "human_name": None, "display_name": None,
+                                     "machine_name": None}}
+    HOME_OK = {"ok": True, "state": "local", "name": "Home", "group_id": "g1",
+               "owner_user_id": "uu",
+               "primary_agent": {"agent_id": "aa", "self_name": None,
+                                 "verified": True},
+               "members": [{"agent_id": "aa", "role": "Admin",
+                            "placement": "roaming", "self_name": None}],
+               "duplicates": [],
+               "warnings": {"no_roaming_agent": False,
+                            "primary_agent_unverified": False,
+                            "unretired_duplicate_home": False}}
+    GROUPS_OK = {"ok": True, "groups": [{"group_id": "g1", "name": "Home",
+                                         "description": "", "creator": "aa",
+                                         "created_at": 1, "member_count": 1}]}
+
+    def fake(routes):
+        def call(_port, _token, path):
+            return routes[path]
+        return call
+
+    def observe_case(name, routes, expect_ok, expect_stage=None):
+        try:
+            result = observe(1, "t", call=fake(routes))
+            got_ok, stage = True, None
+        except PhaseError as error:
+            got_ok, stage = False, error.stage
+        ok = (got_ok == expect_ok) and (expect_stage is None or stage == expect_stage)
+        cases.append((f"observe:{name}", True, ok))
+
+    base = {"/agent": (200, AGENT_OK), "/home": (200, HOME_OK),
+            "/groups": (200, GROUPS_OK)}
+    observe_case("real_shapes_decode", base, True)
+    # THE r2 P1 regression: a top-level agent_id read would have failed here.
+    observe_case("agent_envelope_required", {**base,
+        "/agent": (200, {"ok": True, "agent_id": "aa"})}, False, "observe")
+    observe_case("agent_ok_false", {**base,
+        "/agent": (200, {"ok": False, "data": {"agent_id": "aa"}})}, False, "observe")
+    observe_case("agent_non_200", {**base, "/agent": (503, None)}, False, "observe")
+    observe_case("agent_unreachable", {**base, "/agent": (None, None)}, False, "observe")
+    observe_case("home_ok_false", {**base,
+        "/home": (200, {**HOME_OK, "ok": False})}, False, "observe")
+    observe_case("home_non_200", {**base, "/home": (404, {"ok": False})}, False, "observe")
+    observe_case("groups_ok_false", {**base,
+        "/groups": (200, {"ok": False, "groups": []})}, False, "observe")
+    observe_case("groups_not_a_list", {**base,
+        "/groups": (200, {"ok": True, "groups": {}})}, False, "observe")
+    observe_case("groups_entry_without_id", {**base,
+        "/groups": (200, {"ok": True, "groups": [{"name": "x"}]})}, False, "observe")
+
+    # Positive decode must actually compute the identity comparisons.
+    decoded = observe(1, "t", call=fake(base))
+    cases.append(("observe:primary_is_local_agent_true",
+                  True, decoded["primary_is_local_agent"] is True))
+    cases.append(("observe:local_agent_is_member_true",
+                  True, decoded["local_agent_is_member"] is True))
+    mismatch = observe(1, "t", call=fake({**base, "/home": (200, {**HOME_OK,
+        "primary_agent": {"agent_id": "bb"}, "members": [{"agent_id": "bb"}]})}))
+    cases.append(("observe:primary_mismatch_detected",
+                  True, mismatch["primary_is_local_agent"] is False))
+    cases.append(("observe:missing_membership_detected",
+                  True, mismatch["local_agent_is_member"] is False))
+
     failed = [(n, e, g) for n, e, g in cases if e != g]
     for name, expect, got in cases:
         print(f"{'ok  ' if expect == got else 'FAIL'} {name} (expected {expect}, got {got})")
@@ -379,6 +474,13 @@ def self_test():
 
 
 # ------------------------------- runtime ------------------------------------
+
+def write_receipt(evidence, receipt):
+    """Persist immediately. A later phase failing must never discard evidence
+    already gathered (review r2)."""
+    (evidence / "449-acceptance.json").write_text(
+        json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+
 
 def main():
     parser = argparse.ArgumentParser()
@@ -414,13 +516,22 @@ def main():
             if result.returncode != 0:
                 raise PhaseError("owner-key", f"user-id create exit {result.returncode}")
 
+        # Each phase is appended and flushed the moment it completes, so a
+        # later start failure cannot discard earlier cleanup evidence.
         before = phase(args.binary, root, private_logs, "before")
+        receipt["phases"]["before"] = before
+        write_receipt(args.evidence, receipt)
+
         after = phase(args.binary, root, private_logs, "after")
+        receipt["phases"]["after"] = after
+        write_receipt(args.evidence, receipt)
+
         os.environ["X0X_HOME"] = str(control_root)
         control = phase(args.binary, control_root, private_logs, "control")
         os.environ["X0X_HOME"] = str(root)
+        receipt["phases"]["control"] = control
+        write_receipt(args.evidence, receipt)
 
-        receipt["phases"] = {"before": before, "after": after, "control": control}
         receipt["verdict"] = evaluate(before, after, control)
     except PhaseError as error:
         receipt["verdict"] = {"checks": {}, "passed": False,
@@ -430,8 +541,7 @@ def main():
                               "reason": f"unexpected: {type(error).__name__}"}
     finally:
         # A receipt is ALWAYS written, including on setup failure.
-        (args.evidence / "449-acceptance.json").write_text(
-            json.dumps(receipt, indent=2, sort_keys=True) + "\n")
+        write_receipt(args.evidence, receipt)
     print(json.dumps(receipt["verdict"], indent=2, sort_keys=True), flush=True)
     return 0 if receipt["verdict"] and receipt["verdict"]["passed"] else 1
 

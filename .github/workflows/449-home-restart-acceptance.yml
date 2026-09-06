@@ -32,9 +32,11 @@ jobs:
       # Pinned toolchain, matching the #535 diagnostic.
       RUST_VERSION: 1.95.0
       # Exact bytes of the harness and the UNCHANGED #535 wrapper.
-      HARNESS_SHA256: 9b5c45e2968315b878e84bdf18d1f3c3b41753570b1e6fa5a861bbb2d3bbd1e9
+      HARNESS_SHA256: b31efd6125a52022cf8d11b55b5d198d1fa439b559c0cb39b5ee24d8c8f7750b
       WRAPPER_SHA256: 2a0c2521c19d5054b6e77c995e1604e9e9e174208157bb4331b5b38783aedced
       WITNESS_SHA256: dbd753e24b3d082ed434813e575ed214aa70fd8d33b8872f70db1bedb5e0f5ec
+      # Exact dependency graph from the accepted #449 lane, tracked as a fixture.
+      LOCK_FIXTURE_SHA256: 0fb99da96b7464b3a5a3bfac07031721f0064fc3f128739a3e1ae860107cfd9f
       # Well under the wrapper's own 21600s ceiling.
       X0X_RUNTIME_TIMEOUT_SECONDS: "900"
 
@@ -74,18 +76,54 @@ jobs:
           rustc -V
           cargo -V
 
-      - name: Build binaries with a locked, retained resolution
+      - name: Install the tracked lock fixture (no fresh resolution)
         run: |
           set -euo pipefail
-          # Cargo.lock is gitignored, so resolution is NOT reproducible from the
-          # tree. Resolve once, record it, then require --locked to prove the
-          # build consumed exactly that resolution.
-          cargo generate-lockfile
-          sha256sum Cargo.lock | tee lock-before.txt
+          # Cargo.lock is gitignored, so a digest alone cannot reproduce the
+          # dependency graph and `generate-lockfile` would resolve a NEW graph
+          # at run time. The exact lock from the accepted #449 lane is tracked
+          # as a fixture and installed verbatim, so the run consumes a known
+          # graph rather than whatever crates.io offers today.
+          echo "$LOCK_FIXTURE_SHA256  ci/449-acceptance/Cargo.lock.fixture" | sha256sum -c -
+          cp ci/449-acceptance/Cargo.lock.fixture Cargo.lock
+          sha256sum Cargo.lock | tee lock-installed.txt
+
+      - name: Validate the locked graph without resolving
+        run: |
+          set -euo pipefail
+          # --locked fails rather than silently updating; --offline would hide a
+          # missing crate, so this deliberately allows fetch but forbids change.
+          cargo metadata --locked --format-version 1 > cargo-metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          meta = json.loads(Path('cargo-metadata.json').read_text())
+          pkgs = meta['packages']
+          # Source provenance: every dependency must come from the pinned
+          # registry or be a local path member. Anything else (a git source, a
+          # patched or vendored replacement) is a graph we did not review.
+          foreign = sorted({
+              p['source'] for p in pkgs
+              if p.get('source') and p['source'] != 'registry+https://github.com/rust-lang/crates.io-index'
+          })
+          assert not foreign, f'unexpected package sources: {foreign}'
+          Path('lock-provenance.json').write_text(json.dumps({
+              'package_count': len(pkgs),
+              'workspace_members': sorted(meta['workspace_members']),
+              'sources': sorted({p['source'] for p in pkgs if p.get('source')}),
+          }, indent=2, sort_keys=True) + '\n')
+          print(f'validated {len(pkgs)} packages')
+          PY
+
+      - name: Build binaries from the locked graph
+        run: |
+          set -euo pipefail
           cargo build --locked --release --bin x0xd --bin x0x
           sha256sum Cargo.lock | tee lock-after.txt
-          diff lock-before.txt lock-after.txt || { echo "lock drifted"; exit 1; }
+          diff <(cut -d' ' -f1 lock-installed.txt) <(cut -d' ' -f1 lock-after.txt) \
+            || { echo "lock drifted during build"; exit 1; }
           sha256sum target/release/x0xd target/release/x0x | tee binaries.sha256
+          { rustc -V; cargo -V; } | tee toolchain.txt
 
       - name: Isolated runtime acceptance (unchanged #535 wrapper is the boundary)
         env:
@@ -135,7 +173,7 @@ jobs:
           for f in admission.json exit.json supervisor.json; do
             cp "${RUNNER_TEMP:-${{ runner.temp }}}"/x0x-isolation-*/"$f" "$out/" || true
           done
-          cp lock-before.txt binaries.sha256 "$out/" || true
+          cp lock-installed.txt lock-provenance.json binaries.sha256 toolchain.txt "$out/" || true
           # Explicit refusal: no daemon logs, no data roots, no sidecars.
           find "$out" -type f -print
 
