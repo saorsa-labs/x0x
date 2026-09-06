@@ -844,10 +844,13 @@ impl GossipRuntime {
     ///
     /// Returns an error if configuration validation fails.
     pub async fn new(
-        config: GossipConfig,
+        mut config: GossipConfig,
         network: Arc<NetworkNode>,
         signing: Option<Arc<SigningContext>>,
     ) -> NetworkResult<Self> {
+        if let Some(warning) = config.normalize_egress_budget() {
+            tracing::warn!("{warning}");
+        }
         config.validate().map_err(|e| {
             crate::error::NetworkError::NodeCreation(format!("invalid gossip config: {e}"))
         })?;
@@ -866,13 +869,15 @@ impl GossipRuntime {
         // never engage in production — they silently fall through to
         // the legacy/Alive path.
         let oracle: Arc<dyn saorsa_gossip_types::PeerHealthOracle> = membership.swim_arc();
-        let pubsub = Arc::new(PubSubManager::new_with_participation(
+        let mut pubsub = PubSubManager::new_with_participation(
             Arc::clone(&network),
             signing,
             Some(oracle),
             config.resolved_participation(),
             config.resolved_participation_reason().to_string(),
-        )?);
+        )?;
+        pubsub.configure_egress(&config).await;
+        let pubsub = Arc::new(pubsub);
         let dispatch_workers = config.dispatch_workers;
 
         Ok(Self {
@@ -1011,6 +1016,7 @@ impl GossipRuntime {
         let peer_sync_handle = tokio::spawn(async move {
             loop {
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+                pubsub_refresh.sample_egress();
                 pubsub_refresh.refresh_topic_peers().await;
             }
         });

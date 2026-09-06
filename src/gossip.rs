@@ -4,6 +4,7 @@
 //! enabling pub/sub messaging and HyParView membership management.
 
 pub mod config;
+mod egress;
 pub mod participation;
 pub mod pubsub;
 pub mod runtime;
