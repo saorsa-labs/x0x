@@ -44,17 +44,17 @@ hyper = { version = "0.14", features = ["server", "http1", "tcp"] }
 tokio-stream = { version = "0.1", features = ["sync"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
 rand = "0.8"
-saorsa-gossip-coordinator = "0.5.74"
-saorsa-gossip-crdt-sync = "0.5.74"
-saorsa-gossip-groups = "0.5.74"
-saorsa-gossip-identity = "0.5.74"
-saorsa-gossip-membership = "0.5.74"
-saorsa-gossip-presence = "0.5.74"
-saorsa-gossip-pubsub = "0.5.74"
-saorsa-gossip-rendezvous = "0.5.74"
-saorsa-gossip-runtime = "0.5.74"
-saorsa-gossip-transport = "0.5.74"
-saorsa-gossip-types = "0.5.74"
+saorsa-gossip-coordinator = "0.5.76"
+saorsa-gossip-crdt-sync = "0.5.76"
+saorsa-gossip-groups = "0.5.76"
+saorsa-gossip-identity = "0.5.76"
+saorsa-gossip-membership = "0.5.76"
+saorsa-gossip-presence = "0.5.76"
+saorsa-gossip-pubsub = "0.5.76"
+saorsa-gossip-rendezvous = "0.5.76"
+saorsa-gossip-runtime = "0.5.76"
+saorsa-gossip-transport = "0.5.76"
+saorsa-gossip-types = "0.5.76"
 saorsa-pqc = "0.5"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -191,17 +191,3 @@ strip = "none"
 # Rust symbols without needing the .dwo files shipped alongside.
 split-debuginfo = "off"
 
-# Experimental #504 slice-1 prerequisite: saorsa-gossip draft PR #51.
-# Pin the family together so TopicId/transport types have one source.
-[patch.crates-io]
-saorsa-gossip-coordinator = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-crdt-sync = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-groups = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-identity = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-membership = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-presence = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-pubsub = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-rendezvous = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-runtime = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-transport = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
-saorsa-gossip-types = { git = "https://github.com/saorsa-labs/saorsa-gossip", rev = "c041fdcc807aa8d7be26e72f5ba58584c9b14c88" }
