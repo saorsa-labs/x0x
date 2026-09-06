@@ -77,7 +77,7 @@ jobs:
           import hashlib, json, os, pathlib, subprocess, time
           evidence = pathlib.Path(os.environ['RUNNER_TEMP']) / 'bootstrap-diagnostic'
           lock = hashlib.sha256(pathlib.Path('Cargo.lock').read_bytes()).hexdigest()
-          command = ['bash', 'scripts/ci/nextest-isolated.sh', '--all-features', '--locked', '--test',
+          command = ['bash', 'scripts/ci/nextest-isolated.sh', '--all-features', '--test',
                      'f2_public_group_bootstrap_wiring', '--', '-E',
                      'test(=bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack)']
           started = time.monotonic()
