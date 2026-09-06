@@ -2,7 +2,8 @@
 """#449 runtime acceptance: one Home per owner across a REAL process restart.
 
 PREPARATION ARTIFACT — the author has not executed the runtime path. Only
-`--self-test` (pure, no daemon, no network) has been run.
+`--self-test` (no daemon, no network; own temporary-directory fixtures only)
+has been run.
 
 Runs as the `command` argument of the reviewed, UNCHANGED
 `scripts/ci/isolated-runtime.py`
@@ -497,9 +498,13 @@ def _phase(observation, pid=1, clean=True):
 
 
 def self_test():
-    """Pure positive/negative controls for the evaluator and the schema. No
-    daemon, no network, no filesystem. Each negative must FAIL the verdict —
-    otherwise the corresponding check has no power."""
+    """Pure positive/negative controls for the evaluator, the schema, the
+    address parser and the daemon layout.
+
+    No daemon and no network. The layout controls DO touch the filesystem:
+    they create their own `TemporaryDirectory` and write only inside it, so
+    the fixtures are self-owned and removed on exit. Each negative must FAIL
+    the verdict — otherwise the corresponding check has no power."""
     cases = []
 
     def case(name, expect_pass, before, after, control):
@@ -784,7 +789,8 @@ def write_receipt(evidence, receipt):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--self-test", action="store_true",
-                        help="pure controls only; no daemon, no network")
+                        help="pure controls only; no daemon, no network "
+                             "(own temporary-directory fixtures only)")
     parser.add_argument("--binary", type=Path)
     parser.add_argument("--cli", type=Path)
     parser.add_argument("--evidence", type=Path)
