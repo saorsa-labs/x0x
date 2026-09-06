@@ -157,7 +157,8 @@ def worker(evidence, nextest):
     assert digest(evidence/'build.tar.zst') == binaries['archive_sha256']
     run = evidence/'private-data'
     run.mkdir(mode=0o700)
-    for name in ('tmp', 'logs', 'app-logs'):
+    # nextest --extract-to canonicalizes an existing directory before extracting.
+    for name in ('tmp', 'logs', 'app-logs', 'list-extract', 'run-extract'):
         (run/name).mkdir(mode=0o700)
     env = {'PATH': '/usr/bin:/bin', 'TMPDIR': str(run/'tmp'),
            'X0X_HOME': '/tmp/x0x-nextest-home', 'X0X_TEST_LOG_DIR': str(run/'logs'),
