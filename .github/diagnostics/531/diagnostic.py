@@ -21,6 +21,7 @@ CI_TREE = '637b7237d07d528f2db17dd4ec76e529f71e05e4'
 LOCK = '6c21e6e693b0465c17d00031e9b2dc65e9ffe0c8dae1b4b3fcc6d8baf0cd0b72'
 TEST = 'member_banned_lost_initial_volley_recovers_via_bounded_resend'
 FILTER = f'test(={TEST})'
+TEST_TREE = '29014bff80f9e95b272e90b29963d8eecd7eae5b'
 LOGS = ('provenance.json', 'build.jsonl', 'build.stderr', 'archive.stdout', 'archive.stderr',
         'build.tar.zst', 'Cargo.lock', 'diagnostic.patch', 'binaries.json', 'namespace.json',
         'firewall-before.json', 'firewall-after-probes.json', 'firewall-final.json',
@@ -44,6 +45,15 @@ def capture(args, evidence, name, **kwargs):
     (evidence/f'{name}.exit').write_text(str(result.returncode)+'\n')
     if result.returncode:
         raise RuntimeError(f'{name} exited {result.returncode}; evidence retained')
+
+
+def verify_test_source(source, expected_tree):
+    # Pin bytes, paths and modes, not Git's version/config-dependent diff rendering.
+    tree = subprocess.check_output(['git', 'rev-parse', 'HEAD:tests'], cwd=source, text=True).strip()
+    assert tree == expected_tree, 'unreviewed committed test-source drift'
+    dirty = subprocess.check_output(
+        ['git', 'status', '--porcelain', '--untracked-files=all', '--', 'tests'], cwd=source)
+    assert not dirty, 'unreviewed working test-source drift'
 
 
 def prepare(evidence):
@@ -70,8 +80,8 @@ def prepare(evidence):
         'lock': LOCK, 'rustflags': os.environ.get('RUSTFLAGS'),
         'incremental': os.environ.get('CARGO_INCREMENTAL')}, indent=2))
     patch = subprocess.check_output(['git', 'diff', '--unified=0', BASE, 'HEAD', '--', 'tests'], cwd=SOURCE)
-    assert patch == (HERE/'test-observation.patch').read_bytes(), 'unreviewed test-source drift'
     (evidence/'diagnostic.patch').write_bytes(patch)
+    verify_test_source(SOURCE, TEST_TREE)
     subprocess.run(['cargo', 'fetch', '--locked'], cwd=SOURCE, check=True)
     capture(['cargo', 'test', '--locked', '--offline', '--all-features', '--test',
              'named_group_integration', '--no-run', '--message-format=json'], evidence, 'build')

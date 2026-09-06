@@ -2,11 +2,78 @@ import importlib.util
 import json
 from pathlib import Path
 import tempfile
+import subprocess
 import unittest
 
 spec = importlib.util.spec_from_file_location('diagnostic', Path(__file__).with_name('diagnostic.py'))
 diag = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(diag)
+
+
+class SourceCustodyControls(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.source = Path(self.temp.name)
+        self.git('init', '-q')
+        self.git('config', 'user.name', 'Fixture')
+        self.git('config', 'user.email', 'fixture@example.invalid')
+        (self.source/'tests').mkdir()
+        (self.source/'tests'/'sample.rs').write_text('original\n')
+        self.commit()
+        self.base = self.git('rev-parse', 'HEAD')
+        (self.source/'tests'/'sample.rs').write_text('reviewed\n')
+        self.commit()
+        self.expected = self.git('rev-parse', 'HEAD:tests')
+
+    def git(self, *args):
+        return subprocess.check_output(['git', *args], cwd=self.source, text=True).strip()
+
+    def commit(self):
+        self.git('add', 'tests')
+        self.git('-c', 'core.hooksPath=/dev/null', 'commit', '-qm', 'fixture')
+
+    def test_identical_source_accepts_different_diff_presentation(self):
+        short = self.git('-c', 'core.abbrev=7', 'diff', '--unified=0', self.base, 'HEAD', '--', 'tests')
+        long = self.git('-c', 'core.abbrev=12', 'diff', '--unified=0', self.base, 'HEAD', '--', 'tests')
+        self.assertNotEqual(short, long)  # Old byte-comparison oracle rejects this same tree.
+        self.git('config', 'core.abbrev', '12')
+        diag.verify_test_source(self.source, self.expected)
+
+    def test_committed_byte_drift_rejected(self):
+        (self.source/'tests'/'sample.rs').write_text('unreviewed\n')
+        self.commit()
+        with self.assertRaisesRegex(AssertionError, 'committed'):
+            diag.verify_test_source(self.source, self.expected)
+
+    def test_added_test_path_rejected(self):
+        (self.source/'tests'/'extra.rs').write_text('unreviewed\n')
+        self.commit()
+        with self.assertRaisesRegex(AssertionError, 'committed'):
+            diag.verify_test_source(self.source, self.expected)
+
+    def test_removed_test_path_rejected(self):
+        (self.source/'tests'/'sample.rs').unlink()
+        (self.source/'tests'/'other.rs').write_text('reviewed\n')
+        self.commit()
+        with self.assertRaisesRegex(AssertionError, 'committed'):
+            diag.verify_test_source(self.source, self.expected)
+
+    def test_working_tree_drift_rejected(self):
+        (self.source/'tests'/'sample.rs').write_text('unreviewed\n')
+        with self.assertRaisesRegex(AssertionError, 'working'):
+            diag.verify_test_source(self.source, self.expected)
+
+    def test_staged_test_source_rejected(self):
+        (self.source/'tests'/'sample.rs').write_text('unreviewed\n')
+        self.git('add', 'tests')
+        with self.assertRaisesRegex(AssertionError, 'working'):
+            diag.verify_test_source(self.source, self.expected)
+
+    def test_untracked_test_source_rejected(self):
+        (self.source/'tests'/'extra.rs').write_text('unreviewed\n')
+        with self.assertRaisesRegex(AssertionError, 'working'):
+            diag.verify_test_source(self.source, self.expected)
 
 
 class DiagnosticControls(unittest.TestCase):
