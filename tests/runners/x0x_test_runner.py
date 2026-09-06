@@ -116,13 +116,64 @@ def load_token(token_spec: str) -> str:
 class X0xClient:
     """Minimal stdlib-only x0xd REST client."""
 
-    def __init__(self, base_url: str, token: str) -> None:
+    def __init__(
+        self, base_url: str, token: str, token_file: Optional[str] = None
+    ) -> None:
         self.base_url = base_url.rstrip("/")
         self.token = token
-        self._headers = {
-            "Authorization": f"Bearer {token}",
-            "Content-Type": "application/json",
-        }
+        self._token_file = token_file
+        self._token_lock = threading.Lock()
+
+    def _current_token(self) -> str:
+        with self._token_lock:
+            return self.token
+
+    def _reload_token(self, rejected_token: str) -> bool:
+        # REST and SSE readers share a client. A concurrent reader may have
+        # already refreshed the credential that this request used.
+        with self._token_lock:
+            if self.token != rejected_token:
+                return True
+            if self._token_file is None:
+                return False
+            try:
+                with open(self._token_file, "r", encoding="utf-8") as source:
+                    replacement = source.read().strip()
+            except (OSError, UnicodeError):
+                return False
+            if not replacement or replacement == self.token:
+                return False
+            # Reject whitespace, controls and non-ASCII before caching. Header
+            # validation errors can include the credential in their message,
+            # and happen before HTTP (so no later 401 could refresh the cache).
+            if any(not 33 <= ord(char) <= 126 for char in replacement):
+                return False
+            self.token = replacement
+            return True
+
+    def _open(self, method, path, data, timeout, accept=None):
+        def send(token):
+            headers = {"Authorization": f"Bearer {token}"}
+            if accept is None:
+                headers["Content-Type"] = "application/json"
+            else:
+                headers["Accept"] = accept
+            req = urllib.request.Request(
+                self.base_url + path, data=data, method=method, headers=headers
+            )
+            return urllib.request.urlopen(req, timeout=timeout)
+
+        token = self._current_token()
+        try:
+            return send(token)
+        except urllib.error.HTTPError as error:
+            # Authentication rejection occurs before the API operation. Never
+            # replay timeouts, connection errors, or non-authentication errors.
+            if error.code != 401 or not self._reload_token(token):
+                raise
+            error.close()
+        # Exactly one retry, including when another thread supplied the token.
+        return send(self._current_token())
 
     def _request(
         self,
@@ -132,13 +183,7 @@ class X0xClient:
         timeout: float = 15.0,
     ) -> Dict[str, Any]:
         data = None if body is None else json.dumps(body).encode("utf-8")
-        req = urllib.request.Request(
-            self.base_url + path,
-            data=data,
-            method=method,
-            headers=self._headers,
-        )
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
+        with self._open(method, path, data, timeout) as resp:
             raw = resp.read()
         if not raw:
             return {}
@@ -269,14 +314,7 @@ class X0xClient:
         return self._request("DELETE", f"/groups/{gid}")
 
     def open_sse(self, path: str, timeout: float = 60.0):
-        req = urllib.request.Request(
-            self.base_url + path,
-            headers={
-                "Authorization": f"Bearer {self.token}",
-                "Accept": "text/event-stream",
-            },
-        )
-        return urllib.request.urlopen(req, timeout=timeout)
+        return self._open("GET", path, None, timeout, accept="text/event-stream")
 
 
 class TestRunner:
@@ -1195,7 +1233,9 @@ def main(argv: Optional[List[str]] = None) -> int:
         logging.error("X0X_API_TOKEN empty after loading from %s", token_spec)
         return 2
 
-    client = X0xClient(base, token)
+    client = X0xClient(
+        base, token, token_file=token_spec if os.path.isfile(token_spec) else None
+    )
     runner = TestRunner(
         node_name=node_name,
         client=client,
