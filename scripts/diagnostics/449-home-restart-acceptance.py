@@ -30,15 +30,21 @@ Predicates are lifted from the existing tests, not invented:
 API SHAPE AUDIT (all four endpoints this harness touches, verified against the
 server routes at this base — run 34064199876 failed on exactly this class of
 adapter mismatch):
-  GET /health  -> ApiResponse ENVELOPE {ok, data:{status,version,...}};
-                  auth-EXEMPT (server/auth.rs:270). Only the STATUS CODE is
-                  used here, so the envelope shape cannot mismatch.
-  GET /agent   -> ApiResponse ENVELOPE {ok, data:{agent_id,...}}
-                  (server/routes/identity.rs:81-99).
-  GET /home    -> FLAT body {ok, state, name, group_id, primary_agent{...},
+  `ApiResponse` (server/routes/status.rs:18-24) declares
+  `#[serde(flatten)] data`, so EVERY ApiResponse route serializes FLAT — there
+  is no nested `data` object on the wire.
+  GET /health  -> FLAT {ok, status, version, ...}; auth-EXEMPT
+                  (server/auth.rs:270). Only the STATUS CODE is used here.
+  GET /agent   -> FLAT {ok, agent_id, machine_id, user_id,
+                  kem_public_key_b64, ...} (handler identity.rs:81-99,
+                  `AgentData` identity.rs:1301-1317: plain derive, no rename;
+                  the optional name fields only use skip_serializing_if).
+  GET /home    -> `serde_json::json!` LITERAL, so no serde attribute can
+                  reshape it: {ok, state, name, group_id, primary_agent{...},
                   members[...], duplicates[...], warnings{...}}
                   (server/routes/home.rs).
-  GET /groups  -> FLAT body {ok, groups:[{group_id,...}]}, and it EXCLUDES
+  GET /groups  -> `serde_json::json!` LITERAL too: {ok, groups:[{group_id,...}]},
+                  and it EXCLUDES
                   withdrawn tombstones (named_groups.rs:11370-11372).
   <data_dir>/api.port  -> a SOCKET ADDRESS, not a port (server/mod.rs:1034);
                   the product itself re-reads it as `trim().parse::<SocketAddr>()`
@@ -266,19 +272,20 @@ def observe(host, port, token, call=api_call):
     memory against the Home projection (review P2); only booleans and salted
     digests are retained. `call` is injectable so the decode path has pure
     controls against the real response shapes (review r2 P1)."""
-    # GET /agent returns the ApiResponse ENVELOPE: {ok, data:{agent_id,...}}
-    # (src/server/routes/identity.rs:81-99), NOT a top-level agent_id.
+    # GET /agent is FLAT: `ApiResponse` carries `#[serde(flatten)] data`
+    # (src/server/routes/status.rs:18-24), so the wire body is
+    # {ok, agent_id, machine_id, ...} with NO nested `data` object. An earlier
+    # revision required a nested object; that was wrong and would have failed
+    # every real run. Read the top level only — a nested-only body must FAIL,
+    # never be accepted by a fallback.
     agent_status, agent_body = call(host, port, token, "/agent")
     if agent_status != 200 or not isinstance(agent_body, dict):
         raise PhaseError("observe", f"/agent status {agent_status}")
     if agent_body.get("ok") is not True:
         raise PhaseError("observe", "/agent ok is not true")
-    agent_data = agent_body.get("data")
-    if not isinstance(agent_data, dict):
-        raise PhaseError("observe", "/agent envelope has no data object")
-    local_agent = agent_data.get("agent_id")
+    local_agent = agent_body.get("agent_id")
     if not isinstance(local_agent, str) or not local_agent:
-        raise PhaseError("observe", "/agent data has no agent_id")
+        raise PhaseError("observe", "/agent has no top-level agent_id")
 
     # GET /home is a FLAT body (routes/home.rs), not the envelope.
     home_status, home = call(host, port, token, "/home")
@@ -508,10 +515,9 @@ def self_test():
         cases.append((f"schema:{name}", expect, duplicates_projection(raw)["decoded"]))
 
     # --- observe() decode controls against the REAL response shapes ---
-    AGENT_OK = {"ok": True, "data": {"agent_id": "aa", "machine_id": "mm",
-                                     "user_id": "uu", "kem_public_key_b64": "k",
-                                     "human_name": None, "display_name": None,
-                                     "machine_name": None}}
+    # Real wire shape: ApiResponse flattens, so these are TOP-LEVEL keys.
+    AGENT_OK = {"ok": True, "agent_id": "aa", "machine_id": "mm",
+                "user_id": "uu", "kem_public_key_b64": "k"}
     HOME_OK = {"ok": True, "state": "local", "name": "Home", "group_id": "g1",
                "owner_user_id": "uu",
                "primary_agent": {"agent_id": "aa", "self_name": None,
@@ -543,11 +549,15 @@ def self_test():
     base = {"/agent": (200, AGENT_OK), "/home": (200, HOME_OK),
             "/groups": (200, GROUPS_OK)}
     observe_case("real_shapes_decode", base, True)
-    # THE r2 P1 regression: a top-level agent_id read would have failed here.
-    observe_case("agent_envelope_required", {**base,
-        "/agent": (200, {"ok": True, "agent_id": "aa"})}, False, "observe")
+    # The real flat contract must PASS (covered by real_shapes_decode above),
+    # and the FAKE nested-envelope contract must FAIL — no fallback accepts
+    # both. This is the regression for the incorrect r2 instruction.
+    observe_case("agent_nested_data_rejected", {**base,
+        "/agent": (200, {"ok": True, "data": {"agent_id": "aa"}})}, False, "observe")
+    observe_case("agent_missing_agent_id", {**base,
+        "/agent": (200, {"ok": True, "machine_id": "mm"})}, False, "observe")
     observe_case("agent_ok_false", {**base,
-        "/agent": (200, {"ok": False, "data": {"agent_id": "aa"}})}, False, "observe")
+        "/agent": (200, {"ok": False, "agent_id": "aa"})}, False, "observe")
     observe_case("agent_non_200", {**base, "/agent": (503, None)}, False, "observe")
     observe_case("agent_unreachable", {**base, "/agent": (None, None)}, False, "observe")
     observe_case("home_ok_false", {**base,
