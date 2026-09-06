@@ -120,6 +120,7 @@ struct BootstrapObservations {
     phase: &'static str,
     reconnect_outcome: &'static str,
     polls: u64,
+    cards_before_import: VecDeque<Value>,
     last_projection: Value,
     before_restart: Value,
     after_restart: Value,
@@ -244,6 +245,7 @@ impl Drop for BootstrapFailureDiagnostics {
                 "phase": observations.phase,
                 "polls": observations.polls,
                 "reconnect_outcome": observations.reconnect_outcome,
+                "cards_before_import": observations.cards_before_import,
                 "last_projection": observations.last_projection,
                 "before_restart": observations.before_restart,
                 "after_restart": observations.after_restart,
@@ -408,10 +410,46 @@ where
 
 /// Import `other`'s current card into `into` at full trust. Re-importing after
 /// a restart is what refreshes the peer's ephemeral address.
-async fn import_card(into: &Daemon, other: &Daemon, label: &str) {
+async fn import_card(into: &Daemon, other: &Daemon, label: &'static str) {
+    import_card_observed(into, other, label, None).await;
+}
+
+fn card_address_counts(card: &Value) -> Value {
+    let entries = card["card"]["addresses"].as_array();
+    let addresses: Vec<SocketAddr> = entries
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.as_str()?.parse().ok())
+        .collect();
+    json!({
+        "addresses_array": entries.is_some(),
+        "total": entries.map_or(0, Vec::len),
+        "parseable": addresses.len(),
+        "usable_loopback": addresses.iter().filter(|a| a.ip().is_loopback() && a.port() != 0).count(),
+        "zero_port": addresses.iter().filter(|a| a.port() == 0).count(),
+        "unspecified": addresses.iter().filter(|a| a.ip().is_unspecified()).count(),
+    })
+}
+
+async fn import_card_observed(
+    into: &Daemon,
+    other: &Daemon,
+    label: &'static str,
+    observations: Option<&Mutex<BootstrapObservations>>,
+) {
     let card = other
         .get_json("/agent/card?include_local_addresses=true")
         .await;
+    if let Some(observations) = observations {
+        let mut observations = observations.lock().unwrap();
+        if observations.cards_before_import.len() == 4 {
+            observations.cards_before_import.pop_front();
+        }
+        let phase = observations.phase;
+        observations.cards_before_import.push_back(json!({
+            "phase": phase, "direction": label, "addresses": card_address_counts(&card),
+        }));
+    }
     let link = card["link"].as_str().expect("card link").to_string();
     let imported = into
         .post_json(
@@ -592,8 +630,20 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
         .as_str()
         .expect("alice agent_id")
         .to_string();
-    import_card(&alice, &bob, "alice import of bob").await;
-    import_card(&bob, &alice, "bob import of alice").await;
+    import_card_observed(
+        &alice,
+        &bob,
+        "alice import of bob",
+        Some(observations.as_ref()),
+    )
+    .await;
+    import_card_observed(
+        &bob,
+        &alice,
+        "bob import of alice",
+        Some(observations.as_ref()),
+    )
+    .await;
 
     let group_name = format!("f2-outbox-{}", rand::random::<u32>());
     let created = bob
@@ -656,8 +706,20 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
     // Bring the recipient back. Its ephemeral port changed, so the authority
     // needs the refreshed card before it can reach it again.
     let alice = start_daemon(&alice_dir).await;
-    import_card(&bob, &alice, "bob re-import of restarted alice").await;
-    import_card(&alice, &bob, "alice re-import of restarted bob").await;
+    import_card_observed(
+        &bob,
+        &alice,
+        "bob re-import of restarted alice",
+        Some(observations.as_ref()),
+    )
+    .await;
+    import_card_observed(
+        &alice,
+        &bob,
+        "alice re-import of restarted bob",
+        Some(observations.as_ref()),
+    )
+    .await;
     let connected = bob
         .post_json(
             "/agents/connect",
@@ -814,4 +876,25 @@ fn bootstrap_diagnostic_categories_and_outcomes_reject_unknown_details() {
     assert!(!serde_json::to_string(&observations.events)
         .unwrap()
         .contains("DO_NOT_EMIT_FIXTURE_SECRET"));
+}
+
+#[test]
+fn bootstrap_diagnostic_card_counts_omit_addresses_and_identity() {
+    let secret = "DO_NOT_EMIT_FIXTURE_SECRET";
+    let counts = card_address_counts(&json!({"link": secret, "card": {
+        "agent_id": secret, "addresses": ["127.0.0.1:5483", "[::1]:5483", "127.0.0.1:0", "0.0.0.0:5483", "8.8.8.8:5483", secret, 12]
+    }}));
+    assert_eq!(
+        counts,
+        json!({"addresses_array": true, "total": 7, "parseable": 5, "usable_loopback": 2, "zero_port": 1, "unspecified": 1})
+    );
+    assert!(!counts.to_string().contains(secret));
+    assert!(!counts.to_string().contains("127.0.0.1"));
+    let empty = card_address_counts(&json!({"card": {"addresses": []}}));
+    assert_eq!(empty["total"], 0);
+    assert_eq!(empty["addresses_array"], true);
+    let malformed = card_address_counts(&json!({"card": {"addresses": secret}}));
+    assert_eq!(malformed["addresses_array"], false);
+    assert_eq!(malformed["total"], 0);
+    assert!(!malformed.to_string().contains(secret));
 }
