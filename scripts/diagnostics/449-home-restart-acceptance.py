@@ -233,6 +233,11 @@ def observe(port, token, call=api_call):
             "unretired_duplicate_home"),
         "group_total": len(group_ids),
         "group_id_digests": sorted(digest(g) for g in group_ids),
+        # r3 P2: the Home must belong to the live inventory THIS observation
+        # saw. Without it, a stale or detached Home payload alongside an
+        # unchanged unrelated inventory satisfies every restart predicate.
+        "home_group_in_inventory": digest(home.get("group_id")) in {
+            digest(g) for g in group_ids},
     }
 
 
@@ -282,6 +287,8 @@ def evaluate(before, after, control):
             obs["duplicates"].get("any_safe_to_retire_field") is False)
         checks[f"{name}_retirement_manual_only"] = (
             obs["duplicates"].get("retirement_values") in ([], ["manual_only"]))
+        checks[f"{name}_home_group_in_inventory"] = (
+            obs["home_group_in_inventory"] is True)
 
     # THE restart predicate.
     checks["same_home_across_process_restart"] = (
@@ -314,7 +321,7 @@ def _obs(**over):
         "duplicates": {"decoded": True, "count": 0, "is_empty": True,
                        "retirement_values": [], "any_safe_to_retire_field": False},
         "unretired_duplicate_home": False, "group_total": 1,
-        "group_id_digests": ["aaaa"],
+        "group_id_digests": ["aaaa"], "home_group_in_inventory": True,
     }
     base.update(over)
     return base
@@ -369,7 +376,11 @@ def self_test():
          _phase(good_a, 1), _phase(_obs(group_total=0, group_id_digests=[]), 2),
          _phase(contrast, 3))
     case("group_replaced_across_restart", False,  # same count, different set
-         _phase(good_a, 1), _phase(_obs(group_id_digests=["zzzz"]), 2),
+         _phase(good_a, 1), _phase(_obs(group_id_digests=["zzzz"],
+                                        home_group_in_inventory=False), 2),
+         _phase(contrast, 3))
+    case("home_detached_from_inventory", False,  # r3 P2 regression
+         _phase(good_a, 1), _phase(_obs(home_group_in_inventory=False), 2),
          _phase(contrast, 3))
     case("state_not_local", False,
          _phase(good_a, 1), _phase(_obs(state="elsewhere"), 2), _phase(contrast, 3))
@@ -453,8 +464,16 @@ def self_test():
     observe_case("groups_entry_without_id", {**base,
         "/groups": (200, {"ok": True, "groups": [{"name": "x"}]})}, False, "observe")
 
+    detached = observe(1, "t", call=fake({**base, "/groups": (200, {"ok": True,
+        "groups": [{"group_id": "other", "name": "x", "description": "",
+                    "creator": "aa", "created_at": 1, "member_count": 1}]})}))
+    cases.append(("observe:home_detached_from_inventory_detected",
+                  True, detached["home_group_in_inventory"] is False))
+
     # Positive decode must actually compute the identity comparisons.
     decoded = observe(1, "t", call=fake(base))
+    cases.append(("observe:home_group_in_inventory_true",
+                  True, decoded["home_group_in_inventory"] is True))
     cases.append(("observe:primary_is_local_agent_true",
                   True, decoded["primary_is_local_agent"] is True))
     cases.append(("observe:local_agent_is_member_true",
