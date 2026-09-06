@@ -101,6 +101,199 @@ pub(in crate::server) enum HomeResolution {
 /// The canonical Home is the Tier-1 `("home")` register winner. Absence of a
 /// register value means "no owner device has advertised one yet" — NOT "none
 /// exists" — so an un-synced device with its own Home still reports `Local`.
+/// Home-shaped groups this device is seated in that are NOT the canonical
+/// Home — the duplicates a pre-#449 fork left behind (P4).
+pub(in crate::server) async fn home_duplicates(
+    state: &Arc<AppState>,
+    canonical: &str,
+    owner: &crate::identity::UserId,
+) -> Vec<String> {
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+    let groups = state.named_groups.read().await;
+    let mut ids: Vec<String> = groups
+        .iter()
+        .filter(|(id, info)| {
+            id.as_str() != canonical
+                && info.stable_group_id() != canonical
+                && !info.withdrawn
+                && info.home.is_some()
+                && is_home_policy(&info.policy, owner)
+                && info.has_active_member(&local_hex)
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    ids.sort();
+    ids
+}
+
+/// Why a duplicate Home may NOT be retired automatically (#449 P4).
+///
+/// Empty ⇒ safe to retire. Withdrawal is terminal and cleans only crypto
+/// material: durable history, the group delegations that live ONLY in history,
+/// group-scoped task lists and rider grants all key off the group id and would
+/// be silently orphaned. So the rule is **join first, retire second, and only
+/// when there is provably nothing to lose** — anything else is surfaced to the
+/// owner instead of deleted.
+///
+/// Fails CLOSED: a probe that cannot prove emptiness (unreadable history) is
+/// itself a blocker.
+pub(in crate::server) async fn home_retire_blockers(
+    state: &Arc<AppState>,
+    group_id: &str,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return vec!["un-owned install".to_string()];
+    };
+    let owner = user_kp.user_id();
+    let local_hex = hex::encode(state.agent.agent_id().as_bytes());
+
+    let (stable_id, active_members, join_requests, issued_invites) = {
+        let groups = state.named_groups.read().await;
+        let Some(info) = groups.get(group_id) else {
+            return vec!["group not found".to_string()];
+        };
+        if info.withdrawn {
+            return vec!["already withdrawn".to_string()];
+        }
+        if !is_home_policy(&info.policy, &owner) {
+            return vec!["not a Home for this owner".to_string()];
+        }
+        (
+            info.stable_group_id().to_string(),
+            info.active_members()
+                .map(|m| m.agent_id.clone())
+                .collect::<Vec<_>>(),
+            info.join_requests.len(),
+            info.issued_invites.len(),
+        )
+    };
+
+    // Sole membership: another seated agent would lose its space.
+    if active_members.len() != 1 || active_members.first() != Some(&local_hex) {
+        blockers.push(format!(
+            "not the sole member ({} active)",
+            active_members.len()
+        ));
+    }
+    if join_requests > 0 {
+        blockers.push(format!("{join_requests} pending join request(s)"));
+    }
+    if issued_invites > 0 {
+        blockers.push(format!("{issued_invites} outstanding invite(s)"));
+    }
+
+    // Durable history — and therefore group delegations, which live only there.
+    if let Some(history) = state.agent.history() {
+        let store = Arc::clone(history.store());
+        let query = crate::history::HistoryQuery {
+            scope: Some(crate::history::Scope::Group(stable_id.clone())),
+            limit: 1,
+            ..Default::default()
+        };
+        match tokio::task::spawn_blocking(move || store.query(&query)).await {
+            Ok(Ok(rows)) if !rows.is_empty() => {
+                blockers.push("has durable history (and possibly delegations)".to_string());
+            }
+            Ok(Ok(_)) => {}
+            Ok(Err(e)) => blockers.push(format!("history unreadable: {e}")),
+            Err(e) => blockers.push(format!("history probe failed: {e}")),
+        }
+    }
+
+    // Group-scoped CRDT task lists are namespaced by convention, not keyed,
+    // so nothing would clean them up.
+    let prefixes = [
+        format!("x0x.group.{group_id}."),
+        format!("x0x.group.{stable_id}."),
+    ];
+    if state
+        .crdt_subscriptions
+        .read()
+        .await
+        .entries
+        .iter()
+        .any(|entry| prefixes.iter().any(|p| entry.id.starts_with(p.as_str())))
+    {
+        blockers.push("has group-scoped task lists".to_string());
+    }
+
+    if state
+        .rider_tokens
+        .lock()
+        .await
+        .grants_any_group(&[group_id, stable_id.as_str()])
+    {
+        blockers.push("a rider token grants this group".to_string());
+    }
+
+    blockers
+}
+
+/// Retire duplicate Homes this device no longer needs (#449 P4).
+///
+/// Runs only once this device is seated in the canonical Home, so the order is
+/// always **join-then-retire, never the reverse** — retiring first would leave
+/// the device with no Home at all, and withdrawal is terminal. A duplicate
+/// with anything to lose is left alone and reported by `GET /home`; nothing is
+/// ever deleted merely to tidy up.
+pub(in crate::server) async fn reconcile_home_duplicates(state: &Arc<AppState>) {
+    let Some(user_kp) = state.agent.identity().user_keypair() else {
+        return;
+    };
+    let owner = user_kp.user_id();
+    let HomeResolution::Local {
+        group_id: canonical,
+        ..
+    } = resolve_home(state).await
+    else {
+        return;
+    };
+    for duplicate in home_duplicates(state, &canonical, &owner).await {
+        let blockers = home_retire_blockers(state, &duplicate).await;
+        if !blockers.is_empty() {
+            tracing::info!(
+                group_id = %duplicate,
+                blockers = ?blockers,
+                "duplicate Home kept — not provably empty; surfaced for the owner (#449)"
+            );
+            continue;
+        }
+        match retire_home_group(state, &duplicate).await {
+            Ok(()) => tracing::info!(
+                group_id = %duplicate,
+                canonical = %canonical,
+                "retired an empty duplicate Home (#449)"
+            ),
+            Err(e) => tracing::warn!(
+                group_id = %duplicate,
+                "duplicate Home retirement failed, retrying later: {e}"
+            ),
+        }
+    }
+}
+
+/// Withdraw `group_id` through the audited terminal path (#449 P4).
+///
+/// Reuses `leave_group` rather than reaching for internals: it enforces the
+/// sole-member disposition, seals the terminal commit, prunes TreeKEM and
+/// publishes the signed `GroupDeleted` to members. With #506 fixed, a Hidden
+/// group's withdrawal no longer emits a public discovery card.
+async fn retire_home_group(state: &Arc<AppState>, group_id: &str) -> Result<(), String> {
+    let response = super::named_groups::leave_group(
+        State(Arc::clone(state)),
+        axum::extract::Extension(crate::server::rider_auth::ActorContext::Owner { durable: true }),
+        Path(group_id.to_string()),
+    )
+    .await
+    .into_response();
+    if response.status().is_success() {
+        Ok(())
+    } else {
+        Err(format!("leave_group returned {}", response.status()))
+    }
+}
+
 /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
 ///
 /// Proof means: the group is in our own roster and carries the terminal
@@ -884,6 +1077,18 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
         }));
     }
     let human_name = state.profile.read().await.human_name.clone();
+    // #449 P4: leftover duplicate Homes, each with the reason it survived, so
+    // "why is this still here" is answerable without reading the logs. Home
+    // itself works — this is the owner's cleanup list, not an error state.
+    let mut duplicates = Vec::new();
+    for id in home_duplicates(&state, &group_id, &owner).await {
+        let blockers = home_retire_blockers(&state, &id).await;
+        duplicates.push(serde_json::json!({
+            "group_id": id,
+            "safe_to_retire": blockers.is_empty(),
+            "blockers": blockers,
+        }));
+    }
     let primary_self_name = self_name_for(state.as_ref(), &home.primary_agent).await;
     (
         StatusCode::OK,
@@ -912,9 +1117,11 @@ pub(in crate::server) async fn get_home(State(state): State<Arc<AppState>>) -> i
                 "verified": primary_ok,
             },
             "members": members,
+            "duplicates": duplicates,
             "warnings": {
                 "no_roaming_agent": home_roaming_warning_for(&info).is_some(),
                 "primary_agent_unverified": !primary_ok,
+                "unretired_duplicate_home": !duplicates.is_empty(),
             },
         })),
     )
@@ -1168,6 +1375,235 @@ pub(in crate::server::routes) mod tests {
 
     /// Publish `group_id` as the owner's canonical Home on the Tier-1
     /// register, as a peer device would (#449).
+    /// WHY (#449, ADR-0060 validation gap): the retired-pointer lifecycle
+    /// across a REAL restart — state dropped and rebuilt from the same data
+    /// dir, so both the named-group roster and the owner-sync record store
+    /// are reloaded from disk.
+    ///
+    /// ADR-0060 recorded this as unvalidated: the earlier test re-provisioned
+    /// in-process, so the on-disk reload path held only by construction. The
+    /// hazard is specific — tombstone retention never clears owner-sync
+    /// state, so a persisted pointer to a Home that was retired before
+    /// shutdown could come back after restart and suppress every replacement
+    /// permanently, which is the worst version of this bug: an owner left
+    /// with no Home and no way to obtain one.
+    #[tokio::test]
+    async fn a_retired_pointer_does_not_survive_restart_to_suppress_replacement(
+    ) -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let retired_id = {
+            let state = owned_state(dir.path(), [0x6D; 32]).await?;
+            provision_home(&state).await;
+            let owner = owner_of(&state);
+            let (home_id, _) = find_home(&state, &owner).await.expect("Home provisioned");
+
+            // Advertise it, then retire it through the real terminal path.
+            advertise_canonical_home(&state, &home_id).await;
+            retire_home_group(&state, &home_id)
+                .await
+                .map_err(|e| anyhow::anyhow!("retire: {e}"))?;
+            assert!(
+                find_home(&state, &owner).await.is_none(),
+                "precondition: the retired Home no longer resolves"
+            );
+            drop(state);
+            home_id
+        };
+
+        // Real restart: same data dir, everything reloaded from disk.
+        let state = owned_state(dir.path(), [0x6D; 32]).await?;
+        let owner = owner_of(&state);
+        assert_eq!(
+            state
+                .owner_sync
+                .as_ref()
+                .expect("sync")
+                .canonical_home()
+                .await
+                .map(|home| home.group_id)
+                .as_deref(),
+            Some(retired_id.as_str()),
+            "precondition: the stored pointer to the retired Home survived restart"
+        );
+        assert!(
+            effective_canonical_home(&state).await.is_none(),
+            "a reloaded pointer to a locally-proven retired Home must not govern"
+        );
+
+        provision_home(&state).await;
+
+        let (replacement, info) = find_home(&state, &owner)
+            .await
+            .expect("a usable replacement Home must be provisioned after restart");
+        assert_ne!(replacement, retired_id, "the replacement is a NEW Home");
+        assert!(!info.withdrawn);
+        Ok(())
+    }
+
+    /// Create a REAL second Home-shaped group and stamp it, mimicking the
+    /// duplicate a pre-#449 device would have provisioned.
+    async fn provision_duplicate_home(state: &Arc<AppState>) -> anyhow::Result<String> {
+        let owner = owner_of(state);
+        let response = super::super::named_groups::create_named_group(
+            State(Arc::clone(state)),
+            Json(super::super::named_groups::CreateGroupRequest {
+                name: "Home".to_string(),
+                description: "duplicate".to_string(),
+                display_name: None,
+                preset: None,
+                policy: Some(home_policy(&owner)),
+            }),
+        )
+        .await
+        .into_response();
+        anyhow::ensure!(response.status().is_success(), "create duplicate Home");
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20).await?;
+        let id = serde_json::from_slice::<serde_json::Value>(&body)?["group_id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| anyhow::anyhow!("no group_id"))?;
+        stamp_and_seal_home(state, &id).await;
+        Ok(id)
+    }
+
+    /// WHY (#449 P4): the ordering rule — **join first, retire second.**
+    ///
+    /// Retiring a duplicate before this device is seated in the canonical
+    /// Home would leave it with no Home at all, and withdrawal is terminal.
+    /// A device that has not adopted must retire NOTHING, however empty its
+    /// duplicate looks.
+    #[tokio::test]
+    async fn nothing_is_retired_before_adoption_completes() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x6A; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (local_home, _) = find_home(&state, &owner).await.expect("local Home");
+
+        // The canonical Home lives on a device we have not joined.
+        advertise_canonical_home(&state, &"7f".repeat(16)).await;
+        assert!(
+            matches!(
+                resolve_home(&state).await,
+                HomeResolution::AdoptionPending { .. }
+            ),
+            "precondition: adoption has not completed"
+        );
+
+        reconcile_home_duplicates(&state).await;
+
+        let groups = state.named_groups.read().await;
+        assert!(
+            !groups
+                .get(&local_home)
+                .expect("local Home still present")
+                .withdrawn,
+            "a device that has not adopted must keep its Home — retiring leaves none"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449 P4): once this device IS seated in the canonical Home, an
+    /// empty leftover is cleaned up rather than left as permanent clutter.
+    #[tokio::test]
+    async fn empty_duplicate_is_retired_once_seated_in_canonical() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x6B; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
+        let duplicate = provision_duplicate_home(&state).await?;
+        advertise_canonical_home(&state, &canonical).await;
+        assert_eq!(
+            home_retire_blockers(&state, &duplicate).await,
+            Vec::<String>::new(),
+            "precondition: a freshly created, untouched duplicate is provably empty"
+        );
+
+        reconcile_home_duplicates(&state).await;
+
+        let groups = state.named_groups.read().await;
+        assert!(
+            groups.get(&duplicate).is_none_or(|info| info.withdrawn),
+            "an empty duplicate must be retired once seated in the canonical Home"
+        );
+        assert!(
+            groups.get(&canonical).is_some_and(|info| !info.withdrawn),
+            "the canonical Home must survive"
+        );
+        Ok(())
+    }
+
+    /// WHY (#449 P4): withdrawal cleans only crypto material — durable
+    /// history, and the group delegations that live ONLY in history, are
+    /// orphaned. A duplicate carrying history is therefore never retired
+    /// automatically; it is surfaced for the owner instead.
+    #[tokio::test]
+    async fn duplicate_with_history_is_kept_and_reported() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state(dir.path(), [0x6C; 32]).await?;
+        provision_home(&state).await;
+        let owner = owner_of(&state);
+        let (canonical, _) = find_home(&state, &owner).await.expect("canonical Home");
+        let duplicate = provision_duplicate_home(&state).await?;
+        advertise_canonical_home(&state, &canonical).await;
+
+        let stable = state
+            .named_groups
+            .read()
+            .await
+            .get(&duplicate)
+            .expect("duplicate")
+            .stable_group_id()
+            .to_string();
+        let Some(history) = state.agent.history() else {
+            return Ok(()); // history disabled in this build: blocker unreachable
+        };
+        // Insert through the store directly so the row is durable BEFORE the
+        // probe runs — the async writer would race the assertion.
+        let payload = b"a message the owner would lose".to_vec();
+        let record = crate::history::HistoryRecord {
+            msg_id: crate::history::HistoryRecord::compute_msg_id(None, &payload),
+            scope: crate::history::Scope::Group(stable),
+            author_agent: None,
+            author_machine: None,
+            author_pubkey: None,
+            sent_at_ms: 1,
+            seen_at_ms: 1,
+            direction: crate::history::Direction::Inbound,
+            content_type: "text/plain".to_string(),
+            payload,
+            signed_artifact: None,
+            signature: None,
+            sig_context: None,
+            provenance: crate::history::Provenance::LocalAppDecrypt,
+            replace_key: None,
+            thread_root: None,
+            thread_parent: None,
+            ingress_sender_agent: None,
+            logical_request_id: None,
+        };
+        history.store().insert(&record)?;
+
+        let blockers = home_retire_blockers(&state, &duplicate).await;
+        assert!(
+            blockers.iter().any(|b| b.contains("history")),
+            "history must block automatic retirement, got {blockers:?}"
+        );
+
+        reconcile_home_duplicates(&state).await;
+        assert!(
+            state
+                .named_groups
+                .read()
+                .await
+                .get(&duplicate)
+                .is_some_and(|info| !info.withdrawn),
+            "a duplicate with history must be kept, never silently deleted"
+        );
+        Ok(())
+    }
+
     async fn advertise_canonical_home(state: &Arc<AppState>, group_id: &str) {
         let sync = state.owner_sync.as_ref().expect("owned state wires sync");
         let owner_kp = state
