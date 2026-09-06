@@ -588,6 +588,23 @@ pub async fn messages(
 // ── State-commit chain (Phase D.3) ──────────────────────────────────────
 
 /// `x0x group state` — GET /groups/:id/state.
+/// `x0x group store create` — POST /groups/:id/stores (#341).
+///
+/// Opens (creates or re-opens) a group-scoped ENCRYPTED store bound to the
+/// named secure group. The daemon gates on active membership and the group
+/// being MlsEncrypted on the GSS plane; the store identity is deterministic
+/// from (stable group id, name), so every member converges on the same
+/// store.
+pub async fn group_store_create(client: &DaemonClient, group_id: &str, name: &str) -> Result<()> {
+    client.ensure_running().await?;
+    let body = serde_json::json!({ "name": name });
+    let resp = client
+        .post(&format!("/groups/{group_id}/stores"), &body)
+        .await?;
+    print_value(client.format(), &resp);
+    Ok(())
+}
+
 pub async fn state(client: &DaemonClient, group_id: &str) -> Result<()> {
     client.run_get(&format!("/groups/{group_id}/state")).await
 }

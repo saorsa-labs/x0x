@@ -1546,47 +1546,76 @@ async fn drive_joiner_welcome_install(
 /// (`spawn_blob_responder`), and announce traffic never matches a probe
 /// nonce.
 async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()> {
+    let topic = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
+    let mut owner_sub = owner.subscribe(topic).await?;
+    let mut joiner_sub = joiner.subscribe(topic).await?;
+    await_restart_gossip_ready_with(
+        async |probe| Ok(owner.publish(topic, probe).await?),
+        async |probe| Ok(joiner.publish(topic, probe).await?),
+        async || {
+            owner_sub
+                .recv()
+                .await
+                .map(|message| message.payload.to_vec())
+        },
+        async || {
+            joiner_sub
+                .recv()
+                .await
+                .map(|message| message.payload.to_vec())
+        },
+    )
+    .await
+}
+
+// The real-agent wrapper and deterministic delayed-delivery regressions share
+// this entire readiness loop; the tests replace only publication/reception IO.
+async fn await_restart_gossip_ready_with(
+    mut owner_publish: impl AsyncFnMut(Vec<u8>) -> Result<()>,
+    mut joiner_publish: impl AsyncFnMut(Vec<u8>) -> Result<()>,
+    mut owner_receive: impl AsyncFnMut() -> Option<Vec<u8>>,
+    mut joiner_receive: impl AsyncFnMut() -> Option<Vec<u8>>,
+) -> Result<()> {
     use std::sync::atomic::{AtomicU64, Ordering};
     static PROBE_SEQ: AtomicU64 = AtomicU64::new(0);
     let base = PROBE_SEQ.fetch_add(1, Ordering::Relaxed);
 
-    let topic = crate::announce_blob::ANNOUNCE_BLOB_TOPIC;
-    let mut owner_sub = owner.subscribe(topic).await?;
-    let mut joiner_sub = joiner.subscribe(topic).await?;
-
-    // Probe rounds carry FRESH nonces (the epidemic layer dedupes by
-    // message identity); success requires BOTH directions to deliver the
-    // CURRENT round's remote probe. The 20 s watchdog is a diagnostic
-    // guard — a healthy mesh answers the first round.
+    // Fresh retries avoid epidemic dedupe, but delivery can take longer than
+    // one retry interval. Accept exact probes issued in THIS invocation in
+    // their expected direction and retain each observation across rounds.
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         let mut round = 0u64;
+        let mut owner_probes = std::collections::HashSet::new();
+        let mut joiner_probes = std::collections::HashSet::new();
+        let mut owner_got = false;
+        let mut joiner_got = false;
         loop {
             let owner_probe =
                 format!("hs-f2/restart-gossip-probe/{base}.{round}/owner").into_bytes();
             let joiner_probe =
                 format!("hs-f2/restart-gossip-probe/{base}.{round}/joiner").into_bytes();
-            owner.publish(topic, owner_probe.clone()).await?;
-            joiner.publish(topic, joiner_probe.clone()).await?;
-            let mut owner_got = false;
-            let mut joiner_got = false;
+            owner_probes.insert(owner_probe.clone());
+            joiner_probes.insert(joiner_probe.clone());
+            owner_publish(owner_probe).await?;
+            joiner_publish(joiner_probe).await?;
             let quiet = tokio::time::sleep(std::time::Duration::from_secs(1));
             tokio::pin!(quiet);
             while !(owner_got && joiner_got) {
                 tokio::select! {
                     _ = &mut quiet => break,
-                    message = owner_sub.recv() => {
+                    message = owner_receive() => {
                         let Some(message) = message else {
                             anyhow::bail!("owner gossip subscription closed");
                         };
-                        if message.payload.as_ref() == joiner_probe.as_slice() {
+                        if joiner_probes.contains(&message) {
                             owner_got = true;
                         }
                     }
-                    message = joiner_sub.recv() => {
+                    message = joiner_receive() => {
                         let Some(message) = message else {
                             anyhow::bail!("joiner gossip subscription closed");
                         };
-                        if message.payload.as_ref() == owner_probe.as_slice() {
+                        if owner_probes.contains(&message) {
                             joiner_got = true;
                         }
                     }
@@ -1606,6 +1635,91 @@ async fn await_restart_gossip_ready(owner: &Agent, joiner: &Agent) -> Result<()>
         )
     })??;
     Ok(())
+}
+
+async fn delayed_restart_probe(
+    tx: &tokio::sync::mpsc::Sender<Vec<u8>>,
+    delay_ms: Option<u64>,
+    mut probe: Vec<u8>,
+    wrong_nonce: bool,
+) -> Result<()> {
+    if let Some(delay_ms) = delay_ms {
+        let tx = tx.clone();
+        if wrong_nonce {
+            probe.push(b'!');
+        }
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let _ = tx.send(probe).await;
+        });
+    }
+    Ok(())
+}
+
+async fn restart_gossip_probe_fixture(
+    owner_delay_ms: Option<u64>,
+    joiner_delay_ms: Option<u64>,
+    wrong_nonce: bool,
+) -> (Result<()>, usize, usize) {
+    let (to_owner, mut owner_rx) = tokio::sync::mpsc::channel(100);
+    let (to_joiner, mut joiner_rx) = tokio::sync::mpsc::channel(100);
+    let mut owner_received = 0;
+    let mut joiner_received = 0;
+    let result = await_restart_gossip_ready_with(
+        async |probe| delayed_restart_probe(&to_joiner, owner_delay_ms, probe, wrong_nonce).await,
+        async |probe| delayed_restart_probe(&to_owner, joiner_delay_ms, probe, false).await,
+        async || {
+            let message = owner_rx.recv().await;
+            owner_received += usize::from(message.is_some());
+            message
+        },
+        async || {
+            let message = joiner_rx.recv().await;
+            joiner_received += usize::from(message.is_some());
+            message
+        },
+    )
+    .await;
+    (result, owner_received, joiner_received)
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_gossip_ready_accepts_delayed_out_of_phase_probes() {
+    // Both directions work, but their first deliveries cross different retry
+    // boundaries. The old current-round-only oracle timed out after 20 s.
+    let started = tokio::time::Instant::now();
+    let (result, owner_received, joiner_received) =
+        restart_gossip_probe_fixture(Some(1200), Some(2200), false).await;
+    assert!(result.is_ok(), "delayed bidirectional delivery: {result:?}");
+    assert!(owner_received > 0 && joiner_received > 0);
+    assert!(started.elapsed() < std::time::Duration::from_secs(20));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_gossip_ready_rejects_missing_return_direction() {
+    let started = tokio::time::Instant::now();
+    let (result, owner_received, joiner_received) =
+        restart_gossip_probe_fixture(Some(200), None, false).await;
+    assert!(
+        result.is_err(),
+        "one-way delivery must never satisfy readiness"
+    );
+    assert_eq!(owner_received, 0);
+    assert!(joiner_received > 0);
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
+}
+
+#[tokio::test(start_paused = true)]
+async fn restart_gossip_ready_rejects_unissued_nonce() {
+    let started = tokio::time::Instant::now();
+    let (result, owner_received, joiner_received) =
+        restart_gossip_probe_fixture(Some(200), Some(200), true).await;
+    assert!(
+        result.is_err(),
+        "unissued probe must never satisfy readiness"
+    );
+    assert!(owner_received > 0 && joiner_received > 0);
+    assert_eq!(started.elapsed(), std::time::Duration::from_secs(20));
 }
 
 /// #457/#447/#458 review r2 item 5 — the REAL end-to-end walkthrough on the

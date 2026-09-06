@@ -81,11 +81,12 @@ jobs:
   #    wall-clock limit on every PR, despite all tests passing. It is now
   #    four jobs: three run in parallel on every PR (core + groups + net),
   #    and the de-flaked timing suites run only on the weekly schedule
-  #    (mirroring the soak job's gating). Budgets assume a COLD rust-cache
-  #    — new job names get fresh cache keys, so the first run pays the full
-  #    release build; each PR job is capped at timeout-minutes: 20 and kept
-  #    light enough to clear it with headroom. No suite is dropped —
-  #    coverage is redistributed, not removed.
+  #    (mirroring the soak job's gating). Each PR job retains its 20-min
+  #    ceiling and all existing suites. Their root integration targets include
+  #    tests/harness/src/{daemon,cluster}.rs, which prefer CARGO_BIN_EXE_x0xd:
+  #    Cargo supplies the debug/all-features binary for nextest. Separate
+  #    release prebuilds were unused and exhausted core's cold-cache budget
+  #    before D4 completed (issue #522). Release builds remain in build.yml.
   #    --build-jobs 2 is intentionally omitted here: each nextest call
   #    targets a single test binary, so there's no parallel-linking OOM
   #    risk (unlike the proptest job, which links 8 binaries in one call).
@@ -109,8 +110,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Build release binaries (shared across suites)
-        run: cargo build --release --bin x0xd --bin x0x
       - name: Run daemon API integration tests
         run: cargo nextest run --all-features --test daemon_api_integration -- --ignored
       - name: Run named group D4 signed commit integration tests
@@ -138,8 +137,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Build release binaries (shared across suites)
-        run: cargo build --release --bin x0xd --bin x0x
       - name: Run named group integration tests
         run: cargo nextest run --all-features --test named_group_integration --run-ignored ignored-only
 
@@ -162,8 +159,6 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@nextest
-      - name: Build release binaries (shared across suites)
-        run: cargo build --release --bin x0xd --bin x0x
       - name: Run GUI smoke tests
         run: cargo nextest run --all-features --test gui_smoke
       - name: Run WebSocket tests

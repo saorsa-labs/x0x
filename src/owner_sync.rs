@@ -1,6 +1,6 @@
 //! ADR-0041 Tier-1 cross-machine owner-state sync.
 //!
-//! Tier 1 replicates exactly five kinds of small owner-signed state between
+//! Tier 1 replicates exactly four kinds of small owner-signed state between
 //! the owner's machines over ADR-0022 byte streams ([`crate::streams`]):
 //! the owner profile, per-machine agent/machine names, the Home roster +
 //! policy pointer, and the sub-agent issuance journal. Tier 2 (history
@@ -60,9 +60,9 @@
 //!
 //! # Tier-3 boundary (gapcheck blocker 32 scope note)
 //!
-//! The sync surface serializes ONLY the five Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
+//! The sync surface serializes ONLY the four Tier-1 kinds: [`crate::owner_sync::SyncKind`] and
 //! [`crate::owner_sync::SyncValue`] are closed enums with no catch-all. A record whose kind tag
-//! is not one of the five fails to decode, and a record whose kind does not
+//! is not one of the four fails to decode, and a record whose kind does not
 //! match its value variant is rejected whole.
 
 use std::collections::BTreeMap;
@@ -166,24 +166,16 @@ pub enum SyncKind {
     HomePointer = 0x03,
     /// Sub-agent issuance journal — key = agent id hex.
     IssuanceJournal = 0x04,
-    /// Home join invite addressed to ONE of the owner's agents — key =
-    /// joiner agent id hex (#449). Minted by the device seated in the
-    /// canonical Home so a losing device can actually join it: a group id
-    /// alone cannot, because the join path needs the v4 invite's
-    /// `genesis_creation_nonce` / `base_state_revision` / `base_state_hash`.
-    HomeInvite = 0x05,
 }
 
 impl SyncKind {
-    /// All Tier-1 kinds. The LENGTH is load-bearing: Tier 3 states that no
-    /// other state can be emitted, so widening this array is an ADR-0041
-    /// amendment, never an implementation detail.
-    pub const ALL: [SyncKind; 5] = [
+    /// All Tier-1 kinds. Length 4 is a load-bearing constant: Tier 3 states
+    /// that no other state can be emitted.
+    pub const ALL: [SyncKind; 4] = [
         SyncKind::OwnerProfile,
         SyncKind::MachineNames,
         SyncKind::HomePointer,
         SyncKind::IssuanceJournal,
-        SyncKind::HomeInvite,
     ];
 
     /// Parse a kind tag. `None` for every unassigned byte.
@@ -194,7 +186,6 @@ impl SyncKind {
             0x02 => Some(Self::MachineNames),
             0x03 => Some(Self::HomePointer),
             0x04 => Some(Self::IssuanceJournal),
-            0x05 => Some(Self::HomeInvite),
             _ => None,
         }
     }
@@ -215,7 +206,7 @@ pub struct HomeRosterEntry {
     pub state: GroupMemberState,
 }
 
-/// The value of a Tier-1 record — a closed five-variant enum mirroring
+/// The value of a Tier-1 record — a closed four-variant enum mirroring
 /// [`SyncKind`] with NO catch-all. Compiling a new variant forces every
 /// exhaustive match (including [`SyncValue::kind`]) to handle it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -242,23 +233,6 @@ pub enum SyncValue {
         primary_agent: String,
         provisioned_at_ms: u64,
     },
-    /// A Home join invite addressed to ONE of the owner's agents (#449).
-    ///
-    /// Minted by the device seated in the canonical Home, keyed by the
-    /// joiner's agent id hex, so each joiner gets its own slot and two
-    /// pending adoptions never overwrite one another.
-    HomeInvite {
-        /// Stable group id of the canonical Home this admits to.
-        group_id: String,
-        /// Base64 postcard-encoded v4 `SignedInvite`.
-        invite_b64: String,
-        /// Hex agent id this invite is scoped to — a joiner MUST refuse an
-        /// invite addressed to a different agent rather than try to redeem it.
-        for_agent: String,
-        /// Unix ms after which the joiner must discard it and await a fresh
-        /// one, so a stale invite cannot be replayed indefinitely.
-        expires_at_ms: u64,
-    },
     /// One line of the sub-agent issuance journal (ADR-0039).
     IssuanceJournal {
         agent_id: String,
@@ -278,7 +252,6 @@ impl SyncValue {
             SyncValue::OwnerProfile { .. } => SyncKind::OwnerProfile,
             SyncValue::MachineNames { .. } => SyncKind::MachineNames,
             SyncValue::HomePointer { .. } => SyncKind::HomePointer,
-            SyncValue::HomeInvite { .. } => SyncKind::HomeInvite,
             SyncValue::IssuanceJournal { .. } => SyncKind::IssuanceJournal,
         }
     }
@@ -1926,6 +1899,7 @@ fn home_pointer_mint_decision(
     desired: &SyncValue,
     stored: Option<&SyncValue>,
     local_agent_hex: &str,
+    stored_is_retired: bool,
 ) -> bool {
     let SyncValue::HomePointer {
         group_id: desired_id,
@@ -1949,6 +1923,14 @@ fn home_pointer_mint_decision(
         return true; // defensively: a foreign kind is not a Home winner
     };
 
+    // r3 P2: the slot is held by a Home we can PROVE is retired. Take it —
+    // the ordering rule below would otherwise refuse, because a replacement
+    // Home is always newer than the dead one, leaving every device yielding
+    // to a tombstone forever.
+    if stored_is_retired && desired_id != stored_id {
+        return true;
+    }
+
     if desired_id == stored_id {
         // Single-writer refresh: only the Home's designated primary agent,
         // and only when the value actually changed. `mint` would no-op on an
@@ -1961,27 +1943,6 @@ fn home_pointer_mint_decision(
 
     // Strict improvement only — monotone, therefore terminating.
     (*desired_at, desired_id.as_str()) < (*stored_at, stored_id.as_str())
-}
-
-/// Whether a `HomeInvite` record may be redeemed by THIS agent (#449).
-///
-/// Two refusals, both security-relevant rather than cosmetic:
-///
-/// - **Misaddressed.** Invites are minted addressed (`intended_joiner`), and
-///   the authority compares that against `MemberJoined.member_agent_id`, so a
-///   foreign invite could not be redeemed anyway — but attempting it would
-///   burn the addressed agent's pending invite and stall ITS adoption.
-/// - **Expired.** A record persists on every enrolled device, so without a
-///   deadline a stale invite would stay redeemable indefinitely. `0` means no
-///   expiry, matching the invite layer's own convention.
-#[must_use]
-fn home_invite_is_actionable(
-    for_agent: &str,
-    expires_at_ms: u64,
-    local_agent_hex: &str,
-    now_ms: u64,
-) -> bool {
-    for_agent == local_agent_hex && (expires_at_ms == 0 || now_ms <= expires_at_ms)
 }
 
 /// The owner's canonical Home, as advertised on the Tier-1 register (#449).
@@ -2002,7 +1963,8 @@ pub struct CanonicalHome {
 /// A CONSTANT key, so `(HomePointer, "home")` is one LWW register per owner
 /// rather than one record per device. Every enrolled device writes the same
 /// slot, which is what makes it an election (see
-/// [`home_pointer_mint_decision`], #449).
+/// `home_pointer_mint_decision`, #449). Not an intra-doc link: that function
+/// is private, and a public item may not link to one.
 pub const HOME_POINTER_KEY: &str = "home";
 
 /// Concurrent sync sessions this daemon will run at once (inbound +
@@ -2024,20 +1986,14 @@ pub trait SyncDaemonView: Send + Sync + 'static {
         display_name: Option<String>,
         machine_name: Option<String>,
     );
-    /// Redeem a Home invite addressed to this agent (#449).
+    /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
     ///
-    /// The join path lives in the server subtree (invites, TreeKEM key
-    /// packages, Welcome pull), so the library layer hands it over here
-    /// exactly as it does for names. Implementations MUST be non-blocking
-    /// and idempotent: this fires on every sync pass until the join lands.
-    fn apply_home_invite(&self, group_id: &str, invite_b64: &str);
-    /// Issue Home invites for the owner's agents that are not seated in the
-    /// canonical Home (#449).
-    ///
-    /// Only meaningful on the device seated in that Home — it is the only
-    /// one that can seal `MemberAdded`. Like [`Self::apply_home_invite`],
-    /// implementations MUST be non-blocking and idempotent.
-    fn reconcile_home_invites(&self);
+    /// Proof is local: the group is in our roster and carries the terminal
+    /// `withdrawn` flag. Inability to see the group is NOT proof — a Home on
+    /// an unreachable device is unknown, and treating unknown as retired
+    /// would let a partitioned device mint over the owner's real Home.
+    /// Implementations MUST be non-blocking and answer `false` when unsure.
+    fn canonical_pointer_is_retired(&self, group_id: &str) -> bool;
 }
 
 /// Current daemon self-profile names, best-effort snapshot.
@@ -2378,12 +2334,6 @@ impl OwnerSyncService {
                 local_machine,
             )
             .await;
-            // #449: whoever is seated in the canonical Home issues the
-            // invites that let the owner's other devices join it. Fired
-            // every pass and idempotent — an invite already minted for a
-            // joiner is a no-op, and one whose joiner has since been seated
-            // is simply not re-minted.
-            view.reconcile_home_invites();
             if let Some(home_value) = view.home_pointer() {
                 if self.should_mint_home_pointer(&home_value).await {
                     self.mint_or_log(
@@ -2466,10 +2416,21 @@ impl OwnerSyncService {
             .store
             .stored_value(SyncKind::HomePointer, HOME_POINTER_KEY)
             .await;
+        // r3 P2: a stored pointer naming a Home we hold and know to be
+        // retired must not keep the slot. Without this the ordering rule
+        // would refuse every replacement, since a new Home is always NEWER
+        // than the dead one it replaces.
+        let stored_is_retired = match (&stored, self.view()) {
+            (Some(SyncValue::HomePointer { group_id, .. }), Some(view)) => {
+                view.canonical_pointer_is_retired(group_id)
+            }
+            _ => false,
+        };
         home_pointer_mint_decision(
             desired,
             stored.as_ref(),
             &hex::encode(self.agent.agent_id().as_bytes()),
+            stored_is_retired,
         )
     }
 
@@ -2514,25 +2475,6 @@ impl OwnerSyncService {
                 // Home resolution path rather than pushed here: provisioning,
                 // `GET /home` and adoption all need the CURRENT winner, not
                 // whatever happened to arrive last (#449).
-            }
-            SyncValue::HomeInvite {
-                group_id,
-                invite_b64,
-                for_agent,
-                expires_at_ms,
-            } => {
-                // #449: only the addressed agent may act on an invite, and
-                // only before it expires. Both are re-checked in the server
-                // layer, but refusing here keeps a misaddressed or stale
-                // invite from ever reaching the join path.
-                let local_hex = hex::encode(self.agent.agent_id().as_bytes());
-                if !home_invite_is_actionable(for_agent, *expires_at_ms, &local_hex, now_unix_ms())
-                {
-                    return;
-                }
-                if let Some(view) = self.view() {
-                    view.apply_home_invite(group_id, invite_b64);
-                }
             }
             SyncValue::IssuanceJournal {
                 agent_id,
@@ -3065,26 +3007,20 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tier3_surface_is_exactly_the_five_kinds() {
+    async fn tier3_surface_is_exactly_the_four_kinds() {
         // WHY: blocker 32 — the sync surface serializes ONLY Tier-1 kinds;
         // every other kind tag is undecodable (deny-by-default allowlist).
-        //
-        // This literal is a TRIPWIRE, not bookkeeping: widening the Tier-1
-        // surface must be a deliberate, reviewed act. It moved 4 → 5 for
-        // #449's `HomeInvite`, which requires an ADR-0041 amendment —
-        // a group id alone cannot admit a device, so the owner's canonical
-        // Home had to gain a way to hand out addressed join invites.
-        assert_eq!(SyncKind::ALL.len(), 5);
+        assert_eq!(SyncKind::ALL.len(), 4);
         for byte in 0u8..=255 {
             let decoded = SyncKind::from_u8(byte);
             let known = SyncKind::ALL.iter().any(|k| k.as_u8() == byte);
             assert_eq!(
                 decoded.is_some(),
                 known,
-                "kind tag 0x{byte:02x} must decode iff it is one of the five kinds"
+                "kind tag 0x{byte:02x} must decode iff it is one of the four kinds"
             );
         }
-        // Every one of the five kinds must round-trip through the wire
+        // Every one of the four kinds must round-trip through the wire
         // value enum — these are the only shapes a record can carry.
         let owner = owner_kp(1);
         for kind in SyncKind::ALL {
@@ -3106,17 +3042,11 @@ mod tests {
                     issued_at: 1,
                     not_after: None,
                 },
-                SyncKind::HomeInvite => SyncValue::HomeInvite {
-                    group_id: "g".into(),
-                    invite_b64: "aW52".into(),
-                    for_agent: "a".into(),
-                    expires_at_ms: 1,
-                },
             };
             assert_eq!(value.kind(), kind);
             let record =
                 VersionedRecord::sign(kind, "k", &value, clock(1, 1, 1), &owner).expect("sign");
-            record.verify().expect("all five kinds verify");
+            record.verify().expect("all four kinds verify");
         }
 
         // Behavioral Tier-3 check: kind/value coherence is enforced, so no
@@ -4006,7 +3936,7 @@ mod home_pointer_election_tests {
         for _ in 0..10 {
             let mut mints = 0;
             for (agent_hex, desired) in &devices {
-                if home_pointer_mint_decision(desired, register.as_ref(), agent_hex) {
+                if home_pointer_mint_decision(desired, register.as_ref(), agent_hex, false) {
                     register = Some(desired.clone());
                     mints += 1;
                 }
@@ -4038,9 +3968,19 @@ mod home_pointer_election_tests {
         let newer = home_ptr("g-aaa", "agent-b", 2_000, vec![]);
 
         // Newer already in the slot: the older device takes it.
-        assert!(home_pointer_mint_decision(&older, Some(&newer), "agent-a"));
+        assert!(home_pointer_mint_decision(
+            &older,
+            Some(&newer),
+            "agent-a",
+            false
+        ));
         // Older already in the slot: the newer device yields.
-        assert!(!home_pointer_mint_decision(&newer, Some(&older), "agent-b"));
+        assert!(!home_pointer_mint_decision(
+            &newer,
+            Some(&older),
+            "agent-b",
+            false
+        ));
     }
 
     /// Equal `provisioned_at_ms` — a genuine simultaneous genesis, or just
@@ -4050,32 +3990,30 @@ mod home_pointer_election_tests {
     fn home_pointer_election_breaks_timestamp_ties_on_group_id() {
         let a = home_ptr("g-aaa", "agent-a", 5_000, vec![]);
         let b = home_ptr("g-bbb", "agent-b", 5_000, vec![]);
-        assert!(home_pointer_mint_decision(&a, Some(&b), "agent-a"));
-        assert!(!home_pointer_mint_decision(&b, Some(&a), "agent-b"));
+        assert!(home_pointer_mint_decision(&a, Some(&b), "agent-a", false));
+        assert!(!home_pointer_mint_decision(&b, Some(&a), "agent-b", false));
     }
 
-    /// A Home invite is scoped to ONE agent. Acting on another agent's
-    /// invite would burn the pending invite that agent is waiting for and
-    /// stall its adoption — the authority would refuse the join anyway.
+    /// A slot held by a PROVABLY retired Home must be takeable (r3 P2).
+    ///
+    /// The ordering rule alone refuses every replacement here, because a new
+    /// Home is always NEWER than the dead one it replaces — so without this
+    /// override the register keeps naming a tombstone forever and every
+    /// device yields to it. The proof is local (`withdrawn` in our own
+    /// roster); an unreachable remote Home is unknown, not retired, and must
+    /// NOT be overridden.
     #[test]
-    fn a_home_invite_is_only_actionable_by_the_agent_it_names() {
-        assert!(home_invite_is_actionable("agent-a", 0, "agent-a", 10));
+    fn a_provably_retired_pointer_can_be_replaced_by_a_newer_home() {
+        let retired = home_ptr("g-old", "agent-a", 1_000, vec![]);
+        let replacement = home_ptr("g-new", "agent-a", 9_999, vec![]);
+
         assert!(
-            !home_invite_is_actionable("agent-b", 0, "agent-a", 10),
-            "an invite addressed to another agent must be ignored, not attempted"
+            !home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", false),
+            "without proof of retirement the ordering rule stands: a newer Home does not win"
         );
-    }
-
-    /// Records persist on every enrolled device, so an invite without a
-    /// deadline would stay redeemable forever. `0` = no expiry, matching the
-    /// invite layer's own convention.
-    #[test]
-    fn an_expired_home_invite_is_refused() {
-        assert!(home_invite_is_actionable("agent-a", 100, "agent-a", 100));
-        assert!(!home_invite_is_actionable("agent-a", 100, "agent-a", 101));
         assert!(
-            home_invite_is_actionable("agent-a", 0, "agent-a", u64::MAX),
-            "0 means no expiry"
+            home_pointer_mint_decision(&replacement, Some(&retired), "agent-a", true),
+            "a provably retired pointer must be replaceable despite being older"
         );
     }
 
@@ -4086,7 +4024,8 @@ mod home_pointer_election_tests {
         assert!(home_pointer_mint_decision(
             &home_ptr("g-aaa", "agent-a", 1, vec![]),
             None,
-            "agent-a"
+            "agent-a",
+            false
         ));
     }
 
@@ -4108,11 +4047,11 @@ mod home_pointer_election_tests {
             }],
         );
         assert!(
-            home_pointer_mint_decision(&refreshed, Some(&stored), "agent-a"),
+            home_pointer_mint_decision(&refreshed, Some(&stored), "agent-a", false),
             "the primary agent must be able to refresh its own Home pointer"
         );
         assert!(
-            !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b"),
+            !home_pointer_mint_decision(&refreshed, Some(&stored), "agent-b", false),
             "a co-member must not refresh the primary's Home pointer"
         );
     }

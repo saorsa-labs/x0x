@@ -15,7 +15,8 @@
       "level": "blocking",
       "inputs": [
         "SKILL.md",
-        "Cargo.toml"
+        "Cargo.toml",
+        ".well-known/agent.json"
       ],
       "modes": {
         "pull_request": "changed_only",

@@ -1,5 +1,5 @@
 {
-  "endpoint_count": 175,
+  "endpoint_count": 176,
   "endpoints": [
     {
       "category": "status",
@@ -2732,6 +2732,24 @@
             "in": "body",
             "name": "policy",
             "required": false
+          }
+        ],
+        "kind": "fields"
+      }
+    },
+    {
+      "category": "stores",
+      "cli_name": "group store create",
+      "description": "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+      "method": "POST",
+      "path": "/groups/:id/stores",
+      "request": {
+        "fields": [
+          {
+            "cli": "NAME",
+            "in": "body",
+            "name": "name",
+            "required": true
           }
         ],
         "kind": "fields"

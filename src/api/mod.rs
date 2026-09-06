@@ -1499,6 +1499,14 @@ pub const ENDPOINTS: &[EndpointDef] = &[
         request: RequestSpec::Fields(&[RequestField::body_as("expected_owner", false, "--owner"), RequestField::body("policy", false)]),
     },
     EndpointDef {
+        method: Method::Post,
+        path: "/groups/:id/stores",
+        cli_name: "group store create",
+        description: "Open a group-scoped encrypted store bound to a named secure group (#341); member-gated, group must be MlsEncrypted on the GSS plane",
+        category: "stores",
+        request: RequestSpec::Fields(&[RequestField::body_as("name", true, "NAME")]),
+    },
+    EndpointDef {
         method: Method::Get,
         path: "/stores/:id/keys",
         cli_name: "store keys",

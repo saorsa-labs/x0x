@@ -4,6 +4,57 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Encrypted group-scoped KvStore — issue #341 Phase B.** The #88 design
+  (`docs/design/encrypted-kvstore.md`) is now implemented for the GSS
+  secure plane (ADR-0010). A store created under
+  `AccessPolicy::Encrypted { group_id }` never publishes a plaintext
+  `KvStoreDelta`: every gossip publication — incremental delta, full-state
+  serve, and all `/state-sync` control traffic — is a sign-then-encrypt
+  envelope (`EncryptedKvStoreRecordV1`): the mutation is ML-DSA-65-signed
+  by its author inside the ciphertext, then AEAD-sealed with XChaCha20-
+  Poly1305 under a store-scoped, epoch-bound key (fresh random 192-bit
+  nonce per record). The AEAD AAD and the signed bytes both bind
+  domain, group, store id, and epoch, so cross-group, cross-store, and
+  cross-epoch replay fail closed. Receivers decrypt, derive the author id
+  from the included public key (rejecting mis-attribution before
+  signature verification), verify the signature, enforce ACTIVE GROUP
+  MEMBERSHIP as the v1 write rule, and merge with the verified author
+  identity preserved for later policy layers.
+
+- **`SecureContext` boundary (`x0x::kv::encrypted::KvSecureContext`).**
+  Store and sync code depend on the small trait (group id, epoch, seal,
+  open, membership), not on a key backend. The v1 backend is the
+  named-group GSS plane (`x0x::groups::GssKvSecureContext`), whose
+  snapshot (secret, epoch, active members) is refreshed from the
+  authoritative group state before every seal/open — a rekey (ban/remove)
+  therefore cuts a removed member off on the next record, and stale
+  pre-rekey records are rejected. A TreeKEM backend can implement the
+  same trait without touching store or sync code.
+
+- **`POST /groups/:id/stores`** opens (creates or re-opens, idempotent) a
+  group-scoped encrypted store: member-gated, group must be `MlsEncrypted`
+  on the GSS plane, rider tokens must explicitly cover the group
+  (ADR-0039). Store identity is deterministic from (stable group id,
+  name) so every member computes the same store id and topic; ownership
+  anchors on the GROUP CREATOR. Key operations reuse the existing
+  `/stores/:id/...` routes. Registration persists and rehydrates across
+  daemon restarts. CLI: `x0x group store create`.
+
+### Fixed
+
+- **`authorize_write` no longer permissive on the reserved Encrypted
+  policy.** Phase A (#358) left the un-keyed `authorize_write` arm
+  returning `Ok(())` for a context-less Encrypted store, so the handle
+  layer's local-REMOVE path could mutate a reserved replica. It now
+  fails closed without a context and enforces membership with one.
+
+- **`Encrypted` is a TERMINAL policy.** Mirroring AppendOnly: an owner
+  announce (however authentic) or an adopted checkpoint claiming any
+  non-Encrypted policy — or a different group binding — is rejected
+  instead of silently un-encrypting replicas back onto plaintext paths.
+
 ## [v0.41.3] - 2026-09-05
 
 Emergency GUI fix: the embedded GUI was completely dead in v0.41.1 and v0.41.2.

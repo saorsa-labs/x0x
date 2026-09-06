@@ -1575,6 +1575,31 @@ enum GroupSub {
         /// Path to envelope JSON, or `-` for stdin.
         path: String,
     },
+    /// Group-scoped encrypted stores (#341).
+    Store {
+        #[command(subcommand)]
+        sub: GroupStoreSub,
+    },
+}
+
+/// `x0x group store` subcommands (#341 encrypted group stores).
+#[derive(Subcommand)]
+enum GroupStoreSub {
+    /// Open a group-scoped ENCRYPTED store bound to a named secure group.
+    ///
+    /// Member-gated; the group must be MlsEncrypted on the GSS plane
+    /// (ADR-0010). Every publication is sealed under the group's current
+    /// secret epoch and the v1 write rule is active group membership.
+    /// Idempotent: re-opening returns the existing store's metadata.
+    Create {
+        /// Group ID.
+        #[arg(value_name = "GROUP_ID")]
+        group_id: String,
+        /// Store name — the store identity derives from (group, name), so
+        /// every member converges on the same store id and topic.
+        #[arg(value_name = "NAME")]
+        name: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -2565,6 +2590,9 @@ async fn run(
                 group_id,
                 thread_root,
             }) => commands::group::messages(&client, &group_id, thread_root.as_deref()).await,
+            Some(GroupSub::Store {
+                sub: GroupStoreSub::Create { group_id, name },
+            }) => commands::group::group_store_create(&client, &group_id, &name).await,
             Some(GroupSub::State { group_id }) => commands::group::state(&client, &group_id).await,
             Some(GroupSub::StateCommits {
                 group_id,

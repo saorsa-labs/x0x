@@ -16,6 +16,7 @@ pub mod directory;
 pub mod discovery;
 pub mod invite;
 pub mod kem_envelope;
+pub mod kv_context;
 pub mod member;
 pub mod owner_cert;
 pub mod policy;
@@ -39,6 +40,7 @@ pub use self::discovery::{
     DEFAULT_MAX_ENTRIES_PER_SHARD, DEFAULT_MAX_SUBSCRIPTIONS, DIRECTORY_TOPIC_PREFIX,
     MAX_NAME_WORDS, MAX_TAGS_PER_GROUP, SHARD_COUNT,
 };
+pub use self::kv_context::GssKvSecureContext;
 pub use self::member::{GroupMember, GroupMemberState, GroupRole};
 pub use self::owner_cert::{
     failing_active_members, verify_owner_certified_member, OwnerCertEvidence, OwnerCertFailure,

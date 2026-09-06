@@ -1,0 +1,22 @@
+{
+  "expected_exit": 3,
+  "snapshot": {
+    "agent_id": "acp-1",
+    "owner_machine_id": "owner-m",
+    "journal_mode": "acp",
+    "placement": {
+      "kind": "pending",
+      "machine_id": null
+    },
+    "harness_machine": null,
+    "ledger_capture": {
+      "method": "GET",
+      "path": "/owner/placement",
+      "http_status": 200,
+      "body": {
+        "ok": false,
+        "error": "mint failed"
+      }
+    }
+  }
+}

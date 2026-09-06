@@ -581,6 +581,7 @@ pub(in crate::server) async fn gossip_diagnostics(
                 Json(serde_json::json!({
                 "ok": true,
                 "stats": snap,
+                "participation": state.agent.gossip_participation(),
                 "gossip_publish_zero_fanout": snap.publish_zero_fanout,
                 "pubsub_stages": pubsub_stages,
                 "dispatcher": state.agent.gossip_dispatch_stats(),
@@ -597,6 +598,94 @@ pub(in crate::server) async fn gossip_diagnostics(
             StatusCode::SERVICE_UNAVAILABLE,
             "gossip runtime not initialized",
         ),
+    }
+}
+
+#[cfg(test)]
+mod participation_diagnostics_tests {
+    use super::*;
+    use axum::{body::Body, http::Request, routing::get, Router};
+    use tower::ServiceExt;
+
+    /// The C0 soak needs the subscription-aware relay meter, not the older
+    /// origin-based counter that also includes subscribed-topic forwarding.
+    #[tokio::test]
+    async fn gossip_route_exposes_resolved_participation_and_c0_meters() {
+        for relay in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let agent = Arc::new(
+                x0x::Agent::builder()
+                    .with_machine_key(dir.path().join("machine.key"))
+                    .with_agent_key(x0x::identity::AgentKeypair::generate().unwrap())
+                    .with_agent_cert_path(dir.path().join("agent.cert"))
+                    .with_contact_store_path(dir.path().join("contacts.json"))
+                    .with_peer_cache_disabled()
+                    .with_network_config(x0x::network::NetworkConfig {
+                        bind_addr: Some("127.0.0.1:0".parse().unwrap()),
+                        bootstrap_nodes: Vec::new(),
+                        mdns_enabled: false,
+                        port_mapping_enabled: false,
+                        ..Default::default()
+                    })
+                    .with_gossip_config(x0x::gossip::GossipConfig {
+                        relay,
+                        ..Default::default()
+                    })
+                    .build()
+                    .await
+                    .unwrap(),
+            );
+            let state = crate::server::routes::named_groups::tests::secure_endpoint_test_state_at(
+                dir.path(),
+                Arc::clone(&agent),
+            )
+            .await
+            .unwrap();
+            let app = Router::new()
+                .route("/diagnostics/gossip", get(gossip_diagnostics))
+                .with_state(state);
+            let response = app
+                .oneshot(
+                    Request::get("/diagnostics/gossip")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            let participation = &body["participation"];
+            assert_eq!(participation["mode"], if relay { "full" } else { "leaf" });
+            assert_eq!(
+                participation["reason"],
+                if relay {
+                    "operator_relay"
+                } else {
+                    "default_leaf"
+                }
+            );
+            assert_eq!(
+                participation["relay_bytes_semantics"],
+                "non_subscribed_forward"
+            );
+            for counter in [
+                "relay_bytes",
+                "epidemic_forward_bytes",
+                "unsubscribed_refused_frames",
+                "unsubscribed_refused_graft_equiv",
+                "passthrough_refresh_runs",
+            ] {
+                assert_eq!(participation[counter].as_u64(), Some(0), "{counter}");
+            }
+            assert_eq!(
+                participation,
+                &serde_json::to_value(agent.gossip_participation().unwrap()).unwrap()
+            );
+            agent.shutdown().await;
+        }
     }
 }
 

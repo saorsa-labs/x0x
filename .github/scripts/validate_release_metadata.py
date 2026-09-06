@@ -74,6 +74,10 @@ def parse_args():
         default=str(DEFAULT_POLICY_PATH),
         help="Path to the JSON policy file",
     )
+    parser.add_argument(
+        "--agent-card",
+        help="Validate a staged release card instead of the source card",
+    )
     return parser.parse_args()
 
 
@@ -344,12 +348,22 @@ def extract_release_windows_bins(path_str):
     return bins
 
 
-def validate_version_sync(rule, state, tag_version=None):
-    skill_path, cargo_path = rule["inputs"]
+def validate_version_sync(rule, state, tag_version=None, agent_card=None):
+    skill_path, cargo_path, card_path = rule["inputs"]
+    card_path = agent_card or card_path
+    card_version = json.loads(read_text(card_path)).get("version")
     skill_version = extract_skill_version(skill_path)
     cargo_version = extract_cargo_version(cargo_path)
 
     fix_hint = "run `just bump-version <X.Y.Z>` to sync every version-bearing file"
+
+    if card_version != cargo_version:
+        state.add(
+            rule["level"],
+            f"Agent card version {card_version!r} does not match Cargo.toml version "
+            f"{cargo_version} — {fix_hint}",
+            card_path,
+        )
 
     if skill_version != cargo_version:
         state.add(
@@ -457,7 +471,9 @@ def main():
         print(f"Running {rule_name} ({rule['kind']})")
 
         if rule["kind"] == "version_sync":
-            validate_version_sync(rule, state, tag_version=tag_version)
+            validate_version_sync(
+                rule, state, tag_version=tag_version, agent_card=args.agent_card
+            )
         elif rule["kind"] == "openclaw_bins":
             validate_openclaw_bins(rule, state)
         elif rule["kind"] == "current_release_docs":
