@@ -126,9 +126,13 @@ pub(in crate::server) async fn home_duplicates(
     ids
 }
 
-/// Evidence that a duplicate Home is NOT safe to delete (#449 P4).
+/// Evidence AGAINST deleting a duplicate Home (#449 P4).
 ///
-/// Empty ⇒ safe to retire. Withdrawal is terminal and cleans only crypto
+/// This is an OBSERVATION, not a safety verdict. An empty list means no
+/// evidence was found by these probes at the moment they ran — it does NOT
+/// mean the group is safe to delete, because the observation is not held
+/// across any subsequent mutation. Automatic retirement is deliberately not
+/// implemented; see `docs/design/449-p4-retirement-fence.md`. Withdrawal is terminal and cleans only crypto
 /// material: durable history, the group delegations that live ONLY in history,
 /// group-scoped task lists and rider grants all key off the group id and would
 /// be silently orphaned. So the rule is **join first, retire second, and only
@@ -224,17 +228,21 @@ pub(in crate::server) async fn home_retire_blockers(
     // "could not read the evidence" would masquerade as "there is none". The
     // durable file is therefore probed directly, and an unreadable or
     // unparseable one is a blocker in its own right.
+    // Review r3 P2: observe the VALIDATED DURABLE entries, not the in-memory
+    // manifest and not a generic-JSON probe. `null` and `{"entries":"corrupt"}`
+    // are valid JSON that the typed loader rejects, so a `serde_json::Value`
+    // probe would silently drop the unavailable-evidence warning in exactly
+    // the cases it exists for.
     let prefixes = [
         format!("x0x.group.{group_id}."),
         format!("x0x.group.{stable_id}."),
     ];
-    match durable_json_is_readable(&state.crdt_subscriptions_path).await {
-        Readable::Absent => {}
-        Readable::Ok => {
-            if state
-                .crdt_subscriptions
-                .read()
-                .await
+    match crate::server::crdt_subscriptions::probe_manifest_strict(&state.crdt_subscriptions_path)
+        .await
+    {
+        Ok(None) => {}
+        Ok(Some(manifest)) => {
+            if manifest
                 .entries
                 .iter()
                 .any(|entry| prefixes.iter().any(|p| entry.id.starts_with(p.as_str())))
@@ -242,59 +250,33 @@ pub(in crate::server) async fn home_retire_blockers(
                 blockers.push("has group-scoped task lists".to_string());
             }
         }
-        Readable::Unavailable(why) => blockers.push(format!(
-            "task-list manifest unreadable ({why}) — cannot prove this Home has no task lists"
+        Err(why) => blockers.push(format!(
+            "task-list manifest unreadable ({why}) — cannot observe whether this Home has task lists"
         )),
     }
 
-    // Same class for rider grants: an unreadable or corrupt store is not proof
-    // that the durable grant set is empty. Repairing a transient read problem
-    // after withdrawal would leave a grant pointing at an orphaned group.
+    // Same class for rider grants, read from the durable file under its real
+    // schema. An unreadable or wrong-schema store is not proof that the grant
+    // set is empty.
     let rider_path = state
         .data_dir
         .join(crate::server::rider_auth::RIDER_TOKENS_FILE);
-    match durable_json_is_readable(&rider_path).await {
-        Readable::Absent => {}
-        Readable::Ok => {
-            if state
-                .rider_tokens
-                .lock()
-                .await
-                .grants_any_group(&[group_id, stable_id.as_str()])
+    match crate::server::rider_auth::probe_granted_groups_strict(&rider_path).await {
+        Ok(None) => {}
+        Ok(Some(granted)) => {
+            if granted
+                .iter()
+                .any(|g| g == group_id || g == stable_id.as_str())
             {
                 blockers.push("a rider token grants this group".to_string());
             }
         }
-        Readable::Unavailable(why) => blockers.push(format!(
-            "rider-token store unreadable ({why}) — cannot prove this Home has no grants"
+        Err(why) => blockers.push(format!(
+            "rider-token store unreadable ({why}) — cannot observe whether this Home has grants"
         )),
     }
 
     blockers
-}
-
-/// Durable-evidence readability, for gates that must not confuse "no evidence"
-/// with "evidence unavailable" (#449 P4, review P2).
-enum Readable {
-    /// The file does not exist — genuinely nothing recorded.
-    Absent,
-    /// The file exists and parses as JSON.
-    Ok,
-    /// The file exists but could not be read or parsed.
-    Unavailable(String),
-}
-
-/// Probe a durable JSON evidence file WITHOUT adopting the lenient
-/// fail-to-empty semantics its normal loader uses.
-async fn durable_json_is_readable(path: &std::path::Path) -> Readable {
-    match tokio::fs::read(path).await {
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Readable::Absent,
-        Err(e) => Readable::Unavailable(e.to_string()),
-        Ok(bytes) => match serde_json::from_slice::<serde_json::Value>(&bytes) {
-            Ok(_) => Readable::Ok,
-            Err(e) => Readable::Unavailable(e.to_string()),
-        },
-    }
 }
 
 /// Whether `group_id` is a Home this device can PROVE is retired (r3 P2).
@@ -1582,6 +1564,99 @@ pub(in crate::server::routes) mod tests {
                 .iter()
                 .any(|b| b.contains("rider-token store unreadable")),
             "a corrupt rider store must block, got {blockers:?}"
+        );
+        Ok(())
+    }
+
+    /// WHY (review r3 P2): WRONG-SCHEMA evidence is not absent evidence.
+    ///
+    /// The earlier probe parsed a generic `serde_json::Value`, so `null` and
+    /// `{"entries":"corrupt"}` — both valid JSON that the typed loader
+    /// rejects and flattens to empty — sailed through and the inventory
+    /// dropped its unavailable-evidence warning in exactly the cases the
+    /// warning exists for. These are the schema-valid-JSON controls that a
+    /// syntax-only test cannot catch.
+    #[tokio::test]
+    async fn wrong_schema_evidence_files_are_reported_unavailable() -> anyhow::Result<()> {
+        for body in [&b"null"[..], &br#"{"entries":"corrupt"}"#[..]] {
+            let dir = tempfile::tempdir()?;
+            let state = owned_state_with_history(dir.path(), [0x71; 32]).await?;
+            provision_home(&state).await;
+            let duplicate = provision_duplicate_home(&state).await?;
+            tokio::fs::write(&state.crdt_subscriptions_path, body).await?;
+
+            let blockers = home_retire_blockers(&state, &duplicate).await;
+            assert!(
+                blockers
+                    .iter()
+                    .any(|b| b.contains("task-list manifest unreadable")),
+                "valid JSON of the wrong schema must be reported unavailable, got {blockers:?}"
+            );
+        }
+
+        for body in [&b"null"[..], &br#"{"next_id":1,"tokens":[]}"#[..]] {
+            let dir = tempfile::tempdir()?;
+            let state = owned_state_with_history(dir.path(), [0x72; 32]).await?;
+            provision_home(&state).await;
+            let duplicate = provision_duplicate_home(&state).await?;
+            tokio::fs::write(
+                state
+                    .data_dir
+                    .join(crate::server::rider_auth::RIDER_TOKENS_FILE),
+                body,
+            )
+            .await?;
+
+            let blockers = home_retire_blockers(&state, &duplicate).await;
+            assert!(
+                blockers
+                    .iter()
+                    .any(|b| b.contains("rider-token store unreadable")),
+                "valid JSON of the wrong schema must be reported unavailable, got {blockers:?}"
+            );
+        }
+        Ok(())
+    }
+
+    /// WHY (review r3 P2): a schema-VALID durable manifest must be observed
+    /// from disk, not from the in-memory map — the positive control for the
+    /// probe, and the case the startup-ordering P1 previously missed.
+    #[tokio::test]
+    async fn a_durable_task_list_entry_is_observed_from_disk() -> anyhow::Result<()> {
+        let dir = tempfile::tempdir()?;
+        let state = owned_state_with_history(dir.path(), [0x73; 32]).await?;
+        provision_home(&state).await;
+        let duplicate = provision_duplicate_home(&state).await?;
+        let stable = state
+            .named_groups
+            .read()
+            .await
+            .get(&duplicate)
+            .expect("duplicate")
+            .stable_group_id()
+            .to_string();
+        // Written straight to disk; the in-memory manifest is never touched,
+        // which is exactly the state startup retirement used to act on.
+        tokio::fs::write(
+            &state.crdt_subscriptions_path,
+            serde_json::to_vec(&serde_json::json!({
+                "entries": [{
+                    "kind": "task_list",
+                    "id": format!("x0x.group.{stable}.symphony.todo"),
+                    "name": "todo",
+                    "topic": "t",
+                    "role": "created",
+                }]
+            }))?,
+        )
+        .await?;
+
+        let blockers = home_retire_blockers(&state, &duplicate).await;
+        assert!(
+            blockers
+                .iter()
+                .any(|b| b.contains("group-scoped task lists")),
+            "a durable task-list entry must be observed from disk, got {blockers:?}"
         );
         Ok(())
     }

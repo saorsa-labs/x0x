@@ -242,21 +242,37 @@ pub(super) struct RiderTokenStore {
     records: BTreeMap<u64, RiderTokenRecord>,
 }
 
-impl RiderTokenStore {
-    /// Whether any live token grants one of `group_ids` (#449 P4).
-    ///
-    /// Retiring a group whose id a rider still names would silently strip
-    /// that rider's grant — so a duplicate Home with an outstanding grant is
-    /// never retired automatically.
-    pub(super) fn grants_any_group(&self, group_ids: &[&str]) -> bool {
-        self.records.values().any(|record| {
-            record
-                .groups
-                .iter()
-                .any(|granted| group_ids.contains(&granted.as_str()))
-        })
+/// STRICT typed probe of the persisted rider-token file, returning every
+/// granted group id (#449 P4 review r3).
+///
+/// [`RiderTokenStore::load`] flattens read AND schema failures to an empty
+/// store — correct for authentication, which fails closed by granting
+/// nothing. An observation gate needs the distinction: an unreadable or
+/// wrong-schema file is not proof that the durable grant set is empty. A
+/// generic-JSON probe would not do, since `null` and a wrong-typed `tokens`
+/// field are valid JSON this schema rejects.
+///
+/// `Ok(None)` = file absent · `Ok(Some(ids))` = parsed and schema-valid ·
+/// `Err(why)` = present but unreadable or wrong schema.
+pub(super) async fn probe_granted_groups_strict(
+    path: &std::path::Path,
+) -> Result<Option<Vec<String>>, String> {
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(bytes) => match serde_json::from_slice::<RiderTokenFile>(&bytes) {
+            Ok(file) => Ok(Some(
+                file.tokens
+                    .into_values()
+                    .flat_map(|record| record.groups)
+                    .collect(),
+            )),
+            Err(e) => Err(e.to_string()),
+        },
     }
+}
 
+impl RiderTokenStore {
     /// Load the store from `path` (a missing file is an empty store; a
     /// corrupt file is logged and treated as empty — rider tokens fail
     /// closed, they can never grant more than was persisted).

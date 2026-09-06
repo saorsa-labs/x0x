@@ -131,6 +131,31 @@ impl CrdtSubscriptionManifest {
 /// A missing file yields an empty manifest silently; an unreadable or
 /// corrupt file yields an empty manifest with a warning — startup must never
 /// crash on a bad manifest (fail loud in logs, not in process exit).
+/// STRICT typed probe of the persisted manifest, for observation gates
+/// (#449 P4 review r3).
+///
+/// [`read_manifest`] deliberately flattens read AND schema failures to an
+/// empty manifest — correct for rehydration, which fails closed by simply not
+/// rehydrating. An observation gate needs the opposite: it must distinguish
+/// "no task lists recorded" from "the record could not be read or does not
+/// match the schema". A generic-JSON probe is NOT sufficient — `null` and
+/// `{"entries":"corrupt"}` are valid JSON that this typed loader rejects, so
+/// the gate must parse the real schema.
+///
+/// `Ok(None)` = file absent · `Ok(Some(m))` = parsed and schema-valid ·
+/// `Err(why)` = present but unreadable or wrong schema.
+pub(super) async fn probe_manifest_strict(
+    path: &Path,
+) -> Result<Option<CrdtSubscriptionManifest>, String> {
+    match tokio::fs::read(path).await {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.to_string()),
+        Ok(bytes) => serde_json::from_slice::<CrdtSubscriptionManifest>(&bytes)
+            .map(Some)
+            .map_err(|e| e.to_string()),
+    }
+}
+
 pub(super) async fn read_manifest(path: &Path) -> CrdtSubscriptionManifest {
     match tokio::fs::read(path).await {
         Ok(bytes) => match serde_json::from_slice::<CrdtSubscriptionManifest>(&bytes) {

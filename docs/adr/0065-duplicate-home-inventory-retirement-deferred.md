@@ -81,11 +81,15 @@ We will adopt option 3 as the **interim** position.
 - **`safe_to_retire` is deliberately NOT reported.** A safety verdict is
   precisely what this device cannot currently establish; publishing one would
   invite an operator, or a later automation, to trust it.
-- Evidence probes **fail closed**. An absent history handle, an unreadable or
-  unparseable task-list manifest, and an unreadable or corrupt rider-token
-  store are each evidence *against* deletion. The durable files are probed
-  directly rather than through their lenient loaders, whose fail-to-empty
-  behaviour stays unchanged for their own uses.
+- Evidence probes **report unavailability rather than absence**. An absent
+  history handle, and a task-list manifest or rider-token store that is
+  missing, unreadable or **of the wrong schema**, are each reported as
+  evidence against deletion. The durable files are parsed under their REAL
+  typed schemas — a generic-JSON probe is insufficient, because `null` and
+  `{"entries":"corrupt"}` are valid JSON the typed loaders reject — and the
+  validated durable entries, not the in-memory maps, are what the observation
+  reads. The loaders' own fail-to-empty behaviour is unchanged for their own
+  uses.
 
 ## Consequences
 
@@ -95,7 +99,10 @@ We will adopt option 3 as the **interim** position.
   grants, because no automated path deletes anything.
 - The owner can see exactly which duplicates exist and what is holding each
   one, which is the information a safe retirement would need anyway.
-- The fail-closed probes are reusable unchanged when a fence exists.
+- The probes give an operator the same evidence a future retirement decision
+  would need. Whether they are sufficient for a *destructive* decision is NOT
+  claimed here: that depends on a fence that does not exist, and an
+  observation taken at one instant is not a proof held across a mutation.
 
 ### Negative / Trade-offs
 
@@ -118,6 +125,13 @@ We will adopt option 3 as the **interim** position.
   (`an_unreadable_task_list_manifest_is_evidence_against_deletion`).
 - An unreadable rider-token store is evidence against deletion
   (`an_unreadable_rider_store_is_evidence_against_deletion`).
+- Valid JSON of the WRONG schema (`null`, `{"entries":"corrupt"}`, a
+  wrong-typed `tokens` field) is reported unavailable, not absent
+  (`wrong_schema_evidence_files_are_reported_unavailable`).
+- A schema-valid durable task-list entry is observed FROM DISK, with the
+  in-memory manifest untouched — the positive control, and the state the
+  startup-ordering defect used to act on
+  (`a_durable_task_list_entry_is_observed_from_disk`).
 - **Not validated, because not implemented:** any automatic retirement. The
   conditions under which it could become safe are specified in
   `docs/design/449-p4-retirement-fence.md`; that design is unreviewed and
