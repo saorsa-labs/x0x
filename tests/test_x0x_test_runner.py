@@ -356,6 +356,54 @@ class TokenRotationTests(unittest.TestCase):
                     self.assertEqual(0, self.mod.main([]))
                 self.assertEqual(expected_file, client.call_args.kwargs["token_file"])
 
+    def test_main_retains_file_source_when_file_disappears_after_read(self):
+        from contextlib import contextmanager
+        from unittest.mock import patch
+        original_open = open
+
+        @contextmanager
+        def open_then_remove(*args, **kwargs):
+            with original_open(*args, **kwargs) as source:
+                yield source
+            # The read has completed, but main has not constructed its client.
+            self.token_file.unlink()
+
+        with patch.dict(self.mod.os.environ, {"X0X_API_TOKEN": str(self.token_file)}), patch("builtins.open", side_effect=open_then_remove), patch.object(self.mod, "TestRunner") as runner:
+            runner.return_value.run.return_value = 0
+            self.assertEqual(0, self.mod.main([]))
+        client = runner.call_args.kwargs["client"]
+        self.assertFalse(self.token_file.exists())
+        self.assertEqual("old-fixture-token", client.token)
+        self.assertEqual(str(self.token_file), client._token_file)
+        self.token_file.write_text("new-fixture-token")
+        self.assertTrue(client._reload_token("old-fixture-token"))
+        self.assertEqual("new-fixture-token", client.token)
+
+    def test_main_literal_does_not_gain_file_source_if_path_appears(self):
+        from unittest.mock import patch
+        self.token_file.unlink()
+        original_isfile = self.mod.os.path.isfile
+
+        def classify_then_create(path):
+            is_file = original_isfile(path)
+            if path == str(self.token_file) and not is_file:
+                self.token_file.write_text("unrelated-fixture-token")
+            return is_file
+
+        with patch.dict(self.mod.os.environ, {"X0X_API_TOKEN": str(self.token_file)}), patch.object(self.mod.os.path, "isfile", side_effect=classify_then_create), patch.object(self.mod, "TestRunner") as runner:
+            runner.return_value.run.return_value = 0
+            self.assertEqual(0, self.mod.main([]))
+        client = runner.call_args.kwargs["client"]
+        self.assertTrue(self.token_file.exists())
+        self.assertEqual(str(self.token_file), client.token)
+        self.assertIsNone(client._token_file)
+        self.assertFalse(client._reload_token(str(self.token_file)))
+        self.assertEqual(str(self.token_file), client.token)
+
+    def test_load_token_keeps_string_return_value(self):
+        self.assertEqual("old-fixture-token", self.mod.load_token(str(self.token_file)))
+        self.assertEqual("literal-fixture", self.mod.load_token("literal-fixture"))
+
 
 if __name__ == "__main__":
     unittest.main()

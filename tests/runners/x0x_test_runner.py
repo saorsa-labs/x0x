@@ -101,6 +101,11 @@ def b64decode(s: str) -> bytes:
 
 
 def load_token(token_spec: str) -> str:
+    """Load a token, preserving the string-returning helper interface."""
+    return load_token_with_source(token_spec)[0]
+
+
+def load_token_with_source(token_spec: str) -> Tuple[str, Optional[str]]:
     """Load API token from a path or literal string.
 
     A token-file path is preferred (canonical Linux service location);
@@ -109,8 +114,8 @@ def load_token(token_spec: str) -> str:
     """
     if os.path.isfile(token_spec):
         with open(token_spec, "r", encoding="utf-8") as f:
-            return f.read().strip()
-    return token_spec.strip()
+            return f.read().strip(), token_spec
+    return token_spec.strip(), None
 
 
 class X0xClient:
@@ -1228,14 +1233,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     node_name = os.environ.get("NODE_NAME") or os.uname().nodename
     base = os.environ.get("X0X_API_BASE", "http://127.0.0.1:12600")
     token_spec = os.environ.get("X0X_API_TOKEN", "/var/lib/x0x/api-token")
-    token = load_token(token_spec)
+    token, token_file = load_token_with_source(token_spec)
     if not token:
         logging.error("X0X_API_TOKEN empty after loading from %s", token_spec)
         return 2
 
-    client = X0xClient(
-        base, token, token_file=token_spec if os.path.isfile(token_spec) else None
-    )
+    client = X0xClient(base, token, token_file=token_file)
     runner = TestRunner(
         node_name=node_name,
         client=client,
