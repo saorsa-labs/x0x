@@ -27,12 +27,144 @@
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
+use std::collections::VecDeque;
 use std::net::SocketAddr;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use serde_json::Value;
+use serde_json::{json, Value};
+use tracing_subscriber::prelude::*;
 use x0x::server::{serve_with_options, DaemonConfig, ServeOptions, ServerHandle};
+
+// Capture only static messages from the real worker/admission path. Never retain
+// tracing's error, identity or payload fields, even when a new field is added.
+const BOOTSTRAP_EVENTS: &[&str] = &[
+    "deferring public-group bootstrap delivery until roster durability is confirmed",
+    "public-group bootstrap reconciliation was not directory-durable; delivery deferred",
+    "failed to reconcile public-group bootstrap outbox",
+    "public-group bootstrap received durable application ACK",
+    "public-group bootstrap ACK completion was not directory-durable",
+    "failed to persist public-group bootstrap ACK completion",
+    "sent explicit verified-v1 public-group bootstrap fallback; retaining obligation until a v2 ACK",
+    "failed to persist v1 bootstrap retry schedule",
+    "public-group bootstrap delivery attempt failed",
+    "failed to persist bootstrap retry schedule",
+    "ignoring public-group bootstrap from unknown or blocked sender",
+    "rejected invalid public-group bootstrap",
+    "refusing public-group bootstrap: named-group capacity reached",
+    "installed signed-public group bootstrap",
+    "public-group bootstrap was not durably installed",
+];
+
+#[derive(Default)]
+struct BootstrapObservations {
+    phase: &'static str,
+    polls: u64,
+    last_projection: Value,
+    before_restart: Value,
+    after_restart: Value,
+    events: VecDeque<Value>,
+    dropped_events: u64,
+}
+
+struct BootstrapTrace(Arc<Mutex<BootstrapObservations>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for BootstrapTrace {
+    fn on_event(&self, event: &tracing::Event<'_>, _: tracing_subscriber::layer::Context<'_, S>) {
+        if event.metadata().target() != "x0x::server::routes::public_group_bootstrap_outbox" {
+            return;
+        }
+        #[derive(Default)]
+        struct Message(String);
+        impl tracing::field::Visit for Message {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = format!("{value:?}");
+                }
+            }
+        }
+        let mut message = Message::default();
+        event.record(&mut message);
+        let Some(&known) = BOOTSTRAP_EVENTS.iter().find(|&&known| known == message.0) else {
+            return;
+        };
+        let mut observations = self.0.lock().unwrap();
+        if observations.events.len() == 64 {
+            observations.events.pop_front();
+            observations.dropped_events += 1;
+        }
+        let phase = observations.phase;
+        observations
+            .events
+            .push_back(json!({"phase": phase, "event": known}));
+    }
+}
+
+fn outbox_summary(entries: &[Value]) -> Value {
+    json!({
+        "count": entries.len(),
+        "entries": entries.iter().take(8).map(|entry| json!({
+            "attempt_count": entry["attempt_count"].as_u64(),
+            "next_attempt_at_ms": entry["next_attempt_at_ms"].as_u64(),
+            "state_revision": entry["state_revision"].as_u64(),
+        })).collect::<Vec<_>>(),
+    })
+}
+
+fn projection_summary(status: u16, body: &Value, group_name: &str) -> Value {
+    json!({
+        "http_status": status,
+        "object": body.is_object(),
+        "groups_array": body["groups"].is_array(),
+        "group_count": body["groups"].as_array().map(Vec::len),
+        "target_present": group_listing_contains(body, group_name),
+        "ok": body["ok"].as_bool(),
+        "error_present": body.get("error").is_some(),
+    })
+}
+
+struct BootstrapFailureDiagnostics {
+    observations: Arc<Mutex<BootstrapObservations>>,
+    outbox_path: PathBuf,
+}
+
+impl Drop for BootstrapFailureDiagnostics {
+    fn drop(&mut self) {
+        if !std::thread::panicking() {
+            return;
+        }
+        // Read only this fixture's sidecar while its TempDir still exists. A
+        // failed read/decode is reported, never treated as an empty outbox.
+        let final_outbox = match std::fs::read(&self.outbox_path) {
+            Ok(bytes) => match serde_json::from_slice::<Value>(&bytes) {
+                Ok(sidecar) => match sidecar["entries"].as_array() {
+                    Some(entries) => outbox_summary(entries),
+                    None => json!({"state": "invalid_entries_shape"}),
+                },
+                Err(_) => json!({"state": "invalid_json"}),
+            },
+            Err(error) => json!({"state": "read_error", "kind": format!("{:?}", error.kind())}),
+        };
+        let Ok(observations) = self.observations.lock() else {
+            eprintln!("bootstrap diagnostic unavailable: observation mutex poisoned");
+            return;
+        };
+        eprintln!(
+            "bootstrap failure diagnostic: {}",
+            json!({
+                "phase": observations.phase,
+                "polls": observations.polls,
+                "last_projection": observations.last_projection,
+                "before_restart": observations.before_restart,
+                "after_restart": observations.after_restart,
+                "final_outbox": final_outbox,
+                "events": observations.events,
+                "dropped_events": observations.dropped_events,
+            })
+        );
+    }
+}
 
 /// A running in-process daemon plus a pre-authenticated REST client.
 struct Daemon {
@@ -56,14 +188,22 @@ impl Daemon {
     }
 
     async fn get_json(&self, path: &str) -> Value {
-        self.client
+        self.get_json_with_status(path).await.1
+    }
+
+    async fn get_json_with_status(&self, path: &str) -> (u16, Value) {
+        let response = self
+            .client
             .get(self.url(path))
             .send()
             .await
-            .unwrap_or_else(|e| panic!("GET {path}: {e}"))
+            .unwrap_or_else(|e| panic!("GET {path}: {e}"));
+        let status = response.status().as_u16();
+        let body = response
             .json()
             .await
-            .unwrap_or_else(|e| panic!("GET {path} json: {e}"))
+            .unwrap_or_else(|e| panic!("GET {path} json: {e}"));
+        (status, body)
     }
 
     async fn post_json(&self, path: &str, body: Value) -> Value {
@@ -343,6 +483,18 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let alice_dir = tmp.path().join("alice");
     let bob_dir = tmp.path().join("bob");
+    let observations = Arc::new(Mutex::new(BootstrapObservations {
+        phase: "before_restart",
+        ..BootstrapObservations::default()
+    }));
+    tracing::subscriber::set_global_default(
+        tracing_subscriber::registry().with(BootstrapTrace(Arc::clone(&observations))),
+    )
+    .expect("install bounded bootstrap diagnostic subscriber");
+    let _failure_diagnostics = BootstrapFailureDiagnostics {
+        observations: Arc::clone(&observations),
+        outbox_path: bob_dir.join("data/public_group_bootstrap_outbox.json"),
+    };
 
     let alice = start_daemon(&alice_dir).await;
     let bob = start_daemon(&bob_dir).await;
@@ -391,20 +543,25 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
     // Several retry passes go by with the recipient unreachable. Every one of
     // them fails, and none of them may discharge the debt.
     tokio::time::sleep(Duration::from_secs(3)).await;
+    let before_restart = outbox_entries(&bob_dir).await;
+    observations.lock().unwrap().before_restart = outbox_summary(&before_restart);
     assert_eq!(
-        outbox_entries(&bob_dir).await.len(),
+        before_restart.len(),
         1,
         "failed delivery attempts must never clear an obligation"
     );
 
     // Restart the SENDER. The obligation lives on disk, so it must come back.
+    observations.lock().unwrap().phase = "restarting";
     bob.stop().await;
     let bob = start_daemon(&bob_dir).await;
     let after_restart = outbox_entries(&bob_dir).await;
+    observations.lock().unwrap().after_restart = outbox_summary(&after_restart);
     assert_eq!(
         after_restart.len(),
         1,
-        "the obligation must survive a sender restart: {after_restart:?}"
+        "the obligation must survive a sender restart: {}",
+        outbox_summary(&after_restart)
     );
 
     // Bring the recipient back. Its ephemeral port changed, so the authority
@@ -425,15 +582,20 @@ async fn bootstrap_outbox_survives_sender_restart_and_clears_only_on_ack() {
 
     // Now — and only now — an application ACK is possible, so the obligation
     // written before the restart must both deliver and drain.
+    observations.lock().unwrap().phase = "waiting_for_install";
     wait_until(
         "the restarted authority never delivered the surviving obligation",
         Duration::from_secs(120),
         || async {
-            let groups = alice.get_json("/groups").await;
+            let (status, groups) = alice.get_json_with_status("/groups").await;
+            let mut observed = observations.lock().unwrap();
+            observed.polls += 1;
+            observed.last_projection = projection_summary(status, &groups, &group_name);
             group_listing_contains(&groups, &group_name)
         },
     )
     .await;
+    observations.lock().unwrap().phase = "waiting_for_ack_drain";
     wait_until(
         "the obligation was delivered but never cleared by its v2 ACK",
         Duration::from_secs(120),
@@ -456,4 +618,71 @@ fn group_entry<'a>(groups: &'a Value, name: &str) -> Option<&'a Value> {
 
 fn group_listing_contains(groups: &Value, name: &str) -> bool {
     group_entry(groups, name).is_some()
+}
+
+#[test]
+fn bootstrap_diagnostic_summaries_redact_payloads_and_classify_responses() {
+    let secret = "DO_NOT_EMIT_FIXTURE_SECRET";
+    let entry = json!({
+        "attempt_count": 3, "next_attempt_at_ms": 42, "state_revision": 7,
+        "payload": secret, "key": secret, "recipient_hex": secret,
+    });
+    let summary = outbox_summary(&[entry]);
+    assert_eq!(summary["entries"][0]["attempt_count"], 3);
+    assert_eq!(summary["entries"][0]["next_attempt_at_ms"], 42);
+    assert!(!summary.to_string().contains(secret));
+    let invalid_scalar = outbox_summary(&[json!({"attempt_count": secret})]);
+    assert!(invalid_scalar["entries"][0]["attempt_count"].is_null());
+    assert!(!invalid_scalar.to_string().contains(secret));
+
+    let denied = projection_summary(401, &json!({"error": secret}), "wanted");
+    assert_eq!(denied["http_status"], 401);
+    assert_eq!(denied["error_present"], true);
+    assert_eq!(denied["groups_array"], false);
+    assert!(!denied.to_string().contains(secret));
+    let installed = projection_summary(
+        200,
+        &json!({"groups": [{"name": "wanted", "payload": secret}]}),
+        "wanted",
+    );
+    assert_eq!(installed["target_present"], true);
+    assert_eq!(installed["group_count"], 1);
+    assert!(!installed.to_string().contains(secret));
+    let missing = projection_summary(200, &json!({"groups": []}), "wanted");
+    assert_eq!(missing["target_present"], false);
+    assert_eq!(missing["groups_array"], true);
+    assert_eq!(missing["group_count"], 0);
+}
+
+#[test]
+fn bootstrap_diagnostic_trace_keeps_only_allowed_events_and_bounds_history() {
+    let observations = Arc::new(Mutex::new(BootstrapObservations::default()));
+    let subscriber = tracing_subscriber::registry().with(BootstrapTrace(Arc::clone(&observations)));
+    tracing::subscriber::with_default(subscriber, || {
+        for _ in 0..65 {
+            tracing::warn!(
+                target: "x0x::server::routes::public_group_bootstrap_outbox",
+                error = "DO_NOT_EMIT_FIXTURE_SECRET",
+                payload = "DO_NOT_EMIT_FIXTURE_SECRET",
+                "public-group bootstrap delivery attempt failed"
+            );
+        }
+        tracing::warn!(
+            target: "x0x::server::routes::public_group_bootstrap_outbox",
+            "DO_NOT_EMIT_FIXTURE_SECRET"
+        );
+        tracing::warn!(
+            target: "unrelated",
+            "public-group bootstrap delivery attempt failed"
+        );
+    });
+    let observations = observations.lock().unwrap();
+    assert_eq!(observations.events.len(), 64);
+    assert_eq!(observations.dropped_events, 1);
+    let encoded = serde_json::to_string(&observations.events).unwrap();
+    assert!(!encoded.contains("DO_NOT_EMIT_FIXTURE_SECRET"));
+    assert!(observations
+        .events
+        .iter()
+        .all(|event| event["event"] == "public-group bootstrap delivery attempt failed"));
 }
