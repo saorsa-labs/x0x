@@ -1,12 +1,13 @@
 # #504 slice 1: experimental Leaf selection and named egress meters
 
 Implements the x0x portion of [design #534](design/504-leaf-egress-budget.md)
-§6.1–6.2. Pins [sg draft #51](https://github.com/saorsa-labs/saorsa-gossip/pull/51)
-at `c041fdcc807aa8d7be26e72f5ba58584c9b14c88`, across the sg crate family to keep
-shared types on one source. The ceiling is configured once before any topic
-creation or inbound traffic, including standalone managers; Full / D=0 use
-stock bounds. **Sustained-cap claim waits on published sg ceiling and full
-acceptance (experimental until then).** This is a local implementation candidate, not the accepted #504 fix. The git pin is an integration candidate, not a published release.
+§6.1–6.2. Consumes published crates.io **saorsa-gossip 0.5.76** (sg crate family)
+and **ant-quic 0.27.49** so shared types stay on one release line (replacing the
+earlier temporary git pin of sg draft #51). The ceiling is configured once before
+any topic creation or inbound traffic, including standalone managers; Full / D=0
+use stock bounds. **Sustained-cap claim and full #504 acceptance remain held —
+this stays experimental framing only.** This is a local implementation candidate,
+not the accepted #504 fix.
 
 ```toml
 [gossip]
