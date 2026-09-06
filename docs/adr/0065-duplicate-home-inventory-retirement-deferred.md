@@ -83,8 +83,13 @@ We will adopt option 3 as the **interim** position.
   invite an operator, or a later automation, to trust it.
 - Evidence probes **report unavailability rather than absence**. An absent
   history handle, and a task-list manifest or rider-token store that is
-  missing, unreadable or **of the wrong schema**, are each reported as
-  evidence against deletion. The durable files are parsed under their REAL
+  unreadable or **of the wrong schema**, are each reported as evidence against
+  deletion. A file that is simply **missing is treated as absent evidence, not
+  unavailable evidence**, and emits nothing: never having written a manifest or
+  a rider store is a normal state, distinct from having written one that cannot
+  now be read. (The history handle differs because its absence means the store
+  was not opened, which says nothing about rows already on disk.) The durable
+  files are parsed under their REAL
   typed schemas — a generic-JSON probe is insufficient, because `null` and
   `{"entries":"corrupt"}` are valid JSON the typed loaders reject — and the
   validated durable entries, not the in-memory maps, are what the observation
